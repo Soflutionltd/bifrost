@@ -21,41 +21,6 @@ an entry wrong.
 Each entry names the hunt scope(s) that reported it. The raw reports are in the
 commit that precedes this file's.
 
-## BUG-001 - JMAP and CalDAV disagree on whether an event overlaps a range window
-
-**Reported by:** types (LIVE), jmap-account (live, P1 by its estimate).
-
-The jmap-account hunter confirms the consequence: JMAP's `CalendarEvent/query`
-does not request `expandRecurrences`, so the server returns the master and the
-local filter then discards it - `events_in_range` silently omits recurring events
-whose first occurrence precedes the window. It also notes shared
-`EventRecurrence` / attendee validation is decided per provider
-(`validate_shared_recurrence` in JMAP, `validate_recurrence` in Graph), and RRULE
-parsing/printing lives in JMAP's `calendar_ops.rs`.
-
-Question: does a `CalendarEvent` fall inside an `EventRange`? Both
-`caldav/src/account.rs::event_in_range` and
-`jmap/src/sync/calendar_ops.rs::event_in_range` apply a local guard to results
-the server already filtered, with near-copy helpers (`time_interval`,
-`comparable_time`). They disagree:
-
-| Case | CalDAV | JMAP |
-|---|---|---|
-| all-day event | always kept (floating DATE has no instant; the server had the tz) | compared as UTC midnight |
-| zero-length event on the window start | kept (RFC 4791 s9.9, the earlier dav ruling) | dropped (`event_end > range_start` is false) |
-| recurring master starting before the window | kept unless UNTIL ends before it | dropped |
-| zoneless local date-time | unparsed, so kept | parsed as UTC |
-
-JMAP plausibly drops events a JMAP server's `after`/`before` filter correctly
-returned (JMAP Calendars matches on any occurrence). Google and Graph answer the
-same question a third and fourth way, by delegating to the server and
-normalizing bounds (`google_range_bound`, Graph `events_in_range`).
-
-Root cause is the untyped `EventTime` (see STR-003). Proposed owner:
-`bifrost-types`, `EventRange::admits(&CalendarEvent) -> bool` carrying the RFC
-4791 rules, used by both DAV and JMAP. Both crates carry same-named tests
-(`range_filter_includes_all_day_on_window_start`) that would move with it.
-
 ## BUG-002 - Graph `open_blob_range` trusts caller-forgeable handle capability flags
 
 **Reported by:** types.
@@ -87,37 +52,6 @@ and schema recovery is reserved for persisted envelopes; two sites contradict
 it. Owner: one function taking the cursor's origin,
 `classify_envelope(cursor, Origin::Fresh | Origin::Stored)`, called by every
 site. The two establishment paths that host two of these sites are CON-017.
-
-## BUG-015 - Proof generations restart at zero every attachment while ledger generations are durable
-
-**Reported by:** sync-lanes (live, by reading).
-
-`PendingCoverage::next_generation` is an `AtomicU64` starting at `0` in
-`PendingCoverage::default`, and a fresh `PendingCoverage` is built per
-attachment (`engine/attach.rs`). But every `LedgerEntry::generation`,
-`BarrierIncident::generation` and retained `proved` pair is written to the
-durable ledger (`cursor/ledger_envelope.rs` encodes all three) and reloaded on
-the next attach. Every discharge rule in `cursor/ledger.rs` compares a new
-generation against the stored one: `record_proof` discharges only through
-`proof_union_covers(&self.proved, entry.generation, ..)`, which needs
-`proof_generation >= entry.generation`; the same call drops a barrier only when
-the proof generation is at least `barrier.generation`; the `proved.retain` pass
-then drops the new proof at once, older than every entry it could help.
-
-After a restart, a clean covering walk cannot discharge debt (or clear a
-barrier) raised in an earlier session at a higher generation until the new
-counter climbs past it, moving once per walk or repair attempt. Meanwhile
-`completion_permitted` stays false and the marker is withheld: a full re-walk on
-every attach for as long as the gap lasts, possibly many sessions. `upsert`
-overwrites `existing.generation = generation` on rediscovery, which can LOWER an
-entry's generation, so the durable ordering is not even monotonic.
-
-Root cause: the counter ordering durable evidence is minted by an in-memory
-object with attachment lifetime. Fix: a `ProofGeneration` minted by the
-account's writer (which owns the durable ledger) from `max(generation)` in the
-loaded ledger; `PendingCoverage` mints nothing persisted. Also, `repair.rs`
-`plan_requests` mints `RepairAttemptId(coverage.next_generation())`, so repair
-attempt ids share the sequence (also STR-025).
 
 ## BUG-016 - The backfill completion marker wins resume selection by a magic number, and can lose
 
@@ -198,31 +132,6 @@ persisted `last_error` or barrier `evidence` panics the account writer.
 ("encoding a variant the codec does not know panics"), and that codec runs
 inside consumer stores. The structural cause is STR-045.
 
-## BUG-024 - A server reporting UIDVALIDITY 0 makes every inventoried IMAP object unhydratable
-
-**Reported by:** imap-protocol (latent; "is a zero UIDVALIDITY / MODSEQ / UIDNEXT usable" has no owner).
-
-The decoder accepts 0 for UIDNEXT, UIDVALIDITY, UNSEEN, HIGHESTMODSEQ, MODSEQ,
-APPENDUID and COPYUID uidvalidity ("Postel, Dovecot sends 0 for empty
-mailboxes"). Then: connection SELECT folding stores `UidValidity(0)` as
-`Some(0)` although the `SelectedMailbox::uid_validity` doc says `None` exists to
-avoid the invalid sentinel 0 (HIGHESTMODSEQ 0 there is treated as NOMODSEQ);
-`account::selected_uidvalidity` ("the one place the classification lives")
-checks presence only and returns `Ok(0)`; `poll::observation` additionally
-rejects 0; `folder_registry::record_modseq` silently skips uidvalidity 0 and
-modseq 0; `select_options` drops QRESYNC when `UidValidity::new(cursor value)`
-is `None`; the encoder rejects uidvalidity 0 and modseq 0 in QRESYNC as
-`InvalidInput` (a caller-blaming class); `decode_object_id` rejects 0 via
-`parse_nonzero_u32`.
-
-Consequence: inventory, changes and hydration mint object ids
-`imap2:..:0:<uid>` through `encode_object_id`, and `decode_object_id` rejects
-every one, so nothing inventoried can be hydrated or mutated; the folder cursor
-is written with uidvalidity 0, so every reconnect silently drops QRESYNC and
-full-resyncs. Owner: the decoder (or the SELECT consumer) turns the wire number
-into `Option<UidValidity>` / `Option<ModSeq>` once, stating the "0 means absent"
-tolerance there; every downstream field is the typed value.
-
 ## BUG-030 - SASL vocabulary, ladders and policy are split across IMAP, ManageSieve and SMTP
 
 **Reported by:** imap-protocol, imap-connection, imap-account, smtp-sasl.
@@ -276,25 +185,6 @@ is dropped); binary sections compare `Vec<u32>` exactly. Proposal: a typed
 `SectionSpec { parts: Vec<u32>, text: Option<Header | HeaderFields(..) | Text |
 Mime> }`, with origin part of the key that owns "same section".
 
-## BUG-042 - IMAP `native_code` is `"OTHER"` for every unknown response code
-
-**Reported by:** imap-account (live), imap-protocol.
-
-The wire name of each response code is written in three tables: the codec
-decoder (`codec/decode/flags_caps.rs`, string -> variant),
-`account/error.rs::response_code_name` (variant -> string), and
-`bifrost_types::ImapResponseCode::code` (private), reached through a 60-arm
-`imap_response_code` mirror of `crate::types::ResponseCode`. `classify_status`
-stamps `native_code` from `response_code_name`, which returns the literal
-`"OTHER"` for every unknown code, while `ImapResponseCode::Unknown { code }`
-(built by `imap_response_code` for the same error) returns the server's real
-name. So `native_code` loses exactly the information an operator needs for an
-unrecognized code. Owner: make `ImapResponseCode::code` public and derive
-`native_code` from the already-built `imap_response_code(code)`, deleting the
-middle table; the IMAP crate should own the conversion as an `impl From` beside
-`ResponseCode` in the codec, with the name table in exactly one place (see
-STR-013 on provider vocabularies in the neutral crate).
-
 ## BUG-052 - IMAP `bulk_move` to a DAV-owned folder goes to the IMAP server while `throttle_keys` says IMAP does not own it
 
 **Reported by:** imap-account (live).
@@ -322,6 +212,15 @@ candidate set). The defect is now documented at the `pim.rs` arm and in
 ## BUG-057 - What an absent or zero JMAP core limit means is decided in eight places, with live disagreements
 
 **Reported by:** jmap-protocol (live disagreement).
+
+Partly fixed in wave 11: `CoreLimits`, required-field validation and the upload
+limit now live in `crates/jmap/src/core/session.rs`, the bare-handle batching
+callers decode through it, and factory validation already precedes the open
+probes. Upload-size zero and concurrency zero keep deliberately distinct
+policies (commented there). Residue: `SessionState::derive` does not yet
+validate once per installed session and cache the result, and the
+`CallLimit` / request-size / concurrency readers still interpret raw fields.
+The original account:
 
 RFC 8620 section 2 core limits are read raw (`CoreCapabilities` fields are
 `Option<usize>`) and interpreted per reader:
@@ -503,31 +402,18 @@ production; the scripted wire accepts any bearer. The axis belongs in net: eithe
 `TokenSource::current(&Audience)`, with Graph constructing its Outlook-origin
 requests with the Outlook audience. Related: STR-113 (cloud-aware origins).
 
-## BUG-099 - IMAP and ManageSieve turn every OAuth token-source failure into server-acknowledged `AuthLost`
+## BUG-099 - SMTP fabricates a network failure to classify a contended token cache
 
-**Reported by:** smtp-sasl (live; its top-ranked finding).
+**Reported by:** smtp-sasl; residue after wave 11 fixed the IMAP and ManageSieve token paths.
 
-SMTP `oauth_token_error` projects the `bifrost_net::Error` through
-`into_account_error_with_throttle_scope` and tunnels the typed result with
-`with_preclassified_account_error`, explicitly so a transient refresh failure is not
-flattened into a terminal one. IMAP `authenticate_best` maps it to
-`Error::auth_with_mechanism(format!("failed to read OAuth access token: {e}"), None,
-..)`; `classify_auth` with no response code yields
-`Authentication(ReauthorizationRequired)` and stamps `TransmissionState::Acknowledged`
-("auth failures are server-acknowledged tagged responses"). `account/sieve.rs` does
-the same via `Error::auth_with_code(.., None)`. So on IMAP a token endpoint outage, a
-`RefreshFailed { Network }`, or the `Cancelled` lost-driver case `reference/net.md`
-says must NOT be `AuthLost` all become terminal `AuthLost` with false "the server
-answered" evidence, sending the user to re-authorize an account whose token is
-fine - net.md records fixing exactly this in bifrost-net; the IMAP consumer
-reintroduces it one layer up. Owner: IMAP gets an `Error` variant carrying a
-preclassified `AccountError` (SMTP's tunnel) or a typed token failure, and the
-decision is made once - e.g. a bifrost-net helper `token_failure_account_error(error,
-protocol, operation)` for IMAP, ManageSieve and SMTP. Related smell: SMTP's
-`oauth2_token_blocking` turns `TokenSnapshot::Contended` into a fabricated
-`bifrost_net::Error::RefreshFailed { source: Network { "OAuth token cache is busy" }
-}` purely to obtain a transient classification; the classification of a snapshot
-state belongs on `TokenSnapshot` (or in net's projection).
+SMTP's `oauth2_token_blocking`
+(`crates/smtp/src/transport/smtp/authentication/credentials.rs`) turns
+`TokenSnapshot::Contended` into a fabricated `bifrost_net::Error::RefreshFailed {
+source: Network { "OAuth token cache is busy" } }` purely to obtain a transient
+classification. The classification of a snapshot state belongs on `TokenSnapshot`
+(or in net's projection). Token-lookup failures themselves are now classified
+once, by `bifrost_net::token_source_account_error`, for IMAP, ManageSieve and
+SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
 
 ## BUG-100 - A SCRAM server error other than `invalid-proof` is `AuthLost` on IMAP and `PolicyBlocked` on SMTP
 
@@ -569,8 +455,6 @@ which then becomes the "stable fallback id" on the receipt
 
 **Reported by:** wave 10 fixers (lateral).
 
-- Google `mutation.rs::has_unresolved_label_id` parses `$gmail-label:` itself
-  instead of going through the flag parser in `account/flags.rs`.
 - Graph etag updates apply every insert before every removal, whatever the wire
   order of a repeated id, so a delete then re-add of one id within a page can
   leave the wrong final state.
@@ -579,6 +463,54 @@ which then becomes the "stable fallback id" on the receipt
   per-id lanes now report an omission as unanswered (retryable).
 - IMAP: NOTIFY `MessageNew.fetch_attrs` still bypasses FETCH extension admission
   (`validate_fetch_wire`); its raw items get syntax validation only.
+
+## BUG-171 - Small wave 11 lateral findings across IMAP, net uploads and sync
+
+**Reported by:** wave 11 fixers (lateral).
+
+- IMAP `account/mutate.rs`: the COPYUID diagnostic target construction can
+  still encode a zero UIDVALIDITY epoch, although SELECT assembly now
+  normalizes zero to absent.
+- Resumable uploads (`crates/net/src/resumable.rs`, used by Google Drive and
+  OneDrive): both paths accept a 200 or 201 after a non-final chunk without
+  verifying that every payload byte was sent.
+- Sync `recovery.rs`: documentation claims `plan_recovery` is exhaustive at
+  compile time, but its helper-based classification can reach a runtime panic
+  instead.
+- Sync `recovery.rs::dispatch_stream_failure` stamps a 1 s
+  `RetryHint::After` on every Retry and Reconcile plan, including per-item
+  mutation failures (`bulk::classify_item_outcome`), so `keep_longer_advice`
+  always sees a hint, and it logs once per failed item. The reconciler comment
+  "skips hintless/unkeyed failures" now only describes throttle keys.
+- Sync `reattach::handle_account_error` dispatches again for an error the drive
+  or reconciler already dispatched before forwarding it, so holds are recorded
+  twice (harmless under max-deadline merging).
+- Sync proof generations: if the bounded `compacted` audit history evicts an
+  entry while `proved` is empty, `DebtLedger::latest_generation` can fall back
+  to an older baseline. No open debt sits above it today; nothing pins it.
+- Graph: a missing Outlook token source (Outlook origin differing from Graph's)
+  is refused by bifrost-net as `invalid_argument`, a caller-input Request error
+  rather than a configuration lane. Unverified whether EWS streaming then ends
+  push for the whole account or only drops the EWS fallback.
+- `event_in_range` in `crates/caldav/src/account.rs` and
+  `crates/jmap/src/sync/calendar_ops.rs` is the same test-only shim over
+  `EventRange::admits`; a public window constructor would remove both.
+- Graph: no account-open or factory configuration path supplies
+  `GraphClient::with_outlook_source` yet, so on a cloud whose Outlook origin
+  differs from Graph's, EWS streaming fallback, delegate Autodiscover and public
+  folders are refused until a consumer can configure one. Wire the source
+  through the factory.
+- Sync `dispatch_stream_failure` rewrites every Retry/Reconcile advice to
+  carry a hint, so a reader of the dispatched advice cannot tell a provider
+  hint from the local 1 s floor (no current reader is affected).
+- IMAP `oauth_token_error` stamps `Protocol::Imap` for ManageSieve too.
+- IMAP SELECT assembly: a `UIDVALIDITY 0` (or `UIDNEXT 0`) after a valid one
+  in the same response erases it; order-dependent, unlike the modseq rule.
+- IMAP `native_code` for an unknown response code is now the server's own
+  spelling, which gives that telemetry field unbounded cardinality.
+- Google `flags::eq_flag` now compares label flags (id and advisory name)
+  case-sensitively, where the whole string used to compare ASCII
+  case-insensitively. Probably intended; no test pins it.
 
 ## BUG-167 - IMAP discovery still advertises DAV scopes that were excluded, and namespace-prefix failures use account scope
 

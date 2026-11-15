@@ -32,6 +32,33 @@ pub struct NetErrorContext {
     pub scope: Option<ErrorScope>,
 }
 
+/// Classify a local token-source failure (`TokenSource::current` or
+/// `snapshot`) for a protocol that authenticates with the token.
+///
+/// The one owner for every protocol crate's token lookup: IMAP, ManageSieve
+/// and SMTP all route here, so a token endpoint outage keeps net's typed
+/// recovery (an enterprise user expects a retry, not a demand for a new
+/// password) while real credential loss stays an auth failure. The lookup has
+/// no provider, mailbox or transaction scope to name, so none is stamped; the
+/// caller's own error context adds its scope afterwards.
+#[must_use]
+pub fn token_source_account_error(
+    error: Error,
+    protocol: Protocol,
+    operation: AccountOperation,
+) -> AccountError {
+    into_account_error_with_throttle_scope(
+        error,
+        NetErrorContext {
+            provider: None,
+            protocol,
+            operation,
+            scope: None,
+        },
+        None,
+    )
+}
+
 /// Translate a transport error using the caller's provider throttle policy.
 ///
 /// Provider crates know whether a server's throttle should pause an account,

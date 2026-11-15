@@ -480,7 +480,13 @@ mod tests {
     #[tokio::test]
     async fn a_store_error_while_recording_a_barrier_is_not_success() {
         let (tx, worker) = incident_writer(Some(Err(Error::Other("boom".into()))));
-        let result = record_barriers(Some(&tx), &barrier(), crate::cursor::WalkGeneration::for_test(7), None).await;
+        let result = record_barriers(
+            Some(&tx),
+            &barrier(),
+            crate::cursor::WalkGeneration::for_test(7),
+            None,
+        )
+        .await;
         assert!(
             result.is_err(),
             "a barrier the store refused must not be reported as recorded"
@@ -492,9 +498,14 @@ mod tests {
     #[tokio::test]
     async fn a_recorded_barrier_reports_success() {
         let (tx, worker) = incident_writer(Some(Ok(())));
-        record_barriers(Some(&tx), &barrier(), crate::cursor::WalkGeneration::for_test(7), Some(checkpoint(10)))
-            .await
-            .expect("the writer accepted the incident");
+        record_barriers(
+            Some(&tx),
+            &barrier(),
+            crate::cursor::WalkGeneration::for_test(7),
+            Some(checkpoint(10)),
+        )
+        .await
+        .expect("the writer accepted the incident");
         drop(tx);
         assert_eq!(worker.await.expect("writer task"), 1);
     }
@@ -505,24 +516,39 @@ mod tests {
     #[tokio::test]
     async fn a_departed_writer_is_not_a_persistence_failure() {
         let (tx, worker) = incident_writer(None);
-        record_barriers(Some(&tx), &barrier(), crate::cursor::WalkGeneration::for_test(7), None)
-            .await
-            .expect("a departed writer is not a store failure");
+        record_barriers(
+            Some(&tx),
+            &barrier(),
+            crate::cursor::WalkGeneration::for_test(7),
+            None,
+        )
+        .await
+        .expect("a departed writer is not a store failure");
         drop(tx);
         worker.await.expect("writer task");
 
         // And a channel already closed before the send even lands.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
-        record_barriers(Some(&tx), &barrier(), crate::cursor::WalkGeneration::for_test(7), None)
-            .await
-            .expect("a closed writer channel is not a store failure");
+        record_barriers(
+            Some(&tx),
+            &barrier(),
+            crate::cursor::WalkGeneration::for_test(7),
+            None,
+        )
+        .await
+        .expect("a closed writer channel is not a store failure");
     }
 
     #[tokio::test]
     async fn no_writer_at_all_records_nothing_and_succeeds() {
-        record_barriers(None, &barrier(), crate::cursor::WalkGeneration::for_test(7), None)
-            .await
-            .expect("nothing to record against");
+        record_barriers(
+            None,
+            &barrier(),
+            crate::cursor::WalkGeneration::for_test(7),
+            None,
+        )
+        .await
+        .expect("nothing to record against");
     }
 }

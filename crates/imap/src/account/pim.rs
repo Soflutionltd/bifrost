@@ -40,8 +40,8 @@ use jiff::Timestamp;
 use jiff::tz::Offset;
 
 use crate::types::{
-    AclRight, FetchAttr, Flag, MailboxAttribute, MailboxName, MailboxRights, SearchCriteria,
-    StatusItem, ThreadNode,
+    FetchAttr, Flag, MailboxAttribute, MailboxName, MailboxRights, SearchCriteria, StatusItem,
+    ThreadNode,
 };
 
 use super::targets::UidOperand;
@@ -2768,32 +2768,11 @@ fn container_from_folder_entry(
 /// unreported case is `FolderEntry::rights == None`, which never reaches
 /// here). The mapping follows RFC 4314 Section 4:
 ///
-/// - `l`+`r` -> read (`l` is the visibility gate, `r` the access gate)
-/// - `i` -> add items (APPEND / COPY into)
-/// - `t` -> remove items (set `\Deleted`)
-/// - `s` -> persist `\Seen`
-/// - `w` -> set other flags/keywords
-/// - `k` (or the pre-4314 `c`) -> create a child mailbox
-/// - `x` (or the pre-4314 `d`) -> rename / delete the mailbox itself
-/// - `p` -> post to the mailbox's submission address
+/// The typed rights set owns the projection. RFC 4314 Section 2.1.1 says
+/// virtual c/d in MYRIGHTS responses must be ignored, not expanded; granting
+/// x from d could offer deletion of a shared folder without server authority.
 fn rights_from_myrights(rights: &MailboxRights) -> ContainerRights {
-    let mailbox_admin =
-        rights.contains(AclRight::DeleteMailbox) || rights.contains(AclRight::DeleteLegacy);
-    ContainerRights {
-        may_read_items: Some(rights.can_read()),
-        may_add_items: Some(rights.contains(AclRight::Insert)),
-        may_remove_items: Some(rights.contains(AclRight::DeleteMessages)),
-        may_set_seen: Some(rights.contains(AclRight::Seen)),
-        may_set_keywords: Some(rights.contains(AclRight::Write)),
-        may_create_child: Some(
-            rights.contains(AclRight::CreateMailbox) || rights.contains(AclRight::CreateLegacy),
-        ),
-        may_rename: Some(mailbox_admin),
-        may_delete: Some(mailbox_admin),
-        may_submit: Some(rights.contains(AclRight::Post)),
-        // ACL administration is the authority to grant or revoke folder access.
-        may_share: Some(rights.contains(AclRight::Administer)),
-    }
+    rights.container_rights()
 }
 
 use super::folder_registry::folder_role;
@@ -2882,10 +2861,7 @@ fn leaf_name(account: &ImapAccount, folder: &MailboxName) -> String {
         .folders
         .get(folder)
         .and_then(|entry| entry.delimiter());
-    delimiter
-        .and_then(|delimiter| folder.as_str().rsplit_once(delimiter).map(|(_, leaf)| leaf))
-        .unwrap_or_else(|| folder.as_str())
-        .to_owned()
+    crate::types::mailbox::SpecialUse::leaf_name(folder.as_str(), delimiter).to_owned()
 }
 
 /// Re-LIST the personal namespace over a connection the caller already holds.
@@ -3468,10 +3444,10 @@ mod tests {
         assert_eq!(full.may_delete, Some(true));
         assert_eq!(full.may_submit, Some(true));
 
-        // The pre-4314 virtual rights map onto the same members.
+        // Virtual response rights do not grant the modern member rights.
         let legacy = rights_from_myrights(&MailboxRights::parse("lrcd"));
-        assert_eq!(legacy.may_create_child, Some(true));
-        assert_eq!(legacy.may_delete, Some(true));
+        assert_eq!(legacy.may_create_child, Some(false));
+        assert_eq!(legacy.may_delete, Some(false));
     }
 
     #[test]
@@ -4617,10 +4593,10 @@ mod partial_commit_tests {
     use super::super::folder_registry::FolderRegistry;
     use super::super::test_support::scripted_account_parts;
     use super::*;
-    use crate::types::MailboxInfo;
     use crate::connection::test_support::{
         driver_pair, preauth_greeting, read_line, respond, tag_of,
     };
+    use crate::types::MailboxInfo;
     #[tokio::test]
     async fn fetched_server_thread_handles_resolve_current_members() {
         for (objectid, gmail, expected) in [

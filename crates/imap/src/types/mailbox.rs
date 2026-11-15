@@ -344,47 +344,89 @@ pub enum SpecialUse {
 impl MailboxInfo {
     /// Detect the special-use role of this mailbox.
     ///
-    /// First checks RFC 6154 attributes, then falls back to case-insensitive name matching
+    /// Exact INBOX is implicit; otherwise checks RFC 6154 attributes, then name matching
     /// on well-known names ("All Mail", "Sent", "Drafts", "Trash", "Spam",
     /// "Junk", "Archive", "Starred", "Important").
     pub fn special_use(&self) -> Option<SpecialUse> {
-        // Check attributes first (authoritative).
-        for attr in &self.attributes {
-            match attr {
-                MailboxAttribute::All => return Some(SpecialUse::All),
-                MailboxAttribute::Archive => return Some(SpecialUse::Archive),
-                MailboxAttribute::Drafts => return Some(SpecialUse::Drafts),
-                MailboxAttribute::Sent => return Some(SpecialUse::Sent),
-                MailboxAttribute::Junk => return Some(SpecialUse::Junk),
-                MailboxAttribute::Trash => return Some(SpecialUse::Trash),
-                MailboxAttribute::Flagged => return Some(SpecialUse::Flagged),
-                MailboxAttribute::Important => return Some(SpecialUse::Important),
-                _ => {}
-            }
-        }
+        SpecialUse::classify(&self.attributes, self.name.as_str(), self.delimiter)
+    }
+}
 
-        // Name-based fallback.
-        let lower = self.name.as_str().to_ascii_lowercase();
-        // Strip leading hierarchy using the server-provided delimiter.
-        let leaf = match self.delimiter {
-            // rsplit always yields at least one element, but we avoid unwrap per project rules.
-            Some(delim) => match lower.rsplit(delim).next() {
-                Some(s) => s,
-                None => &lower,
-            },
-            None => &lower,
-        };
-        match leaf {
-            "inbox" => Some(SpecialUse::Inbox),
-            "all" | "all mail" => Some(SpecialUse::All),
-            "sent" | "sent items" | "sent messages" => Some(SpecialUse::Sent),
-            "drafts" | "draft" => Some(SpecialUse::Drafts),
-            "trash" | "deleted" | "deleted items" | "deleted messages" => Some(SpecialUse::Trash),
-            "spam" | "junk" | "junk e-mail" | "bulk mail" => Some(SpecialUse::Junk),
-            "archive" | "archives" => Some(SpecialUse::Archive),
-            "flagged" | "starred" => Some(SpecialUse::Flagged),
-            "important" => Some(SpecialUse::Important),
+impl SpecialUse {
+    /// The single SPECIAL-USE attribute classifier, also used to rank account roles.
+    pub(crate) fn from_attributes(attributes: &[MailboxAttribute]) -> Option<Self> {
+        attributes.iter().find_map(|attr| {
+            match MailboxAttribute::from_imap_str(attr.as_imap_str()) {
+                MailboxAttribute::All => Some(Self::All),
+                MailboxAttribute::Archive => Some(Self::Archive),
+                MailboxAttribute::Drafts => Some(Self::Drafts),
+                MailboxAttribute::Sent => Some(Self::Sent),
+                MailboxAttribute::Junk => Some(Self::Junk),
+                MailboxAttribute::Trash => Some(Self::Trash),
+                MailboxAttribute::Flagged => Some(Self::Flagged),
+                MailboxAttribute::Important => Some(Self::Important),
+                _ => None,
+            }
+        })
+    }
+
+    pub(crate) fn classify(
+        attributes: &[MailboxAttribute],
+        name: &str,
+        delimiter: Option<char>,
+    ) -> Option<Self> {
+        // Only the protocol INBOX is Inbox. An enterprise user's personal
+        // Inbox must not be displaced by a nested name or a custom attribute.
+        if name.eq_ignore_ascii_case("INBOX") {
+            return Some(Self::Inbox);
+        }
+        if let Some(role) = Self::from_attributes(attributes) {
+            return Some(role);
+        }
+        let leaf = Self::leaf_name(name, delimiter).to_ascii_lowercase();
+        match leaf.as_str() {
+            "all" | "all mail" => Some(Self::All),
+            "sent" | "sent items" | "sent mail" | "sent messages" => Some(Self::Sent),
+            "drafts" | "draft" => Some(Self::Drafts),
+            "trash" | "deleted" | "deleted items" | "deleted messages" => Some(Self::Trash),
+            "spam" | "junk" | "junk e-mail" | "junk mail" | "bulk mail" => Some(Self::Junk),
+            "archive" | "archives" => Some(Self::Archive),
+            "flagged" | "starred" => Some(Self::Flagged),
+            "important" => Some(Self::Important),
             _ => None,
+        }
+    }
+
+    pub(crate) fn leaf_name(name: &str, delimiter: Option<char>) -> &str {
+        match delimiter {
+            Some(delimiter) => name.rsplit_once(delimiter).map_or(name, |(_, leaf)| leaf),
+            None => name,
+        }
+    }
+}
+
+/// SELECT's single authority for modification-sequence support.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum ModSeqSupport {
+    #[default]
+    Unknown,
+    NoModSeq,
+    Highest(std::num::NonZeroU64),
+}
+
+impl ModSeqSupport {
+    /// Zero is an unusable concurrency hint, equivalent to NOMODSEQ.
+    pub fn from_highest(value: u64) -> Self {
+        std::num::NonZeroU64::new(value).map_or(Self::NoModSeq, Self::Highest)
+    }
+}
+
+impl SelectedMailbox {
+    pub fn modseq(&self) -> Option<super::ModSeq> {
+        match self.modseq_support {
+            ModSeqSupport::Highest(value) => Some(super::ModSeq::new(value.get())),
+            ModSeqSupport::Unknown | ModSeqSupport::NoModSeq => None,
         }
     }
 }
@@ -400,8 +442,8 @@ pub struct SelectedMailbox {
     pub recent: u32,
     /// UIDVALIDITY value (RFC 3501 Section 7.1).
     ///
-    /// `None` when the server omits UIDVALIDITY (a protocol violation, but
-    /// defensive handling avoids using the invalid sentinel `0`).
+    /// `None` when the server omits UIDVALIDITY or sends zero (a protocol
+    /// violation; neither is a usable mailbox epoch).
     /// RFC 3501 Section 9 defines UIDVALIDITY as `nz-number` (> 0).
     pub uid_validity: Option<u32>,
     /// Predicted next UID (RFC 3501 Section 7.1).
@@ -410,17 +452,8 @@ pub struct SelectedMailbox {
     pub flags: Vec<Flag>,
     /// Flags the client can change permanently (RFC 3501 Section 7.1).
     pub permanent_flags: Vec<Flag>,
-    /// `HIGHESTMODSEQ` if CONDSTORE is active (RFC 7162 Section 3.1.2).
-    pub highest_mod_seq: Option<u64>,
-    /// `true` when the server sends `[NOMODSEQ]` in the SELECT/EXAMINE
-    /// response, indicating the mailbox does not support mod-sequences
-    /// (RFC 7162 Section 3.1.2).
-    ///
-    /// This distinguishes "server explicitly said no mod-sequences" from
-    /// "server simply didn't send HIGHESTMODSEQ" (where `highest_mod_seq`
-    /// is `None` in both cases). Consumers using CONDSTORE/QRESYNC need
-    /// this distinction.
-    pub no_mod_seq: bool,
+    /// Mailbox modification-sequence support established by SELECT.
+    pub modseq_support: ModSeqSupport,
     /// First unseen message sequence number from `[UNSEEN n]` response code (RFC 3501 Section 7.1).
     ///
     /// Dropped in `IMAP4rev2` (RFC 9051), but commonly sent by rev1 servers.
@@ -510,3 +543,35 @@ pub struct StatusResult {
 #[cfg(test)]
 #[path = "mailbox_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod classifier_tests {
+    use super::{MailboxAttribute, SpecialUse};
+
+    #[test]
+    fn classifier_unifies_aliases_and_respects_namespace_and_authority() {
+        for (name, expected) in [
+            ("Sent Items", SpecialUse::Sent),
+            ("Sent Mail", SpecialUse::Sent),
+            ("Deleted Items", SpecialUse::Trash),
+            ("Junk E-mail", SpecialUse::Junk),
+            ("Junk Mail", SpecialUse::Junk),
+        ] {
+            assert_eq!(SpecialUse::classify(&[], name, None), Some(expected));
+        }
+        assert_eq!(SpecialUse::classify(&[], "Projects/Sent", None), None);
+        assert_eq!(SpecialUse::classify(&[], "Projects/Inbox", Some('/')), None);
+        assert_eq!(
+            SpecialUse::classify(&[], "INBOX.Sent Mail", Some('.')),
+            Some(SpecialUse::Sent)
+        );
+        assert_eq!(
+            SpecialUse::classify(&[MailboxAttribute::All], "Sent", None),
+            Some(SpecialUse::All)
+        );
+        assert_eq!(
+            SpecialUse::classify(&[MailboxAttribute::Custom("\\sEnT".into())], "Other", None),
+            Some(SpecialUse::Sent)
+        );
+    }
+}

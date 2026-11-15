@@ -150,7 +150,12 @@ async fn repair_declared_hold_blocks_first_attempt_and_clears() {
     fixture.hold(20);
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
+    let repair = re_establish_scope_with_backoff(
+        &ctx,
+        SCOPE,
+        ctx.control,
+        crate::cursor::ScopeFence::for_test(0),
+    );
     tokio::pin!(repair);
     tokio::select! { biased; () = &mut repair => panic!("repair ignored hold"), () = turns() => {} }
     assert_eq!(calls(&account), 0);
@@ -187,7 +192,12 @@ async fn repair_429_is_recorded_for_another_lane() {
     .await;
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
+    let repair = re_establish_scope_with_backoff(
+        &ctx,
+        SCOPE,
+        ctx.control,
+        crate::cursor::ScopeFence::for_test(0),
+    );
     tokio::pin!(repair);
     tokio::select! { biased; () = &mut repair => panic!("repair finished"), () = turns() => {} }
     assert_eq!(calls(&account), 1);
@@ -208,7 +218,12 @@ async fn repair_throttle_wait_replaces_jitter_without_spending_attempts() {
     .await;
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
+    let repair = re_establish_scope_with_backoff(
+        &ctx,
+        SCOPE,
+        ctx.control,
+        crate::cursor::ScopeFence::for_test(0),
+    );
     tokio::pin!(repair);
     for expected in 1..=2 {
         tokio::select! { biased; () = &mut repair => panic!("repair finished early"), () = turns() => {} }
@@ -236,7 +251,12 @@ async fn repair_wait_allowance_expires_without_provider_call() {
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
     let mut events = ctx.changes_tx.subscribe();
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
+    let repair = re_establish_scope_with_backoff(
+        &ctx,
+        SCOPE,
+        ctx.control,
+        crate::cursor::ScopeFence::for_test(0),
+    );
     tokio::pin!(repair);
     tokio::select! { biased; () = &mut repair => panic!("ignored hold"), () = turns() => {} }
     // Poll only after BOTH timers are ready: expiry must still win.
@@ -398,7 +418,12 @@ async fn repair_first_attempt_honours_hold_recorded_by_another_lane() {
     );
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
+    let repair = re_establish_scope_with_backoff(
+        &ctx,
+        SCOPE,
+        ctx.control,
+        crate::cursor::ScopeFence::for_test(0),
+    );
     tokio::pin!(repair);
     tokio::select! { biased; () = &mut repair => panic!("first attempt ignored existing hold"), () = turns() => {} }
     assert_eq!(calls(&account), 0);
@@ -419,7 +444,12 @@ async fn repair_wait_allowance_is_cumulative_across_hold_extensions() {
     fixture.hold(200);
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
+    let repair = re_establish_scope_with_backoff(
+        &ctx,
+        SCOPE,
+        ctx.control,
+        crate::cursor::ScopeFence::for_test(0),
+    );
     tokio::pin!(repair);
     tokio::select! { biased; () = &mut repair => panic!("ignored hold"), () = turns() => {} }
     step(100).await;
@@ -1003,7 +1033,13 @@ async fn round2_scope_membership_refresh_records_hold_and_remains_best_effort() 
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
     let mut events = ctx.changes_tx.subscribe();
-    re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0)).await;
+    re_establish_scope_with_backoff(
+        &ctx,
+        SCOPE,
+        ctx.control,
+        crate::cursor::ScopeFence::for_test(0),
+    )
+    .await;
     assert_eq!(
         calls(&account),
         1,

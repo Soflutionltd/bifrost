@@ -652,33 +652,30 @@ struct HydrateState {
     shutdown: CancellationToken,
 }
 
-/// Decides whether the walk must refuse to follow `next_page_token`,
-/// returning the diagnostic detail for the terminating error.
-///
-/// Guard ORDER is deliberate and matches `changes::walk_refusal` and
-/// `calendar::calendars_list`: the repeated-token check runs FIRST. Both
-/// guards terminate the walk, so the engine sees the same outcome either
-/// way, but a page that trips both deserves the sharper diagnosis. A
-/// repeated token names a provider contract breach - the server is cycling
-/// and no amount of further paging makes progress - where the budget only
-/// reports "too many pages", which is also what an honestly huge mailbox
-/// looks like.
+/// Translate shared pagination admission into this API's diagnostics.
+/// Repeat precedence and page-budget policy live in bifrost-net.
 fn inventory_walk_refusal(
     seen_page_tokens: &mut HashSet<String>,
     pages_walked: usize,
     next_page_token: Option<&str>,
 ) -> Option<PageRefusal> {
-    let token = next_page_token?;
-    if !seen_page_tokens.insert(token.to_string()) {
-        return Some(PageRefusal::RepeatedToken(format!(
-            "gmail users.messages.list repeated page token {token:?}"
-        )));
-    }
-    (pages_walked >= MAX_INVENTORY_PAGES).then(|| {
-        PageRefusal::BudgetExceeded(format!(
+    match bifrost_net::pagination::check_next(
+        seen_page_tokens,
+        pages_walked,
+        MAX_INVENTORY_PAGES,
+        next_page_token.map(str::to_string),
+    ) {
+        Ok(()) => None,
+        Err(bifrost_net::pagination::PageRefusal::Repeated) => {
+            Some(PageRefusal::RepeatedToken(format!(
+                "gmail users.messages.list repeated page token {token:?}",
+                token = next_page_token.unwrap_or_default()
+            )))
+        }
+        Err(_) => Some(PageRefusal::BudgetExceeded(format!(
             "gmail users.messages.list exceeded {MAX_INVENTORY_PAGES} pages in one walk"
-        ))
-    })
+        ))),
+    }
 }
 
 /// A single opaque message coordinate, with stable persisted obligation bytes.
@@ -895,7 +892,7 @@ mod tests {
         vec![GmailLabel {
             id: "Label_1".to_owned(),
             name: "Work".to_owned(),
-            label_type: Some("user".to_owned()),
+            label_type: Some(crate::types::GmailLabelType::User),
             color: None,
         }]
     }

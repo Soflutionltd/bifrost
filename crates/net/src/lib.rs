@@ -30,10 +30,12 @@ pub mod error;
 pub mod hold;
 mod metered_stream;
 pub mod net;
+pub mod pagination;
 pub mod proxy;
 pub mod rate;
 pub mod redirect;
 pub mod request;
+pub mod resumable;
 pub mod retry;
 pub mod status_line;
 // Compiled for this crate's own unit tests as well, so the scripted
@@ -45,7 +47,9 @@ pub mod trace;
 mod upload;
 pub mod url;
 
-pub use account_error::{NetErrorContext, into_account_error_with_throttle_scope};
+pub use account_error::{
+    NetErrorContext, into_account_error_with_throttle_scope, token_source_account_error,
+};
 pub use attempt::{AttemptLedger, AttemptOutcome, CommitEvidence, is_proven_refusal};
 pub use auth::{
     AccessToken, CoordinatedTokenSource, OAuthRefresher, RefreshState, StaticTokenSource,

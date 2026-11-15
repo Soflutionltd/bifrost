@@ -1642,3 +1642,42 @@ and diagnostic envelope for consumers that construct or inspect them. Internally
 `AttemptEvidence` carries the ledger instead of separate commit booleans.
 Account-error translation reads raw evidence into the ledger and consumes its
 verdict; translated diagnostic cause chains do not decide replay safety.
+
+Graph selects its separately configured Outlook token source through `HopPolicy`
+for EWS and Autodiscover, retaining the account transport's accounting, request
+deadline and shared 401-refresh engine. `TokenSource` represents one credential
+audience; protocol admission selects the source before lookup. A multi-audience
+consumer does not need to change the `TokenSource::current()` contract.
+
+`token_source_account_error` is the one classifier for a failed local token
+lookup (`TokenSource::current` or `snapshot`). IMAP, ManageSieve and SMTP all
+route through it, stamping only protocol and operation: the lookup has no
+provider, mailbox or transaction scope, and the caller's error context adds
+those afterwards. Net's typed projection keeps a token endpoint outage on retry
+and real credential loss on reauthorization.
+
+## Shared walk and upload admission
+
+`pagination::check_next` is the pure admission policy used by Graph's PageWalk
+and Google's history, inventory, address-book and calendar-list walks. It takes
+the caller's seen set, completed-page count, budget and optional continuation.
+A missing continuation completes normally. A repeat wins over budget exhaustion:
+a proven provider cycle is a stronger diagnosis than a local size limit, which
+can also stop an honestly large collection. The caller translates the typed
+refusal and retains its suspended stream state and request ordering.
+
+`resumable::UploadDriver` centralizes bounded chunk windows, attempt admission,
+Content-Range encoding and final-window detection. `ChunkWindow::resume_with`
+accepts a provider decoder and error translator; `admit_resume` also supports
+provider parsers that expose a separately tested offset-admission boundary.
+Offsets cannot regress, skip unsent bytes, stall, or acknowledge the whole file
+without a completion response. No-progress classification is explicit:
+`NoProgress::LocalLimit` for Drive's legal resend response and
+`NoProgress::ContractViolation` for OneDrive's advancing-offset promise.
+Drive supplies its expected-chunk-count plus eight attempt cap. OneDrive retains
+strict progress plus its provider-owned absolute deadline, avoiding a new limit
+on legitimate partial chunk acceptance. `is_redirect` distinguishes an allowed
+resume status without Location from a redirect; request dispatch must still
+disable redirects. Providers own I/O, shutdown, deadlines and durable effect
+records. A window's final flag remains readable in the provider's effect record
+when an in-flight future is dropped.

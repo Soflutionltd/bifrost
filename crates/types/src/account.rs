@@ -341,15 +341,11 @@ pub trait Account: Send + Sync {
     /// Whether `cursor` is an in-progress inventory position accepted by
     /// `inventory_resume_stream`. This method performs pure classification.
     ///
-    /// It must accept EXACTLY what `inventory_resume_stream` accepts, and an
-    /// implementor overriding one must override the other. The engine uses
-    /// this to route a stored cursor to the deferred inventory worker, which
-    /// then calls the hook: a cursor this accepts but the hook refuses leaves
-    /// that worker reporting `NoCursor`, and the scope ends up with neither a
-    /// live cursor nor a recovery path - where the same cursor reaching
-    /// `changes_stream` would have been classified and restarted. Implement
-    /// the condition once and have both entry points read it, rather than
-    /// having two bodies agree by inspection.
+    /// The default derives its answer from the resume hook; providers should
+    /// override only that hook. Graph follows this path, so its classification
+    /// and acceptance cannot drift through separately maintained predicates.
+    /// An override must preserve this equivalence. The engine checks both
+    /// answers and routes disagreement through scoped cursor recovery.
     fn is_inventory_cursor(&self, cursor: &ChangeCursor) -> bool {
         self.inventory_resume_stream(cursor.clone()).is_some()
     }

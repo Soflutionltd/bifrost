@@ -218,38 +218,27 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
     }))
 }
 
-/// Decides whether the walk must refuse to follow `next_page_token`,
-/// returning the diagnostic detail for the terminating error.
-///
-/// Two independent guards, matching `calendars_list` and
-/// `inventory::inventory_walk_refusal`: a repeated token means the server
-/// is cycling and no amount of further paging makes progress, and the page
-/// budget catches a server that hands out fresh tokens forever. `None`
-/// means the walk may continue (or stop normally, when there is no token
-/// at all).
-///
-/// Guard ORDER is deliberate: the repeated-token check runs FIRST. Both
-/// guards terminate the walk with a terminal recovery class, but they
-/// blame different parties, and for a page that trips both, a repeated token is the
-/// sharper diagnosis - it names a provider contract breach, where the
-/// budget only reports "too many pages", which is also what an honestly
-/// huge mailbox looks like.
+/// Translate shared pagination admission into this API's diagnostics.
+/// Repeat precedence and page-budget policy live in bifrost-net.
 fn walk_refusal(
     seen_page_tokens: &mut HashSet<String>,
     pages_walked: usize,
     next_page_token: Option<&str>,
 ) -> Option<PageRefusal> {
-    let token = next_page_token?;
-    if !seen_page_tokens.insert(token.to_string()) {
-        return Some(PageRefusal::RepeatedToken(
+    match bifrost_net::pagination::check_next(
+        seen_page_tokens,
+        pages_walked,
+        MAX_HISTORY_PAGES,
+        next_page_token.map(str::to_string),
+    ) {
+        Ok(()) => None,
+        Err(bifrost_net::pagination::PageRefusal::Repeated) => Some(PageRefusal::RepeatedToken(
             "gmail users.history.list repeated a page token".to_string(),
-        ));
-    }
-    (pages_walked >= MAX_HISTORY_PAGES).then(|| {
-        PageRefusal::BudgetExceeded(format!(
+        )),
+        Err(_) => Some(PageRefusal::BudgetExceeded(format!(
             "gmail users.history.list exceeded {MAX_HISTORY_PAGES} pages in one walk"
-        ))
-    })
+        ))),
+    }
 }
 
 /// Only the final page of a history walk may advance the durable cursor.

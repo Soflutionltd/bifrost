@@ -441,7 +441,7 @@ fn diff_snapshots(old: &ScopeSnapshot, new: &ScopeSnapshot) -> Vec<ScopeLifecycl
             // A rename is metadata invalidation, not permission to mutate the
             // label. Missing type must still report changed display metadata;
             // flag replacement separately requires proven user ownership.
-            *old_name != label.name.as_str() && label.label_type.as_deref() != Some("system")
+            *old_name != label.name.as_str() && !label.is_system()
         }) {
             events.push(ScopeLifecycle::Renamed {
                 old: MembershipScope::Label(LabelId(label.id.clone())),
@@ -608,7 +608,11 @@ mod tests {
         GmailLabel {
             id: id.to_owned(),
             name: name.to_owned(),
-            label_type: Some(label_type.to_owned()),
+            label_type: Some(match label_type {
+                "user" => crate::types::GmailLabelType::User,
+                "system" => crate::types::GmailLabelType::System,
+                _ => crate::types::GmailLabelType::Unknown,
+            }),
             color: None,
         }
     }

@@ -851,8 +851,8 @@ fn response_code_notification_overflow_maps_to_cursor_invalid() {
 fn every_response_code_variant_maps_to_imap_response_code() {
     // Exercise the wire-code mapping for every well-known variant.
     // Compilation is the meaningful assertion: if a `ResponseCode`
-    // variant is added without extending `imap_response_code`, the
-    // exhaustive match in `account/error.rs` won't compile.
+    // variant is added without extending `From<&ResponseCode>`, the
+    // exhaustive match in `types/response.rs` won't compile.
     let codes: Vec<ResponseCode> = vec![
         ResponseCode::Alert,
         ResponseCode::BadCharset(Vec::new()),
@@ -948,6 +948,7 @@ fn other_response_code_preserves_payload_in_wire_unknown() {
         )
     });
     assert!(has_unknown);
+    assert_eq!(account.telemetry_fields().native_code, Some("X-CUSTOM"));
 }
 
 #[test]
@@ -1074,4 +1075,63 @@ fn starttls_refusal_does_not_claim_the_capability_was_absent() {
         error.support_consented().support_text,
         ["required STARTTLS upgrade is unavailable in this session"]
     );
+}
+
+/// The shared-folder mapper asks `permission_denied` about every folder
+/// failure. A token lookup failure reaches it on a reconnect, and must be
+/// answered from its own classification rather than panicking in `classify`.
+#[test]
+fn permission_denied_answers_token_failures_without_classifying_them() {
+    let ctx = ImapErrorContext::operation(AccountOperation::SyncChanges)
+        .with_folder_scope(&mailbox("INBOX"));
+    let tunneled = super::oauth_token_error(bifrost_net::Error::AuthLost {
+        transmission_state: None,
+        final_response: None,
+    });
+    assert!(!super::permission_denied(&tunneled, &ctx));
+}
+
+#[test]
+fn oauth_token_failures_preserve_net_classification_and_context() {
+    let errors = [
+        bifrost_net::Error::RefreshFailed {
+            retry_after: None,
+            source: std::sync::Arc::new(bifrost_net::Error::Cancelled),
+        },
+        bifrost_net::Error::RefreshFailed {
+            retry_after: None,
+            source: std::sync::Arc::new(bifrost_net::Error::Network {
+                message: "token endpoint unavailable".into(),
+                transmission_state: TransmissionState::Unsent,
+                source: None,
+            }),
+        },
+        bifrost_net::Error::AuthLost {
+            transmission_state: None,
+            final_response: None,
+        },
+    ];
+    for error in errors {
+        let tunneled = super::oauth_token_error(error);
+        let Error::OAuthToken(expected) = &tunneled else {
+            panic!("token error must retain its classification");
+        };
+        let expected = std::sync::Arc::clone(expected);
+        let account = into_account_error(
+            tunneled,
+            ImapErrorContext::operation(AccountOperation::SyncChanges)
+                .with_folder_scope(&mailbox("INBOX")),
+        );
+        assert_eq!(account.kind(), expected.kind());
+        assert_eq!(account.recovery(), expected.recovery());
+        assert_eq!(account.operation(), Some(AccountOperation::SyncChanges));
+        assert_eq!(
+            account.scope(),
+            Some(&ErrorScope::Cursor(folder_cursor("INBOX")))
+        );
+        assert!(!account.chain().iter().any(|cause| matches!(
+            cause,
+            Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged
+        )));
+    }
 }

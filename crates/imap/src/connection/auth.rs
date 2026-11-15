@@ -69,14 +69,7 @@ impl ImapConnection {
                 let access_token = tokio::time::timeout(timeout, token_source.current())
                     .await
                     .map_err(|_| Error::timeout())?
-                    .map_err(|e| {
-                        // The selected mechanism identifies the failed token lookup.
-                        Error::auth_with_mechanism(
-                            format!("failed to read OAuth access token: {e}"),
-                            None,
-                            mechanism.name(),
-                        )
-                    })?;
+                    .map_err(crate::account::error::oauth_token_error)?;
                 match mechanism {
                     AuthMechanism::OAuthBearer => {
                         self.authenticate_oauthbearer(identity, access_token.as_str(), timeout)

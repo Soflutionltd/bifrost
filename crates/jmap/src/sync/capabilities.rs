@@ -103,41 +103,31 @@ fn malformed_required_capability(uri: &str) -> AccountError {
 
 use crate::core::session::Session;
 
-/// The `maxObjectsInGet` a session advertises, for the doors that hold a
-/// bare `Account` rather than the `CoreLimits` built at open.
-/// `capabilities::build` refuses a session that omits or zeroes this, so
-/// the fallback is only ever reached by a caller running ahead of that
-/// validation; batching one id at a time is the safe shape there.
-pub(super) fn max_objects_in_get(session: &crate::core::session::Session) -> usize {
-    session
-        .core_capabilities()
-        .map(CoreLimits::from_core)
-        .map_or(1, |limits| limits.max_objects_in_get)
+pub(crate) use crate::core::session::CoreLimits;
+
+/// Bare protocol handles use the protocol-owned session interpretation.
+pub(super) fn max_objects_in_get(session: &Session) -> usize {
+    session.object_limits().max_objects_in_get
 }
 
-/// The per-call `/set` ceiling for paths that hold a bare `Account`
-/// instead of the validated `CoreLimits` from open. Keep the same upper
-/// bound used by bulk mutation batching, while never exceeding the
-/// server-advertised limit.
-pub(super) fn max_objects_in_set(session: &crate::core::session::Session) -> usize {
-    set_batch_size(
-        session
-            .core_capabilities()
-            .map(CoreLimits::from_core)
-            .map_or(1, |limits| limits.max_objects_in_set),
-    )
+pub(super) fn max_objects_in_set(session: &Session) -> usize {
+    set_batch_size(session.object_limits().max_objects_in_set)
+}
+
+fn core_limits_error(error: crate::core::session::CoreLimitsError) -> AccountError {
+    match error {
+        crate::core::session::CoreLimitsError::Absent => missing_core_capability(),
+        crate::core::session::CoreLimitsError::Malformed => malformed_core_capability(),
+        crate::core::session::CoreLimitsError::Unusable => unusable_core_limits(),
+    }
 }
 
 /// RFC 8620 section 2 requires maxSizeUpload. Zero permits only empty files;
 /// the suggested minimum is not a mandatory lower bound.
 pub(crate) fn upload_size_limit(session: &Session) -> Result<usize, AccountError> {
-    match session.core_capability_state() {
-        crate::core::session::CoreCapabilityState::Absent => Err(missing_core_capability()),
-        crate::core::session::CoreCapabilityState::Malformed => Err(malformed_core_capability()),
-        crate::core::session::CoreCapabilityState::Present(core) => {
-            core.max_size_upload().ok_or_else(unusable_core_limits)
-        }
-    }
+    session
+        .required_upload_size_limit()
+        .map_err(core_limits_error)
 }
 
 /// One local batching policy for advertised capabilities and request doors.
@@ -145,24 +135,6 @@ pub(super) const BATCH_MAX_WAIT: Duration = Duration::from_millis(100);
 
 pub(super) fn set_batch_size(advertised: usize) -> usize {
     advertised.clamp(1, 500)
-}
-
-// Bare protocol Accounts do not carry the validated sync slot. Until that
-// handle exposes its slot limits, these doors must read its session snapshot;
-// do not substitute the primary sync account's limits for a foreign handle.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CoreLimits {
-    pub(crate) max_objects_in_get: usize,
-    pub(crate) max_objects_in_set: usize,
-}
-
-impl CoreLimits {
-    fn from_core(core: &crate::core::session::CoreCapabilities) -> Self {
-        Self {
-            max_objects_in_get: core.max_objects_in_get().unwrap_or(1).max(1),
-            max_objects_in_set: core.max_objects_in_set().unwrap_or(1).max(1),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -199,48 +171,11 @@ pub(crate) struct PimSupport {
 /// `build` calls this too, so the refusal does not depend on the caller
 /// having run it first; running it twice is pure session reads.
 pub(crate) fn validate_session(session: &Session) -> Result<CoreLimits, AccountError> {
-    // Three lanes, not two. An ABSENT core block is a capability change
-    // (the server dropped a capability the session previously claimed):
-    // reopen. A block that is present but unparseable, or present with a
-    // zero or missing mandatory core member is a contract violation: the
-    // server is answering `urn:ietf:params:jmap:core` with something that is
-    // not one. Collapsing malformed into absent would send the engine into a
-    // reopen loop against a server that will keep sending the same bad
-    // session forever.
-    let core = match session.core_capability_state() {
-        crate::core::session::CoreCapabilityState::Absent => {
-            return Err(missing_core_capability());
-        }
-        crate::core::session::CoreCapabilityState::Malformed => {
-            return Err(malformed_core_capability());
-        }
-        crate::core::session::CoreCapabilityState::Present(core) => core,
-    };
-
-    upload_size_limit(session)?;
-    // RFC 8620 §2 requires both concurrency fields. Their type is
-    // `UnsignedInt`, so zero is a valid advertised value; only absence is
-    // rejected here.
-    if core.max_concurrent_upload().is_none() || core.max_concurrent_requests().is_none() {
-        return Err(unusable_core_limits());
-    }
-    if !core.has_collation_algorithms() {
-        return Err(unusable_core_limits());
-    }
-
-    let usable = |limit: Option<usize>| limit.is_some_and(|value| value > 0);
-    if !usable(core.max_calls_in_request())
-        || !usable(core.max_objects_in_get())
-        || !usable(core.max_objects_in_set())
-        || !usable(core.max_size_request())
-    {
-        return Err(unusable_core_limits());
-    }
-    // Every one of the four is `Some(> 0)` past this point.
-    let CoreLimits {
-        max_objects_in_get,
-        max_objects_in_set,
-    } = CoreLimits::from_core(core);
+    // Validate before seeding (factory::validate_and_seed), not after probes.
+    // Keep account error classification here: rejecting every bad core block
+    // as a generic protocol error during SessionState derivation would erase
+    // the absent-core CapabilityChanged lane that tells the engine to reopen.
+    let limits = session.validated_core_limits().map_err(core_limits_error)?;
 
     // The same Absent / Malformed / Present split, applied to every other
     // capability this crate models. A block the account DEPENDS on -
@@ -258,10 +193,7 @@ pub(crate) fn validate_session(session: &Session) -> Result<CoreLimits, AccountE
         }
     }
 
-    Ok(CoreLimits {
-        max_objects_in_get,
-        max_objects_in_set,
-    })
+    Ok(limits)
 }
 
 pub(crate) fn build(

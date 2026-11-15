@@ -605,6 +605,8 @@ pub(crate) use define_property_enum;
 
 /// Generates a Property enum with `as_str()`, `Display`, `Serialize`,
 /// `Deserialize`, and `From<&str>` impls, plus an `Other(String)` catch-all.
+/// Keep closed vocabularies on `define_property_enum!`: accepting unknown names
+/// here is part of the JSON-backed objects' extension-property contract.
 #[cfg(any(feature = "contacts", feature = "calendars"))]
 macro_rules! define_open_property_enum {
     (

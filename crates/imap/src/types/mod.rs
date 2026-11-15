@@ -28,7 +28,7 @@ mod sync;
 mod uid_range;
 pub(crate) mod validated;
 
-pub(crate) use acl::{AclRight, MailboxRights};
+pub(crate) use acl::MailboxRights;
 pub(crate) use address::Address;
 pub(crate) use auth::{AuthMechanism, AuthOutcome, CredentialsKind};
 pub use auth::{AuthPolicy, Credentials};

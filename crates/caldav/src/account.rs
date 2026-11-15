@@ -1058,11 +1058,9 @@ impl Account for CalDavAccount {
             let page_size = range.limit.map_or(EVENT_PAGE_SIZE, |value| {
                 usize::try_from(value).unwrap_or(usize::MAX)
             });
-            // The time-range filter runs on the SERVER and answers with hrefs
-            // only, so the page is sliced before anything is hydrated. The
-            // local overlap check below is still the authority over the page:
-            // it is recurrence-aware in ways a bare `time-range` element is
-            // not, and RFC 4791 s9.9 leaves a server free to be generous.
+            // Query hrefs before hydration. The shared guard only rejects
+            // provably disjoint intervals; the server resolves recurrences
+            // and floating dates using the calendar's timezone context.
             let candidates = match client
                 .query_event_hrefs_in_range(&calendar_url, Some(&range_start), Some(&range_end))
                 .await?
@@ -1077,8 +1075,6 @@ impl Account for CalDavAccount {
                         .await?
                 }
             };
-            let start = range.start;
-            let end = range.end;
             hydrated_event_page(
                 &client,
                 &calendar_url,
@@ -1086,7 +1082,7 @@ impl Account for CalDavAccount {
                 watermark.as_deref(),
                 page_size,
                 AccountOperation::EventsInRange,
-                |event| event_in_range(event, &start, &end),
+                |event| range.admits(event),
             )
             .await
         })
@@ -2262,106 +2258,16 @@ fn cursor_error(message: impl Into<String>) -> AccountError {
     .expect("valid account error classification")
 }
 
+#[cfg(test)]
 fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> bool {
-    if start.value.is_empty() || end.value.is_empty() || event.start.value.is_empty() {
-        return true;
+    EventRange {
+        calendar_id: event.calendar_id.clone(),
+        start: start.clone(),
+        end: end.clone(),
+        page_cursor: None,
+        limit: None,
     }
-    if event.is_all_day {
-        // DATE values are floating civil dates and carry no timezone from
-        // which to construct an instant. Comparing their midnight as UTC can
-        // reject an event the server-side time-range filter returned. Keep
-        // those results: the REPORT has the calendar's timezone context that
-        // this local guard does not.
-        return true;
-    }
-    let Some((range_start, range_end)) = time_interval(start, Some(end), false) else {
-        return true;
-    };
-    let Some((event_start, event_end)) =
-        time_interval(&event.start, event.end.as_ref(), event.is_all_day)
-    else {
-        return true;
-    };
-    let rrule = event.recurrence.rrule.as_deref().unwrap_or_default();
-    if rrule.is_empty() {
-        // Non-recurring: RFC 4791 s9.9's overlap rule, which has TWO shapes.
-        // An event with duration overlaps a `[start, end)` window when
-        // `start < event_end && end > event_start`. A zero-length instant (no
-        // DTEND, no DURATION, not all-day - `time_interval` collapses it to
-        // `event_end == event_start`) overlaps when `start <= DTSTART && end >
-        // DTSTART`: the instant sitting EXACTLY on the window's start is
-        // inside it. The strict rule alone dropped that event, which the
-        // server's time-range REPORT had correctly returned. Ruled dav-F9,
-        // 2026-09-07; pinned by `range_filter_includes_a_zero_length_event_on_
-        // the_window_start` and its two boundary siblings.
-        if event_start == event_end {
-            return range_start <= event_start && event_start < range_end;
-        }
-        return event_start < range_end && event_end > range_start;
-    }
-    // Recurring master: its own interval can sit entirely before the
-    // window while a later occurrence lands inside it. The server's
-    // time-range REPORT already expanded the RRULE and returned this
-    // resource because an occurrence overlaps, so the local guard must
-    // not drop it. Occurrences only run forward from the master start, so
-    // the series can reach the window unless it begins after the window
-    // ends, or provably ends (RRULE UNTIL) before the window starts.
-    if event_start >= range_end {
-        return false;
-    }
-    if event_end > range_start {
-        return true;
-    }
-    match rrule_until(rrule) {
-        Some(until) => until >= range_start,
-        // COUNT-bounded or open-ended series: without full expansion we
-        // trust the server's REPORT and retain the master.
-        None => true,
-    }
-}
-
-/// Parse the instant named by an RRULE `UNTIL=` part, if present. Handles
-/// both `YYYYMMDD` (date) and `YYYYMMDDTHHMMSS[Z]` (date-time) forms.
-fn rrule_until(rrule: &str) -> Option<Timestamp> {
-    let value = rrule.split(';').find_map(|part| {
-        let (key, value) = part.split_once('=')?;
-        key.eq_ignore_ascii_case("UNTIL").then_some(value)
-    })?;
-    parse_ical_instant(value.trim())
-}
-
-fn parse_ical_instant(value: &str) -> Option<Timestamp> {
-    if value.len() == 8 {
-        let date = civil::Date::strptime("%Y%m%d", value).ok()?;
-        return Offset::UTC
-            .to_timestamp(date.to_datetime(civil::Time::MIN))
-            .ok();
-    }
-    let core = value.trim_end_matches('Z');
-    let naive = civil::DateTime::strptime("%Y%m%dT%H%M%S", core).ok()?;
-    Offset::UTC.to_timestamp(naive).ok()
-}
-
-fn time_interval(
-    start: &EventTime,
-    end: Option<&EventTime>,
-    is_all_day: bool,
-) -> Option<(Timestamp, Timestamp)> {
-    let start = comparable_time(start, is_all_day)?;
-    let end = end
-        .and_then(|end| comparable_time(end, is_all_day))
-        .unwrap_or(start);
-    Some((start, end))
-}
-
-fn comparable_time(time: &EventTime, is_all_day: bool) -> Option<Timestamp> {
-    if is_all_day || time.value.len() == 10 {
-        let date = civil::Date::strptime("%Y-%m-%d", &time.value).ok()?;
-        return Offset::UTC
-            .to_timestamp(date.to_datetime(civil::Time::MIN))
-            .ok();
-    }
-    time.value.parse::<Timestamp>().ok()
+    .admits(event)
 }
 
 fn caldav_query_time(time: &EventTime) -> Option<String> {
@@ -3774,16 +3680,16 @@ mod tests {
     }
 
     #[test]
-    fn range_filter_drops_recurring_master_that_ended_before_window() {
-        // A bounded weekly series whose UNTIL is before the window start
-        // cannot reach it, so the guard drops the out-of-window master.
+    fn range_filter_retains_bounded_master_for_provider_recurrence_decision() {
+        // UNTIL is not an event end, and explicit dates can extend the series.
+        // The provider owns recurrence matching.
         let event = recurring_event(
             "2026-05-04T12:00:00Z",
             "2026-05-04T13:00:00Z",
             "FREQ=WEEKLY;UNTIL=20260525T120000Z",
         );
 
-        assert!(!event_in_range(
+        assert!(event_in_range(
             &event,
             &time("2026-06-01T00:00:00Z"),
             &time("2026-06-08T00:00:00Z")
@@ -3791,36 +3697,18 @@ mod tests {
     }
 
     #[test]
-    fn range_filter_drops_recurring_master_starting_after_window() {
+    fn range_filter_retains_master_for_provider_recurrence_decision() {
         let event = recurring_event(
             "2026-07-04T12:00:00Z",
             "2026-07-04T13:00:00Z",
             "FREQ=WEEKLY",
         );
 
-        assert!(!event_in_range(
+        assert!(event_in_range(
             &event,
             &time("2026-06-01T00:00:00Z"),
             &time("2026-06-08T00:00:00Z")
         ));
-    }
-
-    #[test]
-    fn rrule_until_parses_date_form_and_case_insensitive_key() {
-        // UNTIL comes in both date and date-time forms, and RRULE part
-        // names are case-insensitive per RFC 5545.
-        let until = rrule_until("FREQ=WEEKLY;until=20260525").expect("date-form UNTIL");
-        assert_eq!(until.to_string(), "2026-05-25T00:00:00Z");
-
-        let until = rrule_until("FREQ=DAILY;UNTIL=20260525T120000").expect("datetime UNTIL");
-        assert_eq!(until.to_string(), "2026-05-25T12:00:00Z");
-
-        let until = rrule_until("FREQ=DAILY;UNTIL=20260525T120000Z").expect("UTC UNTIL");
-        assert_eq!(until.to_string(), "2026-05-25T12:00:00Z");
-
-        assert!(rrule_until("FREQ=DAILY").is_none());
-        assert!(rrule_until("FREQ=DAILY;UNTIL=garbage").is_none());
-        assert!(rrule_until("").is_none());
     }
 
     #[test]

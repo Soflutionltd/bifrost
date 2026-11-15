@@ -38,8 +38,8 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use bifrost_types::{
     Account, AccountCapabilities, AccountControl, AccountError, AccountFactory, AccountFuture,
-    AccountId, AccountStream, BackfillCheckpoint, Batch, ChangeCursor,
-    Checkpoint, CursorEstablishment, CursorScope, DiagnosticText, EngineDirective, ErrorScope,
+    AccountId, AccountStream, BackfillCheckpoint, Batch, ChangeCursor, Checkpoint,
+    CursorEstablishment, CursorScope, DiagnosticText, EngineDirective, ErrorScope,
     InvalidationSink, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
     MutationSuccess, OpenedAccount, PageBoundary, PauseReason, Priority, ReconcileAction,
     ReconcileAdvice, RecoveryClass, RetryAdvice, SkippedScope, SyncEvent,
@@ -469,7 +469,7 @@ impl SyncEngine {
             .get_ledger()
             .await?;
         let observe = |error: &AccountError| {
-            bulk::record_error_throttle(&slot.throttles, account_id, error);
+            crate::recovery::observe_failure_throttles(&slot.throttles, account_id, error);
         };
         tokio::select! {
             biased;

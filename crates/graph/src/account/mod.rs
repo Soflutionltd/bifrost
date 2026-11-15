@@ -1115,6 +1115,9 @@ impl Account for GraphAccount {
         inventory::inventory_stream_admitted(self.clone(), scope, parsed)
     }
 
+    // Keep the default is_inventory_cursor: it asks this hook, whose stream
+    // construction is inert until polled. A second Graph predicate would
+    // duplicate acceptance of scope, payload and acknowledged page position.
     fn inventory_resume_stream(
         &self,
         cursor: ChangeCursor,

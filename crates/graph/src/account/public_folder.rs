@@ -713,7 +713,8 @@ pub(crate) fn ews_client(account: &GraphAccount) -> Result<EwsClient, EwsError> 
         .client
         .account_net()
         .map(|net| {
-            EwsClient::new(net, account.client.ews_url()).with_tally(account.client.batch_tally())
+            EwsClient::new(net, account.client.ews_url(), account.client.outlook_auth())
+                .with_tally(account.client.batch_tally())
         })
         .ok_or_else(|| EwsError::Internal("EWS client has no attached account transport".into()))
 }

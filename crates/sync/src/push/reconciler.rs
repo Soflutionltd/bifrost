@@ -389,9 +389,13 @@ impl Reconciler {
                     return Ok(());
                 }
                 ChangesEvent::Terminated(error) => {
-                    use crate::recovery::{RecoveryPlan, plan_recovery, retry_delay};
+                    use crate::recovery::{RecoveryPlan, retry_delay};
                     let original = error.clone();
-                    match plan_recovery(error) {
+                    match crate::recovery::dispatch_stream_failure(
+                        error,
+                        &self.throttles,
+                        &self.account_id,
+                    ) {
                         // Retry and Reconcile both record their deadline in the
                         // shared throttle bucket and then SKIP this scope,
                         // continuing the sweep. The reconciler is one task for
@@ -404,12 +408,6 @@ impl Reconciler {
                         // scope, under a shutdown select), so the deadline is
                         // honored without a task-wide stall.
                         RecoveryPlan::Retry(advice) => {
-                            crate::recovery::record_throttle(
-                                &self.throttles,
-                                &self.account_id,
-                                &advice,
-                                &original,
-                            );
                             tracing::debug!(
                                 target: "bifrost.sync.reconcile",
                                 account = ?self.account_id,
@@ -417,7 +415,7 @@ impl Reconciler {
                                 delay_secs = retry_delay(
                                     &advice,
                                     std::time::SystemTime::now(),
-                                    std::time::Duration::from_secs(1),
+                                    crate::recovery::HINTLESS_RETRY_WAIT,
                                 ).as_secs(),
                                 "hinted scope throttled; skipping it and continuing the sweep"
                             );
@@ -425,12 +423,6 @@ impl Reconciler {
                             continue;
                         }
                         RecoveryPlan::Reconcile(advice) => {
-                            crate::recovery::record_reconcile_throttle(
-                                &self.throttles,
-                                &self.account_id,
-                                &advice,
-                                &original,
-                            );
                             tracing::debug!(
                                 target: "bifrost.sync.reconcile",
                                 account = ?self.account_id,
@@ -438,7 +430,7 @@ impl Reconciler {
                                 delay_secs = crate::recovery::reconcile_delay(
                                     &advice,
                                     std::time::SystemTime::now(),
-                                    std::time::Duration::from_secs(1),
+                                    crate::recovery::HINTLESS_RETRY_WAIT,
                                 ).as_secs(),
                                 "hinted scope deferred for reconcile; continuing the sweep"
                             );
@@ -490,8 +482,7 @@ impl Reconciler {
                                 // now-stale request.
                                 work.hold = Some((
                                     incarnation,
-                                    tokio::time::Instant::now()
-                                        + std::time::Duration::from_secs(30),
+                                    tokio::time::Instant::now() + crate::recovery::REOPEN_WAIT,
                                 ));
                                 return Ok(());
                             }

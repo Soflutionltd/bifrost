@@ -227,6 +227,12 @@ impl SyncEngine {
         self.discover_and_link_memberships(opened.as_ref(), Arc::clone(&cursors))
             .await?;
 
+        // Load before publishing registrations or spawning producers. Failure
+        // unwinds the opened account without leaving a running unseeded lane.
+        // The same lifecycle guard excludes the preceding attachment's writer.
+        let pending_coverage =
+            Arc::new(ack::restore_proof_order(&account_id, self.checkpoints.as_ref()).await?);
+
         // Wire boundary + priority watches.
         let (boundary, boundary_view) = Boundary::new();
         let (priority_tx, priority_rx) = watch::channel(Priority::Normal);
@@ -264,7 +270,6 @@ impl SyncEngine {
         // Control handle shared between the SyncControl returned to
         // the consumer and the engine's spawned workers (so workers
         // can call `record_checkpoint`).
-        let pending_coverage = Arc::new(PendingCoverage::new());
         let control = SyncControl::new_with_publications(
             account_id.clone(),
             boundary.clone(),

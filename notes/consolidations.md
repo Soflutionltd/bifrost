@@ -217,15 +217,6 @@ Sites: `mime::render::send_request_to_rfc5322`, Google `pim.rs` (its own
 `require_recipient` branch), IMAP `pim.rs` draft send, JMAP scheduled send.
 Owner: a `SendRequest` / `DraftPatch` validator in `compose.rs`.
 
-## CON-008 - Is this stored cursor an inventory resume position?
-
-**Reported by:** types.
-
-`Account::inventory_resume_stream` and `Account::is_inventory_cursor` "must
-accept EXACTLY" the same cursors; only Graph overrides, and only one of them.
-Owner: one method returning a classification (`Option<InventoryResume>`), which
-removes the second answer.
-
 ## CON-009 - Which throttle budget does this work consume, and which does this error stamp?
 
 **Reported by:** types.
@@ -272,46 +263,6 @@ Graph treats them as aliases (`graph/src/account/inventory.rs::event_aliases`,
 only `CalendarEvent` to the calendar sub-account; the engine keys them as
 distinct `CursorScope`s. Owner: `bifrost-types`, one variant or a stated alias
 rule.
-
-## CON-012 - Given a stream-terminating `AccountError`, what does this lane do?
-
-**Reported by:** sync-engine (sites already disagree).
-
-Every long-lived lane matches `plan_recovery` itself and decides what to record
-in the throttle bucket, how long to sleep (and the fallback), whether and how to
-forward (stamped or not), and whether to broadcast `Terminated`. Sites:
-`multiplexer/mod.rs::handle_drive_outcome`, `push/reconciler.rs`,
-`push/lanes.rs`, `push/mod.rs::route_watch_event`, the lifecycle reader
-(`lifecycle_termination` plus `lifecycle_retry_wait`),
-`engine/reattach.rs::handle_account_error`, `re_establish_scope_with_backoff`,
-`bulk.rs` (item and stream), deferred inventory (through `ctx.recover`).
-
-Already disagree: retry fallback with no hint is 1s in the poll loop and
-campaigns, `Duration::ZERO` in push lanes, a 30s floor in lifecycle. Terminal:
-the poll loop parks and logs, the sink broadcasts `Terminated`,
-`handle_account_error` only logs ("broadcast already carried the terminating
-event", true only for some producers). Throttle recording: the push lanes record
-holds; a retryable sink termination records a hold and then reports only a
-prose warning.
-
-Owner: one `StreamFailure` dispatcher in `recovery` taking the error, scope,
-incarnation stamp and lane kind, performing the shared side effects once
-(record holds, telemetry), and returning a typed action (`Retry { after }`,
-`Forward(ReopenRequest)`, `Terminal`). Lanes keep only genuinely lane-specific
-policy, such as the lifecycle reader's await-reopen rule.
-
-The sync-lanes hunter reported the same question independently, adding: the
-reconciler's comment says it does this "exactly as the poll loop's
-`handle_drive_outcome` does", yet on an account-wide `Engine(_)` verdict the
-reconciler holds the remainder for 30s while the poll loop returns with no exit
-and carries on at cadence; the wait-for-the-restart bound is written three
-times (`LIFECYCLE_REOPEN_WAIT` in the multiplexer, a literal
-`Duration::from_secs(30)` in the reconciler hold, a literal in `drive_lane`'s
-restart wait); the `retry_delay` / `reconcile_delay` floors are literal per site.
-Its proposed shape: `recovery.rs` returns `Disposition { record:
-ThrottleRecord, wait: Wait, directive: Option<ReopenRequest>, park: bool,
-announce: Option<Warning> }` from one function taking a `DriverKind` where the
-answer legitimately differs, with the 30s bound one named constant.
 
 ## CON-013 - Is this error a throttle, and for how long? (four-plus recorders, two hold stores)
 
@@ -551,45 +502,6 @@ orchestrator writes both; with no incarnation, a re-established scope reads the
 previous incarnation's state until overwritten. Owner: the registry becomes a
 read-only projection of `BackfillScan` (STR-044), keyed by incarnation.
 
-## CON-028 - IMAP folder role from attributes and names: two tables, already different
-
-**Reported by:** imap-protocol (live, minor).
-
-- `types/mailbox.rs::MailboxInfo::special_use()`: attributes, then the name
-  table {"all", "all mail", "sent", "sent items", "sent messages", "drafts",
-  "draft", "trash", "deleted", "deleted items", "deleted messages", "spam",
-  "junk", "junk e-mail", "bulk mail", "archive", "archives", "flagged",
-  "starred", "important", "inbox"}; leaf by `rsplit` of a lowercased name.
-  Production-dead (only decoder tests call it).
-- `account/pim.rs::folder_role` + `folder_role_from_attributes`: attributes (no
-  `\All`, `\Flagged`, `\Important`; `\Inbox` via `Custom`), then the name table
-  {"inbox", "sent", "sent mail", "sent messages", "draft", "drafts", "archive",
-  "archives", "trash", "deleted", "deleted messages", "junk", "spam", "junk
-  mail"}; leaf via `folder_registry::leaf_name`.
-
-"Sent Items", "Deleted Items" (Exchange) and "Junk E-mail" are recognised by the
-dead copy and not the live one; "Sent Mail" (Gmail) the reverse. The method on
-the protocol type is the one the next consumer will reach for. Owner: one
-classifier in `types/mailbox.rs` (attributes authoritative, one name table,
-namespace-aware per BUG-028), with `pim` mapping `SpecialUse -> FolderRole`.
-
-## CON-029 - What does an IMAP MYRIGHTS set permit?
-
-**Reported by:** imap-protocol (latent).
-
-`types/acl.rs`: `can_read` = l+r, `can_insert` = i, `can_delete` = t+e; legacy
-`c` / `d` parsed but never interpreted. `account/pim.rs::rights_from_myrights`:
-`may_remove_items` = t alone (no e), `may_rename` / `may_delete` = x or legacy
-d, `may_create_child` = k or legacy c. `folder_registry::listing_selectable`:
-`can_read`. `can_insert` / `can_delete` are production-dead and disagree with
-the live projection (t+e vs t); RFC 4314 section 2.1.1's legacy expansion lives
-only, and partially, in pim. ACL rights also travel as strings (`MyRights {
-rights: String }`, `AclEntry { rights: String }`, `ListRights { required:
-String, optional: Vec<String> }`, `Command::SetAcl { rights: String }`,
-`Capability::Rights(String)`) although `MailboxRights` exists. Owner:
-`MailboxRights::parse`, produced by the decoder, expanding legacy letters per
-RFC 4314 2.1.1 at parse time and exposing the one projection; pim delegates.
-
 ## CON-030 - What does an IMAP server event mean for sync?
 
 **Reported by:** imap-protocol.
@@ -676,53 +588,6 @@ Each summarizes other code with nothing forcing agreement:
 
 Owner: table-driven decode dispatch (keyword -> parser + strictness + numeric
 width) and a classification table from which routing keys are computed.
-
-## CON-043 - JMAP wire property names are declared twice per enum
-
-**Reported by:** jmap-protocol.
-
-Most object `Property` enums declare each wire name in a `#[serde(rename =
-"...")]` and again in a hand-written `Display` match (mailbox, email_submission,
-principal, push_subscription, calendar, address_book, sieve, vacation, identity,
-...). `Display` is what `SetError<O::Property>::to_string_error` and `properties`
-lists use; serde is what decode uses. `define_open_property_enum!` already
-generates both from one table for calendar event and contact card; using it (or a
-closed variant) everywhere removes the second answer, and the per-enum round-trip
-tests in `tests.rs` that exist only because there are two answers.
-
-## CON-045 - How many ids per JMAP call?
-
-**Reported by:** jmap-account.
-
-The sync-side duplication is gone: limit decoding lives in
-`sync/capabilities.rs`, one helper replaces the set-size clamps, and one
-constant replaces the two wait definitions. Residue: bare protocol account
-handles still read session snapshots for their limits, because the handle does
-not carry its `CoreLimits` (BUG-057). Owner: a protocol-owned limits accessor
-on the account handle, or the per-account slot (STR-097).
-
-## CON-046 - The pagination guard: five copies, two opposite orders
-
-**Reported by:** graph (both sides call their order deliberate).
-
-Graph's `paging::PageWalk`, and in Google `changes::walk_refusal`,
-`inventory::inventory_walk_refusal`, `contacts::address_book_walk_refusal` and the
-inline loop in `calendar::calendars_list`. All use a 10,000-page budget, a repeat
-as contract violation, and the budget as `LimitExceeded`. Graph checks the budget
-FIRST (`the_budget_is_checked_before_the_repeat`: "the classification does not
-depend on which link the server happened to hand out last"); Google checks the
-repeat FIRST (`walk_refusal`: "a repeated token is the sharper diagnosis"). The
-`PageWalk` module doc cites the Google fix as the reason for its own design.
-Owner: one pure `PaginationGuard<K: Hash + Eq>` in `bifrost-types` (or
-`bifrost-net`), with one ruled order.
-
-The google hunter reports the four Google copies from inside: each doc comment
-says it "matches" the other three, and the calendar copy differs in shape - its
-budget is the `for` bound, so it refuses only after fetching the 10,000th page
-rather than before following its token. `PageRefusal` is the shared result type,
-but there is no shared guard. Its shape: `PageWalk { seen: HashSet<String>, pages:
-usize, budget: usize }` with `admit(next: Option<&str>) -> Result<Option<Token>,
-PageRefusal>`, in bifrost-net beside `parse_retry_after_hint`.
 
 ## CON-047 - May this URL carry the account credential?
 
@@ -845,20 +710,6 @@ Residue: the validator still travels as `String` in `ServerVersion::ETag(String)
 marker kept as text so later code re-detects it. Moving `EntityTag` into
 bifrost-types and adopting it for Graph's `If-Match`, Google People and Google
 Calendar etags is the remaining owner change.
-
-## CON-065 - Google Drive and OneDrive drive the same resumable-upload protocol separately
-
-**Reported by:** net-dav (the copies disagree).
-
-Google's `upload_file_chunked_progress` and Graph's `upload_chunks` /
-`admitted_resume_offset` repeat window arithmetic, the `bytes {offset}-{end-1}/{total}`
-header, resume-offset admission, final-chunk tracking for the partial-commit
-record, and redirect refusal. They disagree on a resume that made no progress
-(Google: `Internal(LimitExceeded)`, "Drive documents resending"; Graph:
-`ContractViolation`) and on the attempt budget (Google has a total budget; Graph has
-none and relies on strictly increasing offsets). Owner: a resumable-upload driver in
-bifrost-net taking a provider closure to parse the server's resume offset, with the
-provider-specific no-progress rule an explicit parameter, not a fork.
 
 ## CON-066 - "Send to a pre-authenticated session URL" is three bools that must agree
 

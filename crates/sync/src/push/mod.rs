@@ -21,7 +21,7 @@ pub mod subscription;
 
 use crate::cancel::{BoundaryRequest, BoundaryView};
 use crate::multiplexer::{ChangeDelivery, EventScope, MultiplexerEvent, ReopenRequest};
-use crate::recovery::{RecoveryPlan, ThrottleBucket, plan_recovery};
+use crate::recovery::{RecoveryPlan, ThrottleBucket};
 use bifrost_types::{
     AccountId, InvalidationSink, SinkPush, SyncEvent, Warning, WarningKind, WatchEvent,
 };
@@ -139,7 +139,11 @@ pub(crate) fn route_watch_event(
             )),
         ),
         WatchEvent::Warning(warning) => broadcast(target, SyncEvent::Warning(warning)),
-        WatchEvent::Terminated(error) => match plan_recovery(error.clone()) {
+        WatchEvent::Terminated(error) => match crate::recovery::dispatch_stream_failure(
+            error.clone(),
+            &target.throttles,
+            account,
+        ) {
             RecoveryPlan::Engine(directive) => {
                 if target.boundary.peek() != BoundaryRequest::Run {
                     return SinkPush::Refused(WatchEvent::Terminated(error));
@@ -162,23 +166,10 @@ pub(crate) fn route_watch_event(
                     Err(_) => SinkPush::NotAttached,
                 };
             }
-            RecoveryPlan::Retry(advice) => {
-                crate::recovery::record_throttle(&target.throttles, account, &advice, &error);
-                broadcast(
-                    target,
-                    SyncEvent::Warning(Warning::user_safe(
-                        WarningKind::Other,
-                        "push stream terminated with retryable recovery",
-                    )),
-                );
-            }
-            RecoveryPlan::Reconcile(advice) => {
-                crate::recovery::record_reconcile_throttle(
-                    &target.throttles,
-                    account,
-                    &advice,
-                    &error,
-                );
+            RecoveryPlan::Retry(_) | RecoveryPlan::Reconcile(_) => {
+                // The injected watch owns its reconnect. Dispatch records the
+                // structured failure and holds; warning is advisory because the
+                // engine has no transport handle it could reopen here.
                 broadcast(
                     target,
                     SyncEvent::Warning(Warning::user_safe(

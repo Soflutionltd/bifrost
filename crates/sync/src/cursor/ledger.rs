@@ -481,6 +481,23 @@ impl DebtLedger {
         Self::default()
     }
 
+    /// Include terminal entries and compacted history: compaction must not
+    /// reset the durable ordering when the last open obligation disappears.
+    pub(crate) fn latest_generation(&self) -> crate::cursor::WalkGeneration {
+        self.entries
+            .values()
+            .map(|entry| entry.generation)
+            .chain(self.barriers.values().map(|barrier| barrier.generation))
+            .chain(self.proved.iter().map(|(generation, _)| *generation))
+            .chain(
+                self.compacted
+                    .iter()
+                    .map(|(_, audit)| audit.latest_generation),
+            )
+            .max()
+            .unwrap_or_else(super::PendingCoverage::initial_generation)
+    }
+
     /// Rebuild a ledger from durable parts.
     ///
     /// The one door into the private maps that does not go through `ingest`,
@@ -964,7 +981,9 @@ impl DebtLedger {
                 // A re-raised obligation keeps its history. Resetting
                 // `first_seen` or the attempt count each time the same broken
                 // object is rediscovered would make any budget unreachable.
-                existing.generation = generation;
+                // Delayed reports must not make an older proof eligible to settle
+                // a gap observed by a newer walk.
+                existing.generation = existing.generation.max(generation);
                 existing.domain = domain.clone();
                 existing.last_error = obligation.error().clone();
                 // The token may legitimately rotate while naming the same gap,
@@ -1050,7 +1069,7 @@ impl DebtLedger {
     pub fn record_barrier(&mut self, incident: BarrierIncident) {
         match self.barriers.get_mut(&incident.key) {
             Some(existing) => {
-                existing.generation = incident.generation;
+                existing.generation = existing.generation.max(incident.generation);
                 existing.evidence = incident.evidence;
                 existing.resume_from = incident.resume_from;
             }

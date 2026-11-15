@@ -1174,8 +1174,14 @@ mod tests {
         user_answer_xml(code, Some(target))
     }
 
+    fn exchange_client() -> GraphClient {
+        GraphClient::new("graph-token").with_outlook_source(std::sync::Arc::new(
+            bifrost_net::StaticTokenSource::new("token", None),
+        ))
+    }
+
     async fn content_mailbox_error(answer: String) -> (bifrost_types::AccountError, usize) {
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux([ScriptedRestResponse::text(reqwest::StatusCode::OK, &answer)]);
         let account = test_account(client.clone());
         let error = account
@@ -1193,7 +1199,7 @@ mod tests {
     /// parser expects.
     #[tokio::test]
     async fn delegate_discovery_posts_autodiscover_xml_and_parses_the_mailboxes() {
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux([ScriptedRestResponse::text(
             reqwest::StatusCode::OK,
             r#"<?xml version="1.0" encoding="utf-8"?>
@@ -1250,7 +1256,7 @@ mod tests {
     /// `Retry-After`, `WWW-Authenticate`, and the request id support reads.
     #[tokio::test]
     async fn a_passed_through_redirect_classifies_with_the_response_headers() {
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux([ScriptedRestResponse::text(reqwest::StatusCode::FOUND, "")
             .with_header("Retry-After", "30")
             .with_header("request-id", "req-77")
@@ -1276,7 +1282,7 @@ mod tests {
     /// `NoError`, which is how Exchange sends them.
     #[tokio::test]
     async fn a_soap_redirect_chain_reissues_against_the_new_mailbox_then_endpoint() {
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux([
             ScriptedRestResponse::text(
                 reqwest::StatusCode::OK,
@@ -1355,7 +1361,7 @@ mod tests {
     /// user, and the Autodiscover error text is lost.
     #[tokio::test]
     async fn an_in_body_error_code_fails_the_lookup_with_its_text() {
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux([ScriptedRestResponse::text(
             reqwest::StatusCode::OK,
             r#"<?xml version="1.0" encoding="utf-8"?>
@@ -1471,7 +1477,7 @@ mod tests {
     </a:UserResponse></a:UserResponses>
   </a:Response></a:GetUserSettingsResponseMessage></s:Body>
 </s:Envelope>"#;
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux([ScriptedRestResponse::text(reqwest::StatusCode::OK, refused)]);
         let error = test_account(client)
             .discover_public_folder_routing("user@contoso.com")
@@ -1494,7 +1500,7 @@ mod tests {
     /// old code sent every hop up to the cap and then blamed the caller.
     #[tokio::test]
     async fn a_redirect_loop_is_the_providers_contract_violation() {
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux([
             ScriptedRestResponse::text(
                 reqwest::StatusCode::OK,
@@ -1522,7 +1528,7 @@ mod tests {
     /// the caller's malformed request and not proof of a provider fault.
     #[tokio::test]
     async fn a_redirect_chain_past_the_cap_is_a_local_limit() {
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux((0..=MAX_REDIRECTS).map(|hop| {
             ScriptedRestResponse::text(
                 reqwest::StatusCode::OK,
@@ -1732,7 +1738,7 @@ mod tests {
         assert_eq!(requests, 1);
         assert_parse_failed(&error);
 
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux([ScriptedRestResponse::text(
             reqwest::StatusCode::OK,
             &cut_before(
@@ -1754,7 +1760,7 @@ mod tests {
     /// `Ok` with an empty list.
     #[tokio::test]
     async fn a_malformed_delegate_answer_fails_discovery_instead_of_finding_none() {
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux([ScriptedRestResponse::text(
             reqwest::StatusCode::OK,
             "<Autodiscover><Response><Account><AlternativeMailbox>",
@@ -1798,7 +1804,7 @@ mod tests {
     async fn delegate_error(
         answers: Vec<ScriptedRestResponse>,
     ) -> (bifrost_types::AccountError, usize) {
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux(answers);
         let error = test_account(client.clone())
             .discover_shared_mailboxes("user@contoso.com")
@@ -1853,7 +1859,7 @@ mod tests {
     /// same mailbox there.
     #[tokio::test]
     async fn pox_redirects_are_followed_to_the_mailbox_list() {
-        let client = GraphClient::new("token");
+        let client = exchange_client();
         client.script_aux([
             ok(&pox_redirect(
                 "redirectAddr",

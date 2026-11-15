@@ -58,7 +58,7 @@ pub(crate) fn calendars_list(
         let mut calendars = Vec::new();
         let mut page_token = None;
         let mut seen_tokens = HashSet::new();
-        for _ in 0..MAX_CALENDAR_LIST_PAGES {
+        for pages_walked in 1..=MAX_CALENDAR_LIST_PAGES {
             let mut url = base_url.clone();
             if let Some(token) = page_token.as_deref() {
                 url.push_str("&pageToken=");
@@ -78,13 +78,23 @@ pub(crate) fn calendars_list(
             let Some(next_token) = response.next_page_token else {
                 return Ok(calendars);
             };
-            if !seen_tokens.insert(next_token.clone()) {
-                return Err(page_refusal(
-                    AccountOperation::CalendarsList,
-                    crate::error::PageRefusal::RepeatedToken(
-                        "Google Calendar calendarList repeated a page token".to_string(),
-                    ),
-                ));
+            if let Err(refusal) = bifrost_net::pagination::check_next(
+                &mut seen_tokens,
+                pages_walked,
+                MAX_CALENDAR_LIST_PAGES,
+                Some(next_token.clone()),
+            ) {
+                let refusal = match refusal {
+                    bifrost_net::pagination::PageRefusal::Repeated => {
+                        crate::error::PageRefusal::RepeatedToken(
+                            "Google Calendar calendarList repeated a page token".to_string(),
+                        )
+                    }
+                    _ => crate::error::PageRefusal::BudgetExceeded(format!(
+                        "Google Calendar calendarList exceeded {MAX_CALENDAR_LIST_PAGES} pages"
+                    )),
+                };
+                return Err(page_refusal(AccountOperation::CalendarsList, refusal));
             }
             page_token = Some(next_token);
         }

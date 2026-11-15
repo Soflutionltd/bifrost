@@ -12,7 +12,7 @@ impl SyncEngine {
     /// alongside partial accounting. Preflight failures return `Err`.
     ///
     /// Mutation accounting consumes `ItemOutcome<MutationSuccess>` and
-    /// dispatches per-item failures via [`crate::recovery::plan_recovery`]:
+    /// dispatches per-item failures via [`crate::recovery::dispatch_stream_failure`]:
     ///
     /// - `Retry { SameRequest | AfterAuthRefresh }` -> retry queue.
     /// - `Retry { AfterStateRefresh }` and `Reconcile { CheckTarget }`
@@ -229,7 +229,7 @@ impl SyncEngine {
         vendor: &crate::mutation::IdempotencyVendor,
         protocol: bifrost_types::ProtocolKind,
     ) -> Result<crate::mutation::MutationCounters, Error> {
-        use crate::recovery::{RecoveryPlan, plan_recovery};
+        use crate::recovery::RecoveryPlan;
         let BulkTargets {
             ids: targets,
             expected_versions,
@@ -530,7 +530,7 @@ impl SyncEngine {
                     BulkPipelineOp::Destroy => ReadbackTarget::Destroy,
                 };
                 let record = |error: &AccountError| {
-                    record_error_throttle(&slot.throttles, account_id, error);
+                    crate::recovery::observe_failure_throttles(&slot.throttles, account_id, error);
                 };
                 let result = tokio::select! {
                     () = slot.shutdown.cancelled() => { first_error.get_or_insert(Error::ShuttingDown); None },
@@ -805,9 +805,8 @@ impl SyncEngine {
                                 blocked_by_engine = true;
                             }
                             if let Some(error) = error {
-                                // Classification also records the primary hold; max deadlines make
-                                // that duplicate harmless. This call observes siblings and cleanup too.
-                                record_error_throttle(&slot.throttles, account_id, &error);
+                                // Classification records every failed leg once, including
+                                // uncertain outcomes; timing here gates only read-back.
                                 let delay = if matches!(
                                     outcomes.get(&item_id),
                                     Some(MutationBucket::PendingReadback(_))
@@ -855,8 +854,11 @@ impl SyncEngine {
                                 },
                             );
                         }
-                        record_error_throttle(&slot.throttles, account_id, &original);
-                        match plan_recovery(err) {
+                        match crate::recovery::dispatch_stream_failure(
+                            err,
+                            &slot.throttles,
+                            account_id,
+                        ) {
                             RecoveryPlan::Retry(advice) => {
                                 if matches!(
                                     advice.disposition,
@@ -1285,26 +1287,6 @@ fn campaign_keys(
     keys
 }
 
-/// Record the throttle hold any retryable or reconcilable error carries,
-/// whatever lane observed it.
-pub(super) fn record_error_throttle(
-    throttles: &std::sync::Mutex<crate::recovery::ThrottleBucket>,
-    account_id: &AccountId,
-    error: &AccountError,
-) {
-    for (source, recovery) in error.throttle_observations() {
-        match recovery {
-            bifrost_types::RecoveryClass::Retry(advice) => {
-                crate::recovery::record_throttle(throttles, account_id, advice, source);
-            }
-            bifrost_types::RecoveryClass::Reconcile(advice) => {
-                crate::recovery::record_reconcile_throttle(throttles, account_id, advice, source);
-            }
-            _ => {}
-        }
-    }
-}
-
 /// What a valid unsatisfied observation of a read-back id may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReadbackOrigin {
@@ -1521,7 +1503,7 @@ pub(super) fn classify_item_outcome(
     // back-to-back resubmissions against a provider that just said no.
     item_retry_advice: &mut Option<RetryAdvice>,
 ) -> Option<(EngineDirective, AccountError)> {
-    use crate::recovery::{RecoveryPlan, plan_recovery};
+    use crate::recovery::RecoveryPlan;
     match item {
         ItemOutcome::Succeeded(success) => {
             let id = bifrost_types::ObjectId(success.item.0);
@@ -1546,13 +1528,12 @@ pub(super) fn classify_item_outcome(
         ItemOutcome::Failed(failure) => {
             let id = bifrost_types::ObjectId(failure.item.0);
             let original = failure.error.clone();
-            match plan_recovery(failure.error) {
+            match crate::recovery::dispatch_stream_failure(failure.error, throttles, account_id) {
                 RecoveryPlan::Retry(advice) => {
                     // A per-item 429 (Graph files them per `$batch`
                     // subresponse) carries the same shared deadline a
                     // stream-level one would; record it so polls and
                     // sibling accounts observe it too.
-                    crate::recovery::record_throttle(throttles, account_id, &advice, &original);
                     match advice.disposition {
                         bifrost_types::RetryDisposition::AfterStateRefresh => {
                             outcomes.insert(
@@ -1581,9 +1562,6 @@ pub(super) fn classify_item_outcome(
                     }
                 }
                 RecoveryPlan::Reconcile(advice) => {
-                    crate::recovery::record_reconcile_throttle(
-                        throttles, account_id, &advice, &original,
-                    );
                     for action in &advice.guidance.actions {
                         if matches!(action, ReconcileAction::DedupeByClientId) {
                             *dedupe_count = dedupe_count.saturating_add(1);
@@ -1611,6 +1589,7 @@ pub(super) fn classify_item_outcome(
             }
         }
         ItemOutcome::Uncertain(uncertain) => {
+            crate::recovery::observe_failure_throttles(throttles, account_id, &uncertain.error);
             let id = bifrost_types::ObjectId(uncertain.item.0);
             outcomes.insert(
                 id,
@@ -2131,7 +2110,7 @@ mod partial_commit_throttle_tests {
         builder.try_build().unwrap()
     }
     #[tokio::test(start_paused = true)]
-    async fn record_error_throttle_holds_each_leg_under_its_own_scope() {
+    async fn observe_failure_throttles_holds_each_leg_under_its_own_scope() {
         let mut record = PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
         let id = record.committed(
             StepEffect::Created,
@@ -2163,7 +2142,7 @@ mod partial_commit_throttle_tests {
         assert!(error.recovery().is_terminal());
         let bucket = std::sync::Mutex::new(crate::recovery::ThrottleBucket::default());
         let account = AccountId("account".into());
-        record_error_throttle(&bucket, &account, &error);
+        crate::recovery::observe_failure_throttles(&bucket, &account, &error);
         let bucket = bucket.lock().unwrap();
         let now = tokio::time::Instant::now();
         assert_eq!(

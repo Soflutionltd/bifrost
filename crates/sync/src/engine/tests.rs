@@ -3839,11 +3839,16 @@ async fn a_failed_account_clear_keeps_reattach_ownership() {
     let (account, _, tx, writer) = writer_harness_over(store);
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"provisional"))
+        .reattach_insert(
+            crate::engine::ReattachAttempt::for_test(7),
+            change_cursor(b"provisional"),
+        )
         .await
         .expect("insert");
     assert!(handle.reset_account_for_schema_recovery().await.is_err());
-    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
+    handle
+        .reattach_abort(crate::engine::ReattachAttempt::for_test(7))
+        .await;
     assert!(
         inner
             .get_change_cursor(&account, &email_scope())
@@ -3865,7 +3870,10 @@ async fn failed_scope_reset_ownership_case(fail_ledger: bool, transfer: bool) {
         writer_harness_over(Arc::clone(&store) as Arc<DynCheckpointStore>);
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"provisional"))
+        .reattach_insert(
+            crate::engine::ReattachAttempt::for_test(7),
+            change_cursor(b"provisional"),
+        )
         .await
         .expect("insert");
     store
@@ -3900,7 +3908,9 @@ async fn failed_scope_reset_ownership_case(fail_ledger: bool, transfer: bool) {
         .fail_delete
         .store(false, std::sync::atomic::Ordering::SeqCst);
     store.release.add_permits(2);
-    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
+    handle
+        .reattach_abort(crate::engine::ReattachAttempt::for_test(7))
+        .await;
     if transfer {
         assert!(
             inner
@@ -3910,7 +3920,9 @@ async fn failed_scope_reset_ownership_case(fail_ledger: bool, transfer: bool) {
                 .is_some(),
             "the stale abort must respect the resuming attempt's claim"
         );
-        handle.reattach_abort(crate::engine::ReattachAttempt::for_test(8)).await;
+        handle
+            .reattach_abort(crate::engine::ReattachAttempt::for_test(8))
+            .await;
     }
     assert!(
         inner
@@ -3949,7 +3961,10 @@ async fn a_failed_scope_reset_backfill_delete_preserves_reattach_ownership() {
     let (account, _, tx, writer) = writer_harness_over(store);
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"provisional"))
+        .reattach_insert(
+            crate::engine::ReattachAttempt::for_test(7),
+            change_cursor(b"provisional"),
+        )
         .await
         .expect("insert");
     assert!(
@@ -3965,7 +3980,9 @@ async fn a_failed_scope_reset_backfill_delete_preserves_reattach_ownership() {
             .expect("read")
             .is_some()
     );
-    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
+    handle
+        .reattach_abort(crate::engine::ReattachAttempt::for_test(7))
+        .await;
     assert!(
         inner
             .get_change_cursor(&account, &email_scope())
@@ -3985,7 +4002,10 @@ async fn a_successful_scope_reset_releases_ownership_before_reestablishment() {
     let (account, store, _, tx, writer) = writer_harness();
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"provisional"))
+        .reattach_insert(
+            crate::engine::ReattachAttempt::for_test(7),
+            change_cursor(b"provisional"),
+        )
         .await
         .expect("insert");
     handle
@@ -4000,7 +4020,9 @@ async fn a_successful_scope_reset_releases_ownership_before_reestablishment() {
     .await
     .expect("writer alive");
     wait.await.expect("answered").expect("persisted");
-    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
+    handle
+        .reattach_abort(crate::engine::ReattachAttempt::for_test(7))
+        .await;
     assert_eq!(
         store
             .get_change_cursor(&account, &email_scope())
@@ -4208,13 +4230,18 @@ async fn failed_rollback_ownership_case(transfer: bool) {
         writer_harness_over(Arc::clone(&store) as Arc<DynCheckpointStore>);
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"provisional"))
+        .reattach_insert(
+            crate::engine::ReattachAttempt::for_test(7),
+            change_cursor(b"provisional"),
+        )
         .await
         .expect("insert");
     store
         .fail_delete
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
+    handle
+        .reattach_abort(crate::engine::ReattachAttempt::for_test(7))
+        .await;
     assert!(
         inner
             .get_change_cursor(&account, &email_scope())
@@ -4237,7 +4264,9 @@ async fn failed_rollback_ownership_case(transfer: bool) {
         .fail_delete
         .store(false, std::sync::atomic::Ordering::SeqCst);
     store.release.add_permits(2);
-    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
+    handle
+        .reattach_abort(crate::engine::ReattachAttempt::for_test(7))
+        .await;
     if transfer {
         assert!(
             inner
@@ -4246,7 +4275,9 @@ async fn failed_rollback_ownership_case(transfer: bool) {
                 .expect("read")
                 .is_some()
         );
-        handle.reattach_abort(crate::engine::ReattachAttempt::for_test(8)).await;
+        handle
+            .reattach_abort(crate::engine::ReattachAttempt::for_test(8))
+            .await;
     }
     assert!(
         inner
@@ -4289,13 +4320,18 @@ async fn an_already_persisted_change_ack_promotes_a_provisional_row() {
         .expect("first ack");
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"acked"))
+        .reattach_insert(
+            crate::engine::ReattachAttempt::for_test(7),
+            change_cursor(b"acked"),
+        )
         .await
         .expect("insert");
     ack(&tx, checkpoint, Some(publication))
         .await
         .expect("duplicate ack");
-    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
+    handle
+        .reattach_abort(crate::engine::ReattachAttempt::for_test(7))
+        .await;
     assert_eq!(
         store
             .get_change_cursor(&account, &email_scope())
@@ -4360,7 +4396,9 @@ async fn departed_writer_is_shutdown_for_reads_and_writes() {
         Err(Error::ShuttingDown)
     ));
     assert!(matches!(
-        writer.reattach_commit(crate::engine::ReattachAttempt::for_test(0)).await,
+        writer
+            .reattach_commit(crate::engine::ReattachAttempt::for_test(0))
+            .await,
         Err(Error::ShuttingDown)
     ));
 }

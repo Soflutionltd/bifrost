@@ -303,7 +303,7 @@ async fn run_inventory(
     // with authoritative replacement on each poll and generation-scoped
     // object handles, before this site can stop minting UID cursors safely.
     let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
-    let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
+    let include_modseq = selected.mailbox.modseq().is_some();
     let mut attrs = inventory_attrs(include_modseq);
     super::hydration::push_native_thread_attrs(&mut attrs, &conn.connection().server_profile());
     let all_uids = UidSet::all();

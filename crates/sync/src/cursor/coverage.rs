@@ -785,7 +785,30 @@ impl PendingCoverage {
     /// never PROVES coverage: a newer partial walk is still partial, which is
     /// why discharge requires a covering domain as well.
     pub fn next_generation(&self) -> WalkGeneration {
-        WalkGeneration(self.next_generation.fetch_add(1, Ordering::Relaxed))
+        let generation = self
+            .next_generation
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .expect("coverage proof generation exhausted");
+        WalkGeneration(generation)
+    }
+
+    /// Restore proof order before any producer can observe this coverage owner.
+    /// The account lifecycle guard excludes an old writer during this load.
+    /// A mail user expects the first covering walk after restart to settle old
+    /// debt, regardless of how many walks the previous attachment performed.
+    pub(crate) fn from_durable_ledger(ledger: &super::DebtLedger) -> Self {
+        let coverage = Self::new();
+        coverage.next_generation.store(
+            ledger
+                .latest_generation()
+                .0
+                .checked_add(1)
+                .expect("coverage proof generation exhausted"),
+            Ordering::Relaxed,
+        );
+        coverage
     }
 
     fn guard(&self) -> std::sync::MutexGuard<'_, Ledger> {
@@ -2234,6 +2257,34 @@ mod tests {
 
     fn scope() -> CursorScope {
         CursorScope::Type(ObjectType::Email)
+    }
+
+    #[test]
+    fn restored_proof_order_exceeds_durable_debt_and_cannot_regress() {
+        let mut ledger = crate::cursor::DebtLedger::new();
+        let newer = crate::cursor::WalkGeneration::for_test(900);
+        ledger.ingest(&degraded("owed"), newer, 1);
+        ledger.ingest(
+            &degraded("owed"),
+            crate::cursor::WalkGeneration::for_test(2),
+            2,
+        );
+        assert_eq!(ledger.latest_generation(), newer);
+        let bytes = crate::cursor::encode_ledger(&ledger);
+        let mut restored = crate::cursor::decode_ledger(&bytes).expect("restore debt");
+        let coverage = PendingCoverage::from_durable_ledger(&restored);
+        let first = coverage.next_generation();
+        assert!(first > newer);
+        assert!(coverage.next_generation() > first);
+        restored.ingest(
+            &InventoryCoverageReport {
+                domain: CoverageDomain::full(scope()),
+                outcome: bifrost_types::CoverageOutcome::Complete,
+            },
+            first,
+            3,
+        );
+        assert!(restored.completion_permitted(&scope()));
     }
 
     #[test]

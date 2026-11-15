@@ -449,9 +449,9 @@ impl FolderEntry {
         modseq: u64,
     ) -> Result<(), crate::Error> {
         if uidvalidity == 0 {
-            // The response-code decoder tolerates UIDVALIDITY 0 from some
-            // servers. It is not a usable cache epoch, so do not cache it or
-            // turn that tolerated response into a sync failure.
+            // SELECT completion rejects zero epochs before account reads.
+            // Keep this cache boundary defensive for directly supplied values;
+            // raw decoder tolerance does not make zero a usable identity.
             return Ok(());
         }
         debug_assert_ne!(uid, 0, "MODSEQ cache update needs UID");
@@ -579,10 +579,7 @@ pub(crate) fn shared_overrides_personal(name: &str, namespace_prefix: &str) -> b
 ///
 /// Pure so the delimiter rule is unit-pinnable without a live server.
 pub(crate) fn leaf_name(name: &str, delimiter: Option<char>) -> &str {
-    match delimiter {
-        Some(delimiter) => name.rsplit_once(delimiter).map_or(name, |(_, leaf)| leaf),
-        None => name,
-    }
+    crate::types::mailbox::SpecialUse::leaf_name(name, delimiter)
 }
 
 /// Whether a folder may be SELECTed, given LIST's own selectability
@@ -616,22 +613,21 @@ pub(crate) struct FolderRegistry {
     by_name: RwLock<HashMap<MailboxName, Arc<FolderEntry>>>,
 }
 
-fn folder_role_from_attributes(attributes: &[MailboxAttribute]) -> Option<FolderRole> {
-    for attr in attributes {
-        match attr {
-            MailboxAttribute::Sent => return Some(FolderRole::Sent),
-            MailboxAttribute::Drafts => return Some(FolderRole::Drafts),
-            MailboxAttribute::Archive => return Some(FolderRole::Archive),
-            MailboxAttribute::Trash => return Some(FolderRole::Trash),
-            MailboxAttribute::Junk => return Some(FolderRole::Spam),
-            MailboxAttribute::Custom(value) if value.eq_ignore_ascii_case("\\Inbox") => {
-                // A nested or localized name is not the protocol INBOX.
-                continue;
-            }
-            _ => {}
-        }
+fn role_from_special_use(role: crate::types::mailbox::SpecialUse) -> Option<FolderRole> {
+    use crate::types::mailbox::SpecialUse;
+    match role {
+        SpecialUse::Inbox => Some(FolderRole::Inbox),
+        SpecialUse::Sent => Some(FolderRole::Sent),
+        SpecialUse::Drafts => Some(FolderRole::Drafts),
+        SpecialUse::Archive => Some(FolderRole::Archive),
+        SpecialUse::Trash => Some(FolderRole::Trash),
+        SpecialUse::Junk => Some(FolderRole::Spam),
+        SpecialUse::All | SpecialUse::Flagged | SpecialUse::Important => None,
     }
-    None
+}
+
+fn folder_role_from_attributes(attributes: &[MailboxAttribute]) -> Option<FolderRole> {
+    crate::types::mailbox::SpecialUse::from_attributes(attributes).and_then(role_from_special_use)
 }
 
 pub(crate) fn folder_role(
@@ -639,23 +635,10 @@ pub(crate) fn folder_role(
     name: &str,
     delimiter: Option<char>,
 ) -> Option<FolderRole> {
-    if name.eq_ignore_ascii_case("INBOX") {
-        return Some(FolderRole::Inbox);
-    }
-    if let Some(role) = folder_role_from_attributes(attributes) {
-        return Some(role);
-    }
-    // Only the top-level INBOX is the account inbox; nested names are ordinary folders.
-    let lower = super::folder_registry::leaf_name(name, delimiter).to_ascii_lowercase();
-    match lower.as_str() {
-        "inbox" => None,
-        "sent" | "sent mail" | "sent messages" => Some(FolderRole::Sent),
-        "draft" | "drafts" => Some(FolderRole::Drafts),
-        "archive" | "archives" => Some(FolderRole::Archive),
-        "trash" | "deleted" | "deleted messages" => Some(FolderRole::Trash),
-        "junk" | "spam" | "junk mail" => Some(FolderRole::Spam),
-        _ => None,
-    }
+    // Recognized attributes without a unified role still suppress name fallback:
+    // a server's All mailbox named Sent must not receive enterprise Sent copies.
+    crate::types::mailbox::SpecialUse::classify(attributes, name, delimiter)
+        .and_then(role_from_special_use)
 }
 
 // Enterprise users expect Sent copies and Trash moves to stay in their own mailbox.
@@ -913,6 +896,24 @@ impl FolderRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn account_roles_use_protocol_aliases_and_attribute_authority() {
+        for (name, role) in [
+            ("Sent Items", FolderRole::Sent),
+            ("Sent Mail", FolderRole::Sent),
+            ("Deleted Items", FolderRole::Trash),
+            ("Junk E-mail", FolderRole::Spam),
+            ("Junk Mail", FolderRole::Spam),
+        ] {
+            assert_eq!(folder_role(&[], name, None), Some(role));
+        }
+        assert_eq!(folder_role(&[MailboxAttribute::All], "Sent", None), None);
+        assert_eq!(
+            folder_role(&[MailboxAttribute::Flagged], "Trash", None),
+            None
+        );
+    }
+
     #[test]
     fn registry_keeps_distinct_wire_addresses_with_the_same_display() {
         let a = MailboxName::from_wire("a".into(), b"&AGE-", false);

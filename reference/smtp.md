@@ -1203,3 +1203,11 @@ recipient's `Response`; `Ok` means the exchange completed and may contain only
 negative statuses. Neither contract is removed or silently reinterpreted.
 Message-submission consumers should use the batch APIs and `submission_status`
 for the shared committed-message rule, retaining all lanes on their receipt.
+
+Shared SMTP wire causes retain enhanced status components as
+`EnhancedStatusCode::components: Option<(u8, u16, u16)>` (class, subject,
+detail). Machine consumers need no consent-tier text parsing. The constructor
+also derives the existing dotted diagnostic spelling from those components.
+Fallback prose hints live in `RATE_HINTS`, `QUOTA_HINTS` and `POLICY_HINTS` in
+the account translator; they preserve first-line ASCII-insensitive substring
+matching and apply only after recognized enhanced codes have been considered.

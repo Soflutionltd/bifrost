@@ -530,19 +530,25 @@ fn selected_mailbox_highest_modseq_zero_is_treated_as_nomodseq() {
         &tagged(None),
         false,
     );
-    assert_eq!(zero.highest_mod_seq, None);
-    assert!(zero.no_mod_seq);
+    assert_eq!(zero.modseq().map(crate::types::ModSeq::get), None);
+    assert!(matches!(
+        zero.modseq_support,
+        crate::types::mailbox::ModSeqSupport::NoModSeq
+    ));
 
     let real = build_selected_mailbox(
         &[ok_code(ResponseCode::HighestModSeq(77))],
         &tagged(None),
         false,
     );
-    assert_eq!(real.highest_mod_seq, Some(77));
-    assert!(!real.no_mod_seq);
+    assert_eq!(real.modseq().map(crate::types::ModSeq::get), Some(77));
+    assert!(real.modseq().is_some());
 
     let none = build_selected_mailbox(&[ok_code(ResponseCode::NoModSeq)], &tagged(None), false);
-    assert!(none.no_mod_seq);
+    assert!(matches!(
+        none.modseq_support,
+        crate::types::mailbox::ModSeqSupport::NoModSeq
+    ));
 }
 
 #[test]
@@ -3436,4 +3442,42 @@ async fn local_driver_queries_bound_admission_and_reply() {
             );
         }
     }
+}
+
+#[test]
+fn selected_mailbox_modseq_denial_wins_in_both_orders() {
+    for denial in [ResponseCode::NoModSeq, ResponseCode::HighestModSeq(0)] {
+        for codes in [
+            vec![ResponseCode::HighestModSeq(77), denial.clone()],
+            vec![denial.clone(), ResponseCode::HighestModSeq(77)],
+        ] {
+            let responses: Vec<_> = codes.into_iter().map(ok_code).collect();
+            let mailbox = build_selected_mailbox(&responses, &tagged(None), false);
+            assert_eq!(mailbox.modseq(), None);
+            assert!(matches!(
+                mailbox.modseq_support,
+                crate::types::mailbox::ModSeqSupport::NoModSeq
+            ));
+        }
+        let mailbox = build_selected_mailbox(
+            &[ok_code(ResponseCode::HighestModSeq(77))],
+            &tagged(Some(denial)),
+            false,
+        );
+        assert_eq!(mailbox.modseq(), None);
+    }
+}
+
+#[test]
+fn selected_mailbox_zero_identity_values_are_absent() {
+    let mailbox = build_selected_mailbox(
+        &[
+            ok_code(ResponseCode::UidValidity(0)),
+            ok_code(ResponseCode::UidNext(0)),
+        ],
+        &tagged(None),
+        false,
+    );
+    assert_eq!(mailbox.uid_validity, None);
+    assert_eq!(mailbox.uid_next, None);
 }

@@ -330,7 +330,7 @@ pub(crate) fn to_types_state(state: SmtpTransmissionState) -> TransmissionState 
 pub(crate) fn smtp_wire_cause(response: &Response) -> TypesEnhancedStatusCode {
     let enhanced = response
         .enhanced_status_code()
-        .map(|code| DiagnosticText::support_only(code.to_string()));
+        .map(|code| (code.class, code.subject, code.detail));
     let text = response
         .message()
         .next()
@@ -590,9 +590,7 @@ fn classify_enhanced(
         (_, 7, 30) => Some(policy_blocked()),
         // X.7 fallback by class
         (4, 7, _) => {
-            let text = response.message().next().unwrap_or("").to_ascii_lowercase();
-            let throttled =
-                text.contains("rate") || text.contains("limit") || text.contains("throttle");
+            let throttled = reply_mentions(response, RATE_HINTS);
             Some(if throttled {
                 (
                     AccountErrorKind::Server(ServerErrorKind::RateLimited),
@@ -608,6 +606,18 @@ fn classify_enhanced(
         (5, 7, _) => Some(policy_blocked()),
         _ => None,
     }
+}
+
+// These are fallback hints only: a recognized enhanced code wins first.
+// Keep the first-line, ASCII-insensitive substring policy explicit so changing
+// a hint does not silently change the other reply classes.
+const RATE_HINTS: &[&str] = &["rate", "limit", "throttle"];
+const QUOTA_HINTS: &[&str] = &["mailbox", "storage", "quota"];
+const POLICY_HINTS: &[&str] = &["policy", "security"];
+
+fn reply_mentions(response: &Response, hints: &[&str]) -> bool {
+    let text = response.message().next().unwrap_or("").to_ascii_lowercase();
+    hints.iter().any(|hint| text.contains(hint))
 }
 
 fn classify_status(
@@ -667,8 +677,7 @@ fn classify_status(
             }),
         ),
         552 => {
-            let text = response.message().next().unwrap_or("").to_ascii_lowercase();
-            if text.contains("mailbox") || text.contains("storage") || text.contains("quota") {
+            if reply_mentions(response, QUOTA_HINTS) {
                 (
                     AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
                     Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
@@ -679,8 +688,7 @@ fn classify_status(
         }
         553 => malformed(response),
         554 => {
-            let text = response.message().next().unwrap_or("").to_ascii_lowercase();
-            if text.contains("policy") || text.contains("security") {
+            if reply_mentions(response, POLICY_HINTS) {
                 policy_blocked()
             } else {
                 server_error(554)
@@ -1575,6 +1583,8 @@ mod tests {
             ),
             vec!["5.1.1 user unknown".to_owned()],
         );
+        let wire = smtp_wire_cause(&resp);
+        assert_eq!(wire.components, Some((5, 1, 1)));
         let err = smtp_error::status(resp);
         let account = into_account_error(err, ctx_smtp_send());
         // The chain must contain a WireCause::Smtp with the right pieces. We

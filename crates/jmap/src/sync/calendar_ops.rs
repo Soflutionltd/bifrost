@@ -107,10 +107,12 @@ pub(crate) fn events_in_range<T: HttpTransport>(
             AccountOperation::EventsInRange,
         )
         .await?;
+        // The query selected matching occurrences but returns master ids.
+        // Retain that decision when recurrence or timezone needs server context.
         let events = hydrated
             .events
             .into_iter()
-            .filter(|event| event_in_range(event, &range.start, &range.end))
+            .filter(|event| range.admits(event))
             .collect::<Vec<_>>();
         Ok(Page {
             truncated: false,
@@ -1856,47 +1858,16 @@ fn jmap_utc_filter_time(time: &EventTime, field: &'static str) -> Result<String,
     Ok(wall.strftime("%Y-%m-%dT%H:%M:%S").to_string())
 }
 
+#[cfg(test)]
 fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> bool {
-    if start.value.is_empty() || end.value.is_empty() {
-        return true;
+    EventRange {
+        calendar_id: event.calendar_id.clone(),
+        start: start.clone(),
+        end: end.clone(),
+        page_cursor: None,
+        limit: None,
     }
-    let Some((range_start, range_end)) = time_interval(start, Some(end), false) else {
-        return true;
-    };
-    let Some((event_start, event_end)) =
-        time_interval(&event.start, event.end.as_ref(), event.is_all_day)
-    else {
-        return true;
-    };
-    // Both the query window and event interval use exclusive ends. An event
-    // ending exactly at the window start, or starting exactly at its end,
-    // does not overlap the window.
-    event_start < range_end && event_end > range_start
-}
-
-fn time_interval(
-    start: &EventTime,
-    end: Option<&EventTime>,
-    is_all_day: bool,
-) -> Option<(Timestamp, Timestamp)> {
-    let start = comparable_time(start, is_all_day)?;
-    let end = end
-        .and_then(|end| comparable_time(end, is_all_day))
-        .unwrap_or(start);
-    Some((start, end))
-}
-
-fn comparable_time(time: &EventTime, is_all_day: bool) -> Option<Timestamp> {
-    if is_all_day || time.value.len() == 10 {
-        let date = civil::Date::strptime("%Y-%m-%d", &time.value).ok()?;
-        return Offset::UTC
-            .to_timestamp(date.to_datetime(civil::Time::MIN))
-            .ok();
-    }
-    time.value
-        .parse::<Timestamp>()
-        .ok()
-        .or_else(|| local_datetime(&time.value))
+    .admits(event)
 }
 
 /// Render an instant for the shared `EventTime` layer, which spells the

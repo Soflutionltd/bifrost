@@ -67,10 +67,8 @@ impl Serialize for RawMethodCall {
 /// Three states, kept apart deliberately. Only the third is a bound this
 /// request may enforce; collapsing the first two into "the limit is zero"
 /// turns a malformed or capability-shifted session into a request that
-/// can never contain a single method call. That matters because account
-/// opening issues probe requests *before* `sync::capabilities::build`
-/// validates the session, so an enforced zero would fail the open as a
-/// client bug and the session would never reach the classification -
+/// can never contain a single method call. Account opening validates before probes;
+/// direct protocol requests still need to preserve the classification -
 /// `CapabilityChanged` for an absent core capability,
 /// `Protocol(ContractViolation)` for a zero-valued one - that tells the
 /// engine how to recover. Not enforcing here loses nothing: the

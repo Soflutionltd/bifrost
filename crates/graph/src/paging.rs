@@ -6,13 +6,9 @@
 //! response - spins the walk forever while the accumulating `Vec` grows without
 //! limit. Six such loops existed here with no bound of any kind.
 //!
-//! `PageWalk` is the shared guard. It is deliberately ONE type rather than a
-//! copy of the check at each site: the same class of defect was fixed
-//! independently in `bifrost-google`'s `calendars_list`, and the lesson there is
-//! that both halves are needed. A repeated-link check alone does not stop a
-//! server handing out a FRESH link every page, and a budget alone lets a tight
-//! two-link cycle burn the whole budget on requests. Only the pair bounds both
-//! shapes.
+//! `PageWalk` adapts bifrost-net's shared pagination admission to Graph URLs
+//! and errors. Both repeated-link detection and a finite page budget are needed:
+//! a repeat catches cycles, while the budget also bounds endless fresh links.
 //!
 //! The two refusals blame different parties, so they travel as different
 //! errors, and neither is a parse failure (every page parsed):
@@ -69,16 +65,23 @@ impl PageWalk {
     /// Admit one page URL, or refuse the walk. Keyed on the admitted URL's
     /// serialization, so two spellings of one link count as a repeat.
     pub(crate) fn enter(&mut self, url: &AdmittedUrl) -> Result<(), GraphError> {
-        self.pages += 1;
-        if self.pages > MAX_PAGES {
-            return Err(GraphError::LimitExceeded {
-                message: format!("Graph {} pagination exceeded {MAX_PAGES} pages", self.what),
-            });
-        }
-        if !self.seen.insert(url.as_str().to_string()) {
-            return Err(GraphError::ContractViolation {
-                message: format!("Graph {} pagination repeated a page link", self.what),
-            });
+        match bifrost_net::pagination::check_next(
+            &mut self.seen,
+            self.pages,
+            MAX_PAGES,
+            Some(url.as_str().to_string()),
+        ) {
+            Ok(()) => self.pages += 1,
+            Err(bifrost_net::pagination::PageRefusal::Repeated) => {
+                return Err(GraphError::ContractViolation {
+                    message: format!("Graph {} pagination repeated a page link", self.what),
+                });
+            }
+            Err(_) => {
+                return Err(GraphError::LimitExceeded {
+                    message: format!("Graph {} pagination exceeded {MAX_PAGES} pages", self.what),
+                });
+            }
         }
         Ok(())
     }
@@ -306,12 +309,9 @@ mod tests {
         }
     }
 
-    /// Budget exhaustion wins over a repeat on the same call: the page past
-    /// the budget is refused as the limit even when its link also repeats,
-    /// so the classification does not depend on which link the server
-    /// happened to hand out last.
+    /// A proven provider cycle is more specific than the local budget limit.
     #[test]
-    fn the_budget_is_checked_before_the_repeat() {
+    fn the_repeat_is_checked_before_the_budget() {
         let mut walk = PageWalk::new("c");
         for page in 0..MAX_PAGES {
             walk.enter(&url(&format!("https://graph.test/c?page={page}")))
@@ -321,7 +321,7 @@ mod tests {
             .enter(&url("https://graph.test/c?page=0"))
             .expect_err("past the budget");
         assert!(
-            matches!(error, GraphError::LimitExceeded { .. }),
+            matches!(error, GraphError::ContractViolation { .. }),
             "{error:?}"
         );
     }

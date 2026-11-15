@@ -42,6 +42,9 @@ impl ImapAttempt {
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum Error {
+    /// Token lookup failed locally; preserve net recovery and endpoint evidence.
+    #[error("OAuth token lookup failed: {0}")]
+    OAuthToken(#[source] Arc<bifrost_types::AccountError>),
     #[error("MOVE fallback incomplete after COPY: {source}")]
     MoveFallbackIncomplete {
         copy: Box<crate::types::CopyResult>,
@@ -324,6 +327,7 @@ impl From<crate::types::ValidationError> for Error {
 impl PartialEq for Error {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::OAuthToken(a), Self::OAuthToken(b)) => Arc::ptr_eq(a, b),
             (
                 Self::MoveFallbackIncomplete {
                     copy: a,

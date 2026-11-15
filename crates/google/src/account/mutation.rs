@@ -412,11 +412,7 @@ fn mutation_stream(
 /// unnecessary refresh.
 fn has_unresolved_label_id(patch: &LabelPatch, labels: &[crate::types::GmailLabel]) -> bool {
     patch.unsupported_flags.iter().any(|flag| {
-        let Some(id) = flag
-            .strip_prefix("$gmail-label:")
-            .and_then(|rest| rest.split_once(':').map(|(id, _)| id))
-            .filter(|id| !id.is_empty())
-        else {
+        let flags::GmailFlag::Label { id, .. } = flags::GmailFlag::parse(flag) else {
             return false;
         };
         !labels.iter().any(|label| label.id == id)
@@ -1704,7 +1700,7 @@ mod tests {
             .map(|n| crate::types::GmailLabel {
                 id: format!("Label_{n}"),
                 name: format!("Name {n}"),
-                label_type: Some("user".to_string()),
+                label_type: Some(crate::types::GmailLabelType::User),
                 color: None,
             })
             .collect::<Vec<_>>();
@@ -1770,7 +1766,7 @@ mod tests {
             .map(|n| crate::types::GmailLabel {
                 id: format!("Label_{n}"),
                 name: format!("Name {n}"),
-                label_type: Some("user".to_string()),
+                label_type: Some(crate::types::GmailLabelType::User),
                 color: None,
             })
             .collect::<Vec<_>>();
@@ -1826,7 +1822,7 @@ mod tests {
             .map(|n| crate::types::GmailLabel {
                 id: format!("Label_{n}"),
                 name: format!("Name {n}"),
-                label_type: Some("user".to_string()),
+                label_type: Some(crate::types::GmailLabelType::User),
                 color: None,
             })
             .collect::<Vec<_>>();
@@ -1859,7 +1855,7 @@ mod tests {
         let labels = vec![crate::types::GmailLabel {
             id: "SENT".to_string(),
             name: "SENT".to_string(),
-            label_type: Some("system".to_string()),
+            label_type: Some(crate::types::GmailLabelType::System),
             color: None,
         }];
         let flags = set(&["\\Seen", "\\Draft", "$gmail-label:SENT:SENT"]);

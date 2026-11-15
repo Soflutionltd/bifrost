@@ -163,7 +163,8 @@ every request unable to hold a single call - and any caller probing such a
 session would then see `Request(Malformed)` /
 `ClientBug`, preempting the classifications the engine actually needs:
 `SyncState(CapabilityChanged)` / `RestartAccount` for an absent core capability,
-`Protocol(ContractViolation)` for a zero-valued one. Capability validation is
+`Protocol(ContractViolation)` for a zero-valued one. Account opening validates the session before seeding or foreign probes.
+Direct protocol requests can still precede account validation, which is
 the gate for both bad sessions; the request builder enforces only a limit the
 server actually advertised.
 
@@ -493,7 +494,13 @@ Every JMAP object type under `crates/jmap/src/<type>/`:
 
 Date setters on `EmailCreate` (`sent_at`, `received_at`) and `EmailImport` (`received_at`) take a `jiff::Timestamp`, never an `i64`: the integer form went through `from_timestamp`, which turns an out-of-range value into the Unix epoch and so silently sends a 1970 date. `from_timestamp` remains only for older integer-taking builders.
 
-**JSON map backing** (CalendarEvent, ContactCard): `serde_json::Map` via `json_object_struct!` macro. Property enum has `Other(String)`. Extension properties preserved on round-trip.
+**JSON map backing** (CalendarEvent, ContactCard): `serde_json::Map` via `json_object_struct!` macro. Property enums use `core::method::define_open_property_enum!` to derive
+`as_str`, `Display`, serde and `From<&str>` from one wire-name table, retaining
+unknown names as `Other(String)`. Extension properties are preserved on round-trip.
+Email keeps its own `email_properties!` table because header selections carry
+a parsed `Header` alongside fixed properties and unknown extensions. Macro
+contract tests cover closed and open wire handling without duplicating each
+object's vocabulary; the two JSON-backed objects retain extension round-trip tests.
 
 ## Key types
 
@@ -649,7 +656,7 @@ Per-RFC features: `mail`, `calendars`, `contacts`, `blob`, `quota`. Each gates:
 - Test modules.
 
 The Account layer under `crates/jmap/src/sync/` wires optional PIM capabilities at open. `contacts.rs` maps AddressBook/ContactCard methods onto the shared contact primitives (incl. JSContact postal addresses); `calendar_ops.rs` maps Calendar/CalendarEvent onto list/range/get/create/update/delete/RSVP/search. Create payloads stamp the mandatory top-level `@type` (`Card` / `Event`) and the `@type` on the nested RFC-defined objects (Name, EmailAddress, Phone, Organization, Title, Address, AddressComponent, Note; Participant, Location, RecurrenceRule, NDay). JSContact photo media is written with `kind: "photo"` (resource role, not a URI marker) so self-written photos read back; the read path filters on that kind.
-Range queries send a server-side `AND(inCalendar, after, before)` filter and reapply the local overlap predicate after hydration. Recurrence maps common RRULE fields to JSCalendar `recurrenceRules` and back; simple RDATE/EXDATE map through `recurrenceOverrides`. Unsupported outbound RRULE parts are rejected before Set construction, and the payload builders reject a failed conversion again on their own - a rule that does not convert is an error, never a cleared or omitted recurrence - so the refusal does not depend on `validate_shared_recurrence` having run first. Modified overrides, multiple rules, excluded rules, and unrecognized inbound recurrence components return `Unsupported` rather than being silently discarded. A `recurrenceOverrides` entry projects only when it is a bare addition or a bare `excluded`; anything that patches the occurrence itself fails hydration instead of handing back the master event with the modified occurrence missing.
+Range queries send a server-side `AND(inCalendar, after, before)` filter and apply `EventRange::admits` after hydration. This shared conservative guard retains recurring masters, all-day dates and floating local times: the server matches occurrences with timezone context that a comparison of the master cannot reproduce. Queries keep master ids rather than requesting expanded occurrence ids. Recurrence maps common RRULE fields to JSCalendar `recurrenceRules` and back; simple RDATE/EXDATE map through `recurrenceOverrides`. Unsupported outbound RRULE parts are rejected before Set construction, and the payload builders reject a failed conversion again on their own - a rule that does not convert is an error, never a cleared or omitted recurrence - so the refusal does not depend on `validate_shared_recurrence` having run first. Modified overrides, multiple rules, excluded rules, and unrecognized inbound recurrence components return `Unsupported` rather than being silently discarded. A `recurrenceOverrides` entry projects only when it is a bare addition or a bare `excluded`; anything that patches the occurrence itself fails hydration instead of handing back the master event with the modified occurrence missing.
 Single-contact reads and raw single-event reads (including event update and
 RSVP pre-reads) correlate the requested id before projection. An explicit
 `notFound` maps to scoped `NotFound(Contact)` or `NotFound(Event)`; a response
@@ -1760,11 +1767,14 @@ false when the server omits the optional sharing right.
 
 ### Sync limit policy and lifecycle publication
 
-`sync/capabilities.rs` owns core object-limit decoding, the local set batch
-ceiling of 500, and the 100 ms batching wait. Capability advertisement and both
+`core/session.rs` owns core object-limit decoding (`CoreLimits`), required-field
+validation (`validated_core_limits`) and upload-size validation.
+`sync/capabilities.rs` maps the three protocol validation failures (absent,
+malformed and unusable) to account errors, and owns the local set batch
+ceiling of 500 and the 100 ms batching wait. Capability advertisement and both
 bulk mutation streams use the same set-size function; hydration uses the same
-wait constant. Bare protocol Account doors still read their own session through
-the capabilities helpers. Those handles do not carry the validated sync slot;
+wait constant. Bare protocol Account doors read their own session through the protocol-owned
+`Session::object_limits` accessor via the capabilities helpers. Those handles do not carry the validated sync slot;
 using the primary slot for a routed foreign handle would obscure that boundary.
 
 The primary lifecycle walk stores its positions and announced mailbox names in

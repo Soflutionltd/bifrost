@@ -1417,21 +1417,6 @@ response family), which also makes the CON-032 tables testable per row. The
 `capability_matrix` oracle is a test copy of production logic and should go once
 production is exhaustive.
 
-## STR-066 - IMAP modseq support is `Option<u64>` plus a contradicting `bool`
-
-**Reported by:** imap-connection.
-
-`SelectedMailbox` carries `highest_mod_seq: Option<u64>` and `no_mod_seq: bool`.
-They can contradict: `extract_selected_code` sets `no_mod_seq = true` on
-`HIGHESTMODSEQ 0` or `[NOMODSEQ]` without clearing a `highest_mod_seq` set by an
-earlier code in the same response set. "Does this mailbox carry modseqs" is then
-answered as `highest_mod_seq.is_some() && !no_mod_seq` at seven account sites
-(`mutate.rs`, `inventory.rs`, `get.rs`, `changes.rs` twice in inverted form,
-`mod.rs::cursor_from_select` twice). Target: `enum ModSeqSupport { Unknown,
-NoModSeq, Highest(ModSeq) }`, built once in `build_selected_mailbox`, read through
-`SelectedMailbox::modseq() -> Option<ModSeq>`; `HIGHESTMODSEQ 0` normalization
-becomes part of `ModSeq` construction (BUG-024).
-
 ## STR-068 - `connection/mod.rs` does seven jobs
 
 **Reported by:** imap-connection.
@@ -2035,23 +2020,6 @@ Proposal: a `GmailEndpoint { Profile, History, Watch, Stop, MessagesGet,
 BatchModify, .. }` minted by the `api.rs` method building the request, owning the
 unit cost, the concurrency class and the history-endpoint classification.
 
-## STR-125 - Gmail label ids and flag tokens need types
-
-**Reported by:** google.
-
-The label vocabulary disagreements are BUG-091. Proposal: a `GmailLabelId` parsing
-into `System(SystemLabel) | Category(..) | User(String)`, with `SystemLabel { Inbox,
-Sent, Draft, Trash, Spam, Unread, Starred, Important, Chat }` and methods
-`is_exclusive`, `is_writable`, `role`, `search_operator`, `flag`;
-`GmailLabel.label_type` an enum with an `Unknown` arm, decided once. And the
-`$gmail-label:<id>:<name>` flag encoding is produced in `canonical_flags_indexed` as
-a literal `format!` (not with `USER_LABEL_FLAG_PREFIX`) and in `patch_for_set` with
-the constant, and parsed in `flags::user_label_id_from_flag`,
-`flags::gmail_flag_target`, and `mutation::has_unresolved_label_id` (its own literal
-`"$gmail-label:"` plus an extra empty-id filter the others lack). A `GmailFlag` enum
-with `parse` and `Display` (`Seen`, `Flagged`, `Draft`, `Important`, `Label { id,
-advisory_name }`, `Unknown(String)`) replaces all four. Related: STR-004, STR-111.
-
 ## STR-129 - Google's mailbox watch registry is process-global
 
 **Reported by:** google.
@@ -2178,23 +2146,6 @@ internals, so the "private" framing will mislead if it ever becomes a public typ
 a published crate; and `strip_frame_delim` in `oauth.rs` silently rewrites a
 credential containing `\x01` rather than refusing it (to keep the builders
 infallible) - behind a fallible `SaslClient`, refusing is free and honest.
-
-## STR-136 - SMTP enhanced status codes are demoted to consent-tier prose at the boundary
-
-**Reported by:** smtp-sasl (a bifrost-types change; SMTP is its only producer).
-
-bifrost-smtp parses a typed `EnhancedStatusCode { class, subject, detail }`. At the
-account boundary `smtp_wire_cause` converts it to `bifrost_types::error::EnhancedStatusCode
-{ reply: u16, enhanced: Option<DiagnosticText>, text }`, and
-`response_to_account_error` sets `native_code` to the same dotted string. The
-structured, non-secret fact `5.1.1` reaches consumers only as support-only text
-behind the diagnostics consent tier, so a machine caller cannot branch on X.1.1 vs
-X.2.2 without parsing prose it may not be allowed to read. The type in bifrost-types
-should carry the three numbers. Lateral: `classify_status` / `classify_enhanced`
-sniff reply text for "rate", "limit", "throttle", "mailbox", "storage", "quota",
-"policy", "security" on 552, 554 and the 4.7.x fallback - reasonable heuristics, but
-the only classification in the crate driven by free-form server prose, deserving a
-named table rather than inline `contains` chains.
 
 ## STR-138 - Smaller SMTP axes and placement notes
 

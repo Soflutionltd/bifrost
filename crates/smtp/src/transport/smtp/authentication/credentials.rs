@@ -2,8 +2,6 @@
 
 use super::{Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS, Zeroizing};
 use crate::transport::smtp::error::{self, Error, SmtpCommandPhase};
-#[cfg(feature = "account-error")]
-use bifrost_net::NetErrorContext;
 use bifrost_net::auth::TokenSnapshot;
 use bifrost_net::{AccessToken, StaticTokenSource, TokenSource};
 use std::fmt::{self, Debug, Formatter};
@@ -218,15 +216,10 @@ pub(super) fn oauth_token_error(error: bifrost_net::Error) -> Error {
     let message = format!("failed to read OAuth access token: {error}");
     // A token endpoint throttle has no SMTP transaction scope to name.
     #[cfg(feature = "account-error")]
-    let account_error = bifrost_net::into_account_error_with_throttle_scope(
+    let account_error = bifrost_net::token_source_account_error(
         error,
-        NetErrorContext {
-            provider: None,
-            protocol: bifrost_types::error::Protocol::Smtp,
-            operation: bifrost_types::error::AccountOperation::Send,
-            scope: None,
-        },
-        None,
+        bifrost_types::error::Protocol::Smtp,
+        bifrost_types::error::AccountOperation::Send,
     );
     #[cfg(feature = "account-error")]
     let error = error::connection(message).with_preclassified_account_error(account_error);

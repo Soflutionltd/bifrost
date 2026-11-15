@@ -757,10 +757,17 @@ base infers an unusable Outlook base, with no production fallback. Shared
 clients retain the same cloud. An enterprise Outlook user expects Exchange
 reads to stay in the configured cloud.
 
-The cloud type is the extension point for service-specific token audiences.
-Audience selection still needs shared transport support: all enabled surfaces
-currently use the supplied token source, which must be accepted by each.
-Selecting a cloud configures endpoints; it does not acquire or exchange tokens.
+`GraphClient::with_outlook_source(source)` configures a separate OAuth source
+for the selected cloud's Outlook audience before opening accounts. EWS buffered
+and streaming requests and bearer Autodiscover requests select that source
+through net's `HopPolicy`, after exact Outlook-origin admission on every hop.
+The Graph source remains exclusive to REST. When the two configured bases share
+an origin, the Graph source remains the default for that single service origin;
+otherwise a missing Outlook source fails locally before dispatch. Anonymous
+upload requests select neither source. Derived clients retain the Outlook source
+and its coordinated refresh cache. Selecting a cloud configures endpoints; it
+does not acquire or exchange tokens. Enterprise Outlook users expect Exchange
+features to use Exchange credentials without disclosing a Graph token there.
 
 ### Which URLs may carry the bearer (`origin.rs`)
 
@@ -2742,7 +2749,8 @@ collection helpers including `list_mail_folders`, the `childFolders` descent,
 `list_message_rules`, `calendars_list`, `address_books_list`, and
 `fetch_paged_values`.
 
-`crates/graph/src/paging.rs` holds the shared guard. `PageWalk::enter` is called
+`crates/graph/src/paging.rs` adapts the shared
+`bifrost_net::pagination::check_next` admission policy. `PageWalk::enter` is called
 with each URL BEFORE fetching it, including the first, so a server echoing the
 request URI back as its own `nextLink` is caught rather than walked. It enforces
 two things, and both are load-bearing: a repeated-link check alone does not stop
@@ -2760,8 +2768,8 @@ server never hands back a link it already served, so it is
 provider - an endless series of fresh links and an honestly enormous
 collection look identical from here - so it is `GraphError::LimitExceeded` ->
 `Internal(LimitExceeded)`, this crate's own limit, the same split
-`bifrost-google`'s walks make. The budget is checked first, so a page past it
-is the limit even when its link also repeats. Every walk, the local event
+`bifrost-google`'s walks make. Repeats are checked first, even past the budget:
+a proven provider cycle is a more specific diagnosis than a local size limit. Every walk, the local event
 search included, classifies the `PageWalk` error through
 `into_account_error` (or `graph_shared_scope_error` on the delta walks) rather
 than remapping it.
@@ -2982,3 +2990,23 @@ new spelling would change durable identity without improving routing; an
 enterprise Outlook user expects previously stored objects and scheduled sends
 to remain reachable. Sync event ids already use the calendar encoder, and
 Trash recognition already parses the native folder and compares its owner.
+
+Inventory cursor classification uses the Account default predicate, which
+asks Graph's resume hook and drops the unpolled stream. Graph deliberately
+owns only the resume acceptance rule, covering scope/payload agreement and
+inventory state, rather than a separately maintained predicate. Stream
+construction performs no I/O or observable work.
+
+## Shared upload sequencing
+
+`bifrost_net::resumable::UploadDriver` owns chunk windows, Content-Range encoding
+and final-window detection. Resume offsets use its shared admission with
+`NoProgress::ContractViolation`: OneDrive must advance rather than stall a
+consumer's upload. Drive explicitly retains its different local-limit policy.
+OneDrive retains strict progress and the absolute upload deadline rather than
+adding Drive's expected-chunk-count attempt cap, so valid partial acceptance
+does not gain a new size-dependent refusal. Provider decoding, cancellation,
+acknowledged-chunk counts and partial-commit records stay in `account/cloud.rs`.
+Empty data or a zero chunk size reaching that driver is an internal refusal
+before a chunk request. Redirect classification is shared; transport redirect
+following remains disabled at the existing anonymous request boundary.

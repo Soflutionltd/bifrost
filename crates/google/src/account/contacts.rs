@@ -97,32 +97,29 @@ pub(crate) fn address_books_list(
     })
 }
 
-/// Decides whether the walk must refuse to follow `next_page_token`,
-/// returning the diagnostic detail for the terminating error.
-///
-/// Guard ORDER is deliberate and matches `inventory::inventory_walk_refusal`,
-/// `changes::walk_refusal` and `calendar::calendars_list`: the repeated-token
-/// check runs FIRST. Both guards terminate the walk with a terminal recovery
-/// class, but they blame different parties, and a page that trips both deserves the sharper
-/// diagnosis. A repeated token names a provider contract breach - the server
-/// is cycling and no amount of further paging makes progress - where the
-/// budget only reports "too many pages", which is also what an honestly huge
-/// address book looks like.
+/// Translate shared pagination admission into this API's diagnostics.
+/// Repeat precedence and page-budget policy live in bifrost-net.
 fn address_book_walk_refusal(
     seen_page_tokens: &mut HashSet<String>,
     pages_walked: usize,
     next_page_token: &str,
 ) -> Option<crate::error::PageRefusal> {
-    if !seen_page_tokens.insert(next_page_token.to_string()) {
-        return Some(crate::error::PageRefusal::RepeatedToken(format!(
-            "google contactGroups.list repeated page token {next_page_token:?}"
-        )));
-    }
-    (pages_walked >= MAX_ADDRESS_BOOK_PAGES).then(|| {
-        crate::error::PageRefusal::BudgetExceeded(format!(
+    match bifrost_net::pagination::check_next(
+        seen_page_tokens,
+        pages_walked,
+        MAX_ADDRESS_BOOK_PAGES,
+        Some(next_page_token.to_string()),
+    ) {
+        Ok(()) => None,
+        Err(bifrost_net::pagination::PageRefusal::Repeated) => {
+            Some(crate::error::PageRefusal::RepeatedToken(format!(
+                "google contactGroups.list repeated page token {next_page_token:?}"
+            )))
+        }
+        Err(_) => Some(crate::error::PageRefusal::BudgetExceeded(format!(
             "google contactGroups.list exceeded {MAX_ADDRESS_BOOK_PAGES} pages in one walk"
-        ))
-    })
+        ))),
+    }
 }
 
 pub(crate) fn list(

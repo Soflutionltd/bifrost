@@ -155,22 +155,18 @@ fn admitted_resume_offset(
         message: "OneDrive 202 nextExpectedRanges entry is not a byte range".to_string(),
         body: Some(body.clone()),
     })?;
-    if next <= offset {
-        return Err(contract_violation(format!(
-            "OneDrive 202 resume offset {next} did not advance past {offset}"
-        )));
-    }
-    if next > end {
-        return Err(contract_violation(format!(
-            "OneDrive 202 resume offset {next} is past the end {end} of the bytes sent"
-        )));
-    }
-    if next >= total {
-        return Err(contract_violation(format!(
-            "OneDrive 202 acknowledged all {total} bytes without returning the drive item"
-        )));
-    }
-    Ok(next)
+    bifrost_net::resumable::admit_resume(
+        offset,
+        end,
+        total,
+        next,
+        bifrost_net::resumable::NoProgress::ContractViolation,
+    )
+    .map_err(|refusal| {
+        contract_violation(format!(
+            "OneDrive 202 supplied an invalid resume offset {next}: {refusal:?}"
+        ))
+    })
 }
 
 /// Admit the `uploadUrl` a `createUploadSession` answer named, at receipt and
@@ -593,6 +589,13 @@ async fn upload_chunks(
     // data is non-empty and the loop always runs at least once.
     let total = data.len();
 
+    if total == 0 || chunk_size == 0 {
+        return Err(GraphError::Internal {
+            message: "OneDrive chunked upload requires nonempty data and a positive chunk size"
+                .to_string(),
+        });
+    }
+    let mut driver = bifrost_net::resumable::UploadDriver::new(total, chunk_size, None);
     let mut offset = 0usize;
     while offset < total {
         // Between chunks no PUT is outstanding and every earlier one got a
@@ -608,10 +611,15 @@ async fn upload_chunks(
                 transmission_state: TransmissionState::Unsent,
             }));
         }
-        let end = (offset + chunk_size).min(total);
-        facts.final_chunk = end == total;
-        let chunk = data.slice(offset..end);
-        let content_range = format!("bytes {offset}-{}/{total}", end - 1);
+        let window = driver
+            .next_window(offset)
+            .map_err(|refusal| GraphError::Internal {
+                message: format!("OneDrive chunk admission failed: {refusal:?}"),
+            })?;
+        let end = window.end;
+        facts.final_chunk = window.is_final();
+        let chunk = data.slice(window.start..end);
+        let content_range = window.content_range();
 
         // The session URL is pre-authenticated: sending the Graph bearer to
         // it would leak the token to whatever host OneDrive minted.
@@ -678,7 +686,12 @@ async fn upload_chunks(
             // the upload contract, not a transient server fault to retry.
             // The message names the status only: a `Location` may carry the
             // session credential.
-            300..=399 => {
+            code if bifrost_net::resumable::is_redirect(
+                code,
+                response.headers.contains_key("location"),
+                None,
+            ) =>
+            {
                 return Err(contract_violation(format!(
                     "OneDrive answered an upload chunk PUT with redirect {status}, \
                      which the resumable upload protocol does not use"

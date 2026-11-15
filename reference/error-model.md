@@ -811,3 +811,21 @@ Non-mail Google errors use Provider::Google and Protocol::{GoogleCalendar,
 GooglePeople, GoogleDrive}, with matching WireCause variants retaining the
 structured Google reason vocabulary currently represented by GmailSignal. Gmail
 retains its existing provider, protocol and wire identities.
+
+`ImapResponseCode::code()` exposes the diagnostic response-code name, including
+the retained server name for `Unknown`. IMAP's protocol type owns conversion
+into this shared vocabulary; account translation uses the same projection for
+wire causes and `native_code`.
+
+SMTP `EnhancedStatusCode::components` preserves the optional numeric
+(class, subject, detail) triple independently of consent-tier diagnostics.
+Its constructor accepts that triple and derives the dotted `enhanced`
+diagnostic text, retaining existing internal summary and native-code exports.
+Consumers inspect the numeric triple directly rather than parsing prose.
+
+The sync engine's `recovery::dispatch_stream_failure` records all throttle
+observations and resolves retry/reconcile timing before returning its closed
+plan. A missing provider hint means one second; stream-owned reconnect backoff
+may impose a larger floor. Publication remains producer-owned: a terminal
+outcome already broadcast by drive/fusion is not broadcast again by recovery.
+An injected watch has no incarnation identity and retains unstamped routing.

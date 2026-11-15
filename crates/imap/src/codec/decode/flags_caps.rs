@@ -379,10 +379,12 @@ fn response_code_inner<'a>(
             Ok((input, ResponseCode::UidNext(n)))
         }
         "UIDVALIDITY" => {
-            // RFC 9051 Section 9 says nz-number, but we accept 0 per Postel's
-            // law (RFC 1122 Section 1.2.2) because non-conformant servers
-            // (e.g. some Dovecot configurations) send 0 for empty mailboxes.
-            // Consistent with the STATUS parser's tolerance for UIDVALIDITY 0.
+            // Retain the wire number here: SELECT's completion validator
+            // already rejects zero before any account inventory can run,
+            // and its builder normalizes zero to absence. Decoder tolerance
+            // is not permission to mint an object identity from this value.
+            // Rejecting every numeric sentinel at syntax decode would also
+            // discard optional server metadata that can be safely ignored.
             let (input, _) = sp(input)?;
             let (input, n) = number(input)?;
             Ok((input, ResponseCode::UidValidity(n)))

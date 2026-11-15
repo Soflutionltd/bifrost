@@ -548,3 +548,18 @@ structural brackets do not become bare identifiers.
 projects `mayShare`, IMAP projects ACL administration, and EWS EffectiveRights
 leaves it unknown. `PushCapability::Webhook` describes Graph webhooks; EWS
 streaming uses `InProcess`.
+
+## Calendar range guard
+
+`EventRange::admits` is the shared defensive guard used by CalDAV and JMAP
+range reads after provider selection. It rejects provably disjoint timed,
+nonrecurring intervals with explicit offset-bearing bounds and ends. Ends are
+exclusive; an explicit zero-length event includes the window start and excludes
+its end. It retains all-day dates, floating local times, unknown or malformed
+ends and recurring masters (RRULE or RDATE), because this seam cannot reproduce
+the provider's timezone and recurrence matching. UNTIL limits occurrence starts,
+not their ends, and explicit dates can extend a series. Calendar users expect
+matching meetings to stay visible rather than disappear under an incomplete
+local comparison. This is a conservative guard, not occurrence expansion or
+request validation. A CalDAV listing fallback can therefore include candidates
+whose overlap cannot be established locally.

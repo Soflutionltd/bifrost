@@ -70,6 +70,15 @@ impl MailboxRights {
     /// preserved as [`AclRight::Unknown`] rather than dropped - a server
     /// extension right must not silently read as "no rights". Empty string
     /// is the empty set (valid: explicit no-rights).
+    // RFC 4314 Section 2.1.1 requires clients to ignore virtual c/d rights
+    // in MYRIGHTS, ACL and LISTRIGHTS responses. They do NOT imply their
+    // members: a server returns d even when only one delete member is granted.
+    // Preserve the wire letters for inspection, but never expand them here.
+    // SETACL input expansion is server policy and cannot be inferred from a
+    // response string; c may mean k or kx, and d may mean et or etx.
+    // Do not replace every ACL string with this granted-set type: SETACL
+    // carries +/- operations, LISTRIGHTS carries tied groups, and RIGHTS=
+    // advertises an alphabet. Discovery parses MYRIGHTS before projecting it.
     pub(crate) fn parse(s: &str) -> Self {
         Self {
             rights: s.chars().map(AclRight::from_letter).collect(),
@@ -93,6 +102,25 @@ impl MailboxRights {
         self.contains(AclRight::DeleteMessages) && self.contains(AclRight::Expunge)
     }
 
+    /// Account authority from a MYRIGHTS response; virtual c/d never grant it.
+    pub(crate) fn container_rights(&self) -> bifrost_types::ContainerRights {
+        let mailbox_admin = self.contains(AclRight::DeleteMailbox);
+        bifrost_types::ContainerRights {
+            may_read_items: Some(self.can_read()),
+            may_add_items: Some(self.can_insert()),
+            // The account removes messages by marking and expunging. An
+            // enterprise user expects removal to finish, not just set a flag.
+            may_remove_items: Some(self.can_delete()),
+            may_set_seen: Some(self.contains(AclRight::Seen)),
+            may_set_keywords: Some(self.contains(AclRight::Write)),
+            may_create_child: Some(self.contains(AclRight::CreateMailbox)),
+            may_rename: Some(mailbox_admin),
+            may_delete: Some(mailbox_admin),
+            may_submit: Some(self.contains(AclRight::Post)),
+            may_share: Some(self.contains(AclRight::Administer)),
+        }
+    }
+
     pub(crate) fn contains(&self, right: AclRight) -> bool {
         self.rights.contains(&right)
     }
@@ -105,6 +133,26 @@ impl MailboxRights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_response_rights_never_grant_member_rights() {
+        let virtual_only = MailboxRights::parse("lrcd").container_rights();
+        assert_eq!(virtual_only.may_create_child, Some(false));
+        assert_eq!(virtual_only.may_delete, Some(false));
+        assert_eq!(virtual_only.may_remove_items, Some(false));
+        let mark_only = MailboxRights::parse("td").container_rights();
+        assert_eq!(mark_only.may_remove_items, Some(false));
+        assert_eq!(
+            MailboxRights::parse("te")
+                .container_rights()
+                .may_remove_items,
+            Some(true)
+        );
+        assert_eq!(
+            MailboxRights::parse("kx").container_rights().may_delete,
+            Some(true)
+        );
+    }
 
     #[test]
     fn parse_full_rights_set() {

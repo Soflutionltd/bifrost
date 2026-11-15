@@ -526,9 +526,10 @@ async fn authenticate(
             // Read the current token from the shared source at auth time,
             // mirroring the IMAP connect path, so a rotated token is
             // presented on every ManageSieve (re)authentication.
-            let access_token = token_source.current().await.map_err(|e| {
-                Error::auth_with_code(format!("failed to read OAuth access token: {e}"), None)
-            })?;
+            let access_token = token_source
+                .current()
+                .await
+                .map_err(super::error::oauth_token_error)?;
             (
                 AuthMechanism::XOAuth2,
                 bifrost_sasl::xoauth2_payload(identity, access_token.as_str()),

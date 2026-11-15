@@ -88,7 +88,11 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
             match result {
                 Ok(Ok(())) => ctx.subscriptions.remove_orphan(&ctx.account_id, &handle),
                 Ok(Err(error)) => {
-                    super::bulk::record_error_throttle(&ctx.throttles, &ctx.account_id, &error);
+                    crate::recovery::observe_failure_throttles(
+                        &ctx.throttles,
+                        &ctx.account_id,
+                        &error,
+                    );
                     tracing::debug!(
                         target: "bifrost.sync.push",
                         account = ?ctx.account_id,

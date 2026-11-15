@@ -154,14 +154,14 @@ Internal modules:
   is Google's documented "no bytes received yet" and reads as offset 0; the
   progress check below then refuses it (no progress from offset 0, or a
   regression after earlier progress), so it is never resumed past. The
-  loop also bounds total chunk attempts to the expected chunk count plus
+  shared `bifrost_net::resumable::UploadDriver` bounds total chunk attempts to the expected chunk count plus
   eight, so malicious tiny progress cannot hold the caller forever. Then a
   `permissions` POST (`type: anyone` / `type: domain` + account domain)
   and a `webViewLink` GET. The chunk PUTs and the session cancel run with
   per-request `follow_redirects(FollowRedirects::Disabled)`, so every 3xx
   reaches this module as a plain response and nothing is ever sent to a
   `Location`. Drive's 308 carries a `Range` and no `Location` and arrives as
-  progress; a 3xx WITH a `Location` is a real redirect the resumable protocol
+  progress; any other 3xx, or a 308 WITH a `Location`, is a redirect the resumable protocol
   never uses and is `Protocol(ContractViolation)`, without echoing the
   server-chosen `Location`. The permission body, and so the account domain,
   is derived before the session POST: the account email is Gmail's own
@@ -1097,17 +1097,14 @@ History entries map to `Change` variants in
 
 ## Paging inventory
 
-Google has no universal paging helper, but every internally traversed walk has
-its own repeated-token detection and 10,000-page refusal budget. Where a page
-trips both guards, the repeated-token check is evaluated FIRST and owns the
-diagnostic: it names a provider contract breach, where the budget only reports
-"too many pages", which is also what an honestly huge corpus looks like. Both
-refusals end the walk with a terminal recovery class, so the order is purely a
-diagnostic choice - but it is a fixed one in the two Gmail
-sync walks and in `contactGroups.list`, pinned per lane by a test that feeds a
-page tripping both, and `calendars_list` reaches the same order structurally
-(its budget is the `for` loop's own bound, so it can only fire after the token
-check).
+Google's four internally traversed walks use
+`bifrost_net::pagination::check_next` for repeated-token detection and their
+10,000-page budgets. The helper checks repeats first: a known provider cycle
+is a more specific diagnosis than a local size limit, which an honestly huge
+corpus can also hit. Completion without a token succeeds on the budget boundary.
+The caller retains the seen set and completed-page count so suspended streams
+keep their existing state. Calendar uses the same admission before following
+the next token, including on its final budgeted page.
 
 Every walk hands its refusal to the error boundary as one crate-level
 `PageRefusal` (`RepeatedToken` or `BudgetExceeded`), converted to the
@@ -1446,6 +1443,15 @@ Result classification:
   is `Uncertain` and carries the same error for read-back.
 
 Flag canonicalization in `flags.rs`:
+
+`GmailLabelId` classifies known system ids, categories and opaque user ids for
+projection, role selection, search and write admission. `GmailLabelType` decodes
+native ownership as User, System or Unknown; missing and unknown ownership stay
+conservative during exact replacement. `GmailFlag` owns flag parsing and display
+for both encoders, reverse translation, observation and mutation vocabulary
+refresh. It rejects empty label ids consistently, retains case-sensitive opaque
+ids, and accepts empty names and names containing colons. Users expect a renamed
+label to retain its identity when a queued flag mutation is replayed.
 
 - Gmail labels project to IMAP-style flags: `UNREAD` toggles
   `\Seen` (presence of `UNREAD` removes `\Seen`), `STARRED` is
@@ -2006,3 +2012,12 @@ AccountNet, with typed provider payloads and keys, shared across accounts on the
 same Net and isolated across independent Nets. A factory-local registry would
 lose coordination between factories sharing a Net; retaining account transports
 in a global registry would pin them. No such substitute is installed here.
+
+## Shared upload sequencing
+
+`bifrost_net::resumable` owns window arithmetic, Content-Range encoding,
+resume-offset admission, final-window detection and redirect classification for
+Drive and OneDrive. Drive supplies header decoding and `NoProgress::LocalLimit`;
+its documented resend response remains a local work refusal. Provider errors,
+chunk acknowledgement counts, cancellation and partial-commit records remain in
+`account/cloud.rs`. The shared driver does not dispatch requests or follow URLs.

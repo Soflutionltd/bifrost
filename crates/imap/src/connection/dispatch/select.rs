@@ -327,8 +327,7 @@ pub(in crate::connection) fn build_selected_mailbox(
     let mut uid_next = Option::None;
     let mut flags = Vec::new();
     let mut permanent_flags = Vec::new();
-    let mut highest_mod_seq = Option::None;
-    let mut no_mod_seq = false;
+    let mut modseq_support = crate::types::mailbox::ModSeqSupport::Unknown;
     let mut unseen: Option<u32> = None;
     // RFC 8474 Section 5.1: unique mailbox identifier from [MAILBOXID (<id>)].
     let mut mailbox_id: Option<String> = None;
@@ -355,8 +354,7 @@ pub(in crate::connection) fn build_selected_mailbox(
                     &mut uid_validity,
                     &mut uid_next,
                     &mut permanent_flags,
-                    &mut highest_mod_seq,
-                    &mut no_mod_seq,
+                    &mut modseq_support,
                     &mut unseen,
                     &mut mailbox_id,
                     &mut uid_not_sticky,
@@ -388,8 +386,7 @@ pub(in crate::connection) fn build_selected_mailbox(
             &mut uid_validity,
             &mut uid_next,
             &mut permanent_flags,
-            &mut highest_mod_seq,
-            &mut no_mod_seq,
+            &mut modseq_support,
             &mut unseen,
             &mut mailbox_id,
             &mut uid_not_sticky,
@@ -403,8 +400,7 @@ pub(in crate::connection) fn build_selected_mailbox(
         uid_next,
         flags,
         permanent_flags,
-        highest_mod_seq,
-        no_mod_seq,
+        modseq_support,
         unseen,
         mailbox_id,
         read_only,
@@ -444,31 +440,36 @@ fn extract_selected_code(
     uid_validity: &mut Option<u32>,
     uid_next: &mut Option<u32>,
     permanent_flags: &mut Vec<Flag>,
-    highest_mod_seq: &mut Option<u64>,
-    no_mod_seq: &mut bool,
+    modseq_support: &mut crate::types::mailbox::ModSeqSupport,
     unseen: &mut Option<u32>,
     mailbox_id: &mut Option<String>,
     uid_not_sticky: &mut bool,
 ) {
     match code {
-        ResponseCode::UidValidity(v) => *uid_validity = Some(*v),
-        ResponseCode::UidNext(v) => *uid_next = Some(*v),
+        // Preserve raw numbers in the decoder, but never turn a zero wire
+        // sentinel into a usable mailbox identity. Users expect a broken
+        // server epoch to fail before inventory can publish unusable ids.
+        ResponseCode::UidValidity(v) => {
+            *uid_validity = crate::types::UidValidity::new(*v).map(crate::types::UidValidity::get);
+        }
+        ResponseCode::UidNext(v) => {
+            *uid_next = std::num::NonZeroU32::new(*v).map(std::num::NonZeroU32::get);
+        }
         ResponseCode::PermanentFlags(f) => permanent_flags.clone_from(f),
         ResponseCode::HighestModSeq(v) => {
-            // RFC 7162 Section 3.1.2.1: mod-sequence-value >= 1.
-            // HIGHESTMODSEQ 0 is semantically invalid  -  the server should
-            // have sent [NOMODSEQ] instead. Treat it equivalently per
-            // Postel's law (RFC 1122 Section 1.2.2).
-            if *v == 0 {
-                *no_mod_seq = true;
-            } else {
-                *highest_mod_seq = Some(*v);
+            // Once support is explicitly denied in this SELECT, do not
+            // enable guarded operations from a contradictory later code.
+            // Enterprise users expect conservative concurrency protection.
+            if !matches!(
+                modseq_support,
+                crate::types::mailbox::ModSeqSupport::NoModSeq
+            ) {
+                *modseq_support = crate::types::mailbox::ModSeqSupport::from_highest(*v);
             }
         }
-        // RFC 7162 Section 3.1.2: [NOMODSEQ]  -  mailbox does not support
-        // mod-sequences. Distinct from the server simply not sending
-        // HIGHESTMODSEQ.
-        ResponseCode::NoModSeq => *no_mod_seq = true,
+        ResponseCode::NoModSeq => {
+            *modseq_support = crate::types::mailbox::ModSeqSupport::NoModSeq;
+        }
         // RFC 3501 Section 7.1: [UNSEEN n]  -  first unseen message sequence number.
         // Dropped in IMAP4rev2 (RFC 9051), but commonly sent by rev1 servers.
         ResponseCode::Unseen(v) => *unseen = Some(*v),

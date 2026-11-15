@@ -253,147 +253,99 @@ mod extension_property_round_trip {
 // 4. Property enum round-trip
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "calendars", feature = "contacts"))]
 mod property_enum_round_trip {
     use super::*;
-    use crate::calendar_event::Property as CEProperty;
-    use crate::contact_card::Property as CCProperty;
 
-    /// All known CalendarEvent::Property variants and their wire names.
-    fn ce_known_variants() -> Vec<(CEProperty, &'static str)> {
-        vec![
-            (CEProperty::Id, "id"),
-            (CEProperty::Uid, "uid"),
-            (CEProperty::CalendarIds, "calendarIds"),
-            (CEProperty::IsDraft, "isDraft"),
-            (CEProperty::Title, "title"),
-            (CEProperty::Description, "description"),
-            (CEProperty::DescriptionContentType, "descriptionContentType"),
-            (CEProperty::Created, "created"),
-            (CEProperty::Updated, "updated"),
-            (CEProperty::Start, "start"),
-            (CEProperty::Duration, "duration"),
-            (CEProperty::TimeZone, "timeZone"),
-            (CEProperty::ShowWithoutTime, "showWithoutTime"),
-            (CEProperty::Status, "status"),
-            (CEProperty::FreeBusyStatus, "freeBusyStatus"),
-            (CEProperty::RecurrenceId, "recurrenceId"),
-            (CEProperty::RecurrenceIdTimeZone, "recurrenceIdTimeZone"),
-            (CEProperty::RecurrenceRules, "recurrenceRules"),
-            (CEProperty::RecurrenceOverrides, "recurrenceOverrides"),
+    crate::core::method::define_property_enum! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        #[non_exhaustive]
+        enum ClosedProperty {
+            First = 7 => "wireFirst",
+            Second => "wireSecond",
+        }
+    }
+
+    #[test]
+    fn closed_property_macro_wire_contract() {
+        for (property, wire) in [
+            (ClosedProperty::First, "wireFirst"),
+            (ClosedProperty::Second, "wireSecond"),
+        ] {
+            assert_eq!(property.to_string(), wire);
+            assert_eq!(serde_json::to_value(property).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<ClosedProperty>(json!(wire)).unwrap(),
+                property
+            );
+        }
+        assert_eq!(ClosedProperty::First as u8, 7);
+        assert_eq!(ClosedProperty::Second as u8, 8);
+        assert!(serde_json::from_value::<ClosedProperty>(json!("vendor:unknown")).is_err());
+        assert!(serde_json::from_value::<ClosedProperty>(json!(7)).is_err());
+    }
+
+    #[cfg(any(feature = "calendars", feature = "contacts"))]
+    crate::define_open_property_enum! {
+        #[non_exhaustive]
+        enum OpenProperty {
+            First => "wireFirst",
+            Second => "wireSecond",
+        }
+    }
+
+    #[test]
+    #[cfg(any(feature = "calendars", feature = "contacts"))]
+    fn open_property_macro_wire_contract() {
+        for (property, wire) in [
+            (OpenProperty::First, "wireFirst"),
+            (OpenProperty::Second, "wireSecond"),
             (
-                CEProperty::ExcludedRecurrenceRules,
-                "excludedRecurrenceRules",
+                OpenProperty::Other("vendor:unknown".to_string()),
+                "vendor:unknown",
             ),
-            (CEProperty::Priority, "priority"),
-            (CEProperty::Color, "color"),
-            (CEProperty::Locale, "locale"),
-            (CEProperty::Keywords, "keywords"),
-            (CEProperty::Categories, "categories"),
-            (CEProperty::ProdId, "prodId"),
-            (CEProperty::ReplyTo, "replyTo"),
-            (CEProperty::Participants, "participants"),
-            (CEProperty::UseDefaultAlerts, "useDefaultAlerts"),
-            (CEProperty::Alerts, "alerts"),
-            (CEProperty::Locations, "locations"),
-            (CEProperty::VirtualLocations, "virtualLocations"),
-            (CEProperty::Links, "links"),
-            (CEProperty::RelatedTo, "relatedTo"),
-            (CEProperty::ExcludedDates, "excludedDates"),
-            (CEProperty::Localizations, "localizations"),
-            (CEProperty::Method, "method"),
-            (CEProperty::Sequence, "sequence"),
-        ]
-    }
-
-    #[test]
-    fn calendar_event_property_display_round_trip() {
-        for (prop, wire_name) in ce_known_variants() {
-            // Display -> &str -> From<&str>
-            let displayed = prop.to_string();
-            assert_eq!(displayed, wire_name, "Display mismatch for {prop:?}");
-            let parsed = CEProperty::from(displayed.as_str());
-            assert_eq!(parsed, prop, "From<&str> mismatch for {wire_name}");
+        ] {
+            assert_eq!(property.as_str(), wire);
+            assert_eq!(property.to_string(), wire);
+            assert_eq!(OpenProperty::from(wire), property);
+            assert_eq!(serde_json::to_value(&property).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<OpenProperty>(json!(wire)).unwrap(),
+                property
+            );
         }
+        assert!(serde_json::from_value::<OpenProperty>(json!(7)).is_err());
     }
 
     #[test]
-    fn calendar_event_property_serde_round_trip() {
-        for (prop, wire_name) in ce_known_variants() {
-            let serialized = serde_json::to_value(&prop).unwrap();
-            assert_eq!(serialized, json!(wire_name));
-            let deserialized: CEProperty = serde_json::from_value(serialized).unwrap();
-            assert_eq!(deserialized, prop);
-        }
-    }
-
-    #[test]
+    #[cfg(feature = "calendars")]
     fn calendar_event_property_other_round_trip() {
-        let prop = CEProperty::Other("example.com:custom".to_string());
-        let displayed = prop.to_string();
-        assert_eq!(displayed, "example.com:custom");
-        let parsed = CEProperty::from("example.com:custom");
-        assert_eq!(parsed, prop);
+        use crate::calendar_event::Property;
 
-        let serialized = serde_json::to_value(&prop).unwrap();
+        let property = Property::Other("example.com:custom".to_string());
+        assert_eq!(property.to_string(), "example.com:custom");
+        assert_eq!(Property::from("example.com:custom"), property);
+        let serialized = serde_json::to_value(&property).unwrap();
         assert_eq!(serialized, json!("example.com:custom"));
-        let deserialized: CEProperty = serde_json::from_value(serialized).unwrap();
-        assert_eq!(deserialized, prop);
-    }
-
-    /// All known ContactCard::Property variants and their wire names.
-    fn cc_known_variants() -> Vec<(CCProperty, &'static str)> {
-        vec![
-            (CCProperty::Id, "id"),
-            (CCProperty::Uid, "uid"),
-            (CCProperty::AddressBookIds, "addressBookIds"),
-            (CCProperty::Kind, "kind"),
-            (CCProperty::Name, "name"),
-            (CCProperty::Nicknames, "nicknames"),
-            (CCProperty::Emails, "emails"),
-            (CCProperty::Phones, "phones"),
-            (CCProperty::Addresses, "addresses"),
-            (CCProperty::Organizations, "organizations"),
-            (CCProperty::OnlineServices, "onlineServices"),
-            (CCProperty::Notes, "notes"),
-            (CCProperty::Media, "media"),
-            (CCProperty::Created, "created"),
-            (CCProperty::Updated, "updated"),
-        ]
+        assert_eq!(
+            serde_json::from_value::<Property>(serialized).unwrap(),
+            property
+        );
     }
 
     #[test]
-    fn contact_card_property_display_round_trip() {
-        for (prop, wire_name) in cc_known_variants() {
-            let displayed = prop.to_string();
-            assert_eq!(displayed, wire_name, "Display mismatch for {prop:?}");
-            let parsed = CCProperty::from(displayed.as_str());
-            assert_eq!(parsed, prop, "From<&str> mismatch for {wire_name}");
-        }
-    }
-
-    #[test]
-    fn contact_card_property_serde_round_trip() {
-        for (prop, wire_name) in cc_known_variants() {
-            let serialized = serde_json::to_value(&prop).unwrap();
-            assert_eq!(serialized, json!(wire_name));
-            let deserialized: CCProperty = serde_json::from_value(serialized).unwrap();
-            assert_eq!(deserialized, prop);
-        }
-    }
-
-    #[test]
+    #[cfg(feature = "contacts")]
     fn contact_card_property_other_round_trip() {
-        let prop = CCProperty::Other("vendor:x-field".to_string());
-        let displayed = prop.to_string();
-        assert_eq!(displayed, "vendor:x-field");
-        let parsed = CCProperty::from("vendor:x-field");
-        assert_eq!(parsed, prop);
+        use crate::contact_card::Property;
 
-        let serialized = serde_json::to_value(&prop).unwrap();
+        let property = Property::Other("vendor:x-field".to_string());
+        assert_eq!(property.to_string(), "vendor:x-field");
+        assert_eq!(Property::from("vendor:x-field"), property);
+        let serialized = serde_json::to_value(&property).unwrap();
         assert_eq!(serialized, json!("vendor:x-field"));
-        let deserialized: CCProperty = serde_json::from_value(serialized).unwrap();
-        assert_eq!(deserialized, prop);
+        assert_eq!(
+            serde_json::from_value::<Property>(serialized).unwrap(),
+            property
+        );
     }
 }
 

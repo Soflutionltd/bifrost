@@ -152,8 +152,45 @@ impl ImapErrorContext {
     }
 }
 
+/// Preserve the shared OAuth classification for IMAP and ManageSieve.
+pub(crate) fn oauth_token_error(error: bifrost_net::Error) -> Error {
+    // The operation is a placeholder: into_account_error restamps the
+    // caller's operation, scope and provider when it surfaces this error.
+    let classified =
+        bifrost_net::token_source_account_error(error, Protocol::Imap, AccountOperation::Discover);
+    Error::OAuthToken(std::sync::Arc::new(classified))
+}
+
 /// Translate an internal IMAP error into a public `AccountError`.
 pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> AccountError {
+    let error = match error {
+        Error::MoveFallbackIncomplete { source, .. } => return into_account_error(*source, ctx),
+        error => error,
+    };
+    // A token endpoint outage must retry without asking the user to replace
+    // valid credentials. It supplies no IMAP server-acknowledgement evidence.
+    if let Error::OAuthToken(classified) = &error {
+        let mut builder = classified
+            .as_ref()
+            .clone()
+            .into_builder()
+            .operation(ctx.operation);
+        if let Some(scope) = ctx.scope {
+            builder = builder.scope(scope);
+        }
+        if let Some(provider) = ctx.provider {
+            builder = builder.provider(provider);
+        }
+        if let Some(idempotent) = ctx.idempotency_override {
+            builder = builder.idempotency_override(idempotent);
+        }
+        for text in ctx.extra_text {
+            builder = builder.text(text);
+        }
+        return builder
+            .try_build()
+            .expect("valid token error classification");
+    }
     let attempt = error.attempt().or(ctx.transmission_state);
     let translation = classify(&error, &ctx);
     let Translation {
@@ -360,8 +397,18 @@ pub(crate) fn folder_error(
 }
 
 pub(crate) fn permission_denied(error: &Error, ctx: &ImapErrorContext) -> bool {
+    // Token errors carry their own classification and must not reach
+    // `classify`, which refuses them; unwrap the MOVE fallback wrapper too.
+    let mut inner = error;
+    while let Error::MoveFallbackIncomplete { source, .. } = inner {
+        inner = source;
+    }
+    let kind = match inner {
+        Error::OAuthToken(classified) => classified.kind().clone(),
+        other => classify(other, ctx).kind,
+    };
     matches!(
-        classify(error, ctx).kind,
+        kind,
         AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied)
     )
 }
@@ -438,6 +485,7 @@ fn internal(kind: InternalErrorKind, detail: String) -> Translation {
 
 fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
     match error {
+        Error::OAuthToken(_) => unreachable!("token errors bypass IMAP classification"),
         Error::MoveFallbackIncomplete { source, .. } => classify(source, ctx),
         Error::Io { source, .. } => Translation::new(
             AccountErrorKind::Transport(TransportErrorKind::Network),
@@ -784,8 +832,9 @@ fn classify_auth(
         t.diagnostic_text = Some(DiagnosticText::support_only(detail));
     }
     if let Some(code) = code {
-        t.wire_code = Some(imap_response_code(code));
-        t.native_code = Some(response_code_name(code).to_owned());
+        let wire_code = ImapResponseCode::from(code);
+        t.native_code = Some(wire_code.code().to_owned());
+        t.wire_code = Some(wire_code);
     }
     // Auth failures are server-acknowledged tagged responses.
     t.attempt = Some(TransmissionState::Acknowledged);
@@ -810,8 +859,9 @@ fn classify_status(
         fallback_status(text, &fallback)
     };
     if let Some(code) = code {
-        t.wire_code = Some(imap_response_code(code));
-        t.native_code = Some(response_code_name(code).to_owned());
+        let wire_code = ImapResponseCode::from(code);
+        t.native_code = Some(wire_code.code().to_owned());
+        t.wire_code = Some(wire_code);
         // For parameterized codes whose payload is interesting, attach
         // as support-only text if not already set.
         if t.diagnostic_text.is_none()
@@ -989,7 +1039,9 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         | ResponseCode::MetadataMaxSize(_) => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(response_code_name(code).to_owned()),
+                detail: DiagnosticText::support_only(
+                    ImapResponseCode::from(code).code().to_owned(),
+                ),
             }),
         ),
 
@@ -1129,148 +1181,6 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
     };
 
     Some(t)
-}
-
-/// Map crate `ResponseCode` -> `bifrost_types::ImapResponseCode`.
-///
-/// Parameterized codes lose their payload at the kind level; the payload
-/// is preserved separately as `DiagnosticText`. The `Unknown` variant
-/// carries the raw name and an optional value.
-fn imap_response_code(code: &ResponseCode) -> ImapResponseCode {
-    match code {
-        ResponseCode::Alert => ImapResponseCode::Alert,
-        ResponseCode::BadCharset(_) => ImapResponseCode::BadCharset,
-        ResponseCode::Capability(_) => ImapResponseCode::Capability,
-        ResponseCode::Parse => ImapResponseCode::Parse,
-        ResponseCode::PermanentFlags(_) => ImapResponseCode::PermanentFlags,
-        ResponseCode::ReadOnly => ImapResponseCode::ReadOnly,
-        ResponseCode::ReadWrite => ImapResponseCode::ReadWrite,
-        ResponseCode::TryCreate => ImapResponseCode::TryCreate,
-        ResponseCode::UidNext(_) => ImapResponseCode::UidNext,
-        ResponseCode::UidValidity(_) => ImapResponseCode::UidValidity,
-        ResponseCode::Unseen(_) => ImapResponseCode::Unseen,
-        ResponseCode::AppendUid { .. } => ImapResponseCode::AppendUid,
-        ResponseCode::CopyUid { .. } => ImapResponseCode::CopyUid,
-        ResponseCode::HighestModSeq(_) => ImapResponseCode::HighestModSeq,
-        ResponseCode::Modified(_) => ImapResponseCode::Modified,
-        ResponseCode::NoModSeq => ImapResponseCode::NoModSeq,
-        ResponseCode::Closed => ImapResponseCode::Closed,
-        ResponseCode::MailboxId(_) => ImapResponseCode::MailboxId,
-        ResponseCode::Unavailable => ImapResponseCode::Unavailable,
-        ResponseCode::AuthenticationFailed => ImapResponseCode::AuthenticationFailed,
-        ResponseCode::AuthorizationFailed => ImapResponseCode::AuthorizationFailed,
-        ResponseCode::Expired => ImapResponseCode::Expired,
-        ResponseCode::PrivacyRequired => ImapResponseCode::PrivacyRequired,
-        ResponseCode::ContactAdmin => ImapResponseCode::ContactAdmin,
-        ResponseCode::NoPerm => ImapResponseCode::NoPerm,
-        ResponseCode::InUse => ImapResponseCode::InUse,
-        ResponseCode::ExpungeIssued => ImapResponseCode::ExpungeIssued,
-        ResponseCode::Corruption => ImapResponseCode::Corruption,
-        ResponseCode::ServerBug => ImapResponseCode::ServerBug,
-        ResponseCode::ClientBug => ImapResponseCode::ClientBug,
-        ResponseCode::Cannot => ImapResponseCode::Cannot,
-        ResponseCode::Limit => ImapResponseCode::Limit,
-        ResponseCode::OverQuota => ImapResponseCode::OverQuota,
-        ResponseCode::AlreadyExists => ImapResponseCode::AlreadyExists,
-        ResponseCode::NonExistent => ImapResponseCode::NonExistent,
-        ResponseCode::NewName(_) => ImapResponseCode::NewName,
-        ResponseCode::Referral(_) => ImapResponseCode::Referral,
-        ResponseCode::UrlMech(_) => ImapResponseCode::UrlMech,
-        ResponseCode::BadUrl(_) => ImapResponseCode::BadUrl,
-        ResponseCode::BadComparator(_) => ImapResponseCode::BadComparator,
-        ResponseCode::Annotate(_) => ImapResponseCode::Annotate,
-        ResponseCode::Annotations(_) => ImapResponseCode::Annotations,
-        ResponseCode::TempFail(_) => ImapResponseCode::TempFail,
-        ResponseCode::MaxConvertMessages(_) => ImapResponseCode::MaxConvertMessages,
-        ResponseCode::MaxConvertParts(_) => ImapResponseCode::MaxConvertParts,
-        ResponseCode::NoUpdate(_) => ImapResponseCode::NoUpdate,
-        ResponseCode::NotificationOverflow(_) => ImapResponseCode::NotificationOverflow,
-        ResponseCode::BadEvent(_) => ImapResponseCode::BadEvent,
-        ResponseCode::UndefinedFilter(_) => ImapResponseCode::UndefinedFilter,
-        ResponseCode::UidNotSticky => ImapResponseCode::UidNotSticky,
-        ResponseCode::NotSaved => ImapResponseCode::NotSaved,
-        ResponseCode::HasChildren => ImapResponseCode::HasChildren,
-        ResponseCode::UnknownCte => ImapResponseCode::UnknownCte,
-        ResponseCode::TooBig => ImapResponseCode::TooBig,
-        ResponseCode::CompressionActive => ImapResponseCode::CompressionActive,
-        ResponseCode::UseAttr => ImapResponseCode::UseAttr,
-        ResponseCode::MetadataLongEntries(_) => ImapResponseCode::MetadataLongEntries,
-        ResponseCode::MetadataMaxSize(_) => ImapResponseCode::MetadataMaxSize,
-        ResponseCode::MetadataTooMany => ImapResponseCode::MetadataTooMany,
-        ResponseCode::MetadataNoPrivate => ImapResponseCode::MetadataNoPrivate,
-        ResponseCode::Other { name, value } => ImapResponseCode::Unknown {
-            code: name.clone(),
-            value: value
-                .as_ref()
-                .map(|v| DiagnosticText::support_only(v.clone())),
-        },
-    }
-}
-
-fn response_code_name(code: &ResponseCode) -> &'static str {
-    match code {
-        ResponseCode::Alert => "ALERT",
-        ResponseCode::BadCharset(_) => "BADCHARSET",
-        ResponseCode::Capability(_) => "CAPABILITY",
-        ResponseCode::Parse => "PARSE",
-        ResponseCode::PermanentFlags(_) => "PERMANENTFLAGS",
-        ResponseCode::ReadOnly => "READ-ONLY",
-        ResponseCode::ReadWrite => "READ-WRITE",
-        ResponseCode::TryCreate => "TRYCREATE",
-        ResponseCode::UidNext(_) => "UIDNEXT",
-        ResponseCode::UidValidity(_) => "UIDVALIDITY",
-        ResponseCode::Unseen(_) => "UNSEEN",
-        ResponseCode::AppendUid { .. } => "APPENDUID",
-        ResponseCode::CopyUid { .. } => "COPYUID",
-        ResponseCode::HighestModSeq(_) => "HIGHESTMODSEQ",
-        ResponseCode::Modified(_) => "MODIFIED",
-        ResponseCode::NoModSeq => "NOMODSEQ",
-        ResponseCode::Closed => "CLOSED",
-        ResponseCode::MailboxId(_) => "MAILBOXID",
-        ResponseCode::Unavailable => "UNAVAILABLE",
-        ResponseCode::AuthenticationFailed => "AUTHENTICATIONFAILED",
-        ResponseCode::AuthorizationFailed => "AUTHORIZATIONFAILED",
-        ResponseCode::Expired => "EXPIRED",
-        ResponseCode::PrivacyRequired => "PRIVACYREQUIRED",
-        ResponseCode::ContactAdmin => "CONTACTADMIN",
-        ResponseCode::NoPerm => "NOPERM",
-        ResponseCode::InUse => "INUSE",
-        ResponseCode::ExpungeIssued => "EXPUNGEISSUED",
-        ResponseCode::Corruption => "CORRUPTION",
-        ResponseCode::ServerBug => "SERVERBUG",
-        ResponseCode::ClientBug => "CLIENTBUG",
-        ResponseCode::Cannot => "CANNOT",
-        ResponseCode::Limit => "LIMIT",
-        ResponseCode::OverQuota => "OVERQUOTA",
-        ResponseCode::AlreadyExists => "ALREADYEXISTS",
-        ResponseCode::NonExistent => "NONEXISTENT",
-        ResponseCode::NewName(_) => "NEWNAME",
-        ResponseCode::Referral(_) => "REFERRAL",
-        ResponseCode::UrlMech(_) => "URLMECH",
-        ResponseCode::BadUrl(_) => "BADURL",
-        ResponseCode::BadComparator(_) => "BADCOMPARATOR",
-        ResponseCode::Annotate(_) => "ANNOTATE",
-        ResponseCode::Annotations(_) => "ANNOTATIONS",
-        ResponseCode::TempFail(_) => "TEMPFAIL",
-        ResponseCode::MaxConvertMessages(_) => "MAXCONVERTMESSAGES",
-        ResponseCode::MaxConvertParts(_) => "MAXCONVERTPARTS",
-        ResponseCode::NoUpdate(_) => "NOUPDATE",
-        ResponseCode::NotificationOverflow(_) => "NOTIFICATIONOVERFLOW",
-        ResponseCode::BadEvent(_) => "BADEVENT",
-        ResponseCode::UndefinedFilter(_) => "UNDEFINED-FILTER",
-        ResponseCode::UidNotSticky => "UIDNOTSTICKY",
-        ResponseCode::NotSaved => "NOTSAVED",
-        ResponseCode::HasChildren => "HASCHILDREN",
-        ResponseCode::UnknownCte => "UNKNOWN-CTE",
-        ResponseCode::TooBig => "TOOBIG",
-        ResponseCode::CompressionActive => "COMPRESSIONACTIVE",
-        ResponseCode::UseAttr => "USEATTR",
-        ResponseCode::MetadataLongEntries(_) => "METADATA LONGENTRIES",
-        ResponseCode::MetadataMaxSize(_) => "METADATA MAXSIZE",
-        ResponseCode::MetadataTooMany => "METADATA TOOMANY",
-        ResponseCode::MetadataNoPrivate => "METADATA NOPRIVATE",
-        ResponseCode::Other { .. } => "OTHER",
-    }
 }
 
 /// Render parameterized response-code payloads as support-only diagnostic

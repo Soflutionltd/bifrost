@@ -32,10 +32,7 @@ use super::blobs;
 use super::blobs::{content_disposition_inline, content_id_value};
 use super::error;
 use super::flags;
-use super::flags::{
-    ARCHIVE_ID, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_TRASH, LABEL_UNREAD,
-    is_archive_id,
-};
+use super::flags::{ARCHIVE_ID, LABEL_TRASH, LABEL_UNREAD, is_archive_id};
 #[cfg(test)]
 use super::query::container_query;
 use super::query::filter_query;
@@ -839,14 +836,7 @@ fn archive_container() -> Container {
 }
 
 fn container_from_label(label: &GmailLabel) -> Container {
-    let role = match label.id.to_ascii_uppercase().as_str() {
-        LABEL_INBOX => Some(FolderRole::Inbox),
-        LABEL_SENT => Some(FolderRole::Sent),
-        LABEL_DRAFT => Some(FolderRole::Drafts),
-        LABEL_TRASH => Some(FolderRole::Trash),
-        LABEL_SPAM => Some(FolderRole::Spam),
-        _ => None,
-    };
+    let role = flags::GmailLabelId::parse(&label.id).role();
     // Gmail is personal-only and has no per-folder ACL / subscription
     // model, so namespace / owner / rights / subscription all stay at
     // their `Container::new` defaults.
@@ -868,7 +858,7 @@ fn container_from_label(label: &GmailLabel) -> Container {
     // `type == "system"` bit through so the consumer can reproduce
     // Gmail's system-label-as-folder split, which `role` alone
     // (INBOX/SENT/DRAFT/TRASH/SPAM only) cannot.
-    .with_system(label_is_system(label))
+    .with_system(label.is_system())
 }
 
 /// Map a Gmail label `color` object into a `ContainerStyle`. Yields
@@ -883,14 +873,6 @@ fn style_from_label_color(color: Option<&GmailLabelColor>) -> Option<ContainerSt
         color_bg: bg,
         color_fg: fg,
     })
-}
-
-/// True iff Gmail marks the label `type == "system"`.
-fn label_is_system(label: &GmailLabel) -> bool {
-    label
-        .label_type
-        .as_deref()
-        .is_some_and(|label_type| label_type == "system")
 }
 
 async fn message_from_gmail(
@@ -1617,6 +1599,7 @@ mod tests {
     use bytes::Bytes;
     use reqwest::StatusCode;
 
+    use super::super::flags::{LABEL_INBOX, LABEL_SPAM};
     use super::super::scopes::{ScopeCacheState, ScopeSnapshot, snapshot};
     use super::*;
 
@@ -1625,7 +1608,7 @@ mod tests {
             labels: vec![GmailLabel {
                 id: "Label_1".to_string(),
                 name: "Work".to_string(),
-                label_type: Some("user".to_string()),
+                label_type: Some(crate::types::GmailLabelType::User),
                 color: None,
             }],
             fetched_at: Some(Instant::now()),
@@ -1950,7 +1933,7 @@ mod tests {
         let label = GmailLabel {
             id: LABEL_INBOX.to_string(),
             name: "Inbox".to_string(),
-            label_type: Some("system".to_string()),
+            label_type: Some(crate::types::GmailLabelType::System),
             color: None,
         };
         let container = container_from_label(&label);
@@ -1988,13 +1971,13 @@ mod tests {
         let system = GmailLabel {
             id: "CATEGORY_PROMOTIONS".to_string(),
             name: "Promotions".to_string(),
-            label_type: Some("system".to_string()),
+            label_type: Some(crate::types::GmailLabelType::System),
             color: None,
         };
         let user = GmailLabel {
             id: "Label_42".to_string(),
             name: "Work".to_string(),
-            label_type: Some("user".to_string()),
+            label_type: Some(crate::types::GmailLabelType::User),
             color: None,
         };
         // A CATEGORY_* label has no `role` yet is a Gmail system label:

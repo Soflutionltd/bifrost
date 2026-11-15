@@ -165,23 +165,17 @@ impl PushLanes {
         generation: crate::types::AccountGeneration,
         pending: &mut VecDeque<ReopenRequest>,
     ) -> (Duration, bool, bool) {
-        match recovery::plan_recovery(error.clone()) {
-            RecoveryPlan::Retry(a) => {
-                recovery::record_throttle(&self.throttles, &self.account_id, &a, &error);
-                (
-                    recovery::retry_delay(&a, SystemTime::now(), Duration::ZERO),
-                    false,
-                    false,
-                )
-            }
-            RecoveryPlan::Reconcile(a) => {
-                recovery::record_reconcile_throttle(&self.throttles, &self.account_id, &a, &error);
-                (
-                    recovery::reconcile_delay(&a, SystemTime::now(), Duration::ZERO),
-                    false,
-                    false,
-                )
-            }
+        match recovery::dispatch_stream_failure(error.clone(), &self.throttles, &self.account_id) {
+            RecoveryPlan::Retry(a) => (
+                recovery::retry_delay(&a, SystemTime::now(), Duration::ZERO),
+                false,
+                false,
+            ),
+            RecoveryPlan::Reconcile(a) => (
+                recovery::reconcile_delay(&a, SystemTime::now(), Duration::ZERO),
+                false,
+                false,
+            ),
             RecoveryPlan::Engine(d) => {
                 let restart = matches!(d, EngineDirective::RestartAccount);
                 pending.push_back(ReopenRequest::PushRecovery {
@@ -411,7 +405,7 @@ impl PushLanes {
                             return backoff.failures();
                         }
                         if !self
-                            .wait(Duration::from_secs(30), &mut pending, &stop, &mut boundary)
+                            .wait(recovery::REOPEN_WAIT, &mut pending, &stop, &mut boundary)
                             .await
                         {
                             return backoff.failures();

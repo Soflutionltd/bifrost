@@ -324,7 +324,7 @@ async fn run_qresync(
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, expected_uidvalidity, uidvalidity)?;
     debug_assert!(known_uids_complete);
-    if selected.mailbox.no_mod_seq || selected.mailbox.highest_mod_seq.is_none() {
+    if selected.mailbox.modseq().is_none() {
         send_strategy_downgrade(
             &tx,
             SyncStrategy::QResync,
@@ -343,7 +343,11 @@ async fn run_qresync(
         )
         .await;
     }
-    validate_modseq_not_reset(&folder, modseq, selected.mailbox.highest_mod_seq)?;
+    validate_modseq_not_reset(
+        &folder,
+        modseq,
+        selected.mailbox.modseq().map(crate::types::ModSeq::get),
+    )?;
     // The SELECT did not use QRESYNC: the account policy was withdrawn
     // between the gate above and building the SELECT, or this member does
     // not have QRESYNC enabled (its dial-time ENABLE was refused or not
@@ -473,7 +477,7 @@ async fn run_condstore_with_baseline(
     if !known_uids_complete {
         return Err(super::error::incomplete_uid_baseline(&folder).into());
     }
-    if selected.mailbox.no_mod_seq || selected.mailbox.highest_mod_seq.is_none() {
+    if selected.mailbox.modseq().is_none() {
         send_strategy_downgrade(
             &tx,
             SyncStrategy::Condstore,
@@ -492,7 +496,11 @@ async fn run_condstore_with_baseline(
         )
         .await;
     }
-    validate_modseq_not_reset(&folder, modseq, selected.mailbox.highest_mod_seq)?;
+    validate_modseq_not_reset(
+        &folder,
+        modseq,
+        selected.mailbox.modseq().map(crate::types::ModSeq::get),
+    )?;
     run_condstore_from_selected(
         account,
         folder,

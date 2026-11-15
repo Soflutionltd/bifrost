@@ -55,7 +55,7 @@ pub(crate) struct RecoveryContext<'a> {
 
 /// Dispatch an `AccountError` to the engine's recovery machinery.
 ///
-/// Routes through `plan_recovery` so the closed `RecoveryPlan` enum
+/// Routes through `dispatch_stream_failure` so the closed `RecoveryPlan` enum
 /// drives the dispatch. The `scope` argument is the worker's
 /// convenience-suggested scope: scope-bound directives use the
 /// directive's own scope when present; account-wide directives ignore
@@ -73,10 +73,11 @@ pub(crate) async fn handle_account_error(
     scope: Option<CursorScope>,
     error: AccountError,
 ) -> RecoveryFollowUp {
-    use crate::recovery::{RecoveryPlan, plan_recovery};
+    use crate::recovery::RecoveryPlan;
     // Clone so we can log structured fields after dispatch consumes
     // the value.
-    let plan = plan_recovery(error.clone());
+    let plan =
+        crate::recovery::dispatch_stream_failure(error.clone(), ctx.throttles, ctx.account_id);
     let mut deferred = RecoveryFollowUp::None;
     match plan {
         RecoveryPlan::Retry(advice) => {
@@ -86,7 +87,6 @@ pub(crate) async fn handle_account_error(
             // after such a sleep, and blocking this task would hold
             // RestartScope / RestartAccount requests behind an inert
             // provider Retry-After delay.
-            apply_throttle(ctx, &advice, &error);
             tracing::debug!(
                 target: "bifrost.sync.recovery",
                 account = ?ctx.account_id,
@@ -96,12 +96,6 @@ pub(crate) async fn handle_account_error(
             );
         }
         RecoveryPlan::Reconcile(advice) => {
-            crate::recovery::record_reconcile_throttle(
-                ctx.throttles,
-                ctx.account_id,
-                &advice,
-                &error,
-            );
             // The poll loop / push reconciler perform the actual probe;
             // if we reach this branch via the reopen listener their
             // next pass owns the reconcile. Surface the actions for
@@ -146,7 +140,11 @@ pub(crate) async fn handle_account_error(
             deferred = handle_engine_directive(ctx, scope, directive, error).await;
         }
         RecoveryPlan::Terminal(fatal) => {
-            // Broadcast already carried the terminating event. Emit a
+            // Deferred inventory returns FusionOutcome::Terminated only after
+            // fusion (including forward_inventory_batch) publishes the error.
+            // Other producers send only Engine directives here. Publishing a
+            // terminal again would duplicate the consumer's notification.
+            // Keep this entry effect-free for terminal advice. Emit a
             // `TelemetryView` structured log so dashboards pivot on
             // stable fields rather than `?debug` text.
             let err = fatal.as_ref();
@@ -167,15 +165,6 @@ pub(crate) async fn handle_account_error(
         }
     }
     deferred
-}
-
-/// Record any provider-documented throttle scope on the engine's
-/// shared `ThrottleBucket`, resolving the key from the identities the
-/// classified error carries (`ErrorScope::Mailbox`, provider).
-/// `CurrentOperation` is a per-call hint and never enters the bucket
-/// (the originating caller owns any inline delay).
-fn apply_throttle(ctx: &RecoveryContext<'_>, advice: &RetryAdvice, error: &AccountError) {
-    crate::recovery::record_throttle(ctx.throttles, ctx.account_id, advice, error);
 }
 
 fn log_reconcile_advice(
@@ -1109,15 +1098,19 @@ async fn re_establish_scope_with_backoff(
                     message_key = err.message_key(),
                     "scope re-establishment failed"
                 );
-                // Dispatch the classified error through `plan_recovery`
+                // Dispatch the classified error through `dispatch_stream_failure`
                 // instead of blind-retrying every class three times: a
                 // scope-quarantine directive names its own action, and
                 // a terminal class cannot be repaired by another
                 // attempt - breaking out lands in the exhaustion tail
                 // below, which broadcasts `Terminated` plus the
                 // operator warning exactly as a spent budget would.
-                use crate::recovery::{RecoveryPlan, plan_recovery};
-                match plan_recovery(err.clone()) {
+                use crate::recovery::RecoveryPlan;
+                match crate::recovery::dispatch_stream_failure(
+                    err.clone(),
+                    ctx.throttles,
+                    ctx.account_id,
+                ) {
                     RecoveryPlan::Engine(EngineDirective::DisableScope(quarantined)) => {
                         disable_scope(ctx, quarantined).await;
                         return;

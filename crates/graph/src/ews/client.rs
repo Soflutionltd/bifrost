@@ -40,6 +40,7 @@ impl EwsExecute for EwsClient {
         let mut req = self
             .net
             .post(self.endpoint()?)
+            .hop_policy(std::sync::Arc::clone(&self.auth))
             .replay(bifrost_net::ReplayPolicy::Idempotent)
             .retry(policy)
             .header("Content-Type", "text/xml; charset=utf-8");
@@ -65,9 +66,11 @@ impl EwsClient {
     pub(crate) fn new(
         net: bifrost_net::AccountNet,
         ews_url: Result<crate::origin::AdmittedUrl, String>,
+        auth: std::sync::Arc<dyn bifrost_net::HopPolicy>,
     ) -> Self {
         Self {
             net,
+            auth,
             ews_url,
             tally: None,
         }
@@ -138,6 +141,7 @@ impl EwsClient {
         let mut req = self
             .net
             .post(self.endpoint()?)
+            .hop_policy(std::sync::Arc::clone(&self.auth))
             .replay(replay)
             .header("Content-Type", "text/xml; charset=utf-8");
         for (name, value) in headers.pairs() {

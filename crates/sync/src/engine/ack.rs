@@ -161,6 +161,17 @@ pub(super) async fn await_ack_writer_until(
     }
 }
 
+/// Bootstrap the writer's proof order before any producer is installed.
+/// Keep issuance in PendingCoverage so existing walk producers share one
+/// atomic sequence; the durable ledger, rather than attachment age, seeds it.
+pub(super) async fn restore_proof_order(
+    account_id: &AccountId,
+    store: &DynCheckpointStore,
+) -> Result<PendingCoverage, Error> {
+    let ledger = store.get_ledger(account_id).await?;
+    Ok(PendingCoverage::from_durable_ledger(&ledger))
+}
+
 /// Ack writer task. One per attached account. Receives `AckRequest`
 /// messages on `rx` and durably persists the carried checkpoint via
 /// the `CheckpointStore`. Notifies the control's checkpoint watch so

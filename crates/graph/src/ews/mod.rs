@@ -267,6 +267,7 @@ impl SoapFaultCode {
 
 pub(crate) struct EwsClient {
     net: AccountNet,
+    auth: std::sync::Arc<dyn bifrost_net::HopPolicy>,
     /// The admitted SOAP endpoint, or why the configured Outlook origin is
     /// unusable - in which case every request fails closed before any byte.
     ews_url: Result<crate::origin::AdmittedUrl, String>,

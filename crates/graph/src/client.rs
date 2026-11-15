@@ -116,6 +116,7 @@ struct ClientInner {
     cloud: MicrosoftCloud,
     rate_limit_host: String,
     token_source: Arc<dyn TokenSource>,
+    outlook_source: Option<bifrost_net::CoordinatedTokenSource>,
     mailbox_id: Option<String>,
     /// The primary mailbox's address (profile `mail`, else UPN), learned at
     /// `open`. Shared clients read the same slot to resolve primary aliases;
@@ -516,6 +517,7 @@ impl GraphClient {
                 },
                 rate_limit_host,
                 token_source: source,
+                outlook_source: None,
                 mailbox_id: None,
                 primary_address: Arc::new(RwLock::new(None)),
                 primary_account: Arc::new(RwLock::new(None)),
@@ -549,6 +551,7 @@ impl GraphClient {
                 },
                 rate_limit_host,
                 token_source,
+                outlook_source: None,
                 mailbox_id: None,
                 primary_address: Arc::new(RwLock::new(None)),
                 primary_account: Arc::new(RwLock::new(Some(net.account().0.clone()))),
@@ -707,6 +710,34 @@ impl GraphClient {
         self.inner.cloud.outlook.admit(target)
     }
 
+    /// Supply the OAuth source for the configured Outlook service audience.
+    /// Configure this before opening accounts; endpoint selection does not
+    /// acquire or exchange the Graph token for an Exchange token.
+    #[must_use]
+    pub fn with_outlook_source(&self, source: Arc<dyn TokenSource>) -> Self {
+        let mut client = self.with_outlook_base(self.inner.cloud.outlook.as_str());
+        Arc::get_mut(&mut client.inner)
+            .expect("new client is exclusive")
+            .outlook_source = Some(bifrost_net::coordinate(source));
+        client
+    }
+
+    pub(crate) fn outlook_auth(&self) -> Arc<dyn bifrost_net::HopPolicy> {
+        // A user enabling Exchange expects its own credential to be used.
+        // A missing source must never disclose a Graph token to another origin.
+        Arc::new(OutlookAuth {
+            base: self.inner.cloud.outlook.clone(),
+            source: self.inner.outlook_source.clone().or_else(|| {
+                self.inner
+                    .cloud
+                    .graph
+                    .admit(self.inner.cloud.outlook.as_str())
+                    .ok()
+                    .map(|_| bifrost_net::coordinate(Arc::clone(&self.inner.token_source)))
+            }),
+        })
+    }
+
     /// Override the Autodiscover / EWS base while retaining the Graph base.
     /// Named Microsoft clouds already pair the two surfaces; this also supports
     /// custom deployments whose service endpoints live on different origins.
@@ -723,6 +754,7 @@ impl GraphClient {
                 },
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
+                outlook_source: self.inner.outlook_source.clone(),
                 mailbox_id: self.inner.mailbox_id.clone(),
                 primary_address: Arc::clone(&self.inner.primary_address),
                 primary_account: Arc::clone(&self.inner.primary_account),
@@ -894,6 +926,7 @@ impl GraphClient {
                 cloud: self.inner.cloud.clone(),
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
+                outlook_source: self.inner.outlook_source.clone(),
                 mailbox_id: Some(mailbox_id.into().to_ascii_lowercase()),
                 primary_address: Arc::clone(&self.inner.primary_address),
                 primary_account: Arc::clone(&self.inner.primary_account),
@@ -1338,7 +1371,9 @@ impl GraphClient {
         self.record_aux(method.as_str(), url, headers, bearer, &body);
         let account_net = self.attached_net()?;
         let mut builder = account_net.request(method, url);
-        if !bearer {
+        if bearer {
+            builder = builder.hop_policy(self.outlook_auth());
+        } else {
             // An anonymous target was admitted under the upload rule, which
             // the transport's redirect walk cannot apply to a hop: following
             // one would send the chunk (and a URL that is itself the
@@ -1798,6 +1833,35 @@ fn check_response_status(response: RestResponse) -> Result<(), GraphError> {
     Err(GraphError::Response(err))
 }
 
+/// Exchange credentials are resolved only after exact configured-origin admission.
+struct OutlookAuth {
+    base: Base,
+    source: Option<bifrost_net::CoordinatedTokenSource>,
+}
+
+impl bifrost_net::HopPolicy for OutlookAuth {
+    fn admit(
+        &self,
+        _prior: Option<&reqwest::Url>,
+        next: &reqwest::Url,
+    ) -> Result<bifrost_net::HopCredential, bifrost_net::Error> {
+        self.base
+            .admit(next.as_str())
+            .map_err(|reason| bifrost_net::Error::InvalidRequest {
+                field: "outlook_origin",
+                detail: reason.to_string(),
+            })?;
+        let source = self
+            .source
+            .clone()
+            .ok_or_else(|| bifrost_net::Error::InvalidRequest {
+                field: "outlook_source",
+                detail: "Exchange requests require an Outlook-audience token source".into(),
+            })?;
+        Ok(bifrost_net::HopCredential::Bearer(source))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1885,6 +1949,106 @@ mod tests {
         assert_eq!(client.access_token().await, "old-token");
         source.set(AccessToken::new("new-token", None));
         assert_eq!(client.access_token().await, "new-token");
+    }
+
+    #[tokio::test]
+    async fn outlook_credentials_survive_derivation_without_replacing_graph_credentials() {
+        let source = StaticTokenSource::new("exchange-token", None);
+        let client = GraphClient::new("graph-token").with_outlook_source(Arc::new(source.clone()));
+        let derived = client
+            .for_shared_mailbox("shared@example.com")
+            .with_outlook_base(OUTLOOK_BASE)
+            .metered()
+            .0;
+        let url = reqwest::Url::parse("https://outlook.office365.com/EWS/Exchange.asmx")
+            .expect("fixture URL");
+        let policy = derived.outlook_auth();
+        let bifrost_net::HopCredential::Bearer(selected) =
+            policy.admit(None, &url).expect("configured Outlook source")
+        else {
+            panic!("Outlook must select a bearer source");
+        };
+        assert_eq!(
+            selected.current().await.expect("token").as_str(),
+            "exchange-token"
+        );
+        source.set(bifrost_net::AccessToken::new(
+            "rotated-exchange-token",
+            None,
+        ));
+        assert_eq!(
+            selected.current().await.expect("rotated token").as_str(),
+            "rotated-exchange-token"
+        );
+        assert_eq!(client.access_token().await, "graph-token");
+        let foreign =
+            reqwest::Url::parse("https://graph.microsoft.com/v1.0/me").expect("fixture URL");
+        assert!(policy.admit(Some(&url), &foreign).is_err());
+    }
+
+    #[tokio::test]
+    async fn autodiscover_wire_uses_outlook_source() {
+        let client = GraphClient::new("graph-token")
+            .with_outlook_source(Arc::new(StaticTokenSource::new("exchange-token", None)));
+        client.script_aux([ScriptedRestResponse::text(
+            reqwest::StatusCode::OK,
+            "<root/>",
+        )]);
+        let url = client
+            .admit_outlook_target("https://outlook.office365.com/autodiscover/autodiscover.xml")
+            .expect("configured origin");
+        client
+            .execute_aux(
+                reqwest::Method::POST,
+                AuxTarget::Bearer(&url),
+                &[],
+                Bytes::new(),
+                None,
+                bifrost_net::ReplayPolicy::Idempotent,
+            )
+            .await
+            .expect("scripted response");
+        let requests = client.rest_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get(reqwest::header::AUTHORIZATION)
+                .expect("bearer"),
+            "Bearer exchange-token"
+        );
+    }
+
+    #[test]
+    fn separate_outlook_origin_requires_its_own_source() {
+        let client = GraphClient::new("graph-token");
+        let url = reqwest::Url::parse("https://outlook.office365.com/EWS/Exchange.asmx")
+            .expect("fixture URL");
+        assert!(matches!(
+            client.outlook_auth().admit(None, &url),
+            Err(bifrost_net::Error::InvalidRequest {
+                field: "outlook_source",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_origin_exchange_retains_single_service_source() {
+        let client = GraphClient::with_api_base("https://mail.example.com/v1.0", "single-token");
+        let url =
+            reqwest::Url::parse("https://mail.example.com/EWS/Exchange.asmx").expect("fixture URL");
+        let bifrost_net::HopCredential::Bearer(source) = client
+            .outlook_auth()
+            .admit(None, &url)
+            .expect("same service origin")
+        else {
+            panic!("same service must select a bearer source");
+        };
+        assert_eq!(
+            source.current().await.expect("token").as_str(),
+            "single-token"
+        );
     }
 
     #[test]

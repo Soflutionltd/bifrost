@@ -863,7 +863,8 @@ pub enum ImapResponseCode {
 }
 
 impl ImapResponseCode {
-    fn code(&self) -> &str {
+    /// Response-code name, retaining the server spelling for unknown codes.
+    pub fn code(&self) -> &str {
         match self {
             Self::Alert => "ALERT",
             Self::BadCharset => "BADCHARSET",
@@ -938,15 +939,26 @@ pub struct EnhancedStatusCode {
     /// lives in the `enhanced` field as a `DiagnosticText`.
     pub reply: u16,
     pub enhanced: Option<DiagnosticText>,
+    /// Non-secret enhanced status components: (class, subject, detail).
+    /// Consumers can inspect these without reading consent-tier diagnostics.
+    pub components: Option<(u8, u16, u16)>,
     pub text: Option<DiagnosticText>,
 }
 
 impl EnhancedStatusCode {
     #[must_use]
-    pub fn new(reply: u16, enhanced: Option<DiagnosticText>, text: Option<DiagnosticText>) -> Self {
+    pub fn new(
+        reply: u16,
+        components: Option<(u8, u16, u16)>,
+        text: Option<DiagnosticText>,
+    ) -> Self {
+        let enhanced = components.map(|(class, subject, detail)| {
+            DiagnosticText::support_only(format!("{class}.{subject}.{detail}"))
+        });
         Self {
             reply,
             enhanced,
+            components,
             text,
         }
     }

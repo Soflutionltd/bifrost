@@ -439,7 +439,7 @@ async fn open_folder_for_mutation(
                 .saturating_sub(previous_bytes_in),
             error,
         })?;
-    let has_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
+    let has_modseq = selected.mailbox.modseq().is_some();
     Ok((conn, uidvalidity, previous_bytes_in, has_modseq))
 }
 

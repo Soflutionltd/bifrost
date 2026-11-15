@@ -774,7 +774,7 @@ pub enum ReopenRequest {
 /// that exhausts its retry budget, or that is queued behind a pause, produces
 /// no generation change at all, so an unbounded wait would park the reader for
 /// the process lifetime and silently stop folder/label lifecycle observation.
-const LIFECYCLE_REOPEN_WAIT: Duration = Duration::from_secs(30);
+const LIFECYCLE_REOPEN_WAIT: Duration = crate::recovery::REOPEN_WAIT;
 
 /// Lifecycle-stream termination policy.
 ///
@@ -813,18 +813,17 @@ fn lifecycle_retry_wait(
     throttles: &StdMutex<crate::recovery::ThrottleBucket>,
     account_id: &AccountId,
 ) -> Duration {
-    use crate::recovery::{RecoveryPlan, plan_recovery};
+    use crate::recovery::RecoveryPlan;
     let now = std::time::SystemTime::now();
-    let hint = match plan_recovery(error.clone()) {
+    let hint = match crate::recovery::dispatch_stream_failure(error.clone(), throttles, account_id)
+    {
         RecoveryPlan::Retry(advice) => {
-            crate::recovery::record_throttle(throttles, account_id, &advice, error);
             // Account requests own token refresh through their transport. There
             // is no engine token source to refresh here; reconnect retries the
             // read through that same authenticated request funnel.
             crate::recovery::retry_delay(&advice, now, fallback)
         }
         RecoveryPlan::Reconcile(advice) => {
-            crate::recovery::record_reconcile_throttle(throttles, account_id, &advice, error);
             // Lifecycle reads have no mutation target to reconcile. Retry the
             // uncommitted read, preserving its provider-owned diff baseline.
             crate::recovery::reconcile_delay(&advice, now, fallback)
@@ -1851,8 +1850,8 @@ async fn handle_drive_outcome(
             exit: None,
         },
         Ok(ChangesEvent::Terminated(error)) => {
-            use crate::recovery::{RecoveryPlan, plan_recovery, retry_delay};
-            // Dispatch via `plan_recovery` so the closed `RecoveryPlan`
+            use crate::recovery::{RecoveryPlan, retry_delay};
+            // Dispatch via `dispatch_stream_failure` so the closed `RecoveryPlan`
             // drives the branch. Retry and reconcile keep the poll
             // loop alive; engine directives hand off to the reopen
             // listener carrying the original account error; terminal
@@ -1861,17 +1860,16 @@ async fn handle_drive_outcome(
             // along on the engine directive arm; we clone it before
             // planning.
             let original = error.clone();
-            match plan_recovery(error) {
+            match crate::recovery::dispatch_stream_failure(error, throttles, account_id) {
                 RecoveryPlan::Retry(advice) => {
                     // Share any provider-documented throttle deadline
                     // with sibling scopes (and, via tenant/provider
                     // keys, sibling accounts) before sleeping it off
                     // locally.
-                    crate::recovery::record_throttle(throttles, account_id, &advice, &original);
                     let delay = retry_delay(
                         &advice,
                         std::time::SystemTime::now(),
-                        std::time::Duration::from_secs(1),
+                        crate::recovery::HINTLESS_RETRY_WAIT,
                     );
                     tokio::select! {
                         () = shutdown.cancelled() => return retired(),
@@ -1884,9 +1882,6 @@ async fn handle_drive_outcome(
                     }
                 }
                 RecoveryPlan::Reconcile(advice) => {
-                    crate::recovery::record_reconcile_throttle(
-                        throttles, account_id, &advice, &original,
-                    );
                     // A read stream's reconcile collapses to "rerun
                     // this scope soon". Sleep briefly so we do not
                     // hot-spin, then re-enter the poll loop. The
@@ -1897,7 +1892,7 @@ async fn handle_drive_outcome(
                     let delay = crate::recovery::reconcile_delay(
                         &advice,
                         std::time::SystemTime::now(),
-                        std::time::Duration::from_secs(1),
+                        crate::recovery::HINTLESS_RETRY_WAIT,
                     );
                     tokio::select! {
                         () = shutdown.cancelled() => return retired(),
@@ -1911,6 +1906,7 @@ async fn handle_drive_outcome(
                 }
                 RecoveryPlan::Engine(directive) => {
                     let directive_scope = directive.target_scope();
+                    let account_wide = directive_scope.is_none();
                     let request = ReopenRequest::Recovery {
                         scope: directive_scope,
                         error: original,
@@ -1931,6 +1927,15 @@ async fn handle_drive_outcome(
                         biased;
                         () = shutdown.cancelled() => return retired(),
                         _ = reopen_tx.send(request) => {}
+                    }
+                    if account_wide {
+                        // Match the reconciler's bounded handoff: avoid driving
+                        // the old account while its directive is being handled.
+                        tokio::select! {
+                            () = shutdown.cancelled() => return retired(),
+                            () = scope_cancel.cancelled() => return retired(),
+                            () = tokio::time::sleep(crate::recovery::REOPEN_WAIT) => {}
+                        }
                     }
                     DriveRecovery {
                         advanced: false,
@@ -2506,7 +2511,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn account_error_from_driver_routes_through_recovery_plan() {
         let scope = CursorScope::Account;
         let cursors = CursorRegistry::new();

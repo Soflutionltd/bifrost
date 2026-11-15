@@ -342,8 +342,7 @@ impl ImapAccount {
         let uidvalidity = selected_uidvalidity(selected)?;
         let known_uids = known_uids.unwrap_or_default();
         if self.qresync_enabled()
-            && let Some(modseq) = selected.highest_mod_seq
-            && !selected.no_mod_seq
+            && let Some(modseq) = selected.modseq().map(crate::types::ModSeq::get)
         {
             return Ok(FolderCursor::QResync {
                 uidvalidity,
@@ -352,9 +351,7 @@ impl ImapAccount {
                 known_uids_complete: true,
             });
         }
-        if let Some(modseq) = selected.highest_mod_seq
-            && !selected.no_mod_seq
-        {
+        if let Some(modseq) = selected.modseq().map(crate::types::ModSeq::get) {
             return Ok(FolderCursor::Condstore {
                 uidvalidity,
                 modseq,
@@ -1126,7 +1123,9 @@ fn unsupported_stream<T: Send + 'static>(
 ///
 /// The server must send it (RFC 3501 6.3.1, RFC 9051 6.3.2), and the
 /// connection layer hands the account layer an `Option` so this is where the
-/// omission is judged. It is the SERVER's omission, so it is
+/// omission is judged. Zero is also unusable, even for a locally constructed
+/// selection that bypasses the SELECT consumer's completion validation.
+/// It is the SERVER's omission, so it is
 /// `Error::ProtocolMissing` (`Protocol(MissingField)`,
 /// `ProviderContractViolation`) at every account-layer read, never a
 /// caller-blaming `Request(Malformed)`: the one place the classification
@@ -1134,7 +1133,8 @@ fn unsupported_stream<T: Send + 'static>(
 pub(crate) fn selected_uidvalidity(selected: &crate::types::SelectedMailbox) -> Result<u32, Error> {
     selected
         .uid_validity
-        .ok_or_else(|| Error::ProtocolMissing("SELECT missing UIDVALIDITY".into()))
+        .filter(|value| *value != 0)
+        .ok_or_else(|| Error::ProtocolMissing("SELECT missing or zero UIDVALIDITY".into()))
 }
 
 /// Convert a crate-private `crate::Error` into a public `AccountError`

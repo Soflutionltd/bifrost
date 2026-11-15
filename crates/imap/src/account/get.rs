@@ -305,7 +305,7 @@ async fn run_folder_get(
         let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
         GetError::Imap(err, bytes_in)
     })?;
-    let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
+    let include_modseq = selected.mailbox.modseq().is_some();
     let plan = projection_plan(projection, include_modseq).ok_or_else(|| {
         GetError::Account(super::error::unsupported(AccountOperation::Hydrate), 0)
     })?;

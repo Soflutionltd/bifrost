@@ -606,18 +606,17 @@ async fn upload_file_chunked_progress(
     let max_attempts = total
         .div_ceil(chunk_size)
         .saturating_add(GDRIVE_MAX_EXTRA_CHUNK_ATTEMPTS);
-    let mut attempts = 0usize;
+    let mut driver =
+        bifrost_net::resumable::UploadDriver::new(total, chunk_size, Some(max_attempts));
     while offset < total {
-        attempts = attempts.saturating_add(1);
-        if attempts > max_attempts {
-            return Err(Error::limit_exceeded_after_response(format!(
+        let window = driver.next_window(offset).map_err(|_| {
+            Error::limit_exceeded_after_response(format!(
                 "resumable upload exceeded {max_attempts} chunk attempts"
-            )));
-        }
-        let end = (offset + chunk_size).min(total);
-        *final_chunk = end == total;
-        let chunk = data.slice(offset..end);
-        let content_range = format!("bytes {offset}-{}/{total}", end - 1);
+            ))
+        })?;
+        *final_chunk = window.is_final();
+        let chunk = data.slice(window.start..window.end);
+        let content_range = window.content_range();
 
         // Redirects are never followed: the session URI is pre-authenticated
         // and admitted only as itself, so a hop would carry the payload
@@ -642,7 +641,11 @@ async fn upload_file_chunked_progress(
             .await?;
 
         let status = response.status().as_u16();
-        if response.status().is_redirection() && response.headers.contains_key("location") {
+        if bifrost_net::resumable::is_redirect(
+            status,
+            response.headers.contains_key("location"),
+            Some(308),
+        ) {
             return Err(redirect_refused("chunk upload", status));
         }
         match status {
@@ -655,37 +658,21 @@ async fn upload_file_chunked_progress(
                 return Ok(file.id);
             }
             308 => {
-                let resumed = parse_resume_offset(&response.headers)?;
-                if resumed > end {
-                    return Err(Error::provider_response(
-                        ProviderFault::ContractViolation,
-                        format!(
-                            "resumable 308 reports {resumed} bytes received after only {end} were sent"
+                offset = window.resume_with(
+                    || parse_resume_offset(&response.headers),
+                    bifrost_net::resumable::NoProgress::LocalLimit,
+                    |refusal| match refusal {
+                        bifrost_net::resumable::UploadRefusal::NoProgress(_) => {
+                            Error::limit_exceeded_after_response(format!(
+                                "resumable 308 made no progress from {offset}; refusing to resend without progress"
+                            ))
+                        }
+                        _ => Error::provider_response(
+                            ProviderFault::ContractViolation,
+                            format!("resumable 308 supplied an invalid resume offset: {refusal:?}"),
                         ),
-                    ));
-                }
-                if resumed < offset {
-                    return Err(Error::provider_response(
-                        ProviderFault::ContractViolation,
-                        format!(
-                            "resumable 308 reports {resumed} bytes received, fewer than the {offset} it already reported"
-                        ),
-                    ));
-                }
-                if resumed == offset {
-                    return Err(Error::limit_exceeded_after_response(format!(
-                        "resumable 308 made no progress from {offset}; refusing to resend without progress"
-                    )));
-                }
-                if resumed == total {
-                    return Err(Error::provider_response(
-                        ProviderFault::ContractViolation,
-                        format!(
-                            "resumable 308 reports all {total} bytes received but did not complete the upload"
-                        ),
-                    ));
-                }
-                offset = resumed;
+                    },
+                )?;
                 *chunks += 1;
             }
             _ => {
@@ -701,15 +688,15 @@ async fn upload_file_chunked_progress(
     ))
 }
 
-/// A 3xx carrying a `Location` against the pre-authenticated session URI: a
-/// real redirect, which the resumable protocol never uses (its 308 carries no
+/// A 3xx other than a locationless 308 against the session URI: a
+/// redirect, which the resumable protocol never uses (its 308 carries no
 /// `Location`). The provider broke the protocol, and the complete response
 /// makes it acknowledged. The `Location` is deliberately not echoed: it is
 /// server-chosen and may itself carry credentials.
 fn redirect_refused(leg: &str, status: u16) -> Error {
     Error::provider_response(
         ProviderFault::ContractViolation,
-        format!("resumable {leg} answered {status} with a Location; redirects are not followed"),
+        format!("resumable {leg} answered redirect status {status}; redirects are not followed"),
     )
 }
 

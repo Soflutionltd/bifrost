@@ -778,6 +778,81 @@ pub(crate) struct ListStatusEntry {
     pub(crate) status: Vec<StatusItem>,
 }
 
+// The protocol type owns projection into the shared diagnostic vocabulary.
+impl From<&ResponseCode> for bifrost_types::ImapResponseCode {
+    fn from(code: &ResponseCode) -> Self {
+        use bifrost_types::{DiagnosticText, ImapResponseCode};
+        match code {
+            ResponseCode::Alert => ImapResponseCode::Alert,
+            ResponseCode::BadCharset(_) => ImapResponseCode::BadCharset,
+            ResponseCode::Capability(_) => ImapResponseCode::Capability,
+            ResponseCode::Parse => ImapResponseCode::Parse,
+            ResponseCode::PermanentFlags(_) => ImapResponseCode::PermanentFlags,
+            ResponseCode::ReadOnly => ImapResponseCode::ReadOnly,
+            ResponseCode::ReadWrite => ImapResponseCode::ReadWrite,
+            ResponseCode::TryCreate => ImapResponseCode::TryCreate,
+            ResponseCode::UidNext(_) => ImapResponseCode::UidNext,
+            ResponseCode::UidValidity(_) => ImapResponseCode::UidValidity,
+            ResponseCode::Unseen(_) => ImapResponseCode::Unseen,
+            ResponseCode::AppendUid { .. } => ImapResponseCode::AppendUid,
+            ResponseCode::CopyUid { .. } => ImapResponseCode::CopyUid,
+            ResponseCode::HighestModSeq(_) => ImapResponseCode::HighestModSeq,
+            ResponseCode::Modified(_) => ImapResponseCode::Modified,
+            ResponseCode::NoModSeq => ImapResponseCode::NoModSeq,
+            ResponseCode::Closed => ImapResponseCode::Closed,
+            ResponseCode::MailboxId(_) => ImapResponseCode::MailboxId,
+            ResponseCode::Unavailable => ImapResponseCode::Unavailable,
+            ResponseCode::AuthenticationFailed => ImapResponseCode::AuthenticationFailed,
+            ResponseCode::AuthorizationFailed => ImapResponseCode::AuthorizationFailed,
+            ResponseCode::Expired => ImapResponseCode::Expired,
+            ResponseCode::PrivacyRequired => ImapResponseCode::PrivacyRequired,
+            ResponseCode::ContactAdmin => ImapResponseCode::ContactAdmin,
+            ResponseCode::NoPerm => ImapResponseCode::NoPerm,
+            ResponseCode::InUse => ImapResponseCode::InUse,
+            ResponseCode::ExpungeIssued => ImapResponseCode::ExpungeIssued,
+            ResponseCode::Corruption => ImapResponseCode::Corruption,
+            ResponseCode::ServerBug => ImapResponseCode::ServerBug,
+            ResponseCode::ClientBug => ImapResponseCode::ClientBug,
+            ResponseCode::Cannot => ImapResponseCode::Cannot,
+            ResponseCode::Limit => ImapResponseCode::Limit,
+            ResponseCode::OverQuota => ImapResponseCode::OverQuota,
+            ResponseCode::AlreadyExists => ImapResponseCode::AlreadyExists,
+            ResponseCode::NonExistent => ImapResponseCode::NonExistent,
+            ResponseCode::NewName(_) => ImapResponseCode::NewName,
+            ResponseCode::Referral(_) => ImapResponseCode::Referral,
+            ResponseCode::UrlMech(_) => ImapResponseCode::UrlMech,
+            ResponseCode::BadUrl(_) => ImapResponseCode::BadUrl,
+            ResponseCode::BadComparator(_) => ImapResponseCode::BadComparator,
+            ResponseCode::Annotate(_) => ImapResponseCode::Annotate,
+            ResponseCode::Annotations(_) => ImapResponseCode::Annotations,
+            ResponseCode::TempFail(_) => ImapResponseCode::TempFail,
+            ResponseCode::MaxConvertMessages(_) => ImapResponseCode::MaxConvertMessages,
+            ResponseCode::MaxConvertParts(_) => ImapResponseCode::MaxConvertParts,
+            ResponseCode::NoUpdate(_) => ImapResponseCode::NoUpdate,
+            ResponseCode::NotificationOverflow(_) => ImapResponseCode::NotificationOverflow,
+            ResponseCode::BadEvent(_) => ImapResponseCode::BadEvent,
+            ResponseCode::UndefinedFilter(_) => ImapResponseCode::UndefinedFilter,
+            ResponseCode::UidNotSticky => ImapResponseCode::UidNotSticky,
+            ResponseCode::NotSaved => ImapResponseCode::NotSaved,
+            ResponseCode::HasChildren => ImapResponseCode::HasChildren,
+            ResponseCode::UnknownCte => ImapResponseCode::UnknownCte,
+            ResponseCode::TooBig => ImapResponseCode::TooBig,
+            ResponseCode::CompressionActive => ImapResponseCode::CompressionActive,
+            ResponseCode::UseAttr => ImapResponseCode::UseAttr,
+            ResponseCode::MetadataLongEntries(_) => ImapResponseCode::MetadataLongEntries,
+            ResponseCode::MetadataMaxSize(_) => ImapResponseCode::MetadataMaxSize,
+            ResponseCode::MetadataTooMany => ImapResponseCode::MetadataTooMany,
+            ResponseCode::MetadataNoPrivate => ImapResponseCode::MetadataNoPrivate,
+            ResponseCode::Other { name, value } => ImapResponseCode::Unknown {
+                code: name.clone(),
+                value: value
+                    .as_ref()
+                    .map(|v| DiagnosticText::support_only(v.clone())),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "response_tests.rs"]
 mod tests;

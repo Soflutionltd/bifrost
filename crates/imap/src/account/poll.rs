@@ -553,16 +553,9 @@ fn observation(
     if selected.uid_not_sticky {
         return Err(not_sticky(folder, op));
     }
-    let uid_validity = super::selected_uidvalidity(selected)
-        .ok()
-        .and_then(NonZeroU32::new)
-        .ok_or_else(|| {
-            folder_error(
-                Error::ProtocolMissing("SELECT missing or zero UIDVALIDITY".into()),
-                folder,
-                op,
-            )
-        })?;
+    let uid_validity =
+        super::selected_uidvalidity(selected).map_err(|error| folder_error(error, folder, op))?;
+    let uid_validity = nonzero(uid_validity);
     let uid_next = selected.uid_next.and_then(NonZeroU32::new).ok_or_else(|| {
         folder_error(
             Error::ProtocolMissing("SELECT missing or zero UIDNEXT".into()),

@@ -237,6 +237,83 @@ pub(crate) struct CoreCapabilities {
     collation_algorithms: Option<Vec<String>>,
 }
 
+/// Protocol-owned object batching limits. Account routing never changes these
+/// session-wide limits; foreign handles read their own session.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CoreLimits {
+    pub(crate) max_objects_in_get: usize,
+    pub(crate) max_objects_in_set: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CoreLimitsError {
+    Absent,
+    Malformed,
+    Unusable,
+}
+
+impl Session {
+    /// Decode required core fields before account probes. Keep absence separate
+    /// from malformed advertisements so the account boundary can choose reopen
+    /// versus contract violation without making a request-builder error.
+    pub(crate) fn validated_core_limits(&self) -> Result<CoreLimits, CoreLimitsError> {
+        let core = match self.core_capability_state() {
+            CoreCapabilityState::Absent => return Err(CoreLimitsError::Absent),
+            CoreCapabilityState::Malformed => return Err(CoreLimitsError::Malformed),
+            CoreCapabilityState::Present(core) => core,
+        };
+        let positive = |value: Option<usize>| {
+            value
+                .and_then(std::num::NonZeroUsize::new)
+                .ok_or(CoreLimitsError::Unusable)
+        };
+        positive(core.max_calls_in_request)?;
+        positive(core.max_size_request)?;
+        let max_objects_in_get = positive(core.max_objects_in_get)?.get();
+        let max_objects_in_set = positive(core.max_objects_in_set)?.get();
+        // Upload size and concurrency are unsigned, not positive integers.
+        // Empty-only uploads and serial scheduling are distinct policies,
+        // not disagreements about the same bound.
+        self.required_upload_size_limit()?;
+        if core.max_concurrent_upload.is_none()
+            || core.max_concurrent_requests.is_none()
+            || !core.has_collation_algorithms()
+        {
+            return Err(CoreLimitsError::Unusable);
+        }
+        Ok(CoreLimits {
+            max_objects_in_get,
+            max_objects_in_set,
+        })
+    }
+
+    pub(crate) fn required_upload_size_limit(&self) -> Result<usize, CoreLimitsError> {
+        match self.core_capability_state() {
+            CoreCapabilityState::Absent => Err(CoreLimitsError::Absent),
+            CoreCapabilityState::Malformed => Err(CoreLimitsError::Malformed),
+            CoreCapabilityState::Present(core) => {
+                core.max_size_upload.ok_or(CoreLimitsError::Unusable)
+            }
+        }
+    }
+
+    /// Conservative object batching for protocol handles used before validation.
+    /// Account opening validates first; no missing field becomes a dead default
+    /// on that path. Do not use another account's cached limits for a share.
+    pub(crate) fn object_limits(&self) -> CoreLimits {
+        let core = self.core_capabilities();
+        let positive_or_serial = |value: Option<usize>| value.unwrap_or(1).max(1);
+        CoreLimits {
+            max_objects_in_get: positive_or_serial(
+                core.and_then(CoreCapabilities::max_objects_in_get),
+            ),
+            max_objects_in_set: positive_or_serial(
+                core.and_then(CoreCapabilities::max_objects_in_set),
+            ),
+        }
+    }
+}
+
 /// An absent member defaults to `None`, while a present member must be an
 /// array. Using `Option<Vec<_>>::deserialize` directly would also accept JSON
 /// `null` as absence, even though RFC 8620 requires an array.

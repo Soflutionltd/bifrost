@@ -233,8 +233,7 @@ pub async fn drive_changes_stream(
         let mut publish = || {
             let expected = match (&control, &checkpoint) {
                 (Some(control), Some(checkpoint)) => {
-                    let publication =
-                        control.publish_checkpoint_without_report(checkpoint.clone());
+                    let publication = control.publish_checkpoint_without_report(checkpoint.clone());
                     me.publication = Some(publication.clone());
                     Some(publication)
                 }

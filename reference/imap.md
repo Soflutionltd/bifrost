@@ -792,7 +792,7 @@ mode, authoritative replacement on every poll, and generation-scoped object
 handles (hydration and mutations must not reuse ephemeral UIDs after another
 selection). This requires changes outside the IMAP account layer.
 
-`SelectedMailbox` carries `highest_mod_seq`, `uid_validity`, `uid_next`, `no_mod_seq`, and the SELECT-side VANISHED list. A missing `UIDVALIDITY` is a protocol error rather than a silent 0: the account layer judges it through one helper, `selected_uidvalidity`, at every site (sync lanes, PIM primitives, search, raw-body read), as `Error::ProtocolMissing` (`Protocol(MissingField)`, `ProviderContractViolation`) - the server's omission, never a caller-blaming `Request(Malformed)`. A tolerated `MODSEQ 0` in a FETCH response is ignored by the opportunistic STORE-guard cache; it does not fail the sync walk.
+`SelectedMailbox` carries `uid_validity`, `uid_next`, `modseq_support` (a `ModSeqSupport` of `Unknown`, `NoModSeq` or `Highest`, read through `modseq()`; `NOMODSEQ` or `HIGHESTMODSEQ 0` anywhere in the SELECT wins over any nonzero `HIGHESTMODSEQ`), and the SELECT-side VANISHED list. A zero `UIDVALIDITY` or `UIDNEXT` is recorded as absent. A missing or zero `UIDVALIDITY` is a protocol error rather than a silent 0: the account layer judges it through one helper, `selected_uidvalidity`, at every site (sync lanes, PIM primitives, search, raw-body read), as `Error::ProtocolMissing` (`Protocol(MissingField)`, `ProviderContractViolation`) - the server's omission, never a caller-blaming `Request(Malformed)`. A tolerated `MODSEQ 0` in a FETCH response is ignored by the opportunistic STORE-guard cache; it does not fail the sync walk.
 
 ## Account layer
 
@@ -1815,3 +1815,57 @@ Shared-folder PermissionDenied quarantine delegates to
 its source and retaining cause and diagnostic evidence. Losing a delegated folder
 must leave an enterprise Outlook user's own mailbox usable. Search page cursor
 refusals use `AccountError::invalid_page_cursor`: restart only the caller's walk.
+
+## OAuth lookup and response-code diagnostics
+
+IMAP and ManageSieve token lookups share `account::error::oauth_token_error`,
+which classifies through `bifrost_net::token_source_account_error` - the same
+owner SMTP's token lookup uses. The internal `Error::OAuthToken` retains net's preclassified `AccountError`;
+the account boundary decorates it with the caller's operation, provider and
+scope without inventing an IMAP acknowledgement. A token endpoint outage or
+lost refresh driver retains retry recovery; actual credential loss retains
+reauthorization recovery. An enterprise user with valid credentials expects
+an outage to retry without asking for a replacement password.
+
+`types::response` owns `From<&ResponseCode>` into `ImapResponseCode`.
+The latter's public `code()` owns diagnostic wire names. Both auth and status
+classification derive `native_code` from that projection, including the actual
+server name of an unknown extension response code.
+
+## Shared role and ACL classifiers
+
+`types/mailbox.rs::SpecialUse` owns SPECIAL-USE attribute classification and
+one name fallback table. `MailboxInfo::special_use` and the folder registry
+use it; the registry alone maps supported categories to `FolderRole` and
+chooses a personal account target. All, Flagged and Important have no unified
+folder role, but their attributes still suppress name fallback. Sent Items,
+Sent Mail, Deleted Items, Junk E-mail and Junk Mail are recognized aliases.
+Only exact INBOX is Inbox; NIL hierarchy delimiters remain flat.
+
+`types/acl.rs::MailboxRights::container_rights` owns the MYRIGHTS projection.
+Removal requires both `t` and `e`, matching the account's mark-and-expunge
+operation: enterprise users expect removal to complete. Virtual `c` and `d`
+remain preserved as wire observations but grant no authority. RFC 4314
+Section 2.1.1 explicitly requires clients to ignore these letters in MYRIGHTS,
+ACL and LISTRIGHTS responses; response-side expansion would invent grants
+because servers include a virtual letter when any member is present. The
+wire strings are retained: SETACL's optional +/- prefix is an operation,
+LISTRIGHTS groups express tied grants, and RIGHTS= advertises an alphabet,
+so these are not interchangeable with a granted MYRIGHTS set. Discovery
+parses MYRIGHTS once into MailboxRights; pim delegates its projection.
+
+## Selected mailbox numeric observations
+
+SELECT assembly normalizes zero UIDVALIDITY and UIDNEXT to absence. The
+completion validator already refuses missing or zero UIDVALIDITY, and the
+account helper also refuses zero for directly constructed selections. Raw
+response decoding retains wire numbers; accepting a wire sentinel does not
+make it a usable mailbox epoch. Enterprise users expect a server with an
+unusable epoch to fail before inventory publishes identities it cannot hydrate.
+
+`SelectedMailbox::modseq_support` is one `ModSeqSupport` state: Unknown,
+NoModSeq, or Highest with a nonzero value. `modseq()` supplies the typed
+`ModSeq` to consumers. NOMODSEQ and HIGHESTMODSEQ zero both deny support;
+that denial wins over contradictory positive codes in either order, including
+the tagged completion. Enterprise users expect conservative concurrency
+protection rather than guarded writes based on contradictory server metadata.

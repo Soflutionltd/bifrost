@@ -3886,7 +3886,9 @@ and the mutation campaigns (per-item outcomes and stream-level
 terminations) and their read-back (every per-item hydration failure the
 guard absorbs as uncertain, through the crate-internal
 run_object_readback path, plus a returned stream-level termination) funnel through
-`recovery::record_throttle` or
+`recovery::dispatch_stream_failure` (classified failures) or
+`recovery::observe_failure_throttles` (observation only), which record every
+primary, sibling and cleanup leg via `recovery::record_throttle` or
 `recovery::record_reconcile_throttle`, and the local sleep those arms
 observe comes from `recovery::retry_delay` /
 `recovery::reconcile_delay`, which honor the carried `RetryHint` and
@@ -4391,6 +4393,47 @@ fields and discharge fingerprints still use the same eight little-endian bytes;
 the ledger envelope remains version 9. Backfill completion progress still writes
 `items_done = observed + 1` (saturating) and `items_estimated = observed`.
 Publication segments and counters retain their existing packed representation.
-Proof order remains attachment-local: restoring durable proofs does not seed the
-next attachment's walk counter. The types do not change that ordering policy or
-add account identity to publication numbers.
+Before exposing registrations or starting producers, attach loads the durable
+ledger and seeds the coverage counter strictly above every retained entry,
+barrier, proof and compacted discharge audit generation. A failed load refuses
+attach and closes the opened account; it never starts an unseeded producer.
+The lifecycle guard excludes the preceding attachment's writer during this
+handoff. The writer still owns ledger mutations, while PendingCoverage issues
+walk numbers from that restored baseline. Delayed rediscovery cannot lower a
+debt or barrier generation. Exhaustion refuses to wrap the counter. The first
+covering walk after restart can therefore settle old debt, as a mail user
+expects, without waiting for an attachment-local counter to catch up.
+Publication numbers retain their separate instance identity.
+
+### Shared stream failure dispatch
+
+`recovery::dispatch_stream_failure` owns classification, structured recovery
+telemetry, throttle observation for primary/sibling/cleanup legs, and resolution
+of retry/reconcile hints. Hintless failures receive one second. It returns the
+closed `RecoveryPlan` with timed advice so campaigns retain disposition and
+read-back guidance. `observe_failure_throttles` also serves uncertain items and
+read-back failures without authorizing replay. Item classification observes the
+error once; its caller does not record it again.
+
+Transport reconnect backoff and lifecycle's 30-second minimum remain local:
+opening a failed long-poll proves no progress, and retrying at poll cadence can
+hammer the provider. An injected watch has no owned connection to reconnect;
+its retry becomes a warning after shared throttle observation. A reconciler
+without a shared hold leaves the next attempt to the ordinary poll cadence;
+with a hold it defers the scope without delaying unrelated scopes.
+
+`recovery::REOPEN_WAIT` is the shared 30-second bound for replacement handoff
+in poll drives, lifecycle, push supervision and reconciliation. Poll drives
+wait after account-wide directives instead of continuing on their old cadence.
+Scope repair retains cancellation through the scope token.
+
+Publication and incarnation stamping remain at the producer that owns delivery.
+Drive/fusion publishes termination before returning its recovery outcome;
+terminal poll recovery parks without publishing again. Deferred inventory also
+uses that published fusion outcome, so the reopen handler logs terminal advice
+without a second event. Engine-owned push and lifecycle publish their own
+terminal event. Injected watches remain unstamped because sampling the current
+connection could label an old event as belonging to its replacement. Terminal
+campaign items retain their accounting instead of stopping unrelated items.
+These differences preserve one notification and the actual failure's ownership,
+while shared dispatch prevents timing and throttle policy from drifting.

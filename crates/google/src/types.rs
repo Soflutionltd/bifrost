@@ -94,17 +94,36 @@ pub(crate) struct GmailThreadStub {
     pub(crate) id: String,
 }
 
+/// Native ownership, independent of the id vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum GmailLabelType {
+    User,
+    System,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GmailLabel {
     pub(crate) id: String,
     pub(crate) name: String,
     #[serde(rename = "type")]
-    pub(crate) label_type: Option<String>,
+    pub(crate) label_type: Option<GmailLabelType>,
     /// Label swatch, present only for user labels that have been
     /// assigned a color. Gmail omits it for uncolored / system labels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) color: Option<GmailLabelColor>,
+}
+
+impl GmailLabel {
+    /// True iff Gmail marks the label `type == "system"`. An absent or
+    /// unknown type is not system: callers that must protect a label treat
+    /// those conservatively through `flags::label_is_user` instead.
+    pub(crate) fn is_system(&self) -> bool {
+        self.label_type == Some(GmailLabelType::System)
+    }
 }
 
 /// Gmail label `color` object: a background / text color pair, each a

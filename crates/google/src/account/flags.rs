@@ -35,22 +35,97 @@ pub(crate) fn is_archive_id(id: &str) -> bool {
     id.eq_ignore_ascii_case(ARCHIVE_ID)
 }
 
-/// Known system ids and the synthetic archive are case-insensitive throughout
-/// the account. User ids retain their exact provider spelling.
+/// Known provider system labels; parsing is ASCII-case-insensitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemLabel {
+    Inbox,
+    Sent,
+    Draft,
+    Trash,
+    Spam,
+    Unread,
+    Starred,
+    Important,
+    Chat,
+}
+
+/// Parse known system ids once; opaque user ids retain their exact spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GmailLabelId<'a> {
+    System(SystemLabel),
+    Category(&'a str),
+    User(&'a str),
+}
+
+impl<'a> GmailLabelId<'a> {
+    pub(crate) fn parse(id: &'a str) -> Self {
+        for (name, system) in [
+            (LABEL_INBOX, SystemLabel::Inbox),
+            (LABEL_SENT, SystemLabel::Sent),
+            (LABEL_DRAFT, SystemLabel::Draft),
+            (LABEL_TRASH, SystemLabel::Trash),
+            (LABEL_SPAM, SystemLabel::Spam),
+            (LABEL_UNREAD, SystemLabel::Unread),
+            (LABEL_STARRED, SystemLabel::Starred),
+            (LABEL_IMPORTANT, SystemLabel::Important),
+            ("CHAT", SystemLabel::Chat),
+        ] {
+            if id.eq_ignore_ascii_case(name) {
+                return Self::System(system);
+            }
+        }
+        if id
+            .get(.."CATEGORY_".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CATEGORY_"))
+        {
+            Self::Category(id)
+        } else {
+            Self::User(id)
+        }
+    }
+
+    pub(crate) fn role(self) -> Option<bifrost_types::FolderRole> {
+        use bifrost_types::FolderRole;
+        match self {
+            Self::System(SystemLabel::Inbox) => Some(FolderRole::Inbox),
+            Self::System(SystemLabel::Sent) => Some(FolderRole::Sent),
+            Self::System(SystemLabel::Draft) => Some(FolderRole::Drafts),
+            Self::System(SystemLabel::Trash) => Some(FolderRole::Trash),
+            Self::System(SystemLabel::Spam) => Some(FolderRole::Spam),
+            _ => None,
+        }
+    }
+
+    fn is_writable(self) -> bool {
+        !matches!(self, Self::System(SystemLabel::Draft | SystemLabel::Sent))
+    }
+
+    fn flag(self) -> Option<GmailFlag<'a>> {
+        match self {
+            Self::System(SystemLabel::Starred) => Some(GmailFlag::Flagged),
+            Self::System(SystemLabel::Draft) => Some(GmailFlag::Draft),
+            Self::System(SystemLabel::Important) => Some(GmailFlag::Important),
+            Self::System(_) => None,
+            Self::Category(id) | Self::User(id) => Some(GmailFlag::Label {
+                id,
+                advisory_name: id,
+            }),
+        }
+    }
+}
+
 pub(crate) fn container_search_operator(id: &str) -> Option<&'static str> {
-    [
-        (LABEL_INBOX, "in:inbox"),
-        (LABEL_SENT, "in:sent"),
-        (LABEL_DRAFT, "in:drafts"),
-        (LABEL_TRASH, "in:trash"),
-        (LABEL_SPAM, "in:spam"),
-        (
-            ARCHIVE_ID,
-            "-in:inbox -in:sent -in:drafts -in:trash -in:spam",
-        ),
-    ]
-    .into_iter()
-    .find_map(|(label, query)| id.eq_ignore_ascii_case(label).then_some(query))
+    if is_archive_id(id) {
+        return Some("-in:inbox -in:sent -in:drafts -in:trash -in:spam");
+    }
+    match GmailLabelId::parse(id) {
+        GmailLabelId::System(SystemLabel::Inbox) => Some("in:inbox"),
+        GmailLabelId::System(SystemLabel::Sent) => Some("in:sent"),
+        GmailLabelId::System(SystemLabel::Draft) => Some("in:drafts"),
+        GmailLabelId::System(SystemLabel::Trash) => Some("in:trash"),
+        GmailLabelId::System(SystemLabel::Spam) => Some("in:spam"),
+        _ => None,
+    }
 }
 
 /// Missing or unknown native types are not proof of user ownership. Outlook
@@ -58,7 +133,7 @@ pub(crate) fn container_search_operator(id: &str) -> Option<&'static str> {
 /// labels must receive the same conservative treatment. Category flags remain
 /// explicitly writable through Add/Remove without becoming user-owned labels.
 pub(crate) fn label_is_user(label: &GmailLabel) -> bool {
-    label.label_type.as_deref() == Some("user")
+    label.label_type == Some(crate::types::GmailLabelType::User)
 }
 
 /// The single Gmail relocation rule, shared by the bulk driver and the
@@ -114,6 +189,57 @@ const FLAG_DRAFT: &str = "\\Draft";
 const FLAG_IMPORTANT: &str = "$Important";
 const USER_LABEL_FLAG_PREFIX: &str = "$gmail-label:";
 
+/// One syntax owner for writes, observations and vocabulary refresh. Empty ids
+/// are malformed; names are advisory and may be empty or contain colons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GmailFlag<'a> {
+    Seen,
+    Flagged,
+    Draft,
+    Important,
+    Label { id: &'a str, advisory_name: &'a str },
+    Unknown(&'a str),
+}
+
+impl<'a> GmailFlag<'a> {
+    pub(crate) fn parse(value: &'a str) -> Self {
+        for (token, flag) in [
+            (FLAG_SEEN, Self::Seen),
+            (FLAG_FLAGGED, Self::Flagged),
+            (FLAG_DRAFT, Self::Draft),
+            (FLAG_IMPORTANT, Self::Important),
+        ] {
+            if value.eq_ignore_ascii_case(token) {
+                return flag;
+            }
+        }
+        if let Some((id, advisory_name)) = value
+            .strip_prefix(USER_LABEL_FLAG_PREFIX)
+            .and_then(|rest| rest.split_once(':'))
+            .filter(|(id, _)| !id.is_empty())
+        {
+            Self::Label { id, advisory_name }
+        } else {
+            Self::Unknown(value)
+        }
+    }
+}
+
+impl std::fmt::Display for GmailFlag<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Seen => f.write_str(FLAG_SEEN),
+            Self::Flagged => f.write_str(FLAG_FLAGGED),
+            Self::Draft => f.write_str(FLAG_DRAFT),
+            Self::Important => f.write_str(FLAG_IMPORTANT),
+            Self::Label { id, advisory_name } => {
+                write!(f, "{USER_LABEL_FLAG_PREFIX}{id}:{advisory_name}")
+            }
+            Self::Unknown(value) => f.write_str(value),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LabelPatch {
     pub(crate) add_label_ids: Vec<String>,
@@ -156,31 +282,12 @@ pub(crate) fn canonical_flags_indexed(
     }
 
     for label_id in label_ids {
-        if [
-            LABEL_UNREAD,
-            LABEL_INBOX,
-            LABEL_SENT,
-            LABEL_TRASH,
-            LABEL_SPAM,
-            "CHAT",
-        ]
-        .iter()
-        .any(|system| label_id.eq_ignore_ascii_case(system))
-        {
-            continue;
-        }
-        if label_id.eq_ignore_ascii_case(LABEL_STARRED) {
-            flags.push(FLAG_FLAGGED.to_string());
-        } else if label_id.eq_ignore_ascii_case(LABEL_DRAFT) {
-            flags.push(FLAG_DRAFT.to_string());
-        } else if label_id.eq_ignore_ascii_case(LABEL_IMPORTANT) {
-            flags.push(FLAG_IMPORTANT.to_string());
-        } else {
-            let name = names_by_id
-                .get(label_id.as_str())
-                .map(String::as_str)
-                .unwrap_or(label_id);
-            flags.push(format!("$gmail-label:{label_id}:{name}"));
+        if let Some(mut flag) = GmailLabelId::parse(label_id).flag() {
+            if let GmailFlag::Label { id, .. } = flag {
+                let advisory_name = names_by_id.get(label_id).map(String::as_str).unwrap_or(id);
+                flag = GmailFlag::Label { id, advisory_name };
+            }
+            flags.push(flag.to_string());
         }
     }
 
@@ -277,7 +384,11 @@ fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
     // no-ops here: resolvable (so they never poison `unsupported_flags`),
     // but never added or removed by an exact-set operation.
     for label in labels.iter().filter(|label| label_is_user(label)) {
-        let flag = format!("{USER_LABEL_FLAG_PREFIX}{}:{}", label.id, label.name);
+        let flag = GmailFlag::Label {
+            id: &label.id,
+            advisory_name: &label.name,
+        }
+        .to_string();
         if flags.iter().any(|candidate| {
             user_label_id_from_flag(candidate, labels).as_deref() == Some(label.id.as_str())
         }) {
@@ -395,7 +506,7 @@ fn flag_to_remove_label(flag: &str, labels: &[GmailLabel]) -> FlagTranslation {
 /// the mutation driver reports the incomplete result instead of a
 /// success it never achieved.
 fn is_read_only_label(label: &str) -> bool {
-    label.eq_ignore_ascii_case(LABEL_DRAFT) || label.eq_ignore_ascii_case(LABEL_SENT)
+    !GmailLabelId::parse(label).is_writable()
 }
 
 /// True when `flag` asserts that a read-only Gmail projection is present.
@@ -418,7 +529,9 @@ fn asserts_read_only_state(flag: &str, labels: &[GmailLabel]) -> bool {
 /// and accepting a caller-forged spelling such as `$gmail-label:TRASH:TRASH`
 /// would bypass `move_placement_patch` or contradict `\\Seen` translation.
 fn user_label_id_from_flag(flag: &str, labels: &[GmailLabel]) -> Option<String> {
-    let (id, _advisory_name) = flag.strip_prefix(USER_LABEL_FLAG_PREFIX)?.split_once(':')?;
+    let GmailFlag::Label { id, .. } = GmailFlag::parse(flag) else {
+        return None;
+    };
     labels
         .iter()
         .find(|label| label.id == id && (label_is_user(label) || is_category_label_id(&label.id)))
@@ -426,8 +539,7 @@ fn user_label_id_from_flag(flag: &str, labels: &[GmailLabel]) -> Option<String> 
 }
 
 fn is_category_label_id(id: &str) -> bool {
-    id.get(.."CATEGORY_".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CATEGORY_"))
+    matches!(GmailLabelId::parse(id), GmailLabelId::Category(_))
 }
 
 fn contains_flag(flags: &HashSet<String>, needle: &str) -> bool {
@@ -443,7 +555,7 @@ fn is_known_flag(flag: &str, labels: &[GmailLabel]) -> bool {
 }
 
 fn eq_flag(left: &str, right: &str) -> bool {
-    left.eq_ignore_ascii_case(right)
+    GmailFlag::parse(left) == GmailFlag::parse(right)
 }
 
 fn push_unique(items: &mut Vec<String>, item: String) {
@@ -497,10 +609,7 @@ pub(crate) fn gmail_flag_target(
             labels.insert(LABEL_IMPORTANT.to_string());
         } else if eq_flag(flag, FLAG_DRAFT) {
             labels.insert(LABEL_DRAFT.to_string());
-        } else if let Some((id, _advisory_name)) = flag
-            .strip_prefix(USER_LABEL_FLAG_PREFIX)
-            .and_then(|s| s.split_once(':'))
-        {
+        } else if let GmailFlag::Label { id, .. } = GmailFlag::parse(flag) {
             labels.insert(id.to_string());
         }
     }
@@ -527,7 +636,7 @@ mod tests {
             labels: vec![GmailLabel {
                 id: "Label_1".into(),
                 name: "Old".into(),
-                label_type: Some("user".into()),
+                label_type: Some(crate::types::GmailLabelType::User),
                 color: None,
             }],
         }
@@ -639,7 +748,7 @@ mod tests {
         let labels = vec![GmailLabel {
             id: "Label_1".to_string(),
             name: "Project".to_string(),
-            label_type: Some("user".to_string()),
+            label_type: Some(crate::types::GmailLabelType::User),
             color: None,
         }];
         let canonical = canonical_flags(
@@ -784,7 +893,7 @@ mod tests {
         vec![GmailLabel {
             id: "Label_1".to_string(),
             name: "Work".to_string(),
-            label_type: Some("user".to_string()),
+            label_type: Some(crate::types::GmailLabelType::User),
             color: None,
         }]
     }
@@ -856,7 +965,7 @@ mod tests {
         let labels = vec![GmailLabel {
             id: "CATEGORY_PROMOTIONS".to_string(),
             name: "CATEGORY_PROMOTIONS".to_string(),
-            label_type: Some("system".to_string()),
+            label_type: Some(crate::types::GmailLabelType::System),
             color: None,
         }];
         let canonical = canonical_flags(&["CATEGORY_PROMOTIONS".to_string()], &labels);
@@ -881,7 +990,7 @@ mod tests {
             .map(|id| GmailLabel {
                 id: id.to_string(),
                 name: id.to_string(),
-                label_type: Some("system".to_string()),
+                label_type: Some(crate::types::GmailLabelType::System),
                 color: None,
             })
             .collect::<Vec<_>>();
@@ -925,7 +1034,7 @@ mod tests {
         let labels = vec![GmailLabel {
             id: "CATEGORY_SOCIAL".to_string(),
             name: "CATEGORY_SOCIAL".to_string(),
-            label_type: Some("system".to_string()),
+            label_type: Some(crate::types::GmailLabelType::System),
             color: None,
         }];
         let omitted = translate_flag_op(&FlagOp::Set(set(&[FLAG_SEEN])), &labels);
@@ -957,7 +1066,7 @@ mod tests {
             .map(|n| GmailLabel {
                 id: format!("Label_{n}"),
                 name: format!("Name {n}"),
-                label_type: Some("user".to_string()),
+                label_type: Some(crate::types::GmailLabelType::User),
                 color: None,
             })
             .collect::<Vec<_>>();

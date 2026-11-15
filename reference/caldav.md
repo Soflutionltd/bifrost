@@ -541,10 +541,10 @@ Supported calendar primitives:
   `time-range` filter, followed by local overlap filtering as a defensive
   guard. The guard applies RFC 4791 s9.9's two overlap shapes: an event with
   duration overlaps a half-open `[start, end)` window when it starts before
-  `end` and ends after `start`; a zero-length instant (no DTEND, not all-day)
+  `end` and ends after `start`; an explicit zero-length timed instant
   overlaps when `start <= DTSTART < end`, so an instant sitting exactly on the
-  window's start is IN the window (dav-F9, ruled 2026-09-07; the strict
-  duration rule alone dropped it). Invalid time bounds fail locally
+  window's start is IN the window. Missing ends remain uncertain and are
+  retained rather than assumed to be zero-length. Invalid time bounds fail locally
   before a REPORT is sent, and the encoder preserves legal one-sided ranges.
   All-day DATE values have no timezone with which this client can construct an
   instant. The local guard keeps them when the REPORT returns them instead of
@@ -641,14 +641,13 @@ Supported calendar primitives:
   `estimated_total` is the number of candidate resources the server named -
   an upper bound on the items, not a count of them. A short or empty page that
   still carries a cursor is normal.
-  The local guard uses half-open overlap, matching CalDAV time-range and the
-  exclusive all-day end contract. It is recurrence-aware: a recurring master
-  whose own interval sits outside the
-  window is retained when its RRULE can still yield an in-window occurrence
-  (dropped only when it starts after the window, or an RRULE `UNTIL` ends it
-  before the window). COUNT-bounded recurrences trust the server's
-  expansion: fully defending against a hostile server would require
-  recurrence expansion that does not exist in this crate. Per-resource failures are not swallowed - the failed
+  The local guard is `EventRange::admits`, shared with JMAP. It compares
+  explicit nonrecurring instant intervals, retaining recurring masters (RRULE
+  or RDATE), floating times and unknown ends for the provider's decision.
+  UNTIL bounds occurrence starts, not ends, and explicit dates can extend a
+  series. Without recurrence expansion a listing fallback can include extra
+  candidates; discarding a matching meeting would be worse for a calendar user.
+  Per-resource failures are not swallowed - the failed
   hrefs surface on `Page::failed_ids` so a consumer can tell a transient
   failure apart from a real remote deletion. Two kinds land there and they
   are equivalent to the consumer: a resource the server refused inside the

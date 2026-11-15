@@ -238,6 +238,58 @@ pub struct EventRange {
     pub limit: Option<u32>,
 }
 
+impl EventRange {
+    /// Defensive overlap guard for provider-selected candidates, not a recurrence
+    /// expander or a replacement for the provider's range query. `true` means
+    /// overlap is possible; it does not prove an occurrence exists in the window.
+    /// Calendar membership and request validation remain the caller's job.
+    ///
+    /// Floating dates, local times, unknown ends and recurring masters retain
+    /// the provider's decision. Calendar users expect matching appointments to
+    /// remain visible when their timezone or recurrence cannot be resolved here.
+    #[must_use]
+    pub fn admits(&self, event: &CalendarEvent) -> bool {
+        if event.is_all_day
+            || event
+                .recurrence
+                .rrule
+                .as_ref()
+                .is_some_and(|rule| !rule.is_empty())
+            || !event.recurrence.rdate.is_empty()
+        {
+            // UNTIL bounds occurrence starts, not ends; RDATE and overrides can
+            // also extend a series. Comparing the master loses valid meetings.
+            return true;
+        }
+        let instant = |time: &EventTime| time.value.parse::<jiff::Timestamp>().ok();
+        let (Some(start), Some(end), Some(event_start)) = (
+            instant(&self.start),
+            instant(&self.end),
+            instant(&event.start),
+        ) else {
+            return true;
+        };
+        let event_end = match event.end.as_ref() {
+            Some(end) => match instant(end) {
+                Some(end) => end,
+                None => return true,
+            },
+            // Missing end can mean an unknown duration, not only an instant.
+            None => return true,
+        };
+        if end <= start || event_end < event_start {
+            return true;
+        }
+        // RFC 4791 section 9.9: instants include the window start; intervals
+        // have exclusive ends. Neither shape includes the window end.
+        if event_start == event_end {
+            start <= event_start && event_start < end
+        } else {
+            event_start < end && event_end > start
+        }
+    }
+}
+
 /// Event creation payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventCreate {
@@ -300,5 +352,117 @@ impl EventSearchRequest {
             limit: None,
             include_cancelled: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn time(value: &str) -> EventTime {
+        EventTime {
+            value: value.to_string(),
+            timezone: None,
+        }
+    }
+
+    fn event(start: &str, end: &str, is_all_day: bool) -> CalendarEvent {
+        CalendarEvent {
+            id: EventId("/cal/one.ics".to_string()),
+            calendar_id: CalendarId("/cal/".to_string()),
+            native_id: "/cal/one.ics".to_string(),
+            uid: None,
+            etag: None,
+            provenance: CalendarProvenance {
+                provider: ProtocolKind::CalDav,
+                native: "/cal/one.ics".to_string(),
+                calendar_native: None,
+            },
+            title: None,
+            description: None,
+            location: None,
+            start: time(start),
+            end: Some(time(end)).filter(|end| !end.value.is_empty()),
+            is_all_day,
+            status: EventStatus::Confirmed,
+            availability: EventAvailability::Busy,
+            visibility: EventVisibility::Default,
+            self_response: RsvpStatus::Unknown,
+            organizer: None,
+            attendees: Vec::new(),
+            reminders: Vec::new(),
+            recurrence: EventRecurrence::default(),
+            html_link: None,
+            raw_ical: None,
+        }
+    }
+
+    fn range() -> EventRange {
+        EventRange {
+            calendar_id: CalendarId("/cal/".to_string()),
+            start: time("2026-06-02T00:00:00Z"),
+            end: time("2026-06-03T00:00:00Z"),
+            page_cursor: None,
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn range_admits_interval_and_instant_boundaries() {
+        let range = range();
+        for (start, end, admitted) in [
+            ("2026-06-01T23:00:00Z", "2026-06-02T01:00:00Z", true),
+            ("2026-06-01T23:00:00Z", "2026-06-02T00:00:00Z", false),
+            ("2026-06-03T00:00:00Z", "2026-06-03T01:00:00Z", false),
+            ("2026-06-02T00:00:00Z", "2026-06-02T00:00:00Z", true),
+            ("2026-06-03T00:00:00Z", "2026-06-03T00:00:00Z", false),
+            ("2026-06-01T23:59:59Z", "2026-06-01T23:59:59Z", false),
+            (
+                "2026-06-02T02:00:00+02:00",
+                "2026-06-02T02:00:00+02:00",
+                true,
+            ),
+        ] {
+            assert_eq!(
+                range.admits(&event(start, end, false)),
+                admitted,
+                "{start} / {end}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_retains_provider_timezone_and_unknown_end_decisions() {
+        let range = range();
+        for (start, end, all_day) in [
+            ("2026-06-01", "2026-06-02", true),
+            ("2026-06-01T23:30:00", "2026-06-01T23:45:00", false),
+            ("2026-06-01T23:00:00Z", "", false),
+            ("2026-06-01T23:00:00Z", "unknown", false),
+            ("", "", false),
+        ] {
+            assert!(range.admits(&event(start, end, all_day)), "{start} / {end}");
+        }
+        let mut floating_range = range;
+        floating_range.start = time("2026-06-02T00:00:00");
+        assert!(floating_range.admits(&event(
+            "2026-06-01T23:00:00Z",
+            "2026-06-02T00:00:00Z",
+            false,
+        )));
+    }
+
+    #[test]
+    fn range_retains_recurring_masters_and_checks_detached_instances() {
+        let range = range();
+        let mut master = event("2026-05-01T00:00:00Z", "2026-05-01T01:00:00Z", false);
+        master.recurrence.rrule = Some("FREQ=DAILY;UNTIL=20260601T233000Z".to_string());
+        assert!(range.admits(&master));
+        master.recurrence.rrule = None;
+        master.recurrence.rdate.push("20260602T120000Z".to_string());
+        assert!(range.admits(&master));
+        master.recurrence.rdate.clear();
+        master.recurrence.recurrence_id = Some("20260501T000000Z".to_string());
+        assert!(!range.admits(&master));
     }
 }
