@@ -1,6 +1,5 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
-use crate::types::SecretString;
 use bifrost_types::TransmissionState;
 
 impl ImapConnection {
@@ -50,17 +49,23 @@ impl ImapConnection {
                     .iter()
                     .copied()
                     .find(|m| profile.supports_sasl_auth(*m))
-                    .ok_or_else(|| Error::MissingCapability("AUTH=OAUTHBEARER".into()))?;
+                    .ok_or_else(|| {
+                        Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(
+                            "AUTH=OAUTHBEARER".into(),
+                        ))
+                    })?;
                 if !bifrost_sasl::authentication_allowed(
                     self.is_encrypted(),
                     policy.allow_cleartext_without_tls,
                 ) {
-                    return Err(Error::AuthPolicy(AuthPolicyFailure::new(
-                        offered_authentication(&profile, false),
-                        vec![AuthMechanismRejection::new(
-                            mechanism,
-                            AuthMechanismRejectionReason::CleartextWithoutTls,
-                        )],
+                    return Err(Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(
+                        AuthPolicyFailure::new(
+                            offered_authentication(&profile, false),
+                            vec![AuthMechanismRejection::new(
+                                mechanism,
+                                AuthMechanismRejectionReason::CleartextWithoutTls,
+                            )],
+                        ),
                     )));
                 }
                 // Read the current token from the shared source at connect
@@ -112,8 +117,10 @@ impl ImapConnection {
                                 continue;
                             };
                             let Some((hash, channel)) = mechanism.scram() else {
-                                return Err(Error::Protocol(
-                                    "selected mechanism is not SCRAM".into(),
+                                return Err(Error::Provider(
+                                    crate::error::ProviderFailure::Protocol(
+                                        "selected mechanism is not SCRAM".into(),
+                                    ),
                                 ));
                             };
                             self.authenticate_scram_with_binding(
@@ -137,7 +144,11 @@ impl ImapConnection {
                         AuthMechanism::ImapLogin => {
                             self.login(username, password.as_str(), timeout).await
                         }
-                        _ => return Err(Error::Protocol("unsupported password mechanism".into())),
+                        _ => {
+                            return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
+                                "unsupported password mechanism".into(),
+                            )));
+                        }
                     };
                     // The ladder was built from `server_profile()` snapshotted
                     // above, but each `authenticate_*` re-reads the live
@@ -175,7 +186,9 @@ impl ImapConnection {
                     // code contradicts and had never been run.
                     match attempt {
                         Ok(()) => {}
-                        Err(Error::MissingCapability(cap)) => {
+                        Err(Error::LocalRefusal(
+                            crate::error::LocalRefusal::MissingCapability(cap),
+                        )) => {
                             debug!(
                                 mechanism = mechanism.name(),
                                 capability = %cap,
@@ -197,9 +210,8 @@ impl ImapConnection {
                     }
                     return Ok(AuthOutcome { mechanism });
                 }
-                Err(Error::AuthPolicy(AuthPolicyFailure::new(
-                    offered_authentication(&profile, true),
-                    rejected,
+                Err(Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(
+                    AuthPolicyFailure::new(offered_authentication(&profile, true), rejected),
                 )))
             }
         }
@@ -283,35 +295,22 @@ impl ImapConnection {
         pass: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
-        use super::dispatch::AuthenticatePlainConsumer;
-        use base64::Engine;
-
+        use super::dispatch::AuthenticateSaslConsumer;
         self.require_auth_mechanism("PLAIN")?;
-        // Validate state and build SASL payload from the snapshot.
-        let (encoded, has_sasl_ir) = {
-            let snap = self.state_rx.borrow();
-
-            // Refuse embedded delimiters before submitting any AUTHENTICATE bytes.
-            let payload = bifrost_sasl::plain_payload("", user, pass)?;
-            let encoded: SecretString = base64::engine::general_purpose::STANDARD
-                .encode(payload.as_bytes())
-                .into();
-
-            let has_sasl_ir = snapshot_supports(&snap, &Capability::SaslIr);
-            drop(snap);
-            (encoded, has_sasl_ir)
-        };
-
+        let has_sasl_ir = snapshot_supports(&self.state_rx.borrow(), &Capability::SaslIr);
+        let consumer = AuthenticateSaslConsumer::new(
+            bifrost_sasl::SaslClient::plain("", user, pass)?,
+            has_sasl_ir,
+        );
         let cmd = Command::Authenticate {
             mechanism: "PLAIN".into(),
             initial_response: if has_sasl_ir {
-                Some(encoded.clone())
+                consumer.initial_response()
             } else {
                 None
             },
         };
 
-        let consumer = AuthenticatePlainConsumer::new(encoded, has_sasl_ir);
         let deadline = tokio::time::Instant::now() + timeout;
         self.submit_with_continuations(cmd, consumer, Some(deadline))
             .await
@@ -327,40 +326,22 @@ impl ImapConnection {
         token: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
-        use super::dispatch::AuthenticateXoauth2Consumer;
-        use base64::Engine;
-
+        use super::dispatch::AuthenticateSaslConsumer;
         self.require_auth_mechanism("XOAUTH2")?;
-        // Validate state and build XOAUTH2 payload from the snapshot.
-        let (encoded, has_sasl_ir) = {
-            let snap = self.state_rx.borrow();
-
-            // Build XOAUTH2 payload via the shared bifrost-sasl builder, then
-            // base64-frame it for AUTHENTICATE. The raw token-bearing Secret is
-            // a temporary that zeroizes on drop; only the base64 form persists.
-            let encoded: SecretString = base64::engine::general_purpose::STANDARD
-                .encode(bifrost_sasl::xoauth2_payload(user, token).as_bytes())
-                .into();
-
-            let has_sasl_ir = snapshot_supports(&snap, &Capability::SaslIr);
-            drop(snap);
-            (encoded, has_sasl_ir)
-        };
-
+        let has_sasl_ir = snapshot_supports(&self.state_rx.borrow(), &Capability::SaslIr);
+        let consumer = AuthenticateSaslConsumer::new(
+            bifrost_sasl::SaslClient::oauth(bifrost_sasl::OAuthMechanism::Xoauth2, user, token)?,
+            has_sasl_ir,
+        );
         let cmd = Command::Authenticate {
             mechanism: "XOAUTH2".into(),
             initial_response: if has_sasl_ir {
-                Some(encoded.clone())
+                consumer.initial_response()
             } else {
                 None
             },
         };
 
-        let consumer = AuthenticateXoauth2Consumer::new(
-            encoded,
-            has_sasl_ir,
-            bifrost_sasl::OAuthMechanism::Xoauth2,
-        );
         let deadline = tokio::time::Instant::now() + timeout;
         self.submit_with_continuations(cmd, consumer, Some(deadline))
             .await
@@ -386,41 +367,26 @@ impl ImapConnection {
         token: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
-        use super::dispatch::AuthenticateXoauth2Consumer;
-        use base64::Engine;
-
+        use super::dispatch::AuthenticateSaslConsumer;
         self.require_auth_mechanism("OAUTHBEARER")?;
-        // Validate state and build the OAUTHBEARER payload from the snapshot.
-        let (encoded, has_sasl_ir) = {
-            let snap = self.state_rx.borrow();
-
-            // Build the OAUTHBEARER payload via the shared bifrost-sasl builder,
-            // then base64-frame it for AUTHENTICATE. The raw token-bearing
-            // Secret is a temporary that zeroizes on drop; only the base64 form
-            // persists.
-            let encoded: SecretString = base64::engine::general_purpose::STANDARD
-                .encode(bifrost_sasl::oauthbearer_payload(identity, token).as_bytes())
-                .into();
-
-            let has_sasl_ir = snapshot_supports(&snap, &Capability::SaslIr);
-            drop(snap);
-            (encoded, has_sasl_ir)
-        };
-
+        let has_sasl_ir = snapshot_supports(&self.state_rx.borrow(), &Capability::SaslIr);
+        let consumer = AuthenticateSaslConsumer::new(
+            bifrost_sasl::SaslClient::oauth(
+                bifrost_sasl::OAuthMechanism::OAuthBearer,
+                identity,
+                token,
+            )?,
+            has_sasl_ir,
+        );
         let cmd = Command::Authenticate {
             mechanism: "OAUTHBEARER".into(),
             initial_response: if has_sasl_ir {
-                Some(encoded.clone())
+                consumer.initial_response()
             } else {
                 None
             },
         };
 
-        let consumer = AuthenticateXoauth2Consumer::new(
-            encoded,
-            has_sasl_ir,
-            bifrost_sasl::OAuthMechanism::OAuthBearer,
-        );
         let deadline = tokio::time::Instant::now() + timeout;
         self.submit_with_continuations(cmd, consumer, Some(deadline))
             .await
@@ -444,7 +410,7 @@ impl ImapConnection {
         pass: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
-        use super::dispatch::AuthenticateCramMd5Consumer;
+        use super::dispatch::AuthenticateSaslConsumer;
 
         self.require_auth_mechanism("CRAM-MD5")?;
 
@@ -453,7 +419,10 @@ impl ImapConnection {
             initial_response: None,
         };
 
-        let consumer = AuthenticateCramMd5Consumer::new(user.to_owned(), pass.to_owned().into());
+        let consumer = AuthenticateSaslConsumer::new(
+            bifrost_sasl::SaslClient::cram_md5(user, pass.into()),
+            false,
+        );
         let deadline = tokio::time::Instant::now() + timeout;
         self.submit_with_continuations(cmd, consumer, Some(deadline))
             .await
@@ -502,7 +471,7 @@ impl ImapConnection {
     /// `ScramChannelBinding` is resolved here unless `resolved` already
     /// carries it (so `authenticate_best` can fetch the peer cert DER once and
     /// thread it in). A direct caller that omits `resolved` and whose binding
-    /// cannot be resolved gets a typed `Error::AuthPolicy` carrying a single
+    /// cannot be resolved gets a typed `crate::error::LocalRefusal::AuthPolicy` carrying a single
     /// `ChannelBindingUnavailable` rejection rather than a silent fall-through.
     ///
     /// `deadline` bounds the whole attempt, binding resolution included, so
@@ -535,12 +504,14 @@ impl ImapConnection {
                     .await?
                     .ok_or_else(|| {
                         let mechanism = AuthMechanism::from_scram(hash, binding);
-                        Error::AuthPolicy(AuthPolicyFailure::new(
-                            offered_authentication(&self.server_profile(), false),
-                            vec![AuthMechanismRejection::new(
-                                mechanism,
-                                AuthMechanismRejectionReason::ChannelBindingUnavailable,
-                            )],
+                        Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(
+                            AuthPolicyFailure::new(
+                                offered_authentication(&self.server_profile(), false),
+                                vec![AuthMechanismRejection::new(
+                                    mechanism,
+                                    AuthMechanismRejectionReason::ChannelBindingUnavailable,
+                                )],
+                            ),
                         ))
                     })?
                     .scram_binding(),
@@ -639,8 +610,8 @@ impl ImapConnection {
     ///
     /// # Errors
     ///
-    /// - [`Error::MissingCapability`] if `UNAUTHENTICATE` is not advertised.
-    /// - [`Error::InvalidState`] if called in Not Authenticated state.
+    /// - [`crate::error::LocalRefusal::MissingCapability`] if `UNAUTHENTICATE` is not advertised.
+    /// - [`crate::error::LocalRefusal::InvalidState`] if called in Not Authenticated state.
     pub async fn unauthenticate(&self, timeout: Duration) -> Result<(), Error> {
         let deadline = tokio::time::Instant::now() + timeout;
 
@@ -715,7 +686,12 @@ impl ImapConnection {
         result
             .downcast::<C::Output>()
             .map(|output| *output)
-            .map_err(|_| Error::Internal("type mismatch in driver result".into()))
+            .map_err(|_| Error::Internal {
+                kind: crate::error::InternalFailure::Invariant(
+                    "type mismatch in driver result".into(),
+                ),
+                mid_exchange: None,
+            })
     }
 
     /// Submit a streaming regular command and await the typed result,
@@ -747,7 +723,12 @@ impl ImapConnection {
         result
             .downcast::<C::Output>()
             .map(|output| *output)
-            .map_err(|_| Error::Internal("type mismatch in driver result".into()))
+            .map_err(|_| Error::Internal {
+                kind: crate::error::InternalFailure::Invariant(
+                    "type mismatch in driver result".into(),
+                ),
+                mid_exchange: None,
+            })
     }
 
     /// Submit a continuation-aware command and await the typed result,
@@ -782,7 +763,12 @@ impl ImapConnection {
         result
             .downcast::<C::Output>()
             .map(|output| *output)
-            .map_err(|_| Error::Internal("type mismatch in driver result".into()))
+            .map_err(|_| Error::Internal {
+                kind: crate::error::InternalFailure::Invariant(
+                    "type mismatch in driver result".into(),
+                ),
+                mid_exchange: None,
+            })
     }
 
     /// Submit a stream upgrade (STARTTLS / COMPRESS), bounded by `deadline`.
@@ -1029,7 +1015,13 @@ mod binding_policy_tests {
         // A present but unparseable DER. If this came back as `Ok(None)` the
         // ladder would silently continue to unbound SCRAM and then PLAIN.
         let err = scram_binding_from_der(Some(&[0x30, 0x01, 0x00])).unwrap_err();
-        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Provider(crate::error::ProviderFailure::Protocol(_))
+            ),
+            "got {err:?}"
+        );
     }
 }
 
@@ -1040,7 +1032,12 @@ fn generate_scram_nonce() -> Result<String, Error> {
     getrandom::fill(&mut bytes)
         // A local failure before AUTHENTICATE is submitted: nothing is on the
         // wire, and the server has done nothing wrong.
-        .map_err(|e| Error::LocalRuntime(format!("failed to generate SCRAM nonce: {e}")))?;
+        .map_err(|e| Error::Internal {
+            kind: crate::error::InternalFailure::Runtime(format!(
+                "failed to generate SCRAM nonce: {e}"
+            )),
+            mid_exchange: None,
+        })?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
@@ -1194,7 +1191,13 @@ mod ladder_tests {
             .await
             .expect_err("a detached driver can never complete the exchange");
         assert!(
-            matches!(err, Error::DriverGone { .. }),
+            matches!(
+                err,
+                Error::Transport {
+                    kind: crate::error::TransportFailure::DriverGone,
+                    ..
+                }
+            ),
             "AUTH=plain must satisfy the live AUTH=PLAIN gate and reach the \
              driver, got {err:?}"
         );
@@ -1217,7 +1220,13 @@ mod ladder_tests {
                 .authenticate_plain(user, password, Duration::from_secs(5))
                 .await
                 .expect_err("embedded NUL must be a local refusal");
-            assert!(matches!(error, Error::InvalidInput(_)), "{error:?}");
+            assert!(
+                matches!(
+                    error,
+                    Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(_))
+                ),
+                "{error:?}"
+            );
         }
     }
 

@@ -456,7 +456,8 @@ fn translate_ok() -> ScriptedRestResponse {
 
 fn registration_count(account: &GraphAccount) -> Option<usize> {
     account
-        .ews_subscriptions
+        .ews
+        .registrations_for_tests()
         .try_read()
         .ok()
         .map(|registrations| registrations.len())
@@ -506,7 +507,7 @@ async fn a_received_ews_subscribe_keeps_its_registration() {
         tokio::task::yield_now().await;
     }
     assert_eq!(registration_count(&account), Some(1));
-    assert!(*account.ews_topology.borrow() > 0);
+    assert!(*account.ews.topology_for_tests().borrow() > 0);
 }
 
 /// A closed account is refused before the translation request, as the webhook
@@ -543,7 +544,7 @@ async fn an_ews_subscribe_racing_close_does_not_register() {
     client.script_rest([translate_ok()]);
     let account = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
 
-    let registration_blocked = account.ews_subscriptions.write().await;
+    let registration_blocked = account.ews.registrations_for_tests().write().await;
     let caller = spawn_subscribe_ews(&account);
     assert!(
         settle(|| client.wire_attempts() == 1).await,

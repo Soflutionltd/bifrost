@@ -11,8 +11,8 @@
 //! engine holds.
 //!
 //! [`TargetBatch`] is the single owner of that derivation. It takes the
-//! decoded ids, builds the wire [`UidSet`] from those ids and nothing else,
-//! keeps an explicit lane for ids the operand could not represent, and is the
+//! decoded ids, builds the wire [`UidSetExpr`] from those ids and nothing else,
+//! retains typed message identities through operand construction and is the
 //! only way to mint the batch's outcomes.
 //!
 //! Exactly-once is a property of the types rather than of an assertion.
@@ -39,7 +39,7 @@ use bifrost_types::{
 };
 
 use super::envelope::DecodedObjectId;
-use crate::types::{MailboxName, Uid, UidSet};
+use crate::types::{MailboxName, Uid, UidSetExpr};
 
 /// The single predicate for "this UID can be named on the wire".
 ///
@@ -47,16 +47,16 @@ use crate::types::{MailboxName, Uid, UidSet};
 /// so the set of UIDs a command names and the set of UIDs a caller believes
 /// it named cannot disagree.
 // Keep this wire admission separate from text decoding and cache observation:
-// operands report excluded targets, decoders reject malformed handles, compact
-// sets discard invalid observations, and poll's conversion asserts a prior
-// decoder guarantee. Sharing their failure policy would erase those contracts.
+// raw operands report excluded targets, while decoded message identities are
+// typed and cannot carry zero. Observed sets discard invalid numeric values.
+// Sharing those failure policies would erase their different contracts.
 fn operand_uid(uid: u32) -> Option<Uid> {
     Uid::new(uid)
 }
 
 /// A wire UID operand plus the UIDs that did not reach it.
 ///
-/// This is the one place a `UidSet` is built from decoded UIDs.
+/// This is the one place a `UidSetExpr` is built from decoded UIDs.
 /// [`TargetBatch`] is the batch-shaped wrapper around it, for lanes that owe
 /// one [`ItemOutcome`] per id; the single-id and PIM-primitive lanes, whose
 /// results are not per-id outcomes, use `UidOperand` directly so that they
@@ -68,7 +68,7 @@ fn operand_uid(uid: u32) -> Option<Uid> {
 pub(crate) struct UidOperand {
     uids: Vec<u32>,
     excluded: Vec<u32>,
-    uid_set: Option<UidSet>,
+    uid_set: Option<UidSetExpr>,
 }
 
 impl UidOperand {
@@ -89,12 +89,12 @@ impl UidOperand {
         Self {
             uids: kept,
             excluded,
-            uid_set: UidSet::from_uids(carried),
+            uid_set: UidSetExpr::from_uids(carried),
         }
     }
 
     /// The wire operand, or `None` when no UID reached it.
-    pub(crate) fn uid_set(&self) -> Option<&UidSet> {
+    pub(crate) fn uid_set(&self) -> Option<&UidSetExpr> {
         self.uid_set.as_ref()
     }
 
@@ -109,8 +109,7 @@ impl UidOperand {
     }
 }
 
-/// The ids one wire command is accountable for, split into the ids the
-/// operand carries and the ids it excluded.
+/// The typed identities one wire command is accountable for.
 pub(crate) struct TargetBatch {
     /// Ids whose UID is in `uid_set`, in request order.
     targets: Vec<DecodedObjectId>,
@@ -118,44 +117,26 @@ pub(crate) struct TargetBatch {
     uids: Vec<u32>,
     /// The wire operand, built from `uids` only. `None` when there is no
     /// target to send.
-    uid_set: Option<UidSet>,
-    /// Ids the operand could not represent. The server never sees these, so
-    /// they may never be reported as applied and may never be dropped.
-    excluded: Vec<DecodedObjectId>,
+    uid_set: Option<UidSetExpr>,
     settled: bool,
 }
 
 impl TargetBatch {
-    /// Split `ids` into the wire operand and the excluded lane.
-    ///
-    /// The only UID a `UidSet` cannot carry is 0. `decode_object_id` rejects
-    /// a 0 UID today, so the excluded lane is normally empty - it exists so
-    /// that a future decode path, or any other producer of
-    /// `DecodedObjectId`, cannot reintroduce the silent-drop hole by
-    /// construction rather than by review.
+    /// Build the operand from the identities themselves. Zero is already
+    /// unrepresentable, so no target can disappear during wire admission.
     pub(crate) fn new(ids: Vec<DecodedObjectId>) -> Self {
-        let operand = UidOperand::build(ids.iter().map(|id| id.uid));
-        let mut targets = Vec::with_capacity(ids.len());
-        let mut excluded = Vec::new();
-        for id in ids {
-            // The same predicate the operand used, so the accountable set and
-            // the wire set are partitioned identically by construction.
-            match operand_uid(id.uid) {
-                Some(_) => targets.push(id),
-                None => excluded.push(id),
-            }
-        }
+        let uids = ids.iter().map(|id| id.uid.get()).collect();
+        let uid_set = UidSetExpr::from_uids(ids.iter().map(|id| id.uid));
         Self {
-            targets,
-            uids: operand.uids,
-            uid_set: operand.uid_set,
-            excluded,
+            targets: ids,
+            uids,
+            uid_set,
             settled: false,
         }
     }
 
     /// The wire operand, or `None` when no id reached it.
-    pub(crate) fn uid_set(&self) -> Option<&UidSet> {
+    pub(crate) fn uid_set(&self) -> Option<&UidSetExpr> {
         self.uid_set.as_ref()
     }
 
@@ -168,44 +149,42 @@ impl TargetBatch {
     /// applied subset of a guarded STORE, the UIDs to EXPUNGE after a
     /// `\Deleted` mark). UIDs outside the batch are refused: a second wire
     /// command must never name a message this batch was not given.
-    pub(crate) fn subset_uid_set(&self, uids: &[u32]) -> Option<UidSet> {
+    pub(crate) fn subset_uid_set(&self, uids: &[u32]) -> Option<UidSetExpr> {
         debug_assert!(
             uids.iter().all(|uid| self.uids.contains(uid)),
             "a follow-up operand may only name UIDs from its own batch"
         );
-        UidOperand::build(uids.iter().copied().filter(|uid| self.uids.contains(uid))).uid_set
+        UidSetExpr::from_uids(
+            self.targets
+                .iter()
+                .map(|id| id.uid)
+                .filter(|uid| uids.contains(&uid.get())),
+        )
     }
 
-    /// Mint the batch's outcomes: exactly one per id, across both lanes.
-    ///
-    /// `classify` is called once per target, with the [`Target`] permit for
-    /// that id, and must return the [`Sealed`] outcome that permit produced.
-    /// The excluded lane is minted here, as a `Failed(Request(Malformed))`
-    /// naming `operation` and `folder` - a UID the server never saw is a
-    /// client-side request defect, never a success and never a silent drop.
+    /// Classify and seal exactly one answer for every requested identity.
     pub(crate) fn settle<T, F>(
         self,
-        operation: AccountOperation,
-        folder: &MailboxName,
+        _operation: AccountOperation,
+        _folder: &MailboxName,
         mut classify: F,
     ) -> Vec<ItemOutcome<T>>
     where
         F: FnMut(Target) -> Sealed<T>,
     {
-        let (targets, mut results) = self.settle_streaming(operation, folder);
-        results.extend(targets.into_iter().map(|target| classify(target).0));
-        results
+        self.settle_streaming()
+            .into_iter()
+            .map(|target| classify(target).0)
+            .collect()
     }
 
     /// Settle a batch that sent no command because no id reached the wire
     /// operand.
     ///
-    /// `UidSet::from_uids` returns `None` only for an empty input, so
+    /// `UidSetExpr::from_uids` returns `None` only for an empty input, so
     /// `uid_set()` is `None` exactly when the target lane is empty and there
-    /// is nothing to classify. The classifier here is therefore never
-    /// called; it answers `Request(Malformed)` - the same verdict the
-    /// excluded lane gets - rather than panicking, because an id that never
-    /// reached an operand is precisely an excluded id.
+    /// is nothing to classify. The fallback classifier is unreachable for
+    /// an empty batch and refuses a target if that invariant regresses.
     pub(crate) fn settle_unsent<T>(
         self,
         operation: AccountOperation,
@@ -218,35 +197,14 @@ impl TargetBatch {
         })
     }
 
-    /// Settle a batch whose outcomes are published elsewhere (the hydration
-    /// stream sends them down a channel rather than returning them), taking
-    /// the target permits out for the caller to walk. The excluded lane is
-    /// still minted here and returned, so it cannot be forgotten.
-    ///
-    /// Each [`Target`] still seals at most once, so this lane cannot answer
-    /// twice for an id either; what it gives up relative to [`Self::settle`]
-    /// is total coverage, which it must, because the caller is allowed to
-    /// abandon the walk (a dropped channel, a failed FETCH) and leave the
-    /// remaining ids to its own unresolved set.
-    pub(crate) fn settle_streaming<T>(
-        mut self,
-        operation: AccountOperation,
-        folder: &MailboxName,
-    ) -> (Vec<Target>, Vec<ItemOutcome<T>>) {
+    /// Take the target permits for streaming publication. A dropped walk may
+    /// leave targets unresolved, but each permit can still answer at most once.
+    pub(crate) fn settle_streaming(mut self) -> Vec<Target> {
         self.settled = true;
-        let targets = std::mem::take(&mut self.targets)
+        std::mem::take(&mut self.targets)
             .into_iter()
             .map(Target::new)
-            .collect();
-        let excluded = std::mem::take(&mut self.excluded);
-        let excluded_outcomes = excluded
-            .into_iter()
-            .map(|id| {
-                let error = excluded_from_operand_error(operation, folder);
-                ItemOutcome::Failed(BatchFailure::new(item_id(&id), error))
-            })
-            .collect();
-        (targets, excluded_outcomes)
+            .collect()
     }
 }
 
@@ -280,7 +238,7 @@ impl Target {
     }
 
     pub(crate) fn uid(&self) -> u32 {
-        self.id.uid
+        self.id.uid.get()
     }
 
     /// Spend the permit on a verdict, stamping the batch's own id onto it.
@@ -317,10 +275,9 @@ impl Drop for TargetBatch {
             return;
         }
         debug_assert!(
-            self.settled || (self.targets.is_empty() && self.excluded.is_empty()),
-            "TargetBatch dropped with {} target and {} excluded ids unaccounted for",
-            self.targets.len(),
-            self.excluded.len()
+            self.settled || self.targets.is_empty(),
+            "TargetBatch dropped with {} target ids unaccounted for",
+            self.targets.len()
         );
     }
 }
@@ -331,9 +288,7 @@ fn item_id(id: &DecodedObjectId) -> BatchItemId {
 
 #[cfg(test)]
 mod tests {
-    use bifrost_types::{
-        AccountErrorKind, AccountOperation, ItemOutcome, MutationSuccess, RequestErrorKind,
-    };
+    use bifrost_types::{AccountOperation, ItemOutcome, MutationSuccess};
 
     use super::{Sealed, Target, TargetBatch, UidOperand, Verdict, item_id};
     use crate::account::envelope::DecodedObjectId;
@@ -344,14 +299,18 @@ mod tests {
     }
 
     fn id(uid: u32) -> DecodedObjectId {
-        DecodedObjectId::canonical(folder(), 7, uid)
+        DecodedObjectId::canonical(
+            folder(),
+            crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            crate::types::Uid::new(uid).expect("nonzero test UID"),
+        )
     }
 
     fn applied(target: Target) -> Sealed<MutationSuccess> {
         target.seal(Verdict::Succeeded(MutationSuccess::Applied))
     }
 
-    // `UidSet` operands must never go out empty, and UID 0 is not a UID
+    // `UidSetExpr` operands must never go out empty, and UID 0 is not a UID
     // (RFC 3501 Section 9), so an all-zero request yields no operand rather
     // than an empty or `0`-bearing sequence set - and the zeros are visible
     // in `excluded()` instead of vanishing.
@@ -380,12 +339,10 @@ mod tests {
         assert_eq!(mixed.excluded(), &[0]);
     }
 
-    // The batch lane and the single-id / PIM lanes must agree on what a UID
-    // operand can carry, because they share one constructor. If `TargetBatch`
-    // ever re-derived the operand itself, this is what would diverge.
+    // Typed targets and raw-number admission share the finite-set owner.
     #[test]
     fn the_batch_operand_is_the_shared_operand() {
-        let uids = [4u32, 0, 6];
+        let uids = [4u32, 5, 6];
         let batch = TargetBatch::new(uids.iter().map(|uid| id(*uid)).collect());
         let shared = UidOperand::build(uids);
         assert_eq!(batch.uids(), shared.uids());
@@ -405,39 +362,24 @@ mod tests {
     }
 
     #[test]
-    fn an_id_the_operand_cannot_carry_lands_in_the_excluded_lane() {
-        let batch = TargetBatch::new(vec![id(1), id(0), id(3)]);
-        assert_eq!(batch.uids(), &[1, 3]);
-        assert_eq!(
-            batch
-                .uid_set()
-                .expect("non-empty operand")
-                .as_sequence_set()
-                .as_str(),
-            "1,3"
-        );
+    fn every_typed_target_is_carried_by_the_operand() {
+        let batch = TargetBatch::new(vec![id(1), id(2), id(3)]);
+        assert_eq!(batch.uids(), &[1, 2, 3]);
+        assert_eq!(batch.uid_set().unwrap().to_string(), "1:3");
         let results = batch.settle(AccountOperation::UpdateFlags, &folder(), applied);
         assert_eq!(results.len(), 3);
-        let failed: Vec<_> = results
-            .iter()
-            .filter_map(|outcome| match outcome {
-                ItemOutcome::Failed(failure) => Some(failure),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(failed.len(), 1, "the excluded id must have its own lane");
-        assert_eq!(failed[0].item, item_id(&id(0)));
-        assert!(matches!(
-            failed[0].error.kind(),
-            AccountErrorKind::Request(RequestErrorKind::Malformed)
-        ));
+        assert!(
+            results
+                .iter()
+                .all(|outcome| matches!(outcome, ItemOutcome::Succeeded(_)))
+        );
+        assert!(crate::types::Uid::new(0).is_none());
     }
 
     #[test]
     fn every_requested_id_yields_exactly_one_outcome() {
-        // One id in each lane: an accounting that answers only the ids the
-        // operand carried leaves the excluded one unanswered.
-        let ids = vec![id(1), id(0), id(3)];
+        // Every typed target is represented and receives exactly one answer.
+        let ids = vec![id(1), id(2), id(3)];
         let expected: Vec<_> = ids.iter().map(item_id).collect();
         let batch = TargetBatch::new(ids);
         let results = batch.settle(AccountOperation::BulkDestroy, &folder(), applied);
@@ -470,7 +412,7 @@ mod tests {
         let batch = TargetBatch::new(vec![id(11), id(12)]);
         let results = batch.settle(AccountOperation::UpdateFlags, &folder(), |target| {
             let uid = target.uid();
-            assert_eq!(target.id().uid, uid);
+            assert_eq!(target.id().uid.get(), uid);
             target.seal(Verdict::Succeeded(MutationSuccess::Applied))
         });
         let seen: Vec<_> = results
@@ -515,18 +457,16 @@ mod tests {
     }
 
     #[test]
-    fn a_streaming_settle_still_mints_the_excluded_lane() {
-        let batch = TargetBatch::new(vec![id(1), id(0)]);
-        let (targets, excluded): (_, Vec<ItemOutcome<MutationSuccess>>) =
-            batch.settle_streaming(AccountOperation::Hydrate, &folder());
+    fn a_streaming_settle_keeps_every_typed_target() {
+        let batch = TargetBatch::new(vec![id(1), id(2)]);
+        let targets = batch.settle_streaming();
         let ids: Vec<DecodedObjectId> = targets.iter().map(|target| target.id().clone()).collect();
-        assert_eq!(ids, vec![id(1)]);
-        assert_eq!(excluded.len(), 1);
+        assert_eq!(ids, vec![id(1), id(2)]);
         // The permits still stamp the batch's own ids.
         let sealed: Vec<ItemOutcome<MutationSuccess>> = targets
             .into_iter()
             .map(|target| applied(target).into_outcome())
             .collect();
-        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed.len(), 2);
     }
 }

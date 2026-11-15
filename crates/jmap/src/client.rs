@@ -127,7 +127,6 @@ pub(crate) struct SessionState {
     /// crate cannot parse impossible to open at all. The download template
     /// stays eager because the account reads blobs throughout.
     event_source_url: Result<Vec<URLPart<crate::event_source::URLParameter>>, String>,
-    default_account_id: crate::core::id::AccountId,
 }
 
 /// Parse one of the session's URI templates. Every template a session
@@ -203,11 +202,6 @@ fn require_absolute_http_url(shown: &str, url: &str) -> Result<(), String> {
 
 impl SessionState {
     fn derive(session: Session) -> crate::Result<Self> {
-        let default_account_id = session
-            .default_account_id()
-            .map(crate::core::id::AccountId::new)
-            .unwrap_or_else(|| crate::core::id::AccountId::new(""));
-
         // `apiUrl` is a plain URL, not a template, but the same rule holds:
         // it is the server's, and a relative or non-http one otherwise
         // failed later inside the transport, blaming nobody.
@@ -224,7 +218,6 @@ impl SessionState {
             upload_url: parse_session_template(session.upload_url()),
             download_url: session_template("downloadUrl", session.download_url())?,
             event_source_url: parse_session_template(session.event_source_url()),
-            default_account_id,
             session: Arc::new(session),
         })
     }
@@ -264,10 +257,6 @@ impl SessionState {
                 property: "eventSourceUrl",
                 detail: detail.clone(),
             })
-    }
-
-    pub(crate) fn default_account_id(&self) -> &crate::core::id::AccountId {
-        &self.default_account_id
     }
 }
 
@@ -650,29 +639,15 @@ mod session_state_tests {
             "https://example.test/.well-known/jmap",
         )
         .expect("client builds");
-        assert_eq!(client.default_account_id().as_str(), "");
-
-        let mut request = client.build();
-        let error = request
-            .call(crate::mailbox::MailboxGet::new())
-            .err()
-            .expect("an empty account id must not reach the wire");
-        assert!(
-            matches!(
-                error,
-                crate::Error::NoPrimaryAccount {
-                    capability: "urn:ietf:params:jmap:mail"
-                }
-            ),
-            "unexpected error: {error:?}"
-        );
-        // Nothing was appended, so the request cannot serialize the
-        // malformed call either.
-        let body = serde_json::to_string(&request).expect("request serializes");
-        assert!(
-            !body.contains("\"accountId\":\"\""),
-            "empty account id must not be serialized: {body}"
-        );
+        assert!(matches!(
+            client.primary_account::<crate::core::capability::Mail>(),
+            Err(crate::Error::NoPrimaryAccount {
+                capability: "urn:ietf:params:jmap:mail"
+            })
+        ));
+        // Accountless core methods still work without any primary account.
+        let body = serde_json::to_string(&client.build()).unwrap();
+        assert!(!body.contains("accountId"));
     }
 
     /// The upload / download templates and the API URL come from the
@@ -767,7 +742,9 @@ mod session_state_tests {
             "https://example.test/.well-known/jmap",
         )
         .expect("client builds");
-        let mut request = client.build();
+        let account =
+            crate::account::Account::<_, crate::core::capability::Blob>::new(client.clone(), "a");
+        let mut request = account.build();
         request
             .call(
                 crate::blob::manage::BlobLookupRequest::new()
@@ -1140,7 +1117,10 @@ mod session_state_tests {
         )
         .expect("client builds");
 
-        let mut request = client.build();
+        let account = client
+            .primary_account::<crate::core::capability::Mail>()
+            .unwrap();
+        let mut request = account.build();
         request
             .call(crate::mailbox::MailboxGet::new())
             .expect("first method fits the original limit");
@@ -1357,13 +1337,25 @@ mod session_state_tests {
         )
         .expect("client builds");
 
-        assert_eq!(client.default_account_id().as_str(), "A1");
+        assert_eq!(
+            client
+                .primary_account::<crate::core::capability::Mail>()
+                .unwrap()
+                .id_str(),
+            "A1"
+        );
         let _ = client.send_request(&client.build()).await;
 
         client.refresh_session().await.expect("refresh succeeds");
 
         assert_eq!(client.session().state(), "session-2");
-        assert_eq!(client.default_account_id().as_str(), "B2");
+        assert_eq!(
+            client
+                .primary_account::<crate::core::capability::Mail>()
+                .unwrap()
+                .id_str(),
+            "B2"
+        );
         let state = client.session_state();
         assert_eq!(state.api_url(), "https://new.example.test/api");
         assert_eq!(
@@ -1617,14 +1609,10 @@ impl<T: HttpTransport> Client<T> {
         &self.inner.session_cell.session_url
     }
 
-    pub(crate) fn default_account_id(&self) -> crate::core::id::AccountId {
-        self.session_state().default_account_id().clone()
-    }
-
     /// Send a JMAP request and get a typed Response.
-    pub(crate) async fn send_request(
+    pub(crate) async fn send_request<C: crate::core::capability::Capability>(
         &self,
-        request: &request::Request<'_, T>,
+        request: &request::Request<'_, T, C>,
     ) -> crate::Result<response::Response> {
         let body = serde_json::to_vec(request).map_err(crate::Error::RequestEncode)?;
         // Enforce the advertised bound before transport, using the same session

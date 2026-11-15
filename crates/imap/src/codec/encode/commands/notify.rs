@@ -24,8 +24,10 @@ pub(in crate::codec::encode) fn encode_notify_set(
     // RFC 5465 Section 8: event-groups = event-group *(SP event-group)
     // requires at least one event-group.
     if params.event_groups.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            "NOTIFY SET requires at least one event group (RFC 5465 Section 8)".into(),
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "NOTIFY SET requires at least one event group (RFC 5465 Section 8)".into(),
+            ),
         ));
     }
 
@@ -42,10 +44,12 @@ pub(in crate::codec::encode) fn encode_notify_set(
         })
         .count();
     if selected_count > 1 {
-        return Err(crate::Error::InvalidInput(
-            "NOTIFY SET must not contain more than one event group with a \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "NOTIFY SET must not contain more than one event group with a \
              selected or selected-delayed filter (RFC 5465 Section 3)"
-                .into(),
+                    .into(),
+            ),
         ));
     }
 
@@ -98,8 +102,10 @@ fn encode_mailbox_filter(
         MailboxFilter::Subtree(mailboxes) => {
             // RFC 5465 Section 8: one-or-more-mailbox requires at least one.
             if mailboxes.is_empty() {
-                return Err(crate::Error::InvalidInput(
-                    "subtree filter requires at least one mailbox (RFC 5465 Section 8)".into(),
+                return Err(crate::Error::LocalRefusal(
+                    crate::error::LocalRefusal::InvalidInput(
+                        "subtree filter requires at least one mailbox (RFC 5465 Section 8)".into(),
+                    ),
                 ));
             }
             w.raw(b"subtree");
@@ -108,8 +114,11 @@ fn encode_mailbox_filter(
         MailboxFilter::Mailboxes(mailboxes) => {
             // RFC 5465 Section 8: one-or-more-mailbox requires at least one.
             if mailboxes.is_empty() {
-                return Err(crate::Error::InvalidInput(
-                    "mailboxes filter requires at least one mailbox (RFC 5465 Section 8)".into(),
+                return Err(crate::Error::LocalRefusal(
+                    crate::error::LocalRefusal::InvalidInput(
+                        "mailboxes filter requires at least one mailbox (RFC 5465 Section 8)"
+                            .into(),
+                    ),
                 ));
             }
             w.raw(b"mailboxes");

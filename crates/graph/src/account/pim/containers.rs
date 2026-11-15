@@ -11,7 +11,7 @@ use crate::client::Resource;
 use crate::types::GraphMailFolder;
 use bifrost_types::{
     AccountError, AccountOperation, Container, ContainerContentClass, ContainerId, ContainerKind,
-    ContainerList, ContainerNamespace, ContainerRights, ErrorScope, FolderRole, MailboxId,
+    ContainerList, ContainerNamespace, ContainerRights, ErrorScope, FolderRole, PrincipalId,
     ProtocolKind, Provenance, SkippedScope,
 };
 use serde_json::{Value, json};
@@ -24,7 +24,8 @@ pub(super) const MSG_FOLDER_ROOT: &str = "msgfolderroot";
 
 pub(crate) async fn containers_list(account: GraphAccount) -> Result<ContainerList, AccountError> {
     let folders = account
-        .client
+        .mailboxes
+        .primary()
         .list_mail_folders_recursive()
         .await
         .map_err(|e| {
@@ -38,7 +39,7 @@ pub(crate) async fn containers_list(account: GraphAccount) -> Result<ContainerLi
             .iter()
             .map(|folder| (folder.id.clone(), folder.parent_folder_id.clone())),
     );
-    let roles = well_known_folder_roles(&account.client).await;
+    let roles = well_known_folder_roles(account.mailboxes.primary()).await;
     let mut containers: Vec<Container> = folders
         .into_iter()
         .map(|folder| container_from_folder(folder, &roles, None))
@@ -97,10 +98,10 @@ pub(super) async fn shared_containers(
     let mut containers = Vec::new();
     let mut skipped = Vec::new();
     // Deterministic order so the projection is stable across calls.
-    let mut mailboxes: Vec<&String> = account.shared_clients.keys().collect();
+    let mut mailboxes: Vec<&String> = account.mailboxes.shared().keys().collect();
     mailboxes.sort();
     for mailbox in mailboxes {
-        let client = &account.shared_clients[mailbox];
+        let client = &account.mailboxes.shared()[mailbox];
         match client.list_mail_folders_recursive().await {
             Ok(folders) => {
                 let roles = well_known_folder_roles(client).await;
@@ -111,7 +112,7 @@ pub(super) async fn shared_containers(
                 );
             }
             Err(error) => skipped.push(SkippedScope {
-                scope: ErrorScope::Mailbox {
+                scope: ErrorScope::Owner {
                     id: mailbox.clone().into(),
                 },
                 error: into_account_error(
@@ -136,15 +137,11 @@ pub(super) async fn shared_containers(
 /// pinned for sync: the consumer has to see a folder before it can decide to
 /// pin it.
 pub(super) async fn public_folder_containers(account: &GraphAccount) -> Vec<Container> {
-    // Snapshot the routing keys and release that guard before taking the
-    // metadata one: the two maps are never held simultaneously.
-    let mut native_ids: Vec<String> = {
-        let routing = account.routing_map.read().await;
-        routing.keys().map(|folder| folder.0.clone()).collect()
-    };
-    // Deterministic order so the projection is stable across calls.
+    let discovery = account.public_folders.snapshot().await;
+    let routing = &discovery.routing;
+    let meta = &discovery.metadata;
+    let mut native_ids: Vec<String> = routing.keys().map(|folder| folder.0.clone()).collect();
     native_ids.sort();
-    let meta = account.public_folder_meta.read().await;
     native_ids
         .into_iter()
         .map(|native| {
@@ -245,7 +242,7 @@ pub(crate) async fn container_create(
     if kind != ContainerKind::Folder {
         return Err(unsupported_account_error(AccountOperation::ContainerCreate));
     }
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     let path = match parent {
         Some(parent) => format!(
             "{prefix}/mailFolders/{}/childFolders",
@@ -254,7 +251,8 @@ pub(crate) async fn container_create(
         None => format!("{prefix}/mailFolders"),
     };
     let folder: GraphMailFolder = account
-        .client
+        .mailboxes
+        .primary()
         .post(
             Resource::Outlook,
             &path,
@@ -280,11 +278,12 @@ pub(crate) async fn container_rename(
 ) -> Result<(), AccountError> {
     let path = format!(
         "{}/mailFolders/{}",
-        account.client.api_path_prefix(),
+        account.mailboxes.primary().api_path_prefix(),
         bifrost_net::url::encode_path_component(&container.0)
     );
     account
-        .client
+        .mailboxes
+        .primary()
         .patch(
             Resource::Outlook,
             &path,
@@ -308,11 +307,12 @@ pub(crate) async fn container_move(
     let destination_id = new_parent.map_or_else(|| MSG_FOLDER_ROOT.to_string(), |id| id.0);
     let path = format!(
         "{}/mailFolders/{}/move",
-        account.client.api_path_prefix(),
+        account.mailboxes.primary().api_path_prefix(),
         bifrost_net::url::encode_path_component(&container.0)
     );
     let _: GraphMailFolder = account
-        .client
+        .mailboxes
+        .primary()
         .post(
             Resource::Outlook,
             &path,
@@ -332,11 +332,12 @@ pub(crate) async fn container_delete(
 ) -> Result<(), AccountError> {
     let path = format!(
         "{}/mailFolders/{}",
-        account.client.api_path_prefix(),
+        account.mailboxes.primary().api_path_prefix(),
         bifrost_net::url::encode_path_component(&container.0)
     );
     account
-        .client
+        .mailboxes
+        .primary()
         .delete(Resource::Outlook, &path, bifrost_net::ReplayPolicy::Never)
         .await
         .map_err(|e| {
@@ -425,7 +426,7 @@ pub(super) fn container_from_folder(
         Some(_) => ContainerNamespace::Shared,
         None => ContainerNamespace::Personal,
     })
-    .with_owner(owner.map(|mailbox| MailboxId(mailbox.to_string())))
+    .with_owner(owner.map(|mailbox| PrincipalId(mailbox.to_string())))
     // The `/users/{id}` routing key doubles as the owner email exactly when
     // it is addressable (a UPN/SMTP address the account already holds);
     // an object-id-shaped key carries no email and projects `None`.
@@ -464,19 +465,12 @@ pub(super) async fn trash_container_id(
     owner: Option<&str>,
     scope: ErrorScope,
 ) -> Result<ContainerId, AccountError> {
-    let cache_key = owner.unwrap_or_default();
-    if let Some(native) = account
-        .trash_folder_ids
-        .read()
-        .await
-        .get(cache_key)
-        .cloned()
-    {
+    if let Some(native) = account.mailboxes.cached_trash(owner).await {
         return Ok(ContainerId(crate::account::foreign::qualify_with_owner(
             owner, &native,
         )));
     }
-    let client = account.client_for_owner(owner).map_err(|error| {
+    let client = account.mailboxes.client_for_owner(owner).map_err(|error| {
         into_account_error(
             error,
             GraphErrorContext::graph(AccountOperation::BulkMove).with_scope(scope.clone()),
@@ -507,10 +501,9 @@ pub(super) async fn trash_container_id(
         })?
         .to_string();
     account
-        .trash_folder_ids
-        .write()
-        .await
-        .insert(cache_key.to_string(), native.clone());
+        .mailboxes
+        .remember_trash(owner, native.clone())
+        .await;
     Ok(ContainerId(crate::account::foreign::qualify_with_owner(
         owner, &native,
     )))

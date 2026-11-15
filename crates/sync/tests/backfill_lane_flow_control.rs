@@ -1152,8 +1152,10 @@ async fn ack_page_or_fenced(engine: &SyncEngine, account_id: &AccountId, event: 
         .await;
     if let Err(error) = outcome {
         assert!(
-            matches!(&error, bifrost_sync::Error::CheckpointStore(message)
-                if message.contains("unknown publication")),
+            matches!(
+                &error,
+                bifrost_sync::Error::AckRejected(bifrost_sync::AckRejection::UnknownPublication)
+            ),
             "the only acknowledgement a consumer may be refused here is one naming a \
              publication of a discarded backfill attempt; got {error:?}"
         );

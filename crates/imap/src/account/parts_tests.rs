@@ -393,15 +393,21 @@ fn handle_round_trips() {
     let path = PartPath(vec![2, 1]);
     let encoded = encode_part_handle(
         &folder(),
-        7,
-        42,
+        crate::types::UidValidity::new(7).expect("valid protocol test value"),
+        crate::types::Uid::new(42).expect("valid protocol test value"),
         &path,
         &canonical(TransferEncoding::Base64),
     );
     let decoded = decode_part_handle(&encoded, OP).expect("round trip");
     assert_eq!(decoded.folder.as_str(), "INBOX");
-    assert_eq!(decoded.uidvalidity, 7);
-    assert_eq!(decoded.uid, 42);
+    assert_eq!(
+        decoded.uidvalidity,
+        crate::types::UidValidity::new(7).expect("valid protocol test value")
+    );
+    assert_eq!(
+        decoded.uid,
+        crate::types::Uid::new(42).expect("valid protocol test value")
+    );
     assert_eq!(decoded.path, path);
     assert_eq!(decoded.encoding.classified, TransferEncoding::Base64);
     assert_eq!(decoded.encoding.token, "base64");
@@ -413,7 +419,13 @@ fn handle_round_trips() {
 #[test]
 fn handle_preserves_an_unmodelled_encoding_token() {
     let part = &walk(b"(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"X-UUENCODE\" 42)")[0];
-    let encoded = encode_part_handle(&folder(), 7, 42, &part.path, &part.encoding);
+    let encoded = encode_part_handle(
+        &folder(),
+        crate::types::UidValidity::new(7).expect("valid protocol test value"),
+        crate::types::Uid::new(42).expect("valid protocol test value"),
+        &part.path,
+        &part.encoding,
+    );
     let decoded = decode_part_handle(&encoded, OP).expect("round trip");
     assert_eq!(decoded.encoding.classified, TransferEncoding::Unknown);
     assert_eq!(decoded.encoding.token, "x-uuencode");
@@ -428,10 +440,19 @@ fn handle_survives_a_colon_in_the_encoding_token() {
         classified: TransferEncoding::Unknown,
         token: "x-weird:token".to_owned(),
     };
-    let encoded = encode_part_handle(&folder(), 3, 9, &PartPath(vec![1]), &encoding);
+    let encoded = encode_part_handle(
+        &folder(),
+        crate::types::UidValidity::new(3).expect("valid protocol test value"),
+        crate::types::Uid::new(9).expect("valid protocol test value"),
+        &PartPath(vec![1]),
+        &encoding,
+    );
     let decoded = decode_part_handle(&encoded, OP).expect("round trip");
     assert_eq!(decoded.encoding, encoding);
-    assert_eq!(decoded.uid, 9);
+    assert_eq!(
+        decoded.uid,
+        crate::types::Uid::new(9).expect("valid protocol test value")
+    );
 }
 
 /// The folder is length-prefixed, not escaped: a mailbox name containing the
@@ -442,8 +463,8 @@ fn handle_survives_a_colon_in_the_mailbox_name() {
     let odd = MailboxName::new("Archive:2026:Q1".to_owned()).expect("valid mailbox");
     let encoded = encode_part_handle(
         &odd,
-        3,
-        9,
+        crate::types::UidValidity::new(3).expect("valid protocol test value"),
+        crate::types::Uid::new(9).expect("valid protocol test value"),
         &PartPath(vec![1]),
         &canonical(TransferEncoding::QuotedPrintable),
     );
@@ -462,8 +483,8 @@ fn handle_survives_a_colon_in_the_mailbox_name() {
 fn unrecognised_version_is_refused() {
     let current = encode_part_handle(
         &folder(),
-        7,
-        42,
+        crate::types::UidValidity::new(7).expect("valid protocol test value"),
+        crate::types::Uid::new(42).expect("valid protocol test value"),
         &PartPath(vec![1]),
         &canonical(TransferEncoding::Base64),
     );
@@ -489,15 +510,25 @@ fn unrecognised_version_is_refused() {
 fn uidvalidity_mismatch_is_reported_not_fetched() {
     let encoded = encode_part_handle(
         &folder(),
-        7,
-        42,
+        crate::types::UidValidity::new(7).expect("valid protocol test value"),
+        crate::types::Uid::new(42).expect("valid protocol test value"),
         &PartPath(vec![1]),
         &canonical(TransferEncoding::Base64),
     );
     let decoded = decode_part_handle(&encoded, OP).expect("round trip");
-    assert!(decoded.verify_uidvalidity(7, OP).is_ok());
+    assert!(
+        decoded
+            .verify_uidvalidity(
+                crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                OP
+            )
+            .is_ok()
+    );
     let error = decoded
-        .verify_uidvalidity(8, OP)
+        .verify_uidvalidity(
+            crate::types::UidValidity::new(8).expect("valid protocol test value"),
+            OP,
+        )
         .expect_err("stale epoch refused");
     assert!(matches!(
         error.kind(),

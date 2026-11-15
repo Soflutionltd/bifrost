@@ -817,7 +817,7 @@ pub enum ObjectChangeKind {
 /// `membership` stays a single `MembershipScope`, not a `Vec`
 /// (adjudicated, likely WONTFIX): the single `Folder(id)` is the
 /// correct routing membership - the engine's covering rule would not
-/// cover a `Mailbox(owner)` tag against a folder cursor. Widening
+/// cover an `Owner(owner)` tag against a folder cursor. Widening
 /// would touch types + jmap + graph + engine and is only worth it if
 /// change events must carry the owner tag for some future consumer.
 #[derive(Debug, Clone)]

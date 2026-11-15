@@ -183,7 +183,10 @@ pub(crate) fn push_subscribe(
         }
         let outcomes = outcomes.finalize(&expected).map_err(|error| {
             account_error_with(
-                crate::Error::Internal(error.to_string()),
+                crate::Error::Internal {
+                    kind: crate::error::InternalFailure::Invariant(error.to_string()),
+                    mid_exchange: None,
+                },
                 ImapErrorContext::operation(AccountOperation::PushSubscribe),
             )
         })?;
@@ -193,9 +196,12 @@ pub(crate) fn push_subscribe(
         bifrost_types::PushSubscription::new((!accepted.is_empty()).then_some(handle), outcomes)
             .map_err(|failure| {
                 account_error_with(
-                    crate::Error::Internal(format!(
-                        "IMAP push subscription invariant failed: {failure}"
-                    )),
+                    crate::Error::Internal {
+                        kind: crate::error::InternalFailure::Invariant(format!(
+                            "IMAP push subscription invariant failed: {failure}"
+                        )),
+                        mid_exchange: None,
+                    },
                     ImapErrorContext::operation(AccountOperation::PushSubscribe),
                 )
             })
@@ -312,9 +318,13 @@ fn select_excludes(error: &AccountError, folder: &crate::types::MailboxName) -> 
 fn notify_failure(
     error: crate::Error,
     folder: &crate::types::MailboxName,
-    shared_owner: Option<&bifrost_types::MailboxId>,
+    shared_owner: Option<&bifrost_types::PrincipalId>,
 ) -> (AccountError, bool) {
-    let refused = matches!(error, crate::Error::No { .. } | crate::Error::Bad { .. });
+    let refused = matches!(
+        error,
+        crate::Error::ServerStatus(crate::error::ServerStatus::No { .. })
+            | crate::Error::ServerStatus(crate::error::ServerStatus::Bad { .. })
+    );
     let error = super::error::folder_error(
         error,
         folder,
@@ -410,7 +420,7 @@ pub(crate) fn push_stream(
                             yield E::UnitFailed(e); yield E::Ended(End::Reconfigure); return;
                         }
                         if e.recovery().is_retryable() || e.recovery().requires_reconciliation() { yield E::UnitFailed(e); }
-                        else if degrade { yield E::Warning(bifrost_types::Warning::support_only(bifrost_types::WarningKind::Other, format!("NOTIFY SET refused: {}", e.message_key()))); }
+                        else if degrade { yield E::Warning(bifrost_types::Warning::support_only(bifrost_types::WarningKind::NotifyRefused, format!("NOTIFY SET refused: {}", e.message_key())).with_error(e)); }
                         else { drop(conn); yield E::Failed(e); return; }
                         false
                     }
@@ -670,7 +680,7 @@ async fn register_notify(
 fn absorb_idle_event(
     account: &ImapAccount,
     selected: &crate::types::MailboxName,
-    uidvalidity: Option<u32>,
+    uidvalidity: Option<crate::types::UidValidity>,
     event: &IdleEvent,
 ) -> Result<(), crate::Error> {
     let IdleEvent::Event(event) = event else {
@@ -961,18 +971,17 @@ mod session_classification_tests {
     fn idle_failures_split_into_folder_local_and_session_failures() {
         let folder = crate::types::MailboxName::new("gone").unwrap();
         let nonexistent = classify(
-            crate::Error::No {
+            crate::Error::ServerStatus(crate::error::ServerStatus::No {
                 code: Some(crate::types::ResponseCode::NonExistent),
                 text: "gone".into(),
-                attempt: None,
-            },
+            }),
             &folder,
         );
         assert!(select_excludes(&nonexistent, &folder));
         let transport = classify(
-            crate::Error::Io {
-                source: std::sync::Arc::new(std::io::Error::from(
-                    std::io::ErrorKind::ConnectionReset,
+            crate::Error::Transport {
+                kind: crate::error::TransportFailure::Io(crate::error::IoFailure(
+                    std::sync::Arc::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
                 )),
                 attempt: None,
             },
@@ -984,21 +993,19 @@ mod session_classification_tests {
     fn a_refused_notify_registration_warns_and_keeps_selected_coverage() {
         let folder = crate::types::MailboxName::new("INBOX").unwrap();
         let (_, degrade) = notify_failure(
-            crate::Error::No {
+            crate::Error::ServerStatus(crate::error::ServerStatus::No {
                 code: None,
                 text: "unsupported filter".into(),
-                attempt: None,
-            },
+            }),
             &folder,
             None,
         );
         assert!(degrade);
         let (_, degrade) = notify_failure(
-            crate::Error::No {
+            crate::Error::ServerStatus(crate::error::ServerStatus::No {
                 code: Some(crate::types::ResponseCode::NoPerm),
                 text: "denied".into(),
-                attempt: None,
-            },
+            }),
             &folder,
             None,
         );
@@ -1006,13 +1013,12 @@ mod session_classification_tests {
         // On a shared folder the denial is a scoped revocation, the class the
         // stream answers by excluding just that folder; it never degrades.
         let (revoked, degrade) = notify_failure(
-            crate::Error::No {
+            crate::Error::ServerStatus(crate::error::ServerStatus::No {
                 code: Some(crate::types::ResponseCode::NoPerm),
                 text: "denied".into(),
-                attempt: None,
-            },
+            }),
             &folder,
-            Some(&bifrost_types::MailboxId("alice".into())),
+            Some(&bifrost_types::PrincipalId("alice".into())),
         );
         assert!(!degrade);
         assert!(matches!(
@@ -1234,11 +1240,10 @@ mod assignment_tests {
     fn an_account_wide_directive_on_select_fails_the_session_without_excluding() {
         let folder = crate::types::MailboxName::new("INBOX").unwrap();
         let error = classify(
-            crate::Error::No {
+            crate::Error::ServerStatus(crate::error::ServerStatus::No {
                 code: Some(crate::types::ResponseCode::NoModSeq),
                 text: "changed".into(),
-                attempt: None,
-            },
+            }),
             &folder,
         );
         assert!(error.recovery().requires_engine_action());
@@ -1252,11 +1257,10 @@ mod assignment_tests {
             crate::types::ResponseCode::UidNotSticky,
         ] {
             let error = classify(
-                crate::Error::No {
+                crate::Error::ServerStatus(crate::error::ServerStatus::No {
                     code: Some(code),
                     text: "changed".into(),
-                    attempt: None,
-                },
+                }),
                 &folder,
             );
             assert!(error.recovery().requires_engine_action());

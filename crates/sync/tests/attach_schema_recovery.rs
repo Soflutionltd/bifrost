@@ -1141,7 +1141,10 @@ async fn a_forwarded_page_with_a_loss_lane_warns_on_the_change_stream() {
     };
     assert_eq!(
         warning.kind,
-        bifrost_types::WarningKind::OperatorAttentionNeeded
+        bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::IncompletePage {
+            skipped_scopes: 1,
+            failed_ids: 1,
+        })
     );
     let text = warning.message.value.clone();
     assert!(text.contains("contacts_list"), "{text}");
@@ -2885,7 +2888,7 @@ async fn a_partial_batch_carrying_a_checkpoint_terminates_the_scope() {
         scope.clone(),
         cursor_for(&scope, b"live"),
         Arc::new(CursorRegistry::new()),
-        Arc::new(bifrost_sync::multiplexer::ChangeDelivery::new(changes_tx)),
+        Arc::new(bifrost_sync::delivery::ChangeDelivery::new(changes_tx)),
         boundary.subscribe(),
         None,
         None,
@@ -2965,7 +2968,7 @@ async fn a_published_change_checkpoint_always_carries_its_publication_id() {
         scope.clone(),
         cursor_for(&scope, b"live"),
         Arc::new(CursorRegistry::new()),
-        Arc::new(bifrost_sync::multiplexer::ChangeDelivery::new(changes_tx)),
+        Arc::new(bifrost_sync::delivery::ChangeDelivery::new(changes_tx)),
         boundary.subscribe(),
         Some(control),
         None,
@@ -3171,9 +3174,7 @@ fn walk_generation(value: u64) -> bifrost_sync::cursor::WalkGeneration {
 #[tokio::test(start_paused = true)]
 async fn deferred_inventory_waits_again_when_its_first_subscriber_leaves() {
     let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
-    let first = Arc::new(Mutex::new(
-        None::<bifrost_sync::multiplexer::ChangesReceiver>,
-    ));
+    let first = Arc::new(Mutex::new(None::<bifrost_sync::delivery::ChangesReceiver>));
     let departed = Arc::clone(&first);
     let mut account = common::StubAccount::new(vec![scope.clone()]);
     account.establishment = |_| bifrost_types::CursorEstablishment::EstablishViaInventory;

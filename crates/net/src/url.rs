@@ -61,20 +61,44 @@ pub fn encode_path_component(value: &str) -> String {
     encode_query_value(value)
 }
 
+/// A scheme, canonical host and effective port, without resource or credential text.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct Origin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl Origin {
+    /// Extract a network origin. URLs without a host or effective port have none.
+    #[must_use]
+    pub fn from_url(url: &reqwest::Url) -> Option<Self> {
+        Some(Self {
+            scheme: url.scheme().to_owned(),
+            host: url.host_str()?.to_ascii_lowercase(),
+            port: url.port_or_known_default()?,
+        })
+    }
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}://{}:{}", self.scheme, self.host, self.port)
+    }
+}
+
 /// Exact credential origins, independently owned by each protocol leg.
 /// Cloning copies the set: discovery must not widen a sibling leg's authority.
 #[derive(Clone, Debug, Default)]
-pub struct TrustedOrigins(Vec<reqwest::Url>);
+pub struct TrustedOrigins(Vec<Origin>);
 
 impl TrustedOrigins {
     /// Trust the complete origin of an absolute HTTP(S) URL.
     pub fn trust(&mut self, raw: &str) -> Result<(), crate::Error> {
-        let mut url = credential_url(raw)?;
-        if !self.0.iter().any(|base| base.origin() == url.origin()) {
-            url.set_path("/");
-            url.set_query(None);
-            url.set_fragment(None);
-            self.0.push(url);
+        let url = credential_url(raw)?;
+        let origin = Origin::from_url(&url).expect("HTTP(S) URL has an origin");
+        if !self.0.contains(&origin) {
+            self.0.push(origin);
         }
         Ok(())
     }
@@ -82,13 +106,19 @@ impl TrustedOrigins {
     /// Mint proof that this URL belongs to this leg's credential destinations.
     pub fn admit(&self, raw: &str) -> Result<AdmittedUrl, crate::Error> {
         let url = credential_url(raw)?;
-        if !self.0.iter().any(|base| base.origin() == url.origin()) {
+        self.admit_url(&url)
+    }
+
+    /// Admit an already parsed target without reinterpreting its serialization.
+    pub fn admit_url(&self, url: &reqwest::Url) -> Result<AdmittedUrl, crate::Error> {
+        validate_credential_url(url)?;
+        if !Origin::from_url(url).is_some_and(|origin| self.0.contains(&origin)) {
             return Err(crate::Error::InvalidRequest {
                 field: "url",
                 detail: "credential destination is not a trusted origin".into(),
             });
         }
-        Ok(AdmittedUrl(url))
+        Ok(AdmittedUrl(url.clone()))
     }
 }
 
@@ -98,6 +128,12 @@ impl TrustedOrigins {
 pub struct AdmittedUrl(reqwest::Url);
 
 impl AdmittedUrl {
+    /// The parsed target admitted by this policy.
+    #[must_use]
+    pub fn as_url(&self) -> &reqwest::Url {
+        &self.0
+    }
+
     /// The canonical serialization that must be sent without reinterpretation.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -118,25 +154,55 @@ fn credential_url(raw: &str) -> Result<reqwest::Url, crate::Error> {
         detail: "credential destination must be an absolute HTTP(S) URL without userinfo".into(),
     };
     let url = reqwest::Url::parse(raw).map_err(|_| refuse())?;
-    let authority = raw.split_once(':').map(|(_, rest)| {
+    if has_userinfo(raw) {
+        return Err(refuse());
+    }
+    validate_credential_url(&url)?;
+    Ok(url)
+}
+
+pub(crate) fn has_userinfo(raw: &str) -> bool {
+    raw.split_once(':').is_some_and(|(_, rest)| {
         let rest = rest.trim_start_matches(['/', '\\']);
         let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
-        &rest[..end]
-    });
+        rest[..end].contains('@')
+    })
+}
+
+pub(crate) fn validate_credential_url(url: &reqwest::Url) -> Result<(), crate::Error> {
     if !matches!(url.scheme(), "http" | "https")
         || url.host().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
-        || authority.is_some_and(|authority| authority.contains('@'))
     {
-        return Err(refuse());
+        return Err(crate::Error::InvalidRequest {
+            field: "url",
+            detail: "credential destination must be an absolute HTTP(S) URL without userinfo"
+                .into(),
+        });
     }
-    Ok(url)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{encode_path_component, encode_query_value};
+
+    #[test]
+    fn origin_identity_excludes_resource_text_and_keeps_ipv6_and_ports() {
+        let origin = |raw: &str| super::Origin::from_url(&reqwest::Url::parse(raw).unwrap());
+        assert_eq!(
+            origin("https://user:password@[::1]:443/a?q=secret#fragment"),
+            origin("https://[::1]/different"),
+        );
+        assert_ne!(origin("https://[::1]/"), origin("https://[::1]:8443/"));
+        assert_ne!(origin("https://[::1]/"), origin("http://[::1]:443/"));
+        assert_eq!(origin("mailto:user@example.test"), None);
+        assert_eq!(
+            origin("https://[::1]/").unwrap().to_string(),
+            "https://[::1]:443"
+        );
+    }
 
     #[test]
     fn credential_origins_compare_scheme_host_and_effective_port() {

@@ -24,15 +24,17 @@ pub(in crate::codec::encode) fn encode_getmetadata(
     if let Some(n) = max_size
         && n > u64::from(u32::MAX)
     {
-        return Err(crate::Error::InvalidInput(format!(
+        return Err(crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(format!(
             "GETMETADATA MAXSIZE must fit in number (u32) per RFC 5464 Section 5 / RFC 3501 Section 9, got {n}"
-        ).into()));
+        ).into())));
     }
 
     // RFC 5464 Section 4.2 ABNF: `entries = entry / "(" entry *(SP entry) ")"`.
     if entries.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            "GETMETADATA requires at least one entry (RFC 5464 Section 4.2)".into(),
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "GETMETADATA requires at least one entry (RFC 5464 Section 4.2)".into(),
+            ),
         ));
     }
 
@@ -46,12 +48,14 @@ pub(in crate::codec::encode) fn encode_getmetadata(
         && d != "1"
         && d != "infinity"
     {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "GETMETADATA DEPTH must be \"0\", \"1\", or \"infinity\" \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "GETMETADATA DEPTH must be \"0\", \"1\", or \"infinity\" \
              (RFC 5464 Section 4.2.2), got: {d:?}"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
 
@@ -116,8 +120,10 @@ pub(in crate::codec::encode) fn encode_setmetadata(
 ) -> Result<(), crate::Error> {
     // RFC 5464 Section 5 ABNF: `entry-values = "(" entry *(SP entry) ")"`.
     if entries.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            "SETMETADATA requires at least one entry (RFC 5464 Section 5)".into(),
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "SETMETADATA requires at least one entry (RFC 5464 Section 5)".into(),
+            ),
         ));
     }
 

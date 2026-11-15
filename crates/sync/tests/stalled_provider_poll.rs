@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use bifrost_sync::cancel::{Boundary, BoundaryRequest};
 use bifrost_sync::cursor::CursorRegistry;
-use bifrost_sync::multiplexer::{ChangeDelivery, ChangesEvent, drive_changes_stream};
+use bifrost_sync::delivery::ChangeDelivery;
+use bifrost_sync::multiplexer::{ChangesEvent, drive_changes_stream};
 use bifrost_types::{Account, CursorScope};
 use tokio::sync::broadcast;
 

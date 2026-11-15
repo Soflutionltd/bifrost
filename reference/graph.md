@@ -98,6 +98,12 @@ readable public folder.
 
 - `mod.rs` - `GraphAccount`, `GraphAccountFactory`, `PushConfig`,
   the `impl Account` surface.
+- `mailbox_router.rs` - `MailboxRouter`: primary/shared client selection,
+  mailbox budget declarations, metered views and the per-mailbox Trash cache.
+- `public_folders.rs` - `PublicFolders`: discovery policy, routing and metadata,
+  discovery completeness, missing-route classification and bounded item shapes.
+  Routing and metadata publish together under one discovery write lock.
+- `etag_index.rs` - the bounded `EtagIndex` and its observation transitions.
 - `capabilities.rs` - `build_capabilities` per `PushConfig`.
 - `cursor.rs` - `GraphCursorKind`, `GraphCursorPayload`,
   `GraphPageMarker`, envelope encode/decode and collection kinds.
@@ -152,8 +158,9 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
 - `push/` - the push subscription surface, split by arm. `mod.rs` declares the
   modules and re-exports the `pub(crate)` doors the rest of `account/` calls
   (`push_subscribe` / `push_unsubscribe`, `retire_all_graph_subscriptions`,
-  `PushEndpoint`, `GraphSubscriptionGroup`, `EwsSubscriptionState` /
-  `EwsSubscriptionScope`); everything else is `pub(super)` inside `push`.
+  `PushEndpoint`, `WebhookRegistry`, `RecreatedSubscriptionIds` and
+  `EwsSubscriptionState` / `EwsSubscriptionScope`). Webhook row types are
+  re-exported only for account tests; arm helpers stay inside `push`.
   - `push/dispatch.rs` - the two `Account` doors: the empty-scope refusal, the
     per-scope poll-only split, the `PushConfig` dispatch (`subscribe_eligible`),
     and the positional three-lane outcome ledger (`push_item_ids` /
@@ -169,6 +176,10 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
     `unsubscribe_graph`, `close()`'s `retire_all_graph_subscriptions`, and the
     `mark_group_tearing_down` / `remove_subscription_from_groups` pair that
     makes it race-free against renewal.
+  - `push/registry.rs` - `WebhookRegistry`, the private registration lock,
+    topology watch, gap queue and factory-shared recreated-id ledger. Registration,
+    renewal updates, replacement installation and teardown snapshots are methods;
+    replacement rows, gaps and recreated ids commit under one registration lock.
   - `push/renewal.rs` - due-row maintenance sessions, account-owned recreate
     install-or-undo tasks, committed gap obligations and terminal row retirement.
   - `push/ews.rs` - the EWS streaming arm: native folder ids from `GraphScope`, the
@@ -186,9 +197,11 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
     the whole-request refusals, which run in both push modes and belong to
     neither arm.
 - `push_stream.rs` - lane declarations and session dispatch by push mode.
-- `push_tasks.rs` - tracks account-owned effects that survive session drop.
+- `push_tasks.rs` - `PushTasks` tracks account-owned effects that survive
+  session drop and joins them under one five-second close budget.
 - `ews_stream.rs` - EWS Streaming Notifications fallback:
-  scope recovery, sessions and release ledger - generic over the crate-private
+  scope recovery, sessions and `EwsRegistry` (registrations, topology and the
+  private release ledger) - generic over the crate-private
   `EwsExecute` transport seam (`EwsClient` in production, a scripted
   double in tests). One-shot SOAP calls use the buffered `execute` funnel;
   `GetStreamingEvents` uses its separate chunked response seam and frames
@@ -513,7 +526,14 @@ whitespace `start` is `Request(Malformed)` naming `start` on both, and an empty
 `end` on a create is `Unsupported` (no end is invented). An empty `end` on a
 patch is not refused: `graph_event_from_patch` drops it, before it can feed the
 all-day inference or `isAllDay`, so an echoed event leaves the stored end
-alone. An `EventId` without
+alone. Shared `EventTime` values own parsed dates, local times and instants;
+the create payload and returned event derive `is_all_day()` from their starts.
+Malformed touched bounds and incompatible or reversed bound pairs are refused
+through shared validation before I/O. An explicit patch `is_all_day` remains a
+conversion request; otherwise supplied typed bounds determine `isAllDay`.
+Graph and public-folder EWS reads retain provider timezone names, while range
+and recurrence writers consume the shared parsed clock rather than re-parsing
+its spelling. An `EventId` without
 the calendar separator was never minted here, so `split_event_id` refuses it
 as `Request(Malformed)` with field `event`. A server-derived organizer, a
 non-`Confirmed` status, and an RSVP value Graph has no action for stay
@@ -757,7 +777,7 @@ Capability, lane and subscribe dispatch all read the same configuration.
 `/users/{id}` routing key.
 Configuration and delegate discovery deduplicate ASCII case variants, keeping
 the FIRST configured spelling as the mailbox's canonical spelling. That
-spelling keys `shared_clients` and is the owner written into every item,
+spelling keys the shared-client map in `MailboxRouter` and is the owner written into every item,
 folder, thread and owner-tag id; ids are never re-spelled, because they are
 durable identities a consumer has stored and re-spelling would make every
 shared-mailbox object look new. Only routing and throttle budgets compare
@@ -957,10 +977,15 @@ opt-in delegate-Autodiscover pass (account-scoped, since discovery is
 what failed and no narrower scope is knowable) - config-supplied shared
 mailboxes always install.
 
-`GraphAccount` owns:
+`GraphAccount` composes state owners. Production code cannot take the webhook
+registration locks, EWS registration/release locks or public-folder write locks
+outside their owners. Existing lock-blocking tests use explicit test-only accessors.
+An enterprise Outlook user expects closing or unsubscribing to retain failed
+cleanup obligations and prevent renewal from resurrecting retired coverage;
+those transitions therefore live on the registry holding the relevant lock.
 
-- The shared primary `GraphClient` plus `shared_clients: Arc<HashMap<String,
-  GraphClient>>`, one `for_shared_mailbox(id)` client per foreign mailbox.
+- `MailboxRouter` holds the primary `GraphClient` and an immutable shared-client
+  map, one `for_shared_mailbox(id)` client per foreign mailbox.
   Every foreign operation, including initial inventory and delta-link resume,
   selects that owner client before it builds or follows a URL; continuations
   retain the selected client even though Graph's `nextLink` and `deltaLink`
@@ -1017,13 +1042,17 @@ mailboxes always install.
     `Protocol(ContractViolation)` and transport failures, and flattening a
     provider contract violation or a retryable 500 into `Request(Malformed)`
     would derive `ClientBug` for a fault the caller cannot fix.
-- The built `AccountCapabilities`, push mode and optional endpoint, shared
-  lane lease, effect-task registry, topology watches, gap queue and EWS ledger.
+- The built `AccountCapabilities`, `PushConfig`, shared lane lease and shutdown
+  token, plus `PushTasks` for effects that survive a dropped session.
 - An `Arc<RwLock<CursorIndex>>` (scope list) and `Arc<RwLock<FolderTree>>`
   (parent map).
-- `HashMap<SubscriptionHandle, GraphSubscriptionGroup>` (webhook) +
-  `HashMap<SubscriptionHandle, EwsSubscriptionState>` (EWS), with a
-  `CancellationToken`.
+- `WebhookRegistry` holds webhook groups, topology, pending coverage gaps and
+  the recreated-id ledger shared by every open from the factory. `EwsRegistry`
+  holds EWS registrations, topology and server subscription release obligations.
+  Registration checks shutdown under its owner's write lock. Replacement install
+  checks both shutdown and teardown intent, and records the row, gap and recreated
+  identity before releasing that same lock. Release claims and task publication
+  retain the ledger-before-task-registry lock order.
 - A bounded LRU `etag_index` of mail HTTP entity-tags (powering `If-Match`; mutation
   preflight reads refresh recency, `MESSAGE_SELECT` explicitly requests
   `changeKey`; the shared JSON projection prefers `@odata.etag` and otherwise
@@ -1038,8 +1067,8 @@ mailboxes always install.
   tickets, so insert / hit / evict are each one hash lookup plus a couple of
   tree nodes and never a scan: the write lock is taken once per hydrated page
   and once per mutation preflight, where a scanning policy would cost
-  `messages * capacity` comparisons serialized behind it. Alongside it a
-  per-mailbox `trash_folder_ids` cache resolves `deletedItems` once per
+  `messages * capacity` comparisons serialized behind it. Alongside it,
+  `MailboxRouter`'s per-mailbox Trash cache resolves `deletedItems` once per
   opened account (primary key empty, shared key its routing key); a reopen
   creates a fresh cache. This avoids re-listing all well-known folders for
   every `delete_thread` while retaining owner-correct routing. ONLY a
@@ -1048,11 +1077,10 @@ mailboxes always install.
   move destination but not the id `container_is_trash` compares against, so
   answering with it turns "destroy a thread already in Trash" into a
   no-op move that reports success - and caching it made one transient
-  failure do that for the rest of the account's life. Alongside it
-  is a
-  `routing_map: Arc<RwLock<HashMap<FolderId,
-  PublicFolderRouting>>>` from public-folder discovery, plus
-  `public_folders_enabled` and the discovered `user_email`.
+  failure do that for the rest of the account's life.
+- `PublicFolders` owns the configured policy, routing and metadata snapshot,
+  discovery-completeness flag and bounded item-class cache. The discovered
+  `user_email` remains account configuration.
 - `set_priority` / `set_bandwidth_cap` delegate to `AccountNet`.
   Open attaches before account construction; same-id reattachment preserves
   the bandwidth budget, while cross-id retagging selects the destination budget.
@@ -1080,7 +1108,8 @@ batch that made it. The record sits at both wire funnels (`execute_wire` and
 Autodiscover POST are counted too. Each engine stream takes one accumulator and each emitted batch
 `take`s it.
 
-`metered()` is a `self.clone()` with two client fields swapped, so it produces
+`metered()` clones the account and replaces its `MailboxRouter` with a metered
+view of every client, preserving the shared Trash cache. It produces
 a SECOND `GraphAccount` value over the same account. Every field that must be
 one thing per account has to be `Arc`-shared for that to hold - which is why
 the maps, lane lease, EWS ledger, pending gaps and effect-task registry all are.
@@ -1124,14 +1153,14 @@ there is no provider terminal latch or event broadcast adapter.
 subscription dies because this process did. In order:
 `retire_all_graph_subscriptions` cancels the shutdown token (its first step,
 before it looks at any group, and `close()`'s only cancel), then walks
-`graph_subscriptions` and runs the teardown per handle (best-effort - a DELETE
+`WebhookRegistry` groups and runs the teardown per handle (best-effort - a DELETE
 failure is logged, never returned, since `close()` must still complete and the
 engine has no recovery for "the server kept a subscription"); `close()` then
 marks the EWS release ledger retired and claims a release for every `Live` and
 `Orphaned` streaming subscription (Exchange caps streaming subscriptions per
 mailbox, so a reopen that skipped this burned one until it timed out); and
 finally awaits every handle in `push_tasks` (those releases and any webhook
-recreate install-or-undo) under ONE `CLOSE_WORKER_JOIN_TIMEOUT`. A handle still
+recreate install-or-undo) under one five-second `PushTasks::join` budget. A handle still
 running at the bound is dropped, never aborted, so its task runs to completion
 detached; the close logs how many were left. Without the walk, each reopen
 stranded one live webhook subscription per resource still POSTing to the
@@ -1188,7 +1217,7 @@ session's start or `close()`.
   `remove_from_container`, `set_keyword`, `set_label_membership`,
   standalone `attachment_upload`, `identity_update`, `quota_get`.
   `send_as` is the one flag derived per account rather than fixed: true
-  only while `shared_clients` is non-empty, refreshed once if delegate
+  only while the `MailboxRouter` shared-client map is non-empty, refreshed once if delegate
   Autodiscover widens that map during `open`.
 - `filter_rule_shape: Rules`; all 5 filter flags true (Graph Inbox
   `messageRules` CRUD + local `filter_validate`).
@@ -1487,12 +1516,12 @@ identity rides inside the `FolderId` string via the `account/foreign.rs`
 codec (`encode_foreign(mailbox, folder)` joins on `\u{1f}`,
 `parse_folder` splits it back into `ParsedFolder::{Primary, Foreign}`).
 No new `CursorScope` variant. `client_for_scope(scope)` selects the
-`shared_clients` entry when the folder parses foreign, else the primary
-client; `owner_of_scope(scope)` returns the `MailboxId` owner for a foreign
+`MailboxRouter` shared-client entry when the folder parses foreign, else the primary
+client; `GraphScope::owner()` retains the owner for a foreign
 scope, `None` for primary. `discover_cursor_scopes_inner` lists the primary
 then each shared mailbox's folders, emitting foreign-namespaced `FolderType`
 scopes; a per-mailbox permission denial skips with a `Warning`.
-`discover_memberships_inner` emits the foreign `MembershipScope::Mailbox(owner)`
+`discover_memberships_inner` emits the foreign `MembershipScope::Owner(owner)`
 tag with the folder membership, and `inventory_stream` stamps it onto every
 foreign-scope item (the engine covering rule cannot form it).
 `containers_list` resolves each shared mailbox's well-known folder roles on
@@ -1616,7 +1645,7 @@ containers, zero pinned scopes, and nothing but a support-only warning:
 - No `PublicFolderInformation` (the setting is absent, or the lookup failed,
   a malformed answer included): `hierarchy_routing_fallback` anchors the
   browse on the account's own mailbox (a real identity - the anchor becomes
-  the owner `MailboxId` on every emitted item, so it must never be empty).
+  the owner `PrincipalId` on every emitted item, so it must never be empty).
 - No content-mailbox routing for a folder: `content_routing_or_hierarchy`
   seeds it with the hierarchy routing the browse already succeeded with.
 
@@ -1625,9 +1654,10 @@ still fatal to the leg (there is no hierarchy at all); a sub-folder browse
 failure still skips that subtree.
 
 `seed_and_scope` then splits discovery from sync. It ALWAYS seeds two maps -
-`routing_map` (the content-mailbox routing the cursor payload carries) and
-`public_folder_meta` (display name, `FolderClass`, parent, effective rights,
-for the `containers_list` projection) - and emits a `CursorScope::Folder`
+the routing map (the content-mailbox routing the cursor payload carries) and
+metadata (display name, `FolderClass`, parent, effective rights,
+for the `containers_list` projection) - under one `PublicFolders` discovery
+lock, and emits a `CursorScope::Folder`
 only when the configured `PublicFolderScope` names a mail folder
 (`IPF.Note` or a dot-separated subclass). Non-mail folders remain in
 hierarchy metadata with their `ContainerContentClass`.
@@ -1754,7 +1784,7 @@ wakes it. No provider task needs spawning or aborting on either path.
 Handles are self-describing so a teardown retried on a newer account instance
 still works. The engine keeps a handle whose teardown failed and retries
 `push_unsubscribe` on whatever instance is current; after a reopen that
-instance's `graph_subscriptions` map has never seen it. A webhook handle is the
+instance's `WebhookRegistry` groups map has never seen it. A webhook handle is the
 opaque string `graph2:<hex token>:<hex account>:<id>,<id>,...` carrying the
 Graph subscription ids (server-global per tenant; the account's credentials can
 delete them) and the hex-encoded engine `AccountId` that minted it. An orphan
@@ -1778,7 +1808,7 @@ failure so the engine keeps the orphan. The recreated ids live in
 hands to every account it opens, so it survives the reopens the engine retries
 across: a recreate records its new id there under the same write lock as the
 install, and on teardown an id leaves only when its DELETE succeeds, at the
-same point (`forget_deleted_subscription`) where its row leaves its group. The
+same point (`WebhookRegistry::forget_deleted`) where its row leaves its group. The
 other exits are not teardown: a later recreate swaps the id for its own, and a
 fully successful orphan teardown clears the handle's entry.
 
@@ -1864,7 +1894,7 @@ grouping, handle mint, the closed-account refusal) and then hands the creates,
 the rollback, the ledger close and the registration to a task spawned on the
 runtime (`run_subscribe` / `create_and_register`); the caller's future only
 awaits it. Dropping the caller therefore cannot skip a rollback DELETE, unwind
-the create loop over live creates, or die between the `graph_subscriptions`
+the create loop over live creates, or die between the `WebhookRegistry` groups
 insert and the return. Nothing is spawned or written before the first poll, so
 a future dropped before it has nothing to leak; the "guard" is the spawn, not an
 object built inside the async body.
@@ -2166,11 +2196,11 @@ primary message with the same native id untouched. Refused direct writes do
 not evict the previous observation.
 
 `SendRequest::send_as` (gated by `pim_methods.send_as`, which Graph advertises
-only while `shared_clients` is non-empty, so an account with no shared mailbox
+only while the `MailboxRouter` shared-client map is non-empty, so an account with no shared mailbox
 configured does not promise a path on which every request would fail; see
 `reference/jmap.md` for the JMAP foreign-submission leg)
-routes create/deferred-stamp/send through the shared mailbox's `shared_clients`
-entry (keyed by `MailboxId`); create and send take an explicit
+routes create/deferred-stamp/send through the shared mailbox's `MailboxRouter` shared clients
+entry (keyed by `PrincipalId`); create and send take an explicit
 `&GraphClient`, while deferred stamping takes the account and owner so it can
 route the write and invalidate the matching cache entry together.
 `apply_send_as` stamps `from`/`sender`: `As` forces both to
@@ -2352,8 +2382,8 @@ native folder ids (`Provenance { Graph, Folder, native }`), refreshes the
 folder tree, and maps well-known folders; user folders stay role-less. It then
 appends two namespaced legs:
 
-- Each `shared_clients` entry's folders, `namespace = Shared`,
-  `owner = MailboxId(mailbox)`, `native_id = encode_foreign(mailbox, folderId)`
+- Each `MailboxRouter` shared-client entry's folders, `namespace = Shared`,
+  `owner = PrincipalId(mailbox)`, `native_id = encode_foreign(mailbox, folderId)`
   (byte-identical to the `CursorScope::FolderType` string discovery emits, so
   a container joins its sync scope by id), `owner_local_id` = the bare Graph
   folder id. The primary role map is deliberately NOT applied here - a shared
@@ -2460,14 +2490,20 @@ terminal `ClientBug` instead of `SyncState(CursorInvalid)` ->
 `RestartScope`, and a 403 `AdminConsentRequired` classified
 `PermissionDenied` instead of `NeedsAdminConsent`. `net_to_account_error`
 refines when the body is Graph's - an envelope decoded, or there was no body
-at all and the status table is the whole answer (a bare 412 is
-`ConcurrencyConflict` here and an opaque server error in bifrost-net's
-table). A NON-EMPTY body that is not an envelope stays on bifrost-net's
+at all and the status table is the whole answer). A NON-EMPTY body that is not an envelope stays on bifrost-net's
 mapping on purpose: Graph did not write it, so reading it as
 `Protocol(ContractViolation)` would turn an edge device's HTML 403 on the
 Autodiscover leg into a terminal provider fault. `AuthLost` is never
 refined - it means a 401 survived a forced refresh, stronger evidence than
 the envelope, and Graph's own 401 arm derives the same recovery class.
+
+HTTP fallback uses `bifrost_net::classify_status` with an explicit
+cursor-context 400 override. The same policy reaches non-envelope transport
+failures, so 412 consistently refreshes state and 413 is malformed regardless
+of body format. Typed Graph codes still take precedence. The policy carries
+account throttle scope and the optional mailbox budget into net; the response,
+SOAP and Autodiscover paths apply the same throttle decoration at construction.
+No returned net error is rebuilt merely to stamp its budget.
 
 The same transport fact governs control flow, not just classification:
 `webhooks::subscription_is_gone` reads the status through
@@ -3221,3 +3257,12 @@ pass origin admission before bearer use. Refusals use
 `AccountError::invalid_page_cursor` with Protocol::Graph. An enterprise Outlook
 user expects an unrelated or stale saved page to reload only that walk, without
 searching another collection or resetting durable sync state.
+
+## Discovery degradation evidence
+
+A shared mailbox denied during cursor-scope discovery is reported through
+`WarningKind::ScopeSkipped` with `ErrorScope::Owner` and the originating
+classified error. Primary and accessible shared mail continue. An Outlook user
+can inspect the failed grant without mistaking the missing share for an empty
+mailbox. Outlook service configuration refusals retain
+`OperatorOverrideReason::OutlookConfiguration` and support-only detail.

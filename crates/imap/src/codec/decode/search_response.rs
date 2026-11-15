@@ -45,7 +45,7 @@ pub(super) fn parse_untagged_sort(input: &[u8]) -> IResult<&[u8], UntaggedRespon
 fn parse_number_list_with_modseq<'a>(
     input: &'a [u8],
     keyword: &'static [u8],
-) -> IResult<&'a [u8], (Vec<u32>, Option<u64>)> {
+) -> IResult<&'a [u8], (Vec<u32>, Option<crate::types::ModSeq>)> {
     let (input, _) = tag_no_case(keyword).parse(input)?;
     // RFC 3501 Section 7.2.5 / RFC 5256 Section 4 ABNF specifies
     // `nz-number`, but we use `number` per Postel's law: some
@@ -60,7 +60,7 @@ fn parse_number_list_with_modseq<'a>(
 
 /// Parse optional `search-sort-mod-seq` suffix and consume trailing content
 /// through CRLF (RFC 7162 Section 3.1.6).
-fn parse_optional_modseq_and_crlf(input: &[u8]) -> IResult<&[u8], Option<u64>> {
+fn parse_optional_modseq_and_crlf(input: &[u8]) -> IResult<&[u8], Option<crate::types::ModSeq>> {
     // A malformed or overflowing MODSEQ is discarded rather than committed:
     // `number64` reports overflow as a Failure, which `opt` would propagate
     // and so lose the already-parsed result numbers. Demote it to a plain
@@ -82,7 +82,7 @@ fn parse_optional_modseq_and_crlf(input: &[u8]) -> IResult<&[u8], Option<u64>> {
     .parse(input)?;
     let (input, _) = take_while(|b: u8| b != b'\r' && b != b'\n').parse(input)?;
     let (input, _) = crlf(input)?;
-    Ok((input, mod_seq))
+    Ok((input, mod_seq.and_then(crate::types::ModSeq::new)))
 }
 
 /// Parse `* ESEARCH (TAG "tag") [UID] result-data` (RFC 4731 Section 3.1).
@@ -172,7 +172,7 @@ pub(super) fn parse_untagged_esearch(input: &[u8]) -> IResult<&[u8], UntaggedRes
                 // results are preserved.
                 if let Ok((rest2, _)) = sp(rest) {
                     if let Ok((rest2, val)) = nz_number64(rest2) {
-                        esearch.mod_seq = Some(val);
+                        esearch.mod_seq = crate::types::ModSeq::new(val);
                         input = rest2;
                     } else {
                         let (rest2, _) =

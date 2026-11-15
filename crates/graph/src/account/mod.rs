@@ -14,6 +14,7 @@ pub(crate) use contacts::DirectoryMode;
 mod cursor;
 mod delta;
 mod error;
+mod etag_index;
 mod ews_stream;
 mod filters;
 mod flags;
@@ -22,9 +23,11 @@ mod get;
 pub(crate) mod graph_error;
 mod groups;
 mod inventory;
+mod mailbox_router;
 mod mutate;
 mod pim;
 mod public_folder;
+mod public_folders;
 mod push;
 mod push_stream;
 mod push_tasks;
@@ -33,7 +36,8 @@ mod scope;
 mod scopes;
 mod wire_item;
 
-use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
@@ -54,13 +58,11 @@ use bifrost_types::{
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use tokio::sync::{RwLock, watch};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 // pub: consumers build a GraphClient before registering GraphAccountFactory with the engine.
-use crate::client::Resource;
 pub use crate::client::{GraphClient, MicrosoftCloud};
-use crate::etag::GraphETag;
 use crate::types::GraphMailFolder;
 
 // Re-exported for the client-side api-base override test, which pins that a
@@ -68,7 +70,8 @@ use crate::types::GraphMailFolder;
 #[cfg(test)]
 pub(crate) use self::autodiscover::{autodiscover_soap_url, autodiscover_xml_url};
 
-use self::push::{EwsSubscriptionState, GraphSubscriptionGroup, PushEndpoint};
+use self::etag_index::{EtagIndex, EtagObservation};
+use self::push::PushEndpoint;
 use self::scopes::{CursorIndex, FolderTree};
 
 // pub: public-folder consumers name the folders they want synced.
@@ -109,98 +112,18 @@ impl PushConfig {
 
 #[derive(Clone)]
 pub(crate) struct GraphAccount {
-    pub(crate) client: GraphClient,
-    /// Foreign (shared/delegate) mailbox clients, keyed by the
-    /// `/users/{id}` routing key. Built once at `open` from the
-    /// factory's configured shared mailboxes via
-    /// `GraphClient::for_shared_mailbox`. Selecting the right client by
-    /// scope (`GraphScope::client`) keeps each sync call site - which
-    /// reads `api_path_prefix()` off the client - mailbox-correct by
-    /// construction.
-    pub(crate) shared_clients: Arc<HashMap<String, GraphClient>>,
+    pub(crate) mailboxes: mailbox_router::MailboxRouter,
     pub(crate) capabilities: AccountCapabilities,
     pub(crate) push_config: PushConfig,
     pub(crate) push_lease: bifrost_types::LaneLease,
-    pub(crate) push_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    pub(crate) graph_topology: Arc<watch::Sender<u64>>,
-    pub(crate) pending_gaps: Arc<std::sync::Mutex<std::collections::VecDeque<CursorScope>>>,
-    pub(crate) ews_ledger: Arc<std::sync::Mutex<ews_stream::EwsLedger>>,
+    pub(crate) push_tasks: push_tasks::PushTasks,
+    pub(crate) webhooks: push::WebhookRegistry,
+    pub(crate) ews: ews_stream::EwsRegistry,
     pub(crate) cursor_index: Arc<RwLock<CursorIndex>>,
     pub(crate) folder_tree: Arc<RwLock<FolderTree>>,
-    pub(crate) graph_subscriptions:
-        Arc<RwLock<HashMap<SubscriptionHandle, GraphSubscriptionGroup>>>,
-    /// Subscription ids recreated under a handle the handle cannot name.
-    /// Unlike the rest of the push state this is NOT fresh per instance: the
-    /// factory hands every account it opens the same ledger, so an orphan
-    /// retried on a reopened instance still reaches them.
-    pub(crate) recreated_subscription_ids: push::RecreatedSubscriptionIds,
-    pub(crate) ews_subscriptions: Arc<RwLock<HashMap<SubscriptionHandle, EwsSubscriptionState>>>,
-    /// Monotone generation counter bumped by `subscribe_ews` /
-    /// `unsubscribe_ews` on every change to `ews_subscriptions`. An EWS
-    /// session marks the current generation seen immediately before each
-    /// read of that map, so a bump can never be lost between reading and
-    /// waiting: a parked session wakes to subscribe, a live one releases its
-    /// subscription and ends `Reconfigure` so the next session subscribes to
-    /// the new scope union. A `watch` generation rather than a `Notify`
-    /// because a `Notify` permit stored by the registration that wakes a
-    /// parked session would be consumed right after its first Subscribe and
-    /// read as a topology change - turning every first registration into a
-    /// guaranteed redundant resubscribe.
-    pub(crate) ews_topology: Arc<watch::Sender<u64>>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) etag_index: Arc<RwLock<EtagIndex>>,
-    /// Well-known Trash folder ids keyed by their owning mailbox. The empty
-    /// key is the primary mailbox; shared mailboxes use their routing key.
-    /// Folder ids are stable for one opened account, and a fresh account on
-    /// reopen starts with an empty cache.
-    pub(crate) trash_folder_ids: Arc<RwLock<HashMap<String, String>>>,
-    /// Public-folder routing map, keyed by native EWS `FolderId`. A
-    /// folder present here is a public folder: it establishes via the
-    /// public-folder inventory pass and polls via the no-delta-token
-    /// strategy. Seeded empty at open; spec-3's Autodiscover discovery
-    /// fills it. The presence-in-map check (`public_folder_routing`) is
-    /// the discriminator that keeps a bare `CursorScope::Folder` for a
-    /// non-public folder on its existing (reject-on-delta) path.
-    pub(crate) routing_map:
-        Arc<RwLock<HashMap<bifrost_types::FolderId, cursor::PublicFolderRouting>>>,
-    /// Whether the most recent public-folder discovery pass browsed the
-    /// WHOLE hierarchy: no early exit, no skipped subtree, no step-cap
-    /// truncation. Only then does a folder missing from `routing_map` prove
-    /// the folder is gone for this user rather than not yet rediscovered;
-    /// hydration uses it to stop retrying such items (see
-    /// `graph_error::unroutable_public_resource_error`). Starts false on every
-    /// open, like the map it qualifies.
-    pub(crate) public_folder_discovery_complete: Arc<std::sync::atomic::AtomicBool>,
-    /// Projection metadata for every discovered public folder (display name,
-    /// EWS `FolderClass`, parent, effective rights), seeded in the same
-    /// discovery pass that fills `routing_map`. `containers_list` reads this
-    /// so it can render the full readable hierarchy - including folders that
-    /// are visible but not pinned for sync - without re-browsing EWS.
-    pub(crate) public_folder_meta:
-        Arc<RwLock<HashMap<bifrost_types::FolderId, public_folder::PublicFolderMeta>>>,
-    /// Which public folders this account syncs, or `None` when public-folder
-    /// discovery is off (the default, so no existing Graph account pays the
-    /// Autodiscover round-trips). Opt in via `with_public_folders`.
-    /// EWS item classes learned by the public-folder inventory / poll
-    /// passes, keyed by the folder-qualified `ObjectId` those passes mint.
-    ///
-    /// Hydration builds a CLASS-CONDITIONAL `GetItem` body, and the class is
-    /// not derivable from an id: this map is how the class the inventory
-    /// pass already parsed (`EwsItem.item_class`) reaches the hydration
-    /// call. It is a cache, never a source of truth - a miss falls back to
-    /// the folder's `FolderClass` in `public_folder_meta` (re-seeded by
-    /// discovery on every attach, so a cold reattach that hydrates a
-    /// consumer-held id before any inventory pass still gets a container
-    /// level answer), and a miss there falls back to the message shape,
-    /// which is the historical request. The alternative - encoding the
-    /// class into the `ObjectId` - was rejected because the poll's
-    /// `Destroyed` ids are minted from the persisted `live_ids` baseline,
-    /// which stores bare native item ids: a class-bearing id would stop
-    /// byte-matching the id the consumer stored unless the class were also
-    /// added to the cursor payload, ticking its schema, and ids already held
-    /// by consumers would carry no class either way.
-    pub(crate) public_item_classes: Arc<RwLock<HashMap<ObjectId, crate::ews::EwsItemShape>>>,
-    pub(crate) public_folders: Option<PublicFolderScope>,
+    pub(crate) public_folders: public_folders::PublicFolders,
     /// The account's primary SMTP, captured at open from the Graph
     /// profile. Seeds the `GetUserSettings` Autodiscover lookups.
     pub(crate) user_email: Option<String>,
@@ -219,135 +142,6 @@ pub(crate) struct GraphAccount {
     pub(crate) open_folder_seed: Arc<RwLock<Option<Vec<GraphMailFolder>>>>,
 }
 
-/// Entity tags are a best-effort mutation optimization. Retaining one per
-/// object forever turns a long-running high-churn account into an unbounded
-/// cache, so keep only a fixed working set.
-pub(crate) const ETAG_INDEX_MAX_ENTRIES: usize = 10_000;
-
-/// One join bound for account-owned push effects. Unfinished tasks are
-/// detached on expiry, preserving release and recreate install-or-undo work.
-const CLOSE_WORKER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// An entity tag plus the recency ticket that orders it in `EtagIndex::order`.
-struct EtagEntry {
-    etag: GraphETag,
-    seq: u64,
-}
-
-/// Bounded LRU over entity tags.
-///
-/// Every operation is one hash lookup plus one or two `BTreeMap` node
-/// operations - no scan of the cache. That matters because the write lock
-/// guarding this index is taken once per hydrated page and once per mutation
-/// preflight: a recency policy that walked the entries would make a full
-/// inventory pass cost `messages * capacity` comparisons, serialized, which
-/// is a worse trade than the unbounded map it replaced.
-#[derive(Default)]
-pub(crate) struct EtagIndex {
-    /// Keys are `Arc<str>` so a recency ticket can name an entry without a
-    /// second copy of the (long, base64url) Graph id.
-    entries: HashMap<Arc<str>, EtagEntry>,
-    /// Recency tickets, oldest first. Exactly one row per `entries` row,
-    /// keyed by that row's current `seq`, so eviction is `pop_first`.
-    order: BTreeMap<u64, Arc<str>>,
-    next_seq: u64,
-}
-
-/// Reads learn a validator; writes consume the old one even without a new
-/// validator. Failed preconditions and vanished targets invalidate it.
-pub(crate) enum EtagObservation {
-    Read(GraphETag),
-    Written(Option<GraphETag>),
-    Invalidated,
-}
-
-impl EtagIndex {
-    pub(crate) fn observe(&mut self, id: &str, observation: EtagObservation) {
-        match observation {
-            EtagObservation::Read(etag) | EtagObservation::Written(Some(etag)) => {
-                self.insert(id.to_owned(), etag);
-            }
-            EtagObservation::Written(None) | EtagObservation::Invalidated => self.remove(id),
-        }
-    }
-
-    pub(crate) fn insert(&mut self, id: String, etag: GraphETag) {
-        // `remove_entry` hands back the owned key, so re-caching an id
-        // already present does not reallocate it.
-        let (key, previous) = match self.entries.remove_entry(id.as_str()) {
-            Some((key, entry)) => (key, Some(entry.seq)),
-            None => {
-                self.evict_to_capacity();
-                (Arc::from(id), None)
-            }
-        };
-        let seq = self.promote(Arc::clone(&key), previous);
-        self.entries.insert(key, EtagEntry { etag, seq });
-    }
-
-    /// Reads an entity tag AND marks it hot. Mutation preflight is the only
-    /// reader, so an id being read is an id about to carry an `If-Match`.
-    pub(crate) fn get(&mut self, id: &str) -> Option<GraphETag> {
-        let (key, entry) = self.entries.remove_entry(id)?;
-        let seq = self.promote(Arc::clone(&key), Some(entry.seq));
-        let etag = entry.etag.clone();
-        self.entries.insert(
-            key,
-            EtagEntry {
-                etag: entry.etag,
-                seq,
-            },
-        );
-        Some(etag)
-    }
-
-    pub(crate) fn remove(&mut self, id: &str) {
-        if let Some(entry) = self.entries.remove(id) {
-            self.order.remove(&entry.seq);
-        }
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    #[cfg(test)]
-    fn contains_key(&self, id: &str) -> bool {
-        self.entries.contains_key(id)
-    }
-
-    #[cfg(test)]
-    fn order_len(&self) -> usize {
-        self.order.len()
-    }
-
-    /// Issues `key` a fresh recency ticket, retiring `previous` if it had
-    /// one. The caller must store the returned `seq` on the entry, which is
-    /// what keeps `order` and `entries` one-to-one.
-    fn promote(&mut self, key: Arc<str>, previous: Option<u64>) -> u64 {
-        if let Some(previous) = previous {
-            self.order.remove(&previous);
-        }
-        let seq = self.next_seq;
-        // A u64 ticket space is not exhaustible by any real account: at one
-        // cache write per nanosecond it lasts ~585 years.
-        self.next_seq = self.next_seq.wrapping_add(1);
-        self.order.insert(seq, key);
-        seq
-    }
-
-    /// Drops the coldest entries until one more will fit.
-    fn evict_to_capacity(&mut self) {
-        while self.entries.len() >= ETAG_INDEX_MAX_ENTRIES {
-            let Some((_, coldest)) = self.order.pop_first() else {
-                break;
-            };
-            self.entries.remove(&coldest);
-        }
-    }
-}
-
 impl GraphAccount {
     /// An account view whose every request reports its inbound payload
     /// bytes into a fresh batch accumulator.
@@ -357,15 +151,9 @@ impl GraphAccount {
     /// issues its requests through those handles, and leaving them out
     /// would report every such batch as having cost nothing.
     pub(crate) fn metered(&self) -> (Self, crate::client::ByteTally) {
-        let (client, tally) = self.client.metered();
-        let shared_clients = self
-            .shared_clients
-            .iter()
-            .map(|(key, client)| (key.clone(), client.with_tally(tally.clone())))
-            .collect();
+        let (mailboxes, tally) = self.mailboxes.metered();
         let mut metered = self.clone();
-        metered.client = client;
-        metered.shared_clients = Arc::new(shared_clients);
+        metered.mailboxes = mailboxes;
         (metered, tally)
     }
 
@@ -376,38 +164,23 @@ impl GraphAccount {
         public_folders: Option<PublicFolderScope>,
         user_email: Option<String>,
     ) -> Self {
-        let shared_clients = shared_clients_map(&client, shared_mailboxes);
-        // `pim_methods.send_as` mirrors this map, so derive it from the map
-        // AFTER `shared_clients_map` has dropped unroutable keys: a config
-        // of nothing but empty strings leaves no reachable mailbox and must
-        // not advertise the flag.
-        let has_shared_mailboxes = !shared_clients.is_empty();
+        let mailboxes = mailbox_router::MailboxRouter::new(client, shared_mailboxes);
+        let has_shared_mailboxes = !mailboxes.shared().is_empty();
         Self {
-            shared_clients: Arc::new(shared_clients),
-            client,
+            mailboxes,
             capabilities: capabilities::build_capabilities(&push_config, has_shared_mailboxes),
             push_config,
             push_lease: bifrost_types::LaneLease::new(),
-            push_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
-            graph_topology: Arc::new(watch::Sender::new(0)),
-            pending_gaps: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
-            ews_ledger: Arc::new(std::sync::Mutex::new(ews_stream::EwsLedger::default())),
-            cursor_index: Arc::new(RwLock::new(CursorIndex::default())),
-            folder_tree: Arc::new(RwLock::new(FolderTree::default())),
-            graph_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-            recreated_subscription_ids: Arc::default(),
-            ews_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-            ews_topology: Arc::new(watch::channel(0_u64).0),
+            push_tasks: push_tasks::PushTasks::default(),
+            webhooks: push::WebhookRegistry::default(),
+            ews: ews_stream::EwsRegistry::default(),
+            cursor_index: Arc::default(),
+            folder_tree: Arc::default(),
             shutdown: CancellationToken::new(),
-            etag_index: Arc::new(RwLock::new(EtagIndex::default())),
-            trash_folder_ids: Arc::new(RwLock::new(HashMap::new())),
-            routing_map: Arc::new(RwLock::new(HashMap::new())),
-            public_folder_discovery_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            public_folder_meta: Arc::new(RwLock::new(HashMap::new())),
-            public_item_classes: Arc::new(RwLock::new(HashMap::new())),
-            public_folders,
+            etag_index: Arc::default(),
+            public_folders: public_folders::PublicFolders::new(public_folders),
             user_email,
-            open_folder_seed: Arc::new(RwLock::new(None)),
+            open_folder_seed: Arc::default(),
         }
     }
 
@@ -420,7 +193,7 @@ impl GraphAccount {
     /// one refresh at the point of replacement is enough; a consumer that
     /// read the flag never has to re-read it.
     pub(crate) fn refresh_shared_mailbox_capabilities(&mut self) {
-        self.capabilities.pim_methods.send_as = !self.shared_clients.is_empty();
+        self.capabilities.pim_methods.send_as = !self.mailboxes.shared().is_empty();
     }
 
     #[cfg(test)]
@@ -464,7 +237,7 @@ impl GraphAccount {
         shared_clients: HashMap<String, GraphClient>,
     ) -> Self {
         let mut account = Self::new(client, test_push_config(push_mode), &[], None, None);
-        account.shared_clients = Arc::new(shared_clients);
+        account.mailboxes.set_shared_clients(shared_clients);
         account.refresh_shared_mailbox_capabilities();
         account
     }
@@ -504,11 +277,7 @@ impl GraphAccount {
         routing: cursor::PublicFolderRouting,
         meta: public_folder::PublicFolderMeta,
     ) {
-        self.routing_map
-            .write()
-            .await
-            .insert(folder.clone(), routing);
-        self.public_folder_meta.write().await.insert(folder, meta);
+        self.public_folders.seed(folder, routing, meta).await;
     }
 
     /// Select the `GraphClient` whose `/users/{mailbox}` prefix routes
@@ -529,235 +298,6 @@ impl GraphAccount {
         })?;
         parsed.client(self)
     }
-
-    /// Select the `GraphClient` for an owning mailbox decoded from a
-    /// foreign-encoded message/blob id. `None` (a primary-mailbox item)
-    /// routes through `/me`; a configured shared mailbox routes through
-    /// its `/users/{mailbox}` client. An unconfigured foreign owner is a
-    /// stale account configuration, never a primary-mailbox id.
-    pub(crate) fn client_for_owner(
-        &self,
-        owner: Option<&str>,
-    ) -> Result<&GraphClient, crate::error::GraphError> {
-        match owner {
-            None => Ok(&self.client),
-            Some(mailbox) => shared_client(&self.shared_clients, mailbox).ok_or_else(|| {
-                crate::error::GraphError::Configuration {
-                    message: format!("shared mailbox not configured on this account: {mailbox}"),
-                }
-            }),
-        }
-    }
-
-    /// The Outlook mailbox budget a REST request for `owner` is charged to:
-    /// the budget of the very client `client_for_owner` routes it through,
-    /// so the declaration and the stamp the REST funnel puts on that
-    /// client's throttles are one function of one client. `None` for an
-    /// unconfigured owner, which never reaches the wire.
-    pub(crate) fn budget_for_owner(
-        &self,
-        owner: Option<&str>,
-    ) -> Option<bifrost_types::ThrottleBudget> {
-        self.client_for_owner(owner)
-            .ok()
-            .map(GraphClient::mailbox_budget)
-    }
-
-    /// The mailbox budget a REST request for message `id` is charged to.
-    /// A public-folder item is read over EWS, whose throttles carry no
-    /// mailbox budget, so it declares none.
-    pub(crate) fn budget_for_object(&self, id: &ObjectId) -> Option<bifrost_types::ThrottleBudget> {
-        let parsed = foreign::parse_message_id(id);
-        if parsed.public_folder().is_some() {
-            return None;
-        }
-        self.budget_for_owner(parsed.owner())
-    }
-
-    /// Keep one owner per subrequest; the REST funnel merges final keys
-    /// before applying the per-mailbox batch weight.
-    pub(crate) fn batch_resource(
-        &self,
-        ids: &[ObjectId],
-    ) -> Result<Resource, crate::error::GraphError> {
-        let clients = ids
-            .iter()
-            .map(|id| {
-                let parsed = foreign::parse_message_id(id);
-                self.client_for_owner(parsed.owner()).cloned()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Resource::Batch(clients))
-    }
-
-    /// The mailbox budget a drive of `scope` is charged to. Use the same
-    /// scope admission and client routing as sync. Public-folder polling
-    /// uses EWS rather than a REST mailbox budget.
-    pub(crate) fn budget_for_scope(
-        &self,
-        scope: &CursorScope,
-    ) -> Option<bifrost_types::ThrottleBudget> {
-        let parsed = scope::GraphScope::parse(scope).ok()?;
-        if matches!(parsed, scope::GraphScope::PublicFolder(_)) {
-            return None;
-        }
-        parsed.client(self).ok().map(GraphClient::mailbox_budget)
-    }
-
-    /// Look up the public-folder routing for a native EWS folder id, or
-    /// `None` if the folder is not a public folder. Presence in the map
-    /// is the discriminator that routes a `CursorScope::Folder` onto the
-    /// public-folder sync path (vs the existing reject-on-delta path).
-    pub(crate) async fn public_folder_routing(
-        &self,
-        folder: &bifrost_types::FolderId,
-    ) -> Option<cursor::PublicFolderRouting> {
-        self.routing_map.read().await.get(folder).cloned()
-    }
-
-    /// The refusal for a public-folder item whose folder has no routing entry.
-    /// A retryable stale-local-state conflict until a complete discovery pass
-    /// has run; after one, `NotFound(Message)` so the item stops retrying
-    /// (ruling on `graph_error::unroutable_public_resource_error`).
-    pub(crate) fn missing_public_route_error(
-        &self,
-        operation: bifrost_types::AccountOperation,
-        id: &bifrost_types::ObjectId,
-        folder: &bifrost_types::FolderId,
-    ) -> bifrost_types::AccountError {
-        self.missing_public_collection_route_error(
-            operation,
-            folder,
-            bifrost_types::ErrorScope::Message {
-                id: id.0.clone().into(),
-            },
-            bifrost_types::ResourceKind::Message,
-            &id.0,
-        )
-    }
-
-    /// Before discovery, preserve the visible resource while routing catches up.
-    /// After a complete browse, an Outlook user expects an absent collection to
-    /// stop retrying. Keep its actual resource kind and scope for the consumer.
-    pub(crate) fn missing_public_collection_route_error(
-        &self,
-        operation: bifrost_types::AccountOperation,
-        folder: &bifrost_types::FolderId,
-        scope: bifrost_types::ErrorScope,
-        kind: bifrost_types::ResourceKind,
-        id: &str,
-    ) -> bifrost_types::AccountError {
-        let detail = format!("public folder {} has no routing entry", folder.0);
-        if self
-            .public_folder_discovery_complete
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            graph_error::unroutable_public_resource_error(
-                operation,
-                scope,
-                kind,
-                id,
-                format!("{detail} after a complete public-folder discovery"),
-            )
-        } else {
-            graph_error::stale_local_state_error(operation, scope, detail)
-        }
-    }
-
-    /// Whether `folder` is a public folder this account has discovered: in
-    /// the routing map (pinned for sync) or in the projection metadata
-    /// (visible in the hierarchy). A public folder id is a bare EWS
-    /// `FolderId`, so `foreign::parse_folder` reads it as primary; only
-    /// discovery can tell the two apart. An undiscovered bare id cannot be
-    /// classified here and is left to the server to refuse.
-    pub(crate) async fn is_known_public_folder(&self, folder: &bifrost_types::FolderId) -> bool {
-        self.routing_map.read().await.contains_key(folder)
-            || self.public_folder_meta.read().await.contains_key(folder)
-    }
-
-    /// Record the EWS item class of every item a public-folder inventory or
-    /// poll walk returned, so a later `GetItem` for one of those ids can ask
-    /// for the property shape that item's class accepts.
-    ///
-    /// Keyed by the same folder-qualified `ObjectId` the projections mint,
-    /// so the hydration doors look up exactly the id they were handed. The
-    /// map is bounded by `PUBLIC_ITEM_CLASS_CACHE_CAP`, which bounds
-    /// admission of NEW ids only: past it the folder's `FolderClass` fallback
-    /// carries hydration for ids that never got in, which is the correct
-    /// answer for every single-class folder and the historical one otherwise.
-    /// An id already resident is always refreshed, cap or no cap, so an item
-    /// whose `ItemClass` changed does not keep a stale shape.
-    pub(crate) async fn record_public_item_classes(
-        &self,
-        folder: &bifrost_types::FolderId,
-        items: &[crate::ews::EwsItem],
-    ) {
-        if items.is_empty() {
-            return;
-        }
-        let mut map = self.public_item_classes.write().await;
-        let mut len = map.len();
-        for item in items {
-            let id = foreign::encode_public_item_id(folder, &item.item_id);
-            let shape = crate::ews::EwsItemShape::from_item_class(&item.item_class);
-            match map.entry(id) {
-                // An id already in the map is refreshed unconditionally: the
-                // cap bounds ADMISSION of new keys, and overwriting an
-                // existing key does not grow the map. Without this an item
-                // whose `ItemClass` changed would keep its stale shape for
-                // the account's lifetime once the map filled up.
-                std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    slot.insert(shape);
-                }
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    if len < PUBLIC_ITEM_CLASS_CACHE_CAP {
-                        slot.insert(shape);
-                        len += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Drop the cached item classes for ids the public-folder poll just
-    /// emitted as `Destroyed`.
-    ///
-    /// The map is filled at every EWS walk and nothing else removed from
-    /// it, so without this the entry for a deleted item lived until the
-    /// account was dropped. That is not merely wasted memory: the cap is
-    /// an admission bound, not an eviction policy (see
-    /// `record_public_item_classes`), so a churning folder whose dead
-    /// entries fill the map locks every LATER item out of the cache and
-    /// silently demotes hydration to the neutral shape for the rest of
-    /// the process. Pruning at the destroy site keeps the resident set
-    /// proportional to the live set; the cap stays as the backstop for a
-    /// folder that is genuinely that large.
-    pub(crate) async fn forget_public_item_classes(&self, ids: &[ObjectId]) {
-        if ids.is_empty() {
-            return;
-        }
-        let mut map = self.public_item_classes.write().await;
-        for id in ids {
-            map.remove(id);
-        }
-    }
-
-    /// The `GetItem` property shape to request for a public-folder item.
-    ///
-    /// The cache is a property-selection hint only. Without a cached item
-    /// class request common properties; folder class cannot establish the
-    /// domain of an item in a mixed folder.
-    pub(crate) async fn public_item_shape(
-        &self,
-        id: &ObjectId,
-        folder: &bifrost_types::FolderId,
-    ) -> crate::ews::EwsItemShape {
-        if let Some(shape) = self.public_item_classes.read().await.get(id) {
-            return *shape;
-        }
-        let _ = folder;
-        crate::ews::EwsItemShape::default()
-    }
 }
 
 // pub: sync-engine consumers register this factory so reopen can mint fresh Graph accounts.
@@ -768,7 +308,7 @@ pub struct GraphAccountFactory {
     public_folders: Option<PublicFolderScope>,
     delegate_discovery: bool,
     /// Handed to every account this factory opens; see
-    /// `GraphAccount::recreated_subscription_ids`.
+    /// `push::WebhookRegistry`.
     recreated_subscription_ids: push::RecreatedSubscriptionIds,
 }
 
@@ -911,7 +451,9 @@ impl AccountFactory for GraphAccountFactory {
                 public_folders,
                 user_email.clone(),
             );
-            account.recreated_subscription_ids = recreated_subscription_ids;
+            account
+                .webhooks
+                .set_recreated_ids(recreated_subscription_ids);
 
             // Opt-in delegate enumeration: additive to config-supplied
             // shared mailboxes, deduped by routing key. Autodiscover is a
@@ -930,7 +472,7 @@ impl AccountFactory for GraphAccountFactory {
                         // nothing to add.
                         let merged =
                             autodiscover::merge_shared_mailboxes(&shared_mailboxes, &discovered);
-                        account.shared_clients = Arc::new(shared_clients_map(&client, &merged));
+                        account.mailboxes.set_shared_mailboxes(&merged);
                         account.refresh_shared_mailbox_capabilities();
                     }
                     Err(error) => {
@@ -986,7 +528,7 @@ impl Account for GraphAccount {
     fn set_priority(&self, priority: Priority) {
         // GraphAccountFactory::open attaches before constructing the account;
         // every client constructor carries a parent Net or an AccountNet.
-        match self.client.account_net() {
+        match self.mailboxes.primary().account_net() {
             Some(account_net) => account_net.set_priority(priority),
             None => tracing::error!("opened Graph account has no AccountNet"),
         }
@@ -995,7 +537,7 @@ impl Account for GraphAccount {
     fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
         // GraphAccountFactory::open attaches before constructing the account;
         // every client constructor carries a parent Net or an AccountNet.
-        match self.client.account_net() {
+        match self.mailboxes.primary().account_net() {
             Some(account_net) => account_net.set_bandwidth_cap(bps),
             None => tracing::error!("opened Graph account has no AccountNet"),
         }
@@ -1013,11 +555,13 @@ impl Account for GraphAccount {
     ) -> Vec<bifrost_types::ThrottleKey> {
         use bifrost_types::{ThrottleKey, ThrottleWork};
         let budgets: Vec<bifrost_types::ThrottleBudget> = match work {
-            ThrottleWork::Scope(scope) => self.budget_for_scope(scope).into_iter().collect(),
+            ThrottleWork::Scope(scope) => {
+                self.mailboxes.budget_for_scope(scope).into_iter().collect()
+            }
             ThrottleWork::Objects(ids) => {
                 let mut budgets = Vec::new();
                 for id in ids {
-                    if let Some(budget) = self.budget_for_object(id)
+                    if let Some(budget) = self.mailboxes.budget_for_object(id)
                         && !budgets.contains(&budget)
                     {
                         budgets.push(budget);
@@ -1026,6 +570,7 @@ impl Account for GraphAccount {
                 budgets
             }
             ThrottleWork::Membership(bifrost_types::MembershipScope::Folder(folder)) => self
+                .mailboxes
                 .budget_for_owner(foreign::folder_owner(folder).as_deref())
                 .into_iter()
                 .collect(),
@@ -1089,7 +634,11 @@ impl Account for GraphAccount {
                 )
             })?;
             if let scope::GraphScope::PublicFolder(folder) = &parsed
-                && account.public_folder_routing(folder).await.is_none()
+                && account
+                    .public_folders
+                    .public_folder_routing(folder)
+                    .await
+                    .is_none()
             {
                 return Err(graph_error::cursor_error_to_account_error(
                     cursor::CursorError::Unsupported,
@@ -1110,7 +659,12 @@ impl Account for GraphAccount {
             let folder = folder.clone();
             return Box::pin(
                 stream::once(async move {
-                    if account.public_folder_routing(&folder).await.is_some() {
+                    if account
+                        .public_folders
+                        .public_folder_routing(&folder)
+                        .await
+                        .is_some()
+                    {
                         public_folder::public_folder_inventory_stream_admitted(
                             account, scope, folder,
                         )
@@ -1793,79 +1347,11 @@ impl Account for GraphAccount {
             // `JoinHandle` detaches its task, which then runs to completion,
             // and those tasks own server-side cleanup that must not be cut
             // short.
-            ews_stream::retire_ledger(&account);
-            let handles = std::mem::take(&mut *account.push_tasks.lock().expect("push tasks lock"));
-            let deadline = tokio::time::Instant::now() + CLOSE_WORKER_JOIN_TIMEOUT;
-            let mut left_running = 0_usize;
-            for mut handle in handles {
-                if tokio::time::timeout_at(deadline, &mut handle)
-                    .await
-                    .is_err()
-                {
-                    left_running += 1;
-                }
-            }
-            if left_running > 0 {
-                tracing::warn!(
-                    target: "bifrost_graph::push",
-                    left_running,
-                    "push cleanup tasks outlived the close() budget; left running detached"
-                );
-            }
+            account.ews.retire(&account.push_tasks);
+            account.push_tasks.join().await;
             Ok(())
         })
     }
-}
-
-/// Build the `/users/{id}`-keyed foreign-mailbox client map from a list
-/// of routing keys (SMTP addresses or user ids), dropping empty keys. The
-/// map key is the exact string later looked up by `client_for_scope` /
-/// `client_for_owner` and minted into foreign scope/owner tags by
-/// `discover_cursor_scopes`, so seeding a key here is self-consistent with
-/// every routing site.
-///
-/// `with_shared_mailbox("")` is constructible, and an empty key used to
-/// install a client whose prefix is the malformed `/users/` - which every
-/// foreign id with an empty owner then routed to, producing an opaque
-/// remote 400 for what is a local configuration error. Dropping it here
-/// makes that id fall to the same local `Configuration` rejection every
-/// other unconfigured owner gets. `merge_shared_mailboxes` already applies
-/// the identical rule on the Autodiscover leg; this is the config leg,
-/// which had no such filter.
-fn shared_clients_map(client: &GraphClient, mailboxes: &[String]) -> HashMap<String, GraphClient> {
-    mailboxes
-        .iter()
-        .filter(|mailbox| !mailbox.is_empty())
-        // Outlook users expect one shared mailbox regardless of address case,
-        // and stable ids for the mail in it. The FIRST configured spelling is
-        // the mailbox's canonical spelling: it keys this map and is the owner
-        // written into every id, so ids never change spelling. Later case
-        // aliases fold into it; lookups (`shared_client`) are ASCII
-        // case-insensitive, and the client routes and budgets in lowercase.
-        .fold(HashMap::new(), |mut map, mailbox| {
-            if !map
-                .keys()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(mailbox))
-            {
-                map.insert(mailbox.clone(), client.for_shared_mailbox(mailbox.clone()));
-            }
-            map
-        })
-}
-
-/// The configured client for a shared mailbox, matched ASCII
-/// case-insensitively so an id or send-as address spelled differently from
-/// the configuration still routes to the one mailbox.
-pub(crate) fn shared_client<'a>(
-    clients: &'a HashMap<String, GraphClient>,
-    mailbox: &str,
-) -> Option<&'a GraphClient> {
-    clients.get(mailbox).or_else(|| {
-        clients
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(mailbox))
-            .map(|(_, client)| client)
-    })
 }
 
 #[cfg(test)]
@@ -1924,27 +1410,27 @@ mod tests {
             ),
         ];
         for (operation, scope, kind) in cases {
-            account
-                .public_folder_discovery_complete
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            let before = account.missing_public_collection_route_error(
-                operation,
-                &folder,
-                scope.clone(),
-                kind,
-                &folder.0,
-            );
+            account.public_folders.set_discovery_complete(false);
+            let before = account
+                .public_folders
+                .missing_public_collection_route_error(
+                    operation,
+                    &folder,
+                    scope.clone(),
+                    kind,
+                    &folder.0,
+                );
             assert_eq!(before.kind(), &AccountErrorKind::ConcurrencyConflict);
-            account
-                .public_folder_discovery_complete
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            let after = account.missing_public_collection_route_error(
-                operation,
-                &folder,
-                scope.clone(),
-                kind,
-                &folder.0,
-            );
+            account.public_folders.set_discovery_complete(true);
+            let after = account
+                .public_folders
+                .missing_public_collection_route_error(
+                    operation,
+                    &folder,
+                    scope.clone(),
+                    kind,
+                    &folder.0,
+                );
             assert_eq!(after.kind(), &AccountErrorKind::NotFound(kind));
             assert_eq!(after.scope(), Some(&scope));
         }
@@ -1957,14 +1443,21 @@ mod tests {
             PushMode::GraphSubscriptions,
             &["Shared@Contoso.com".into(), "shared@contoso.com".into()],
         );
-        assert_eq!(account.shared_clients.len(), 1);
+        assert_eq!(account.mailboxes.shared().len(), 1);
         // The first configured spelling is canonical and keys the map.
-        assert!(account.shared_clients.contains_key("Shared@Contoso.com"));
+        assert!(
+            account
+                .mailboxes
+                .shared()
+                .contains_key("Shared@Contoso.com")
+        );
         assert!(std::ptr::eq(
             account
+                .mailboxes
                 .client_for_owner(Some("SHARED@CONTOSO.COM"))
                 .unwrap(),
             account
+                .mailboxes
                 .client_for_owner(Some("shared@contoso.com"))
                 .unwrap(),
         ));
@@ -2010,6 +1503,7 @@ mod tests {
         };
         let budget_of = |mailbox: &str| {
             account
+                .mailboxes
                 .client_for_owner(Some(mailbox))
                 .expect("configured")
                 .mailbox_budget()
@@ -2138,7 +1632,7 @@ mod tests {
             crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
         ]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
-        account.graph_subscriptions.write().await.insert(
+        account.webhooks.groups_for_tests().write().await.insert(
             bifrost_types::SubscriptionHandle("h".to_string()),
             push::GraphSubscriptionGroup::live(vec![
                 push::GraphSubscriptionState {
@@ -2168,7 +1662,7 @@ mod tests {
 
         Account::close(&account).await.expect("close succeeds");
 
-        assert!(account.graph_subscriptions.read().await.is_empty());
+        assert!(account.webhooks.groups_for_tests().read().await.is_empty());
         let requests = client.take_rest_requests();
         assert_eq!(requests.len(), 2);
         assert!(requests[0].url.ends_with("/subscriptions/one"));
@@ -2253,70 +1747,6 @@ mod tests {
             account.describe_cursor(&messages).strategy,
             SyncStrategy::ServerCursor
         );
-    }
-
-    #[test]
-    fn etag_cache_evicts_the_least_recently_used_entry() {
-        let mut cache = EtagIndex::default();
-        for index in 0..=ETAG_INDEX_MAX_ENTRIES {
-            cache.insert(
-                format!("id-{index}"),
-                GraphETag::from_odata_annotation(&format!("etag-{index}")),
-            );
-        }
-        assert_eq!(cache.len(), ETAG_INDEX_MAX_ENTRIES);
-        assert!(!cache.contains_key("id-0"));
-        assert!(cache.contains_key("id-10000"));
-
-        // A read refreshes the recency position. On the next insertion the
-        // oldest untouched entry must go, not the hot one.
-        assert_eq!(cache.get("id-1").as_deref(), Some("etag-1"));
-        cache.insert(
-            "new".to_string(),
-            GraphETag::from_odata_annotation("etag-new"),
-        );
-        assert!(cache.contains_key("id-1"));
-        assert!(!cache.contains_key("id-2"));
-        assert!(cache.contains_key("new"));
-    }
-
-    /// Eviction reads the recency order without consulting the entry map, so
-    /// the two must stay one-to-one: a re-insert, a hit, and a removal each
-    /// have to retire the ticket they replace. A leaked ticket would evict a
-    /// key that is no longer there and let the cache grow past its bound; a
-    /// missing one would make an entry immortal.
-    #[test]
-    fn etag_cache_keeps_one_recency_ticket_per_entry() {
-        let mut cache = EtagIndex::default();
-        cache.insert("a".to_string(), GraphETag::from_odata_annotation("etag-a"));
-        cache.insert("b".to_string(), GraphETag::from_odata_annotation("etag-b"));
-
-        // Re-caching an id updates it in place.
-        cache.insert("a".to_string(), GraphETag::from_odata_annotation("etag-a2"));
-        assert_eq!(cache.len(), 2);
-        assert_eq!(cache.order_len(), 2);
-        assert_eq!(cache.get("a").as_deref(), Some("etag-a2"));
-        assert_eq!(cache.order_len(), 2);
-
-        cache.remove("a");
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.order_len(), 1);
-        // Removing an absent id is a no-op, not a ticket leak.
-        cache.remove("a");
-        assert_eq!(cache.order_len(), 1);
-
-        // The oldest surviving ticket still names a live entry: refill to
-        // capacity and only "b" (never touched again) may be evicted.
-        for index in 0..ETAG_INDEX_MAX_ENTRIES {
-            cache.insert(
-                format!("fill-{index}"),
-                GraphETag::from_odata_annotation("etag"),
-            );
-        }
-        assert_eq!(cache.len(), ETAG_INDEX_MAX_ENTRIES);
-        assert_eq!(cache.order_len(), ETAG_INDEX_MAX_ENTRIES);
-        assert!(!cache.contains_key("b"));
-        assert!(cache.contains_key("fill-0"));
     }
 
     #[tokio::test]

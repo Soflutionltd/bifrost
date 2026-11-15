@@ -8,6 +8,8 @@
 mod common;
 mod dispatch;
 mod ews;
+mod registry;
+pub(crate) use registry::WebhookRegistry;
 pub(crate) mod renewal;
 mod webhook;
 
@@ -20,7 +22,5 @@ pub(crate) use ews::{EwsSubscriptionScope, EwsSubscriptionState};
 /// Only `account`'s own tests build a subscription row by hand; production
 /// code outside `push` reaches every one of them through the group.
 #[cfg(test)]
-pub(crate) use webhook::GraphSubscriptionState;
-pub(crate) use webhook::{
-    GraphSubscriptionGroup, RecreatedSubscriptionIds, retire_all_graph_subscriptions,
-};
+pub(crate) use webhook::{GraphSubscriptionGroup, GraphSubscriptionState};
+pub(crate) use webhook::{RecreatedSubscriptionIds, retire_all_graph_subscriptions};

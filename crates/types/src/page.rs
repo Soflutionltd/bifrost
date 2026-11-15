@@ -116,7 +116,7 @@ pub struct Page<T> {
 /// impls construct it directly.
 #[derive(Debug, Clone)]
 pub struct SkippedScope {
-    /// Where the skip happened - e.g. `ErrorScope::Mailbox` for a
+    /// Where the skip happened - e.g. `ErrorScope::Owner` for a
     /// shared mailbox the account has lost delegate access to. Kept
     /// mandatory and separate from `error`'s own optional scope: the
     /// whole point of the entry is WHICH scope went unsearched.

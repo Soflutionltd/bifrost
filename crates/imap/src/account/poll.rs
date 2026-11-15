@@ -15,7 +15,9 @@
 
 use super::error::{ImapErrorContext, folder_of, not_sticky};
 
-use std::num::{NonZeroU32, NonZeroUsize};
+use super::envelope::MessageRef;
+use crate::types::{Uid, UidValidity};
+use std::num::NonZeroUsize;
 
 use bifrost_types::{AccountError, AccountOperation, ContainerId, ObjectId, SyncEvent};
 use bytes::Bytes;
@@ -72,8 +74,7 @@ impl std::error::Error for InvalidImapRef {}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ImapMessageRef {
     container: ContainerId,
-    uid_validity: NonZeroU32,
-    uid: NonZeroU32,
+    message: MessageRef,
 }
 
 impl ImapMessageRef {
@@ -88,11 +89,10 @@ impl ImapMessageRef {
             decode_object_id(id, AccountOperation::OpenRawRfc822).map_err(|_| InvalidImapRef {
                 value: id.0.clone(),
             })?;
-        Ok(Self::from_parts(
-            &decoded.folder,
-            nonzero(decoded.uidvalidity),
-            nonzero(decoded.uid),
-        ))
+        Ok(Self {
+            container: ContainerId(decoded.folder.account_id()),
+            message: decoded.message,
+        })
     }
 
     /// Build a ref from a container id (as `containers_list` hands it out)
@@ -103,8 +103,8 @@ impl ImapMessageRef {
     /// [`InvalidImapRef`] when `container` is not an IMAP folder identity.
     pub fn new(
         container: &ContainerId,
-        uid_validity: NonZeroU32,
-        uid: NonZeroU32,
+        uid_validity: UidValidity,
+        uid: Uid,
     ) -> Result<Self, InvalidImapRef> {
         let folder = MailboxName::from_account_id(&container.0).map_err(|_| InvalidImapRef {
             value: container.0.clone(),
@@ -112,11 +112,14 @@ impl ImapMessageRef {
         Ok(Self::from_parts(&folder, uid_validity, uid))
     }
 
-    fn from_parts(folder: &MailboxName, uid_validity: NonZeroU32, uid: NonZeroU32) -> Self {
+    fn from_parts(folder: &MailboxName, uid_validity: UidValidity, uid: Uid) -> Self {
         Self {
             container: ContainerId(folder.account_id()),
-            uid_validity,
-            uid,
+            message: MessageRef {
+                folder: folder.clone(),
+                uidvalidity: uid_validity,
+                uid,
+            },
         }
     }
 
@@ -128,25 +131,28 @@ impl ImapMessageRef {
 
     /// The UIDVALIDITY generation the UID belongs to.
     #[must_use]
-    pub fn uid_validity(&self) -> NonZeroU32 {
-        self.uid_validity
+    pub fn uid_validity(&self) -> UidValidity {
+        self.message.uidvalidity
     }
 
     /// The UID within that generation.
     #[must_use]
-    pub fn uid(&self) -> NonZeroU32 {
-        self.uid
+    pub fn uid(&self) -> Uid {
+        self.message.uid
     }
 
     /// The canonical `ObjectId` for this message.
     #[must_use]
     pub fn object_id(&self) -> ObjectId {
-        encode_object_id(&self.folder(), self.uid_validity.get(), self.uid.get())
+        encode_object_id(
+            &self.message.folder,
+            self.message.uidvalidity,
+            self.message.uid,
+        )
     }
 
     fn folder(&self) -> MailboxName {
-        MailboxName::from_account_id(&self.container.0)
-            .expect("a ref's container was validated when the ref was built")
+        self.message.folder.clone()
     }
 }
 
@@ -163,9 +169,9 @@ pub struct FolderObservation {
     /// The observed folder, canonical spelling.
     pub container: ContainerId,
     /// The folder's UIDVALIDITY generation.
-    pub uid_validity: NonZeroU32,
+    pub uid_validity: UidValidity,
     /// The folder's UIDNEXT. Valid for an empty folder.
-    pub uid_next: NonZeroU32,
+    pub uid_next: Uid,
     /// The EXISTS count the selection reported.
     pub exists: u32,
 }
@@ -176,13 +182,13 @@ pub struct FolderObservation {
 #[non_exhaustive]
 pub struct UidScan {
     /// The generation the caller's position belongs to.
-    pub uid_validity: NonZeroU32,
+    pub uid_validity: UidValidity,
     /// First UID to enumerate.
-    pub from: NonZeroU32,
+    pub from: Uid,
     /// Last UID to enumerate, inclusive. `None` means up to the UIDNEXT each
     /// call observes; a caller that needs a finite pass over a busy folder
     /// freezes it instead, since an open bound can keep moving.
-    pub through: Option<NonZeroU32>,
+    pub through: Option<Uid>,
     /// Most refs one call returns.
     pub limit: NonZeroUsize,
 }
@@ -190,7 +196,7 @@ pub struct UidScan {
 impl UidScan {
     /// A scan from `from` with an open upper bound.
     #[must_use]
-    pub fn new(uid_validity: NonZeroU32, from: NonZeroU32, limit: NonZeroUsize) -> Self {
+    pub fn new(uid_validity: UidValidity, from: Uid, limit: NonZeroUsize) -> Self {
         Self {
             uid_validity,
             from,
@@ -201,7 +207,7 @@ impl UidScan {
 
     /// Bound the scan at `through`, inclusive.
     #[must_use]
-    pub fn through(mut self, through: NonZeroU32) -> Self {
+    pub fn through(mut self, through: Uid) -> Self {
         self.through = Some(through);
         self
     }
@@ -224,11 +230,11 @@ pub struct UidPage {
     /// Highest UID through which enumeration is complete. `None` when the
     /// interval was empty (`from` above the bound): nothing was scanned, and
     /// this is not a watermark assignment.
-    pub completed_through: Option<NonZeroU32>,
+    pub completed_through: Option<Uid>,
     /// Where the next call resumes, with the same bound, when this call
     /// stopped short of it (the limit or the per-call window budget).
     /// `None` when the bound was reached.
-    pub next_from: Option<NonZeroU32>,
+    pub next_from: Option<Uid>,
 }
 
 /// Outcome of [`ImapPoller::list_uids`].
@@ -258,7 +264,7 @@ pub enum RawMessage {
     /// The folder's UIDVALIDITY is no longer the ref's; the UID names nothing.
     GenerationChanged {
         /// The UIDVALIDITY the selection reported.
-        observed: NonZeroU32,
+        observed: UidValidity,
     },
 }
 
@@ -383,7 +389,7 @@ impl ImapPoller {
             lo = hi + 1;
         }
         let next_from = if completed < bound {
-            NonZeroU32::new(completed + 1)
+            Uid::new(completed + 1)
         } else {
             None
         };
@@ -394,7 +400,7 @@ impl ImapPoller {
         Ok(UidListing::Listed(UidPage {
             observation,
             refs,
-            completed_through: NonZeroU32::new(completed),
+            completed_through: Uid::new(completed),
             next_from,
         }))
     }
@@ -418,8 +424,8 @@ impl ImapPoller {
             super::blob::run_fetch(
                 &self.account,
                 &folder,
-                message.uid_validity.get(),
-                message.uid.get(),
+                message.message.uidvalidity,
+                message.message.uid.get(),
                 op,
                 RAW_FETCH_BUDGET,
                 super::blob::UidPersistence::Sticky,
@@ -446,14 +452,7 @@ impl ImapPoller {
             Ok(RawFetchOutcome::Absent) => Ok(RawMessage::Absent),
             Ok(RawFetchOutcome::NotSticky) => Err(not_sticky(&folder, op)),
             Ok(RawFetchOutcome::GenerationChanged { observed }) => {
-                match NonZeroU32::new(observed) {
-                    Some(observed) => Ok(RawMessage::GenerationChanged { observed }),
-                    None => Err(folder_error(
-                        Error::ProtocolMissing("SELECT reported UIDVALIDITY 0".into()),
-                        &folder,
-                        op,
-                    )),
-                }
+                Ok(RawMessage::GenerationChanged { observed })
             }
             Err(BlobError::Account(err)) => Err(err),
             Err(BlobError::Imap(err)) => Err(self.account.folder_error(
@@ -468,8 +467,8 @@ impl ImapPoller {
     }
 }
 
-fn nonzero(value: u32) -> NonZeroU32 {
-    NonZeroU32::new(value).expect("the id decoder rejects zero UIDVALIDITY and UID")
+fn nonzero(value: u32) -> Uid {
+    Uid::new(value).expect("the id decoder rejects zero UIDVALIDITY and UID")
 }
 
 fn folder_error(err: Error, folder: &MailboxName, op: AccountOperation) -> AccountError {
@@ -524,10 +523,11 @@ fn observation(
     }
     let uid_validity =
         super::selected_uidvalidity(selected).map_err(|error| folder_error(error, folder, op))?;
-    let uid_validity = nonzero(uid_validity);
-    let uid_next = selected.uid_next.and_then(NonZeroU32::new).ok_or_else(|| {
+    let uid_next = selected.uid_next.ok_or_else(|| {
         folder_error(
-            Error::ProtocolMissing("SELECT missing or zero UIDNEXT".into()),
+            Error::Provider(crate::error::ProviderFailure::Missing(
+                "SELECT missing or zero UIDNEXT".into(),
+            )),
             folder,
             op,
         )
@@ -544,8 +544,11 @@ fn observation(
 mod tests {
     use super::*;
 
-    fn nz(value: u32) -> NonZeroU32 {
-        NonZeroU32::new(value).unwrap()
+    fn nz<T: TryFrom<u32>>(value: u32) -> T
+    where
+        T::Error: std::fmt::Debug,
+    {
+        T::try_from(value).unwrap()
     }
 
     #[test]
@@ -572,7 +575,11 @@ mod tests {
         // Two folders that display as "a" but differ on the wire stay two
         // containers through parse and re-mint.
         let folder = MailboxName::from_wire("a".into(), b"&AGE-", false);
-        let id = encode_object_id(&folder, 3, 4);
+        let id = encode_object_id(
+            &folder,
+            crate::types::UidValidity::new(3).expect("nonzero epoch"),
+            crate::types::Uid::new(4).expect("valid protocol test value"),
+        );
         let parsed = ImapMessageRef::parse(&id).unwrap();
         assert_eq!(parsed.container(), &ContainerId(folder.account_id()));
         assert_ne!(parsed.container(), &ContainerId("a".into()));

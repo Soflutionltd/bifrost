@@ -14,7 +14,7 @@ pub(crate) struct DriveStart<'a> {
     pub current: &'a ArcSwap<Incarnation>,
     pub control: &'a SyncControl,
     pub scheduler: &'a Scheduler,
-    pub throttles: &'a crate::recovery::ThrottleBucket,
+    pub throttles: &'a crate::throttle::ThrottleBucket,
     pub account_id: &'a AccountId,
     pub shutdown: &'a CancellationToken,
 }
@@ -70,7 +70,7 @@ impl DriveStart<'_> {
         account: &dyn Account,
         keys: impl FnOnce(&dyn Account) -> Vec<bifrost_types::ThrottleKey>,
     ) -> Result<(), StartRefused> {
-        if let Some(wait) = crate::recovery::account_throttle_wait(self.throttles, self.account_id)
+        if let Some(wait) = crate::throttle::account_throttle_wait(self.throttles, self.account_id)
         {
             return Err(StartRefused::Held {
                 scope_local: false,
@@ -78,7 +78,7 @@ impl DriveStart<'_> {
             });
         }
         if let Some(wait) =
-            crate::recovery::throttle_wait(self.throttles, self.account_id, &keys(account))
+            crate::throttle::throttle_wait(self.throttles, self.account_id, &keys(account))
         {
             return Err(StartRefused::Held {
                 scope_local: true,
@@ -94,7 +94,7 @@ impl DriveStart<'_> {
         kind: WorkKind,
     ) -> Result<Admitted, StartRefused> {
         self.admit_keys(kind, |account| {
-            crate::recovery::declared_keys(account, self.account_id, work)
+            crate::throttle::declared_keys(account, self.account_id, work)
         })
         .await
     }
@@ -175,7 +175,7 @@ impl DriveStart<'_> {
                 // retrying would hang until shutdown. Surface it to the caller
                 // instead of looping; only a full lane is backpressure.
                 Err(crate::Error::ShuttingDown) => return Err(StartRefused::ShuttingDown),
-                Err(_) => {
+                Err(crate::Error::Admission(crate::AdmissionFailure::LaneFull { .. })) => {
                     drop(activity);
                     tokio::select! {
                         biased;
@@ -184,6 +184,10 @@ impl DriveStart<'_> {
                         () = tokio::time::sleep(ADMISSION_RETRY) => {}
                     }
                     continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "scheduler admission cannot recover on this attachment");
+                    return Err(StartRefused::ShuttingDown);
                 }
             };
             // Admission is an internal wait. A hold, replacement, pause or Stop

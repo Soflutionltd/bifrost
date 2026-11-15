@@ -558,6 +558,16 @@ impl SessionRequestBuilder {
         Self(self.0.timeout(timeout))
     }
 
+    /// Share one absolute deadline across protocol legs.
+    pub fn deadline(self, deadline: crate::RequestDeadline) -> Self {
+        Self(self.0.deadline(deadline))
+    }
+
+    /// Let the provider interpret selected statuses with their full bodies.
+    pub fn statuses_as_data(self, statuses: impl IntoIterator<Item = reqwest::StatusCode>) -> Self {
+        Self(self.0.statuses_as_data(statuses))
+    }
+
     /// Declare whether the transport may replay this wire request.
     pub fn replay(self, replay: crate::ReplayPolicy) -> Self {
         Self(self.0.replay(replay))
@@ -643,10 +653,9 @@ impl AccountNet {
     }
 
     /// Start a request with any standard or extension HTTP method.
-    /// The public method type comes from `http`, so reqwest remains
-    /// absent from this crate's API.
+    /// Accept either URL text or an already parsed URL, parsed once at entry.
     #[must_use]
-    pub fn request(&self, method: http::Method, url: &str) -> RequestBuilder {
+    pub fn request(&self, method: http::Method, url: impl reqwest::IntoUrl) -> RequestBuilder {
         RequestBuilder::new(self.clone(), method, url)
     }
 
@@ -659,7 +668,7 @@ impl AccountNet {
         method: http::Method,
         url: &crate::AdmittedUrl,
     ) -> RequestBuilder {
-        self.request(method, url.as_str())
+        self.request(method, url.as_url().clone())
     }
 
     /// Send to a provider-admitted, pre-authenticated session URL.
@@ -1271,7 +1280,7 @@ fn content_range_matches(req_range: ByteRange, resp_range: &str) -> bool {
 pub(crate) fn wrap_metered(
     body: ByteStream,
     account: AccountNet,
-    deadline: crate::request::RequestDeadline,
+    deadline: crate::RequestDeadline,
     request_bytes: crate::request::RequestByteCounter,
 ) -> ByteStream {
     wrap_delivery(body, account, deadline, request_bytes, None)
@@ -1282,7 +1291,7 @@ pub(crate) fn wrap_metered(
 pub(crate) fn wrap_delivery(
     body: ByteStream,
     account: AccountNet,
-    deadline: crate::request::RequestDeadline,
+    deadline: crate::RequestDeadline,
     request_bytes: crate::request::RequestByteCounter,
     limit: Option<usize>,
 ) -> ByteStream {

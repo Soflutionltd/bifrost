@@ -121,27 +121,6 @@ impl Credentials {
         }
     }
 
-    /// Pair the credential's OAuth identity with a token already resolved
-    /// by the connection driver. Rejects password credentials (wrong
-    /// mechanism) and a missing token (driver bug: an OAuth mechanism was
-    /// driven without resolving the token first).
-    pub(super) fn oauth_identity_and_token<'a>(
-        &'a self,
-        oauth_token: Option<&'a str>,
-    ) -> Result<(&'a str, &'a str), Error> {
-        match self {
-            Credentials::OAuth2 { identity, .. } => {
-                let token = oauth_token.ok_or_else(|| {
-                    error::invalid_input("OAuth mechanism driven without a resolved access token")
-                })?;
-                Ok((identity, token))
-            }
-            Credentials::Password { .. } => Err(error::invalid_input(
-                "password credentials cannot be used with OAuth2 authentication mechanisms",
-            )),
-        }
-    }
-
     /// Resolve the OAuth identity and a freshly read access token from
     /// the shared source. Used by the async transport, which awaits a
     /// possible refresh.

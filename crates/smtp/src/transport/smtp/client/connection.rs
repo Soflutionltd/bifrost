@@ -1,74 +1,40 @@
 #[cfg(feature = "account-error")]
 use crate::transport::smtp::batch::{SendProgress, SmtpBatchRecipient};
+#[cfg(all(test, feature = "account-error"))]
+use crate::transport::smtp::error::SmtpCommandPhase;
 #[cfg(unix)]
 use std::path::Path;
 use std::{
     fmt::{Display, Write as _},
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Write},
     net::{IpAddr, ToSocketAddrs},
     time::Duration,
 };
 
-use bifrost_sasl::ScramChannelBinding;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::ReplyMode;
-#[cfg(feature = "tracing")]
-use super::escape_crlf;
 use super::metering::WireMetering;
 use super::{
-    ClientCodec, ConnectionState, DEFAULT_TLS_HANDSHAKE_TIMEOUT, MAX_RESPONSE_BYTES,
-    MAX_RESPONSE_LINE_BYTES, NetworkStream, TlsParameters, core,
+    ClientCodec, ConnectionState, DEFAULT_TLS_HANDSHAKE_TIMEOUT, NetworkStream, TlsParameters,
+    core,
     core::{Op, OpOutcome, ProtocolMachine, Step},
     data_terminator,
 };
+use super::{ReplyMode, reply::ReplyAssembler, session::Session};
 #[cfg(feature = "account-error")]
 use crate::address::Address;
 use crate::{
     address::Envelope,
     transport::smtp::{
         Dialect,
-        authentication::{
-            Credentials, Mechanism, ScramExchange, ScramStep, decode_auth_challenge,
-            decode_scram_payload, oauth_mechanism, password_mechanism, resolve_scram_binding,
-            scram_hash,
-        },
-        commands::{Auth, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Starttls, Vrfy},
+        authentication::{Credentials, Mechanism},
+        commands::{Expn, Mail, Noop, Rcpt, Vrfy},
         error,
-        error::{Error, SmtpCommandPhase},
+        error::Error,
         extension::{ClientId, Extension, SendOptions, ServerInfo},
-        response::{Response, parse_response},
+        response::Response,
     },
 };
-
-macro_rules! try_smtp (
-    ($err: expr, $client: ident) => ({
-        match $err {
-            Ok(val) => val,
-            Err(err) => {
-                $client.abort();
-                return Err(From::from(err))
-            },
-        }
-    });
-    // Phase-tagged variant. Stamps the SMTP error with the given
-    // SmtpCommandPhase so the translation boundary in `account_error.rs`
-    // can retain phase evidence (e.g. AUTH mechanism diagnostics,
-    // MAIL FROM phase tagged on telemetry, etc.). Use this in the
-    // legacy non-batch send paths and the AUTH command exchange.
-    // Set-if-absent (`or_phase`): a multi-phase callee (the LMTP body
-    // upload + final-status drain) stamps its own finer-grained phase
-    // inside, and this wrapper must not overwrite it.
-    ($err: expr, $client: ident, $phase: expr) => ({
-        match $err {
-            Ok(val) => val,
-            Err(err) => {
-                $client.abort();
-                return Err(From::from(err.or_phase($phase)))
-            },
-        }
-    });
-);
 
 /// Lift an adapter result into the outcome the protocol core consumes.
 fn op_done(result: Result<(), Error>) -> OpOutcome {
@@ -181,8 +147,7 @@ impl SmtpConnection {
             read_timeout: None,
         };
         conn.set_timeout(timeout).map_err(error::connection_io)?;
-        let _response = conn.read_response()?;
-        conn.hello(hello_name)?;
+        conn.initialize(hello_name)?;
         Ok(conn)
     }
 
@@ -210,9 +175,7 @@ impl SmtpConnection {
             read_timeout: None,
         };
         conn.set_timeout(timeout).map_err(error::network)?;
-        let _response = conn.read_response()?;
-
-        conn.hello(hello_name)?;
+        conn.initialize(hello_name)?;
 
         // Print server information
         #[cfg(feature = "tracing")]
@@ -241,9 +204,7 @@ impl SmtpConnection {
             read_timeout: None,
         };
         conn.set_timeout(timeout).map_err(error::network)?;
-        let _response = conn.read_response()?;
-
-        conn.hello(hello_name)?;
+        conn.initialize(hello_name)?;
 
         #[cfg(feature = "tracing")]
         tracing::debug!("server {}", conn.server_info);
@@ -299,9 +260,12 @@ impl SmtpConnection {
         }
 
         let (mail, recipients) = self.build_envelope(envelope, email, options, true)?;
-        // BDAT is never pipelined: the path has no window accounting and has
-        // never been driven that way, on either half.
-        let mut machine = core::DirectSmtp::new(mail, recipients, false, core::BodyKind::Bdat);
+        let mut machine = core::DirectSmtp::new(
+            mail,
+            recipients,
+            self.server_info.supports_pipelining(),
+            core::BodyKind::Bdat,
+        );
         self.drive(&mut machine, email)
     }
 
@@ -320,7 +284,12 @@ impl SmtpConnection {
         options: &SendOptions,
     ) -> Result<Vec<Response>, Error> {
         let (mail, recipients) = self.build_envelope(envelope, email, options, false)?;
-        let mut machine = core::DirectLmtp::new(mail, recipients, core::BodyKind::Data);
+        let mut machine = core::DirectLmtp::new(
+            mail,
+            recipients,
+            self.server_info.supports_pipelining(),
+            core::BodyKind::Data,
+        );
         self.drive(&mut machine, email)
     }
 
@@ -337,7 +306,12 @@ impl SmtpConnection {
         }
 
         let (mail, recipients) = self.build_envelope(envelope, email, options, true)?;
-        let mut machine = core::DirectLmtp::new(mail, recipients, core::BodyKind::Bdat);
+        let mut machine = core::DirectLmtp::new(
+            mail,
+            recipients,
+            self.server_info.supports_pipelining(),
+            core::BodyKind::Bdat,
+        );
         self.drive(&mut machine, email)
     }
 
@@ -360,7 +334,13 @@ impl SmtpConnection {
         let (mail_cmd, rcpt_cmds, progress) =
             self.build_batch(Dialect::Smtp, from, recipients, email, options)?;
         let pipelined = self.server_info().supports_pipelining();
-        let mut machine = core::BatchSmtp::new(mail_cmd, rcpt_cmds, pipelined, progress);
+        let mut machine = core::BatchTransaction::batch(
+            mail_cmd,
+            rcpt_cmds,
+            pipelined,
+            core::BodyKind::Data,
+            progress,
+        );
         self.drive(&mut machine, email)
     }
 
@@ -378,7 +358,13 @@ impl SmtpConnection {
     ) -> Result<SendProgress, (Error, SendProgress)> {
         let (mail_cmd, rcpt_cmds, progress) =
             self.build_batch(Dialect::Lmtp, from, recipients, email, options)?;
-        let mut machine = core::BatchLmtp::new(mail_cmd, rcpt_cmds, progress);
+        let mut machine = core::BatchTransaction::batch(
+            mail_cmd,
+            rcpt_cmds,
+            self.server_info.supports_pipelining(),
+            core::BodyKind::Data,
+            progress,
+        );
         self.drive(&mut machine, email)
     }
 
@@ -421,6 +407,22 @@ impl SmtpConnection {
     fn perform(&mut self, op: Op, email: &[u8]) -> OpOutcome {
         match op {
             Op::Write(bytes) => op_done(self.write(bytes.as_bytes())),
+            Op::WriteSecret(bytes) => op_done(self.write(bytes.as_bytes())),
+            Op::ResolveToken(credentials) => match credentials.oauth2_token_blocking() {
+                Ok((_, token)) => OpOutcome::Token(token.into()),
+                Err(error) => OpOutcome::Failed(error),
+            },
+            Op::UpgradeTls(parameters) => {
+                let result =
+                    match ReplyAssembler::check_surplus(!self.stream.buffer().is_empty(), true) {
+                        Ok(()) => self.upgrade_tls_bounded(&parameters),
+                        Err(error) => {
+                            self.stream.get_mut().set_state(ConnectionState::Broken);
+                            Err(error)
+                        }
+                    };
+                op_done(result)
+            }
             Op::WriteBody => op_done(self.write_body(email)),
             Op::WriteBdat => op_done(self.write_bdat_body(email)),
             Op::OpenReplyGroup => op_done(self.open_reply_group()),
@@ -474,35 +476,16 @@ impl SmtpConnection {
         tls_parameters: &TlsParameters,
         hello_name: &ClientId,
     ) -> Result<(), Error> {
-        if self.server_info.supports_feature(Extension::StartTls) {
-            try_smtp!(self.command(Starttls), self);
-            // Belt and braces at the security boundary. The generic
-            // surplus-bytes check inside the reply read normally fires first,
-            // but `get_mut()` swaps only the INNER stream and leaves the
-            // `BufReader` buffer intact, so any pre-TLS byte still sitting here
-            // would be consumed as the first bytes of the TLS session - the
-            // classic STARTTLS response-injection. This gate is independent of
-            // whichever reply path produced the 220.
-            if !self.stream.buffer().is_empty() {
-                self.stream.get_mut().set_state(ConnectionState::Broken);
-                self.abort();
-                return Err(error::parse(
-                    "SMTP server sent an unsolicited reply before the STARTTLS upgrade",
-                ));
-            }
-            self.upgrade_tls_bounded(tls_parameters)?;
-            #[cfg(feature = "tracing")]
-            tracing::debug!("connection encrypted");
-            // Send EHLO/LHLO again
-            try_smtp!(self.hello(hello_name), self);
-            self.hello_name = hello_name.clone();
-            Ok(())
-        } else {
-            // A client policy refusal, not caller input: the configuration
-            // demanded TLS and this server cannot provide it. Same class as
-            // IMAP's `StartTlsUnavailable`, `Authorization(PolicyBlocked)`.
-            Err(error::policy("STARTTLS is not supported on this server"))
-        }
+        let mut machine = Session::starttls(
+            self.protocol,
+            hello_name,
+            self.server_info.clone(),
+            tls_parameters.clone(),
+        );
+        let (info, _) = self.drive(&mut machine, &[])?;
+        self.server_info = info;
+        self.hello_name = hello_name.clone();
+        Ok(())
     }
 
     /// The STARTTLS handshake, never unbounded.
@@ -531,19 +514,10 @@ impl SmtpConnection {
         restored.map_err(error::network)
     }
 
-    /// Send EHLO or LHLO and update server info
-    fn hello(&mut self, hello_name: &ClientId) -> Result<(), Error> {
-        let response = match self.protocol {
-            Dialect::Lmtp => {
-                let command = Lhlo::new(hello_name.clone())?;
-                try_smtp!(self.command(command), self)
-            }
-            Dialect::Smtp => {
-                let command = Ehlo::new(hello_name.clone())?;
-                try_smtp!(self.command(command), self)
-            }
-        };
-        self.server_info = try_smtp!(ServerInfo::from_response(&response), self);
+    fn initialize(&mut self, hello_name: &ClientId) -> Result<(), Error> {
+        let mut machine = Session::greeting(self.protocol, hello_name);
+        let (info, _) = self.drive(&mut machine, &[])?;
+        self.server_info = info;
         Ok(())
     }
 
@@ -611,252 +585,23 @@ impl SmtpConnection {
         self.command_accepting_status(Expn::new(argument.into())?)
     }
 
-    /// Sends an AUTH command, selecting the strongest compatible mechanism.
-    ///
-    /// [`password_mechanism`] is SCRAM-aware, applies RFC 5802 Section 6
-    /// downgrade protection against the advertised set, and skips a PLUS rung
-    /// whose channel binding cannot resolve, falling through to the next safe
-    /// rung (the other PLUS hash, then PLAIN). Only binding-unavailability
-    /// falls through; a wire-level rejection `?`-propagates and is final, since
-    /// walking down to an unbound mechanism after a 535 is the silent downgrade
-    /// RFC 5802 Section 6 exists to prevent.
-    ///
-    /// `tls-server-end-point` is a property of the certificate, not of the
-    /// SCRAM hash, so the binding is resolved at most once per authentication
-    /// and shared by either PLUS choice.
     pub(crate) fn auth(
         &mut self,
         mechanisms: &[Mechanism],
         credentials: &Credentials,
     ) -> Result<Response, Error> {
-        // OAuth credentials never use SCRAM: select the first advertised
-        // allowed mechanism in SASL's canonical order, then run the encoder path.
-        if let Some(mechanism) = oauth_mechanism(mechanisms, &self.server_info, credentials) {
-            return self.auth_legacy(mechanism, credentials);
-        }
-
-        // OAuth incompatibility is a local policy refusal, never a password fallback.
-        if matches!(credentials, Credentials::OAuth2 { .. }) {
-            return Err(error::policy("no compatible authentication mechanism")
-                .with_phase(SmtpCommandPhase::Auth { mechanism: None }));
-        }
-
-        let scram_candidate = mechanisms.iter().any(|mechanism| {
-            matches!(
-                mechanism,
-                Mechanism::ScramSha1Plus
-                    | Mechanism::ScramSha256Plus
-                    | Mechanism::ScramSha1
-                    | Mechanism::ScramSha256
-            ) && self.server_info.supports_auth_mechanism(*mechanism)
-        });
-        let binding = if scram_candidate {
-            self.resolve_scram_binding()?
-        } else {
-            None
-        };
-        let selected = password_mechanism(mechanisms, &self.server_info, binding.as_ref())?;
-        match selected.scram {
-            Some(rung) => self.auth_scram(selected.mechanism, rung.binding, credentials),
-            None => self.auth_legacy(selected.mechanism, credentials),
-        }
-    }
-
-    /// Resolve the `tls-server-end-point` channel binding for the live
-    /// connection: fetch the peer certificate DER (already cached on the TLS
-    /// stream, no wire I/O) and hash it. Returns `Ok(None)` only when the DER
-    /// is absent (plaintext). If a certificate is present but
-    /// [`bifrost_sasl::tls_server_end_point`] cannot process it (for example,
-    /// an `EdDSA` leaf, malformed DER, or an unsupported signature algorithm),
-    /// its typed error propagates and cannot silently downgrade authentication.
-    fn resolve_scram_binding(&self) -> Result<Option<bifrost_sasl::ChannelBindingData>, Error> {
-        let der = self.peer_certificate_der();
-        resolve_scram_binding(der.as_deref())
-    }
-
-    /// Run a SCRAM exchange (bound or unbound) as a no-IR `334` challenge walk.
-    fn auth_scram(
-        &mut self,
-        mechanism: Mechanism,
-        binding: ScramChannelBinding,
-        credentials: &Credentials,
-    ) -> Result<Response, Error> {
-        let hash = scram_hash(mechanism).expect("auth_scram only called for SCRAM mechanisms");
-        // Every auth-phase stamp in this exchange names the rung that is
-        // running, derived from the same `Mechanism` that frames the AUTH
-        // command, so the reported name and the wire token cannot disagree.
-        let phase = SmtpCommandPhase::Auth {
-            mechanism: Some(mechanism),
-        };
-        let (username, password) = credentials.password_parts()?;
-        let mut exchange = ScramExchange::new(hash, binding, username, password.into())?;
-
-        // Bare `AUTH <mechanism>`: SCRAM has no initial response, so
-        // `Mechanism::response` is never invoked and `Display` emits the bare
-        // command.
-        let auth = Auth::new(mechanism, credentials.clone(), None)?;
-        let response = try_smtp!(self.command(auth), self, phase);
-        // Server's first 334 (empty challenge): send client-first.
-        if !response.has_code(334) {
-            self.abort();
-            return Err(error::status(response).with_phase(phase));
-        }
-        let client_first = exchange.client_first();
-        let response = try_smtp!(
-            self.write_auth_continuation(client_first.as_str()),
-            self,
-            phase
+        let mut machine = Session::auth(
+            self.protocol,
+            &self.hello_name,
+            self.server_info.clone(),
+            mechanisms,
+            credentials,
+            self.peer_certificate_der(),
         );
-
-        // 334 carrying server-first -> client-final. A malformed continuation
-        // is a protocol-class parse error (not an auth failure), so it is not
-        // Auth-phase tagged, but it must still abort the connection like every
-        // other error path in this exchange.
-        let server_first = try_smtp!(decode_auth_challenge(&response), self);
-        let response = match try_smtp!(exchange.step(&server_first), self, phase) {
-            ScramStep::Reply(client_final) => {
-                try_smtp!(
-                    self.write_auth_continuation(client_final.as_str()),
-                    self,
-                    phase
-                )
-            }
-            ScramStep::Complete => {
-                self.abort();
-                return Err(error::parse("SCRAM completed before server-final"));
-            }
-        };
-
-        // Server-final reply. RFC 4954 carries it on a `334` continuation, with
-        // the tagged `235` success following an empty client line. Some servers
-        // (field-observed) fold the server-final straight onto the `235`
-        // success reply (`235 v=...`). Both shapes are accepted; anything else
-        // is an auth failure (or protocol error) and aborts. A `334` here must
-        // not be mistaken for success - only a positive reply ends the walk.
-        let success = if response.has_code(334) {
-            let server_final = try_smtp!(decode_auth_challenge(&response), self);
-            try_smtp!(
-                Self::verify_scram_server_final(&mut exchange, &server_final),
-                self,
-                phase
-            );
-            let final_reply = try_smtp!(self.write_auth_continuation(""), self, phase);
-            if !final_reply.is_positive() {
-                self.abort();
-                return Err(error::status(final_reply).with_phase(phase));
-            }
-            final_reply
-        } else if response.is_positive() {
-            let server_final = try_smtp!(decode_scram_payload(&response), self);
-            try_smtp!(
-                Self::verify_scram_server_final(&mut exchange, &server_final),
-                self,
-                phase
-            );
-            response
-        } else {
-            self.abort();
-            return Err(error::status(response).with_phase(phase));
-        };
-
-        let hello_name = self.hello_name.clone();
-        try_smtp!(self.hello(&hello_name), self);
-        Ok(success)
+        let (info, response) = self.drive(&mut machine, &[])?;
+        self.server_info = info;
+        response.ok_or_else(|| error::internal("AUTH completed without a response"))
     }
-
-    /// Verify a decoded SCRAM server-final, mapping a non-terminal step to a
-    /// parse-class error. Shared by the `334`-continuation and `235`-folded
-    /// server-final shapes.
-    fn verify_scram_server_final(
-        exchange: &mut ScramExchange,
-        server_final: &str,
-    ) -> Result<(), Error> {
-        match exchange.step(server_final)? {
-            ScramStep::Complete => Ok(()),
-            ScramStep::Reply(_) => Err(error::parse("unexpected SCRAM reply after server-final")),
-        }
-    }
-
-    /// Write a base64 SASL continuation line (already encoded) and read the
-    /// reply. An empty `line` emits a bare `\r\n`.
-    fn write_auth_continuation(&mut self, line: &str) -> Result<Response, Error> {
-        let framed = Zeroizing::new(format!("{line}\r\n"));
-        self.write(framed.as_bytes())?;
-        self.read_response()
-    }
-
-    /// The legacy stateless `Auth::new` / `Auth::new_from_response` 334 loop,
-    /// for PLAIN / LOGIN / XOAUTH2 / OAUTHBEARER.
-    fn auth_legacy(
-        &mut self,
-        mechanism: Mechanism,
-        credentials: &Credentials,
-    ) -> Result<Response, Error> {
-        // Every auth-phase stamp in this exchange names the rung that is
-        // running, derived from the same `Mechanism` that frames the AUTH
-        // command, so the reported name and the wire token cannot disagree.
-        let phase = SmtpCommandPhase::Auth {
-            mechanism: Some(mechanism),
-        };
-        // Resolve only a non-refreshing cache snapshot. A stale source requires
-        // the async transport; cache-lock contention remains a transient error.
-        let oauth_token = if matches!(mechanism, Mechanism::Xoauth2 | Mechanism::OAuthBearer) {
-            Some(try_smtp!(credentials.oauth2_token_blocking(), self, phase))
-        } else {
-            None
-        };
-        let oauth_token = oauth_token.as_ref().map(|(_, token)| token.as_str());
-
-        // Limit challenges to avoid blocking
-        let mut challenges = 10;
-        // Position of the challenge within the exchange. LOGIN answers by
-        // position (username, then password) rather than by prompt text, so
-        // this counter is the only thing that selects which credential goes
-        // out; it must not be derived from the remaining-challenge budget.
-        let mut challenge_index: usize = 0;
-        let auth = Auth::new(mechanism, credentials.clone(), oauth_token)?;
-        let mut response = try_smtp!(self.command(auth), self, phase);
-
-        while challenges > 0 && response.has_code(334) {
-            challenges -= 1;
-            // Build the continuation reply. For XOAUTH2/OAUTHBEARER a 334 here
-            // is the server's base64 failure detail, and the encoder returns
-            // the dummy-cancel line so the next read surfaces the tagged
-            // negative reply on the Auth lane. Any construction error (bad
-            // base64, an encoder rejecting an unexpected challenge) must abort
-            // and carry the Auth phase, not leak through a bare `?` as an
-            // untagged parse error.
-            let continuation = try_smtp!(
-                Auth::new_from_response_at_index(
-                    mechanism,
-                    credentials.clone(),
-                    &response,
-                    challenge_index,
-                    oauth_token,
-                ),
-                self,
-                phase
-            );
-            challenge_index += 1;
-            response = try_smtp!(self.command(continuation), self, phase);
-        }
-
-        if challenges == 0 && response.has_code(334) {
-            // The server never completed (or rejected) the exchange within the
-            // round-trip budget: malformed peer behavior, with AUTH phase kept
-            // for diagnostics. Exhausting the budget while sending the
-            // tenth answer is fine when that answer receives a final reply.
-            self.abort();
-            Err(error::parse("Unexpected number of challenges").with_phase(phase))
-        } else {
-            let hello_name = self.hello_name.clone();
-            try_smtp!(self.hello(&hello_name), self);
-            Ok(response)
-        }
-    }
-
-    // NB: SCRAM continuation decoding lives in the free `decode_auth_challenge`
-    // helper below so the sync and async drivers share one base64/UTF-8 path.
 
     /// Write the DATA body and its terminator.
     ///
@@ -1012,63 +757,23 @@ impl SmtpConnection {
             self.stream.get_mut().set_state(ConnectionState::Broken);
         }
 
-        let mut buffer = String::with_capacity(100);
-
+        let mut assembler = ReplyAssembler::default();
         loop {
-            let mut line = Vec::with_capacity(100);
-            let bytes_read = {
-                let mut limited = (&mut self.stream).take((MAX_RESPONSE_LINE_BYTES + 1) as u64);
-                limited
-                    .read_until(b'\n', &mut line)
-                    .map_err(error::network)?
-            };
-            if bytes_read == 0 {
-                break;
-            }
-            if line.len() > MAX_RESPONSE_LINE_BYTES {
-                return Err(error::parse("SMTP response line too long"));
-            }
-            if buffer.len() + line.len() > MAX_RESPONSE_BYTES {
-                return Err(error::parse("SMTP response too large"));
-            }
-            let line = std::str::from_utf8(&line)
-                .map_err(|_| error::parse("SMTP response is not valid UTF-8"))?;
-            buffer.push_str(line);
-
-            #[cfg(feature = "tracing")]
-            tracing::debug!("<< {}", escape_crlf(line));
-            match parse_response(&buffer) {
-                Ok((_remaining, response)) => {
-                    if mode.manages_state() && !self.stream.buffer().is_empty() {
-                        return Err(error::parse("SMTP server sent an unsolicited reply"));
-                    }
-                    if mode.manages_state() {
-                        self.stream.get_mut().set_state(ConnectionState::Ok);
-                    }
-
-                    return if mode.accepts_negative() || response.is_positive() {
-                        Ok(response)
-                    } else {
-                        Err(error::status(response))
-                    };
+            let (consumed, response) =
+                assembler.feed(self.stream.fill_buf().map_err(error::network)?)?;
+            self.stream.consume(consumed);
+            if let Some(response) = response {
+                if mode.manages_state() {
+                    ReplyAssembler::check_surplus(!self.stream.buffer().is_empty(), false)?;
+                    self.stream.get_mut().set_state(ConnectionState::Ok);
                 }
-                Err(nom::Err::Failure(e)) => {
-                    return Err(error::parse(e.to_string()));
-                }
-                Err(nom::Err::Incomplete(_)) => { /* read more */ }
-                Err(nom::Err::Error(e)) => {
-                    return Err(error::parse(e.to_string()));
-                }
+                return ReplyAssembler::complete(response, mode);
             }
         }
-
-        Err(error::parse("incomplete response"))
     }
 
     fn finish_reply_group(&mut self) -> Result<(), Error> {
-        if !self.stream.buffer().is_empty() {
-            return Err(error::parse("SMTP server sent an unsolicited reply"));
-        }
+        ReplyAssembler::check_surplus(!self.stream.buffer().is_empty(), false)?;
         self.stream.get_mut().set_state(ConnectionState::Ok);
         Ok(())
     }
@@ -1080,15 +785,12 @@ mod transcript_tests {
         address::{Address, Envelope},
         transport::smtp::{
             Dialect,
-            account_error::{SmtpErrorContext, into_account_error},
-            authentication::{Credentials, Mechanism},
             batch::SmtpBatchRecipient,
             error::{SmtpCommandPhase, SmtpTransmissionState},
             extension::{
-                ClientId, DeliverByMode, DsnNotify, DsnReturn, Extension, MailBodyParameter,
-                MailParameter,
+                ClientId, DeliverByMode, DsnNotify, DsnReturn, MailBodyParameter, MailParameter,
             },
-            test_support::{Transcript, scram_enhanced_success_reply, scram_server_first_reply},
+            test_support::Transcript,
         },
     };
     use bifrost_types::error::BatchItemId;
@@ -1122,30 +824,6 @@ mod transcript_tests {
         assert_eq!(error.attempt(), Some(SmtpTransmissionState::Unsent));
         assert_eq!(error.phase(), Some(SmtpCommandPhase::MailFrom));
         transcript.assert_exhausted();
-    }
-
-    /// The blocking mirror of the async oversized-banner pin (finding 4c): a
-    /// greeting line past `MAX_RESPONSE_LINE_BYTES` is a parse error, and the
-    /// reader returns it instead of reading on for a terminator that a
-    /// pathological peer may never send.
-    #[test]
-    fn an_oversized_greeting_line_is_a_parse_error_not_a_hang() {
-        // A WELL-FORMED greeting that is merely too long. A line of garbage
-        // would fail to parse whether or not the cap exists, so it pins
-        // nothing about the cap; this one parses fine once the cap is removed.
-        let mut banner = format!("220 {}", "x".repeat(4096));
-        banner.push_str("\r\n");
-        let transcript = Transcript::new(&banner);
-
-        let error = SmtpConnection::from_transcript(
-            transcript,
-            &ClientId::Domain("client.example".to_owned()),
-            Dialect::Smtp,
-        )
-        .err()
-        .expect("an oversized banner line must surface as an error");
-
-        assert!(error.is_parse(), "expected a parse error, got {error:?}");
     }
 
     #[test]
@@ -2364,332 +2042,6 @@ mod transcript_tests {
         transcript.assert_exhausted();
     }
 
-    #[test]
-    fn whitespace_only_ehlo_extension_is_a_parse_error() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250-smtp.example\r\n250- \r\n250 AUTH PLAIN\r\n");
-
-        let error = SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
-            .err()
-            .expect("whitespace-only EHLO text must be rejected");
-
-        assert!(error.is_parse(), "expected parse error, got {error:?}");
-        transcript.assert_exhausted();
-    }
-
-    #[test]
-    fn scram_client_final_is_sent_once_and_enhanced_235_verifies() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250-smtp.example\r\n250 AUTH SCRAM-SHA-256\r\n")
-            .expect("AUTH SCRAM-SHA-256\r\n", "334 \r\n")
-            .expect_generated(scram_server_first_reply)
-            .expect_generated(scram_enhanced_success_reply)
-            .expect(HELLO, "250 smtp.example\r\n");
-        let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
-
-        let response = connection
-            .auth(
-                &[Mechanism::ScramSha256],
-                &Credentials::password("user", "pencil"),
-            )
-            .unwrap();
-
-        assert!(response.has_code(235));
-        assert!(!connection.has_broken());
-        transcript.assert_exhausted();
-    }
-
-    #[test]
-    fn auth_succeeds_when_the_tenth_legacy_challenge_is_answered() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let credentials = Credentials::oauth2("user", "token");
-        let payload = bifrost_sasl::oauthbearer_payload("user", "token");
-        let initial = format!(
-            "AUTH OAUTHBEARER {}\r\n",
-            crate::base64::encode(payload.as_bytes())
-        );
-        let mut transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
-            .expect(initial, "334 YQ==\r\n");
-        for _ in 0..9 {
-            transcript = transcript.expect("AQ==\r\n", "334 YQ==\r\n");
-        }
-        let transcript = transcript
-            .expect("AQ==\r\n", "235 authenticated\r\n")
-            .expect(HELLO, "250 smtp.example\r\n");
-        let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
-
-        let response = connection
-            .auth(&[Mechanism::OAuthBearer], &credentials)
-            .unwrap();
-
-        assert!(response.has_code(235));
-        assert!(!connection.has_broken());
-        transcript.assert_exhausted();
-    }
-
-    #[test]
-    fn auth_refreshes_server_info_with_ehlo() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let plain = format!(
-            "AUTH PLAIN {}\r\n",
-            crate::base64::encode("\u{0}user\u{0}pass")
-        );
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(
-                HELLO,
-                "250-smtp.example\r\n250-AUTH PLAIN\r\n250 SIZE 100\r\n",
-            )
-            .expect(plain, "235 authenticated\r\n")
-            .expect(HELLO, "250-smtp.example\r\n250 8BITMIME\r\n");
-        let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
-
-        assert!(
-            connection
-                .server_info()
-                .supports_auth_mechanism(Mechanism::Plain)
-        );
-        let response = connection
-            .auth(
-                &[Mechanism::Plain],
-                &Credentials::password("user".to_owned(), "pass".to_owned()),
-            )
-            .unwrap();
-
-        assert!(response.has_code(235));
-        // The post-AUTH EHLO replaced the capability set wholesale.
-        assert!(
-            !connection
-                .server_info()
-                .supports_auth_mechanism(Mechanism::Plain)
-        );
-        assert!(
-            connection
-                .server_info()
-                .supports_feature(Extension::EightBitMime)
-        );
-        transcript.assert_exhausted();
-    }
-
-    #[test]
-    fn oauthbearer_auth_sends_initial_response_and_refreshes_ehlo() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        // GS2 header escaping of the authzid is part of the wire contract.
-        let initial = crate::base64::encode("n,a=us=2Cer=3Done,\u{1}auth=Bearer token\u{1}\u{1}");
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
-            .expect(
-                format!("AUTH OAUTHBEARER {initial}\r\n"),
-                "235 authenticated\r\n",
-            )
-            .expect(HELLO, "250 smtp.example\r\n");
-        let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
-
-        let response = connection
-            .auth(
-                &[Mechanism::OAuthBearer],
-                &Credentials::oauth2("us,er=one", "token"),
-            )
-            .unwrap();
-
-        assert!(response.has_code(235));
-        transcript.assert_exhausted();
-    }
-
-    #[test]
-    fn a_server_credential_rejection_names_the_mechanism_in_support_diagnostics() {
-        // The blocking half of the server-rejection naming. A 535 says only
-        // that authentication failed; without the rung on the phase stamp the
-        // consumer cannot tell an operator WHICH mechanism the server
-        // refused, while the local-policy path has always named mechanisms.
-        // The name rides the support-only tier and must not disturb the
-        // classification, which is still read from the reply code.
-        let hello = ClientId::Domain("client.example".to_owned());
-        let plain = format!(
-            "AUTH PLAIN {}\r\n",
-            crate::base64::encode("\u{0}user\u{0}pass")
-        );
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250-smtp.example\r\n250 AUTH PLAIN\r\n")
-            .expect(plain, "535 5.7.8 credentials rejected\r\n");
-        let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
-
-        let error = connection
-            .auth(
-                &[Mechanism::Plain],
-                &Credentials::password("user".to_owned(), "pass".to_owned()),
-            )
-            .unwrap_err();
-
-        assert_eq!(
-            error.phase(),
-            Some(super::SmtpCommandPhase::Auth {
-                mechanism: Some(crate::transport::smtp::authentication::Mechanism::Plain)
-            })
-        );
-        let account = into_account_error(error, SmtpErrorContext::send(Dialect::Smtp));
-        assert!(
-            matches!(
-                account.kind(),
-                bifrost_types::error::AccountErrorKind::Authentication(
-                    bifrost_types::error::AuthErrorKind::ReauthorizationRequired
-                )
-            ),
-            "naming the mechanism must not move the classification: {:?}",
-            account.kind()
-        );
-        let consented = account.support_consented();
-        assert!(
-            consented
-                .support_text
-                .iter()
-                .any(|text| text.contains("mechanism PLAIN")),
-            "support text did not name the refused mechanism: {:?}",
-            consented.support_text
-        );
-        transcript.assert_exhausted();
-    }
-
-    #[test]
-    fn oauthbearer_immediate_rejection_marks_connection_broken() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let initial = crate::base64::encode("n,a=user,\u{1}auth=Bearer token\u{1}\u{1}");
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
-            .expect(
-                format!("AUTH OAUTHBEARER {initial}\r\n"),
-                "535 rejected\r\n",
-            );
-        let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
-
-        let error = connection
-            .auth(
-                &[Mechanism::OAuthBearer],
-                &Credentials::oauth2("user", "token"),
-            )
-            .unwrap_err();
-
-        assert!(
-            error.is_permanent(),
-            "expected permanent SMTP error: {error:?}"
-        );
-        assert!(connection.has_broken());
-        transcript.assert_exhausted();
-    }
-
-    #[test]
-    fn oauthbearer_failed_challenge_sends_cancel_response() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let initial = crate::base64::encode("n,a=user,\u{1}auth=Bearer token\u{1}\u{1}");
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
-            .expect(format!("AUTH OAUTHBEARER {initial}\r\n"), "334 e30=\r\n")
-            // RFC 7628 requires the client to answer a failure challenge with
-            // the single `0x01` cancel byte before reading the final reply.
-            .expect("AQ==\r\n", "535 rejected\r\n");
-        let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
-
-        let error = connection
-            .auth(
-                &[Mechanism::OAuthBearer],
-                &Credentials::oauth2("user", "token"),
-            )
-            .unwrap_err();
-
-        assert!(
-            error.is_permanent(),
-            "expected permanent SMTP error: {error:?}"
-        );
-        assert!(connection.has_broken());
-        transcript.assert_exhausted();
-    }
-
-    #[test]
-    fn starttls_downgrade_is_refused_without_a_wire_command() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250 smtp.example\r\n")
-            .expect("NOOP\r\n", "250 noop\r\n");
-        let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
-
-        assert!(!connection.can_starttls());
-        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
-        let error = connection
-            .starttls(&tls, &hello)
-            .expect_err("a server without the STARTTLS capability must not be upgraded");
-        assert!(
-            error.to_string().contains("STARTTLS is not supported"),
-            "expected a capability refusal, got: {error}"
-        );
-        assert!(error.is_policy(), "expected a policy refusal, got: {error}");
-
-        // The refusal happened before any byte hit the wire: the very next
-        // scripted step is NOOP, so a stray STARTTLS write would be rejected.
-        connection
-            .command(crate::transport::smtp::commands::Noop)
-            .unwrap();
-        transcript.assert_exhausted();
-    }
-
-    #[test]
-    fn starttls_refuses_plaintext_bytes_buffered_after_the_reply() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
-            .expect_coalesced(
-                "STARTTLS\r\n",
-                "220 go ahead\r\n250 attacker-controlled capabilities\r\n",
-            );
-        let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
-        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
-
-        let error = connection
-            .starttls(&tls, &hello)
-            .expect_err("pre-TLS injected bytes must refuse the upgrade");
-
-        assert!(error.to_string().contains("unsolicited reply"));
-        assert!(connection.has_broken());
-        transcript.assert_exhausted();
-    }
-
-    /// The capability is advertised, so the driver must actually issue
-    /// `STARTTLS` and only then attempt the upgrade. The transcript stream is
-    /// not a TCP socket, so the upgrade stops at the handshake boundary: that
-    /// is exactly as far as a hermetic test can follow, and it still pins the
-    /// wire step and its ordering.
-    #[test]
-    fn advertised_starttls_writes_the_command_before_the_handshake() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
-            .expect("STARTTLS\r\n", "220 ready to start tls\r\n");
-        let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
-
-        assert!(connection.can_starttls());
-        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
-        let error = connection
-            .starttls(&tls, &hello)
-            .expect_err("the in-process transcript stream cannot complete a TLS handshake");
-        assert!(
-            error.to_string().contains("only supported on TCP"),
-            "expected the upgrade to fail at the handshake boundary, got: {error}"
-        );
-        // The STARTTLS step was consumed, and no post-upgrade EHLO was sent.
-        transcript.assert_exhausted();
-    }
-
     /// Reads back what the blocking driver armed on the socket around the
     /// handshake. The transcript stream cannot complete a handshake, but the
     /// timeouts are set before it is attempted and restored after it fails, so
@@ -2751,48 +2103,6 @@ mod transcript_tests {
         );
     }
 
-    /// A server that advertises STARTTLS may still refuse it. The refusal must
-    /// surface as the server's reply, and no upgrade may be attempted.
-    #[test]
-    fn refused_starttls_reply_does_not_upgrade_the_stream() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
-            .expect("STARTTLS\r\n", "454 TLS temporarily unavailable\r\n");
-        let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
-
-        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
-        let error = connection
-            .starttls(&tls, &hello)
-            .expect_err("a refused STARTTLS must not be treated as an upgrade");
-        assert!(
-            error
-                .smtp_response()
-                .is_some_and(|response| response.has_code(454)),
-            "expected the 454 reply to survive, got: {error}"
-        );
-        assert!(!connection.is_encrypted());
-        transcript.assert_exhausted();
-    }
-
-    /// A peer that hangs up in the middle of a multiline reply must produce a
-    /// parse failure, not a hang and not a half-parsed capability set.
-    #[test]
-    fn peer_closing_mid_reply_line_is_a_parse_failure() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect_then_close(HELLO, "250-smtp.example\r\n250 PIPELI");
-
-        let Err(error) = SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp) else {
-            panic!("a truncated EHLO reply cannot yield a usable connection");
-        };
-        assert!(
-            error.to_string().contains("incomplete response"),
-            "expected an incomplete-response parse error, got: {error}"
-        );
-    }
-
     /// The peer closes right after accepting `DATA`. The body write fails, so
     /// the message may or may not have been seen: every recipient must land in
     /// the `uncertain` lane, never `succeeded`.
@@ -2824,38 +2134,6 @@ mod transcript_tests {
         assert!(outcome.succeeded().is_empty());
         assert_eq!(outcome.uncertain().len(), 1);
         assert_eq!(outcome.uncertain()[0].item.0, "item-0");
-        assert!(connection.has_broken());
-    }
-
-    /// An unsolicited reply coalesced with a requested reply breaks the
-    /// connection before it can be mistaken for the next command's answer.
-    ///
-    /// The coalesced segment is not an incidental choice of harness feature:
-    /// it is the ONLY shape in which an unsolicited reply is observable at
-    /// all. Outside the LMTP final-status drain, SMTP has no surplus-reply
-    /// detection that runs while no reply is owed - a reply that arrives on an
-    /// idle connection is simply not read until the next command asks for one.
-    /// Detection therefore happens exactly when the surplus has already
-    /// crossed into the `BufReader` alongside an answer that was owed, which
-    /// is what `expect_coalesced` reproduces. A test scripting the surplus as
-    /// a separate segment would pin nothing; that is an accepted limit of the
-    /// protocol, not of the harness.
-    #[test]
-    fn unsolicited_reply_coalesced_with_an_answer_breaks_the_connection() {
-        let hello = ClientId::Domain("client.example".to_owned());
-        let transcript = Transcript::new("220 smtp.example\r\n")
-            .expect(HELLO, "250 smtp.example\r\n")
-            .expect_coalesced("NOOP\r\n", "250 noop ok\r\n421 service closing\r\n");
-        let mut connection =
-            SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).unwrap();
-
-        let error = connection
-            .command(crate::transport::smtp::commands::Noop)
-            .expect_err("the surplus reply must break the connection immediately");
-        assert!(
-            error.to_string().contains("unsolicited reply"),
-            "expected a desynchronization error, got: {error}"
-        );
         assert!(connection.has_broken());
     }
 

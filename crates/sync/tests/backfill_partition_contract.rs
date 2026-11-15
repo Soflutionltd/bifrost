@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bifrost_sync::Error;
 use bifrost_sync::backfill::{BackfillRunner, LiveSupersedes};
-use bifrost_sync::multiplexer::{ChangeDelivery, PagePublisher};
+use bifrost_sync::delivery::{ChangeDelivery, PagePublisher};
 use bifrost_types::{
     Account, AccountErrorBuilder, AccountErrorKind, Cause, Checkpoint, CoverageDomain, CursorScope,
     DiagnosticText, InternalErrorKind, InventoryBatch, InventoryCompletion,
@@ -56,8 +56,13 @@ fn publisher(delivery: ChangeDelivery) -> PagePublisher {
         priority,
         bandwidth,
     );
-    let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(4);
-    drop(writer_rx);
+    let (writer_tx, writer_task) = bifrost_sync::engine::writer::WriterHandle::spawn(
+        bifrost_types::AccountId("partition-contract".into()),
+        Arc::new(bifrost_sync::InMemoryCheckpointStore::new()),
+        control.clone(),
+        4,
+    );
+    writer_task.abort();
     PagePublisher::new(
         Arc::new(delivery),
         control,

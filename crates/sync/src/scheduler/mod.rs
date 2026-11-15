@@ -42,12 +42,10 @@
 //! restores arrival order in place of priority - which is precisely the
 //! implementation this design replaced.
 //!
-//! A refused admission is TRANSIENT, never terminal: `admit` errors when its
-//! lane is full or the scheduler is stopping, and both clear by themselves. A
-//! caller must back off (the poll loop steps its cadence) or skip just that
-//! scope (the push sweep). Returning from a poll loop on an admission error
-//! retires that scope's polling forever for a condition that heals, which was
-//! a real regression here.
+//! A full lane is transient pressure: the wire-start gate backs off before
+//! retrying, rather than retiring a scope for a condition that heals. A stopped
+//! dispatcher, forgotten account budget or broken pool is a distinct typed
+//! failure. Retrying those cannot restore this attachment's admission.
 
 pub mod budget;
 pub mod lanes;
@@ -130,7 +128,7 @@ struct SchedulerState {
 struct AdmissionRequest {
     account: AccountId,
     kind: WorkKind,
-    tx: oneshot::Sender<BudgetPermit>,
+    tx: oneshot::Sender<Result<BudgetPermit, crate::Error>>,
 }
 
 #[derive(Debug, Default)]
@@ -371,11 +369,10 @@ impl Scheduler {
     /// request can overtake it. The permit is minted only when the
     /// budget can actually grant it.
     ///
-    /// Returns `Error::Other` when the lane is at capacity (the request
+    /// Returns `Error::Admission(LaneFull { .. })` when the lane is at capacity (the request
     /// is refused rather than displacing an older waiter) or when the
-    /// scheduler is shutting down. Callers on a repeating work path
-    /// should treat that as transient and retry at their next tick
-    /// rather than exiting.
+    /// scheduler is shutting down. Only lane saturation is transient;
+    /// forgotten accounts and broken budget state retain their typed failure.
     pub async fn admit(
         &self,
         account: AccountId,
@@ -402,9 +399,10 @@ impl Scheduler {
                     capacity = self.inner.lane_capacity,
                     "admission lane full; refusing the incoming request"
                 );
-                return Err(crate::Error::Other(
-                    "scheduler admission lane is full".into(),
-                ));
+                return Err(crate::Error::Admission(crate::AdmissionFailure::LaneFull {
+                    priority,
+                    capacity: self.inner.lane_capacity,
+                }));
             }
             admission.lanes[lane].push_back(AdmissionRequest { account, kind, tx });
         }
@@ -412,7 +410,7 @@ impl Scheduler {
         // The dispatcher dropped our request unanswered: it is gone, so no
         // retry can succeed. A typed error lets callers tell this apart from
         // a full lane (which is transient).
-        rx.await.map_err(|_| crate::Error::ShuttingDown)
+        rx.await.map_err(|_| crate::Error::ShuttingDown)?
     }
 
     fn ensure_dispatcher(&self) {
@@ -561,10 +559,12 @@ async fn dispatch_admissions(inner: Arc<SchedulerInner>) {
                     %error,
                     "budget acquisition failed; dropping the admission attempt"
                 );
-                // Fail the waiter rather than spinning on a closed
-                // semaphore: its channel drops when the request is taken.
+                // Preserve the budget verdict through the response channel.
+                // Only a full lane can clear by retrying this attachment.
                 let mut admission = inner.admission.lock().expect("poisoned");
-                let _ = admission.take_for_class(&account, kind, floor);
+                if let Some(request) = admission.take_for_class(&account, kind, floor) {
+                    let _ = request.tx.send(Err(error));
+                }
                 continue;
             }
         };
@@ -576,7 +576,7 @@ async fn dispatch_admissions(inner: Arc<SchedulerInner>) {
             // Send failure means the caller went away between selection
             // and hand-off; dropping the permit returns it immediately.
             Some(request) => {
-                let _ = request.tx.send(permit);
+                let _ = request.tx.send(Ok(permit));
             }
             None => drop(permit),
         }
@@ -706,5 +706,41 @@ mod tests {
         );
         background.await.expect("background task");
         foreground.await.expect("foreground task");
+    }
+
+    #[tokio::test]
+    async fn admission_preserves_forgotten_account_failure() {
+        let scheduler = scheduler(1);
+        let account = AccountId("retired-admission".into());
+        scheduler.budget().forget(&account);
+        assert!(matches!(
+            scheduler.admit(account.clone(), Priority::Normal, WorkKind::Sync).await,
+            Err(crate::Error::Admission(crate::AdmissionFailure::AccountForgotten(id))) if id == account
+        ));
+    }
+
+    #[tokio::test]
+    async fn admission_reports_full_lane_with_priority_and_capacity() {
+        let scheduler = Scheduler::with_lane_capacity(
+            SchedulerConfig {
+                starvation_floor: 1,
+            },
+            BudgetGate::new(ConcurrencyBudget::default()),
+            1,
+        );
+        // Enqueue by polling, without yielding to the dispatcher. This makes
+        // saturation deterministic rather than depending on task scheduling.
+        let first = scheduler.admit(AccountId("first".into()), Priority::Normal, WorkKind::Sync);
+        tokio::pin!(first);
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(matches!(
+            scheduler
+                .admit(AccountId("second".into()), Priority::Normal, WorkKind::Sync)
+                .await,
+            Err(crate::Error::Admission(crate::AdmissionFailure::LaneFull {
+                priority: Priority::Normal,
+                capacity: 1
+            }))
+        ));
     }
 }

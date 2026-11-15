@@ -1793,7 +1793,7 @@ fn fetch_with_envelope() {
 fn fetch_modseq() {
     let input = b"(UID 5 MODSEQ (12345))";
     let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
-    assert_eq!(fr.mod_seq, Some(12345));
+    assert_eq!(fr.mod_seq.map(crate::types::ModSeqValzer::get), Some(12345));
 }
 
 #[test]
@@ -2261,7 +2261,7 @@ fn response_code_modified_accepts_star_range() {
     let (_, code) = response_code(b"[MODIFIED 1:*]").unwrap();
     if let ResponseCode::Modified(ranges) = code {
         assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].start, 1);
+        assert_eq!(ranges[0].start(), 1);
         assert_eq!(ranges[0].end_bound(), Some(crate::types::SeqBound::Star));
     } else {
         panic!("expected Modified, got {code:?}");
@@ -2275,8 +2275,8 @@ fn response_code_modified_accepts_bare_star() {
     let (_, code) = response_code(b"[MODIFIED *]").unwrap();
     if let ResponseCode::Modified(ranges) = code {
         assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].start, u32::MAX);
-        assert_eq!(ranges[0].end, None);
+        assert_eq!(ranges[0].start(), u32::MAX);
+        assert_eq!(ranges[0].end(), None);
         assert_eq!(ranges[0].start_bound(), crate::types::SeqBound::Star);
     } else {
         panic!("expected Modified, got {code:?}");
@@ -3968,8 +3968,14 @@ fn fetch_gmail_msgid_and_thrid() {
     {
         assert_eq!(fr.seq, 5);
         assert_eq!(fr.uid, Some(100));
-        assert_eq!(fr.gmail_msg_id, Some(1_278_455_344_230_334_864));
-        assert_eq!(fr.gmail_thread_id, Some(1_278_455_344_230_334_865));
+        assert_eq!(
+            fr.gmail_msg_id,
+            Some(crate::types::GmailMessageId::new(1_278_455_344_230_334_864))
+        );
+        assert_eq!(
+            fr.gmail_thread_id,
+            Some(crate::types::GmailThreadId::new(1_278_455_344_230_334_865))
+        );
         return;
     }
     panic!("expected Fetch response with Gmail message and thread ids");
@@ -5074,8 +5080,8 @@ fn esearch_all_preserves_ranges() {
 fn uid_range_single_value() {
     let (_, ranges) = uid_set(b"42").unwrap();
     assert_eq!(ranges.len(), 1);
-    assert_eq!(ranges[0].start, 42);
-    assert_eq!(ranges[0].end, None);
+    assert_eq!(ranges[0].start(), 42);
+    assert_eq!(ranges[0].end(), None);
 }
 
 /// UID range parsing: comma-separated set with ranges.
@@ -5095,9 +5101,9 @@ fn response_code_appenduid_multi() {
     if let ResponseCode::AppendUid { uid_validity, uids } = code {
         assert_eq!(uid_validity, 1234);
         assert_eq!(uids.len(), 3);
-        assert_eq!(uids[0].start, 100);
-        assert_eq!(uids[1].start, 101);
-        assert_eq!(uids[2].start, 102);
+        assert_eq!(uids[0].start(), 100);
+        assert_eq!(uids[1].start(), 101);
+        assert_eq!(uids[2].start(), 102);
     } else {
         panic!("expected AppendUid");
     }
@@ -5310,7 +5316,7 @@ fn fetch_lowercase_bodystructure() {
 fn fetch_lowercase_modseq() {
     let input = b"(modseq (12345))";
     let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
-    assert_eq!(fr.mod_seq, Some(12345));
+    assert_eq!(fr.mod_seq.map(crate::types::ModSeqValzer::get), Some(12345));
 }
 
 /// INTERNALDATE in lowercase.
@@ -6980,7 +6986,10 @@ fn fetch_modseq_i64_max() {
     if let Response::Untagged(boxed) = resp
         && let UntaggedResponse::Fetch(fr) = *boxed
     {
-        assert_eq!(fr.mod_seq, Some(i64::MAX as u64));
+        assert_eq!(
+            fr.mod_seq.map(crate::types::ModSeqValzer::get),
+            Some(i64::MAX as u64)
+        );
         return;
     }
     panic!("expected Fetch with max MODSEQ");
@@ -6998,7 +7007,8 @@ fn fetch_modseq_u64_max_rejected() {
     if let Response::Untagged(boxed) = resp {
         if let UntaggedResponse::Fetch(fr) = &*boxed {
             assert_eq!(
-                fr.mod_seq, None,
+                fr.mod_seq.map(crate::types::ModSeqValzer::get),
+                None,
                 "u64::MAX MODSEQ should be skipped (None), not stored"
             );
         } else {
@@ -7460,7 +7470,10 @@ fn search_with_modseq_trailing() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Search { uids, mod_seq } = *u {
             assert_eq!(uids, vec![2, 5, 6, 7, 11, 12, 18, 19, 20, 23]);
-            assert_eq!(mod_seq, Some(917_162_500));
+            assert_eq!(
+                mod_seq,
+                Some(crate::types::ModSeq::new(917_162_500).expect("valid protocol test value"))
+            );
         } else {
             panic!("expected Search, got {u:?}");
         }
@@ -7482,9 +7495,8 @@ fn search_modseq_rejects_zero() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Search { uids, mod_seq } = &*u {
             assert_eq!(*uids, vec![1, 5], "UIDs must be preserved");
-            assert_ne!(
-                *mod_seq,
-                Some(0),
+            assert_eq!(
+                *mod_seq, None,
                 "SEARCH MODSEQ 0 must be rejected per RFC 7162 Section 3.1.6"
             );
         } else {
@@ -7505,7 +7517,7 @@ fn search_modseq_accepts_one() {
             assert_eq!(uids, vec![1, 5]);
             assert_eq!(
                 mod_seq,
-                Some(1),
+                Some(crate::types::ModSeq::new(1).expect("valid protocol test value")),
                 "SEARCH MODSEQ 1 must be accepted per RFC 7162 Section 3.1.6"
             );
         } else {
@@ -7530,7 +7542,7 @@ fn esearch_with_modseq_result() {
     let (_, resp) = result.unwrap();
     if let UntaggedResponse::Esearch(esearch) = resp {
         assert_eq!(
-            esearch.mod_seq,
+            esearch.mod_seq.map(crate::types::ModSeq::get),
             Some(917_162_500),
             "ESEARCH MODSEQ value must be retained per RFC 7162 Section 3.1.10"
         );
@@ -7549,7 +7561,7 @@ fn spec_audit_esearch_all_accepts_wildcard() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(es) = &*u {
             assert_eq!(es.all.len(), 1);
-            assert_eq!(es.all[0].start, 1);
+            assert_eq!(es.all[0].start(), 1);
             assert_eq!(es.all[0].end_bound(), Some(crate::types::SeqBound::Star));
         } else {
             panic!("Expected Esearch, got {u:?}");
@@ -7926,8 +7938,12 @@ fn uid_range_zero_end_rejected() {
 #[test]
 fn uid_range_reversed_normalized() {
     let (_, r) = uid_range(b"100:1").unwrap();
-    assert_eq!(r.start, 1, "reversed range must normalize start to min");
-    assert_eq!(r.end, Some(100), "reversed range must normalize end to max");
+    assert_eq!(r.start(), 1, "reversed range must normalize start to min");
+    assert_eq!(
+        r.end(),
+        Some(100),
+        "reversed range must normalize end to max"
+    );
 }
 
 /// Postel's law: `seq_range` must also normalize reversed ranges,
@@ -7938,11 +7954,12 @@ fn uid_range_reversed_normalized() {
 fn seq_range_reversed_normalized() {
     let (_, r) = seq_range(b"100:1").unwrap();
     assert_eq!(
-        r.start, 1,
+        r.start(),
+        1,
         "seq_range reversed range must normalize start to min"
     );
     assert_eq!(
-        r.end,
+        r.end(),
         Some(100),
         "seq_range reversed range must normalize end to max"
     );
@@ -7954,7 +7971,7 @@ fn seq_range_reversed_normalized() {
 #[test]
 fn seq_range_wildcard_reversed_normalized() {
     let (_, r) = seq_range(b"*:1").unwrap();
-    assert_eq!(r.start, 1, "seq_range *:1 must normalize start to 1");
+    assert_eq!(r.start(), 1, "seq_range *:1 must normalize start to 1");
     assert_eq!(
         r.end_bound(),
         Some(crate::types::SeqBound::Star),
@@ -8633,7 +8650,8 @@ fn number64_rejects_above_i64_max() {
     if let Response::Untagged(boxed) = resp {
         if let UntaggedResponse::Fetch(fr) = &*boxed {
             assert_eq!(
-                fr.mod_seq, None,
+                fr.mod_seq.map(crate::types::ModSeqValzer::get),
+                None,
                 "u64::MAX MODSEQ should be skipped (None), not stored"
             );
         } else {
@@ -8738,7 +8756,10 @@ fn sort_with_modseq() {
         match &*u {
             UntaggedResponse::Sort { nums, mod_seq } => {
                 assert_eq!(nums, &[2, 5, 6]);
-                assert_eq!(*mod_seq, Some(917162500));
+                assert_eq!(
+                    *mod_seq,
+                    Some(crate::types::ModSeq::new(917162500).expect("valid protocol test value"))
+                );
             }
             other => panic!("expected Sort, got {other:?}"),
         }
@@ -9430,9 +9451,9 @@ fn audit_l6_fetch_modseq_accepts_zero() {
     let result = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7);
     let (_, fr) = result.expect("FETCH with MODSEQ (0) must parse  -  0 accepted per Postel's law");
     assert_eq!(
-        fr.mod_seq,
+        fr.mod_seq.map(crate::types::ModSeqValzer::get),
         Some(0),
-        "MODSEQ 0 must be accepted per Postel's law (should be Some(0), not None)"
+        "MODSEQ 0 is accepted without supplying a concurrency guard"
     );
     assert_eq!(
         fr.uid,
@@ -9726,7 +9747,10 @@ fn spec_audit_search_modseq_case_insensitive() {
         Response::Untagged(u) => match *u {
             UntaggedResponse::Search { uids, mod_seq } => {
                 assert_eq!(uids, vec![2, 5]);
-                assert_eq!(mod_seq, Some(917162500));
+                assert_eq!(
+                    mod_seq,
+                    Some(crate::types::ModSeq::new(917162500).expect("valid protocol test value"))
+                );
             }
             other => panic!("expected Search, got {other:?}"),
         },
@@ -9743,7 +9767,10 @@ fn spec_audit_sort_modseq_case_insensitive() {
         Response::Untagged(u) => match *u {
             UntaggedResponse::Sort { nums, mod_seq } => {
                 assert_eq!(nums, vec![2, 3, 6]);
-                assert_eq!(mod_seq, Some(917162500));
+                assert_eq!(
+                    mod_seq,
+                    Some(crate::types::ModSeq::new(917162500).expect("valid protocol test value"))
+                );
             }
             other => panic!("expected Sort, got {other:?}"),
         },
@@ -10699,9 +10726,9 @@ fn regression_fetch_modseq_zero_preserves_other_attrs() {
             );
             assert_eq!(fr.rfc822_size, Some(1024), "RFC822.SIZE must be preserved");
             assert_eq!(
-                fr.mod_seq,
+                fr.mod_seq.map(crate::types::ModSeqValzer::get),
                 Some(0),
-                "MODSEQ (0) should be preserved as Some(0) per Postel's law"
+                "MODSEQ 0 is an absent concurrency guard"
             );
         } else {
             panic!("expected Fetch, got {u:?}  -  MODSEQ (0) must not drop the response");
@@ -10828,7 +10855,8 @@ fn regression_esearch_modseq_missing_space_preserves_results() {
             assert!(esearch.uid, "UID indicator must be preserved");
             assert_eq!(esearch.tag.as_deref(), Some("A1"), "TAG must be preserved");
             assert_eq!(
-                esearch.mod_seq, None,
+                esearch.mod_seq.map(crate::types::ModSeq::get),
+                None,
                 "MODSEQ should be None when space is missing"
             );
         } else {
@@ -10857,7 +10885,11 @@ fn regression_fetch_modseq_overflow_preserves_other_attrs() {
                     .is_some_and(|f| f.contains(&crate::types::Flag::Flagged)),
                 "FLAGS must be preserved"
             );
-            assert_eq!(fr.mod_seq, None, "overflowing MODSEQ should be None");
+            assert_eq!(
+                fr.mod_seq.map(crate::types::ModSeqValzer::get),
+                None,
+                "overflowing MODSEQ should be None"
+            );
         } else {
             panic!("expected Fetch, got {u:?}");
         }
@@ -10877,9 +10909,9 @@ fn fetch_modseq_zero() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Fetch(fr) = &*u {
             assert_eq!(
-                fr.mod_seq,
+                fr.mod_seq.map(crate::types::ModSeqValzer::get),
                 Some(0),
-                "MODSEQ (0) should be preserved as Some(0), not silently discarded"
+                "MODSEQ 0 is an absent concurrency guard"
             );
         } else {
             panic!("expected Fetch, got {u:?}");
@@ -12846,7 +12878,8 @@ fn edge_esearch_empty_uid_list() {
             "COUNT must be None for an empty ESEARCH result"
         );
         assert_eq!(
-            esearch.mod_seq, None,
+            esearch.mod_seq.map(crate::types::ModSeq::get),
+            None,
             "MODSEQ must be None for an empty ESEARCH result"
         );
         return;
@@ -14156,7 +14189,10 @@ fn fetch_x_gm_labels_are_exposed_without_losing_other_attributes() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Fetch(fr) = *u {
             assert_eq!(fr.uid, Some(9), "UID before the unknown item survives");
-            assert_eq!(fr.gmail_msg_id, Some(1_278_455_344_230_334_865));
+            assert_eq!(
+                fr.gmail_msg_id,
+                Some(crate::types::GmailMessageId::new(1_278_455_344_230_334_865))
+            );
             assert_eq!(
                 fr.gmail_labels,
                 Some(vec![

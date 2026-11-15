@@ -1,36 +1,41 @@
-use bifrost_dav_core::{
-    DavProtocol, SnapshotEntry, append_path, decode_snapshot, decode_watermark_cursor,
-    diff_snapshots, encode_snapshot, encode_watermark_cursor,
-    inventory_entry as inventory_entry_from_snapshot, preserve_unobserved_entries, same_dav_url,
-    slice_after_watermark, sorted_candidate_hrefs, worse_recovery,
+use crate::dialect::CardDavDialect;
+#[cfg(test)]
+use bifrost_dav_core::SnapshotEntry;
+use bifrost_dav_core::append_path;
+use bifrost_dav_core::collection::{COLLECTION_PAGE_SIZE, Dialect};
+use bifrost_dav_core::collection_account::{
+    CollectionSnapshot, DavCollectionAccount, IdleLifecycle, RelocateFailure,
 };
-use bifrost_types::{
-    Application, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets, TargetRef,
-    TargetRole,
-};
+use bifrost_dav_core::worse_recovery;
+#[cfg(test)]
+use bifrost_dav_core::{slice_after_watermark, sorted_candidate_hrefs};
+#[cfg(test)]
+use bifrost_types::ObjectType;
+type Kernel = DavCollectionAccount<CardDavDialect>;
+use bifrost_dav_core::same_dav_url;
+
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountFuture, AccountId, AccountOperation, AccountStream, AddressBook, AddressBookId,
     AttachmentHandle, BlobHandle, ByteRange, Calendar, CalendarEvent, Cause, Change, ChangeCursor,
-    Checkpoint, CloudUploadMeta, ContactCard, ContactCorpus, ContactCreate, ContactId,
-    ContactPatch, ContactProvenance, ContactSearchRequest, ContainerId, ContainerKind,
-    ContainerList, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DiagnosticText,
-    DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
-    ErrorScope, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
-    FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
-    IdentityId, IdentityPatch, Importance, InternalCause, InternalErrorKind, InventoryEvent,
+    CloudUploadMeta, ContactCard, ContactCorpus, ContactCreate, ContactId, ContactPatch,
+    ContactProvenance, ContactSearchRequest, ContainerId, ContainerKind, ContainerList, CostClass,
+    CursorDescriptor, CursorEstablishment, CursorScope, DiagnosticText, DirectoryCard,
+    DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, ErrorScope,
+    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
+    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, Importance, InternalCause, InternalErrorKind, InventoryEvent,
     InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope, Message,
-    MutationSuccess, MutationTarget, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary,
-    Priority, Protocol, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendReceipt,
-    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SkippedScope,
-    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
+    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Protocol, ProtocolKind, QuotaInfo,
+    RsvpStatus, SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SkippedScope, SubscriptionHandle, SyncEvent, SyncStrategy,
+    ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
-use futures::{FutureExt, StreamExt, stream};
+use futures::{StreamExt, stream};
 use uuid::Uuid;
 
 use crate::CardDavConfig;
@@ -39,7 +44,10 @@ use crate::client::{
     CardDavClient, FilteredHrefs, HrefQuery, PutCondition, contact_scope, extend_candidates,
     local_error, not_found_error, unsupported_error,
 };
-use crate::parse::{AddressBookCollection, CardDavFetchedVCard, CardDavMultigetReport};
+use crate::parse::AddressBookCollection;
+use crate::parse::CardDavFetchedVCard;
+#[cfg(test)]
+use crate::parse::CardDavMultigetReport;
 use crate::vcard::{
     VCardParseError, VCardWriteError, contact_from_vcard, vcard_from_create, vcard_from_patch,
 };
@@ -51,49 +59,7 @@ use crate::vcard::{
 /// is no request limit to honour. That is the shape of the trait method, not an
 /// omission here; `contact_search`, whose request DOES carry a limit, uses this
 /// only as the default.
-const CONTACT_PAGE_SIZE: usize = 250;
-// Version 2 changes snapshot ids from base-URL-relative to request-URI-relative.
-//
-// Accepted cost of that bump, recorded so it is not rediscovered as a bug: a
-// v1 cursor is REFUSED by `decode_cursor_snapshot` rather than migrated - a v1
-// payload is byte-identical in shape to a v2 one, so the ids cannot be
-// distinguished and rewritten, only re-derived - so every consumer holding a
-// pre-bump cursor pays one full re-sync per DAV account, once. That is a
-// one-time cost against ids that were silently wrong, which was worth paying.
-// Pinned by `contact_cursor_rejects_the_base_relative_id_version`.
-const CURSOR_ENVELOPE_VERSION: u32 = 2;
-const CURSOR_MAGIC: &[u8] = b"CDAVCTAG1";
-
-/// No dynamic scope events are available, but exhaustion would make the
-/// consumer reconnect. Keep every subscription alive until account shutdown.
-#[derive(Debug)]
-struct IdleLifecycle {
-    sender: std::sync::Mutex<Option<futures::channel::oneshot::Sender<()>>>,
-    shutdown: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
-}
-
-impl Default for IdleLifecycle {
-    fn default() -> Self {
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        Self {
-            sender: std::sync::Mutex::new(Some(sender)),
-            shutdown: receiver.shared(),
-        }
-    }
-}
-
-impl IdleLifecycle {
-    fn stream(&self) -> AccountStream<bifrost_types::ScopeLifecycleEvent> {
-        Box::pin(stream::pending().take_until(self.shutdown.clone()))
-    }
-
-    fn close(&self) {
-        let sender = self.sender.lock().expect("lifecycle lock poisoned").take();
-        if let Some(sender) = sender {
-            let _ = sender.send(());
-        }
-    }
-}
+const CONTACT_PAGE_SIZE: usize = COLLECTION_PAGE_SIZE;
 
 #[derive(Debug)]
 pub(crate) struct CardDavAccount {
@@ -106,7 +72,7 @@ pub(crate) struct CardDavAccount {
     /// when the home enumerated no collections.
     ///
     /// Deliberately not the addressbook home in that case. See
-    /// `no_default_addressbook`.
+    /// the shared kernel default-collection policy.
     pub(crate) default_addressbook_url: Option<String>,
     pub(crate) addressbook_urls: Vec<String>,
 }
@@ -237,7 +203,7 @@ impl CardDavAccount {
         }
         default_addressbook_url
             .map(str::to_string)
-            .ok_or_else(|| no_default_addressbook(operation))
+            .ok_or_else(|| Kernel::no_default(operation))
     }
 
     fn map_addressbook(collection: AddressBookCollection) -> AddressBook {
@@ -284,7 +250,7 @@ impl CardDavAccount {
             Some(address_book) => client.resolve_url(&address_book.0),
             None => contact_addressbook_url(&client, &contact)
                 .or(default_addressbook_url)
-                .ok_or_else(|| no_default_addressbook(operation))?,
+                .ok_or_else(|| Kernel::no_default(operation))?,
         };
         client.refuse_directory_access(&addressbook, operation)?;
         client.refuse_directory_access(&client.resolve_url(&contact.0), operation)?;
@@ -323,7 +289,7 @@ impl CardDavAccount {
 
     /// Move one contact resource into another address book collection.
     ///
-    /// Twin of `bifrost-caldav`'s `relocate_event`; keep them in step. WebDAV
+    /// The shared kernel performs relocation. WebDAV
     /// `MOVE` is the atomic form and is tried first; a server that does not
     /// implement it falls back to PUT-to-new then DELETE-from-old, which is not
     /// atomic. Typed progress preserves the committed copy and failing leg.
@@ -334,50 +300,22 @@ impl CardDavAccount {
         data: String,
         content_changed: bool,
     ) -> Result<(), RelocateFailure> {
-        let destination = append_path(target_addressbook, &resource_file_name(source_url));
-        if client
-            .move_resource(source_url, &destination, AccountOperation::ContactUpdate)
-            .await
-            .map_err(RelocateFailure::Before)?
-        {
-            if !content_changed {
-                return Ok(());
-            }
-            // The move is done and the id has changed. A failure here is a
-            // half-applied request, not a failed one.
-            return client
-                .put_vcard(
-                    &destination,
-                    data,
-                    PutCondition::None,
-                    AccountOperation::ContactUpdate,
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| RelocateFailure::MovedThenPut { destination, error });
-        }
-        // No MOVE support: copy first, then remove the original. A failed copy
-        // leaves the contact exactly where it was; a failed delete leaves it
-        // readable in two places - the recoverable direction of the pair.
         client
-            .put_vcard(
-                &destination,
-                data,
-                PutCondition::IfNoneMatch,
-                AccountOperation::ContactUpdate,
-            )
-            .await
-            .map(|_| ())
+            .refuse_directory_access(source_url, AccountOperation::ContactUpdate)
             .map_err(RelocateFailure::Before)?;
         client
-            .delete_vcard(source_url, AccountOperation::ContactUpdate)
-            .await
-            .map(|_| ())
-            .map_err(|error| RelocateFailure::CopiedThenDelete {
-                destination,
-                source: source_url.to_owned(),
-                error,
-            })
+            .refuse_directory_access(target_addressbook, AccountOperation::ContactUpdate)
+            .map_err(RelocateFailure::Before)?;
+        Kernel::relocate(
+            client.collection_dispatch(),
+            source_url,
+            target_addressbook,
+            data,
+            content_changed,
+            AccountOperation::ContactUpdate,
+            || format!("{}.{}", Uuid::new_v4(), CardDavDialect::FILE_EXTENSION),
+        )
+        .await
     }
 
     /// The whole collection as candidate hrefs, from the depth-1 PROPFIND.
@@ -422,36 +360,27 @@ impl CardDavAccount {
         operation: AccountOperation,
         keep: K,
     ) -> Result<Page<ContactCard>, AccountError> {
-        let HrefQuery {
-            hrefs,
-            failed_hrefs,
-            degraded,
-        } = candidates;
-        let hrefs = sorted_candidate_hrefs(hrefs);
-        let total = hrefs.len();
-        let slice = slice_after_watermark(hrefs, watermark, page_size, String::as_str);
-        let fetch = client
-            .fetch_vcards(addressbook, &slice.items, operation)
-            .await?;
-        let skipped_scopes =
-            skipped_addressbook_scope(worse_recovery_option(degraded, fetch.degraded));
-        let (fetched, mut failed_ids) = resolved_report(fetch.report);
-        merge_listing_failures(&mut failed_ids, failed_hrefs);
-        let (cards, projection_failures) = partition_hydrated_vcards(addressbook, fetched);
-        failed_ids.extend(projection_failures);
-        one_outcome_per_id(&mut failed_ids, &cards);
-        let mut cards = cards.into_iter().filter(keep).collect::<Vec<_>>();
-        // The page is served in the same key order it was sliced in; a
-        // multiget answers in whatever order it likes.
-        cards.sort_by(|left, right| left.native_id.cmp(&right.native_id));
-        Ok(Page {
-            truncated: false,
-            items: cards,
-            next_cursor: slice.next_watermark.as_deref().map(encode_watermark_cursor),
-            estimated_total: Some(estimated_total(total)),
-            failed_ids,
-            skipped_scopes,
-        })
+        Kernel::hydrated_page(
+            bifrost_dav_core::collection_account::PageRequest {
+                collection: addressbook,
+                candidates,
+                watermark,
+                page_size,
+            },
+            |hrefs| async move { client.fetch_vcards(addressbook, &hrefs, operation).await },
+            |card| {
+                contact_from_vcard(
+                    card.uri,
+                    Some(AddressBookId(addressbook.to_owned())),
+                    card.etag,
+                    &card.data,
+                )
+                .map(|card| vec![card])
+            },
+            keep,
+            |card| card.native_id.as_str(),
+        )
+        .await
     }
 
     /// Snapshot one address book's contact listing plus its ctag.
@@ -479,49 +408,7 @@ impl CardDavAccount {
             CtagSource::Known(ctag) => ctag,
         };
         let listing = client.list_contacts_listing(addressbook, operation).await?;
-        // COMPLETE inventory coverage cannot discharge a refused member. Fail
-        // before emitting either items or a checkpoint, retaining its status.
-        if operation == AccountOperation::SyncInventory
-            && let Some(failure) = listing.failed.first()
-        {
-            return Err(
-                match failure
-                    .status
-                    .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
-                {
-                    Some(status) => bifrost_dav_core::status_error(
-                        &reqwest::header::HeaderMap::new(),
-                        operation,
-                        status,
-                        format!("inventory member refused: {}", failure.href),
-                        DavProtocol::CardDav,
-                    ),
-                    None => bifrost_dav_core::parse_error(
-                        operation,
-                        "inventory member omitted usable properties",
-                        DavProtocol::CardDav,
-                    ),
-                },
-            );
-        }
-        let failed_hrefs = listing.failed_hrefs();
-        let mut entries = listing
-            .entries
-            .into_iter()
-            .map(|entry| ContactSnapshotEntry {
-                uri: entry.uri,
-                etag: entry.etag.map(Into::into),
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.uri.cmp(&right.uri));
-        let observation = preserve_unobserved_entries(&[], &mut entries, &failed_hrefs);
-        let ctag = observation.advance_token(None, ctag);
-        Ok(ContactSnapshot {
-            addressbook_url: addressbook.to_string(),
-            ctag,
-            entries,
-            failed_hrefs,
-        })
+        Kernel::snapshot_from_listing(addressbook, ctag, listing, operation)
     }
 }
 
@@ -534,6 +421,8 @@ pub(crate) enum CtagSource {
 }
 
 impl Account for CardDavAccount {
+    bifrost_dav_core::dav_unsupported_account_methods!(CardDavDialect);
+
     fn protocol(&self) -> bifrost_types::Protocol {
         bifrost_types::Protocol::CardDav
     }
@@ -559,30 +448,12 @@ impl Account for CardDavAccount {
     }
 
     fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>> {
-        let scopes = self
-            .addressbook_urls
-            .iter()
-            .filter(|url| !self.client.is_directory_url(url))
-            .cloned()
-            .map(|url| CursorScope::FolderType {
-                folder: bifrost_types::FolderId(url),
-                ty: ObjectType::Contact,
-            })
-            .collect();
-        Box::pin(stream::iter([
-            SyncEvent::Batch(bifrost_types::Batch {
-                items: scopes,
-                page_boundary: PageBoundary::Final,
-                server_latency: Default::default(),
-                bytes_in: 0,
-                checkpoint: None,
-            }),
-            SyncEvent::Done(None),
-        ]))
-    }
-
-    fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>> {
-        unsupported_stream(AccountOperation::DiscoverMemberships)
+        Kernel::discover_scopes(
+            self.addressbook_urls
+                .iter()
+                .filter(|url| !self.client.is_directory_url(url))
+                .cloned(),
+        )
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<bifrost_types::ScopeLifecycleEvent> {
@@ -594,94 +465,38 @@ impl Account for CardDavAccount {
         scope: CursorScope,
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
         let client = Arc::clone(&self.client);
-        let default_addressbook = self.default_addressbook_url.clone();
-        let addressbook_urls = self.addressbook_urls.clone();
-        Box::pin(async move {
-            validate_contact_scope(&scope, AccountOperation::EstablishCursor)?;
-            let addressbook = collection_url_for_scope(
-                &scope,
-                default_addressbook.as_deref(),
-                &addressbook_urls,
-                AccountOperation::EstablishCursor,
-            )?;
-            let snapshot = Self::contact_snapshot(
-                &client,
-                CtagSource::Collection,
-                &addressbook,
-                AccountOperation::EstablishCursor,
-            )
-            .await
-            .map_err(|error| directory_sync_error(error, &scope))?;
-            Ok(CursorEstablishment::Ready(cursor_from_snapshot(
-                scope, &snapshot,
-            )))
-        })
+        Kernel::establish(
+            scope,
+            self.default_addressbook_url.clone(),
+            self.addressbook_urls.clone(),
+            move |collection| async move {
+                Self::contact_snapshot(
+                    &client,
+                    CtagSource::Collection,
+                    &collection,
+                    AccountOperation::EstablishCursor,
+                )
+                .await
+            },
+        )
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         let (client, tally) = self.client.metered();
-        let default_addressbook = self.default_addressbook_url.clone();
-        let addressbook_urls = self.addressbook_urls.clone();
-        let coverage_scope = scope.clone();
-        let coverage_domain = collection_coverage_domain(
-            coverage_scope,
-            scope_collection_url(&scope, default_addressbook.as_deref()),
-        );
-        // COMPLETE coverage is accurate here: the walk terminates wholesale on
-        // any failure, so it never advances a checkpoint across a gap.
-        Box::pin(
-            stream::once(async move {
-                let mut events = Vec::new();
-                if let Err(error) = validate_contact_scope(&scope, AccountOperation::SyncInventory)
-                {
-                    events.push(SyncEvent::Terminated(directory_sync_error(error, &scope)));
-                    return events;
-                }
-                let addressbook = match collection_url_for_scope(
-                    &scope,
-                    default_addressbook.as_deref(),
-                    &addressbook_urls,
-                    AccountOperation::SyncInventory,
-                ) {
-                    Ok(addressbook) => addressbook,
-                    Err(error) => {
-                        events.push(SyncEvent::Terminated(directory_sync_error(error, &scope)));
-                        return events;
-                    }
-                };
-                let started = Instant::now();
-                let snapshot = match Self::contact_snapshot(
+        Kernel::inventory(
+            scope,
+            self.default_addressbook_url.clone(),
+            self.addressbook_urls.clone(),
+            tally,
+            move |collection| async move {
+                Self::contact_snapshot(
                     &client,
                     CtagSource::Collection,
-                    &addressbook,
+                    &collection,
                     AccountOperation::SyncInventory,
                 )
                 .await
-                {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        events.push(SyncEvent::Terminated(directory_sync_error(error, &scope)));
-                        return events;
-                    }
-                };
-                let checkpoint = cursor_from_snapshot(scope, &snapshot);
-                let items = snapshot
-                    .entries
-                    .iter()
-                    .map(inventory_entry_from_snapshot)
-                    .collect();
-                events.push(SyncEvent::Batch(bifrost_types::Batch {
-                    items,
-                    page_boundary: PageBoundary::Final,
-                    server_latency: started.elapsed(),
-                    bytes_in: tally.take(),
-                    checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
-                }));
-                events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
-                events
-            })
-            .flat_map(stream::iter)
-            .map(bifrost_types::lift_complete_walk(coverage_domain)),
+            },
         )
     }
 
@@ -704,132 +519,11 @@ impl Account for CardDavAccount {
         }
     }
 
-    fn get_stream(
-        &self,
-        _ids: AccountStream<ObjectId>,
-        _projection: bifrost_types::Projection,
-    ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
-        unsupported_stream(AccountOperation::Hydrate)
-    }
-
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
         let (client, tally) = self.client.metered();
-        // No address book home is captured: the poll path resolves its ctag
-        // against the collection itself, never by re-listing the home.
-        Box::pin(
-            stream::once(async move {
-                let mut events = Vec::new();
-                let previous = match decode_cursor_snapshot(&cursor) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        events.push(SyncEvent::Terminated(directory_sync_error(
-                            error,
-                            &cursor.scope,
-                        )));
-                        return events;
-                    }
-                };
-                let started = Instant::now();
-                // ctag short-circuit (brick 8): when the prior cursor
-                // carries a ctag and a cheap depth-0 getctag PROPFIND
-                // shows the collection unchanged, skip the full depth-1
-                // PROPFIND + diff and carry the cursor forward with no
-                // changes. Mirrors CalDAV's sync-token short-circuit.
-                //
-                // The ctag is resolved AT MOST ONCE per poll, and the value is
-                // carried into the snapshot below rather than re-derived. It
-                // used to be fetched here and then recovered a second time from
-                // a depth-1 listing of the whole address book home - three
-                // round trips for a changed collection, one of them scaling
-                // with the number of address books.
-                // Resolved unconditionally, not only when the prior cursor
-                // carried one. A cursor with no ctag previously had to recover
-                // one from the depth-1 home listing, which is both dearer and
-                // likelier to come back empty (it finds nothing when the
-                // collection does not appear in its own home). Asking the
-                // collection directly seeds the ctag for the next poll, so a
-                // cursor that starts without one is not stuck without one.
-                let current_ctag = match client
-                    .collection_ctag(&previous.addressbook_url, AccountOperation::SyncChanges)
-                    .await
-                {
-                    Ok(ctag) => ctag,
-                    Err(error) => {
-                        events.push(SyncEvent::Terminated(directory_sync_error(
-                            error,
-                            &cursor.scope,
-                        )));
-                        return events;
-                    }
-                };
-                if let (Some(prev_ctag), Some(current_ctag)) =
-                    (previous.ctag.as_deref(), current_ctag.as_deref())
-                    && prev_ctag == current_ctag
-                {
-                    let checkpoint = cursor_from_snapshot(cursor.scope, &previous);
-                    events.push(SyncEvent::Batch(bifrost_types::Batch {
-                        items: Vec::new(),
-                        page_boundary: PageBoundary::Final,
-                        server_latency: started.elapsed(),
-                        bytes_in: tally.take(),
-                        checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
-                    }));
-                    events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
-                    return events;
-                }
-                // ctag changed, server omits getctag, or the prior cursor
-                // carried none: fall through to the full snapshot + diff
-                // (which still runs brick 6's empty-207 guard). `Known`
-                // spends no request - it reuses whatever the check above
-                // resolved, including `None`, which is exactly the value the
-                // old depth-1 path would have produced for a server that does
-                // not publish getctag.
-                let mut current = match Self::contact_snapshot(
-                    &client,
-                    CtagSource::Known(current_ctag),
-                    &previous.addressbook_url,
-                    AccountOperation::SyncChanges,
-                )
-                .await
-                {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        events.push(SyncEvent::Terminated(directory_sync_error(
-                            error,
-                            &cursor.scope,
-                        )));
-                        return events;
-                    }
-                };
-                preserve_unobserved_contact_entries(&previous, &mut current);
-                let checkpoint = cursor_from_snapshot(cursor.scope, &current);
-                let changes = diff_contact_snapshots(&previous, &current);
-                events.push(SyncEvent::Batch(bifrost_types::Batch {
-                    items: changes,
-                    page_boundary: PageBoundary::Final,
-                    server_latency: started.elapsed(),
-                    bytes_in: tally.take(),
-                    checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
-                }));
-                events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
-                events
-            })
-            .flat_map(stream::iter),
-        )
-    }
-
-    fn push_subscribe(
-        &self,
-        _scopes: &[CursorScope],
-    ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
-        unsupported_future(AccountOperation::PushSubscribe)
-    }
-
-    fn push_unsubscribe(
-        &self,
-        _handle: SubscriptionHandle,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::PushUnsubscribe)
+        Kernel::changes(cursor, tally, move |previous| async move {
+            changes_from_cursor(&client, &previous).await
+        })
     }
 
     fn push_stream(
@@ -845,279 +539,6 @@ impl Account for CardDavAccount {
                 "not a lane of this account",
             )),
         ]))
-    }
-
-    fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {
-        unsupported_stream(AccountOperation::OpenBlob)
-    }
-
-    fn open_blob_range(
-        &self,
-        _handle: BlobHandle,
-        _range: ByteRange,
-    ) -> AccountStream<SyncEvent<Bytes>> {
-        unsupported_stream(AccountOperation::OpenBlobRange)
-    }
-
-    fn open_raw_rfc822(&self, _message: ObjectId) -> AccountStream<SyncEvent<Bytes>> {
-        unsupported_stream(AccountOperation::OpenRawRfc822)
-    }
-
-    fn bulk_set_flags(
-        &self,
-        _targets: AccountStream<ObjectId>,
-        op: FlagOp,
-        _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        match op.validate_for_account(bifrost_types::Protocol::CardDav) {
-            Ok(()) => unsupported_stream(AccountOperation::UpdateFlags),
-            Err(error) => Box::pin(futures::stream::once(async move {
-                SyncEvent::Terminated(error)
-            })),
-        }
-    }
-
-    fn bulk_move(
-        &self,
-        _targets: AccountStream<ObjectId>,
-        _destination: MembershipScope,
-        _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        unsupported_stream(AccountOperation::BulkMove)
-    }
-
-    fn bulk_destroy(
-        &self,
-        _targets: AccountStream<ObjectId>,
-        _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        unsupported_stream(AccountOperation::BulkDestroy)
-    }
-
-    fn add_to_container(
-        &self,
-        _target: MutationTarget,
-        _container: ContainerId,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::AddToContainer)
-    }
-
-    fn remove_from_container(
-        &self,
-        _target: MutationTarget,
-        _container: ContainerId,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::RemoveFromContainer)
-    }
-
-    fn set_keyword(
-        &self,
-        _target: MutationTarget,
-        _keyword: bifrost_types::Flag,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetKeyword)
-    }
-
-    fn set_label_membership(
-        &self,
-        _target: MutationTarget,
-        _label: ContainerId,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetLabelMembership)
-    }
-
-    fn set_category(
-        &self,
-        _target: MutationTarget,
-        _category: String,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetCategory)
-    }
-
-    fn set_extended_property(
-        &self,
-        _target: MutationTarget,
-        _property_id: String,
-        _value: Option<String>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetExtendedProperty)
-    }
-
-    fn set_is_read(
-        &self,
-        _target: MutationTarget,
-        _is_read: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetIsRead)
-    }
-
-    fn set_importance(
-        &self,
-        _target: MutationTarget,
-        _level: Importance,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetImportance)
-    }
-
-    fn send_message(
-        &self,
-        _request: SendRequest,
-    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
-        unsupported_future(AccountOperation::Send)
-    }
-
-    fn attachment_upload(
-        &self,
-        _bytes: AccountStream<Result<Bytes, AccountError>>,
-        _mime: String,
-    ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-        unsupported_future(AccountOperation::AttachmentUpload)
-    }
-
-    fn host_attachment(
-        &self,
-        _bytes: Bytes,
-        _meta: CloudUploadMeta,
-    ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
-        unsupported_future(AccountOperation::HostAttachment)
-    }
-
-    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
-        unsupported_future(AccountOperation::DraftCreate)
-    }
-
-    fn draft_update(
-        &self,
-        _draft: DraftHandle,
-        _patch: DraftPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::DraftUpdate)
-    }
-
-    fn draft_discard(&self, _draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::DraftDiscard)
-    }
-
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
-        unsupported_future(AccountOperation::DraftSend)
-    }
-
-    fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::CancelScheduledSend)
-    }
-
-    fn reschedule_send(
-        &self,
-        _handle: ObjectId,
-        _scheduled: std::time::SystemTime,
-    ) -> AccountFuture<Result<ObjectId, AccountError>> {
-        unsupported_future(AccountOperation::RescheduleSend)
-    }
-
-    fn search(
-        &self,
-        _request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
-        unsupported_future(AccountOperation::Search)
-    }
-
-    fn search_messages(
-        &self,
-        _request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
-        unsupported_future(AccountOperation::SearchMessages)
-    }
-
-    fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>> {
-        unsupported_future(AccountOperation::ContainersList)
-    }
-
-    fn container_create(
-        &self,
-        _kind: ContainerKind,
-        _name: String,
-        _parent: Option<ContainerId>,
-        _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
-        unsupported_future(AccountOperation::ContainerCreate)
-    }
-
-    fn container_rename(
-        &self,
-        _container: ContainerId,
-        _name: String,
-        _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::ContainerRename)
-    }
-
-    fn container_move(
-        &self,
-        _container: ContainerId,
-        _new_parent: Option<ContainerId>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::ContainerMove)
-    }
-
-    fn container_delete(&self, _container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::ContainerDelete)
-    }
-
-    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
-        unsupported_future(AccountOperation::IdentitiesList)
-    }
-
-    fn identity_update(
-        &self,
-        _identity: IdentityId,
-        _patch: IdentityPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::IdentityUpdate)
-    }
-
-    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
-        unsupported_future(AccountOperation::VacationGet)
-    }
-
-    fn vacation_set(&self, _config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::VacationSet)
-    }
-
-    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
-        unsupported_future(AccountOperation::QuotaGet)
-    }
-
-    fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
-        unsupported_future(AccountOperation::FiltersList)
-    }
-
-    fn filter_create(
-        &self,
-        _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
-        unsupported_future(AccountOperation::FilterCreate)
-    }
-
-    fn filter_update(
-        &self,
-        _filter: ServerFilterId,
-        _patch: ServerFilterPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::FilterUpdate)
-    }
-
-    fn filter_delete(&self, _filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::FilterDelete)
-    }
-
-    fn filter_validate(
-        &self,
-        _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<FilterValidation, AccountError>> {
-        unsupported_future(AccountOperation::FilterValidate)
     }
 
     fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
@@ -1167,7 +588,7 @@ impl Account for CardDavAccount {
                 operation,
             )?;
             client.refuse_directory_access(&addressbook, operation)?;
-            let watermark = decode_contact_page_cursor(page_cursor, operation)?;
+            let watermark = Kernel::decode_page_cursor(page_cursor, operation)?;
             let candidates = Self::listing_candidates(&client, &addressbook, operation).await?;
             // No request limit: the trait's `contacts_list` takes an address
             // book and a cursor and nothing else, so the page size is fixed
@@ -1336,7 +757,7 @@ impl Account for CardDavAccount {
             let content_changed = patch_changes_content(&patch);
             Self::relocate_contact(&client, &url, &target_addressbook, data, content_changed)
                 .await
-                .map_err(|failure| relocation_error(failure, &url))
+                .map_err(|failure| Kernel::relocation_error(failure, &url))
         })
     }
 
@@ -1401,7 +822,7 @@ impl Account for CardDavAccount {
                 operation,
             )?;
             client.refuse_directory_access(&addressbook, operation)?;
-            let watermark = decode_contact_page_cursor(request.page_cursor.clone(), operation)?;
+            let watermark = Kernel::decode_page_cursor(request.page_cursor.clone(), operation)?;
             let needle = request.query.to_lowercase();
             // A zero limit is honored as an empty exhausted page, not clamped
             // up to one. Clamping silently served a contact the caller had
@@ -1465,7 +886,7 @@ impl Account for CardDavAccount {
         if !self.capabilities.pim_methods.directory_search
             || (query.trim().is_empty() && !self.capabilities.pim_methods.directory_enumerate)
         {
-            return unsupported_future(operation);
+            return Kernel::unsupported_future(operation);
         }
         let client = Arc::clone(&self.client);
         let gateways = self.directory_gateways.clone();
@@ -1520,7 +941,7 @@ impl Account for CardDavAccount {
                         page.failed_ids
                             .extend(report.failed.into_iter().map(|f| f.href));
                         page.failed_ids.extend(report.missing_data);
-                        for raw in report.cards {
+                        for raw in report.items {
                             match crate::vcard::directory_from_vcard(&raw.data) {
                                 Ok(Some(card)) => {
                                     // Directory identity folds the trimmed primary email
@@ -1550,38 +971,23 @@ impl Account for CardDavAccount {
         })
     }
 
-    fn directory_groups_list(
-        &self,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
-        unsupported_future(AccountOperation::DirectoryGroupsList)
-    }
-
-    fn directory_group_expand(
-        &self,
-        _group: DirectoryGroupId,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
-        unsupported_future(AccountOperation::DirectoryGroupExpand)
-    }
-
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
-        unsupported_future(AccountOperation::CalendarsList)
+        Kernel::unsupported_future(AccountOperation::CalendarsList)
     }
 
     fn events_in_range(
         &self,
         _range: EventRange,
     ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
-        unsupported_future(AccountOperation::EventsInRange)
+        Kernel::unsupported_future(AccountOperation::EventsInRange)
     }
 
     fn event_get(&self, _event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
-        unsupported_future(AccountOperation::EventGet)
+        Kernel::unsupported_future(AccountOperation::EventGet)
     }
 
     fn event_create(&self, _event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
-        unsupported_future(AccountOperation::EventCreate)
+        Kernel::unsupported_future(AccountOperation::EventCreate)
     }
 
     fn event_update(
@@ -1589,11 +995,11 @@ impl Account for CardDavAccount {
         _event: EventId,
         _patch: EventPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::EventUpdate)
+        Kernel::unsupported_future(AccountOperation::EventUpdate)
     }
 
     fn event_delete(&self, _event: EventId) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::EventDelete)
+        Kernel::unsupported_future(AccountOperation::EventDelete)
     }
 
     fn event_rsvp(
@@ -1601,50 +1007,20 @@ impl Account for CardDavAccount {
         _event: EventId,
         _status: RsvpStatus,
     ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::EventRsvp)
+        Kernel::unsupported_future(AccountOperation::EventRsvp)
     }
 
     fn event_search(
         &self,
         _request: EventSearchRequest,
     ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
-        unsupported_future(AccountOperation::EventSearch)
-    }
-
-    fn thread_hydrate(
-        &self,
-        _thread: ThreadId,
-    ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
-        unsupported_future(AccountOperation::HydrateThread)
-    }
-
-    fn message_hydrate(
-        &self,
-        _message: ObjectId,
-        _projection: HydrationProjection,
-    ) -> AccountFuture<Result<Message, AccountError>> {
-        unsupported_future(AccountOperation::HydrateMessage)
+        Kernel::unsupported_future(AccountOperation::EventSearch)
     }
 
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
         self.lifecycle.close();
         Box::pin(async { Ok(()) })
     }
-}
-
-fn unsupported_future<T: Send + 'static>(
-    operation: AccountOperation,
-) -> AccountFuture<Result<T, AccountError>> {
-    Box::pin(async move { Err(unsupported_error(operation)) })
-}
-
-fn unsupported_stream<T: Send + 'static>(
-    operation: AccountOperation,
-) -> AccountStream<SyncEvent<T>> {
-    Box::pin(stream::iter([
-        SyncEvent::Terminated(unsupported_error(operation)),
-        SyncEvent::Done(None),
-    ]))
 }
 
 /// Whether the patch changes anything other than which collection the contact
@@ -1666,90 +1042,6 @@ fn patch_changes_content(patch: &ContactPatch) -> bool {
         ..patch.clone()
     };
     content != ContactPatch::default()
-}
-
-enum RelocateFailure {
-    Before(AccountError),
-    MovedThenPut {
-        destination: String,
-        error: AccountError,
-    },
-    CopiedThenDelete {
-        destination: String,
-        source: String,
-        error: AccountError,
-    },
-}
-fn relocation_error(failure: RelocateFailure, original: &str) -> AccountError {
-    let (error, source, destination, committed, effect, subject) = match failure {
-        RelocateFailure::Before(error) => return error,
-        RelocateFailure::MovedThenPut { destination, error } => {
-            let subject = destination.clone();
-            (
-                error,
-                original.to_owned(),
-                destination,
-                StepEffect::Moved,
-                StepEffect::Updated,
-                subject,
-            )
-        }
-        RelocateFailure::CopiedThenDelete {
-            destination,
-            source,
-            error,
-        } => {
-            let subject = source.clone();
-            (
-                error,
-                source,
-                destination,
-                StepEffect::Copied,
-                StepEffect::Deleted,
-                subject,
-            )
-        }
-    };
-    let scope = |id: &str| ErrorScope::Contact {
-        id: ContactId(id.to_owned()),
-    };
-    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
-        effect,
-        StepTargets::complete(vec![TargetRef::new(TargetRole::Subject, scope(&subject))]),
-        StepReplay::Repeatable,
-        Application::from_leaf(&error),
-    ));
-    record.committed(
-        committed,
-        StepTargets::complete(vec![
-            TargetRef::new(TargetRole::Source, scope(&source)),
-            TargetRef::new(TargetRole::Destination, scope(&destination)),
-        ]),
-        StepReplay::Blocking,
-    );
-    error
-        .into_builder()
-        .scope(scope(&subject))
-        .partial_commit(record)
-        .try_build()
-        .expect("valid relocation record")
-}
-
-/// The last path segment of a resource URL - the name the resource keeps when
-/// it moves into another collection.
-///
-/// Falls back to a fresh UUID-backed name when the URL has no usable final
-/// segment, so a move never targets the destination collection itself.
-fn resource_file_name(url: &str) -> String {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|parsed| {
-            parsed
-                .path_segments()
-                .and_then(|mut segments| segments.next_back().filter(|name| !name.is_empty()))
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| format!("{}.vcf", Uuid::new_v4()))
 }
 
 fn contact_addressbook_url(client: &CardDavClient, contact: &ContactId) -> Option<String> {
@@ -1854,44 +1146,13 @@ fn directory_gateway_invariant_error(operation: AccountOperation) -> AccountErro
     .expect("valid directory-search invariant classification")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct ContactSnapshot {
-    addressbook_url: String,
-    pub(crate) ctag: Option<String>,
-    entries: Vec<ContactSnapshotEntry>,
-    /// Hrefs the server reported *failed* within the 207 of the poll
-    /// that built this snapshot. Not persisted in the cursor (a
-    /// per-poll observation); the diff preserves these `previous`
-    /// entries rather than destroying them.
-    failed_hrefs: Vec<String>,
-}
+type ContactSnapshot = CollectionSnapshot;
 
 /// One polled address-book member. The shape, the cursor codec, the diff and
 /// the page slicer are all shared with `bifrost-caldav` through
 /// `bifrost-dav-core`; only the magic bytes and the token's name differ.
+#[cfg(test)]
 type ContactSnapshotEntry = SnapshotEntry;
-
-fn validate_contact_scope(
-    scope: &CursorScope,
-    operation: AccountOperation,
-) -> Result<(), AccountError> {
-    if matches!(
-        scope,
-        CursorScope::Type(ObjectType::Contact)
-            | CursorScope::Folder(_)
-            | CursorScope::FolderType {
-                ty: ObjectType::Contact,
-                ..
-            }
-    ) {
-        Ok(())
-    } else {
-        Err(local_error(
-            operation,
-            "CardDAV only supports contact cursor scopes",
-        ))
-    }
-}
 
 /// The cursor-scope collection set: one entry per DISCOVERED address book, and
 /// NOTHING when the home holds none.
@@ -1903,57 +1164,10 @@ fn validate_contact_scope(
 /// point cursor establishment and inventory at a 404, and would contradict the
 /// empty-home contract the listing APIs are pinned to.
 fn discovered_collection_urls(collections: &[AddressBookCollection]) -> Vec<String> {
-    collections
-        .iter()
-        .map(|collection| collection.href.clone())
-        .collect()
-}
-
-/// A collection reclassified as a directory is no longer a personal sync
-/// scope. Disable the original scope, rather than retry or try another sync
-/// strategy. Keep redirect transmission evidence from the guard's refusal.
-fn directory_sync_error(error: AccountError, scope: &CursorScope) -> AccountError {
-    let Some(ErrorScope::DirectoryGateway { url }) = error.scope() else {
-        return error;
-    };
-    if !matches!(error.kind(), AccountErrorKind::Unsupported(_)) {
-        return error;
-    }
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::ScopeRevoked),
-        Cause::State(bifrost_types::StateCause::ScopeRevoked),
-    )
-    .protocol(Protocol::CardDav)
-    .scope(ErrorScope::Cursor(scope.clone()))
-    .text(DiagnosticText::support_only(format!(
-        "personal sync scope targets a directory: {url}"
-    )));
-    if let Some(operation) = error.operation() {
-        builder = builder.operation(operation);
-    }
-    for cause in error.chain().iter().cloned() {
-        builder = builder.push_cause(cause);
-    }
-    builder
-        .try_build()
-        .expect("valid directory scope retirement")
-}
-
-/// A call that names no address book cannot be routed, because the addressbook
-/// home enumerated no collections.
-///
-/// The alternative - falling back to the addressbook home URL - is what this
-/// replaces. The home is not itself a collection in that case
-/// (`list_addressbooks` already returns the home when it genuinely is one, so
-/// an empty result means an empty backend), so every such request went to a
-/// resource a spec-correct server 404s, and reported it as a remote failure
-/// rather than as the local routing failure it is. It also contradicted the
-/// empty-home contract `address_books_list` is pinned to. Twin of
-/// `bifrost-caldav`'s `no_default_calendar`.
-fn no_default_addressbook(operation: AccountOperation) -> AccountError {
-    local_error(
-        operation,
-        "CardDAV account has no address book collection to route a call that names none",
+    Kernel::discovered_collections(
+        collections
+            .iter()
+            .map(|collection| collection.href.as_str()),
     )
 }
 
@@ -1962,202 +1176,13 @@ fn no_default_addressbook(operation: AccountOperation) -> AccountError {
 ///
 /// Deliberately has no access to the addressbook home, so the fallback this
 /// replaced cannot be reintroduced here without also changing the signature.
-/// See `no_default_addressbook` for why the home is the wrong answer.
+/// The shared kernel deliberately has no home URL to substitute.
 fn default_collection_url(collections: &[AddressBookCollection]) -> Option<String> {
-    collections
-        .first()
-        .map(|collection| collection.href.clone())
-}
-
-fn collection_url_for_scope(
-    scope: &CursorScope,
-    default_url: Option<&str>,
-    collection_urls: &[String],
-    operation: AccountOperation,
-) -> Result<String, AccountError> {
-    match scope {
-        CursorScope::Type(ObjectType::Contact) => default_url
-            .map(str::to_string)
-            .ok_or_else(|| no_default_addressbook(operation)),
-        CursorScope::Folder(folder)
-        | CursorScope::FolderType {
-            folder,
-            ty: ObjectType::Contact,
-        } if collection_urls.contains(&folder.0) => Ok(folder.0.clone()),
-        _ => Err(local_error(
-            operation,
-            "CardDAV cursor scope does not name a discovered address book",
-        )),
-    }
-}
-
-fn scope_collection_url<'a>(
-    scope: &'a CursorScope,
-    default_url: Option<&'a str>,
-) -> Option<&'a str> {
-    match scope {
-        CursorScope::Folder(folder)
-        | CursorScope::FolderType {
-            folder,
-            ty: ObjectType::Contact,
-        } => Some(&folder.0),
-        _ => default_url,
-    }
-}
-
-fn collection_coverage_domain(
-    scope: CursorScope,
-    collection_url: Option<&str>,
-) -> bifrost_types::CoverageDomain {
-    match scope {
-        CursorScope::Folder(_)
-        | CursorScope::FolderType {
-            ty: ObjectType::Contact,
-            ..
-        } => bifrost_types::CoverageDomain::full(scope),
-        // An unroutable legacy scope still needs a domain to carry the
-        // terminating stream; the walk fails before the region is read.
-        _ => bifrost_types::CoverageDomain {
-            scope,
-            coordinate: bifrost_types::CoverageCoordinate::ProviderRegion {
-                namespace: "carddav".to_string(),
-                region: collection_url.unwrap_or_default().as_bytes().to_vec(),
-            },
-            snapshot: bifrost_types::SnapshotIdentity::unstable(),
-        },
-    }
-}
-
-fn cursor_from_snapshot(scope: CursorScope, snapshot: &ContactSnapshot) -> ChangeCursor {
-    ChangeCursor {
-        scope,
-        server_state: OpaqueChangeState {
-            protocol: ProtocolKind::CardDav,
-            envelope_version: bifrost_types::PayloadVersion::new(CURSOR_ENVELOPE_VERSION),
-            bytes: encode_cursor_snapshot(snapshot),
-        },
-        advanced_through: None,
-        envelope_version: bifrost_types::TraitEnvelopeVersion::new(
-            bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
-        ),
-    }
-}
-
-fn encode_cursor_snapshot(snapshot: &ContactSnapshot) -> Vec<u8> {
-    encode_snapshot(
-        CURSOR_MAGIC,
-        &snapshot.addressbook_url,
-        snapshot.ctag.as_deref(),
-        &snapshot.entries,
+    Kernel::default_collection(
+        collections
+            .iter()
+            .map(|collection| collection.href.as_str()),
     )
-}
-
-// Keep the persisted dialect magic stable: its suffix is not a second schema
-// version. The envelope alone rejects the old native-id namespace. The payload
-// collection is also necessary for accepted legacy Type scopes, which carry no
-// URL; Folder scopes cross-check it to prevent polling a different collection.
-// Sharing the token's storage does not share its semantics: only this dialect
-// decides whether it is a sync-token or a ctag.
-fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<ContactSnapshot, AccountError> {
-    validate_contact_scope(&cursor.scope, AccountOperation::SyncChanges)?;
-    let bytes = cursor
-        .server_state
-        .open(
-            ProtocolKind::CardDav,
-            bifrost_types::PayloadVersion::new(CURSOR_ENVELOPE_VERSION),
-        )
-        .map_err(|fault| {
-            fault
-                .builder(
-                    bifrost_types::Protocol::CardDav,
-                    AccountOperation::SyncChanges,
-                )
-                .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
-                .try_build()
-                .expect("valid account error classification")
-        })?;
-    let decoded =
-        decode_snapshot(CURSOR_MAGIC, DavProtocol::CardDav.label(), bytes).map_err(|error| {
-            cursor_error(error)
-                .into_builder()
-                .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
-                .try_build()
-                .expect("valid account error classification")
-        })?;
-    // Fixed, valid classification: try_build cannot fail.
-    #[allow(clippy::unwrap_in_result)]
-    if let CursorScope::Folder(folder)
-    | CursorScope::FolderType {
-        folder,
-        ty: ObjectType::Contact,
-    } = &cursor.scope
-        && !same_dav_url(&folder.0, &decoded.collection_url)
-    {
-        return Err(bifrost_types::CursorDecodeFault::ScopeMismatch
-            .builder(
-                bifrost_types::Protocol::CardDav,
-                AccountOperation::SyncChanges,
-            )
-            .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
-            .text(bifrost_types::DiagnosticText::support_only(
-                "cursor collection does not match its folder scope",
-            ))
-            .try_build()
-            .expect("valid account error classification"));
-    }
-    Ok(ContactSnapshot {
-        addressbook_url: decoded.collection_url,
-        ctag: decoded.token,
-        entries: decoded.entries,
-        failed_hrefs: Vec::new(),
-    })
-}
-
-/// Diff two contact snapshots. The rule, the transient-empty-207 suppression
-/// and the failed-href preservation all live in `bifrost-dav-core`, which
-/// `bifrost-caldav` reads through the same door.
-fn diff_contact_snapshots(previous: &ContactSnapshot, current: &ContactSnapshot) -> Vec<Change> {
-    diff_snapshots(&previous.entries, &current.entries, &current.failed_hrefs)
-}
-
-fn preserve_unobserved_contact_entries(previous: &ContactSnapshot, current: &mut ContactSnapshot) {
-    let observation = preserve_unobserved_entries(
-        &previous.entries,
-        &mut current.entries,
-        &current.failed_hrefs,
-    );
-    current.ctag = observation.advance_token(previous.ctag.clone(), current.ctag.take());
-}
-
-fn cursor_error(message: impl Into<String>) -> AccountError {
-    bifrost_types::CursorDecodeFault::Malformed
-        .builder(
-            bifrost_types::Protocol::CardDav,
-            AccountOperation::SyncChanges,
-        )
-        .text(bifrost_types::DiagnosticText::support_only(message))
-        .try_build()
-        .expect("valid account error classification")
-}
-
-fn decode_contact_page_cursor(
-    cursor: Option<bifrost_types::PageCursor>,
-    operation: AccountOperation,
-) -> Result<Option<String>, AccountError> {
-    decode_watermark_cursor(cursor, operation, DavProtocol::CardDav)
-}
-
-/// Keep the worse of two optional failures, so a refused query leg is not
-/// buried under a milder multiget failure or dropped entirely. Twin of the
-/// CalDAV function of the same name.
-fn worse_recovery_option(
-    current: Option<AccountError>,
-    candidate: Option<AccountError>,
-) -> Option<AccountError> {
-    match candidate {
-        Some(candidate) => worse_recovery(current, candidate),
-        None => current,
-    }
 }
 
 /// Reduce the failure lane to one outcome per resource id.
@@ -2169,22 +1194,16 @@ fn worse_recovery_option(
 /// display as lost. The sort and dedup finish the job for ids that failed
 /// in more than one REPORT.
 ///
-/// `bifrost-caldav` has a function of the same name and shape, and the two
-/// were deliberately NOT collapsed into `bifrost-dav-core` when the propstat
-/// machine and the snapshot layer were: this one filters against the
-/// `native_id` of the parsed cards, the CalDAV twin against a materialized
-/// href set, so they share only their outline and a shared version would
-/// need a projection each side supplies anyway.
+/// The shared helper accepts the materialized href projection explicitly.
+#[cfg(test)]
 fn one_outcome_per_id(failed_ids: &mut Vec<String>, cards: &[ContactCard]) {
-    let materialized = cards
-        .iter()
-        .map(|card| card.native_id.as_str())
-        .collect::<HashSet<_>>();
-    failed_ids.retain(|id| !materialized.contains(id.as_str()));
-    failed_ids.sort_unstable();
-    failed_ids.dedup();
+    bifrost_dav_core::collection_account::one_outcome_per_id(
+        failed_ids,
+        cards.iter().map(|card| card.native_id.as_str()),
+    );
 }
 
+#[cfg(test)]
 fn merge_listing_failures(failed_ids: &mut Vec<String>, listing_failed_hrefs: Vec<String>) {
     failed_ids.extend(listing_failed_hrefs);
 }
@@ -2200,18 +1219,9 @@ fn merge_listing_failures(failed_ids: &mut Vec<String>, listing_failed_hrefs: Ve
 /// `ErrorScope::ContactCollection` carries no id of its own; the refused
 /// address book is the one named by the request, and the error's own
 /// diagnostics carry the URL.
+#[cfg(test)]
 fn skipped_addressbook_scope(degraded: Option<AccountError>) -> Vec<SkippedScope> {
-    degraded
-        .map(|error| SkippedScope {
-            scope: ErrorScope::ContactCollection,
-            error,
-        })
-        .into_iter()
-        .collect()
-}
-
-fn estimated_total(total: usize) -> u64 {
-    u64::try_from(total).unwrap_or(u64::MAX)
+    Kernel::skipped_scope("", degraded)
 }
 
 /// Project a batch of hydrated vCard resources, splitting successful
@@ -2226,8 +1236,9 @@ fn estimated_total(total: usize) -> u64 {
 /// Parsed multiget reports already use the absolute native-id namespace.
 /// DAV response hrefs are rebased at the XML decoding boundary, before this
 /// account layer can place them in success or failure lanes.
+#[cfg(test)]
 fn resolved_report(report: CardDavMultigetReport) -> (Vec<CardDavFetchedVCard>, Vec<String>) {
-    let cards = report.cards;
+    let cards = report.items;
     let failed = report
         .failed
         .into_iter()
@@ -2237,6 +1248,7 @@ fn resolved_report(report: CardDavMultigetReport) -> (Vec<CardDavFetchedVCard>, 
     (cards, failed)
 }
 
+#[cfg(test)]
 fn partition_hydrated_vcards(
     addressbook: &str,
     fetched: Vec<CardDavFetchedVCard>,
@@ -2317,6 +1329,35 @@ fn contains(value: &str, needle: &str) -> bool {
     value.to_lowercase().contains(needle)
 }
 
+/// Poll the collection token once. An unchanged ctag needs no member listing;
+/// an incomplete observation retains the old token for a later retry.
+async fn changes_from_cursor(
+    client: &CardDavClient,
+    previous: &ContactSnapshot,
+) -> Result<(ContactSnapshot, Vec<Change>), AccountError> {
+    let token = client
+        .collection_ctag(&previous.collection_url, AccountOperation::SyncChanges)
+        .await?;
+    if previous
+        .token
+        .as_deref()
+        .zip(token.as_deref())
+        .is_some_and(|(old, new)| old == new)
+    {
+        return Ok((previous.clone(), Vec::new()));
+    }
+    let mut current = CardDavAccount::contact_snapshot(
+        client,
+        CtagSource::Known(token),
+        &previous.collection_url,
+        AccountOperation::SyncChanges,
+    )
+    .await?;
+    current.preserve_unobserved(previous);
+    let changes = current.changes_from(previous);
+    Ok((current, changes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2381,7 +1422,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body,
-            url: "https://dav.example.test/books/".to_string(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/books/")
+                .expect("test DAV URL"),
         }
     }
 
@@ -2407,7 +1449,7 @@ mod tests {
               </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
             </D:multistatus>"#
                 .to_string(),
-            url: addressbook.to_string(),
+            url: bifrost_dav_core::DavHref::parse(addressbook).expect("test DAV URL"),
         };
         let contacts_response = book_multistatus(
             r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/books/ada/one.vcf</D:href><D:propstat><D:prop><D:getetag>"e1"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#
@@ -2464,7 +1506,7 @@ mod tests {
               </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
             </D:multistatus>"#
                 .to_string(),
-            url: addressbook.to_string(),
+            url: bifrost_dav_core::DavHref::parse(addressbook).expect("test DAV URL"),
         };
         let contacts = DavResponse {
             status: StatusCode::MULTI_STATUS,
@@ -2473,7 +1515,7 @@ mod tests {
               <D:propstat><D:prop><D:getetag>"e1"</D:getetag></D:prop>
               <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#
                 .to_string(),
-            url: addressbook.to_string(),
+            url: bifrost_dav_core::DavHref::parse(addressbook).expect("test DAV URL"),
         };
         let script = dav_script([collection, contacts]);
         let client = Arc::new(CardDavClient::with_account_net(
@@ -2527,7 +1569,8 @@ mod tests {
             status: reqwest::StatusCode::TEMPORARY_REDIRECT,
             headers,
             body: "redirect body".to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let expected_bytes = (redirect.body.len() + response.body.len()) as u64;
         let script = dav_script([redirect, response]);
@@ -2537,12 +1580,12 @@ mod tests {
         ));
         let account = CardDavAccount::for_tests(client, addressbook);
         let previous = ContactSnapshot {
-            addressbook_url: addressbook.to_string(),
-            ctag: Some("42".to_string()),
+            collection_url: addressbook.to_string(),
+            token: Some("42".to_string()),
             ..ContactSnapshot::default()
         };
         let scope = CursorScope::Folder(bifrost_types::FolderId(addressbook.to_string()));
-        let cursor = cursor_from_snapshot(scope, &previous);
+        let cursor = Kernel::cursor_from_snapshot(scope, &previous);
         let events = account.changes_stream(cursor).collect::<Vec<_>>().await;
 
         let SyncEvent::Batch(batch) = &events[0] else {
@@ -2783,7 +1826,8 @@ mod tests {
             status: StatusCode::BAD_REQUEST,
             headers: HeaderMap::new(),
             body: String::new(),
-            url: "https://dav.example.test/books/".to_string(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/books/")
+                .expect("test DAV URL"),
         }];
         responses.extend(vec![book_multistatus(query); 7]);
         responses.push(book_multistatus(book_document(&[
@@ -3242,7 +2286,7 @@ mod tests {
         // the leg returns `Unsupported(HostAttachment)`.
         assert!(!carddav_capabilities().pim_methods.host_attachment);
 
-        let err = unsupported_future::<HostedAttachment>(AccountOperation::HostAttachment)
+        let err = Kernel::unsupported_future::<HostedAttachment>(AccountOperation::HostAttachment)
             .await
             .expect_err("carddav host_attachment is unsupported");
         assert_eq!(
@@ -3257,9 +2301,10 @@ mod tests {
         // and the leg returns `Unsupported(DirectorySearch)`.
         assert!(!carddav_capabilities().pim_methods.directory_search);
 
-        let err = unsupported_future::<Page<DirectoryCard>>(AccountOperation::DirectorySearch)
-            .await
-            .expect_err("carddav directory_search is unsupported");
+        let err =
+            Kernel::unsupported_future::<Page<DirectoryCard>>(AccountOperation::DirectorySearch)
+                .await
+                .expect_err("carddav directory_search is unsupported");
         assert_eq!(
             err.kind(),
             &AccountErrorKind::Unsupported(AccountOperation::DirectorySearch)
@@ -3293,7 +2338,7 @@ mod tests {
         // stream's first item terminates `Unsupported(OpenRawRfc822)`.
         assert!(!carddav_capabilities().pim_methods.open_raw_rfc822);
 
-        let mut stream = unsupported_stream::<Bytes>(AccountOperation::OpenRawRfc822);
+        let mut stream = Kernel::unsupported_stream::<Bytes>(AccountOperation::OpenRawRfc822);
         let first = stream.next().await.expect("first event");
         match first {
             SyncEvent::Terminated(err) => assert_eq!(
@@ -3309,7 +2354,7 @@ mod tests {
         // XML decoding rebases every response href before the account layer
         // sees it, so hydration cannot split native ids from the snapshot.
         let mut report = CardDavMultigetReport {
-            cards: vec![CardDavFetchedVCard {
+            items: vec![CardDavFetchedVCard {
                 uri: "/contacts/one.vcf".to_string(),
                 etag: Some("e1".into()),
                 data: "BEGIN:VCARD\r\nFN:Ada\r\nEND:VCARD\r\n".to_string(),
@@ -3366,7 +2411,7 @@ mod tests {
     #[test]
     fn the_contact_page_cursor_carries_the_last_href_served() {
         assert_eq!(
-            decode_contact_page_cursor(
+            Kernel::decode_page_cursor(
                 Some(b"/book/two.vcf".to_vec().into()),
                 AccountOperation::ContactsList
             )
@@ -3374,11 +2419,11 @@ mod tests {
             Some("/book/two.vcf".to_string())
         );
         assert_eq!(
-            decode_contact_page_cursor(None, AccountOperation::ContactsList).unwrap(),
+            Kernel::decode_page_cursor(None, AccountOperation::ContactsList).unwrap(),
             None
         );
         assert!(
-            decode_contact_page_cursor(Some(Vec::new().into()), AccountOperation::ContactsList)
+            Kernel::decode_page_cursor(Some(Vec::new().into()), AccountOperation::ContactsList)
                 .is_err(),
             "an empty cursor is corrupt, not a restart from the first contact"
         );
@@ -3482,34 +2527,34 @@ mod tests {
     #[test]
     fn a_cursor_collection_must_match_its_folder_scope() {
         let snapshot = ContactSnapshot {
-            addressbook_url: "https://dav.example.test/c/a%40b/".to_string(),
+            collection_url: "https://dav.example.test/c/a%40b/".to_string(),
             ..ContactSnapshot::default()
         };
-        let equivalent = cursor_from_snapshot(
+        let equivalent = Kernel::cursor_from_snapshot(
             CursorScope::Folder(bifrost_types::FolderId(
                 "https://dav.example.test/c/a@b/".to_string(),
             )),
             &snapshot,
         );
-        assert!(decode_cursor_snapshot(&equivalent).is_ok());
-        let mismatched = cursor_from_snapshot(
+        assert!(Kernel::decode_snapshot(&equivalent).is_ok());
+        let mismatched = Kernel::cursor_from_snapshot(
             CursorScope::Folder(bifrost_types::FolderId(
                 "https://dav.example.test/c/other/".to_string(),
             )),
             &snapshot,
         );
-        assert!(decode_cursor_snapshot(&mismatched).is_err());
+        assert!(Kernel::decode_snapshot(&mismatched).is_err());
     }
 
     #[test]
     fn a_failed_poll_keeps_the_token_needed_to_retry_the_member() {
         let mut previous = snapshot_with(&["a", "b"]);
-        previous.ctag = Some("old".to_string());
+        previous.token = Some("old".to_string());
         let mut current = snapshot_with(&["a"]);
-        current.ctag = Some("new".to_string());
+        current.token = Some("new".to_string());
         current.failed_hrefs = vec!["b".to_string()];
-        preserve_unobserved_contact_entries(&previous, &mut current);
-        assert_eq!(current.ctag, previous.ctag);
+        current.preserve_unobserved(&previous);
+        assert_eq!(current.token, previous.token);
         assert_eq!(current.entries, previous.entries);
     }
 
@@ -3547,15 +2592,15 @@ mod tests {
         )
         .await
         .expect("partial snapshot");
-        assert!(snapshot.ctag.is_none());
+        assert!(snapshot.token.is_none());
         assert_eq!(snapshot.failed_hrefs.len(), 1);
     }
 
     #[test]
     fn contact_cursor_snapshot_round_trips() {
         let snapshot = ContactSnapshot {
-            addressbook_url: "https://dav.example.test/contacts/".to_string(),
-            ctag: Some("42".to_string()),
+            collection_url: "https://dav.example.test/contacts/".to_string(),
+            token: Some("42".to_string()),
             entries: vec![
                 ContactSnapshotEntry {
                     uri: "https://dav.example.test/contacts/a.vcf".to_string(),
@@ -3568,11 +2613,12 @@ mod tests {
             ],
             failed_hrefs: Vec::new(),
         };
-        let cursor = cursor_from_snapshot(CursorScope::Type(ObjectType::Contact), &snapshot);
+        let cursor =
+            Kernel::cursor_from_snapshot(CursorScope::Type(ObjectType::Contact), &snapshot);
 
         // failed_hrefs is a per-poll observation, not persisted; the
         // decoded cursor carries an empty failed_hrefs.
-        let decoded = decode_cursor_snapshot(&cursor).expect("cursor should decode");
+        let decoded = Kernel::decode_snapshot(&cursor).expect("cursor should decode");
 
         assert_eq!(decoded, snapshot);
     }
@@ -3587,10 +2633,11 @@ mod tests {
     #[test]
     fn contact_cursor_rejects_the_base_relative_id_version() {
         let snapshot = ContactSnapshot::default();
-        let mut cursor = cursor_from_snapshot(CursorScope::Type(ObjectType::Contact), &snapshot);
+        let mut cursor =
+            Kernel::cursor_from_snapshot(CursorScope::Type(ObjectType::Contact), &snapshot);
         cursor.server_state.envelope_version = bifrost_types::PayloadVersion::new(1);
 
-        let error = decode_cursor_snapshot(&cursor).expect_err("v1 cursors are disowned");
+        let error = Kernel::decode_snapshot(&cursor).expect_err("v1 cursors are disowned");
         assert!(matches!(
             error.kind(),
             AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
@@ -3604,23 +2651,24 @@ mod tests {
     #[test]
     fn contact_cursor_rejects_impossible_count_before_allocating() {
         let snapshot = ContactSnapshot {
-            addressbook_url: "https://dav.example.test/contacts/".to_string(),
-            ctag: None,
+            collection_url: "https://dav.example.test/contacts/".to_string(),
+            token: None,
             entries: Vec::new(),
             failed_hrefs: Vec::new(),
         };
-        let mut cursor = cursor_from_snapshot(CursorScope::Type(ObjectType::Contact), &snapshot);
+        let mut cursor =
+            Kernel::cursor_from_snapshot(CursorScope::Type(ObjectType::Contact), &snapshot);
         let count_offset = cursor.server_state.bytes.len() - 4;
         cursor.server_state.bytes[count_offset..].copy_from_slice(&u32::MAX.to_be_bytes());
 
-        assert!(decode_cursor_snapshot(&cursor).is_err());
+        assert!(Kernel::decode_snapshot(&cursor).is_err());
     }
 
     #[test]
     fn contact_snapshot_diff_classifies_object_changes() {
         let previous = ContactSnapshot {
-            addressbook_url: "book".to_string(),
-            ctag: Some("1".to_string()),
+            collection_url: "book".to_string(),
+            token: Some("1".to_string()),
             entries: vec![
                 ContactSnapshotEntry {
                     uri: "a.vcf".to_string(),
@@ -3638,8 +2686,8 @@ mod tests {
             failed_hrefs: Vec::new(),
         };
         let current = ContactSnapshot {
-            addressbook_url: "book".to_string(),
-            ctag: Some("2".to_string()),
+            collection_url: "book".to_string(),
+            token: Some("2".to_string()),
             entries: vec![
                 ContactSnapshotEntry {
                     uri: "a.vcf".to_string(),
@@ -3657,7 +2705,7 @@ mod tests {
             failed_hrefs: Vec::new(),
         };
 
-        let changes = diff_contact_snapshots(&previous, &current);
+        let changes = current.changes_from(&previous);
         let kinds = changes
             .into_iter()
             .map(|change| match change {
@@ -3678,8 +2726,8 @@ mod tests {
 
     fn snapshot_with(entries: &[&str]) -> ContactSnapshot {
         ContactSnapshot {
-            addressbook_url: "book".to_string(),
-            ctag: None,
+            collection_url: "book".to_string(),
+            token: None,
             entries: entries
                 .iter()
                 .map(|uri| ContactSnapshotEntry {
@@ -3698,29 +2746,29 @@ mod tests {
         // empty multistatus.
         let previous = snapshot_with(&["a.vcf", "b.vcf"]);
         let empty = snapshot_with(&[]);
-        assert!(diff_contact_snapshots(&previous, &empty).is_empty());
+        assert!(empty.changes_from(&previous).is_empty());
 
         // populated-vs-populated unchanged; empty-vs-empty zero.
-        let same = diff_contact_snapshots(&previous, &previous);
+        let same = previous.changes_from(&previous);
         assert!(same.is_empty());
-        assert!(diff_contact_snapshots(&empty, &empty).is_empty());
+        assert!(empty.changes_from(&empty).is_empty());
     }
 
     #[test]
     fn empty_poll_checkpoint_preserves_snapshot_for_the_recovery_poll() {
         let previous = snapshot_with(&["a.vcf", "b.vcf"]);
         let mut empty = snapshot_with(&[]);
-        empty.ctag = Some("refreshed".to_string());
+        empty.token = Some("refreshed".to_string());
 
-        preserve_unobserved_contact_entries(&previous, &mut empty);
+        empty.preserve_unobserved(&previous);
         assert_eq!(empty.entries.len(), 2);
         assert_eq!(
-            empty.ctag, None,
+            empty.token, None,
             "an empty observation must retry the listing"
         );
 
         let recovered = snapshot_with(&["a.vcf", "b.vcf"]);
-        assert!(diff_contact_snapshots(&empty, &recovered).is_empty());
+        assert!(recovered.changes_from(&empty).is_empty());
     }
 
     #[test]
@@ -3738,7 +2786,7 @@ mod tests {
         let mut current = snapshot_with(&["a.vcf"]);
         current.failed_hrefs = vec!["b.vcf".to_string()];
 
-        let changes = diff_contact_snapshots(&previous, &current);
+        let changes = current.changes_from(&previous);
         assert!(
             changes.is_empty(),
             "a transiently-failed resource must not be destroyed: {changes:?}"
@@ -3746,7 +2794,7 @@ mod tests {
 
         // Without the failed-href, b.vcf's absence IS a destroy.
         let current_no_failed = snapshot_with(&["a.vcf"]);
-        let changes = diff_contact_snapshots(&previous, &current_no_failed);
+        let changes = current_no_failed.changes_from(&previous);
         assert_eq!(changes.len(), 1);
         assert!(matches!(
             changes[0],
@@ -3844,6 +2892,7 @@ mod directory_tests;
 #[cfg(test)]
 mod partial_commit_tests {
     use super::*;
+    use bifrost_types::StepEffect;
     use bifrost_types::{ReconcileAction, RecoveryClass, RetryHint, ServerCause, ServerErrorKind};
     fn throttled() -> AccountError {
         AccountErrorBuilder::new(
@@ -3858,7 +2907,7 @@ mod partial_commit_tests {
     #[test]
     fn partial_commit_moved_then_put_refused() {
         let leaf = unsupported_error(AccountOperation::ContactUpdate);
-        let error = relocation_error(
+        let error = Kernel::relocation_error(
             RelocateFailure::MovedThenPut {
                 destination: "destination".into(),
                 error: leaf.clone(),
@@ -3879,7 +2928,7 @@ mod partial_commit_tests {
     fn partial_commit_copied_then_delete_throttled() {
         let leaf = throttled();
         let expected = leaf.recovery().clone();
-        let error = relocation_error(
+        let error = Kernel::relocation_error(
             RelocateFailure::CopiedThenDelete {
                 destination: "destination".into(),
                 source: "source".into(),

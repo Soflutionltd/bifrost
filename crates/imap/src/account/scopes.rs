@@ -97,20 +97,19 @@ where
 /// Memberships a single folder entry contributes to discovery. Every
 /// folder keeps its `Folder` membership for folder-keyed routing. A
 /// shared/other-user folder (`shared_owner.is_some()`) also emits its
-/// owning `Mailbox(owner)` membership so the consumer maps the scope to a
+/// owning `Owner(owner)` membership so the consumer maps the scope to a
 /// shared mailbox identity (A5c). The owner tag does not form via the
-/// engine's `scope_covers_membership` covering rule (the FolderId and
-/// MailboxId strings differ for a shared folder), so it must be emitted
-/// explicitly here.
+/// generic `CursorScope::covers` rule, which deliberately keeps principals
+/// separate from containers, so it must be emitted explicitly here.
 fn memberships_for_entry(
     entry: &super::folder_registry::FolderEntry,
-    shared_owners: &mut HashSet<bifrost_types::MailboxId>,
+    shared_owners: &mut HashSet<bifrost_types::PrincipalId>,
 ) -> Vec<MembershipScope> {
     let mut out = vec![membership_scope(&entry.name)];
     if let Some(owner) = &entry.shared_owner
         && shared_owners.insert(owner.clone())
     {
-        out.push(MembershipScope::Mailbox(owner.clone()));
+        out.push(MembershipScope::Owner(owner.clone()));
     }
     out
 }
@@ -148,7 +147,7 @@ pub(crate) fn scope_lifecycle_stream(
 
 #[cfg(test)]
 mod tests {
-    use bifrost_types::{Account, CursorScope, FolderId, MailboxId, ObjectType, SyncEvent};
+    use bifrost_types::{Account, CursorScope, FolderId, ObjectType, PrincipalId, SyncEvent};
     use futures::StreamExt;
 
     use super::super::folder_registry::{FolderRegistry, SharedFolderEntry};
@@ -167,7 +166,7 @@ mod tests {
     }
 
     // A registry with one personal + one shared folder yields, for the
-    // shared one, both `Folder(..)` and `Mailbox(owner)` memberships; the
+    // shared one, both `Folder(..)` and `Owner(owner)` memberships; the
     // personal one yields only `Folder`.
     #[test]
     fn discover_memberships_tags_shared_folder_with_mailbox() {
@@ -175,7 +174,7 @@ mod tests {
             vec![mailbox_info("INBOX")],
             vec![SharedFolderEntry {
                 info: mailbox_info("Shared/alice/INBOX"),
-                owner: MailboxId("alice".to_string()),
+                owner: PrincipalId("alice".to_string()),
                 rights: None,
                 namespace_prefix: "Shared/".to_string(),
             }],
@@ -201,13 +200,13 @@ mod tests {
         assert!(shared.contains(&MembershipScope::Folder(FolderId(
             "Shared/alice/INBOX".to_string()
         ))));
-        assert!(shared.contains(&MembershipScope::Mailbox(MailboxId("alice".to_string()))));
+        assert!(shared.contains(&MembershipScope::Owner(PrincipalId("alice".to_string()))));
         assert_eq!(shared.len(), 2);
     }
 
     #[test]
     fn discover_memberships_emits_one_mailbox_scope_per_shared_owner() {
-        let owner = MailboxId("alice".to_string());
+        let owner = PrincipalId("alice".to_string());
         let registry = FolderRegistry::from_lists(
             Vec::new(),
             vec![
@@ -235,7 +234,7 @@ mod tests {
         assert_eq!(
             memberships
                 .iter()
-                .filter(|membership| **membership == MembershipScope::Mailbox(owner.clone()))
+                .filter(|membership| **membership == MembershipScope::Owner(owner.clone()))
                 .count(),
             1
         );
@@ -250,7 +249,7 @@ mod tests {
             vec![mailbox_info("INBOX")],
             vec![SharedFolderEntry {
                 info: mailbox_info("Shared/alice/INBOX"),
-                owner: MailboxId("alice".to_string()),
+                owner: PrincipalId("alice".to_string()),
                 rights: None,
                 namespace_prefix: "Shared/".to_string(),
             }],
@@ -348,7 +347,16 @@ mod tests {
         let mut saw_done = false;
         while let Some(event) = stream.next().await {
             match event {
-                SyncEvent::Warning(_) => warnings += 1,
+                SyncEvent::Warning(warning) => {
+                    assert_eq!(warning.kind, bifrost_types::WarningKind::ScopeSkipped);
+                    let error = warning.error.as_ref().expect("classified delegate failure");
+                    assert!(error.recovery().is_retryable());
+                    assert_eq!(
+                        error.operation(),
+                        Some(bifrost_types::AccountOperation::DiscoverCursorScopes)
+                    );
+                    warnings += 1;
+                }
                 SyncEvent::Batch(batch) => items.extend(batch.items),
                 SyncEvent::Done(_) => {
                     saw_done = true;
@@ -410,7 +418,10 @@ mod tests {
         parts.discovery_skips.push(bifrost_types::SkippedScope {
             scope: bifrost_types::ErrorScope::ContactCollection,
             error: super::super::account_error_with(
-                crate::Error::Internal("DAV open failed".into()),
+                crate::Error::Internal {
+                    kind: crate::error::InternalFailure::Invariant("DAV open failed".into()),
+                    mid_exchange: None,
+                },
                 super::super::error::ImapErrorContext::operation(
                     bifrost_types::AccountOperation::Discover,
                 ),

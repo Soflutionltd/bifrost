@@ -4,7 +4,7 @@ use std::time::Duration;
 use bifrost_types::{
     AccessErrorKind, AccountError, AccountErrorKind, AccountOperation, Batch, Checkpoint,
     CursorScope, FolderId, MembershipScope, ObjectType, PageBoundary, ScopeLifecycle, SyncEvent,
-    Warning, WarningKind,
+    Warning,
 };
 
 use super::GraphAccount;
@@ -116,7 +116,8 @@ async fn discover_cursor_scopes_inner(
         Some(folders) => (folders, true),
         None => {
             let folders = account
-                .client
+                .mailboxes
+                .primary()
                 .list_mail_folders_recursive()
                 .await
                 .map_err(|error| {
@@ -150,7 +151,7 @@ async fn discover_cursor_scopes_inner(
     // failing the whole discovery (the primary and other shared
     // mailboxes still sync).
     let mut warnings = Vec::new();
-    for (mailbox, client) in account.shared_clients.iter() {
+    for (mailbox, client) in account.mailboxes.shared() {
         match client.list_mail_folders_recursive().await {
             Ok(folders) => {
                 for folder in folders {
@@ -169,9 +170,11 @@ async fn discover_cursor_scopes_inner(
                     account_error.kind(),
                     AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
                 ) {
-                    warnings.push(Warning::support_only(
-                        WarningKind::OperatorAttentionNeeded,
-                        format!("shared mailbox {mailbox} skipped: access denied during discovery"),
+                    warnings.push(Warning::skipped(
+                        Some(bifrost_types::ErrorScope::Owner {
+                            id: bifrost_types::PrincipalId(mailbox.clone()),
+                        }),
+                        account_error,
                     ));
                 } else {
                     return Err(account_error);
@@ -188,7 +191,7 @@ async fn discover_cursor_scopes_inner(
     // discovered above are unaffected.
     // Discovery seeds the whole readable hierarchy either way; only the
     // allowlisted folders come back as scopes.
-    if let Some(policy) = account.public_folders.as_ref() {
+    if let Some(policy) = account.public_folders.policy() {
         let (pf_scopes, pf_warnings) =
             super::public_folder::discover_public_folder_scopes(account, policy).await;
         scopes.extend(pf_scopes);
@@ -217,8 +220,7 @@ async fn discover_memberships_inner(
             CursorScope::FolderType { folder, .. } if seen_folders.insert(folder.clone()) => {
                 // A foreign folder also contributes its owner tag (the
                 // shared-mailbox identity), which the engine's covering
-                // rule cannot form because the folder-id and mailbox-id
-                // strings differ.
+                // rule cannot infer from opaque folder identities.
                 if let Some(foreign) = parse_folder(&folder).foreign()
                     && seen_owners.insert(foreign.mailbox.clone())
                 {
@@ -229,8 +231,8 @@ async fn discover_memberships_inner(
             // A public folder contributes its content-mailbox owner tag
             // (the same A5a pattern) plus its folder membership.
             CursorScope::Folder(folder) if seen_folders.insert(folder.clone()) => {
-                if let Some(routing) = account.public_folder_routing(&folder).await {
-                    memberships.push(MembershipScope::Mailbox(bifrost_types::MailboxId(
+                if let Some(routing) = account.public_folders.public_folder_routing(&folder).await {
+                    memberships.push(MembershipScope::Owner(bifrost_types::PrincipalId(
                         routing.anchor_mailbox,
                     )));
                 }
@@ -244,7 +246,7 @@ async fn discover_memberships_inner(
 
 #[cfg(test)]
 mod tests {
-    use bifrost_types::{FolderId, MailboxId};
+    use bifrost_types::{FolderId, PrincipalId};
 
     use super::super::PushMode;
     use super::*;
@@ -315,10 +317,9 @@ mod tests {
     }
 
     /// Each foreign folder contributes an owner tag the engine's covering
-    /// rule cannot derive on its own (the folder-id and mailbox-id strings
-    /// differ), but the tag is per-MAILBOX, not per-folder: a shared
-    /// mailbox with forty discovered folders must still contribute exactly
-    /// one `Mailbox` membership. The seed below therefore carries TWO
+    /// rule cannot derive from opaque folder identities. The tag is per owner:
+    /// a shared mailbox with forty discovered folders must still contribute
+    /// exactly one `Owner` membership. The seed below therefore carries TWO
     /// folders in one shared mailbox, so the dedup is actually exercised
     /// rather than being satisfied trivially by a single foreign folder,
     /// plus a folder in a second mailbox so the dedup is proven to be
@@ -366,16 +367,16 @@ mod tests {
         // One owner tag per shared mailbox - not one per foreign folder,
         // and not one collapsed tag for both mailboxes. The primary
         // mailbox's folder contributes no owner tag at all.
-        let owners: Vec<&MailboxId> = memberships
+        let owners: Vec<&PrincipalId> = memberships
             .iter()
             .filter_map(|m| match m {
-                MembershipScope::Mailbox(id) => Some(id),
+                MembershipScope::Owner(id) => Some(id),
                 _ => None,
             })
             .collect();
         assert_eq!(owners.len(), 2, "{memberships:?}");
-        assert!(owners.contains(&&MailboxId("shared@contoso.com".to_string())));
-        assert!(owners.contains(&&MailboxId("ops@contoso.com".to_string())));
+        assert!(owners.contains(&&PrincipalId("shared@contoso.com".to_string())));
+        assert!(owners.contains(&&PrincipalId("ops@contoso.com".to_string())));
     }
 
     #[test]

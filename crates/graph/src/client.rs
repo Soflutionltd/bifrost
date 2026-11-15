@@ -1847,7 +1847,11 @@ fn outlook_configuration_refusal(reason: String) -> bifrost_net::Error {
         bifrost_types::AccountErrorKind::SyncState(
             bifrost_types::SyncStateErrorKind::OperatorOverrideNeeded,
         ),
-        bifrost_types::Cause::State(bifrost_types::StateCause::OperatorOverrideNeeded { reason }),
+        bifrost_types::Cause::State(bifrost_types::StateCause::OperatorOverrideNeeded {
+            reason: bifrost_types::OperatorOverrideReason::OutlookConfiguration {
+                detail: bifrost_types::DiagnosticText::support_only(reason),
+            },
+        }),
     )
     .protocol(bifrost_types::Protocol::Ews)
     .provider(bifrost_types::Provider::Microsoft)

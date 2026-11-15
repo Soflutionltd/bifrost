@@ -1,8 +1,8 @@
 //! Validated newtypes for IMAP protocol strings.
 //!
-//! These types enforce syntactic validity at construction time so that
-//! downstream code (the encoder, the connection layer) can rely on
-//! well-formedness without re-validating.
+//! Caller constructors enforce syntactic validity. Server object-id
+//! observations preserve the decoder's established atom tolerance; they are
+//! distinct from admitting that spelling into a caller's command operand.
 //!
 //! - [`SequenceSet`]  -  RFC 3501 Section 9 / RFC 9051 Section 9
 //! - [`ImapAtom`]  -  RFC 3501 Section 9 / RFC 9051 Section 9
@@ -74,12 +74,79 @@ impl ValidationError {
 /// Construction validates the full ABNF and rejects empty, malformed,
 /// or overflowing values.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SequenceSet(String);
+pub struct SequenceSet {
+    wire: String,
+    members: Vec<SetMember>,
+}
+
+/// Saved-result operands are deliberately separate from finite membership.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+enum SetMember {
+    Range(super::UidRange),
+    SavedResult,
+}
 
 impl SequenceSet {
+    fn from_validated(wire: String) -> Self {
+        let members = wire
+            .split(',')
+            .map(|part| {
+                if part == "$" {
+                    return SetMember::SavedResult;
+                }
+                let bound = |s: &str| {
+                    if s == "*" {
+                        super::SeqBound::Star
+                    } else {
+                        super::SeqBound::Number(s.parse().expect("sequence-set grammar validated"))
+                    }
+                };
+                let (start, end) = match part.split_once(':') {
+                    Some((a, b)) => (bound(a), Some(bound(b))),
+                    None => (bound(part), None),
+                };
+                SetMember::Range(super::UidRange::from_sequence_bounds(start, end))
+            })
+            .collect();
+        Self { wire, members }
+    }
+
+    pub(crate) fn from_finite(ranges: Vec<super::UidRange>) -> Self {
+        assert!(!ranges.is_empty() && ranges.iter().all(super::UidRange::is_numeric));
+        let wire = ranges
+            .iter()
+            .map(|r| match r.end() {
+                Some(end) => format!("{}:{end}", r.start()),
+                None => r.start().to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Self {
+            wire,
+            members: ranges.into_iter().map(SetMember::Range).collect(),
+        }
+    }
+
+    pub(crate) fn ranges(&self) -> Option<Vec<super::UidRange>> {
+        self.members
+            .iter()
+            .map(|member| match member {
+                SetMember::Range(range) => Some(*range),
+                SetMember::SavedResult => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_finite(&self) -> bool {
+        self.members
+            .iter()
+            .all(|member| matches!(member, SetMember::Range(r) if r.is_numeric()))
+    }
+
     /// Consumes the wrapper and returns the inner string.
     pub fn into_inner(self) -> String {
-        self.0
+        self.wire
     }
 
     /// Create a general sequence set (allows `*` and `$`).
@@ -94,7 +161,7 @@ impl SequenceSet {
                 format!("invalid sequence set per RFC 3501 Section 9: {s:?}"),
             ));
         }
-        Ok(Self(s))
+        Ok(Self::from_validated(s))
     }
 
     /// Create a "known" sequence set that rejects `*` and `$`.
@@ -129,18 +196,18 @@ impl SequenceSet {
                  (RFC 7162 Section 7: known-uids = sequence-set)",
             ));
         }
-        Ok(Self(s))
+        Ok(Self::from_validated(s))
     }
 
     /// Return the inner string.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.wire
     }
 }
 
 impl AsRef<str> for SequenceSet {
     fn as_ref(&self) -> &str {
-        &self.0
+        &self.wire
     }
 }
 
@@ -148,7 +215,7 @@ impl fmt::Display for SequenceSet {
     /// Formats the sequence set as its wire representation
     /// (RFC 3501 Section 9).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.wire)
     }
 }
 
@@ -781,6 +848,12 @@ impl From<MailboxName> for String {
 pub struct ObjectId(String);
 
 impl ObjectId {
+    /// Preserve a server atom even when it exceeds RFC 8474's stricter grammar.
+    /// Observation tolerance does not admit that spelling as a command operand.
+    pub(crate) fn from_observed(value: String) -> Self {
+        Self(value)
+    }
+
     /// Consumes the wrapper and returns the inner string.
     pub fn into_inner(self) -> String {
         self.0
@@ -833,6 +906,13 @@ impl ObjectId {
     }
 }
 
+impl std::ops::Deref for ObjectId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl AsRef<str> for ObjectId {
     fn as_ref(&self) -> &str {
         &self.0
@@ -867,153 +947,6 @@ impl TryFrom<&str> for ObjectId {
 impl From<ObjectId> for String {
     fn from(o: ObjectId) -> Self {
         o.into_inner()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ParsedUidSet  -  RFC 7162 Section 3.2.6 defensive filtering
-// ---------------------------------------------------------------------------
-
-use crate::types::UidRange;
-
-/// A parsed, normalized set of UID intervals for efficient containment checks.
-///
-/// Constructed from a [`SequenceSet`] by parsing its string representation into
-/// sorted, merged, non-overlapping inclusive `(start, end)` intervals.
-///
-/// Used by `FetchVanishedConsumer` to defensively filter `VANISHED (EARLIER)`
-/// UIDs that fall outside the requested set (RFC 7162 Section 3.2.6).
-///
-/// Returns `None` from [`ParsedUidSet::new`] when the set contains `$`
-/// (RFC 5182 search result reference), which cannot be resolved client-side.
-/// `*` is mapped to `u32::MAX` as a conservative upper bound  -  safe because `*`
-/// means "the highest UID in the mailbox" (RFC 3501 Section 6.4.8), and all
-/// reportable UIDs are <= that value.
-pub(crate) struct ParsedUidSet(Vec<(u32, u32)>);
-
-impl ParsedUidSet {
-    /// Parse a [`SequenceSet`] into sorted, merged, non-overlapping intervals.
-    ///
-    /// Returns `None` if the set contains `$` (RFC 5182 search result
-    /// reference), which cannot be resolved client-side  -  the caller should
-    /// skip filtering entirely in that case.
-    ///
-    /// `*` is mapped to `u32::MAX` per RFC 3501 Section 6.4.8.
-    pub(crate) fn new(set: &SequenceSet) -> Option<Self> {
-        let s = set.as_str();
-        let mut intervals: Vec<(u32, u32)> = Vec::new();
-
-        for part in s.split(',') {
-            // RFC 5182 Section 2: "$" references saved search results  -
-            // unresolvable client-side.
-            if part.contains('$') {
-                return None;
-            }
-
-            if let Some((left, right)) = part.split_once(':') {
-                // seq-range: two seq-numbers separated by ":"
-                let start = Self::parse_seq_number(left)?;
-                let end = Self::parse_seq_number(right)?;
-                // Normalize: RFC 3501 Section 9 allows reversed ranges (e.g. "10:5").
-                let (lo, hi) = if start <= end {
-                    (start, end)
-                } else {
-                    (end, start)
-                };
-                intervals.push((lo, hi));
-            } else {
-                // Single seq-number
-                let n = Self::parse_seq_number(part)?;
-                intervals.push((n, n));
-            }
-        }
-
-        // Sort by start, then merge overlapping/adjacent intervals.
-        intervals.sort_unstable_by_key(|&(start, _)| start);
-        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(intervals.len());
-        for (lo, hi) in intervals {
-            if let Some(last) = merged.last_mut() {
-                // Adjacent: last.end + 1 == lo (with saturating add to avoid overflow
-                // when last.end == u32::MAX).
-                if lo <= last.1 || lo == last.1.saturating_add(1) {
-                    last.1 = last.1.max(hi);
-                    continue;
-                }
-            }
-            merged.push((lo, hi));
-        }
-
-        Some(Self(merged))
-    }
-
-    /// Parse a single seq-number: `"*"` -> `u32::MAX`, otherwise a non-zero u32.
-    fn parse_seq_number(s: &str) -> Option<u32> {
-        if s == "*" {
-            Some(u32::MAX)
-        } else {
-            s.parse::<u32>().ok()
-        }
-    }
-
-    /// Intersect a list of server-reported `VANISHED (EARLIER)` UID ranges
-    /// against this parsed set, keeping only UIDs that fall within the
-    /// requested set.
-    ///
-    /// Returns `(filtered_ranges, dropped_count)` where `dropped_count` is
-    /// the number of individual UIDs that were removed by filtering.
-    ///
-    /// Uses a two-pointer sweep: for each vanished interval, walk the
-    /// `ParsedUidSet` intervals to find overlapping regions.
-    ///
-    /// RFC 7162 Section 3.2.6: the server SHOULD limit `VANISHED (EARLIER)`
-    /// to the requested UID set, but non-conformant servers may not.
-    pub(crate) fn intersect_uid_ranges(&self, ranges: &[UidRange]) -> (Vec<UidRange>, usize) {
-        let mut result: Vec<UidRange> = Vec::new();
-        let mut total_input_uids: u64 = 0;
-        let mut total_output_uids: u64 = 0;
-
-        for range in ranges {
-            let v_start = range.start;
-            let v_end = range.end.unwrap_or(range.start);
-            // Defensive: normalize reversed ranges from buggy servers.
-            let (v_lo, v_hi) = if v_start <= v_end {
-                (v_start, v_end)
-            } else {
-                (v_end, v_start)
-            };
-            total_input_uids += u64::from(v_hi) - u64::from(v_lo) + 1;
-
-            // Two-pointer sweep against sorted, non-overlapping set intervals.
-            for &(s_lo, s_hi) in &self.0 {
-                // No overlap possible if the set interval is entirely after
-                // the vanished interval.
-                if s_lo > v_hi {
-                    break;
-                }
-                // No overlap if the set interval is entirely before.
-                if s_hi < v_lo {
-                    continue;
-                }
-                // Compute overlap.
-                let overlap_start = v_lo.max(s_lo);
-                let overlap_end = v_hi.min(s_hi);
-                // overlap_start <= overlap_end is guaranteed by the checks above.
-                total_output_uids += u64::from(overlap_end) - u64::from(overlap_start) + 1;
-                if overlap_start == overlap_end {
-                    result.push(UidRange::single(overlap_start));
-                } else {
-                    result.push(UidRange::range(overlap_start, overlap_end));
-                }
-            }
-        }
-
-        // Dropped = total input UIDs minus total output UIDs.
-        // In practice this count fits in usize  -  a VANISHED response cannot
-        // reference more than u32::MAX UIDs  -  but we use saturating conversion
-        // for 32-bit target safety.
-        let dropped_u64 = total_input_uids - total_output_uids;
-        let dropped = usize::try_from(dropped_u64).unwrap_or(usize::MAX);
-        (result, dropped)
     }
 }
 

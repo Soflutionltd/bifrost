@@ -47,12 +47,14 @@ use dispatch::encode_command_to_buf;
 /// prematurely and allow injection of arbitrary commands.
 fn validate_no_crlf(s: &str, context: &str) -> Result<(), crate::Error> {
     if s.bytes().any(|b| b == b'\r' || b == b'\n') {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must not contain CR or LF  -  IMAP commands are \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{context} must not contain CR or LF  -  IMAP commands are \
              CRLF-delimited (RFC 3501 Section 2.2)"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
     Ok(())
@@ -91,9 +93,9 @@ pub(crate) fn validate_search_criteria_crlf(
             } = literal_marker_at(bytes, i)
             {
                 let size = usize::try_from(size).map_err(|_| {
-                    crate::Error::InvalidInput(
+                    crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
                         format!("{context} literal count exceeds usize").into(),
-                    )
+                    ))
                 })?;
                 let has_plus = !synchronizing;
                 // A non-synchronizing literal the caller wrote is well-formed;
@@ -102,32 +104,36 @@ pub(crate) fn validate_search_criteria_crlf(
                 if has_plus {
                     match literal_mode {
                         LiteralMode::Synchronizing => {
-                            return Err(crate::Error::MissingCapability(
-                                crate::error::CapabilityFailure::new(
-                                    "LITERAL+".into(),
-                                    crate::error::CapabilityFailureReason::Alternatives(vec![
-                                        "LITERAL-".into(),
-                                    ]),
-                                    format!(
-                                        "{context} uses a non-synchronizing literal \
+                            return Err(crate::Error::LocalRefusal(
+                                crate::error::LocalRefusal::MissingCapability(
+                                    crate::error::CapabilityFailure::new(
+                                        "LITERAL+".into(),
+                                        crate::error::CapabilityFailureReason::Alternatives(vec![
+                                            "LITERAL-".into(),
+                                        ]),
+                                        format!(
+                                            "{context} uses a non-synchronizing literal \
                                  without negotiated LITERAL+/LITERAL- support \
                                  (RFC 7888 Section 3)"
+                                        ),
                                     ),
                                 ),
                             ));
                         }
                         LiteralMode::LiteralMinus if size > LITERAL_MINUS_MAX => {
-                            return Err(crate::Error::MissingCapability(
-                                crate::error::CapabilityFailure::new(
-                                    "LITERAL+".into(),
-                                    crate::error::CapabilityFailureReason::LiteralTooLarge {
-                                        size,
-                                        limit: LITERAL_MINUS_MAX,
-                                    },
-                                    format!(
-                                        "{context} uses a non-synchronizing literal of {size} octets, \
+                            return Err(crate::Error::LocalRefusal(
+                                crate::error::LocalRefusal::MissingCapability(
+                                    crate::error::CapabilityFailure::new(
+                                        "LITERAL+".into(),
+                                        crate::error::CapabilityFailureReason::LiteralTooLarge {
+                                            size,
+                                            limit: LITERAL_MINUS_MAX,
+                                        },
+                                        format!(
+                                            "{context} uses a non-synchronizing literal of {size} octets, \
                                  which exceeds the 4096-octet limit for LITERAL- / IMAP4rev2 \
                                  mode (RFC 7888 Section 5 / RFC 9051 Section 4.3)"
+                                        ),
                                     ),
                                 ),
                             ));
@@ -136,21 +142,23 @@ pub(crate) fn validate_search_criteria_crlf(
                     }
                 }
                 let data_end = data_start.checked_add(size).ok_or_else(|| {
-                    crate::Error::InvalidInput(
+                    crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
                         format!(
                             "{context} literal length overflows usize \
                          (RFC 3501 Section 4.3)"
                         )
                         .into(),
-                    )
+                    ))
                 })?;
                 if data_end > bytes.len() {
-                    return Err(crate::Error::InvalidInput(
-                        format!(
-                            "{context} literal declares {size} octets but the provided \
+                    return Err(crate::Error::LocalRefusal(
+                        crate::error::LocalRefusal::InvalidInput(
+                            format!(
+                                "{context} literal declares {size} octets but the provided \
                          criteria fragment ends early (RFC 3501 Section 4.3)"
-                        )
-                        .into(),
+                            )
+                            .into(),
+                        ),
                     ));
                 }
                 i = data_end;
@@ -159,12 +167,14 @@ pub(crate) fn validate_search_criteria_crlf(
         }
 
         if matches!(bytes[i], b'\r' | b'\n') {
-            return Err(crate::Error::InvalidInput(
-                format!(
-                    "{context} must not contain raw CR or LF except inside an IMAP literal \
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    format!(
+                        "{context} must not contain raw CR or LF except inside an IMAP literal \
                  (RFC 3501 Sections 2.2 and 4.3)"
-                )
-                .into(),
+                    )
+                    .into(),
+                ),
             ));
         }
 
@@ -326,12 +336,14 @@ pub(crate) fn validate_login_credential_ascii(
     field: &str,
 ) -> Result<(), crate::Error> {
     if !value.is_ascii() {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "LOGIN {field} must be ASCII-only; RFC 6855 Section 5 requires \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "LOGIN {field} must be ASCII-only; RFC 6855 Section 5 requires \
              AUTHENTICATE for non-ASCII credentials"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
     Ok(())
@@ -363,11 +375,11 @@ fn validate_sasl_initial_response(ir: &str) -> Result<(), crate::Error> {
         .decode(ir.as_bytes())
         .map(|_| ())
         .map_err(|_| {
-            crate::Error::InvalidInput(
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
                 "AUTHENTICATE initial response must be RFC 4648 base64 or the special \
                  \"=\" empty marker (RFC 4959 Section 3)"
                     .into(),
-            )
+            ))
         })
 }
 
@@ -376,53 +388,16 @@ fn validate_sasl_initial_response(ir: &str) -> Result<(), crate::Error> {
 // guarantees validity at construction time, so callers no longer need
 // runtime re-validation.
 
-/// Maximum value for `mod-sequence-value` and `mod-sequence-valzer`
-/// (RFC 7162 Section 7): a positive unsigned 63-bit integer.
-const MOD_SEQ_MAX: u64 = crate::types::ModSeq::MAX;
-
-/// Validates a `mod-sequence-value` per RFC 7162 Section 7:
-/// `mod-sequence-value = 1*DIGIT` where `1 <= n <= 9,223,372,036,854,775,807`.
-///
-/// Raw CHANGEDSINCE entry points validate through the same owner as QRESYNC.
-fn validate_mod_sequence_value(val: u64, context: &str) -> Result<(), crate::Error> {
-    if crate::types::ModSeq::new(val).is_some() {
-        return Ok(());
-    }
-    let detail = if val == 0 {
-        format!("{context} mod-sequence-value must be >= 1 per RFC 7162 Section 7, got 0")
-    } else {
-        format!(
-            "{context} mod-sequence-value must be <= {MOD_SEQ_MAX} per RFC 7162 Section 7, got {val}"
-        )
-    };
-    Err(crate::Error::InvalidInput(detail.into()))
-}
-
-/// Validates a `mod-sequence-valzer` per RFC 7162 Section 7:
-/// `mod-sequence-valzer = "0" / mod-sequence-value` where `0 <= n <= 9,223,372,036,854,775,807`.
-///
-/// Used for UNCHANGEDSINCE (RFC 7162 Section 3.1.3).
-fn validate_mod_sequence_valzer(val: u64, context: &str) -> Result<(), crate::Error> {
-    if crate::types::ModSeqValzer::new(val).is_none() {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} mod-sequence-valzer must be <= {MOD_SEQ_MAX} per RFC 7162 Section 7, got {val}"
-        ).into()));
-    }
-    Ok(())
-}
-
 /// Encode the CHANGEDSINCE fetch modifier (RFC 7162 Section 3.1.4.1),
 /// optionally followed by VANISHED (RFC 7162 Section 3.2.6).
 ///
 /// Emits ` (CHANGEDSINCE <modseq>)` or ` (CHANGEDSINCE <modseq> VANISHED)`.
-/// Validates that `modseq` satisfies the `mod-sequence-value` production
-/// (>= 1, <= `i64::MAX`).
+/// The operand already satisfies the positive 63-bit MODSEQ invariant.
 fn encode_changedsince_modifier(
     w: &mut CommandWriter,
-    modseq: u64,
+    modseq: crate::types::ModSeq,
     vanished: bool,
-) -> Result<(), crate::Error> {
-    validate_mod_sequence_value(modseq, "CHANGEDSINCE")?;
+) {
     w.raw(b" (CHANGEDSINCE ");
     w.raw(modseq.to_string().as_bytes());
     // RFC 7162 Section 3.2.6: VANISHED modifier appended in the same
@@ -431,7 +406,6 @@ fn encode_changedsince_modifier(
         w.raw(b" VANISHED");
     }
     w.raw(b")");
-    Ok(())
 }
 
 /// Encode ENABLE command (RFC 5161 Section 3).
@@ -446,8 +420,10 @@ fn encode_enable(
     capabilities: &[Capability],
 ) -> Result<(), crate::Error> {
     if capabilities.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            "ENABLE requires at least one capability (RFC 5161 Section 3.1)".into(),
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "ENABLE requires at least one capability (RFC 5161 Section 3.1)".into(),
+            ),
         ));
     }
     for cap in capabilities {
@@ -495,23 +471,27 @@ fn validate_sort_thread_charset(charset: &str) -> Result<(), crate::Error> {
 fn validate_imap_quoted_string(s: &str, context: &str) -> Result<(), crate::Error> {
     let bytes = s.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must be either an atom or a quoted-string \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{context} must be either an atom or a quoted-string \
              (RFC 5256 Section 5 / RFC 3501 Section 9): {s:?}"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
 
     let inner = &bytes[1..bytes.len() - 1];
     if inner.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must not be empty (RFC 5256 Section 5: charset values \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{context} must not be empty (RFC 5256 Section 5: charset values \
              name an IANA-registered charset)"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
 
@@ -520,50 +500,60 @@ fn validate_imap_quoted_string(s: &str, context: &str) -> Result<(), crate::Erro
         match inner[idx] {
             b'\\' => {
                 let Some(&escaped) = inner.get(idx + 1) else {
-                    return Err(crate::Error::InvalidInput(
-                        format!(
-                            "{context} quoted-string must not end with a bare backslash \
+                    return Err(crate::Error::LocalRefusal(
+                        crate::error::LocalRefusal::InvalidInput(
+                            format!(
+                                "{context} quoted-string must not end with a bare backslash \
                          (RFC 3501 Section 9)"
-                        )
-                        .into(),
+                            )
+                            .into(),
+                        ),
                     ));
                 };
                 if escaped != b'"' && escaped != b'\\' {
-                    return Err(crate::Error::InvalidInput(
-                        format!(
-                            "{context} quoted-string may only escape DQUOTE or backslash \
+                    return Err(crate::Error::LocalRefusal(
+                        crate::error::LocalRefusal::InvalidInput(
+                            format!(
+                                "{context} quoted-string may only escape DQUOTE or backslash \
                          (RFC 3501 Section 9): {s:?}"
-                        )
-                        .into(),
+                            )
+                            .into(),
+                        ),
                     ));
                 }
                 idx += 2;
             }
             b'"' => {
-                return Err(crate::Error::InvalidInput(
-                    format!(
-                        "{context} quoted-string contains an unescaped DQUOTE \
+                return Err(crate::Error::LocalRefusal(
+                    crate::error::LocalRefusal::InvalidInput(
+                        format!(
+                            "{context} quoted-string contains an unescaped DQUOTE \
                      (RFC 3501 Section 9): {s:?}"
-                    )
-                    .into(),
+                        )
+                        .into(),
+                    ),
                 ));
             }
             b'\r' | b'\n' | 0x00 => {
-                return Err(crate::Error::InvalidInput(
-                    format!(
-                        "{context} quoted-string contains CR, LF, or NUL \
+                return Err(crate::Error::LocalRefusal(
+                    crate::error::LocalRefusal::InvalidInput(
+                        format!(
+                            "{context} quoted-string contains CR, LF, or NUL \
                      (RFC 3501 Section 9): {s:?}"
-                    )
-                    .into(),
+                        )
+                        .into(),
+                    ),
                 ));
             }
             byte if !byte.is_ascii() => {
-                return Err(crate::Error::InvalidInput(
-                    format!(
-                        "{context} quoted-string must be ASCII-only \
+                return Err(crate::Error::LocalRefusal(
+                    crate::error::LocalRefusal::InvalidInput(
+                        format!(
+                            "{context} quoted-string must be ASCII-only \
                      (RFC 3501 Section 9 CHAR): {s:?}"
-                    )
-                    .into(),
+                        )
+                        .into(),
+                    ),
                 ));
             }
             _ => {
@@ -584,28 +574,34 @@ fn validate_imap_quoted_string(s: &str, context: &str) -> Result<(), crate::Erro
 /// the annotation scope and is currently limited to `/private` or `/shared`.
 fn validate_metadata_entry_name(entry: &str, context: &str) -> Result<(), crate::Error> {
     if entry.contains("//") {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must not contain consecutive '/' characters \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{context} must not contain consecutive '/' characters \
              (RFC 5464 Section 3.2): {entry:?}"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
 
     if entry.ends_with('/') {
-        return Err(crate::Error::InvalidInput(
-            format!("{context} must not end with '/' (RFC 5464 Section 3.2): {entry:?}").into(),
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!("{context} must not end with '/' (RFC 5464 Section 3.2): {entry:?}").into(),
+            ),
         ));
     }
 
     if !entry.is_ascii() {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must not contain non-ASCII characters \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{context} must not contain non-ASCII characters \
              (RFC 5464 Section 3.2): {entry:?}"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
 
@@ -613,12 +609,14 @@ fn validate_metadata_entry_name(entry: &str, context: &str) -> Result<(), crate:
         .bytes()
         .any(|byte| matches!(byte, 0x00..=0x19) || byte == b'*' || byte == b'%')
     {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must not contain '*', '%', or control octets \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{context} must not contain '*', '%', or control octets \
              0x00..=0x19 (RFC 5464 Section 3.2): {entry:?}"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
 
@@ -626,22 +624,26 @@ fn validate_metadata_entry_name(entry: &str, context: &str) -> Result<(), crate:
     // paths whose first component defines the annotation scope. The only
     // standardized scope prefixes are `/private` and `/shared`.
     let Some(stripped) = entry.strip_prefix('/') else {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must start with '/' and use the /private or /shared \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{context} must start with '/' and use the /private or /shared \
              scope prefixes (RFC 5464 Section 3.2): {entry:?}"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     };
     let scope = stripped.split('/').next().unwrap_or_default();
     if !matches!(scope.to_ascii_lowercase().as_str(), "private" | "shared") {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must use the /private or /shared scope prefixes \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{context} must use the /private or /shared scope prefixes \
              (RFC 5464 Section 3.2): {entry:?}"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
 
@@ -692,12 +694,14 @@ pub(crate) fn validate_append_datetime(date: &str) -> Result<(), crate::Error> {
     // date-day-fixed (2) + "-" (1) + month (3) + "-" (1) + year (4)
     //   + SP (1) + time (8) + SP (1) + zone (5) = 26
     if b.len() != 26 {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "expected 26 characters, got {}  -  \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "expected 26 characters, got {}  -  \
              date-time must be date-day-fixed \"-\" date-month \"-\" date-year \
              SP time SP zone (RFC 3501 Section 9)",
-            b.len()
-        )));
+                b.len()
+            )),
+        ));
     }
 
     // date-day-fixed = (SP DIGIT) / 2DIGIT (RFC 3501 Section 9).
@@ -716,19 +720,23 @@ pub(crate) fn validate_append_datetime(date: &str) -> Result<(), crate::Error> {
         _ => false,
     };
     if !valid_day {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "invalid day {:?}  -  date-day-fixed must be (SP DIGIT) / 2DIGIT \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "invalid day {:?}  -  date-day-fixed must be (SP DIGIT) / 2DIGIT \
              with values 1-31 (RFC 3501 Section 9)",
-            std::str::from_utf8(&b[0..2]).unwrap_or("??")
-        )));
+                std::str::from_utf8(&b[0..2]).unwrap_or("??")
+            )),
+        ));
     }
 
     // First separator: "-" (RFC 3501 Section 9).
     if b[2] != b'-' {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "expected '-' at position 2, got {:?} (RFC 3501 Section 9)",
-            b[2] as char
-        )));
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "expected '-' at position 2, got {:?} (RFC 3501 Section 9)",
+                b[2] as char
+            )),
+        ));
     }
 
     // date-month (RFC 3501 Section 9).
@@ -738,10 +746,12 @@ pub(crate) fn validate_append_datetime(date: &str) -> Result<(), crate::Error> {
     // literal strings are case-insensitive.
     let month = &b[3..6];
     if !MONTHS.iter().any(|m| m.eq_ignore_ascii_case(month)) {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "invalid month {:?}  -  date-month must be Jan/Feb/.../Dec (RFC 3501 Section 9)",
-            std::str::from_utf8(month).unwrap_or("???")
-        )));
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "invalid month {:?}  -  date-month must be Jan/Feb/.../Dec (RFC 3501 Section 9)",
+                std::str::from_utf8(month).unwrap_or("???")
+            )),
+        ));
     }
 
     let day: u8 = match day_hi {
@@ -751,18 +761,22 @@ pub(crate) fn validate_append_datetime(date: &str) -> Result<(), crate::Error> {
 
     // Second separator: "-" (RFC 3501 Section 9).
     if b[6] != b'-' {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "expected '-' at position 6, got {:?} (RFC 3501 Section 9)",
-            b[6] as char
-        )));
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "expected '-' at position 6, got {:?} (RFC 3501 Section 9)",
+                b[6] as char
+            )),
+        ));
     }
 
     // date-year = 4DIGIT (RFC 3501 Section 9).
     if !b[7..11].iter().all(u8::is_ascii_digit) {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "invalid year {:?}  -  date-year must be 4DIGIT (RFC 3501 Section 9)",
-            std::str::from_utf8(&b[7..11]).unwrap_or("????")
-        )));
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "invalid year {:?}  -  date-year must be 4DIGIT (RFC 3501 Section 9)",
+                std::str::from_utf8(&b[7..11]).unwrap_or("????")
+            )),
+        ));
     }
 
     // Parse year for the day-vs-month cross-check below (needed for
@@ -802,21 +816,25 @@ pub(crate) fn validate_append_datetime(date: &str) -> Result<(), crate::Error> {
         _ => 31,
     };
     if day > max_day {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "invalid day {} for month {:?} year {}  -  maximum is {} (RFC 3501 Section 9)",
-            day,
-            std::str::from_utf8(month).unwrap_or("???"),
-            year,
-            max_day
-        )));
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "invalid day {} for month {:?} year {}  -  maximum is {} (RFC 3501 Section 9)",
+                day,
+                std::str::from_utf8(month).unwrap_or("???"),
+                year,
+                max_day
+            )),
+        ));
     }
 
     // SP between date and time (RFC 3501 Section 9).
     if b[11] != b' ' {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "expected SP at position 11, got {:?} (RFC 3501 Section 9)",
-            b[11] as char
-        )));
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "expected SP at position 11, got {:?} (RFC 3501 Section 9)",
+                b[11] as char
+            )),
+        ));
     }
 
     // time = 2DIGIT ":" 2DIGIT ":" 2DIGIT (RFC 3501 Section 9).
@@ -830,11 +848,13 @@ pub(crate) fn validate_append_datetime(date: &str) -> Result<(), crate::Error> {
         && time[6].is_ascii_digit()
         && time[7].is_ascii_digit();
     if !valid_time {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "invalid time {:?}  -  time must be 2DIGIT \":\" 2DIGIT \":\" 2DIGIT \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "invalid time {:?}  -  time must be 2DIGIT \":\" 2DIGIT \":\" 2DIGIT \
              (RFC 3501 Section 9)",
-            std::str::from_utf8(time).unwrap_or("????????")
-        )));
+                std::str::from_utf8(time).unwrap_or("????????")
+            )),
+        ));
     }
 
     // Semantic range checks for time components (RFC 3501 Section 9).
@@ -849,30 +869,38 @@ pub(crate) fn validate_append_datetime(date: &str) -> Result<(), crate::Error> {
     let second = (time[6] - b'0') * 10 + (time[7] - b'0');
 
     if hour > 23 {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "invalid hour {hour:02}  -  must be 00-23 (RFC 3501 Section 9, \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "invalid hour {hour:02}  -  must be 00-23 (RFC 3501 Section 9, \
              RFC 5322 Section 3.3)"
-        )));
+            )),
+        ));
     }
     if minute > 59 {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "invalid minute {minute:02}  -  must be 00-59 (RFC 3501 Section 9, \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "invalid minute {minute:02}  -  must be 00-59 (RFC 3501 Section 9, \
              RFC 5322 Section 3.3)"
-        )));
+            )),
+        ));
     }
     if second > 60 {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "invalid second {second:02}  -  must be 00-60 (RFC 3501 Section 9, \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "invalid second {second:02}  -  must be 00-60 (RFC 3501 Section 9, \
              RFC 5322 Section 3.3; 60 permits leap seconds)"
-        )));
+            )),
+        ));
     }
 
     // SP between time and zone (RFC 3501 Section 9).
     if b[20] != b' ' {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "expected SP at position 20, got {:?} (RFC 3501 Section 9)",
-            b[20] as char
-        )));
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "expected SP at position 20, got {:?} (RFC 3501 Section 9)",
+                b[20] as char
+            )),
+        ));
     }
 
     // zone = ("+" / "-") 4DIGIT (RFC 3501 Section 9).
@@ -880,10 +908,12 @@ pub(crate) fn validate_append_datetime(date: &str) -> Result<(), crate::Error> {
     let valid_zone =
         (zone[0] == b'+' || zone[0] == b'-') && zone[1..].iter().all(u8::is_ascii_digit);
     if !valid_zone {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "invalid zone {:?}  -  zone must be (\"+\" / \"-\") 4DIGIT (RFC 3501 Section 9)",
-            std::str::from_utf8(zone).unwrap_or("?????")
-        )));
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "invalid zone {:?}  -  zone must be (\"+\" / \"-\") 4DIGIT (RFC 3501 Section 9)",
+                std::str::from_utf8(zone).unwrap_or("?????")
+            )),
+        ));
     }
 
     // Semantic range checks for zone components (RFC 3501 Section 9).
@@ -895,16 +925,20 @@ pub(crate) fn validate_append_datetime(date: &str) -> Result<(), crate::Error> {
     let zone_mm = (zone[3] - b'0') * 10 + (zone[4] - b'0');
 
     if zone_hh > 14 {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "invalid zone hour {zone_hh:02}  -  must be 00-14 \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "invalid zone hour {zone_hh:02}  -  must be 00-14 \
              (maximum real UTC offset is ±14:00, RFC 3501 Section 9)"
-        )));
+            )),
+        ));
     }
     if zone_mm > 59 {
-        return Err(crate::Error::InvalidAppendDate(format!(
-            "invalid zone minute {zone_mm:02}  -  must be 00-59 \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidAppendDate(format!(
+                "invalid zone minute {zone_mm:02}  -  must be 00-59 \
              (RFC 3501 Section 9)"
-        )));
+            )),
+        ));
     }
     // RFC 3501 Section 9: `zone = ("+" / "-") 4DIGIT`  -  the grammar
     // imposes no semantic constraint beyond valid digits.  We cap the

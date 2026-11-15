@@ -1,7 +1,4 @@
-use bifrost_sasl::{
-    ScramChannelBinding, ScramHash, ScramPassword, cram_md5_response, decode_continuation,
-    prepare_scram_password, prepare_scram_username, scram_client_final, verify_server_final,
-};
+use bifrost_sasl::{SaslClient, ScramChannelBinding, ScramHash};
 
 use crate::connection::NotifyFlags;
 use crate::error::Error;
@@ -18,29 +15,40 @@ use super::{Consumer, ConsumerContext, ContinuationConsumer, ContinuationReply, 
 impl From<bifrost_sasl::SaslError> for Error {
     fn from(e: bifrost_sasl::SaslError) -> Self {
         match e {
-            bifrost_sasl::SaslError::Protocol(m) => Error::Protocol(m),
-            bifrost_sasl::SaslError::InvalidCredential(m) => Error::InvalidInput(m.into()),
-            bifrost_sasl::SaslError::LocalRuntime(m) => Error::LocalRuntime(m),
-            bifrost_sasl::SaslError::ServerRejected(refusal) => Error::Auth {
-                text: refusal.to_string(),
-                code: None,
-                mechanism: None,
-                scram: Some(refusal),
-                attempt: None,
+            bifrost_sasl::SaslError::Protocol(m) => {
+                Error::Provider(crate::error::ProviderFailure::Protocol(m))
+            }
+            bifrost_sasl::SaslError::InvalidCredential(m) => {
+                Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(m.into()))
+            }
+            bifrost_sasl::SaslError::LocalRuntime(m) => Error::Internal {
+                kind: crate::error::InternalFailure::Runtime(m),
+                mid_exchange: None,
             },
+            bifrost_sasl::SaslError::ServerRejected(refusal) => {
+                Error::ServerStatus(crate::error::ServerStatus::Auth {
+                    text: refusal.to_string(),
+                    code: None,
+                    mechanism: None,
+                    scram: Some(refusal),
+                })
+            }
             // `SaslError` is `#[non_exhaustive]`; any future variant is an
             // mapping gap until it is handled explicitly; it is not evidence
             // that the user must replace credentials.
-            other => Error::Internal(other.to_string()),
+            other => Error::Internal {
+                kind: crate::error::InternalFailure::Invariant(other.to_string()),
+                mid_exchange: None,
+            },
         }
     }
 }
 
 /// Validate a tagged response for an authentication command.
 ///
-/// Returns the response on OK, or an [`Error::Auth`] for NO / [`Error::Bad`]
+/// Returns the response on OK, or an [`crate::error::ServerStatus::Auth`] for NO / [`crate::error::ServerStatus::Bad`]
 /// for BAD. AUTH commands need a more specific error than the generic
-/// [`Error::No`] that [`TaggedResponse::require_ok`] produces.
+/// [`crate::error::ServerStatus::No`] that [`TaggedResponse::require_ok`] produces.
 ///
 /// `mechanism` is the wire name of the mechanism this consumer drove. The
 /// consumer is the last place that still knows it - by the time the error
@@ -94,311 +102,52 @@ impl Consumer for LoginConsumer {
     }
 }
 
-/// Consumer for AUTHENTICATE PLAIN (RFC 4616 / RFC 3501 Section6.2.2).
-///
-/// Implements [`ContinuationConsumer`] when the server sends `+`,
-/// the consumer replies with the base64-encoded SASL PLAIN credentials.
-/// When SASL-IR (RFC 4959) was used, the payload was already part of
-/// the AUTHENTICATE command and no continuation is expected.
-pub(crate) struct AuthenticatePlainConsumer {
-    /// Base64-encoded SASL PLAIN payload (RFC 4616 Section2).
-    encoded: SecretString,
-    /// Whether the initial response has already been sent (via SASL-IR
-    /// in the command, or via a previous continuation reply).
-    initial_sent: bool,
+/// IMAP framing for a shared SASL exchange, including deferred SASL-IR.
+pub(crate) struct AuthenticateSaslConsumer {
+    client: SaslClient,
+    initial: Option<SecretString>,
+    pending: Option<SecretString>,
     buffered: Vec<UntaggedResponse>,
 }
 
-impl AuthenticatePlainConsumer {
-    pub(crate) fn new(encoded: SecretString, sasl_ir_used: bool) -> Self {
+impl AuthenticateSaslConsumer {
+    pub(crate) fn new(mut client: SaslClient, sasl_ir_used: bool) -> Self {
+        use base64::Engine;
+        let initial = client.initial_response().map(|raw| {
+            base64::engine::general_purpose::STANDARD
+                .encode(raw.as_bytes())
+                .into()
+        });
         Self {
-            encoded,
-            initial_sent: sasl_ir_used,
+            client,
+            pending: if sasl_ir_used { None } else { initial.clone() },
+            initial,
             buffered: Vec::new(),
         }
     }
-}
 
-impl Consumer for AuthenticatePlainConsumer {
-    type Output = ();
-
-    fn on_response(
-        &mut self,
-        resp: UntaggedResponse,
-        _notify_snapshot: NotifyFlags,
-        _ctx: &ConsumerContext,
-    ) {
-        self.buffered.push(resp);
+    pub(crate) fn initial_response(&self) -> Option<SecretString> {
+        self.initial.clone()
     }
 
-    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
-        // Surrender the `Either` buffer on both arms.
-        if let Err(e) = require_ok_auth(tagged, AuthMechanism::Plain) {
-            return Finalized::failure(e, self.buffered);
-        }
-        Finalized::success((), self.buffered)
-    }
-}
-
-impl ContinuationConsumer for AuthenticatePlainConsumer {
-    fn on_continuation(
-        &mut self,
-        _cont: ContinuationRequest,
-        _ctx: &ConsumerContext,
-    ) -> Result<ContinuationReply, Error> {
-        if self.initial_sent {
-            // PLAIN is a single-round mechanism (RFC 4616 Section2). A second
-            // continuation is a protocol error.
-            return Err(Error::Protocol(
-                "unexpected continuation after PLAIN initial response \
-                 (RFC 4616 Section 2)"
-                    .into(),
-            ));
-        }
-        self.initial_sent = true;
-        let mut bytes = Vec::with_capacity(self.encoded.len() + 2);
-        bytes.extend_from_slice(self.encoded.as_bytes());
-        bytes.extend_from_slice(b"\r\n");
-        Ok(ContinuationReply::Write(bytes))
-    }
-}
-
-/// Consumer for AUTHENTICATE XOAUTH2 and OAUTHBEARER.
-///
-/// Implements [`ContinuationConsumer`]. The first continuation triggers
-/// the base64 credential payload. Subsequent error challenges receive the
-/// mechanism-specific acknowledgement so the server can send its tagged failure.
-pub(crate) struct AuthenticateXoauth2Consumer {
-    /// Base64-encoded OAuth payload.
-    encoded: SecretString,
-    /// Whether the initial credential payload has been sent.
-    initial_sent: bool,
-    buffered: Vec<UntaggedResponse>,
-    /// Mechanism determines both the diagnostic token and the error answer.
-    mechanism: bifrost_sasl::OAuthMechanism,
-}
-
-impl AuthenticateXoauth2Consumer {
-    pub(crate) fn new(
-        encoded: SecretString,
-        sasl_ir_used: bool,
-        mechanism: bifrost_sasl::OAuthMechanism,
-    ) -> Self {
-        Self {
-            encoded,
-            initial_sent: sasl_ir_used,
-            buffered: Vec::new(),
-            mechanism,
-        }
-    }
-}
-
-impl Consumer for AuthenticateXoauth2Consumer {
-    type Output = ();
-
-    fn on_response(
-        &mut self,
-        resp: UntaggedResponse,
-        _notify_snapshot: NotifyFlags,
-        _ctx: &ConsumerContext,
-    ) {
-        self.buffered.push(resp);
-    }
-
-    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
-        // Surrender the `Either` buffer on both arms.
-        if let Err(e) = require_ok_auth(
-            tagged,
-            match self.mechanism {
-                bifrost_sasl::OAuthMechanism::Xoauth2 => AuthMechanism::Xoauth2,
-                bifrost_sasl::OAuthMechanism::OAuthBearer => AuthMechanism::OAuthBearer,
-                _ => {
-                    return Finalized::failure(
-                        Error::Internal("unmapped OAuth mechanism".into()),
-                        self.buffered,
-                    );
-                }
-            },
-        ) {
-            return Finalized::failure(e, self.buffered);
-        }
-        Finalized::success((), self.buffered)
-    }
-}
-
-impl ContinuationConsumer for AuthenticateXoauth2Consumer {
-    fn on_continuation(
-        &mut self,
-        _cont: ContinuationRequest,
-        _ctx: &ConsumerContext,
-    ) -> Result<ContinuationReply, Error> {
-        if self.initial_sent {
-            use base64::Engine;
-
-            let mut bytes = base64::engine::general_purpose::STANDARD
-                .encode(self.mechanism.error_ack().as_bytes())
-                .into_bytes();
-            bytes.extend_from_slice(b"\r\n");
-            Ok(ContinuationReply::Write(bytes))
-        } else {
-            // First continuation: send the OAuth credential payload.
-            self.initial_sent = true;
-            let mut bytes = Vec::with_capacity(self.encoded.len() + 2);
-            bytes.extend_from_slice(self.encoded.as_bytes());
-            bytes.extend_from_slice(b"\r\n");
-            Ok(ContinuationReply::Write(bytes))
-        }
-    }
-}
-
-/// Consumer for AUTHENTICATE CRAM-MD5.
-pub(crate) struct AuthenticateCramMd5Consumer {
-    user: String,
-    pass: SecretString,
-    response_sent: bool,
-    buffered: Vec<UntaggedResponse>,
-}
-
-impl AuthenticateCramMd5Consumer {
-    pub(crate) fn new(user: String, pass: SecretString) -> Self {
-        Self {
-            user,
-            pass,
-            response_sent: false,
-            buffered: Vec::new(),
-        }
-    }
-}
-
-impl Consumer for AuthenticateCramMd5Consumer {
-    type Output = ();
-
-    fn on_response(
-        &mut self,
-        resp: UntaggedResponse,
-        _notify_snapshot: NotifyFlags,
-        _ctx: &ConsumerContext,
-    ) {
-        self.buffered.push(resp);
-    }
-
-    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
-        // Surrender the `Either` buffer on both arms.
-        if let Err(e) = require_ok_auth(tagged, AuthMechanism::CramMd5) {
-            return Finalized::failure(e, self.buffered);
-        }
-        Finalized::success((), self.buffered)
-    }
-}
-
-impl ContinuationConsumer for AuthenticateCramMd5Consumer {
-    fn on_continuation(
-        &mut self,
-        cont: ContinuationRequest,
-        _ctx: &ConsumerContext,
-    ) -> Result<ContinuationReply, Error> {
-        if self.response_sent {
-            return Err(Error::Protocol(
-                "unexpected continuation after CRAM-MD5 response".into(),
-            ));
-        }
-        self.response_sent = true;
-        let encoded = cram_md5_response(&self.user, &self.pass, &cont.data)?;
-        let mut bytes = Vec::with_capacity(encoded.as_str().len() + 2);
-        bytes.extend_from_slice(encoded.as_bytes());
-        bytes.extend_from_slice(b"\r\n");
-        Ok(ContinuationReply::Write(bytes))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScramState {
-    SendClientFirst,
-    AwaitServerFirst,
-    AwaitServerFinal,
-    Done,
-}
-
-/// Consumer for SCRAM-SHA-1 and SCRAM-SHA-256.
-pub(crate) struct AuthenticateScramConsumer {
-    mechanism: ScramHash,
-    /// SASLprep'd in `new`, before AUTHENTICATE is submitted, so a password
-    /// the caller supplied that cannot be prepared is refused locally rather
-    /// than discovered mid-exchange.
-    pass: ScramPassword,
-    client_nonce: String,
-    client_first_bare: String,
-    /// GS2 channel binding for this exchange. `None` reproduces the old
-    /// `n,,` / `c=biws` behavior byte-for-byte; `TlsServerEndPoint` drives
-    /// the `-PLUS` GS2 header and `c=` value.
-    binding: ScramChannelBinding,
-    state: ScramState,
-    expected_server_signature: Option<Vec<u8>>,
-    buffered: Vec<UntaggedResponse>,
-}
-
-impl AuthenticateScramConsumer {
-    pub(crate) fn new(
-        mechanism: ScramHash,
-        user: String,
-        pass: SecretString,
-        nonce: String,
-        sasl_ir_used: bool,
-        binding: ScramChannelBinding,
-    ) -> Result<Self, Error> {
-        let client_first_bare = format!("n={},r={nonce}", prepare_scram_username(&user)?);
-        let pass = prepare_scram_password(pass.as_str())?;
-        Ok(Self {
-            mechanism,
-            pass,
-            client_nonce: nonce,
-            client_first_bare,
-            binding,
-            state: if sasl_ir_used {
-                ScramState::AwaitServerFirst
-            } else {
-                ScramState::SendClientFirst
-            },
-            expected_server_signature: None,
-            buffered: Vec::new(),
-        })
-    }
-
-    /// Derive the diagnostic rung from the exchange hash and binding.
-    fn mechanism(&self) -> AuthMechanism {
-        AuthMechanism::from_scram(self.mechanism, self.binding.binding())
-    }
-
-    /// Classify through the shared owner before adding the selected rung.
     fn named_sasl_error(&self, error: bifrost_sasl::SaslError) -> Error {
-        let mechanism = self.mechanism();
+        let mechanism = self.client.mechanism();
         let mut mapped = Error::from(error);
         match &mut mapped {
-            Error::Auth {
+            Error::ServerStatus(crate::error::ServerStatus::Auth {
                 mechanism: stamp, ..
-            } => *stamp = Some(mechanism),
-            Error::Protocol(message) => {
+            }) => *stamp = Some(mechanism),
+            Error::Provider(crate::error::ProviderFailure::Protocol(message)) => {
                 message.push_str(&format!(" (mechanism {})", mechanism.name()));
             }
             _ => {}
         }
         mapped
     }
-
-    pub(crate) fn initial_response(&self) -> SecretString {
-        use base64::Engine;
-
-        // RFC 5802: the GS2 header MUST come from the binding, never a
-        // literal, so the header and the `c=` value can never desync.
-        base64::engine::general_purpose::STANDARD
-            .encode(format!("{}{}", self.binding.gs2_header(), self.client_first_bare).as_bytes())
-            .into()
-    }
 }
 
-impl Consumer for AuthenticateScramConsumer {
+impl Consumer for AuthenticateSaslConsumer {
     type Output = ();
-
     fn on_response(
         &mut self,
         resp: UntaggedResponse,
@@ -407,80 +156,106 @@ impl Consumer for AuthenticateScramConsumer {
     ) {
         self.buffered.push(resp);
     }
-
     fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
-        // Surrender the `Either` buffer on every arm.
-        if let Err(e) = require_ok_auth(tagged, self.mechanism()) {
-            return Finalized::failure(e, self.buffered);
+        if let Err(error) = require_ok_auth(tagged, self.client.mechanism()) {
+            return Finalized::failure(error, self.buffered);
         }
-        if self.state != ScramState::Done {
-            // A tagged OK here means the server claimed success without
-            // proving it knew the password. The driver explicitly retires an
-            // authentication session whose OK failed consumer verification,
-            // even though its tagged completion synchronized the framing.
+        // An enterprise user needs a verified session even when the server
+        // claims success early. The driver retires a failed tagged-OK exchange.
+        if self.pending.is_some() {
             return Finalized::failure(
-                Error::Protocol("SCRAM exchange ended before server-final verification".into()),
+                Error::Provider(crate::error::ProviderFailure::Protocol(
+                    "SASL initial response was never sent".into(),
+                )),
                 self.buffered,
             );
+        }
+        if let Err(error) = self.client.finish() {
+            let error = self.named_sasl_error(error);
+            return Finalized::failure(error, self.buffered);
         }
         Finalized::success((), self.buffered)
     }
 }
 
-impl ContinuationConsumer for AuthenticateScramConsumer {
+impl ContinuationConsumer for AuthenticateSaslConsumer {
     fn on_continuation(
         &mut self,
         cont: ContinuationRequest,
         _ctx: &ConsumerContext,
     ) -> Result<ContinuationReply, Error> {
-        match self.state {
-            ScramState::SendClientFirst => {
-                self.state = ScramState::AwaitServerFirst;
-                let encoded = self.initial_response();
-                let mut bytes = Vec::with_capacity(encoded.len() + 2);
-                bytes.extend_from_slice(encoded.as_bytes());
-                bytes.extend_from_slice(b"\r\n");
-                Ok(ContinuationReply::Write(bytes))
-            }
-            ScramState::AwaitServerFirst => {
-                let server_first = decode_continuation(&cont.data)?;
-                let (client_final, server_signature) = scram_client_final(
-                    self.mechanism,
-                    &self.pass,
-                    &self.client_nonce,
-                    &self.client_first_bare,
-                    &server_first,
-                    &self.binding,
-                )
-                .map_err(|e| self.named_sasl_error(e))?;
-                self.expected_server_signature = Some(server_signature);
-                self.state = ScramState::AwaitServerFinal;
-                let mut bytes = Vec::with_capacity(client_final.as_str().len() + 2);
-                bytes.extend_from_slice(client_final.as_bytes());
-                bytes.extend_from_slice(b"\r\n");
-                Ok(ContinuationReply::Write(bytes))
-            }
-            ScramState::AwaitServerFinal => {
-                let server_final = decode_continuation(&cont.data)?;
-                // A local invariant, raised mid-exchange: the server is
-                // waiting for our reply to its server-final, so this must
-                // retire the connection. The exchange has no tagged
-                // completion yet, hence `InFlight`.
-                let expected = self.expected_server_signature.take().ok_or_else(|| {
-                    Error::internal_mid_exchange(
-                        "SCRAM server signature missing from client state",
-                        bifrost_types::TransmissionState::InFlight,
-                    )
+        use base64::Engine;
+        let encoded = if let Some(initial) = self.pending.take() {
+            initial
+        } else {
+            let challenge = base64::engine::general_purpose::STANDARD
+                .decode(cont.data.trim())
+                .map_err(|e| {
+                    Error::Provider(crate::error::ProviderFailure::Protocol(format!(
+                        "invalid base64 SASL continuation: {e}"
+                    )))
                 })?;
-                verify_server_final(&server_final, &expected)
-                    .map_err(|e| self.named_sasl_error(e))?;
-                self.state = ScramState::Done;
-                Ok(ContinuationReply::Write(b"\r\n".to_vec()))
+            match self
+                .client
+                .step(&challenge)
+                .map_err(|e| self.named_sasl_error(e))?
+            {
+                bifrost_sasl::Step::Reply(raw) => base64::engine::general_purpose::STANDARD
+                    .encode(raw.as_bytes())
+                    .into(),
+                bifrost_sasl::Step::Done => SecretString::default(),
+                _ => {
+                    return Err(Error::Internal {
+                        kind: crate::error::InternalFailure::Invariant("unmapped SASL step".into()),
+                        mid_exchange: None,
+                    });
+                }
             }
-            ScramState::Done => Err(Error::Protocol(
-                "unexpected continuation after SCRAM server-final message".into(),
-            )),
-        }
+        };
+        let mut bytes = Vec::with_capacity(encoded.len() + 2);
+        bytes.extend_from_slice(encoded.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+        Ok(ContinuationReply::Write(bytes))
+    }
+}
+
+/// SCRAM construction adapter; all exchange state lives in bifrost-sasl.
+pub(crate) struct AuthenticateScramConsumer(AuthenticateSaslConsumer);
+
+impl AuthenticateScramConsumer {
+    pub(crate) fn new(
+        hash: ScramHash,
+        user: String,
+        pass: SecretString,
+        nonce: String,
+        sasl_ir_used: bool,
+        binding: ScramChannelBinding,
+    ) -> Result<Self, Error> {
+        Ok(Self(AuthenticateSaslConsumer::new(
+            SaslClient::scram(hash, binding, &user, &pass, nonce)?,
+            sasl_ir_used,
+        )))
+    }
+    pub(crate) fn initial_response(&self) -> SecretString {
+        self.0.initial_response().unwrap_or_default()
+    }
+}
+impl Consumer for AuthenticateScramConsumer {
+    type Output = ();
+    fn on_response(&mut self, resp: UntaggedResponse, notify: NotifyFlags, ctx: &ConsumerContext) {
+        self.0.on_response(resp, notify, ctx);
+    }
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, ctx: &ConsumerContext) -> Finalized<()> {
+        Box::new(self.0).finalize(tagged, ctx)
+    }
+}
+impl ContinuationConsumer for AuthenticateScramConsumer {
+    fn on_continuation(
+        &mut self,
+        cont: ContinuationRequest,
+        ctx: &ConsumerContext,
+    ) -> Result<ContinuationReply, Error> {
+        self.0.on_continuation(cont, ctx)
     }
 }
 
@@ -568,7 +343,13 @@ mod tests {
         ) else {
             panic!("a prohibited password must not build a consumer");
         };
-        assert!(matches!(err, Error::InvalidInput(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(_))
+            ),
+            "got {err:?}"
+        );
         assert!(!err.is_connection_fatal());
     }
 
@@ -589,7 +370,46 @@ mod tests {
             Err(err) => err,
             Ok(_) => panic!("tagged NO must reject authentication"),
         };
-        assert!(matches!(err, Error::Auth { .. }));
+        assert!(matches!(
+            err,
+            Error::ServerStatus(crate::error::ServerStatus::Auth { .. })
+        ));
+    }
+
+    #[test]
+    fn success_before_deferred_initial_response_is_refused() {
+        for client in [
+            SaslClient::plain("", "user", "pw").unwrap(),
+            SaslClient::oauth(bifrost_sasl::OAuthMechanism::Xoauth2, "user", "token").unwrap(),
+        ] {
+            let consumer = AuthenticateSaslConsumer::new(client, false);
+            assert!(
+                Box::new(consumer)
+                    .finalize(tagged(StatusKind::Ok), &context())
+                    .output
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_success_after_an_error_challenge_is_refused() {
+        let mut consumer = AuthenticateSaslConsumer::new(
+            SaslClient::oauth(bifrost_sasl::OAuthMechanism::OAuthBearer, "user", "token").unwrap(),
+            true,
+        );
+        let cont = ContinuationRequest {
+            code: None,
+            data: "e30=".into(),
+        };
+        let ContinuationReply::Write(reply) = consumer.on_continuation(cont, &context()).unwrap();
+        assert_eq!(reply, b"AQ==\r\n");
+        assert!(
+            Box::new(consumer)
+                .finalize(tagged(StatusKind::Ok), &context())
+                .output
+                .is_err()
+        );
     }
 
     #[test]
@@ -601,10 +421,9 @@ mod tests {
             (OAuthMechanism::OAuthBearer, b"AQ==\r\n".as_slice()),
         ] {
             for sasl_ir in [false, true] {
-                let mut consumer = AuthenticateXoauth2Consumer::new(
-                    "payload".to_owned().into(),
+                let mut consumer = AuthenticateSaslConsumer::new(
+                    SaslClient::oauth(mechanism, "user", "token").unwrap(),
                     sasl_ir,
-                    mechanism,
                 );
                 let continuation = || ContinuationRequest {
                     code: None,
@@ -614,7 +433,10 @@ mod tests {
                     let ContinuationReply::Write(bytes) = consumer
                         .on_continuation(continuation(), &context())
                         .unwrap();
-                    assert_eq!(bytes, b"payload\r\n");
+                    assert_eq!(
+                        bytes,
+                        format!("{}\r\n", consumer.initial_response().unwrap().as_str()).as_bytes()
+                    );
                 }
                 let ContinuationReply::Write(bytes) = consumer
                     .on_continuation(continuation(), &context())
@@ -632,7 +454,9 @@ mod tests {
         // on every consumer rather than only on one.
         fn mechanism_of(err: Error) -> Option<AuthMechanism> {
             match err {
-                Error::Auth { mechanism, .. } => mechanism,
+                Error::ServerStatus(crate::error::ServerStatus::Auth { mechanism, .. }) => {
+                    mechanism
+                }
                 other => panic!("tagged NO must be an auth failure, got {other:?}"),
             }
         }
@@ -659,7 +483,8 @@ mod tests {
             Some(AuthMechanism::ScramSha256Plus),
         );
 
-        let plain = AuthenticatePlainConsumer::new("payload".to_owned().into(), true);
+        let plain =
+            AuthenticateSaslConsumer::new(SaslClient::plain("", "user", "pw").unwrap(), true);
         assert_eq!(
             mechanism_of(
                 Box::new(plain)
@@ -671,7 +496,7 @@ mod tests {
             Some(AuthMechanism::Plain),
         );
 
-        let cram = AuthenticateCramMd5Consumer::new("user".to_owned(), "pw".to_owned().into());
+        let cram = AuthenticateSaslConsumer::new(SaslClient::cram_md5("user", "pw".into()), false);
         assert_eq!(
             mechanism_of(
                 Box::new(cram)
@@ -701,8 +526,10 @@ mod tests {
             bifrost_sasl::OAuthMechanism::Xoauth2,
             bifrost_sasl::OAuthMechanism::OAuthBearer,
         ] {
-            let oauth =
-                AuthenticateXoauth2Consumer::new("payload".to_owned().into(), true, mechanism);
+            let oauth = AuthenticateSaslConsumer::new(
+                SaslClient::oauth(mechanism, "user", "token").unwrap(),
+                true,
+            );
             assert_eq!(
                 mechanism_of(
                     Box::new(oauth)
@@ -746,7 +573,7 @@ mod tests {
             panic!("a non-SCRAM server-first is a protocol fault");
         };
         match err {
-            Error::Protocol(message) => {
+            Error::Provider(crate::error::ProviderFailure::Protocol(message)) => {
                 assert!(message.contains("SCRAM-SHA-256-PLUS"), "got: {message}");
             }
             other => panic!("classification must stay protocol-class, got {other:?}"),
@@ -770,7 +597,10 @@ mod tests {
             Err(err) => err,
             Ok(_) => panic!("tagged OK must not bypass server-final verification"),
         };
-        assert!(matches!(err, Error::Protocol(_)));
+        assert!(matches!(
+            err,
+            Error::Provider(crate::error::ProviderFailure::Protocol(_))
+        ));
     }
 
     fn decode_initial(consumer: &AuthenticateScramConsumer) -> String {

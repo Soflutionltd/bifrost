@@ -808,7 +808,7 @@ naming `start`. All of this runs in `reject_unusable_write_times`, before any
 request and, on update, before the calendar move, alongside the all-day check.
 The same guard checks the SHAPE of every non-empty start and end, as
 `Request(Malformed)`: a bare `YYYY-MM-DD` date for an all-day value (the write's
-`is_all_day`, or each value's own shape when a patch leaves it unset), an RFC
+derived `is_all_day()`, or an explicit patch conversion instruction), an RFC
 3339 timestamp with an offset for a timed one, or a local date-time beside a
 `timezone`. Google would answer a bad value with a 400, which already
 classifies as the caller's malformed input with nothing sent in error, and that
@@ -827,11 +827,11 @@ serves the rest of the page, matching how bifrost-jmap and bifrost-caldav
 treat per-item conversion failures; collecting through `Result` previously
 let one item destroy every neighbour in the page and left the walk no way
 past it. Cross-calendar search concatenates the per-calendar `failed_ids`
-into its aggregate `Page` rather than zeroing the lane. `is_all_day` is read off that EFFECTIVE start rather
-than off `event.start`, because a cancelled instance of an all-day recurrence
-carries only `originalStartTime.date` - reading `event.start` alone paired
-date-valued times with `is_all_day: false`, which the shared surface treats as
-a timed event. Calendar update
+into its aggregate `Page` rather than zeroing the lane. The shared typed start
+owns `is_all_day()`, including a cancelled instance whose effective start comes
+from `originalStartTime.date`. No independent bool can contradict that date.
+Write and range guards inspect shared parsed kinds, and paired write bounds use
+the shared compatible-shape and exclusive-end validation. Calendar update
 uses `events.move` when `EventPatch.calendar_id` targets a different
 calendar, then applies any remaining field patch against the destination.
 Patch-local validation runs before the move, so a patch that could never
@@ -1675,8 +1675,15 @@ Mapping highlights:
   `transmission_state` carries the wire-level evidence; the
   central mapping picks `Retry::SameRequest` for idempotent ops
   and `Reconcile` for non-idempotent ops caught mid-flight.
-- 5xx and `internalError` -> `Server(Unavailable)` ->
-  `Retry::SameRequest, reason: ServerUnavailable`.
+- HTTP fallback uses `bifrost_net::classify_status` for both envelopes with
+  unknown reasons and plain transport failures. 408/502/503/504 and typed
+  `backendError` -> `Server(Unavailable)`. 507 is quota exhausted with throttle
+  scope; 409/412 are conflicts and 400/413/422 are malformed requests. Other
+  5xx retain net's status-bearing `Server(Error)` classification. Users receive
+  the same recovery when only the response body format changes. The declared
+  history-endpoint 400/404/410 overrides and resource hints reach generic net
+  failures too. Throttle scope and optional project budget are applied once
+  from the resulting classification, including typed reason overrides.
 - Every `Error::Response` and every post-200 decode failure
   (`JsonDecode`, `Base64`) pushes
   `AttemptCause(Acknowledged)` onto the chain so the central

@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use bifrost_types::{
     AccountStream, Batch, BlobId, CursorScope, Fingerprint, InventoryEntry, InventoryPartition,
-    MailboxId as TypesMailboxId, MembershipScope, ObjectId, ObjectType, PageBoundary,
+    MembershipScope, ObjectId, ObjectType, PageBoundary, PrincipalId as TypesPrincipalId,
     ServerVersion, SyncEvent, ThreadId,
 };
 
@@ -20,7 +20,7 @@ pub(crate) fn stream<T: HttpTransport>(
     mail: MailAccount<T>,
     limits: CoreLimits,
     scope: CursorScope,
-    owner: Option<TypesMailboxId>,
+    owner: Option<TypesPrincipalId>,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     match super::state::JmapScopeRepr::from_cursor_scope(&scope) {
         Ok(super::state::JmapScopeRepr::Email) => email_inventory(mail, limits),
@@ -66,7 +66,7 @@ pub(crate) fn stream_partition<T: HttpTransport>(
     limits: CoreLimits,
     scope: CursorScope,
     partition: InventoryPartition,
-    owner: Option<TypesMailboxId>,
+    owner: Option<TypesPrincipalId>,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     match partition {
         InventoryPartition::Full => stream(mail, limits, scope, owner),
@@ -85,7 +85,7 @@ fn foreign_email_inventory<T: HttpTransport>(
     limits: CoreLimits,
     scope: CursorScope,
     mailbox_id: String,
-    owner: Option<TypesMailboxId>,
+    owner: Option<TypesPrincipalId>,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     let filter =
         (!mailbox_id.is_empty()).then(|| crate::email::query::Filter::in_mailbox(mailbox_id));
@@ -103,7 +103,7 @@ fn email_inventory_loop<T: HttpTransport>(
     mail: MailAccount<T>,
     scope: CursorScope,
     filter: Option<crate::email::query::Filter>,
-    owner: Option<TypesMailboxId>,
+    owner: Option<TypesPrincipalId>,
     full_limit: usize,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     Box::pin(async_stream::stream! {
@@ -197,7 +197,7 @@ fn email_inventory_loop<T: HttpTransport>(
             for email in get_response.into_list().into_iter().filter(email_has_id) {
                 let mut entry = email_to_inventory(email, &state);
                 // Each foreign (shared/delegate) inventory item carries
-                // its owning account's `Mailbox(accountId)` membership in
+                // its owning account's `Owner(accountId)` membership in
                 // addition to its native mailbox memberships, so the
                 // consumer maps the item to its shared-account owner (the
                 // A5c-established owner-tag pattern).
@@ -244,7 +244,7 @@ fn email_inventory_loop<T: HttpTransport>(
 /// Each native `Mailbox(native)` membership is re-encoded as
 /// `Folder(encode_foreign(accountId, native))` - byte-identical to the
 /// container ids `containers_list` mints for the share - and the owner
-/// `Mailbox(accountId)` tag is appended. Without the re-encoding, a
+/// `Owner(accountId)` tag is appended. Without the re-encoding, a
 /// foreign native mailbox id (e.g. `inbox`) collides with the primary's
 /// identical id in the engine's membership index and the two accounts'
 /// messages conflate. Shared by the foreign inventory walk and by
@@ -253,7 +253,7 @@ fn email_inventory_loop<T: HttpTransport>(
 /// change stream cannot know), so the two must speak one namespace.
 pub(crate) fn qualify_foreign_memberships(
     memberships: &mut Vec<MembershipScope>,
-    owner: &TypesMailboxId,
+    owner: &TypesPrincipalId,
 ) {
     for membership in memberships.iter_mut() {
         if let MembershipScope::Mailbox(native) = membership {
@@ -261,7 +261,7 @@ pub(crate) fn qualify_foreign_memberships(
                 MembershipScope::Folder(super::foreign::encode_foreign(&owner.0, &native.0));
         }
     }
-    memberships.push(MembershipScope::Mailbox(owner.clone()));
+    memberships.push(MembershipScope::Owner(owner.clone()));
 }
 
 /// Qualify a foreign inventory item's OBJECT ids with its owning account.
@@ -282,7 +282,7 @@ pub(crate) fn qualify_foreign_memberships(
 /// so on an id collision the primary `Thread/get` resolves an UNRELATED
 /// thread and the mutation lands on its messages - `delete_thread`
 /// destroys them.
-pub(crate) fn qualify_foreign_ids(entry: &mut InventoryEntry, owner: &TypesMailboxId) {
+pub(crate) fn qualify_foreign_ids(entry: &mut InventoryEntry, owner: &TypesPrincipalId) {
     entry.id = ObjectId(super::foreign::encode_object(&owner.0, &entry.id.0));
     if let Some(blob) = entry.blob_id.take() {
         entry.blob_id = Some(BlobId(super::foreign::encode_object(&owner.0, &blob.0)));
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn foreign_memberships_are_qualified_with_owner_account() {
-        let owner = TypesMailboxId("acct-9".to_string());
+        let owner = TypesPrincipalId("acct-9".to_string());
         let mut memberships = vec![
             MembershipScope::Mailbox(MailboxId("inbox".to_string())),
             MembershipScope::Mailbox(MailboxId("mbx-2".to_string())),
@@ -569,14 +569,28 @@ mod tests {
             "native mailbox membership must be qualified, not bare"
         );
         // The owner tag is appended.
-        assert!(memberships.contains(&MembershipScope::Mailbox(owner.clone())));
+        assert!(memberships.contains(&MembershipScope::Owner(owner.clone())));
         // Two native memberships qualified + one owner tag.
         assert_eq!(memberships.len(), 3);
     }
 
     #[test]
+    fn foreign_owner_never_aliases_a_primary_mailbox_with_the_same_id() {
+        let primary = MembershipScope::Mailbox(MailboxId("a".into()));
+        let mut foreign = vec![MembershipScope::Mailbox(MailboxId("inbox".into()))];
+        qualify_foreign_memberships(&mut foreign, &TypesPrincipalId("a".into()));
+        assert!(foreign.contains(&super::super::foreign::owner_tag("a")));
+        assert!(
+            foreign
+                .iter()
+                .all(|membership| !membership.same_container(&primary))
+        );
+        assert_eq!(foreign.len(), 2);
+    }
+
+    #[test]
     fn foreign_object_and_blob_ids_are_qualified_with_owner_account() {
-        let owner = TypesMailboxId("acct-9".to_string());
+        let owner = TypesPrincipalId("acct-9".to_string());
         let mut entry = InventoryEntry {
             id: ObjectId("M1".to_string()),
             memberships: Vec::new(),
@@ -972,7 +986,7 @@ mod tests {
         for (filter, owner) in [
             (None, None),
             (Some(crate::email::query::Filter::in_mailbox("inbox")), None),
-            (None, Some(TypesMailboxId("share".to_string()))),
+            (None, Some(TypesPrincipalId("share".to_string()))),
         ] {
             let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let client = crate::client::Client::with_transport(

@@ -6,12 +6,12 @@ use bifrost_types::{
     WarningKind,
 };
 
-use crate::types::{FetchAttr, MailboxName, SelectedMailbox, UidSet};
+use crate::types::{FetchAttr, MailboxName, SelectedMailbox, UidSetExpr};
 
 use super::envelope::UidBaseline;
 
 use super::{
-    BATCH_ITEMS, CompactUidSet, FolderCursor, ImapAccount, ScopeHandler, batch, decode_cursor,
+    BATCH_ITEMS, FolderCursor, ImapAccount, ScopeHandler, UidSet, batch, decode_cursor,
     encode_cursor, encode_object_id, folder_scope, membership_scope, route_scope, terminated_event,
 };
 
@@ -153,13 +153,13 @@ enum ChangeError {
     Imap(crate::Error),
     UidValidityChanged {
         folder: MailboxName,
-        expected: u32,
-        actual: u32,
+        expected: crate::types::UidValidity,
+        actual: crate::types::UidValidity,
     },
     ModSeqReset {
         folder: MailboxName,
-        previous: u64,
-        current: Option<u64>,
+        previous: crate::types::ModSeq,
+        current: Option<crate::types::ModSeq>,
     },
     /// The consumer dropped the output receiver. This is not an error
     /// to escalate: per IMAP plan, dropped output channels stop the
@@ -266,9 +266,9 @@ async fn run_changes(
 async fn run_qresync(
     account: ImapAccount,
     folder: MailboxName,
-    expected_uidvalidity: u32,
-    modseq: u64,
-    known_uids: CompactUidSet,
+    expected_uidvalidity: crate::types::UidValidity,
+    modseq: crate::types::ModSeq,
+    known_uids: UidSet,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
     // The caller must extract Complete before dispatch; legacy baselines never
@@ -291,7 +291,10 @@ async fn run_qresync(
             }
             // A parse failure keeps its precise diagnostic; a missing
             // QRESYNC / ENABLE capability is the generic session downgrade.
-            let refusal = if matches!(err, crate::Error::Parse(_)) {
+            let refusal = if matches!(
+                err,
+                crate::Error::Provider(crate::error::ProviderFailure::Parse(_))
+            ) {
                 super::QresyncRefusal::SelectParseFailed
             } else {
                 super::QresyncRefusal::SessionDowngraded
@@ -345,11 +348,7 @@ async fn run_qresync(
         )
         .await;
     }
-    validate_modseq_not_reset(
-        &folder,
-        modseq,
-        selected.mailbox.modseq().map(crate::types::ModSeq::get),
-    )?;
+    validate_modseq_not_reset(&folder, modseq, selected.mailbox.modseq())?;
     // The SELECT did not use QRESYNC: the account policy was withdrawn
     // between the gate above and building the SELECT, or this member does
     // not have QRESYNC enabled (its dial-time ENABLE was refused or not
@@ -423,7 +422,7 @@ async fn run_qresync(
     // Reconcile membership when SELECT has not accounted for that count;
     // do not repeat the all-UID CHANGEDSINCE/VANISHED flags fetch.
     let live_set = if usize::try_from(selected.mailbox.exists).ok() != Some(live_uids.uid_count()) {
-        let current = CompactUidSet::from_uids(search_all(&account, conn.connection()).await?);
+        let current = UidSet::from_numbers(search_all(&account, conn.connection()).await?);
         let diff = live_uids.diff(&current);
         for uid in diff.added {
             changes.push(added_change(&folder, uidvalidity, uid));
@@ -494,11 +493,7 @@ async fn run_condstore_with_baseline(
         )
         .await;
     }
-    validate_modseq_not_reset(
-        &folder,
-        modseq,
-        selected.mailbox.modseq().map(crate::types::ModSeq::get),
-    )?;
+    validate_modseq_not_reset(&folder, modseq, selected.mailbox.modseq())?;
     run_condstore_from_selected(
         account,
         folder,
@@ -519,9 +514,9 @@ async fn run_condstore_with_baseline(
 /// matched the cursor, the mailbox has persistent mod-sequences, and its
 /// HIGHESTMODSEQ did not go backwards.
 struct SelectedBaseline {
-    uidvalidity: u32,
-    modseq: u64,
-    known_uids: CompactUidSet,
+    uidvalidity: crate::types::UidValidity,
+    modseq: crate::types::ModSeq,
+    known_uids: UidSet,
     selected: crate::types::SelectedMailbox,
 }
 
@@ -554,7 +549,7 @@ async fn run_condstore_from_selected(
         known_uids,
         selected,
     } = baseline;
-    let all_uids = UidSet::all();
+    let all_uids = UidSetExpr::all();
     let (mut fetch_rx, fetch_fut) = conn.connection().uid_fetch_changed_since_stream(
         all_uids.as_sequence_set(),
         &[FetchAttr::Uid, FetchAttr::Flags, FetchAttr::ModSeq],
@@ -595,7 +590,7 @@ async fn run_condstore_from_selected(
             }
         }
     }
-    let live_set = CompactUidSet::from_uids(search_all(&account, conn.connection()).await?);
+    let live_set = UidSet::from_numbers(search_all(&account, conn.connection()).await?);
     warn_if_uid_count_mismatch(&tx, &folder, selected.exists, live_set.uid_count()).await?;
     let diff = known_uids.diff(&live_set);
     for uid in diff.added {
@@ -621,7 +616,7 @@ async fn run_basic(
     let known_uids = cursor.known_uids().clone();
     let cursor_uidnext = match cursor {
         FolderCursor::Basic { uidnext, .. } => uidnext,
-        _ => 0,
+        _ => None,
     };
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
@@ -631,13 +626,13 @@ async fn run_basic(
         .map_err(|err| select_error(&account, &folder, err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, cursor.uidvalidity(), uidvalidity)?;
-    let uidnext_unchanged = cursor_uidnext != 0
-        && selected.mailbox.uid_next == Some(cursor_uidnext)
+    let uidnext_unchanged = cursor_uidnext.is_some()
+        && selected.mailbox.uid_next == cursor_uidnext
         && usize::try_from(selected.mailbox.exists).ok() == Some(known_uids.uid_count());
     let live_set = if uidnext_unchanged {
         known_uids.clone()
     } else {
-        CompactUidSet::from_uids(search_all(&account, conn.connection()).await?)
+        UidSet::from_numbers(search_all(&account, conn.connection()).await?)
     };
     warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let diff = known_uids.diff(&live_set);
@@ -668,7 +663,7 @@ async fn run_basic(
     }
     let next = FolderCursor::Basic {
         uidvalidity,
-        uidnext: selected.mailbox.uid_next.unwrap_or_default(),
+        uidnext: selected.mailbox.uid_next,
         known_uids: live_set,
     };
     let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
@@ -678,7 +673,7 @@ async fn run_basic(
 async fn run_basic_from_selected(
     account: ImapAccount,
     folder: MailboxName,
-    known_uids: CompactUidSet,
+    known_uids: UidSet,
     selected: crate::types::SelectedMailbox,
     conn: super::PooledConn,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
@@ -686,7 +681,7 @@ async fn run_basic_from_selected(
 ) -> Result<(), ChangeError> {
     let uidvalidity = selected_uidvalidity(&selected)?;
     let live = search_all(&account, conn.connection()).await?;
-    let live_set = CompactUidSet::from_uids(live);
+    let live_set = UidSet::from_numbers(live);
     warn_if_uid_count_mismatch(&tx, &folder, selected.exists, live_set.uid_count()).await?;
     let diff = known_uids.diff(&live_set);
     let mut changes = Vec::with_capacity(BATCH_ITEMS);
@@ -716,7 +711,7 @@ async fn run_basic_from_selected(
     }
     let next = FolderCursor::Basic {
         uidvalidity,
-        uidnext: selected.uid_next.unwrap_or_default(),
+        uidnext: selected.uid_next,
         known_uids: live_set,
     };
     let bytes_in = super::measured_bytes_in(conn.connection(), previous_bytes_in);
@@ -810,9 +805,9 @@ async fn flush_page(
 /// the stream has no mechanism for and no right to do. Accepted, not open.
 fn record_fetch_change(
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     uid: Option<u32>,
-    live_uids: &mut CompactUidSet,
+    live_uids: &mut UidSet,
     fetch_change_seen: &mut BTreeSet<u32>,
     removed_seen: &mut BTreeSet<u32>,
     changes: &mut Vec<Change>,
@@ -843,11 +838,15 @@ fn record_fetch_change(
 
 fn remove_buffered_removed_change(
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     uid: u32,
     changes: &mut Vec<Change>,
 ) -> bool {
-    let id = encode_object_id(folder, uidvalidity, uid);
+    let id = encode_object_id(
+        folder,
+        uidvalidity,
+        crate::types::Uid::new(uid).expect("wire UID is nonzero"),
+    );
     let Some(index) = changes.iter().rposition(|change| {
         matches!(
             change,
@@ -864,25 +863,45 @@ fn remove_buffered_removed_change(
     true
 }
 
-fn added_change(folder: &MailboxName, uidvalidity: u32, uid: u32) -> Change {
+fn added_change(folder: &MailboxName, uidvalidity: crate::types::UidValidity, uid: u32) -> Change {
     Change::ScopeChange(ScopeChange {
-        id: encode_object_id(folder, uidvalidity, uid),
+        id: encode_object_id(
+            folder,
+            uidvalidity,
+            crate::types::Uid::new(uid).expect("wire UID is nonzero"),
+        ),
         membership: membership_scope(folder),
         kind: ScopeChangeKind::Added,
     })
 }
 
-fn removed_change(folder: &MailboxName, uidvalidity: u32, uid: u32) -> Change {
+fn removed_change(
+    folder: &MailboxName,
+    uidvalidity: crate::types::UidValidity,
+    uid: u32,
+) -> Change {
     Change::ScopeChange(ScopeChange {
-        id: encode_object_id(folder, uidvalidity, uid),
+        id: encode_object_id(
+            folder,
+            uidvalidity,
+            crate::types::Uid::new(uid).expect("wire UID is nonzero"),
+        ),
         membership: membership_scope(folder),
         kind: ScopeChangeKind::Removed,
     })
 }
 
-fn updated_change(folder: &MailboxName, uidvalidity: u32, uid: u32) -> Change {
+fn updated_change(
+    folder: &MailboxName,
+    uidvalidity: crate::types::UidValidity,
+    uid: u32,
+) -> Change {
     Change::ObjectChange(ObjectChange {
-        id: encode_object_id(folder, uidvalidity, uid),
+        id: encode_object_id(
+            folder,
+            uidvalidity,
+            crate::types::Uid::new(uid).expect("wire UID is nonzero"),
+        ),
         kind: ObjectChangeKind::Updated,
     })
 }
@@ -905,10 +924,10 @@ fn updated_change(folder: &MailboxName, uidvalidity: u32, uid: u32) -> Change {
 /// flag changes for every existing UID without fetching the full mailbox.
 fn basic_updated_change(
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     uid: u32,
-    known_uids: &CompactUidSet,
-    live_uids: &CompactUidSet,
+    known_uids: &UidSet,
+    live_uids: &UidSet,
 ) -> Result<Option<Change>, ChangeError> {
     if known_uids.contains(uid) {
         return Ok(Some(updated_change(folder, uidvalidity, uid)));
@@ -921,8 +940,8 @@ fn basic_updated_change(
 
 fn validate_uidvalidity(
     folder: &MailboxName,
-    expected: u32,
-    actual: u32,
+    expected: crate::types::UidValidity,
+    actual: crate::types::UidValidity,
 ) -> Result<(), ChangeError> {
     if expected == actual {
         return Ok(());
@@ -934,14 +953,16 @@ fn validate_uidvalidity(
     })
 }
 
-fn selected_uidvalidity(selected: &SelectedMailbox) -> Result<u32, ChangeError> {
+fn selected_uidvalidity(
+    selected: &SelectedMailbox,
+) -> Result<crate::types::UidValidity, ChangeError> {
     Ok(super::selected_uidvalidity(selected)?)
 }
 
 fn validate_modseq_not_reset(
     folder: &MailboxName,
-    previous: u64,
-    current: Option<u64>,
+    previous: crate::types::ModSeq,
+    current: Option<crate::types::ModSeq>,
 ) -> Result<(), ChangeError> {
     if current.is_some_and(|current| current >= previous) {
         return Ok(());
@@ -962,31 +983,20 @@ async fn warn_if_uid_count_mismatch<T>(
     if usize::try_from(expected).ok() == Some(actual) {
         return Ok(());
     }
-    send_warning(
-        tx,
-        WarningKind::Other,
-        &format!(
-            "IMAP UID count differs from SELECT EXISTS for {}: SELECT EXISTS {}, UID set {}",
-            folder.as_str(),
-            expected,
-            actual,
-        ),
-    )
-    .await
-}
-
-async fn send_warning<T>(
-    tx: &tokio::sync::mpsc::Sender<SyncEvent<T>>,
-    kind: WarningKind,
-    message: &str,
-) -> Result<(), ChangeError> {
     tx.send(SyncEvent::Warning(
-        Warning::support_only(kind, message)
-            .with_protocol_detail(bifrost_types::DiagnosticText::support_only("imap")),
+        Warning::support_only(
+            WarningKind::UidCountMismatch { expected, actual },
+            format!(
+                "IMAP UID count differs from SELECT EXISTS for {}: SELECT EXISTS {}, UID set {}",
+                folder.as_str(),
+                expected,
+                actual,
+            ),
+        )
+        .with_scope(bifrost_types::ErrorScope::Cursor(folder_scope(folder))),
     ))
     .await
-    .map_err(|_| ChangeError::ChannelDropped)?;
-    Ok(())
+    .map_err(|_| ChangeError::ChannelDropped)
 }
 
 async fn send_strategy_downgrade<T>(
@@ -996,9 +1006,22 @@ async fn send_strategy_downgrade<T>(
     reason: &str,
 ) -> Result<(), ChangeError> {
     tx.send(SyncEvent::Warning(
-        Warning::support_only(WarningKind::StrategyDowngraded, reason).with_protocol_detail(
-            bifrost_types::DiagnosticText::support_only(format!("{from:?}->{to:?}")),
-        ),
+        Warning::support_only(WarningKind::StrategyDowngraded, reason)
+            .with_strategy_downgrade(match (from, to) {
+                (SyncStrategy::QResync, SyncStrategy::Condstore) => {
+                    bifrost_types::StrategyDowngrade::QResyncToCondstore
+                }
+                (SyncStrategy::Condstore, SyncStrategy::Basic) => {
+                    bifrost_types::StrategyDowngrade::CondstoreToBasic
+                }
+                (SyncStrategy::QResync, SyncStrategy::Basic) => {
+                    bifrost_types::StrategyDowngrade::QResyncToBasic
+                }
+                _ => unreachable!("strategy downgrade must name an adjacent fallback"),
+            })
+            .with_protocol_detail(bifrost_types::DiagnosticText::support_only(format!(
+                "{from:?}->{to:?}"
+            ))),
     ))
     .await
     .map_err(|_| ChangeError::ChannelDropped)?;
@@ -1007,7 +1030,7 @@ async fn send_strategy_downgrade<T>(
 
 fn should_disable_qresync(err: &crate::Error) -> bool {
     match err {
-        crate::Error::Parse(_) => true,
+        crate::Error::Provider(crate::error::ProviderFailure::Parse(_)) => true,
         // "ENABLE" covers select_for_sync's enable() leg on a server that
         // advertises QRESYNC without ENABLE (possible pre-rev2): in this
         // QRESYNC-only context a missing ENABLE means QRESYNC cannot be
@@ -1015,7 +1038,7 @@ fn should_disable_qresync(err: &crate::Error) -> bool {
         // The typed capability decides, never the diagnostic prose: QRESYNC
         // not advertised or not ENABLEd, or an alternatives gate that QRESYNC
         // would have satisfied.
-        crate::Error::MissingCapability(failure) => {
+        crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(failure)) => {
             use crate::error::CapabilityFailureReason;
             use crate::types::Capability;
             match (&failure.capability, &failure.reason) {
@@ -1032,7 +1055,10 @@ fn should_disable_qresync(err: &crate::Error) -> bool {
 }
 
 fn should_discard_conn_after_qresync_error(err: &crate::Error) -> bool {
-    matches!(err, crate::Error::Parse(_))
+    matches!(
+        err,
+        crate::Error::Provider(crate::error::ProviderFailure::Parse(_))
+    )
 }
 
 #[cfg(test)]
@@ -1061,16 +1087,20 @@ mod tests {
         parts.folders = std::sync::Arc::new(registry);
         let account = super::super::ImapAccount::new(parts);
         let cursor = FolderCursor::Basic {
-            uidvalidity: 7,
-            uidnext: 2,
-            known_uids: CompactUidSet::from_uids([1]),
+            uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            uidnext: crate::types::Uid::new(2),
+            known_uids: UidSet::from_numbers([1]),
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(finish_changes(
             account.clone(),
             folder.clone(),
             cursor,
-            vec![added_change(&folder, 7, 1)],
+            vec![added_change(
+                &folder,
+                crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                1,
+            )],
             tx,
             0,
         ));
@@ -1101,9 +1131,9 @@ mod tests {
     // range subtraction used by the stream.
     fn record_removed_change(
         folder: &MailboxName,
-        uidvalidity: u32,
+        uidvalidity: crate::types::UidValidity,
         uid: u32,
-        live_uids: &mut CompactUidSet,
+        live_uids: &mut UidSet,
         removed_seen: &mut BTreeSet<u32>,
         changes: &mut Vec<Change>,
     ) {
@@ -1116,7 +1146,12 @@ mod tests {
     #[test]
     fn uidvalidity_mismatch_requests_scope_restart() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let err = validate_uidvalidity(&folder, 7, 8).expect_err("mismatch should fail");
+        let err = validate_uidvalidity(
+            &folder,
+            crate::types::UidValidity::new(7).unwrap(),
+            crate::types::UidValidity::new(8).unwrap(),
+        )
+        .expect_err("mismatch should fail");
         let ChangeError::UidValidityChanged {
             folder,
             expected,
@@ -1137,7 +1172,12 @@ mod tests {
     #[test]
     fn modseq_reset_requests_scope_restart() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let err = validate_modseq_not_reset(&folder, 10, Some(9)).expect_err("reset should fail");
+        let err = validate_modseq_not_reset(
+            &folder,
+            crate::types::ModSeq::new(10).expect("valid protocol test value"),
+            Some(crate::types::ModSeq::new(9).expect("valid protocol test value")),
+        )
+        .expect_err("reset should fail");
         let ChangeError::ModSeqReset {
             folder,
             previous,
@@ -1167,7 +1207,10 @@ mod tests {
         assert!(matches!(
             event,
             SyncEvent::Warning(Warning {
-                kind: WarningKind::Other,
+                kind: WarningKind::UidCountMismatch {
+                    expected: 2,
+                    actual: 1
+                },
                 ..
             })
         ));
@@ -1176,14 +1219,14 @@ mod tests {
     #[test]
     fn qresync_record_helpers_deduplicate_select_and_fetch_data() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let mut live_uids = CompactUidSet::from_uids([1, 2]);
+        let mut live_uids = UidSet::from_numbers([1, 2]);
         let mut fetch_seen = BTreeSet::new();
         let mut removed_seen = BTreeSet::new();
         let mut changes = Vec::new();
 
         record_fetch_change(
             &folder,
-            99,
+            crate::types::UidValidity::new(99).expect("valid protocol test value"),
             Some(3),
             &mut live_uids,
             &mut fetch_seen,
@@ -1192,7 +1235,7 @@ mod tests {
         );
         record_fetch_change(
             &folder,
-            99,
+            crate::types::UidValidity::new(99).expect("valid protocol test value"),
             Some(3),
             &mut live_uids,
             &mut fetch_seen,
@@ -1201,7 +1244,7 @@ mod tests {
         );
         record_removed_change(
             &folder,
-            99,
+            crate::types::UidValidity::new(99).expect("valid protocol test value"),
             2,
             &mut live_uids,
             &mut removed_seen,
@@ -1209,7 +1252,7 @@ mod tests {
         );
         record_removed_change(
             &folder,
-            99,
+            crate::types::UidValidity::new(99).expect("valid protocol test value"),
             2,
             &mut live_uids,
             &mut removed_seen,
@@ -1217,7 +1260,7 @@ mod tests {
         );
         record_fetch_change(
             &folder,
-            99,
+            crate::types::UidValidity::new(99).expect("valid protocol test value"),
             Some(2),
             &mut live_uids,
             &mut fetch_seen,
@@ -1240,7 +1283,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(live_uids, CompactUidSet::from_uids([1, 2, 3]));
+        assert_eq!(live_uids, UidSet::from_numbers([1, 2, 3]));
     }
 
     // A HIGHESTMODSEQ that merely stayed put is not a reset; only a
@@ -1249,10 +1292,31 @@ mod tests {
     #[test]
     fn modseq_reset_detection_accepts_equal_and_rejects_absent() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        assert!(validate_modseq_not_reset(&folder, 10, Some(10)).is_ok());
-        assert!(validate_modseq_not_reset(&folder, 10, Some(11)).is_ok());
-        assert!(validate_modseq_not_reset(&folder, 0, Some(0)).is_ok());
-        assert!(validate_modseq_not_reset(&folder, 10, None).is_err());
+        assert!(
+            validate_modseq_not_reset(
+                &folder,
+                crate::types::ModSeq::new(10).expect("valid protocol test value"),
+                Some(crate::types::ModSeq::new(10).expect("valid protocol test value"))
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_modseq_not_reset(
+                &folder,
+                crate::types::ModSeq::new(10).expect("valid protocol test value"),
+                Some(crate::types::ModSeq::new(11).expect("valid protocol test value"))
+            )
+            .is_ok()
+        );
+        assert!(crate::types::ModSeq::new(0).is_none());
+        assert!(
+            validate_modseq_not_reset(
+                &folder,
+                crate::types::ModSeq::new(10).expect("valid protocol test value"),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1271,26 +1335,33 @@ mod tests {
 
     #[tokio::test]
     async fn strategy_downgrade_warning_names_both_strategies() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<SyncEvent<Change>>(1);
-        send_strategy_downgrade(
-            &tx,
-            SyncStrategy::QResync,
-            SyncStrategy::Condstore,
-            "server said no",
-        )
-        .await
-        .expect("warning should send");
-        let event = rx.recv().await.expect("warning event");
-        assert!(
-            matches!(
-                event,
-                SyncEvent::Warning(Warning {
-                    kind: WarningKind::StrategyDowngraded,
-                    ..
-                })
+        for (from, to, downgrade) in [
+            (
+                SyncStrategy::QResync,
+                SyncStrategy::Condstore,
+                bifrost_types::StrategyDowngrade::QResyncToCondstore,
             ),
-            "a downgrade must be reported as StrategyDowngraded, not a generic warning",
-        );
+            (
+                SyncStrategy::QResync,
+                SyncStrategy::Basic,
+                bifrost_types::StrategyDowngrade::QResyncToBasic,
+            ),
+            (
+                SyncStrategy::Condstore,
+                SyncStrategy::Basic,
+                bifrost_types::StrategyDowngrade::CondstoreToBasic,
+            ),
+        ] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<SyncEvent<Change>>(1);
+            send_strategy_downgrade(&tx, from, to, "server said no")
+                .await
+                .expect("warning sends");
+            let SyncEvent::Warning(warning) = rx.recv().await.expect("warning event") else {
+                panic!("expected a downgrade warning");
+            };
+            assert_eq!(warning.kind, WarningKind::StrategyDowngraded);
+            assert_eq!(warning.strategy_downgrade, Some(downgrade));
+        }
     }
 
     // The dedup only rewrites a Removed that is still buffered in THIS
@@ -1299,14 +1370,14 @@ mod tests {
     #[test]
     fn a_fetch_after_an_already_flushed_removal_reports_added() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let mut live_uids = CompactUidSet::from_uids([1, 2]);
+        let mut live_uids = UidSet::from_numbers([1, 2]);
         let mut fetch_seen = BTreeSet::new();
         let mut removed_seen = BTreeSet::new();
         let mut changes = Vec::new();
 
         record_removed_change(
             &folder,
-            99,
+            crate::types::UidValidity::new(99).expect("valid protocol test value"),
             2,
             &mut live_uids,
             &mut removed_seen,
@@ -1317,7 +1388,7 @@ mod tests {
 
         record_fetch_change(
             &folder,
-            99,
+            crate::types::UidValidity::new(99).expect("valid protocol test value"),
             Some(2),
             &mut live_uids,
             &mut fetch_seen,
@@ -1345,14 +1416,14 @@ mod tests {
     #[test]
     fn a_buffered_removal_is_retracted_into_an_update() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let mut live_uids = CompactUidSet::from_uids([1, 2]);
+        let mut live_uids = UidSet::from_numbers([1, 2]);
         let mut fetch_seen = BTreeSet::new();
         let mut removed_seen = BTreeSet::new();
         let mut changes = Vec::new();
 
         record_removed_change(
             &folder,
-            99,
+            crate::types::UidValidity::new(99).expect("valid protocol test value"),
             2,
             &mut live_uids,
             &mut removed_seen,
@@ -1360,7 +1431,7 @@ mod tests {
         );
         record_fetch_change(
             &folder,
-            99,
+            crate::types::UidValidity::new(99).expect("valid protocol test value"),
             Some(2),
             &mut live_uids,
             &mut fetch_seen,
@@ -1381,13 +1452,13 @@ mod tests {
     #[test]
     fn a_fetch_without_a_uid_is_ignored() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let mut live_uids = CompactUidSet::default();
+        let mut live_uids = UidSet::default();
         let mut fetch_seen = BTreeSet::new();
         let mut removed_seen = BTreeSet::new();
         let mut changes = Vec::new();
         record_fetch_change(
             &folder,
-            99,
+            crate::types::UidValidity::new(99).expect("valid protocol test value"),
             None,
             &mut live_uids,
             &mut fetch_seen,
@@ -1401,24 +1472,42 @@ mod tests {
     #[test]
     fn basic_server_update_is_classified_against_baseline_and_live_set() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let known = CompactUidSet::from_uids([1, 2]);
-        let live = CompactUidSet::from_uids([1, 2, 3]);
+        let known = UidSet::from_numbers([1, 2]);
+        let live = UidSet::from_numbers([1, 2, 3]);
 
         assert!(
-            basic_updated_change(&folder, 7, 2, &known, &live)
-                .expect("a baseline UID is a plain update")
-                .is_some(),
+            basic_updated_change(
+                &folder,
+                crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                2,
+                &known,
+                &live
+            )
+            .expect("a baseline UID is a plain update")
+            .is_some(),
             "a UID the consumer already knows must surface as Updated"
         );
         assert!(
-            basic_updated_change(&folder, 7, 3, &known, &live)
-                .expect("an arrival is not a cursor fault")
-                .is_none(),
+            basic_updated_change(
+                &folder,
+                crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                3,
+                &known,
+                &live
+            )
+            .expect("an arrival is not a cursor fault")
+            .is_none(),
             "an arrival is owned by the baseline diff's Added lane, not Updated"
         );
 
-        let error = basic_updated_change(&folder, 7, 9, &known, &live)
-            .expect_err("a UID in neither set cannot be described at all");
+        let error = basic_updated_change(
+            &folder,
+            crate::types::UidValidity::new(7).expect("valid protocol test value"),
+            9,
+            &known,
+            &live,
+        )
+        .expect_err("a UID in neither set cannot be described at all");
         let ChangeError::Account(error) = error else {
             panic!("unknown Basic UID must be a cursor error");
         };
@@ -1430,46 +1519,46 @@ mod tests {
 
     #[test]
     fn qresync_disable_fallback_uses_parse_errors_and_enable_misses() {
-        assert!(should_disable_qresync(&crate::Error::Parse(
-            "malformed FETCH".to_string(),
+        assert!(should_disable_qresync(&crate::Error::Provider(
+            crate::error::ProviderFailure::Parse("malformed FETCH".to_string(),)
         )));
         use crate::error::{CapabilityFailure, CapabilityFailureReason};
         use crate::types::Capability;
-        assert!(should_disable_qresync(&crate::Error::MissingCapability(
-            CapabilityFailure::new(
+        assert!(should_disable_qresync(&crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(CapabilityFailure::new(
                 Capability::QResync,
                 CapabilityFailureReason::NotEnabled,
                 "QRESYNC (not ENABLEd)",
-            ),
+            ),)
         )));
         // The dispatch gate on a server that does not advertise QRESYNC.
-        assert!(should_disable_qresync(&crate::Error::MissingCapability(
-            CapabilityFailure::new(
+        assert!(should_disable_qresync(&crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(CapabilityFailure::new(
                 Capability::QResync,
                 CapabilityFailureReason::NotAdvertised,
                 "SELECT (QRESYNC) requires QRESYNC",
-            ),
+            ),)
         )));
         // The enable() leg on a server advertising QRESYNC without ENABLE.
-        assert!(should_disable_qresync(&crate::Error::MissingCapability(
-            "ENABLE".into(),
+        assert!(should_disable_qresync(&crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability("ENABLE".into(),)
         )));
-        assert!(!should_disable_qresync(&crate::Error::Protocol(
-            "missing FLAGS".to_string(),
+        assert!(!should_disable_qresync(&crate::Error::Provider(
+            crate::error::ProviderFailure::Protocol("missing FLAGS".to_string(),)
         )));
-        assert!(!should_disable_qresync(&crate::Error::MissingCapability(
-            "CONDSTORE".into(),
+        assert!(!should_disable_qresync(&crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability("CONDSTORE".into(),)
         )));
-        assert!(!should_disable_qresync(&crate::Error::MissingCapability(
-            "QRESYNC_V2".into(),
+        assert!(!should_disable_qresync(&crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability("QRESYNC_V2".into(),)
         )));
         // Prose naming QRESYNC on another capability's failure does not count.
-        assert!(!should_disable_qresync(&crate::Error::MissingCapability(
-            CapabilityFailure::new(
+        assert!(!should_disable_qresync(&crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(CapabilityFailure::new(
                 Capability::Condstore,
                 CapabilityFailureReason::NotAdvertised,
                 "QRESYNC session needs CONDSTORE",
-            ),
+            ),)
         )));
     }
 }

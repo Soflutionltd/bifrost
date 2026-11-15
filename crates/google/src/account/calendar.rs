@@ -22,8 +22,8 @@ use bifrost_types::{
 use bifrost_types::{
     AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, EventAttendee,
     EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
-    EventRecurrence, EventSearchRequest, EventStatus, EventTime, EventVisibility, Page,
-    ProtocolKind, RsvpStatus,
+    EventRecurrence, EventSearchRequest, EventStatus, EventTime, EventTimeKind, EventVisibility,
+    Page, ProtocolKind, RsvpStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -169,7 +169,7 @@ pub(crate) fn create(
             AccountOperation::EventCreate,
             Some(&event.start),
             Some(&event.end),
-            Some(event.is_all_day),
+            Some(event.is_all_day()),
         )?;
         let body = google_event_from_create(&event)?;
         let calendar_id = event.calendar_id.0.clone();
@@ -738,16 +738,9 @@ fn event_from_google(
     let cancelled_instance_time = is_cancelled
         .then(|| event.original_start_time.clone())
         .flatten();
-    // `is_all_day` must be read off the EFFECTIVE start, not `event.start`.
-    // A cancelled instance of an all-day recurrence arrives with no `start`
-    // at all and only `originalStartTime.date`, so deciding all-day-ness
-    // from `event.start` alone yields a date-valued start and end paired
-    // with `is_all_day: false` - a shape the shared surface treats as a
-    // timed event and renders at midnight.
+    // A cancelled instance can carry its date only in originalStartTime.
+    // Its typed effective start owns the all-day interpretation.
     let effective_start = event.start.or_else(|| cancelled_instance_time.clone());
-    let is_all_day = effective_start
-        .as_ref()
-        .is_some_and(|time| time.date.is_some() && time.date_time.is_none());
     // A tombstone is not a malformed event. Under `showDeleted=true` a
     // cancelled INSTANCE of a recurrence arrives with only
     // `originalStartTime`, and a cancelled STANDALONE event arrives as a
@@ -812,7 +805,6 @@ fn event_from_google(
         location: event.location,
         start,
         end,
-        is_all_day,
         status: event_status(event.status.as_deref()),
         availability: availability(event.transparency.as_deref()),
         visibility: visibility(event.visibility.as_deref()),
@@ -844,7 +836,7 @@ fn event_from_google(
             recurrence_id: event
                 .original_start_time
                 .map(event_time)
-                .map(|time| time.value),
+                .map(|time| time.value().to_owned()),
         },
         html_link: event.html_link,
         raw_ical: None,
@@ -856,10 +848,10 @@ fn google_event_from_create(event: &EventCreate) -> Result<GoogleEventPatch, Acc
         summary: event.title.clone().map(Some),
         description: event.description.clone().map(Some),
         location: event.location.clone().map(Some),
-        start: Some(google_time(&event.start, event.is_all_day)),
+        start: Some(google_time(&event.start, event.is_all_day())),
         // A blank end never reaches here: `reject_unusable_write_times`
         // refuses it on create.
-        end: Some(google_time(&event.end, event.is_all_day)),
+        end: Some(google_time(&event.end, event.is_all_day())),
         status: Some(google_event_status(event.status).to_string()),
         attendees: google_attendees(&event.attendees, AccountOperation::EventCreate)?,
         recurrence: recurrence_lines(&event.recurrence, AccountOperation::EventCreate)?,
@@ -882,7 +874,7 @@ fn google_event_from_patch(patch: &EventPatch) -> Result<GoogleEventPatch, Accou
         start: patch
             .start
             .as_ref()
-            .map(|time| google_time(time, patch.is_all_day.unwrap_or(is_ymd_date(&time.value)))),
+            .map(|time| google_time(time, patch.is_all_day.unwrap_or(time.is_all_day()))),
         // An empty `end` is the projection's "no end" for an
         // `endTimeUnspecified` event (see `reject_unusable_write_times`), so
         // echoing it back leaves the stored end alone: it is omitted rather
@@ -891,7 +883,7 @@ fn google_event_from_patch(patch: &EventPatch) -> Result<GoogleEventPatch, Accou
             .end
             .as_ref()
             .filter(|time| !is_blank_time(time))
-            .map(|time| google_time(time, patch.is_all_day.unwrap_or(is_ymd_date(&time.value)))),
+            .map(|time| google_time(time, patch.is_all_day.unwrap_or(time.is_all_day()))),
         status: patch
             .status
             .map(|status| google_event_status(status).to_string()),
@@ -990,21 +982,21 @@ fn google_attendee(
 fn google_time(time: &EventTime, all_day: bool) -> GoogleEventTime {
     if all_day {
         GoogleEventTime {
-            date: Some(time.value.clone()),
+            date: Some(time.value().to_owned()),
             date_time: None,
-            time_zone: time.timezone.clone(),
+            time_zone: time.timezone().map(str::to_owned),
         }
     } else {
         GoogleEventTime {
             date: None,
-            date_time: Some(time.value.clone()),
-            time_zone: time.timezone.clone(),
+            date_time: Some(time.value().to_owned()),
+            time_zone: time.timezone().map(str::to_owned),
         }
     }
 }
 
 fn is_blank_time(time: &EventTime) -> bool {
-    time.value.trim().is_empty()
+    time.is_unspecified()
 }
 
 // Write-side guard for event times, run before any request (and, on update,
@@ -1083,6 +1075,14 @@ fn reject_unusable_write_times(
             GmailErrorContext::calendar_collection(operation),
         ));
     }
+    if let (Some(start), Some(end)) = (start, end.filter(|end| !end.is_unspecified())) {
+        start.validate_end(end).map_err(|_| {
+            caller_input_error(
+                operation,
+                "Google Calendar end must follow start in the same time domain".to_string(),
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -1092,9 +1092,8 @@ fn reject_malformed_time_shape(
     time: &EventTime,
     is_all_day: Option<bool>,
 ) -> Result<(), AccountError> {
-    let value = time.value.as_str();
-    if is_all_day.unwrap_or_else(|| is_ymd_date(value)) {
-        if is_ymd_date(value) && value.parse::<jiff::civil::Date>().is_ok() {
+    if is_all_day.unwrap_or_else(|| time.is_all_day()) {
+        if time.is_all_day() {
             return Ok(());
         }
         return Err(caller_input_error(
@@ -1102,28 +1101,13 @@ fn reject_malformed_time_shape(
             format!("Google Calendar all-day `{field}` must be a YYYY-MM-DD date"),
         ));
     }
-    let has_time_separator = value.contains('T');
-    if has_time_separator && has_rfc3339_offset(value) && value.parse::<jiff::Timestamp>().is_ok() {
-        return Ok(());
-    }
-    // A local date-time is only meaningful beside a `timezone`; Google reads
-    // it in that zone. Offset and `Z` forms were handled above, so anything
-    // still carrying one here is not a bare local time.
-    let is_bare_local = has_time_separator
-        && !value.contains(['+', 'Z', 'z', '['])
-        && !value
-            .rsplit('T')
-            .next()
-            .is_some_and(|time| time.contains('-'))
-        && value.parse::<jiff::civil::DateTime>().is_ok();
-    if is_bare_local
-        && time
-            .timezone
-            .as_deref()
-            .is_some_and(|zone| !zone.trim().is_empty())
+    if matches!(time.kind(), EventTimeKind::Offset(_))
+        || matches!(time.kind(), EventTimeKind::Zoned(_))
+            && time.timezone().is_some_and(|zone| !zone.trim().is_empty())
     {
         return Ok(());
     }
+
     Err(caller_input_error(
         operation,
         format!(
@@ -1134,18 +1118,18 @@ fn reject_malformed_time_shape(
 }
 
 fn google_range_bound(time: &EventTime, field: &'static str) -> Result<String, AccountError> {
-    if is_ymd_date(&time.value) {
-        return Ok(format!("{}T00:00:00Z", time.value));
+    if time.is_all_day() {
+        return Ok(format!("{}T00:00:00Z", time.value()));
     }
-    if has_rfc3339_offset(&time.value) {
-        return Ok(time.value.clone());
+    if time.instant().is_some() {
+        return Ok(time.value().to_owned());
     }
-    if time
-        .timezone
-        .as_deref()
-        .is_some_and(|timezone| matches!(timezone, "UTC" | "Etc/UTC" | "Etc/GMT"))
+    if matches!(time.kind(), EventTimeKind::Zoned(_))
+        && time
+            .timezone()
+            .is_some_and(|timezone| matches!(timezone, "UTC" | "Etc/UTC" | "Etc/GMT"))
     {
-        return Ok(format!("{}Z", time.value));
+        return Ok(format!("{}Z", time.value()));
     }
     Err(caller_input_error(
         AccountOperation::EventsInRange,
@@ -1153,41 +1137,11 @@ fn google_range_bound(time: &EventTime, field: &'static str) -> Result<String, A
     ))
 }
 
-fn is_ymd_date(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
-}
-
-fn has_rfc3339_offset(value: &str) -> bool {
-    if value.ends_with('Z') {
-        return true;
-    }
-    let Some(time_index) = value.find('T') else {
-        return false;
-    };
-    let Some(offset) = value.get(value.len().saturating_sub(6)..) else {
-        return false;
-    };
-    value.len() > time_index + 6
-        && (offset.starts_with('+') || offset.starts_with('-'))
-        && offset.as_bytes()[3] == b':'
-        && offset
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| index == 0 || index == 3 || byte.is_ascii_digit())
-}
-
 fn event_time(time: GoogleEventTime) -> EventTime {
-    EventTime {
-        value: time.date_time.or(time.date).unwrap_or_default(),
-        timezone: time.time_zone,
-    }
+    EventTime::from_observed(
+        time.date_time.or(time.date).unwrap_or_default(),
+        time.time_zone,
+    )
 }
 
 // The time a tombstone that carries no time at all projects to. Not a new
@@ -1197,10 +1151,7 @@ fn event_time(time: GoogleEventTime) -> EventTime {
 // a cancelled standalone stub, and is distinguishable from any real
 // Google timestamp.
 fn unknown_event_time() -> EventTime {
-    EventTime {
-        value: String::new(),
-        timezone: None,
-    }
+    EventTime::from_observed(String::new(), None)
 }
 
 /// A PATCH failed after the move committed. The PATCH leaf keeps its own
@@ -1598,10 +1549,7 @@ mod tests {
         );
         assert_client_bug(
             google_range_bound(
-                &EventTime {
-                    value: "2026-09-29T10:00:00".into(),
-                    timezone: Some("Europe/Oslo".into()),
-                },
+                &EventTime::from_observed("2026-09-29T10:00:00", Some("Europe/Oslo".into())),
                 "timeMin",
             )
             .expect_err("a floating bound in a non-UTC zone is refused"),
@@ -1865,14 +1813,11 @@ mod tests {
         )]);
         let range = EventRange {
             calendar_id: CalendarId("primary".to_string()),
-            start: bifrost_types::EventTime {
-                value: "2026-06-01T00:00:00Z".to_string(),
-                timezone: None,
-            },
-            end: bifrost_types::EventTime {
-                value: "2026-06-03T00:00:00Z".to_string(),
-                timezone: None,
-            },
+            start: bifrost_types::EventTime::from_observed(
+                "2026-06-01T00:00:00Z".to_string(),
+                None,
+            ),
+            end: bifrost_types::EventTime::from_observed("2026-06-03T00:00:00Z".to_string(), None),
             limit: None,
             page_cursor: None,
         };
@@ -1882,7 +1827,7 @@ mod tests {
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].status, EventStatus::Cancelled);
         assert!(
-            !page.items[0].is_all_day,
+            !page.items[0].is_all_day(),
             "a dateTime tombstone is a timed instance",
         );
         assert!(script.requests()[0].url.query().is_some_and(|query| {
@@ -1909,14 +1854,11 @@ mod tests {
         )]);
         let range = EventRange {
             calendar_id: CalendarId("primary".to_string()),
-            start: bifrost_types::EventTime {
-                value: "2026-06-01T00:00:00Z".to_string(),
-                timezone: None,
-            },
-            end: bifrost_types::EventTime {
-                value: "2026-06-03T00:00:00Z".to_string(),
-                timezone: None,
-            },
+            start: bifrost_types::EventTime::from_observed(
+                "2026-06-01T00:00:00Z".to_string(),
+                None,
+            ),
+            end: bifrost_types::EventTime::from_observed("2026-06-03T00:00:00Z".to_string(), None),
             limit: None,
             page_cursor: None,
         };
@@ -1925,13 +1867,10 @@ mod tests {
 
         let event = &page.items[0];
         assert_eq!(event.status, EventStatus::Cancelled);
-        assert_eq!(event.start.value, "2026-06-02");
-        assert_eq!(
-            event.end.as_ref().map(|end| end.value.as_str()),
-            Some("2026-06-02")
-        );
+        assert_eq!(event.start.value(), "2026-06-02");
+        assert_eq!(event.end.as_ref().map(EventTime::value), Some("2026-06-02"));
         assert!(
-            event.is_all_day,
+            event.is_all_day(),
             "a date-valued tombstone must project as an all-day instance",
         );
     }
@@ -1939,14 +1878,8 @@ mod tests {
     fn primary_range() -> EventRange {
         EventRange {
             calendar_id: CalendarId("primary".to_string()),
-            start: EventTime {
-                value: "2026-06-01T00:00:00Z".to_string(),
-                timezone: None,
-            },
-            end: EventTime {
-                value: "2026-06-03T00:00:00Z".to_string(),
-                timezone: None,
-            },
+            start: EventTime::from_observed("2026-06-01T00:00:00Z".to_string(), None),
+            end: EventTime::from_observed("2026-06-03T00:00:00Z".to_string(), None),
             limit: None,
             page_cursor: None,
         }
@@ -1973,10 +1906,10 @@ mod tests {
 
         assert_eq!(event.id.0, join_event_id("primary", "deleted-standalone"));
         assert_eq!(event.status, EventStatus::Cancelled);
-        assert_eq!(event.start.value, "");
+        assert_eq!(event.start.value(), "");
         assert_eq!(event.end, None);
         assert!(
-            !event.is_all_day,
+            !event.is_all_day(),
             "a stub with no times says nothing about all-day-ness",
         );
     }
@@ -2000,9 +1933,9 @@ mod tests {
         )
         .expect("an unspecified end is a valid event");
 
-        assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
+        assert_eq!(event.start.value(), "2026-06-02T12:00:00Z");
         assert_eq!(event.end, None);
-        assert!(!event.is_all_day);
+        assert!(!event.is_all_day());
     }
 
     /// The flag also wins over a missing `end`: a live event whose end is
@@ -2025,7 +1958,7 @@ mod tests {
         .expect("no end plus endTimeUnspecified is valid");
 
         assert_eq!(event.end, None);
-        assert!(event.is_all_day);
+        assert!(event.is_all_day());
     }
 
     /// `endTimeUnspecified: false` (or absent) leaves a real end alone, so
@@ -2047,7 +1980,7 @@ mod tests {
         )
         .expect("valid event");
 
-        assert_eq!(event.end.expect("end").value, "2026-06-02T13:00:00Z");
+        assert_eq!(event.end.expect("end").value(), "2026-06-02T13:00:00Z");
     }
 
     /// The tolerance is gated on the cancelled status, not on the mere
@@ -2163,9 +2096,9 @@ mod tests {
         // The cancelled instance keeps projecting off `originalStartTime`
         // for both bounds, which is what makes the stub case a widening
         // rather than a replacement.
-        assert_eq!(page.items[0].start.value, "2026-06-02T12:00:00Z");
+        assert_eq!(page.items[0].start.value(), "2026-06-02T12:00:00Z");
         assert_eq!(
-            page.items[0].end.as_ref().map(|end| end.value.as_str()),
+            page.items[0].end.as_ref().map(EventTime::value),
             Some("2026-06-02T12:00:00Z")
         );
         assert_eq!(page.failed_ids, vec![join_event_id("primary", "broken")]);
@@ -2867,15 +2800,8 @@ mod tests {
             title: None,
             description: None,
             location: None,
-            start: EventTime {
-                value: "2026-06-02T12:00:00Z".to_string(),
-                timezone: None,
-            },
-            end: EventTime {
-                value: "2026-06-02T13:00:00Z".to_string(),
-                timezone: None,
-            },
-            is_all_day: false,
+            start: EventTime::from_observed("2026-06-02T12:00:00Z".to_string(), None),
+            end: EventTime::from_observed("2026-06-02T13:00:00Z".to_string(), None),
             status: EventStatus::Tentative,
             availability: EventAvailability::Free,
             visibility: EventVisibility::Default,
@@ -2901,15 +2827,8 @@ mod tests {
                 title: None,
                 description: None,
                 location: None,
-                start: EventTime {
-                    value: "2026-06-02T12:00:00Z".to_string(),
-                    timezone: None,
-                },
-                end: EventTime {
-                    value: "2026-06-02T13:00:00Z".to_string(),
-                    timezone: None,
-                },
-                is_all_day: false,
+                start: EventTime::from_observed("2026-06-02T12:00:00Z".to_string(), None),
+                end: EventTime::from_observed("2026-06-02T13:00:00Z".to_string(), None),
                 status: EventStatus::Confirmed,
                 availability: EventAvailability::Busy,
                 visibility: EventVisibility::Default,
@@ -2949,15 +2868,8 @@ mod tests {
             title: None,
             description: None,
             location: None,
-            start: EventTime {
-                value: "2026-06-02T12:00:00Z".to_string(),
-                timezone: None,
-            },
-            end: EventTime {
-                value: "2026-06-02T13:00:00Z".to_string(),
-                timezone: None,
-            },
-            is_all_day: false,
+            start: EventTime::from_observed("2026-06-02T12:00:00Z".to_string(), None),
+            end: EventTime::from_observed("2026-06-02T13:00:00Z".to_string(), None),
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -3003,14 +2915,14 @@ mod tests {
     #[test]
     fn google_event_patch_keeps_all_day_date_shape() {
         let patch = google_event_from_patch(&EventPatch {
-            start: Some(EventTime {
-                value: "2026-06-02".to_string(),
-                timezone: Some("UTC".to_string()),
-            }),
-            end: Some(EventTime {
-                value: "2026-06-03".to_string(),
-                timezone: Some("UTC".to_string()),
-            }),
+            start: Some(EventTime::from_observed(
+                "2026-06-02".to_string(),
+                Some("UTC".to_string()),
+            )),
+            end: Some(EventTime::from_observed(
+                "2026-06-03".to_string(),
+                Some("UTC".to_string()),
+            )),
             ..EventPatch::default()
         })
         .expect("patch is expressible");
@@ -3095,24 +3007,15 @@ mod tests {
     fn all_day_patch_with_both_bounds_is_accepted() {
         reject_unexpressible_all_day_patch(&EventPatch {
             is_all_day: Some(true),
-            start: Some(EventTime {
-                value: "2026-06-02".to_string(),
-                timezone: None,
-            }),
-            end: Some(EventTime {
-                value: "2026-06-03".to_string(),
-                timezone: None,
-            }),
+            start: Some(EventTime::from_observed("2026-06-02".to_string(), None)),
+            end: Some(EventTime::from_observed("2026-06-03".to_string(), None)),
             ..EventPatch::default()
         })
         .expect("all-day patch carrying both bounds is expressible");
     }
 
     fn write_time(value: &str) -> EventTime {
-        EventTime {
-            value: value.to_string(),
-            timezone: None,
-        }
+        EventTime::from_observed(value.to_string(), None)
     }
 
     fn create_with(start: &str, end: &str) -> EventCreate {
@@ -3123,7 +3026,6 @@ mod tests {
             location: None,
             start: write_time(start),
             end: write_time(end),
-            is_all_day: false,
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -3270,24 +3172,18 @@ mod tests {
                 "garbage start",
             ),
             (create_with("2026-06-02T12:00:00Z", "later"), "garbage end"),
-            // A date on a timed write.
+            // Typed bounds cannot disagree through a separate bool; mixed
+            // bound domains and impossible dates are still caller faults.
             (
-                create_with("2026-06-02", "2026-06-03"),
-                "date on a timed write",
-            ),
-            // A timestamp on an all-day write.
-            (
-                EventCreate {
-                    is_all_day: true,
-                    ..create_with("2026-06-02T12:00:00Z", "2026-06-03T12:00:00Z")
-                },
-                "timestamp on an all-day write",
+                create_with("2026-06-02", "2026-06-03T12:00:00Z"),
+                "mixed date and timestamp",
             ),
             (
-                EventCreate {
-                    is_all_day: true,
-                    ..create_with("2026-13-45", "2026-06-03")
-                },
+                create_with("2026-06-02T12:00:00Z", "2026-06-03"),
+                "mixed timestamp and date",
+            ),
+            (
+                create_with("2026-13-45", "2026-06-03"),
                 "impossible all-day date",
             ),
         ];
@@ -3314,10 +3210,10 @@ mod tests {
         let ok = |value: &str, timezone: Option<&str>, all_day: Option<bool>| {
             reject_unusable_write_times(
                 op,
-                Some(&EventTime {
-                    value: value.to_string(),
-                    timezone: timezone.map(ToString::to_string),
-                }),
+                Some(&EventTime::from_observed(
+                    value.to_string(),
+                    timezone.map(ToString::to_string),
+                )),
                 None,
                 all_day,
             )
@@ -3403,13 +3299,22 @@ mod tests {
     }
 
     #[test]
+    fn google_range_bounds_reject_malformed_observations_even_with_utc() {
+        for value in ["tomorrow", "2026-02-30", "2026-06-02T99:00:00Z", ""] {
+            let time = EventTime::from_observed(value, Some("UTC".to_string()));
+            let error = google_range_bound(&time, "timeMin").unwrap_err();
+            assert!(
+                matches!(error.kind(), AccountErrorKind::Request(_)),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn google_range_bound_expands_all_day_dates() {
         assert_eq!(
             google_range_bound(
-                &EventTime {
-                    value: "2026-06-02".to_string(),
-                    timezone: None,
-                },
+                &EventTime::from_observed("2026-06-02".to_string(), None),
                 "timeMin"
             )
             .unwrap(),
@@ -3421,10 +3326,10 @@ mod tests {
     fn google_range_bound_keeps_existing_offsets() {
         assert_eq!(
             google_range_bound(
-                &EventTime {
-                    value: "2026-06-02T12:00:00+02:00".to_string(),
-                    timezone: Some("Europe/Oslo".to_string()),
-                },
+                &EventTime::from_observed(
+                    "2026-06-02T12:00:00+02:00".to_string(),
+                    Some("Europe/Oslo".to_string())
+                ),
                 "timeMin"
             )
             .unwrap(),
@@ -3436,10 +3341,10 @@ mod tests {
     fn google_range_bound_adds_utc_offset_when_timezone_is_utc() {
         assert_eq!(
             google_range_bound(
-                &EventTime {
-                    value: "2026-06-02T12:00:00".to_string(),
-                    timezone: Some("UTC".to_string()),
-                },
+                &EventTime::from_observed(
+                    "2026-06-02T12:00:00".to_string(),
+                    Some("UTC".to_string())
+                ),
                 "timeMin"
             )
             .unwrap(),
@@ -3451,10 +3356,10 @@ mod tests {
     fn google_range_bound_rejects_offsetless_non_utc_datetime() {
         assert!(
             google_range_bound(
-                &EventTime {
-                    value: "2026-06-02T12:00:00".to_string(),
-                    timezone: Some("Europe/Oslo".to_string()),
-                },
+                &EventTime::from_observed(
+                    "2026-06-02T12:00:00".to_string(),
+                    Some("Europe/Oslo".to_string())
+                ),
                 "timeMin",
             )
             .is_err()

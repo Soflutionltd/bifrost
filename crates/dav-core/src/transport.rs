@@ -30,7 +30,7 @@ pub struct DavResponse {
     /// `/dav/users/ada/calendar/` is a real deployment shape; resolving
     /// `one.ics` against the submitted URI there mints a wrong native id and a
     /// wrong follow-up request URL.
-    pub url: String,
+    pub url: crate::DavHref,
 }
 
 /// A DAV response body paired with the effective URI that produced it, so href
@@ -38,7 +38,7 @@ pub struct DavResponse {
 #[derive(Debug, Clone)]
 pub struct DavBody {
     pub text: String,
-    pub url: String,
+    pub url: crate::DavHref,
 }
 
 /// A DAV request as an owned record rather than a builder.
@@ -49,7 +49,7 @@ pub struct DavBody {
 #[derive(Debug, Clone)]
 pub struct DavRequest {
     pub(crate) method: Method,
-    pub(crate) url: String,
+    pub(crate) url: Result<crate::DavHref, String>,
     pub(crate) headers: HeaderMap,
     pub(crate) body: Option<Bytes>,
     /// Declared replay policy for this wire leg. `None` uses the method
@@ -70,9 +70,11 @@ pub struct DavRequest {
 impl DavRequest {
     #[must_use]
     pub fn new(method: Method, url: impl Into<String>) -> Self {
+        let url = url.into();
+        let url = crate::DavHref::parse(&url).map_err(|_| url);
         Self {
             method,
-            url: url.into(),
+            url,
             headers: HeaderMap::new(),
             body: None,
             replay: None,
@@ -163,7 +165,10 @@ impl DavRequest {
 
     #[must_use]
     pub fn url(&self) -> &str {
-        &self.url
+        match &self.url {
+            Ok(href) => href.as_str(),
+            Err(raw) => raw,
+        }
     }
 }
 
@@ -202,7 +207,7 @@ pub fn origin_is_secure(value: &str) -> bool {
 
 /// The scheme/host/effective-port triple a credential gate compares on.
 #[must_use]
-pub fn url_origin(value: &str) -> Option<String> {
+pub fn url_origin(value: &str) -> Option<bifrost_net::Origin> {
     let url = Url::parse(value).ok()?;
     bifrost_net::origin_key(&url)
 }
@@ -214,11 +219,15 @@ mod tests {
     #[test]
     fn url_origin_normalizes_case_and_default_port() {
         assert_eq!(
-            url_origin("HTTPS://DAV.Example.Test/cal/").as_deref(),
+            url_origin("HTTPS://DAV.Example.Test/cal/")
+                .map(|origin| origin.to_string())
+                .as_deref(),
             Some("https://dav.example.test:443")
         );
         assert_eq!(
-            url_origin("https://dav.example.test:8443/cal/").as_deref(),
+            url_origin("https://dav.example.test:8443/cal/")
+                .map(|origin| origin.to_string())
+                .as_deref(),
             Some("https://dav.example.test:8443")
         );
         assert_eq!(url_origin("not a url"), None);

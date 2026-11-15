@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 /// [`super::session::Session::capability_config`] selects the session object
 /// or the primary account's object according to the capability URI.
 /// Capabilities with no configuration (empty JSON object) should use `()`.
-pub(crate) trait Capability {
+pub(crate) trait Capability: 'static {
     const LEVEL: CapabilityLevel = CapabilityLevel::Account;
     const URI: &'static str;
 

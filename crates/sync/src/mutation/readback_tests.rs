@@ -618,3 +618,48 @@ async fn destroy_readback_requires_message_not_found() {
     assert_eq!(outcome.still_failed, 0);
     assert_eq!(outcome.uncertain, (cases.len() - 1) as u64);
 }
+
+#[tokio::test]
+async fn move_readback_bridges_native_mailbox_membership_but_never_owner_tags() {
+    let folder = MembershipScope::Folder(bifrost_types::FolderId("a".into()));
+    let owner = MembershipScope::Owner(bifrost_types::PrincipalId("a".into()));
+    for (destination, observed, expected) in [
+        (
+            folder.clone(),
+            MembershipScope::Mailbox(bifrost_types::MailboxId("a".into())),
+            ObjectReadback::Satisfied,
+        ),
+        (folder, owner.clone(), ObjectReadback::Unsatisfied),
+        (owner.clone(), owner, ObjectReadback::Unsatisfied),
+    ] {
+        let item = ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
+            bifrost_types::BatchItemId("message".into()),
+            HydratedObject {
+                id: ObjectId("message".into()),
+                kind: HydratedObjectKind::Metadata(bifrost_types::InventoryEntry {
+                    id: ObjectId("message".into()),
+                    memberships: vec![observed],
+                    blob_id: None,
+                    fingerprint: bifrost_types::Fingerprint {
+                        size: None,
+                        flags_hash: bifrost_types::canonical_flags_hash(std::iter::empty::<&str>()),
+                        server_version: bifrost_types::ServerVersion::Unavailable,
+                    },
+                    thread_id: None,
+                    message_id: None,
+                    references: Vec::new(),
+                    in_reply_to: None,
+                }),
+                blobs: Vec::new(),
+            },
+        ));
+        let report = run_object_readback(
+            &scripted(vec![item]),
+            vec![ObjectId("message".into())],
+            ReadbackTarget::Move(&destination),
+            None,
+        )
+        .await;
+        assert_eq!(report.objects[&ObjectId("message".into())], expected);
+    }
+}

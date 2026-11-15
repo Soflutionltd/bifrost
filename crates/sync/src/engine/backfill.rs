@@ -52,7 +52,8 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
         config,
         fusion_owned_scopes,
     } = wiring;
-    let publisher = crate::multiplexer::PagePublisher::new(
+    let writer_tx = WriterHandle::new(writer_tx);
+    let publisher = crate::delivery::PagePublisher::new(
         Arc::clone(&delivery),
         control.clone(),
         writer_tx.clone(),
@@ -156,7 +157,17 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                 // Planning and writer barrier reads do no wire work. They
                 // need no scheduler budget; partition admission below owns the
                 // start gate and rechecks this original walk fence after waits.
-                if scope_barrier_blocked(&writer_tx, scope.clone()).await {
+                let barrier_blocked = match scope_barrier_blocked(&writer_tx, scope.clone()).await {
+                    Ok(blocked) => blocked,
+                    Err(error) => {
+                        // Unknown debt still stops the walk, but must not tell
+                        // the operator to waive a barrier nobody has observed.
+                        tracing::warn!(%error, ?scope, "backfill barrier query failed");
+                        scan.record_attempt(incarnation_key, false);
+                        continue;
+                    }
+                };
+                if barrier_blocked {
                     tracing::debug!(
                         target: "bifrost.sync.backfill",
                         account = ?account_id,
@@ -173,7 +184,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     // withholds a scope until its delay elapses, so reusing it
                     // here parks the query on the same 5s-to-5min ramp the walk
                     // itself would have used.
-                    scan.record_attempt(incarnation_key, false);
+                    scan.record_barrier_wait(incarnation_key);
                     continue;
                 }
                 let acc_arc = account.load_full();
@@ -236,10 +247,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     );
                     plan.walk_from_scratch()
                 } else {
-                    match super::ack::WriterHandle::new(writer_tx.clone())
-                        .get_backfill(scope.clone())
-                        .await
-                    {
+                    match writer_tx.get_backfill(scope.clone()).await {
                         Ok(stored) => plan.resume(stored.as_ref()),
                         Err(err) => {
                             // A read failure is not authoritative; fall back to a
@@ -341,6 +349,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                             );
                         }
                         if step == crate::backfill::ScopeWalkStep::StopScopeWalk {
+                            scan.mark_operator_blocked(&incarnation_key);
                             tracing::warn!(
                                 target: "bifrost.sync.backfill",
                                 account = ?account_id,
@@ -492,22 +501,11 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
 /// failures leave the rows in place, so the answer to both is to keep the
 /// request.
 async fn discard_backfill_progress(
-    writer: &mpsc::Sender<WriterRequest>,
+    writer: &WriterHandle,
     account_id: &AccountId,
     scope: &CursorScope,
 ) -> bool {
-    let (done, recv) = oneshot::channel();
-    if writer
-        .send(WriterRequest::DiscardBackfillProgress {
-            scope: scope.clone(),
-            done,
-        })
-        .await
-        .is_err()
-    {
-        return false;
-    }
-    match recv.await {
+    match writer.discard_backfill_progress(scope.clone()).await {
         Ok(Ok(())) => true,
         Ok(Err(error)) => {
             tracing::warn!(
@@ -527,18 +525,8 @@ async fn discard_backfill_progress(
     }
 }
 
-async fn scope_barrier_blocked(writer: &mpsc::Sender<WriterRequest>, scope: CursorScope) -> bool {
-    // An unavailable writer cannot prove the scope unblocked. An enterprise
-    // mail user expects inventory to stop rather than cross unknown debt.
-    let (done, recv) = oneshot::channel();
-    if writer
-        .send(WriterRequest::ScopeBarrierBlocked { scope, done })
-        .await
-        .is_err()
-    {
-        return true;
-    }
-    recv.await.unwrap_or(true)
+async fn scope_barrier_blocked(writer: &WriterHandle, scope: CursorScope) -> Result<bool, Error> {
+    writer.scope_barrier_blocked(scope).await
 }
 
 /// First retry delay for a scope incarnation whose backfill did not
@@ -591,6 +579,7 @@ struct IncarnationState {
     phase: ScanPhase,
     baseline: Option<crate::cursor::UndeliveredMark>,
     lost_pages: bool,
+    operator_blocked: bool,
     retry: Option<crate::backoff::ReconnectBackoff>,
 }
 
@@ -604,6 +593,12 @@ impl IncarnationState {
         match &self.phase {
             ScanPhase::Settled if self.baseline() == watermark => BackfillState::Completed,
             ScanPhase::Running => BackfillState::Running,
+            _ if self.operator_blocked => BackfillState::OperatorBlocked,
+            _ if self.lost_pages || self.baseline.is_some_and(|baseline| baseline != watermark) => {
+                BackfillState::RestartingAfterLoss
+            }
+            ScanPhase::Parked(_) => BackfillState::Throttled,
+            ScanPhase::Failed(_) => BackfillState::Retrying,
             _ => BackfillState::Pending,
         }
     }
@@ -776,6 +771,7 @@ impl BackfillScan {
         entry.phase = ScanPhase::Settled;
         entry.retry = None;
         entry.lost_pages = false;
+        entry.operator_blocked = false;
     }
 
     pub(super) fn note_lost_pages(&mut self, key: ScanKey) {
@@ -800,6 +796,7 @@ impl BackfillScan {
         let entry = state.incarnations.entry(key.clone()).or_default();
         entry.baseline = Some(watermark);
         entry.phase = ScanPhase::Running;
+        entry.operator_blocked = false;
         watermark
     }
 
@@ -823,6 +820,21 @@ impl BackfillScan {
             .incarnations
             .get(key)
             .is_some_and(|entry| entry.lost_pages)
+    }
+
+    fn mark_operator_blocked(&mut self, key: &ScanKey) {
+        self.state
+            .lock()
+            .expect("backfill scan poisoned")
+            .incarnations
+            .entry(key.clone())
+            .or_default()
+            .operator_blocked = true;
+    }
+
+    fn record_barrier_wait(&mut self, key: ScanKey) {
+        self.record_attempt(key.clone(), false);
+        self.mark_operator_blocked(&key);
     }
 
     pub(super) fn record_attempt(&mut self, key: ScanKey, completed: bool) {
@@ -849,11 +861,11 @@ async fn run_backfill_partition_at_boundary(
     live: &Arc<LiveSupersedes>,
     control: &SyncControl,
     shutdown: &CancellationToken,
-    throttles: &crate::recovery::ThrottleBucket,
+    throttles: &crate::throttle::ThrottleBucket,
     coverage: &Arc<PendingCoverage>,
-    writer_tx: &mpsc::Sender<WriterRequest>,
+    writer_tx: &WriterHandle,
     bound: &BackfillBound,
-    delivery: &Arc<crate::multiplexer::ChangeDelivery>,
+    delivery: &Arc<crate::delivery::ChangeDelivery>,
     fence_at_walk_start: crate::cursor::ScopeFence,
     cursors: &CursorRegistry,
     incarnation: crate::cursor::ScopeIncarnation,
@@ -931,11 +943,9 @@ async fn run_backfill_partition_at_boundary(
                  walk rather than publishing its later partitions against rows the \
                  reset deleted"
             );
-            return Some(Err(Error::Other(
-                "scope reset between two partitions of the backfill walk".into(),
-            )));
+            return Some(Err(Error::Superseded));
         }
-        let publisher = crate::multiplexer::PagePublisher::new(
+        let publisher = crate::delivery::PagePublisher::new(
             Arc::clone(delivery),
             control.admitted_by(&activity),
             writer_tx.clone(),
@@ -1036,7 +1046,7 @@ pub(super) fn open_pages_resume(checkpoint: Option<&BackfillCheckpoint>) -> Open
 pub(super) async fn emit_backfill_complete(
     scope: &CursorScope,
     total_seen: crate::backfill::scope_walk::WalkTotal,
-    publisher: &crate::multiplexer::PagePublisher,
+    publisher: &crate::delivery::PagePublisher,
     bound: &BackfillBound,
     undelivered_before: crate::cursor::UndeliveredMark,
     fence_at_walk_start: crate::cursor::ScopeFence,
@@ -1397,6 +1407,17 @@ mod scan_projection_tests {
             registry.snapshot(&account, &scope),
             Some(BackfillState::Running)
         );
+        scan.record_attempt(key.clone(), false);
+        assert_eq!(
+            registry.snapshot(&account, &scope),
+            Some(BackfillState::Retrying)
+        );
+        scan.record_barrier_wait(key.clone());
+        assert_eq!(
+            registry.snapshot(&account, &scope),
+            Some(BackfillState::OperatorBlocked)
+        );
+        scan.begin_walk(&key, &coverage);
         scan.record_attempt(key.clone(), true);
         assert_eq!(
             registry.snapshot(&account, &scope),
@@ -1405,7 +1426,7 @@ mod scan_projection_tests {
         coverage.note_undelivered(&scope, 1);
         assert_eq!(
             registry.snapshot(&account, &scope),
-            Some(BackfillState::Pending)
+            Some(BackfillState::RestartingAfterLoss)
         );
         // Re-establishment must not inherit even a loss-free completion.
         scan.begin_walk(&key, &coverage);

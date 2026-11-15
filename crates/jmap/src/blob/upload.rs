@@ -75,7 +75,7 @@ impl<Tr: HttpTransport> Client<Tr> {
     }
 }
 
-impl<Tr: HttpTransport> Account<Tr> {
+impl<Tr: HttpTransport, C: crate::core::capability::Capability> Account<Tr, C> {
     /// Upload `data` to this account's blob store.
     ///
     /// The returned [`BlobRef`] is bound to this account and carries

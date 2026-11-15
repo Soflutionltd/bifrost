@@ -344,13 +344,15 @@ impl ImapConnection {
         // non-use-attr values." Reject base LIST attributes like \Noselect,
         // \HasChildren, etc. before sending the command.
         if let Some(bad) = special_use.iter().find(|a| !a.is_special_use()) {
-            return Err(Error::InvalidInput(
-                format!(
-                    "CREATE USE parameter contains non-special-use attribute {} \
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    format!(
+                        "CREATE USE parameter contains non-special-use attribute {} \
                  (RFC 6154 Section 3: USE MUST only contain use-attr values)",
-                    bad.as_imap_str()
-                )
-                .into(),
+                        bad.as_imap_str()
+                    )
+                    .into(),
+                ),
             ));
         }
         let cmd = Command::CreateSpecialUse {

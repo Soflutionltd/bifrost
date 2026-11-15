@@ -162,14 +162,22 @@ pub(crate) fn oauth_token_error(error: bifrost_net::Error) -> Error {
     // caller's operation, scope and provider when it surfaces this error.
     let classified =
         bifrost_net::token_source_account_error(error, Protocol::Imap, AccountOperation::Discover);
-    Error::OAuthToken(std::sync::Arc::new(classified))
+    Error::OAuthToken(crate::error::OAuthFailure(std::sync::Arc::new(classified)))
 }
 
 /// Translate an internal IMAP error into a public `AccountError`.
 pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> AccountError {
-    let error = match error {
-        Error::MoveFallbackIncomplete { source, .. } => return into_account_error(*source, ctx),
-        error => error,
+    let mut error = error;
+    let mut operation_not_sent = false;
+    let error = loop {
+        error = match error {
+            Error::MoveFallbackIncomplete { source, .. } => *source,
+            Error::OperationNotSent(source) => {
+                operation_not_sent = true;
+                *source
+            }
+            error => break error,
+        };
     };
     // A token endpoint outage must retry without asking the user to replace
     // valid credentials. It supplies no IMAP server-acknowledgement evidence.
@@ -196,7 +204,10 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
             .expect("valid token error classification");
     }
     let attempt = error.attempt().or(ctx.transmission_state);
-    let translation = classify(&error, &ctx);
+    let mut translation = classify(&error, &ctx);
+    if operation_not_sent {
+        translation.attempt = Some(TransmissionState::Unsent);
+    }
     finish_translation(translation, attempt, ctx)
 }
 
@@ -302,16 +313,28 @@ pub(crate) fn sieve_account_error(
                 ctx,
             );
         }
-        Se::Io { source } => Error::Io {
-            source,
+        Se::Io { source } => Error::Transport {
+            kind: crate::error::TransportFailure::Io(crate::error::IoFailure(source)),
             attempt: None,
         },
-        Se::Timeout => Error::Timeout { attempt: None },
-        Se::StartTlsUnavailable => Error::StartTlsUnavailable,
-        Se::Internal(message) => Error::Internal(message),
-        Se::Parse(message) => Error::Parse(message),
-        Se::InvalidInput(message) => Error::InvalidInput(message.into()),
-        Se::AuthPolicy(failure) => Error::AuthPolicy(failure),
+        Se::Timeout => Error::Transport {
+            kind: crate::error::TransportFailure::Timeout,
+            attempt: None,
+        },
+        Se::StartTlsUnavailable => {
+            Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable)
+        }
+        Se::Internal(message) => Error::Internal {
+            kind: crate::error::InternalFailure::Invariant(message),
+            mid_exchange: None,
+        },
+        Se::Parse(message) => Error::Provider(crate::error::ProviderFailure::Parse(message)),
+        Se::InvalidInput(message) => {
+            Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(message.into()))
+        }
+        Se::AuthPolicy(failure) => {
+            Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(failure))
+        }
         Se::Auth { message, mechanism } => Error::auth_with_mechanism(message, None, mechanism),
         // The shared protocol taxonomy has no ManageSieve identity; this
         // retains the same IMAP account identity as other sieve failures.
@@ -331,8 +354,8 @@ pub(crate) fn unsupported(operation: AccountOperation) -> AccountError {
 /// Build a fatal-stream error for UIDVALIDITY change on a folder cursor.
 pub(crate) fn uidvalidity_changed(
     folder: &MailboxName,
-    expected: u32,
-    actual: u32,
+    expected: crate::types::UidValidity,
+    actual: crate::types::UidValidity,
 ) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
@@ -354,8 +377,8 @@ pub(crate) fn uidvalidity_changed(
 /// Build a fatal-stream error for HIGHESTMODSEQ regression on a folder cursor.
 pub(crate) fn modseq_reset(
     folder: &MailboxName,
-    previous: u64,
-    current: Option<u64>,
+    previous: crate::types::ModSeq,
+    current: Option<crate::types::ModSeq>,
 ) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
@@ -426,7 +449,7 @@ pub(crate) fn strategy_failure(folder: &MailboxName, downgrade: StrategyDowngrad
 pub(crate) fn folder_error(
     error: Error,
     folder: &MailboxName,
-    shared_owner: Option<&bifrost_types::MailboxId>,
+    shared_owner: Option<&bifrost_types::PrincipalId>,
     ctx: ImapErrorContext,
 ) -> AccountError {
     // A narrower scope the caller already chose (one message, for a raw
@@ -445,7 +468,8 @@ pub(crate) fn permission_denied(error: &Error, ctx: &ImapErrorContext) -> bool {
     // Token errors carry their own classification and must not reach
     // `classify`, which refuses them; unwrap the MOVE fallback wrapper too.
     let mut inner = error;
-    while let Error::MoveFallbackIncomplete { source, .. } = inner {
+    while let Error::MoveFallbackIncomplete { source, .. } | Error::OperationNotSent(source) = inner
+    {
         inner = source;
     }
     let kind = match inner {
@@ -469,7 +493,7 @@ pub(crate) fn permission_denied(error: &Error, ctx: &ImapErrorContext) -> bool {
 pub(crate) fn shared_folder_error(
     error: Error,
     folder: &MailboxName,
-    shared_owner: Option<&bifrost_types::MailboxId>,
+    shared_owner: Option<&bifrost_types::PrincipalId>,
     ctx: ImapErrorContext,
 ) -> AccountError {
     let mut ctx = ctx;
@@ -532,25 +556,42 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
     match error {
         Error::OAuthToken(_) => unreachable!("token errors bypass IMAP classification"),
         Error::MoveFallbackIncomplete { source, .. } => classify(source, ctx),
-        Error::Io { source, .. } => Translation::new(
+        Error::OperationNotSent(source) => {
+            let mut translation = classify(source, ctx);
+            translation.attempt = Some(TransmissionState::Unsent);
+            translation
+        }
+        Error::Transport {
+            kind: crate::error::TransportFailure::Io(crate::error::IoFailure(source)),
+            ..
+        } => Translation::new(
             AccountErrorKind::Transport(TransportErrorKind::Network),
             Cause::Transport(TransportCause::new(
                 TransportKind::Network,
                 Some(DiagnosticText::support_only(source.to_string())),
             )),
         ),
-        Error::Timeout { .. } => Translation::new(
+        Error::Transport {
+            kind: crate::error::TransportFailure::Timeout,
+            ..
+        } => Translation::new(
             AccountErrorKind::Transport(TransportErrorKind::Timeout),
             Cause::Transport(TransportCause::new(TransportKind::Timeout, None)),
         ),
-        Error::Closed { .. } => Translation::new(
+        Error::Transport {
+            kind: crate::error::TransportFailure::Closed,
+            ..
+        } => Translation::new(
             AccountErrorKind::Transport(TransportErrorKind::Network),
             Cause::Transport(TransportCause::new(
                 TransportKind::Network,
                 Some(DiagnosticText::support_only("IMAP connection closed")),
             )),
         ),
-        Error::DriverGone { .. } => Translation::new(
+        Error::Transport {
+            kind: crate::error::TransportFailure::DriverGone,
+            ..
+        } => Translation::new(
             AccountErrorKind::Transport(TransportErrorKind::Network),
             Cause::Transport(TransportCause::new(
                 TransportKind::Network,
@@ -562,17 +603,19 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
         // caller's phase (`observe_driver_panic`), so a non-idempotent
         // command the driver owned when it died reconciles rather than
         // terminating.
-        Error::DriverPanicked { message, .. } => internal(
+        Error::Internal {
+            kind: crate::error::InternalFailure::Panicked(message),
+            ..
+        } => internal(
             InternalErrorKind::Panicked,
             format!("IMAP driver panicked: {message}"),
         ),
-        Error::Auth {
+        Error::ServerStatus(crate::error::ServerStatus::Auth {
             text,
             code,
             mechanism,
             scram,
-            attempt,
-        } => {
+        }) => {
             let mut translation = classify_auth(text, code.as_ref(), *mechanism);
             if let Some(refusal) = scram {
                 use bifrost_sasl::RefusalClass;
@@ -603,12 +646,9 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
                 translation.kind = kind;
                 translation.primary_cause = cause;
             }
-            if let Some(attempt) = attempt {
-                translation.attempt = Some(attempt.transmission_state);
-            }
             translation
         }
-        Error::AuthPolicy(failure) => {
+        Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(failure)) => {
             let mut t = Translation::new(
                 AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
                 Cause::Access(AccessCause::PolicyBlocked),
@@ -616,7 +656,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             t.diagnostic_text = Some(DiagnosticText::support_only(failure.to_string()));
             t
         }
-        Error::StartTlsUnavailable => {
+        Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable) => {
             let mut t = Translation::new(
                 AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
                 Cause::Access(AccessCause::PolicyBlocked),
@@ -628,16 +668,16 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             ));
             t
         }
-        Error::No { text, code, .. } => {
+        Error::ServerStatus(crate::error::ServerStatus::No { text, code, .. }) => {
             classify_status(text, code.as_ref(), StatusFallback::No, ctx)
         }
-        Error::Bad { text, code, .. } => {
+        Error::ServerStatus(crate::error::ServerStatus::Bad { text, code, .. }) => {
             classify_status(text, code.as_ref(), StatusFallback::Bad, ctx)
         }
         Error::Bye { text, code, .. } => {
             classify_status(text, code.as_ref(), StatusFallback::Bye, ctx)
         }
-        Error::Protocol(msg) => Translation::new(
+        Error::Provider(crate::error::ProviderFailure::Protocol(msg)) => Translation::new(
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
@@ -646,21 +686,21 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
         ),
         // Same recovery class as `Protocol` (`ProviderContractViolation`);
         // the kind only records that the server omitted something mandatory.
-        Error::ProtocolMissing(msg) => Translation::new(
+        Error::Provider(crate::error::ProviderFailure::Missing(msg)) => Translation::new(
             AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
                 detail: Some(DiagnosticText::support_only(msg.clone())),
             }),
         ),
-        Error::Parse(msg) => Translation::new(
+        Error::Provider(crate::error::ProviderFailure::Parse(msg)) => Translation::new(
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
                 detail: Some(DiagnosticText::support_only(msg.clone())),
             }),
         ),
-        Error::InvalidInput(msg) => Translation::new(
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(msg)) => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only(msg.clone()),
@@ -668,13 +708,13 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
         ),
         // Local refusals, all made before the first byte. None of them is a
         // provider fault (`reference/error-model.md`, "Local refusals").
-        Error::InvalidState(msg) => Translation::new(
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidState(msg)) => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only(msg.clone()),
             }),
         ),
-        Error::StateChangedBeforeSend(msg) => {
+        Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(msg)) => {
             let mut t = Translation::new(
                 AccountErrorKind::ConcurrencyConflict,
                 Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
@@ -683,7 +723,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             t.attempt = Some(TransmissionState::Unsent);
             t
         }
-        Error::UnsupportedOperation(msg) => {
+        Error::LocalRefusal(crate::error::LocalRefusal::UnsupportedOperation(msg)) => {
             let operation = ctx.operation;
             let mut t = Translation::new(
                 AccountErrorKind::Unsupported(operation),
@@ -692,11 +732,15 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             t.diagnostic_text = Some(DiagnosticText::support_only(msg.clone()));
             t
         }
-        Error::Internal(msg) | Error::InternalMidExchange { message: msg, .. } => {
-            internal(InternalErrorKind::InvariantViolated, msg.clone())
-        }
-        Error::LocalRuntime(msg) => internal(InternalErrorKind::RuntimeFailure, msg.clone()),
-        Error::MissingCapability(cap) => {
+        Error::Internal {
+            kind: crate::error::InternalFailure::Invariant(msg),
+            ..
+        } => internal(InternalErrorKind::InvariantViolated, msg.clone()),
+        Error::Internal {
+            kind: crate::error::InternalFailure::Runtime(msg),
+            ..
+        } => internal(InternalErrorKind::RuntimeFailure, msg.clone()),
+        Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(cap)) => {
             let operation = ctx.operation;
             let mut t = Translation::new(
                 AccountErrorKind::Unsupported(operation),
@@ -705,17 +749,19 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             t.diagnostic_text = Some(DiagnosticText::support_only(cap.clone()));
             t
         }
-        Error::AppendLimit { size, limit } => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(format!(
-                    "message size {size} exceeds server APPENDLIMIT of {limit}"
-                )),
-            }),
-        ),
-        Error::FetchLimit {
+        Error::LocalRefusal(crate::error::LocalRefusal::AppendLimit { size, limit }) => {
+            Translation::new(
+                AccountErrorKind::Request(RequestErrorKind::Malformed),
+                Cause::Request(RequestCause::Malformed {
+                    detail: DiagnosticText::support_only(format!(
+                        "message size {size} exceeds server APPENDLIMIT of {limit}"
+                    )),
+                }),
+            )
+        }
+        Error::ResultLimit(crate::error::ResultLimit::Fetch {
             estimated, limit, ..
-        } => {
+        }) => {
             let mut t = Translation::new(
                 AccountErrorKind::Request(RequestErrorKind::Malformed),
                 Cause::Request(RequestCause::Malformed {
@@ -727,7 +773,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             t.attempt = Some(TransmissionState::Acknowledged);
             t
         }
-        Error::FetchLiteralLimit { estimated, limit } => {
+        Error::ResultLimit(crate::error::ResultLimit::FetchLiteral { estimated, limit }) => {
             let mut t = Translation::new(
                 AccountErrorKind::Request(RequestErrorKind::Malformed),
                 Cause::Request(RequestCause::Malformed {
@@ -739,7 +785,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             t.attempt = Some(TransmissionState::Acknowledged);
             t
         }
-        Error::SearchResultTruncated { returned, omitted } => {
+        Error::ResultLimit(crate::error::ResultLimit::SearchTruncated { returned, omitted }) => {
             let mut t = Translation::new(
                 AccountErrorKind::Request(RequestErrorKind::Malformed),
                 Cause::Request(RequestCause::Malformed {
@@ -754,12 +800,14 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             t.attempt = Some(TransmissionState::Acknowledged);
             t
         }
-        Error::InvalidAppendDate(msg) => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(msg.clone()),
-            }),
-        ),
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidAppendDate(msg)) => {
+            Translation::new(
+                AccountErrorKind::Request(RequestErrorKind::Malformed),
+                Cause::Request(RequestCause::Malformed {
+                    detail: DiagnosticText::support_only(msg.clone()),
+                }),
+            )
+        }
     }
 }
 

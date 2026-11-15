@@ -36,9 +36,10 @@ struct CategoryListResponse {
 pub(crate) async fn category_definitions_list(
     account: GraphAccount,
 ) -> Result<Vec<CategoryDefinition>, AccountError> {
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     let response: CategoryListResponse = account
-        .client
+        .mailboxes
+        .primary()
         .get_json(
             Resource::Outlook,
             &format!("{prefix}/outlook/masterCategories"),

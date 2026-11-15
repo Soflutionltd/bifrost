@@ -163,12 +163,12 @@ pub(super) async fn send_wire_command(
 /// `ProtocolMissing`, because the server finished the exchange, the framing is
 /// intact, and the unsent remainder is never written.
 pub(super) fn early_ok_error() -> Error {
-    Error::ProtocolMissing(
+    Error::Provider(crate::error::ProviderFailure::Missing(
         "command completed with a tagged OK before the server sent \
          the `+` continuation its synchronizing literal is owed \
          (RFC 3501 Section 4.3); the literal was not sent"
             .into(),
-    )
+    ))
 }
 
 /// Wait for a server continuation response (`+ ...`) during
@@ -287,7 +287,9 @@ pub(super) async fn wait_for_continuation(
                 let _ = u; // ReadLoop already published this event.
             }
             crate::types::Response::Greeting(_) => {
-                return Err(Error::Protocol("unexpected greeting".into()));
+                return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
+                    "unexpected greeting".into(),
+                )));
             }
         }
     }

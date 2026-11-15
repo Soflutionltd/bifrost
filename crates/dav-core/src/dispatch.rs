@@ -124,7 +124,7 @@ impl DavByteTally {
 #[derive(Clone)]
 pub struct DavDispatch {
     net: AccountNet,
-    base_url: String,
+    base_url: Result<crate::DavHref, String>,
     credentials: DispatchCredentials,
     trusted_origins: bifrost_net::TrustedOrigins,
     protocol: DavProtocol,
@@ -192,6 +192,7 @@ impl DavDispatch {
         let mut trusted_origins = bifrost_net::TrustedOrigins::default();
         // An invalid base leaves an empty, fail-closed credential policy.
         let _ = trusted_origins.trust(&base_url);
+        let base_url = crate::DavHref::parse(&base_url).map_err(|_| base_url);
         Self {
             net,
             base_url,
@@ -225,7 +226,7 @@ impl DavDispatch {
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
         if let Some(guard) = &self.request_guard {
-            guard.check_target(&request.method, &request.url, operation)?;
+            guard.check_target(&request.method, request.url(), operation)?;
             if let Some(destination) = request
                 .headers
                 .get(DESTINATION)
@@ -244,7 +245,10 @@ impl DavDispatch {
 
     #[must_use]
     pub fn base_url(&self) -> &str {
-        &self.base_url
+        match &self.base_url {
+            Ok(href) => href.as_str(),
+            Err(raw) => raw,
+        }
     }
 
     /// The account handle, for the priority and bandwidth-cap doors the
@@ -277,18 +281,14 @@ impl DavDispatch {
     /// done, so the two branches now agree on the shape they share.
     #[must_use]
     pub fn resolve_url(&self, href: &str) -> String {
-        let parsed = Url::parse(href).ok();
-        if parsed
-            .as_ref()
-            .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
-        {
+        if crate::DavHref::parse(href).is_ok() {
             return href.to_string();
         }
         // Native DAV ids name HTTP resources. Users expect scheme-like names
         // such as mailto:one.ics to stay beneath their configured collection,
         // rather than selecting a different transport. The ./ makes Url::join
         // treat a non-HTTP scheme as path text instead of an absolute URI.
-        let relative = parsed.map(|_| format!("./{href}"));
+        let relative = Url::parse(href).is_ok().then(|| format!("./{href}"));
         let join_href = relative.as_deref().unwrap_or(href);
         if let Some(base) = self.join_base()
             && let Ok(resolved) = base.join(join_href)
@@ -298,15 +298,15 @@ impl DavDispatch {
         // `around()` trims the trailing slash from base_url, so only the
         // href side decides whether a separator is needed.
         if href.starts_with('/') {
-            format!("{}{href}", self.base_url)
+            format!("{}{href}", self.base_url())
         } else {
-            format!("{}/{href}", self.base_url)
+            format!("{}/{href}", self.base_url())
         }
     }
 
     /// The base URL as a directory, so relative hrefs resolve beneath it.
     fn join_base(&self) -> Option<Url> {
-        let mut base = Url::parse(&self.base_url).ok()?;
+        let mut base = self.base_url.as_ref().ok()?.as_url().clone();
         if !base.cannot_be_a_base() && !base.path().ends_with('/') {
             let path = format!("{}/", base.path());
             base.set_path(&path);
@@ -330,7 +330,12 @@ impl DavDispatch {
     /// the account is shared or a home request can be in flight.
     pub fn admit_discovered_urls(&mut self, urls: impl IntoIterator<Item = String>) {
         for url in urls {
-            if origin_is_secure(&self.base_url) && !origin_is_secure(&url) {
+            if self
+                .base_url
+                .as_ref()
+                .is_ok_and(|href| href.as_url().scheme() == "https")
+                && !origin_is_secure(&url)
+            {
                 continue;
             }
             // Enterprise DAV deployments delegate homes across HTTPS origins.
@@ -520,15 +525,34 @@ impl DavDispatch {
                 self.protocol,
             ));
         }
+        // Preserve raw href spelling for native ids, but dispatch exactly the
+        // parsed target. Admission sees raw userinfo before parsing can erase it.
+        if !self.is_trusted_url(request.url()) {
+            return Err(local_error(
+                operation,
+                format!(
+                    "refusing to send DAV credentials to untrusted URL: {}",
+                    request.url()
+                ),
+                self.protocol,
+            ));
+        }
+        let target = request.url.as_ref().map_err(|_| {
+            local_error(
+                operation,
+                "DAV target is not an absolute HTTP(S) URL",
+                self.protocol,
+            )
+        })?;
         self.check_request_targets(request, operation)?;
         let policy = Arc::new(DavHopPolicy {
             dispatch: self.clone(),
             operation,
-            effective_url: std::sync::Mutex::new(request.url.clone()),
+            effective_url: std::sync::Mutex::new(target.clone()),
         });
         let mut builder = self
             .net
-            .request(request.method.clone(), &request.url)
+            .request(request.method.clone(), target.as_url().clone())
             .without_bearer_auth()
             .follow_redirects(FollowRedirects::default())
             .hop_policy(Arc::clone(&policy) as Arc<dyn HopPolicy>)
@@ -578,28 +602,13 @@ impl DavDispatch {
             tally.add(counter.bytes_in());
         }
         let mut effective_request = request.clone();
-        effective_request.url = policy
+        effective_request.url = Ok(policy
             .effective_url
             .lock()
             .expect("DAV effective URL lock")
-            .clone();
+            .clone());
         self.wire_outcome(&effective_request, operation, outcome)
             .map_err(|error| {
-                let error = if matches!(
-                    error.kind(),
-                    bifrost_types::AccountErrorKind::Server(
-                        bifrost_types::ServerErrorKind::RateLimited
-                            | bifrost_types::ServerErrorKind::QuotaExhausted
-                    )
-                ) {
-                    error
-                        .into_builder()
-                        .throttle_scope(bifrost_types::ThrottleScope::Account)
-                        .try_build()
-                        .expect("valid DAV throttle scope")
-                } else {
-                    error
-                };
                 if !request.replayable() {
                     return error
                         .into_builder()
@@ -620,6 +629,13 @@ impl DavDispatch {
         operation: AccountOperation,
         outcome: Result<bifrost_net::Response, NetError>,
     ) -> Result<DavResponse, AccountError> {
+        let url = request.url.as_ref().map_err(|_| {
+            local_error(
+                operation,
+                "DAV target is not an absolute HTTP(S) URL",
+                self.protocol,
+            )
+        })?;
         match outcome {
             Err(error @ NetError::AttemptHistory { .. }) => {
                 // The terminal status of an unreplayable request is data only
@@ -683,7 +699,7 @@ impl DavDispatch {
                             status,
                             headers: headers.clone(),
                             body: decode_body(body),
-                            url: request.url.clone(),
+                            url: url.clone(),
                         });
                     }
                     if let NetError::ResponseTooLarge { limit } = error.terminal() {
@@ -710,7 +726,7 @@ impl DavDispatch {
                 status: response.status,
                 headers: response.headers,
                 body: decode_body(&response.body),
-                url: request.url.clone(),
+                url: url.clone(),
             }),
             Err(NetError::Status {
                 code,
@@ -720,7 +736,7 @@ impl DavDispatch {
                 status: code,
                 headers,
                 body: decode_body(&body),
-                url: request.url.clone(),
+                url: url.clone(),
             }),
             // MOVE consumes 501 as data even after net exhausts its 5xx
             // retry budget. Other exhausted statuses keep their complete retry
@@ -733,7 +749,7 @@ impl DavDispatch {
                 status: response.status,
                 headers: response.headers,
                 body: decode_body(&response.body),
-                url: request.url.clone(),
+                url: url.clone(),
             }),
             // A body past the buffered ceiling is acknowledged but unreadable:
             // the request reached the server and may have taken effect, so a
@@ -974,7 +990,7 @@ impl DavDispatch {
 struct DavHopPolicy {
     dispatch: DavDispatch,
     operation: AccountOperation,
-    effective_url: std::sync::Mutex<String>,
+    effective_url: std::sync::Mutex<crate::DavHref>,
 }
 
 impl DavHopPolicy {
@@ -997,7 +1013,7 @@ impl HopPolicy for DavHopPolicy {
     }
 
     fn admit(&self, _prior: Option<&Url>, next: &Url) -> Result<HopCredential, NetError> {
-        if !self.dispatch.is_trusted_url(next.as_str()) {
+        if self.dispatch.trusted_origins.admit_url(next).is_err() {
             return Err(self.local(format!(
                 "refusing to send DAV credentials to untrusted URL: {next}"
             )));
@@ -1079,11 +1095,12 @@ impl HopPolicy for DavHopPolicy {
                     .map_err(|error| NetError::HopPolicy(Box::new(error)))?;
             }
         }
-        // A poisoned lock still holds a plain String; overwriting it is sound.
+        // A poisoned lock still holds a plain href; overwriting it is sound.
         *self
             .effective_url
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = url.to_string();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            crate::DavHref::from_url(url.clone()).map_err(|detail| self.local(detail))?;
         Ok(())
     }
 }
@@ -1449,7 +1466,7 @@ mod tests {
                 assert_eq!(sent.len(), 2);
                 assert_eq!(sent[1].method, method);
                 assert_eq!(sent[1].body, "query");
-                assert_eq!(response.url, format!("{BASE}/relocated"));
+                assert_eq!(response.url.as_str(), format!("{BASE}/relocated"));
             }
         }
     }

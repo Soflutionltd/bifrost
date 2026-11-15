@@ -1,19 +1,37 @@
 # bifrost-sasl
 
-Private shared SASL/SCRAM computation layer for the bifrost protocol crates.
-Not in the public API of any protocol crate. Depended on by `bifrost-imap`
-and `bifrost-smtp`. No `bifrost-types`, no
+Published SASL support crate for the bifrost protocol crates. The protocol
+facades adapt its mechanisms and errors to their own API. Depended on by
+`bifrost-imap` and `bifrost-smtp`. No `bifrost-types`, no
 `bifrost-net`, no tokio: the crate is sync and computation-only.
 
 ## Scope
 
 Pure computation: no I/O, no async, no protocol command flow. The protocol
 crates own the wire sequencing - driving `+` continuations, framing commands -
-and call into the transition functions here. The SASL crate is invoked from
-inside the protocol consumers, never the other way around.
+and feed decoded challenges into `SaslClient`. The shared client owns the pure
+exchange: initial response, LOGIN position, OAuth error acknowledgement, SCRAM
+nonce, GS2 header, prepared password and expected server signature. Adapters own
+commands, base64 framing, terminal protocol replies, deadlines and token lookup.
 
 ## Surface
 
+- `SaslClient` (`client.rs`) has credential-specific `plain`, `login`, `cram_md5`,
+  `oauth` and `scram` constructors. OAuth requires a resolved token. SCRAM
+  accepts an adapter-generated nonce and prepares both credentials before any
+  command is written. `initial_response()` takes the raw initial response once;
+  `step(&[u8])` returns raw `Step::Reply(Secret)` or verified `Step::Done`.
+  Binary CRAM challenges remain supported. `finish()` validates terminal
+  success, refusing unfinished SCRAM and success after an OAuth error answer.
+  A failed step consumes the exchange; it cannot replay a failed proof.
+  Protocol adapters retain a deferred initial response when SASL-IR is absent.
+  IMAP uses this client for every SASL mechanism; SMTP retains it for PLAIN,
+  LOGIN and OAuth, with `ScramExchange` as its SCRAM base64 adapter. SMTP's AUTH
+  command builder frames payloads without credential lookup or challenge indices. ManageSieve supports SCRAM (both hashes, bound and
+  unbound), PLAIN, XOAUTH2 and OAUTHBEARER using the same client and negotiation.
+  OAuth construction refuses SOH, NUL, CR and LF in either field as local
+  `InvalidCredential`. Enterprise users expect saved credentials to be refused
+  rather than silently rewritten into another identity or token.
 - `Secret` - zeroizing string wrapper (`Zeroizing<String>` newtype),
   constant-time `PartialEq`, redacted `Debug`, `as_str` / `as_bytes` /
   `into_zeroizing`, plus `From<String>` / `From<&str>` /
@@ -41,8 +59,8 @@ inside the protocol consumers, never the other way around.
   `scram_client_final`. `gs2_header()` returns the GS2 header string
   (`"n,,"` / `"y,,"` / `"p=tls-server-end-point,,"`); `binding()` returns the matching
   `ChannelBinding`. A data-carrying enum, not a discriminant-plus-data struct,
-  so the GS2 header and the `c=` value never desync. A PLUS consumer MUST build
-  its client-first header from `gs2_header()`, not a literal.
+  so the GS2 header and the `c=` value never desync. `SaslClient` builds both
+  from the same binding.
 - `Mechanism` (`negotiation.rs`) owns the mechanism vocabulary, wire names,
   case-insensitive `from_name`, and SCRAM hash/binding projection. SASL `Login`
   and the legacy command `ImapLogin` are distinct identities. SMTP's public
@@ -178,6 +196,11 @@ mid-exchange, where retiring the connection is required.
 Unit tests in the crate are the load-bearing proof that the computation is
 correct:
 
+- Shared client (`client.rs`): the absolute RFC 5802 SHA-1 exchange, premature
+  success, failed verifier/refusal terminality, both hashes across n/y/p binding,
+  positional LOGIN, single-use PLAIN, binary CRAM, OAuth error answers and local
+  delimiter refusal. Removing the OAuth validation guard makes its regression
+  test fail; restoring it passes.
 - RFC 5802 SHA-1 client-final + server signature (`scram.rs`), now passing
   `ScramChannelBinding::None` - proves the `None` path stays byte-identical to
   the old `c=biws`.
@@ -235,9 +258,7 @@ correct:
 IMAP and SMTP both drive the PLUS path: their consumers send the
 `p=tls-server-end-point,,` GS2 header, pull the peer cert DER, select PLUS when
 advertised, and enforce RFC 5802 Section 6 downgrade protection (see
-`reference/imap.md` / `reference/smtp.md` and git history). SMTP consumes
-`ScramHash` / `ScramChannelBinding` / `scram_client_final` /
-`verify_server_final` via `ScramExchange`. OAuth (XOAUTH2 / OAUTHBEARER)
+`reference/imap.md` / `reference/smtp.md` and git history). SMTP consumes `SaslClient` through its base64-only `ScramExchange` adapter. OAuth (XOAUTH2 / OAUTHBEARER)
 payload construction now lives here (`xoauth2_payload` / `oauthbearer_payload`),
 collapsing the formerly duplicated IMAP and SMTP builders. The crate owns SCRAM rung eligibility and GS2 selection via
 `scram_rung` and `negotiate`; protocol crates retain wire sequencing.
@@ -262,7 +283,8 @@ SCRAM-SHA-256, SCRAM-SHA-1, PLAIN, CRAM-MD5, SASL LOGIN, IMAP LOGIN. A bound
 SHA-1 exchange outranks unbound SHA-256. Protocol support sets filter this order:
 SMTP supports its existing eight mechanisms; IMAP supports its existing nine
 choices, with CRAM-MD5 and legacy LOGIN opt-in; ManageSieve currently supports
-only PLAIN and XOAUTH2. No new wire exchange is implied by the common vocabulary.
+SCRAM (both hashes with and without binding), PLAIN, XOAUTH2 and OAUTHBEARER.
+Each protocol's support set filters the common vocabulary.
 LOGIN is opt-in for SMTP as well. Enterprise users expect a legacy method only
 when configured, rather than an automatic downgrade.
 

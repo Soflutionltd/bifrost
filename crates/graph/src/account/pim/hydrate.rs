@@ -69,8 +69,8 @@ pub(super) async fn public_message_hydrate(
     // before any EWS request, and neither the caller's fault nor the
     // provider's: local state that no longer matches the id - until a
     // complete discovery pass has run without it, after which it is NotFound.
-    let Some(routing) = account.public_folder_routing(folder).await else {
-        return Err(account.missing_public_route_error(
+    let Some(routing) = account.public_folders.public_folder_routing(folder).await else {
+        return Err(account.public_folders.missing_public_route_error(
             AccountOperation::HydrateMessage,
             id,
             folder,
@@ -91,7 +91,7 @@ pub(super) async fn public_message_hydrate(
         .to_string();
     // Same class-conditional property shape the batch door uses, so both
     // doors ask a non-mail public-folder item for a set it accepts.
-    let shape = account.public_item_shape(id, folder).await;
+    let shape = account.public_folders.public_item_shape(id, folder).await;
     let item = ews
         .get_item(&native, shape, &routing.headers())
         .await

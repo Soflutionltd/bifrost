@@ -15,8 +15,11 @@ macro_rules! nonzero_u32_id {
         impl $name {
             /// Create the identifier. Returns `None` for zero, which is not
             /// valid for IMAP `nz-number` identifiers.
-            pub fn new(value: u32) -> Option<Self> {
-                NonZeroU32::new(value).map(Self)
+            pub const fn new(value: u32) -> Option<Self> {
+                match NonZeroU32::new(value) {
+                    Some(value) => Some(Self(value)),
+                    None => None,
+                }
             }
 
             /// Create the identifier, returning a validation error for zero.
@@ -139,16 +142,35 @@ impl ModSeqValzer {
     }
 }
 
+impl From<ModSeq> for ModSeqValzer {
+    fn from(value: ModSeq) -> Self {
+        Self(value.get())
+    }
+}
+
+impl fmt::Display for ModSeqValzer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 // protocol-specific: X-GM-MSGID is a Gmail IMAP extension value, not a shared object id.
 u64_id!(GmailMessageId, "A Gmail X-GM-MSGID value.");
 // protocol-specific: X-GM-THRID is exposed through IMAP as u64, not bifrost_types::ThreadId.
 u64_id!(GmailThreadId, "A Gmail X-GM-THRID value.");
 
+/// One appended message, with distinct mailbox epoch and UID slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AppendUid {
+    pub(crate) validity: UidValidity,
+    pub(crate) uid: Uid,
+}
+
 /// A typed UID set for UID commands.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct UidSet(SequenceSet);
+pub struct UidSetExpr(SequenceSet);
 
-impl UidSet {
+impl UidSetExpr {
     /// All UIDs in the selected mailbox.
     pub fn all() -> Self {
         Self(SequenceSet::new("1:*").expect("static UID set is valid"))
@@ -161,13 +183,15 @@ impl UidSet {
 
     /// A single UID.
     pub fn one(uid: Uid) -> Self {
-        Self(SequenceSet::new(uid.to_string()).expect("UID is valid sequence-set member"))
+        Self(SequenceSet::from_finite(vec![UidRange::single(uid.get())]))
     }
 
     /// An inclusive UID range.
     pub fn range(start: Uid, end: Uid) -> Self {
-        let set = format!("{start}:{end}");
-        Self(SequenceSet::new(set).expect("UID range is valid sequence set"))
+        Self(SequenceSet::from_finite(vec![UidRange::range(
+            start.get(),
+            end.get(),
+        )]))
     }
 
     /// Build a compact UID set from individual UIDs.
@@ -178,54 +202,14 @@ impl UidSet {
     /// Empty input returns `None` so callers cannot accidentally send an empty
     /// command operand.
     pub fn from_uids(uids: impl IntoIterator<Item = Uid>) -> Option<Self> {
-        let mut values: Vec<u32> = uids.into_iter().map(Uid::get).collect();
-        if values.is_empty() {
-            return None;
-        }
-        values.sort_unstable();
-        values.dedup();
-        Some(Self(
-            SequenceSet::new(coalesce_numbers(&values)).expect("coalesced UID set is valid"),
-        ))
+        super::set::UidSet::from_uids(uids).expression().map(Self)
     }
 
-    /// Build a UID set from already-coalesced ascending ranges.
-    ///
-    /// The counterpart to [`from_uids`](Self::from_uids) for callers that
-    /// already hold range-compressed UIDs - a QRESYNC known-UID baseline,
-    /// for one, which can name hundreds of thousands of messages. Expanding
-    /// those into individual `Uid`s only to re-coalesce them is the whole
-    /// cost of the call.
-    ///
-    /// Ranges are emitted in the order given; `0` is not a legal UID, so a
-    /// range starting at zero is skipped. Empty input (or input that is
-    /// entirely skipped) returns `None`.
-    pub fn from_ranges<'a>(ranges: impl IntoIterator<Item = &'a UidRange>) -> Option<Self> {
-        let mut set = String::new();
-        for range in ranges {
-            if range.start == 0 {
-                continue;
-            }
-            if !set.is_empty() {
-                set.push(',');
-            }
-            match range.end {
-                Some(end) if end > range.start => {
-                    use std::fmt::Write as _;
-                    let _ = write!(set, "{}:{end}", range.start);
-                }
-                _ => {
-                    use std::fmt::Write as _;
-                    let _ = write!(set, "{}", range.start);
-                }
-            }
-        }
-        if set.is_empty() {
-            return None;
-        }
-        Some(Self(
-            SequenceSet::new(set).expect("coalesced UID ranges are a valid sequence set"),
-        ))
+    /// Finite range construction shares the cursor set's normalization.
+    pub fn from_ranges(ranges: impl IntoIterator<Item = UidRange>) -> Option<Self> {
+        super::set::UidSet::from_ranges(ranges.into_iter().collect())
+            .expression()
+            .map(Self)
     }
 
     /// Parse a raw IMAP sequence-set string as a UID set.
@@ -250,13 +234,13 @@ impl UidSet {
     }
 }
 
-impl AsRef<SequenceSet> for UidSet {
+impl AsRef<SequenceSet> for UidSetExpr {
     fn as_ref(&self) -> &SequenceSet {
         self.as_sequence_set()
     }
 }
 
-impl fmt::Display for UidSet {
+impl fmt::Display for UidSetExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
@@ -264,9 +248,9 @@ impl fmt::Display for UidSet {
 
 /// A typed message sequence-number set for non-UID commands.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SeqSet(SequenceSet);
+pub struct SeqSetExpr(SequenceSet);
 
-impl SeqSet {
+impl SeqSetExpr {
     /// All sequence numbers in the selected mailbox.
     pub fn all() -> Self {
         Self(SequenceSet::new("1:*").expect("static sequence set is valid"))
@@ -279,13 +263,15 @@ impl SeqSet {
 
     /// A single sequence number.
     pub fn one(seq: Seq) -> Self {
-        Self(SequenceSet::new(seq.to_string()).expect("sequence number is valid"))
+        Self(SequenceSet::from_finite(vec![UidRange::single(seq.get())]))
     }
 
     /// An inclusive sequence range.
     pub fn range(start: Seq, end: Seq) -> Self {
-        let set = format!("{start}:{end}");
-        Self(SequenceSet::new(set).expect("sequence range is valid sequence set"))
+        Self(SequenceSet::from_finite(vec![UidRange::range(
+            start.get(),
+            end.get(),
+        )]))
     }
 
     /// Build a compact sequence set from individual sequence numbers.
@@ -296,15 +282,9 @@ impl SeqSet {
     /// Empty input returns `None` so callers cannot accidentally send an empty
     /// command operand.
     pub fn from_seqs(seqs: impl IntoIterator<Item = Seq>) -> Option<Self> {
-        let mut values: Vec<u32> = seqs.into_iter().map(Seq::get).collect();
-        if values.is_empty() {
-            return None;
-        }
-        values.sort_unstable();
-        values.dedup();
-        Some(Self(
-            SequenceSet::new(coalesce_numbers(&values)).expect("coalesced sequence set is valid"),
-        ))
+        super::set::SeqNumSet::from_uids(seqs)
+            .expression()
+            .map(Self)
     }
 
     /// Parse a raw IMAP sequence-set string as a sequence-number set.
@@ -329,41 +309,15 @@ impl SeqSet {
     }
 }
 
-impl AsRef<SequenceSet> for SeqSet {
+impl AsRef<SequenceSet> for SeqSetExpr {
     fn as_ref(&self) -> &SequenceSet {
         self.as_sequence_set()
     }
 }
 
-impl fmt::Display for SeqSet {
+impl fmt::Display for SeqSetExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
-    }
-}
-
-fn coalesce_numbers(values: &[u32]) -> String {
-    let mut parts = Vec::new();
-    let mut start = values[0];
-    let mut prev = start;
-
-    for &value in &values[1..] {
-        if value == prev.saturating_add(1) {
-            prev = value;
-            continue;
-        }
-        push_range(&mut parts, start, prev);
-        start = value;
-        prev = value;
-    }
-    push_range(&mut parts, start, prev);
-    parts.join(",")
-}
-
-fn push_range(parts: &mut Vec<String>, start: u32, end: u32) {
-    if start == end {
-        parts.push(start.to_string());
-    } else {
-        parts.push(format!("{start}:{end}"));
     }
 }
 

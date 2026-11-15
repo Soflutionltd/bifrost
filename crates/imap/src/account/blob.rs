@@ -36,7 +36,7 @@ impl From<crate::Error> for BlobError {
 /// declared literal octets before parsing. It is not a peak-memory bound:
 /// one complete response is buffered before delivery, and syntax, parsed
 /// objects and retained backing capacity add overhead. Crossing the body
-/// budget is `Error::FetchLimit`.
+/// budget is `crate::error::ResultLimit::Fetch`.
 const RAW_FETCH_BUDGET: usize = 256 * 1024 * 1024;
 
 /// Open a message's assembled RFC822 octets (`BODY.PEEK[]`).
@@ -69,7 +69,7 @@ pub(crate) fn open_raw_rfc822(
                 {
                     Ok(decoded) => account.folder_error(
                         err,
-                        &decoded.folder,
+                        &decoded.folder.clone(),
                         super::error::ImapErrorContext::operation(AccountOperation::OpenRawRfc822)
                             .with_message_id(scope_id),
                     ),
@@ -94,9 +94,9 @@ async fn run_raw(
     let decoded = decode_object_id(&message, AccountOperation::OpenRawRfc822)?;
     let outcome = run_fetch(
         &account,
-        &decoded.folder,
+        &decoded.folder.clone(),
         decoded.uidvalidity,
-        decoded.uid,
+        decoded.uid.get(),
         AccountOperation::OpenRawRfc822,
         RAW_FETCH_BUDGET,
         UidPersistence::Session,
@@ -105,8 +105,10 @@ async fn run_raw(
     .await?;
     match outcome {
         RawFetchOutcome::Delivered => Ok(()),
-        RawFetchOutcome::NotSticky => Err(BlobError::Imap(crate::Error::Protocol(
-            "raw read unexpectedly refused session-local UIDs".into(),
+        RawFetchOutcome::NotSticky => Err(BlobError::Imap(crate::Error::Provider(
+            crate::error::ProviderFailure::Protocol(
+                "raw read unexpectedly refused session-local UIDs".into(),
+            ),
         ))),
         // The server completed the FETCH without answering for the UID: the
         // message was expunged after the caller learned its id. Completing
@@ -128,7 +130,7 @@ pub(super) enum RawFetchOutcome {
     Absent,
     /// The selected folder's UIDVALIDITY is not the one the id was minted
     /// under; nothing was fetched.
-    GenerationChanged { observed: u32 },
+    GenerationChanged { observed: crate::types::UidValidity },
     /// The folder is `UIDNOTSTICKY` and the caller asked for that to be
     /// refused before the generation is judged; nothing was fetched.
     NotSticky,
@@ -144,16 +146,16 @@ pub(super) enum UidPersistence {
 }
 
 fn missing_body(uid: u32) -> crate::Error {
-    crate::Error::Protocol(format!(
+    crate::Error::Provider(crate::error::ProviderFailure::Protocol(format!(
         "FETCH answered for UID {uid} without its whole BODY[] section"
-    ))
+    )))
 }
 
 /// Shared selection / UIDVALIDITY recheck / streaming-FETCH core for the
 /// raw-message reads (`open_raw_rfc822` and the polling surface's
 /// `fetch_raw`). `op` tags the errors so the caller's operation is
 /// preserved, and `budget` is the client-side ceiling on the octets one read
-/// may stream before `Error::FetchLimit`.
+/// may stream before `crate::error::ResultLimit::Fetch`.
 ///
 /// The outcome is judged over the whole command, not per response: a server
 /// may answer the UID in several FETCH responses (an unsolicited FLAGS update
@@ -165,7 +167,7 @@ fn missing_body(uid: u32) -> crate::Error {
 pub(super) async fn run_fetch(
     account: &ImapAccount,
     folder: &MailboxName,
-    expected_uidvalidity: u32,
+    expected_uidvalidity: crate::types::UidValidity,
     uid: u32,
     op: AccountOperation,
     budget: usize,
@@ -274,20 +276,24 @@ pub(super) async fn run_fetch(
                 };
                 if let Some(first) = &body {
                     if *first != data {
-                        outcome = Err(BlobError::Imap(crate::Error::Protocol(format!(
-                            "FETCH answered UID {requested_uid} with two different bodies"
-                        ))));
+                        outcome = Err(BlobError::Imap(crate::Error::Provider(
+                            crate::error::ProviderFailure::Protocol(format!(
+                                "FETCH answered UID {requested_uid} with two different bodies"
+                            )),
+                        )));
                         break 'responses;
                     }
                     continue;
                 }
                 if data.len() > budget {
-                    outcome = Err(BlobError::Imap(crate::Error::FetchLimit {
-                        estimated: data.len(),
-                        limit: budget,
-                        seq: Some(seq),
-                        uid: Some(requested_uid),
-                    }));
+                    outcome = Err(BlobError::Imap(crate::Error::ResultLimit(
+                        crate::error::ResultLimit::Fetch {
+                            estimated: data.len(),
+                            limit: budget,
+                            seq: crate::types::Seq::new(seq),
+                            uid: crate::types::Uid::new(requested_uid),
+                        },
+                    )));
                     break 'responses;
                 }
                 body = Some(data.clone());
@@ -322,18 +328,23 @@ pub(super) async fn run_fetch(
     let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain);
     let judged = drain_result?;
     match fetch_result {
-        Err(crate::Error::FetchLiteralLimit { estimated, limit }) => {
+        Err(crate::Error::ResultLimit(crate::error::ResultLimit::FetchLiteral {
+            estimated,
+            limit,
+        })) => {
             // The response was stopped at its literal marker, before parsing
             // could recover the server's sequence number or UID. This lane
             // requested exactly one UID, so retain that identity while
             // reporting the caller's byte limit through the established
             // FetchLimit variant.
-            return Err(BlobError::Imap(crate::Error::FetchLimit {
-                estimated,
-                limit,
-                seq: None,
-                uid: Some(uid),
-            }));
+            return Err(BlobError::Imap(crate::Error::ResultLimit(
+                crate::error::ResultLimit::Fetch {
+                    estimated,
+                    limit,
+                    seq: None,
+                    uid: crate::types::Uid::new(uid),
+                },
+            )));
         }
         other => other?,
     }
@@ -357,7 +368,14 @@ mod cancellation_tests {
         let account = ImapAccount::new(scripted_account_parts(conn, 1));
         let pool = std::sync::Arc::downgrade(&account.pool);
         let folder = MailboxName::new("INBOX").unwrap();
-        let stream = open_raw_rfc822(account, super::super::encode_object_id(&folder, 5, 7));
+        let stream = open_raw_rfc822(
+            account,
+            super::super::encode_object_id(
+                &folder,
+                crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                crate::types::Uid::new(7).expect("valid protocol test value"),
+            ),
+        );
         let select = read_line(&mut server).await;
         assert!(select.contains("EXAMINE"), "{select}");
         respond(

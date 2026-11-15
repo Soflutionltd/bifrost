@@ -247,7 +247,9 @@ fn group_splits_distinct_kinds_that_share_an_untagged_response() {
             Command::UidFetch {
                 sequence_set: SequenceSet::new("1:*").unwrap(),
                 items: "(FLAGS)".into(),
-                changed_since: Some(1),
+                changed_since: Some(
+                    crate::types::ModSeq::new(1).expect("valid protocol test value"),
+                ),
                 vanished: true,
             },
             Command::UidExpunge {
@@ -557,7 +559,9 @@ fn synchronized_framing_keeps_admission_open() {
 
 #[test]
 fn a_desynchronization_class_error_retires_only_once_bytes_may_have_left() {
-    let parse = Error::Parse("uninterpretable".into());
+    let parse = Error::Provider(crate::error::ProviderFailure::Parse(
+        "uninterpretable".into(),
+    ));
     // Refused before the first byte: the framing is intact whatever the error.
     let mut state = super::super::state::ProtocolState::new();
     let (tx, mut rx) = mpsc::channel(1);
@@ -596,7 +600,10 @@ fn synchronized_framing_cannot_override_an_unusable_session() {
 #[tokio::test]
 async fn foreign_tag_emits_its_alert_then_fails_the_shared_read_boundary() {
     let (result, events) = run_as_event(b"other OK [ALERT] lost ownership\r\n").await;
-    assert!(matches!(result, Err(Error::Protocol(_))));
+    assert!(matches!(
+        result,
+        Err(Error::Provider(crate::error::ProviderFailure::Protocol(_)))
+    ));
     assert!(matches!(events.as_slice(), [TypedEvent::Alert(text)] if text == "lost ownership"));
 }
 
@@ -611,6 +618,9 @@ async fn shared_read_boundary_reports_framing_from_the_wire_completion() {
     assert_eq!(framing, read_loop::Framing::Desynchronized);
 
     let (result, _, framing) = run_read_frame(b"foreign OK surplus\r\n").await;
-    assert!(matches!(result, Err(Error::Protocol(_))));
+    assert!(matches!(
+        result,
+        Err(Error::Provider(crate::error::ProviderFailure::Protocol(_)))
+    ));
     assert_eq!(framing, read_loop::Framing::Desynchronized);
 }

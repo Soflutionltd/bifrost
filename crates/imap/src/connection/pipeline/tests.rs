@@ -45,7 +45,9 @@ fn unfold_two_element_tuple_ok() {
 #[test]
 fn unfold_two_element_tuple_with_command_error() {
     let results: Vec<Result<Box<dyn std::any::Any + Send>, Error>> = vec![
-        Err(Error::Protocol("test error".into())),
+        Err(Error::Provider(crate::error::ProviderFailure::Protocol(
+            "test error".into(),
+        ))),
         Ok(Box::new(vec![Capability::Imap4Rev1])),
     ];
 
@@ -210,7 +212,12 @@ async fn pipeline_literal_budget_applies_during_responses_and_continuations() {
                     .await
             }
             .unwrap();
-            assert!(matches!(results[0], Err(Error::FetchLiteralLimit { .. })));
+            assert!(matches!(
+                results[0],
+                Err(Error::ResultLimit(
+                    crate::error::ResultLimit::FetchLiteral { .. }
+                ))
+            ));
         };
         let peer = async {
             let fetch = read_line(&mut server).await;

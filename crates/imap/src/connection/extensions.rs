@@ -50,10 +50,10 @@ impl ImapConnection {
     ///
     /// # Errors
     ///
-    /// - [`Error::MissingCapability`] if the server does not advertise `NOTIFY`.
-    /// - [`Error::InvalidState`] if the command is issued in an invalid state
-    ///   ([`Error::Closed`] once the session is in Logout).
-    /// - [`Error::No`] if the server rejects the request (e.g. `[BADEVENT]`
+    /// - [`crate::error::LocalRefusal::MissingCapability`] if the server does not advertise `NOTIFY`.
+    /// - [`crate::error::LocalRefusal::InvalidState`] if the command is issued in an invalid state
+    ///   ([`crate::error::TransportFailure::Closed`] once the session is in Logout).
+    /// - [`crate::error::ServerStatus::No`] if the server rejects the request (e.g. `[BADEVENT]`
     ///   for unsupported event types, RFC 5465 Section 5).
     pub async fn notify_set(
         &self,
@@ -112,9 +112,9 @@ impl ImapConnection {
     ///
     /// # Errors
     ///
-    /// - [`Error::MissingCapability`] if the server does not advertise `NOTIFY`.
-    /// - [`Error::InvalidState`] if the command is issued in an invalid state
-    ///   ([`Error::Closed`] once the session is in Logout).
+    /// - [`crate::error::LocalRefusal::MissingCapability`] if the server does not advertise `NOTIFY`.
+    /// - [`crate::error::LocalRefusal::InvalidState`] if the command is issued in an invalid state
+    ///   ([`crate::error::TransportFailure::Closed`] once the session is in Logout).
     pub async fn notify_none(&self, timeout: Duration) -> Result<(), Error> {
         // RFC 5465 Section 3: NOTIFY is a `command-auth` extension.
         self.require_notify()?;
@@ -167,7 +167,7 @@ impl ImapConnection {
     /// RFC 5161 Section 3.1: ENABLE is valid only in the Authenticated state,
     /// before any mailbox is selected. Attempting to ENABLE in the Selected
     /// state, or after a mailbox was selected and then closed or unselected,
-    /// returns [`Error::InvalidState`].
+    /// returns [`crate::error::LocalRefusal::InvalidState`].
     ///
     /// # Ordering constraint
     ///

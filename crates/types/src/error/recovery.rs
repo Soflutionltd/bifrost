@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 use serde::Serialize;
 
 use crate::cursor::CursorScope;
-use crate::ids::{AccountId, MailboxId};
+use crate::ids::{AccountId, FolderId, PrincipalId};
 
 use super::account_error::AccountError;
 use super::cause::{
@@ -131,7 +131,7 @@ pub enum EngineDirective {
     DowngradeCapabilityForScope(CursorScope),
     SchemaIncompatible,
     OperatorOverrideRequired {
-        reason: String,
+        reason: OperatorOverrideReason,
     },
     /// Permanently disable a single cursor scope without escalating to
     /// the account: an admin revoked access to one shared/other-user
@@ -342,7 +342,7 @@ pub enum ThrottleScope {
 /// Engine bucket key for throttle holds that survive across requests.
 ///
 /// Two routes produce one. The engine LIFTS a `ThrottleScope` plus the
-/// identity the error carries into `Mailbox` / `Account`; and an `Account`
+/// identity the error carries into `Owner` / `Folder` / `Account`; and an `Account`
 /// implementation DECLARES the keys a unit of work consumes
 /// (`Account::throttle_keys`), while its errors STAMP the
 /// [`ThrottleBudget`]s a throttled request was held against
@@ -354,9 +354,13 @@ pub enum ThrottleScope {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum ThrottleKey {
-    Mailbox {
+    Owner {
         account: AccountId,
-        mailbox: MailboxId,
+        owner: PrincipalId,
+    },
+    Folder {
+        account: AccountId,
+        folder: FolderId,
     },
     Account(AccountId),
     Budget(ThrottleBudget),
@@ -470,7 +474,52 @@ impl TryFrom<AccountError> for Fatal {
 #[non_exhaustive]
 pub enum StrategyDowngrade {
     QResyncToCondstore,
+    QResyncToBasic,
     CondstoreToBasic,
+}
+
+/// Why automatic recovery requires an operator. Diagnostic text remains
+/// available for custom provider requirements without becoming a discriminator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OperatorOverrideReason {
+    EstablishRetryBudgetExhausted,
+    UnsupportedRecoveryClassification,
+    OutlookConfiguration { detail: super::DiagnosticText },
+    Other { detail: super::DiagnosticText },
+}
+
+impl OperatorOverrideReason {
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::EstablishRetryBudgetExhausted => {
+                "automatic re-establishment retry budget exhausted"
+            }
+            Self::UnsupportedRecoveryClassification => "unsupported recovery classification",
+            Self::OutlookConfiguration { detail } | Self::Other { detail } => detail.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for OperatorOverrideReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.detail())
+    }
+}
+
+impl From<String> for OperatorOverrideReason {
+    fn from(detail: String) -> Self {
+        Self::Other {
+            detail: super::DiagnosticText::support_only(detail),
+        }
+    }
+}
+
+impl From<&str> for OperatorOverrideReason {
+    fn from(detail: &str) -> Self {
+        detail.to_owned().into()
+    }
 }
 
 // The builder supplies only producer-owned classification causes here, never
@@ -948,8 +997,7 @@ fn derive_sync_state(
         SyncStateErrorKind::OperatorOverrideNeeded => {
             RecoveryClass::Engine(EngineDirective::OperatorOverrideRequired {
                 reason: operator_reason(chain)
-                    .unwrap_or("operator override required")
-                    .to_string(),
+                    .unwrap_or_else(|| "operator override required".into()),
             })
         }
     }
@@ -965,9 +1013,9 @@ fn strategy_downgrade(chain: &CauseChain) -> StrategyDowngrade {
         .unwrap_or(StrategyDowngrade::QResyncToCondstore)
 }
 
-fn operator_reason(chain: &CauseChain) -> Option<&str> {
+fn operator_reason(chain: &CauseChain) -> Option<OperatorOverrideReason> {
     chain.iter().find_map(|cause| match cause {
-        Cause::State(StateCause::OperatorOverrideNeeded { reason }) => Some(reason.as_str()),
+        Cause::State(StateCause::OperatorOverrideNeeded { reason }) => Some(reason.clone()),
         _ => None,
     })
 }
@@ -1227,7 +1275,7 @@ mod tests {
             (EngineDirective::SchemaIncompatible, None),
             (
                 EngineDirective::OperatorOverrideRequired {
-                    reason: "x".to_owned(),
+                    reason: "x".to_owned().into(),
                 },
                 None,
             ),
@@ -1260,11 +1308,11 @@ mod tests {
         );
         assert_eq!(
             EngineDirective::OperatorOverrideRequired {
-                reason: "a".to_owned()
+                reason: "a".to_owned().into()
             }
             .identity(),
             EngineDirective::OperatorOverrideRequired {
-                reason: "b".to_owned()
+                reason: "b".to_owned().into()
             }
             .identity(),
         );
@@ -1879,7 +1927,7 @@ mod tests {
             None,
             Some(AccountOperation::SyncChanges),
             &chain(Cause::State(StateCause::OperatorOverrideNeeded {
-                reason: "qresync repeatedly failed".to_string(),
+                reason: OperatorOverrideReason::EstablishRetryBudgetExhausted,
             })),
             None,
             None,
@@ -1894,7 +1942,7 @@ mod tests {
         assert_eq!(
             operator,
             RecoveryClass::Engine(EngineDirective::OperatorOverrideRequired {
-                reason: "qresync repeatedly failed".to_string(),
+                reason: OperatorOverrideReason::EstablishRetryBudgetExhausted,
             })
         );
     }

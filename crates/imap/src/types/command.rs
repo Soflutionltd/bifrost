@@ -172,14 +172,14 @@ pub(crate) enum Command {
         sequence_set: SequenceSet,
         items: super::fetch::FetchItems,
         /// Optional CHANGEDSINCE modifier (RFC 7162 Section 3.1.4.1).
-        changed_since: Option<u64>,
+        changed_since: Option<crate::types::ModSeq>,
     },
     /// STORE command (RFC 3501 Section 6.4.6, RFC 7162 for CONDSTORE).
     Store {
         sequence_set: SequenceSet,
         operation: super::StoreOperation,
         flags: Vec<Flag>,
-        unchanged_since: Option<u64>,
+        unchanged_since: Option<crate::types::ModSeqValzer>,
     },
     /// COPY command (RFC 3501 Section 6.4.7).
     Copy {
@@ -213,7 +213,7 @@ pub(crate) enum Command {
         sequence_set: SequenceSet,
         items: super::fetch::FetchItems,
         /// Optional CHANGEDSINCE modifier (RFC 7162 Section 3.1.4.1).
-        changed_since: Option<u64>,
+        changed_since: Option<crate::types::ModSeq>,
         /// VANISHED modifier for QRESYNC (RFC 7162 Section 3.2.6).
         ///
         /// When `true`, the server returns `VANISHED` responses instead of
@@ -226,7 +226,7 @@ pub(crate) enum Command {
         sequence_set: SequenceSet,
         operation: super::StoreOperation,
         flags: Vec<Flag>,
-        unchanged_since: Option<u64>,
+        unchanged_since: Option<crate::types::ModSeqValzer>,
     },
     /// UID MOVE command (RFC 6851).
     UidMove {

@@ -57,15 +57,13 @@ impl ReadLoop {
                 // Enterprise users expect a reconnect when command ownership
                 // is lost, including during IDLE, rather than stale mail on
                 // a connection whose next completion cannot be trusted.
-                return Err(Error::Protocol(format!(
-                    "unexpected tag {:?} in active exchange",
-                    t.tag
+                return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
+                    format!("unexpected tag {:?} in active exchange", t.tag),
                 )));
             };
             let Some(terminal) = terminal else {
-                return Err(Error::Protocol(format!(
-                    "tagged response for unsent pipelined command: {:?}",
-                    t.tag,
+                return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
+                    format!("tagged response for unsent pipelined command: {:?}", t.tag,),
                 )));
             };
             if *terminal {
@@ -80,9 +78,9 @@ impl ReadLoop {
         let mut code_emitted = false;
         match &response {
             Response::Greeting(_) => {
-                return Err(Error::Protocol(
+                return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
                     "unexpected greeting in active exchange".into(),
-                ));
+                )));
             }
             Response::Untagged(u) => {
                 code_emitted = super::process_untagged_prefix(

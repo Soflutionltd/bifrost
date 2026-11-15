@@ -1,4 +1,3 @@
-#![allow(dead_code)] // codec helper surface not every caller reads
 //! Foreign (shared/delegate) JMAP account codec.
 //!
 //! A non-personal JMAP account surfaces as ONE account-level cursor scope,
@@ -16,12 +15,10 @@
 //! collide in the engine's cursor / membership index); the `Folder`
 //! shape is the variant-free resolution.
 //!
-//! Identical in shape to the Graph codec but per-crate: here the
-//! `mailbox` field is a JMAP `accountId` and `folder` is a native JMAP
-//! mailbox id, where Graph carries a `/users/{id}` routing key - so a
-//! shared `bifrost-types` type would be a false generalization.
+//! Owner meaning stays provider-owned; the legacy consumer encoding is kept
+//! here so every JMAP door uses the same parsing and wire conversion.
 
-use bifrost_types::{FolderId, MailboxId, MembershipScope};
+use bifrost_types::{FolderId, MembershipScope, PrincipalId};
 
 /// Reserved separator. A `FolderId` of the form
 /// `"<accountId>\u{1f}<mailboxId>"` is a foreign-account mailbox. `\u{1f}`
@@ -29,6 +26,69 @@ use bifrost_types::{FolderId, MailboxId, MembershipScope};
 /// printable-ASCII-ish and never contain control characters), so it is an
 /// unambiguous delimiter.
 const FOREIGN_SEP: char = '\u{1f}';
+
+/// Declared ownership is independent of the current session's reachability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Owner<'a> {
+    Primary,
+    Shared(&'a str),
+}
+
+impl<'a> Owner<'a> {
+    pub(crate) fn shared(self) -> Option<&'a str> {
+        match self {
+            Self::Primary => None,
+            Self::Shared(id) => Some(id),
+        }
+    }
+}
+
+/// A borrowed consumer identity. Parsing retains the historical first separator
+/// grammar, including empty owners and suffix separators, for persisted keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JmapRef<'a> {
+    pub(crate) owner: Owner<'a>,
+    pub(crate) native: &'a str,
+    raw: &'a str,
+}
+
+impl<'a> JmapRef<'a> {
+    pub(crate) fn parse(raw: &'a str) -> Self {
+        match raw.split_once(FOREIGN_SEP) {
+            Some((owner, native)) => Self {
+                owner: Owner::Shared(owner),
+                native,
+                raw,
+            },
+            None => Self {
+                owner: Owner::Primary,
+                native: raw,
+                raw,
+            },
+        }
+    }
+
+    /// Strip only on the matching shared route. A qualified primary id or a
+    /// departed share stays literal: otherwise a colliding primary object could
+    /// be read or mutated under somebody else's identity.
+    pub(crate) fn wire(self, route: Owner<'_>) -> &'a str {
+        match (self.owner, route) {
+            (Owner::Shared(owner), Owner::Shared(selected)) if owner == selected => self.native,
+            _ => self.raw,
+        }
+    }
+
+    pub(crate) fn encode(owner: Owner<'_>, native: &str) -> String {
+        match owner {
+            Owner::Primary => native.to_owned(),
+            Owner::Shared(owner) => format!("{owner}{FOREIGN_SEP}{native}"),
+        }
+    }
+
+    pub(crate) fn same_owner(self, other: Self) -> bool {
+        self.owner == other.owner
+    }
+}
 
 /// A foreign-account mailbox: the owning JMAP `accountId` plus the native
 /// JMAP mailbox id within it.
@@ -45,6 +105,7 @@ impl ForeignMailbox {
     /// True for the account-level cursor scope shape (empty mailbox
     /// part), which names the whole foreign account rather than one of
     /// its mailboxes.
+    #[cfg(test)]
     pub(crate) fn is_account_scope(&self) -> bool {
         self.mailbox_id.is_empty()
     }
@@ -53,7 +114,7 @@ impl ForeignMailbox {
 /// Encode a `(accountId, mailboxId)` pair into the namespaced `FolderId`
 /// used for foreign containers and memberships.
 pub(crate) fn encode_foreign(account_id: &str, mailbox_id: &str) -> FolderId {
-    FolderId(format!("{account_id}{FOREIGN_SEP}{mailbox_id}"))
+    FolderId(JmapRef::encode(Owner::Shared(account_id), mailbox_id))
 }
 
 /// Encode a foreign account's single ACCOUNT-LEVEL cursor scope id: the
@@ -73,26 +134,18 @@ pub(crate) fn encode_foreign_account(account_id: &str) -> FolderId {
 /// occurs for JMAP, whose primary scopes are `Type(_)`, but guards the
 /// boundary regardless).
 pub(crate) fn parse_foreign(folder: &FolderId) -> Option<ForeignMailbox> {
-    // Keep the historical first-separator grammar, including empty owners
-    // and separators in the suffix. The encoders accept arbitrary strings,
-    // and protocol Id deserialization does not validate them either: these
-    // exact forms may already be persisted ids minted by this crate. Tightening
-    // only this reader would orphan those containers on a later reopen. A
-    // stricter format needs a versioned codec and a legacy decoding path.
-    folder
-        .0
-        .split_once(FOREIGN_SEP)
-        .map(|(account_id, mailbox_id)| ForeignMailbox {
-            account_id: account_id.to_string(),
-            mailbox_id: mailbox_id.to_string(),
-        })
+    let parsed = JmapRef::parse(&folder.0);
+    parsed.owner.shared().map(|account_id| ForeignMailbox {
+        account_id: account_id.to_owned(),
+        mailbox_id: parsed.native.to_owned(),
+    })
 }
 
 /// The `MembershipScope` owner tag for a foreign mailbox: the owning JMAP
-/// `accountId` as a `MailboxId`. Emitted on discovery so the consumer
+/// `accountId` as a `PrincipalId`. Emitted on discovery so the consumer
 /// maps the scope to its shared-account owner.
 pub(crate) fn owner_tag(account_id: &str) -> MembershipScope {
-    MembershipScope::Mailbox(MailboxId(account_id.to_string()))
+    MembershipScope::Owner(PrincipalId(account_id.to_string()))
 }
 
 /// Encode a foreign account's native object id (an `Email` id, a `blobId`,
@@ -116,13 +169,20 @@ pub(crate) fn owner_tag(account_id: &str) -> MembershipScope {
 /// thread and every thread-keyed mutation lands on ITS messages -
 /// `delete_thread` destroys them.
 pub(crate) fn encode_object(account_id: &str, native: &str) -> String {
-    format!("{account_id}{FOREIGN_SEP}{native}")
+    JmapRef::encode(Owner::Shared(account_id), native)
 }
 
 /// A parsed object id: `Some((accountId, native))` for a foreign-account
 /// object, `None` for a primary-account object (a bare native id).
 pub(crate) fn parse_object(id: &str) -> Option<(&str, &str)> {
-    id.split_once(FOREIGN_SEP)
+    match JmapRef::parse(id) {
+        JmapRef {
+            owner: Owner::Shared(owner),
+            native,
+            ..
+        } => Some((owner, native)),
+        _ => None,
+    }
 }
 
 /// The native (owner-namespace) form of an object id, whether or not it was
@@ -189,10 +249,10 @@ mod tests {
     }
 
     #[test]
-    fn owner_tag_is_mailbox_membership() {
+    fn owner_tag_is_owner_membership() {
         assert_eq!(
             owner_tag("acct-99"),
-            MembershipScope::Mailbox(MailboxId("acct-99".to_string()))
+            MembershipScope::Owner(PrincipalId("acct-99".to_string()))
         );
     }
 

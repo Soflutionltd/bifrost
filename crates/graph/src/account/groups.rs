@@ -37,7 +37,7 @@ pub(crate) async fn directory_groups_list(
     let url = match decode_link_cursor(&account, page_cursor, operation)? {
         Some(next) => next,
         None => {
-            let prefix = account.client.api_path_prefix();
+            let prefix = account.mailboxes.primary().api_path_prefix();
             first_page(&account, &groups_list_path(&prefix), operation)?
         }
     };
@@ -84,7 +84,7 @@ fn first_page(
     path: &str,
     operation: AccountOperation,
 ) -> Result<AdmittedUrl, AccountError> {
-    account.client.api_url(path).map_err(|error| {
+    account.mailboxes.primary().api_url(path).map_err(|error| {
         graph_error::into_account_error(error, graph_error::GraphErrorContext::graph(operation))
     })
 }

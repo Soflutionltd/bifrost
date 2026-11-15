@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use bifrost_types::{Account, AccountCapabilities, AccountControl, AccountFactory};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 
-use crate::multiplexer::ReopenRequest;
+use crate::engine::supervisor::ReopenRequest;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -400,7 +400,7 @@ pub(crate) struct AccountSlot {
     /// no subscribers so new subscribers don't get a closed-channel
     /// error.
     #[allow(dead_code)]
-    pub _sentinel_rx: tokio::sync::broadcast::Receiver<crate::multiplexer::MultiplexerEvent>,
+    pub _sentinel_rx: tokio::sync::broadcast::Receiver<crate::delivery::MultiplexerEvent>,
     /// Spawned workers paired with their abort handles. `detach`
     /// aborts each worker on timeout so tasks do not leak past the
     /// configured deadline.
@@ -426,7 +426,7 @@ pub(crate) struct AccountSlot {
     /// provider deadlines cross accounts). Recovery paths record waits
     /// keyed by `ThrottleKey`; the per-scope poll loop and the push
     /// reconciler consult it before driving work.
-    pub throttles: Arc<crate::recovery::ThrottleBucket>,
+    pub throttles: Arc<crate::throttle::ThrottleBucket>,
     /// The `OpenedAccount::skipped_scopes` lane from the most recent
     /// successful `factory.open` (attach or reopen swap): the parts of
     /// the account surface the protocol crate discovered but could not
@@ -443,7 +443,7 @@ pub(crate) struct AccountSlot {
     /// an overlapping successor. One mutex orders send-and-stamp,
     /// subscribe-and-number, and unregister-and-sweep, so the answer is exact
     /// rather than approximate.
-    pub delivery: Arc<crate::multiplexer::ChangeDelivery>,
+    pub delivery: Arc<crate::delivery::ChangeDelivery>,
 }
 
 pub(crate) struct WorkerTask {

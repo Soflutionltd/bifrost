@@ -31,6 +31,7 @@ mod events;
 mod idle;
 mod pipeline;
 pub(super) mod read_loop;
+pub(crate) mod task;
 mod upgrade;
 mod wire_send;
 
@@ -337,12 +338,14 @@ impl DriverConsumer {
         ctx: &ConsumerContext,
     ) -> Result<ContinuationReply, Error> {
         match self {
-            Self::Regular(_) => Err(Error::Protocol(
+            Self::Regular(_) => Err(Error::Provider(crate::error::ProviderFailure::Protocol(
                 "unexpected continuation during command that does not expect one".into(),
-            )),
-            Self::StreamingRegular(_) => Err(Error::Protocol(
-                "unexpected continuation during streaming command".into(),
-            )),
+            ))),
+            Self::StreamingRegular(_) => {
+                Err(Error::Provider(crate::error::ProviderFailure::Protocol(
+                    "unexpected continuation during streaming command".into(),
+                )))
+            }
             Self::WithContinuations(c) => c.on_continuation_erased(cont, ctx),
         }
     }
@@ -728,7 +731,9 @@ pub(in crate::connection) fn live_state_refusal(
     .require_state(kind)
     .err()
     .map(|error| match error {
-        Error::InvalidState(reason) => Error::StateChangedBeforeSend(reason),
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidState(reason)) => {
+            Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(reason))
+        }
         other => other,
     })
 }
@@ -756,21 +761,29 @@ pub(in crate::connection) fn admit_live(
         },
     )
     .map_err(|error| match error {
-        Error::InvalidState(reason) => Error::StateChangedBeforeSend(reason),
-        Error::MissingCapability(reason) => {
-            Error::StateChangedBeforeSend(crate::error::LocalFailure::state(
-                crate::error::StateRequirement::Capability(reason.clone()),
-                reason.message,
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidState(reason)) => {
+            Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(reason))
+        }
+        Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(reason)) => {
+            Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(
+                crate::error::LocalFailure::state(
+                    crate::error::StateRequirement::Capability(reason.clone()),
+                    reason.message,
+                ),
             ))
         }
-        Error::StartTlsUnavailable => {
-            Error::StateChangedBeforeSend(crate::error::LocalFailure::state(
-                crate::error::StateRequirement::Capability(crate::error::CapabilityFailure::new(
-                    Capability::StartTls,
-                    crate::error::CapabilityFailureReason::NotAdvertised,
+        Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable) => {
+            Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(
+                crate::error::LocalFailure::state(
+                    crate::error::StateRequirement::Capability(
+                        crate::error::CapabilityFailure::new(
+                            Capability::StartTls,
+                            crate::error::CapabilityFailureReason::NotAdvertised,
+                            "STARTTLS is no longer available",
+                        ),
+                    ),
                     "STARTTLS is no longer available",
-                )),
-                "STARTTLS is no longer available",
+                ),
             ))
         }
         other => other,
@@ -950,11 +963,19 @@ async fn dispatch_response_loop(
                         // SCRAM refusal already supplies the recovery class. Without one,
                         // the continuation error carries the more useful
                         // server-final explanation.
-                        let error = if matches!(&error, Error::Auth { scram: None, .. }) {
+                        let error = if matches!(
+                            &error,
+                            Error::ServerStatus(crate::error::ServerStatus::Auth {
+                                scram: None,
+                                ..
+                            })
+                        ) {
                             match finalized_output {
-                                Err(completion_error @ Error::Auth { code: Some(_), .. }) => {
-                                    completion_error
-                                }
+                                Err(
+                                    completion_error @ Error::ServerStatus(
+                                        crate::error::ServerStatus::Auth { code: Some(_), .. },
+                                    ),
+                                ) => completion_error,
                                 _ => error,
                             }
                         } else {
@@ -969,9 +990,9 @@ async fn dispatch_response_loop(
                     // Framing completed, but cancellation did not restore the
                     // agreed authentication state. Retire this session explicitly.
                     state.apply_infrastructure_failure();
-                    return Err(Error::Protocol(
+                    return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
                         "SASL cancellation did not end with the command's tagged NO".into(),
-                    ));
+                    )));
                 }
                 return finalized_output
                     .map_err(|e| e.with_attempt(TransmissionState::Acknowledged));
@@ -1019,9 +1040,9 @@ async fn dispatch_response_loop(
             }
             crate::types::Response::Continuation(c) => {
                 if continuation_error.is_some() {
-                    return Err(Error::Protocol(
+                    return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
                         "server sent another SASL continuation after client cancellation".into(),
-                    ));
+                    )));
                 }
                 // A regular or streaming consumer refuses a continuation as a
                 // protocol error; only a continuation consumer (AUTHENTICATE)
@@ -1055,7 +1076,9 @@ async fn dispatch_response_loop(
                     .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
             }
             crate::types::Response::Greeting(_) => {
-                return Err(Error::Protocol("unexpected greeting mid-command".into()));
+                return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
+                    "unexpected greeting mid-command".into(),
+                )));
             }
         }
     }

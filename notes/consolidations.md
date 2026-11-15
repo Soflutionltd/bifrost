@@ -233,43 +233,6 @@ and an error from a net local hold is recorded into the engine bucket a second
 time. Decide which store owns provider holds and feed the other from it.
 Related: CON-009 (budget declared vs stamped).
 
-## CON-016 - Which cursor scopes does a membership map to, and back?
-
-**Reported by:** sync-engine, types.
-
-- `engine/attach.rs::scope_covers_membership`: the predicate from a
-  `CursorScope` to the memberships it covers (feeds push-hint routing).
-- `multiplexer/mod.rs::membership_scopes` and `folder_cursor_shapes`: generate
-  cursor scopes from a membership for lifecycle create and delete.
-- `recovery.rs::resolve_throttle_key`: turns `ErrorScope::Cursor(Folder(id))`
-  into `ThrottleKey::Mailbox(MailboxId(folder.0))`.
-
-All three treat `FolderId` and `MailboxId` as the same string via `.0` ("Graph
-maps folders 1:1 to mailboxes"). They agree today; nothing ties them. Adding
-`MembershipScope::Label` handling or a new `CursorScope` shape means editing two
-inverse functions in two modules. The `Type(_)` arm also "covers every
-membership", including memberships of an unrelated object type. Owner:
-`bifrost-types`, `CursorScope::covers(&MembershipScope)` plus a shape-driven
-`scopes_for(membership)` tested as its inverse, with Folder vs Mailbox an
-explicit conversion. The type-level overload behind it is STR-001.
-
-The sync-lanes hunter counted five sites and two answers on folder-vs-mailbox
-identity, adding: `inventory_walk::removals` projects a folder scope's removal
-only to `MembershipScope::Folder`, never `Mailbox`, and an unknown `CursorScope`
-is an `Internal(AccountContract)` error; the `mutation/readback.rs` move check
-(`entry.memberships.contains(destination)`) is strict enum equality, so a
-`Folder("x")` destination never matches an observed `Mailbox("x")` - the
-opposite of the string-identity rule in `scope_covers_membership`; and
-`cursor::ScopeShapes::record` / `folder_cursor_shapes` decide which shapes
-exist. Every site carries a `_ =>` arm because both enums are
-`#[non_exhaustive]` across the crate boundary, so a new variant becomes false,
-ignored or an error depending on the site. Its proposed owner: one
-`cursor/topology.rs` owning `covers(scope, membership)`,
-`removal_projection(scope)`, `scopes_for(shapes, membership)` and
-`membership_eq(a, b)`; or `bifrost-types` next to the enums, where the matches
-can be exhaustive, if the equivalence is a protocol fact rather than engine
-policy.
-
 ## CON-018 - Which priority maps to which scheduler lane, and when does starvation fire?
 
 **Reported by:** sync-engine.
@@ -388,18 +351,4 @@ walk still discharges a proven absence silently, because `InventoryEvent` has
 no per-object evidence variant, so the engine never sees the proof. That needs
 a shared inventory API change in bifrost-types. (Mutation 404 handling stays
 separate on purpose: it proves target absence, not inventory coverage.)
-
-## CON-061 - Throttle-scope stamping happens at three sites for DAV alone
-
-**Reported by:** net-dav.
-
-net `status_kind_cause` returns a throttle bool for 429/507; DAV `status_error`
-stamps `ThrottleScope::Account` on 429 and 507 itself; DAV `net_account_error`
-passes `Some(Account)` into net's funnel; DAV `dispatch_once` re-stamps `Account`
-afterwards on any `RateLimited` or `QuotaExhausted` kind; Graph's `stamp_budget`
-re-stamps after net; JMAP passes `Account`. The test
-`generic_transport_throttle_matches_dav_status_policy` exists to hold two DAV copies
-in step. Owner: the one status classification (BUG-072) returns `throttles: bool`,
-and the provider context supplies the scope (and Graph's budget) exactly once.
-Related: BUG-083, CON-013.
 

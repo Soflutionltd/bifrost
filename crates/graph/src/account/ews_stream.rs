@@ -28,7 +28,7 @@ pub(crate) type EwsReleaser = std::sync::Arc<
 >;
 type Completion = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
 #[derive(Default)]
-pub(crate) struct EwsLedger {
+struct EwsLedger {
     retired: bool,
     entries: std::collections::HashMap<String, EwsEntry>,
 }
@@ -42,53 +42,146 @@ enum EwsEntryState {
     Releasing(Completion),
 }
 
-fn release(account: &GraphAccount, id: &str) -> Completion {
-    use futures::FutureExt;
-    let mut ledger = account.ews_ledger.lock().expect("EWS ledger lock");
-    let Some(entry) = ledger.entries.get_mut(id) else {
-        return futures::future::ready(()).boxed().shared();
-    };
-    if let EwsEntryState::Releasing(done) = &entry.state {
-        return done.clone();
+type EwsRegistrations =
+    std::collections::HashMap<bifrost_types::SubscriptionHandle, super::push::EwsSubscriptionState>;
+
+/// Owns EWS registrations, their wakeup generation and server release state.
+/// Clones share all mutable state, including metered account views.
+#[derive(Clone)]
+pub(crate) struct EwsRegistry {
+    registrations: std::sync::Arc<tokio::sync::RwLock<EwsRegistrations>>,
+    topology: std::sync::Arc<tokio::sync::watch::Sender<u64>>,
+    ledger: std::sync::Arc<std::sync::Mutex<EwsLedger>>,
+}
+impl Default for EwsRegistry {
+    fn default() -> Self {
+        Self {
+            registrations: std::sync::Arc::default(),
+            topology: std::sync::Arc::new(tokio::sync::watch::Sender::new(0)),
+            ledger: std::sync::Arc::default(),
+        }
     }
-    let releaser = std::sync::Arc::clone(&entry.releaser);
-    let id = id.to_owned();
-    let owner = account.clone();
-    let (tx, rx) = futures::channel::oneshot::channel();
-    let done = async move {
-        let _ = rx.await;
+}
+impl EwsRegistry {
+    pub(crate) async fn register(
+        &self,
+        shutdown: &tokio_util::sync::CancellationToken,
+        handle: bifrost_types::SubscriptionHandle,
+        scopes: Vec<EwsSubscriptionScope>,
+    ) -> bool {
+        let mut registrations = self.registrations.write().await;
+        if shutdown.is_cancelled() {
+            return false;
+        }
+        registrations.insert(handle, super::push::EwsSubscriptionState { scopes });
+        drop(registrations);
+        // No await after commit. Observe topology before reading the scope
+        // union so registration between that read and a wait cannot be lost.
+        self.topology.send_modify(|n| *n = n.wrapping_add(1));
+        true
     }
-    .boxed()
-    .shared();
-    entry.state = EwsEntryState::Releasing(done.clone());
-    let task = tokio::spawn(async move {
-        let result = releaser(id.clone()).await;
-        let mut ledger = owner.ews_ledger.lock().expect("EWS ledger lock");
-        if result.is_ok() || ledger.retired {
-            ledger.entries.remove(&id);
-        } else if let Some(entry) = ledger.entries.get_mut(&id) {
+    pub(crate) async fn remove(&self, handle: &bifrost_types::SubscriptionHandle) {
+        let removed = self.registrations.write().await.remove(handle).is_some();
+        if removed {
+            self.topology.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    }
+    fn topology(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.topology.subscribe()
+    }
+    async fn active_scopes(&self) -> Vec<EwsSubscriptionScope> {
+        let states = self.registrations.read().await;
+        dedupe_by_ews_folder(states.values().flat_map(|s| s.scopes.iter()))
+    }
+    async fn scopes_for_folder(&self, folder: &str) -> Vec<CursorScope> {
+        let states = self.registrations.read().await;
+        unique_scopes_for_folder(states.values().flat_map(|s| s.scopes.iter()), folder)
+    }
+    fn record(&self, id: String, releaser: EwsReleaser) -> bool {
+        let mut ledger = self.ledger.lock().expect("EWS ledger lock");
+        ledger.entries.insert(
+            id,
+            EwsEntry {
+                state: EwsEntryState::Live,
+                releaser,
+            },
+        );
+        ledger.retired
+    }
+    fn orphans(&self) -> Vec<String> {
+        self.ledger
+            .lock()
+            .expect("EWS ledger lock")
+            .entries
+            .iter()
+            .filter(|(_, e)| matches!(e.state, EwsEntryState::Orphaned))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+    fn orphan(&self, id: &str) {
+        let mut ledger = self.ledger.lock().expect("EWS ledger lock");
+        if let Some(entry) = ledger.entries.get_mut(id)
+            && matches!(entry.state, EwsEntryState::Live)
+        {
             entry.state = EwsEntryState::Orphaned;
         }
-        if let Err(error) = result {
-            tracing::debug!(?error, "EWS Unsubscribe failed");
+    }
+    #[cfg(test)]
+    pub(crate) fn registrations_for_tests(&self) -> &tokio::sync::RwLock<EwsRegistrations> {
+        &self.registrations
+    }
+    #[cfg(test)]
+    pub(crate) fn topology_for_tests(&self) -> &tokio::sync::watch::Sender<u64> {
+        &self.topology
+    }
+    pub(crate) fn release(&self, tasks: &super::push_tasks::PushTasks, id: &str) -> Completion {
+        use futures::FutureExt;
+        let mut ledger = self.ledger.lock().expect("EWS ledger lock");
+        let Some(entry) = ledger.entries.get_mut(id) else {
+            return futures::future::ready(()).boxed().shared();
+        };
+        if let EwsEntryState::Releasing(done) = &entry.state {
+            return done.clone();
         }
-        let _ = tx.send(());
-    });
-    // Ledger -> task registry is the lock order. Publish the handle before
-    // close can observe Releasing, so a claimed release cannot slip between
-    // its ledger snapshot and its task join.
-    super::push_tasks::track(account, task);
-    drop(ledger);
-    done
-}
-pub(crate) fn retire_ledger(account: &GraphAccount) {
-    let ids = {
-        let mut ledger = account.ews_ledger.lock().expect("EWS ledger lock");
-        ledger.retired = true;
-        ledger.entries.keys().cloned().collect::<Vec<_>>()
-    };
-    for id in ids {
-        drop(release(account, &id));
+        let releaser = std::sync::Arc::clone(&entry.releaser);
+        let id = id.to_owned();
+        let owner = self.clone();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let done = async move {
+            let _ = rx.await;
+        }
+        .boxed()
+        .shared();
+        entry.state = EwsEntryState::Releasing(done.clone());
+        let task = tokio::spawn(async move {
+            let result = releaser(id.clone()).await;
+            let mut ledger = owner.ledger.lock().expect("EWS ledger lock");
+            if result.is_ok() || ledger.retired {
+                ledger.entries.remove(&id);
+            } else if let Some(entry) = ledger.entries.get_mut(&id) {
+                entry.state = EwsEntryState::Orphaned;
+            }
+            if let Err(error) = result {
+                tracing::debug!(?error, "EWS Unsubscribe failed");
+            }
+            let _ = tx.send(());
+        });
+        // Ledger -> task registry is the lock order. Publish the handle before
+        // close can observe Releasing, so a claimed release cannot slip between
+        // its ledger snapshot and its task join.
+        tasks.track(task);
+        drop(ledger);
+        done
+    }
+    pub(crate) fn retire(&self, tasks: &super::push_tasks::PushTasks) {
+        let ids = {
+            let mut ledger = self.ledger.lock().expect("EWS ledger lock");
+            ledger.retired = true;
+            ledger.entries.keys().cloned().collect::<Vec<_>>()
+        };
+        for id in ids {
+            drop(self.release(tasks, &id));
+        }
     }
 }
 struct LiveSubscription {
@@ -97,12 +190,7 @@ struct LiveSubscription {
 }
 impl Drop for LiveSubscription {
     fn drop(&mut self) {
-        let mut ledger = self.account.ews_ledger.lock().expect("EWS ledger lock");
-        if let Some(entry) = ledger.entries.get_mut(&self.id)
-            && matches!(entry.state, EwsEntryState::Live)
-        {
-            entry.state = EwsEntryState::Orphaned;
-        }
+        self.account.ews.orphan(&self.id);
     }
 }
 
@@ -110,7 +198,7 @@ pub(crate) fn streaming_session(
     account: GraphAccount,
     stop: bifrost_types::SessionStop,
 ) -> bifrost_types::AccountStream<bifrost_types::PushSessionEvent> {
-    let Some(net) = account.client.account_net() else {
+    let Some(net) = account.mailboxes.primary().account_net() else {
         return Box::pin(futures::stream::once(async {
             bifrost_types::PushSessionEvent::Failed(ews_error_to_account_error(
                 EwsError::Internal("EWS session has no attached account transport".into()),
@@ -120,8 +208,8 @@ pub(crate) fn streaming_session(
     };
     let ews = std::sync::Arc::new(EwsClient::new(
         net,
-        account.client.ews_url(),
-        account.client.outlook_auth(),
+        account.mailboxes.primary().ews_url(),
+        account.mailboxes.primary().outlook_auth(),
     ));
     ews_session(account, ews, stop)
 }
@@ -135,12 +223,12 @@ fn ews_session<E: EwsExecute + Send + Sync + 'static>(
     use futures::FutureExt;
     Box::pin(async_stream::stream! {
         let Some(_lease) = account.push_lease.try_claim() else { yield E::Failed(bifrost_types::push_lane_contract_error(bifrost_types::Protocol::Ews, bifrost_types::PushLane(0), "already driven")); return; };
-        let orphans = { let ledger = account.ews_ledger.lock().expect("EWS ledger lock"); ledger.entries.iter().filter(|(_, e)| matches!(e.state, EwsEntryState::Orphaned)).map(|(id, _)| id.clone()).collect::<Vec<_>>() };
-        for id in orphans { drop(release(&account, &id)); }
-        let mut topology = account.ews_topology.subscribe();
+        let orphans = account.ews.orphans();
+        for id in orphans { drop(account.ews.release(&account.push_tasks, &id)); }
+        let mut topology = account.ews.topology();
         let scopes = loop {
             topology.borrow_and_update();
-            let scopes = { let registrations = account.ews_subscriptions.read().await; dedupe_by_ews_folder(registrations.values().flat_map(|state| state.scopes.iter())) };
+            let scopes = account.ews.active_scopes().await;
             if !scopes.is_empty() { break scopes; }
             tokio::select! { () = stop.stopped() => { yield E::Ended(End::Stopped); return; }, () = account.shutdown.cancelled() => { yield E::Ended(End::Stopped); return; }, _ = topology.changed() => {} }
         };
@@ -151,9 +239,9 @@ fn ews_session<E: EwsExecute + Send + Sync + 'static>(
             let transport = std::sync::Arc::clone(&transport);
             async move { transport.execute(&build_unsubscribe_request(&id), &EwsHeaders::default(), bifrost_net::ReplayPolicy::Idempotent).await.map(|_| ()) }.boxed()
         });
-        let retired = { let mut ledger = account.ews_ledger.lock().expect("EWS ledger lock"); ledger.entries.insert(id.clone(), EwsEntry { state: EwsEntryState::Live, releaser }); ledger.retired };
+        let retired = account.ews.record(id.clone(), releaser);
         let _live = LiveSubscription { account: account.clone(), id: id.clone() };
-        if retired || stop.is_stopped() || account.shutdown.is_cancelled() { release(&account, &id).await; yield E::Ended(End::Stopped); return; }
+        if retired || stop.is_stopped() || account.shutdown.is_cancelled() { account.ews.release(&account.push_tasks, &id).await; yield E::Ended(End::Stopped); return; }
         yield E::Established;
         let outcome = 'poll: loop {
             let body = build_get_streaming_events_request(&id, 30);
@@ -187,7 +275,7 @@ fn ews_session<E: EwsExecute + Send + Sync + 'static>(
             }
             yield E::Healthy;
         };
-        release(&account, &id).await;
+        account.ews.release(&account.push_tasks, &id).await;
         yield outcome;
     })
 }
@@ -247,8 +335,7 @@ async fn streaming_hints(
 /// `ews_session`); this wrapper exists for tests that only want the union.
 #[cfg(test)]
 async fn active_ews_scopes(account: &GraphAccount) -> Vec<EwsSubscriptionScope> {
-    let states = account.ews_subscriptions.read().await;
-    dedupe_by_ews_folder(states.values().flat_map(|state| state.scopes.iter()))
+    account.ews.active_scopes().await
 }
 
 /// The union of every handle's registrations, one entry per EWS folder.
@@ -279,11 +366,7 @@ fn dedupe_by_ews_folder<'a>(
 }
 
 async fn scopes_for_folder(account: &GraphAccount, folder_id: &str) -> Vec<CursorScope> {
-    let states = account.ews_subscriptions.read().await;
-    unique_scopes_for_folder(
-        states.values().flat_map(|state| state.scopes.iter()),
-        folder_id,
-    )
+    account.ews.scopes_for_folder(folder_id).await
 }
 
 /// Every DISTINCT cursor scope registered against `folder_id`, in
@@ -471,13 +554,13 @@ mod tests {
             crate::client::GraphClient::new("token"),
             super::super::PushMode::EwsStreaming,
         );
-        account.ews_subscriptions.write().await.insert(
+        account.ews.registrations_for_tests().write().await.insert(
             bifrost_types::SubscriptionHandle("first".to_string()),
             EwsSubscriptionState {
                 scopes: vec![ews_scope("rest-a", "ews-shared")],
             },
         );
-        account.ews_subscriptions.write().await.insert(
+        account.ews.registrations_for_tests().write().await.insert(
             bifrost_types::SubscriptionHandle("second".to_string()),
             EwsSubscriptionState {
                 scopes: vec![ews_scope("rest-b", "ews-shared")],
@@ -976,12 +1059,13 @@ mod tests {
     /// Registers a handle's scopes the way `subscribe_ews` does: map write,
     /// then topology bump.
     async fn register(account: &GraphAccount, handle: &str, scopes: Vec<EwsSubscriptionScope>) {
-        account.ews_subscriptions.write().await.insert(
+        account.ews.registrations_for_tests().write().await.insert(
             SubscriptionHandle(handle.to_string()),
             EwsSubscriptionState { scopes },
         );
         account
-            .ews_topology
+            .ews
+            .topology_for_tests()
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 

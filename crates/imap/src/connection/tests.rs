@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt;
 // Driver-panic supervision tests
 //
 // These tests verify invariant I7: a consumer that panics inside the
-// driver task surfaces as `Error::DriverPanicked` on the caller side,
+// driver task surfaces as `crate::error::InternalFailure::Panicked` on the caller side,
 // with the panic message preserved. Post-panic commands fail fast with
 // `DriverPanicked` or `DriverGone` rather than hanging.
 //
@@ -134,7 +134,12 @@ impl dispatch::Consumer for UninterpretableConsumer {
         _tagged: TaggedResponse,
         _ctx: &dispatch::ConsumerContext,
     ) -> dispatch::Finalized<()> {
-        dispatch::Finalized::failure(Error::Parse("uninterpretable answer".into()), Vec::new())
+        dispatch::Finalized::failure(
+            Error::Provider(crate::error::ProviderFailure::Parse(
+                "uninterpretable answer".into(),
+            )),
+            Vec::new(),
+        )
     }
 }
 
@@ -156,7 +161,13 @@ async fn a_consumer_failure_on_a_tagged_ok_retires_the_connection() {
     let result = conn
         .submit_regular(Command::Noop, UninterpretableConsumer, None)
         .await;
-    assert!(matches!(result, Err(Error::Parse(_))), "got {result:?}");
+    assert!(
+        matches!(
+            result,
+            Err(Error::Provider(crate::error::ProviderFailure::Parse(_)))
+        ),
+        "got {result:?}"
+    );
     let _peer = server.await.unwrap();
     assert!(
         !conn.is_alive(),
@@ -221,7 +232,7 @@ async fn driver_logout_drain_is_bounded_against_a_silent_peer() {
 }
 
 /// Invariant: a consumer that panics inside the driver task surfaces
-/// as `Error::DriverPanicked` on the caller side. The panic message
+/// as `crate::error::InternalFailure::Panicked` on the caller side. The panic message
 /// is extracted from the `JoinError` and included in the error.
 #[tokio::test]
 async fn invariant_driver_panic_surfaces_as_error() {
@@ -255,8 +266,17 @@ async fn invariant_driver_panic_surfaces_as_error() {
     let _server = server_task.await.unwrap();
 
     match result {
-        Err(error @ Error::DriverPanicked { .. }) => {
-            let Error::DriverPanicked { message: msg, .. } = &error else {
+        Err(
+            error @ Error::Internal {
+                kind: crate::error::InternalFailure::Panicked(_),
+                ..
+            },
+        ) => {
+            let Error::Internal {
+                kind: crate::error::InternalFailure::Panicked(msg),
+                ..
+            } = &error
+            else {
                 unreachable!()
             };
             assert!(
@@ -317,7 +337,13 @@ async fn invariant_driver_panic_subsequent_commands_fail() {
     assert!(
         matches!(
             inner,
-            Err(Error::DriverPanicked { .. } | Error::DriverGone { .. })
+            Err(Error::Internal {
+                kind: crate::error::InternalFailure::Panicked(_),
+                ..
+            } | Error::Transport {
+                kind: crate::error::TransportFailure::DriverGone,
+                ..
+            })
         ),
         "post-panic command should be DriverPanicked or DriverGone, got: {inner:?}"
     );
@@ -384,10 +410,10 @@ fn expand_uid_ranges_star_bound_is_not_expanded() {
     .expect_err("an unexpandable `*` range must not look complete");
     assert!(matches!(
         err,
-        Error::SearchResultTruncated {
+        Error::ResultLimit(crate::error::ResultLimit::SearchTruncated {
             returned: 0,
             omitted: None
-        }
+        })
     ));
 }
 
@@ -406,19 +432,18 @@ fn expand_uid_ranges_caps_at_one_million() {
         .expect_err("an over-cap range must not be returned partially");
     assert!(matches!(
         err,
-        Error::SearchResultTruncated {
+        Error::ResultLimit(crate::error::ResultLimit::SearchTruncated {
             returned: 1_000_000,
             omitted: Some(2_000_000)
-        }
+        })
     ));
 }
 
 #[test]
-fn expand_uid_ranges_inverted_range_yields_nothing() {
-    // Defensive: a non-conformant server sending `10:5` must not panic.
+fn expand_uid_ranges_normalizes_reversed_numeric_ranges() {
     let uids = expand_uid_ranges(&[UidRange::range(10, 5)])
-        .expect("inverted range is empty, not incomplete");
-    assert!(uids.is_empty());
+        .expect("reversed ranges have the same concrete membership");
+    assert_eq!(uids, vec![5, 6, 7, 8, 9, 10]);
 }
 
 // ---------------------------------------------------------------------------
@@ -496,8 +521,14 @@ fn selected_mailbox_collects_counts_flags_and_codes() {
     assert_eq!(mailbox.exists, 17);
     assert_eq!(mailbox.recent, 2);
     assert_eq!(mailbox.flags, vec![Flag::Seen, Flag::Draft]);
-    assert_eq!(mailbox.uid_validity, Some(42));
-    assert_eq!(mailbox.uid_next, Some(100));
+    assert_eq!(
+        mailbox.uid_validity,
+        Some(crate::types::UidValidity::new(42).expect("valid protocol test value"))
+    );
+    assert_eq!(
+        mailbox.uid_next,
+        Some(crate::types::Uid::new(100).expect("valid protocol test value"))
+    );
     assert_eq!(mailbox.permanent_flags, vec![Flag::Seen]);
     assert_eq!(mailbox.unseen, Some(3));
     assert_eq!(mailbox.mailbox_id.as_deref(), Some("mb-1"));
@@ -510,7 +541,10 @@ fn selected_mailbox_reads_the_tagged_response_code_too() {
     // RFC 3501 Section 6.3.1: SELECT reports [READ-WRITE] / [UIDVALIDITY]
     // on the tagged line on some servers.
     let mailbox = build_selected_mailbox(&[], &tagged(Some(ResponseCode::UidValidity(9))), true);
-    assert_eq!(mailbox.uid_validity, Some(9));
+    assert_eq!(
+        mailbox.uid_validity,
+        Some(crate::types::UidValidity::new(9).expect("valid protocol test value"))
+    );
     assert!(mailbox.read_only);
 }
 
@@ -567,8 +601,8 @@ fn selected_mailbox_keeps_only_earlier_vanished() {
     ];
     let mailbox = build_selected_mailbox(&untagged, &tagged(None), false);
     assert_eq!(mailbox.vanished.len(), 1);
-    assert_eq!(mailbox.vanished[0].start, 1);
-    assert_eq!(mailbox.vanished[0].end, Some(3));
+    assert_eq!(mailbox.vanished[0].start(), 1);
+    assert_eq!(mailbox.vanished[0].end(), Some(3));
 }
 
 #[test]
@@ -586,7 +620,10 @@ fn selected_mailbox_ignores_state_from_before_closed() {
         false,
     );
     assert_eq!(mailbox.exists, 4);
-    assert_eq!(mailbox.uid_validity, Some(2));
+    assert_eq!(
+        mailbox.uid_validity,
+        Some(crate::types::UidValidity::new(2).expect("valid protocol test value"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -737,8 +774,14 @@ async fn select_round_trip_parses_the_untagged_block() {
     let _server = script.await.unwrap();
 
     assert_eq!(mailbox.exists, 3);
-    assert_eq!(mailbox.uid_validity, Some(4242));
-    assert_eq!(mailbox.uid_next, Some(9));
+    assert_eq!(
+        mailbox.uid_validity,
+        Some(crate::types::UidValidity::new(4242).expect("valid protocol test value"))
+    );
+    assert_eq!(
+        mailbox.uid_next,
+        Some(crate::types::Uid::new(9).expect("valid protocol test value"))
+    );
     assert_eq!(mailbox.flags, vec![Flag::Seen, Flag::Deleted]);
     assert!(!mailbox.read_only);
     assert_eq!(conn.session_state(), SessionState::Selected);
@@ -767,7 +810,13 @@ async fn select_no_response_leaves_the_session_authenticated() {
         .expect_err("SELECT NO must surface as an error");
     let _server = script.await.unwrap();
 
-    assert!(matches!(err, Error::No { .. }), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::ServerStatus(crate::error::ServerStatus::No { .. })
+        ),
+        "got {err:?}"
+    );
     assert_eq!(conn.session_state(), SessionState::Authenticated);
     assert!(conn.is_alive(), "a tagged NO leaves the wire reusable");
 }
@@ -806,7 +855,13 @@ async fn a_missing_mandatory_response_leaves_the_connection_usable() {
         .select("INBOX", Duration::from_secs(5))
         .await
         .expect_err("a SELECT without FLAGS must fail");
-    assert!(matches!(err, Error::ProtocolMissing(_)), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::Provider(crate::error::ProviderFailure::Missing(_))
+        ),
+        "got {err:?}"
+    );
     assert!(
         conn.is_alive(),
         "an omission after the tagged OK leaves the wire synchronized"
@@ -836,7 +891,7 @@ async fn a_refused_logout_reports_the_refusal_not_a_missing_bye() {
 
     let err = conn.logout().await.expect_err("a refused LOGOUT fails");
     assert!(
-        matches!(err, Error::No { ref text, .. } if text.contains("not now")),
+        matches!(err, Error::ServerStatus(crate::error::ServerStatus::No { ref text, .. }) if text.contains("not now")),
         "got {err:?}"
     );
     let _server = script.await.unwrap();
@@ -976,7 +1031,16 @@ async fn a_scram_binding_lookup_behind_a_stalled_command_honours_the_auth_deadli
     .await
     .expect("authentication must end at its own deadline");
     let error = outcome.expect_err("the binding lookup cannot complete");
-    assert!(matches!(error, Error::Timeout { .. }), "got {error:?}");
+    assert!(
+        matches!(
+            error,
+            Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
+                ..
+            }
+        ),
+        "got {error:?}"
+    );
     assert_eq!(
         error.attempt(),
         Some(bifrost_types::TransmissionState::Unsent)
@@ -1056,7 +1120,13 @@ async fn a_scram_server_final_error_cancels_and_leaves_the_connection_reusable()
         .submit_with_continuations(command, consumer, None)
         .await
         .expect_err("the server-final error must reject authentication");
-    assert!(matches!(error, Error::Auth { .. }), "got {error:?}");
+    assert!(
+        matches!(
+            error,
+            Error::ServerStatus(crate::error::ServerStatus::Auth { .. })
+        ),
+        "got {error:?}"
+    );
     assert!(
         conn.is_alive(),
         "a completed SASL cancellation keeps the driver alive"
@@ -1289,7 +1359,9 @@ async fn starttls_rejects_an_empty_capability_snapshot_before_touching_the_drive
     assert!(matches!(
         conn.starttls_with_connector(connector, Duration::from_secs(1))
             .await,
-        Err(Error::StartTlsUnavailable)
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::StartTlsUnavailable
+        ))
     ));
 }
 
@@ -1337,7 +1409,13 @@ async fn append_waits_for_the_continuation_before_sending_the_literal() {
         .unwrap();
     let _server = script.await.unwrap();
 
-    assert_eq!(uid, Some((4242, 12)));
+    assert_eq!(
+        uid,
+        Some(crate::types::AppendUid {
+            validity: crate::types::UidValidity::new(4242).unwrap(),
+            uid: crate::types::Uid::new(12).unwrap()
+        })
+    );
 }
 
 #[tokio::test]
@@ -1405,7 +1483,7 @@ async fn append_rejects_oversized_messages_before_the_wire() {
         .append("INBOX", &[], None, b"HELLO", Duration::from_secs(5))
         .await
     {
-        Err(Error::AppendLimit { size, limit }) => {
+        Err(Error::LocalRefusal(crate::error::LocalRefusal::AppendLimit { size, limit })) => {
             assert_eq!(size, 5);
             assert_eq!(limit, 4);
         }
@@ -1427,7 +1505,9 @@ async fn append_uses_the_most_restrictive_global_appendlimit() {
     assert!(matches!(
         conn.append("INBOX", &[], None, b"HELLO", Duration::from_secs(5))
             .await,
-        Err(Error::AppendLimit { size: 5, limit: 4 })
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::AppendLimit { size: 5, limit: 4 }
+        ))
     ));
 }
 
@@ -1454,7 +1534,9 @@ async fn append_checks_the_mailbox_specific_appendlimit_before_writing() {
     assert!(matches!(
         conn.append("INBOX", &[], None, b"HELLO", Duration::from_secs(5))
             .await,
-        Err(Error::AppendLimit { size: 5, limit: 4 })
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::AppendLimit { size: 5, limit: 4 }
+        ))
     ));
     let _server = script.await.expect("STATUS transcript");
 }
@@ -1511,7 +1593,7 @@ async fn multiappend_refuses_bytes_built_before_a_capability_vanished() {
 
     let err = result.expect_err("bytes built against the pre-CAPABILITY state must not be sent");
     assert!(
-        matches!(err, Error::MissingCapability(ref m) if m.contains("requires BINARY literal8 support")),
+        matches!(err, Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(ref m)) if m.contains("requires BINARY literal8 support")),
         "the literal kind must be derived from the state at execution, so a \
          vanished BINARY is caught by the driver; got {err:?}"
     );
@@ -1595,7 +1677,7 @@ async fn a_queued_append_is_validated_against_the_state_at_execution() {
         // before send (safe to re-issue), not a permanent refusal.
         matches!(
             err,
-            Error::StateChangedBeforeSend(ref f)
+            Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(ref f))
                 if f.message.contains("requires BINARY literal8 support")
         ),
         "the driver must validate the queued APPEND against the state it \
@@ -1676,7 +1758,13 @@ async fn a_queued_append_is_encoded_for_the_state_at_execution() {
         .await
         .expect("append task")
         .expect("the APPEND is encoded for the live state and succeeds");
-    assert_eq!(uid, Some((7, 3)));
+    assert_eq!(
+        uid,
+        Some(crate::types::AppendUid {
+            validity: crate::types::UidValidity::new(7).unwrap(),
+            uid: crate::types::Uid::new(3).unwrap()
+        })
+    );
     let _server = script.await.expect("transcript");
 }
 
@@ -1753,7 +1841,10 @@ async fn a_queued_append_is_refused_when_the_session_left_the_legal_states() {
         .expect("append task")
         .expect_err("the session is no longer legal for APPEND");
     assert!(
-        matches!(err, Error::StateChangedBeforeSend(_)),
+        matches!(
+            err,
+            Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(_))
+        ),
         "session legality must be refused as StateChangedBeforeSend; got {err:?}"
     );
     assert_eq!(
@@ -1789,7 +1880,7 @@ async fn a_refused_append_leaves_the_connection_usable() {
         .await
         .expect_err("a NUL body without BINARY must be refused");
     assert!(
-        matches!(err, Error::MissingCapability(ref m) if m.contains("BINARY")),
+        matches!(err, Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(ref m)) if m.contains("BINARY")),
         "expected the BINARY refusal; got {err:?}"
     );
     conn.noop(Duration::from_secs(5))
@@ -1819,7 +1910,7 @@ async fn multiappend_without_the_capability_is_refused_before_the_wire() {
         .await
         .expect_err("MULTIAPPEND is not advertised");
     assert!(
-        matches!(err, Error::MissingCapability(ref m) if m.contains("MULTIAPPEND")),
+        matches!(err, Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(ref m)) if m.contains("MULTIAPPEND")),
         "got {err:?}"
     );
     drop(conn);
@@ -1881,7 +1972,19 @@ async fn multiappend_waits_for_a_continuation_before_each_body() {
         .await
         .unwrap();
     let _server = script.await.unwrap();
-    assert_eq!(uids, vec![(9, 10), (9, 11)]);
+    assert_eq!(
+        uids,
+        vec![
+            crate::types::AppendUid {
+                validity: crate::types::UidValidity::new(9).unwrap(),
+                uid: crate::types::Uid::new(10).unwrap()
+            },
+            crate::types::AppendUid {
+                validity: crate::types::UidValidity::new(9).unwrap(),
+                uid: crate::types::Uid::new(11).unwrap()
+            }
+        ]
+    );
 }
 
 /// The APPENDLIMIT STATUS is a preflight. Its own transmission evidence is
@@ -1950,7 +2053,7 @@ fn mailbox_append_limit_reads_every_plausible_status_reply() {
     };
     assert!(matches!(
         mailbox_append_limit(&status),
-        Err(Error::ProtocolMissing(_))
+        Err(Error::Provider(crate::error::ProviderFailure::Missing(_)))
     ));
 }
 
@@ -1965,10 +2068,10 @@ fn expand_uid_ranges_handles_bare_star_and_overlap() {
     .expect_err("a standalone `*` is not the literal id 4294967295");
     assert!(matches!(
         err,
-        Error::SearchResultTruncated {
+        Error::ResultLimit(crate::error::ResultLimit::SearchTruncated {
             returned: 0,
             omitted: None
-        }
+        })
     ));
 
     // Overlap is legal and must be counted once, both for the cap and for the
@@ -2094,7 +2197,16 @@ async fn a_driver_death_mid_idle_is_in_flight() {
     );
     let err = result.expect_err("a dead driver must fail the IDLE");
     assert!(
-        matches!(err, Error::DriverGone { .. } | Error::DriverPanicked { .. }),
+        matches!(
+            err,
+            Error::Transport {
+                kind: crate::error::TransportFailure::DriverGone,
+                ..
+            } | Error::Internal {
+                kind: crate::error::InternalFailure::Panicked(_),
+                ..
+            }
+        ),
         "got {err:?}"
     );
     assert_eq!(
@@ -2196,7 +2308,7 @@ async fn an_idle_completed_without_its_continuation_is_an_idle_omission() {
         .await
         .expect_err("IDLE without its continuation is a server omission");
     assert!(
-        matches!(err, Error::ProtocolMissing(ref m) if m.contains("IDLE") && !m.contains("literal")),
+        matches!(err, Error::Provider(crate::error::ProviderFailure::Missing(ref m)) if m.contains("IDLE") && !m.contains("literal")),
         "got {err:?}"
     );
     assert!(
@@ -2239,7 +2351,16 @@ async fn an_eof_mid_idle_is_in_flight() {
 
     let err = idle.await.expect_err("an EOF ends the IDLE");
     assert!(
-        matches!(err, Error::Closed { .. } | Error::Io { .. }),
+        matches!(
+            err,
+            Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            } | Error::Transport {
+                kind: crate::error::TransportFailure::Io(crate::error::IoFailure(_)),
+                ..
+            }
+        ),
         "the driver's own error, not a generic DriverGone: {err:?}"
     );
     assert_eq!(
@@ -2274,7 +2395,16 @@ async fn an_eof_while_draining_after_done_is_in_flight() {
         .await
         .expect_err("an EOF during the DONE drain fails the IDLE");
     assert!(
-        matches!(err, Error::Closed { .. } | Error::Io { .. }),
+        matches!(
+            err,
+            Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            } | Error::Transport {
+                kind: crate::error::TransportFailure::Io(crate::error::IoFailure(_)),
+                ..
+            }
+        ),
         "got {err:?}"
     );
     assert_eq!(
@@ -2294,7 +2424,16 @@ async fn next_event_on_a_dead_driver_carries_a_phase() {
         .next_event(Duration::from_secs(5))
         .await
         .expect_err("a closed event channel is a dead driver");
-    assert!(matches!(err, Error::DriverGone { .. }), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::Transport {
+                kind: crate::error::TransportFailure::DriverGone,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
     assert_eq!(
         err.attempt(),
         Some(bifrost_types::TransmissionState::Unsent)
@@ -2328,7 +2467,16 @@ async fn idle_done_handshake_is_bounded_when_the_server_never_completes() {
         )
         .await
         .expect_err("an unanswered DONE must not park the caller");
-    assert!(matches!(err, crate::Error::Timeout { .. }), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            crate::Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
     script.abort();
 }
 
@@ -2360,7 +2508,13 @@ async fn an_idle_whose_done_times_out_is_abandoned_and_its_last_drop_releases_th
     );
     let (result, ()) = tokio::join!(idle, script);
     assert!(
-        matches!(result, Err(crate::Error::Timeout { .. })),
+        matches!(
+            result,
+            Err(crate::Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
+                ..
+            })
+        ),
         "got {result:?}"
     );
     assert!(
@@ -2482,7 +2636,10 @@ async fn a_queued_command_is_refused_when_the_session_left_its_legal_states() {
         .expect("namespace task")
         .expect_err("the session is no longer legal for NAMESPACE");
     assert!(
-        matches!(err, Error::StateChangedBeforeSend(_)),
+        matches!(
+            err,
+            Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(_))
+        ),
         "got {err:?}"
     );
     assert_eq!(
@@ -2529,7 +2686,13 @@ async fn a_refused_select_leaves_no_pending_selection_behind() {
         )
         .await
         .expect_err("an un-ENABLEd QRESYNC SELECT is refused");
-    assert!(matches!(refused, Error::InvalidState(_)), "{refused:?}");
+    assert!(
+        matches!(
+            refused,
+            Error::LocalRefusal(crate::error::LocalRefusal::InvalidState(_))
+        ),
+        "{refused:?}"
+    );
 
     conn.noop(Duration::from_secs(5)).await.expect("NOOP");
     assert_eq!(
@@ -2635,7 +2798,16 @@ async fn the_driver_refuses_a_batch_holding_a_command_that_cannot_be_pipelined()
     let Err(err) = pending.recv().await.expect("driver answers") else {
         panic!("the batch must be refused");
     };
-    assert!(matches!(err, Error::Internal(_)), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::Internal {
+                kind: crate::error::InternalFailure::Invariant(_),
+                mid_exchange: None
+            }
+        ),
+        "got {err:?}"
+    );
 
     conn.noop(Duration::from_secs(5))
         .await
@@ -2663,7 +2835,9 @@ async fn a_pipeline_is_admitted_against_the_session_state_at_execution() {
     assert!(
         matches!(
             err,
-            super::pipeline::PipelineError::Driver(Error::InvalidState(_))
+            super::pipeline::PipelineError::Driver(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidState(_)
+            ))
         ),
         "got {err:?}"
     );
@@ -2686,7 +2860,13 @@ async fn idle_is_admitted_against_the_session_state() {
         )
         .await
         .expect_err("IDLE is not legal before authentication");
-    assert!(matches!(err, Error::InvalidState(_)), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::LocalRefusal(crate::error::LocalRefusal::InvalidState(_))
+        ),
+        "got {err:?}"
+    );
 }
 
 mod withdrawal {
@@ -2734,7 +2914,7 @@ mod withdrawal {
     fn append_task(
         conn: &Arc<ImapConnection>,
         timeout: Duration,
-    ) -> JoinHandle<Result<Option<(u32, u32)>, Error>> {
+    ) -> JoinHandle<Result<Option<crate::types::AppendUid>, Error>> {
         let conn = Arc::clone(conn);
         tokio::spawn(async move { conn.append("INBOX", &[], None, b"hello", timeout).await })
     }
@@ -2768,7 +2948,13 @@ mod withdrawal {
         let b = append_task(&conn, SHORT);
         buffered(&conn, one_queued(&conn)).await;
         let err = b.await.unwrap().unwrap_err();
-        assert!(matches!(err, Error::Timeout { .. }));
+        assert!(matches!(
+            err,
+            Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
+                ..
+            }
+        ));
         assert_eq!(err.attempt(), Some(Unsent));
         assert!(conn.is_reusable());
         next_capability(&conn, &mut server, a, &tag).await;
@@ -2810,7 +2996,13 @@ mod withdrawal {
         let b = append_task(&conn, SHORT);
         assert!(read_line(&mut server).await.contains(" APPEND"));
         let err = b.await.unwrap().unwrap_err();
-        assert!(matches!(err, Error::Timeout { .. }));
+        assert!(matches!(
+            err,
+            Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
+                ..
+            }
+        ));
         assert_eq!(err.attempt(), Some(InFlight));
         assert!(!conn.is_reusable());
     }
@@ -2855,7 +3047,16 @@ mod withdrawal {
     async fn a_claimed_command_withdrawn_during_its_first_bandwidth_wait_is_unsent_and_reusable() {
         let (conn, mut server, budget, hog) = starved_pair().await;
         let err = append_task(&conn, SHORT).await.unwrap().unwrap_err();
-        assert!(matches!(err, Error::Timeout { .. }), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Transport {
+                    kind: crate::error::TransportFailure::Timeout,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
         assert_eq!(err.attempt(), Some(Unsent));
         assert!(conn.is_reusable());
         drop(hog);
@@ -2890,7 +3091,13 @@ mod withdrawal {
         let err = b.await.unwrap().unwrap_err();
         assert!(matches!(
             err,
-            Error::DriverGone { .. } | Error::DriverPanicked { .. }
+            Error::Transport {
+                kind: crate::error::TransportFailure::DriverGone,
+                ..
+            } | Error::Internal {
+                kind: crate::error::InternalFailure::Panicked(_),
+                ..
+            }
         ));
         assert_eq!(err.attempt(), Some(Unsent));
     }
@@ -2922,7 +3129,13 @@ mod withdrawal {
         let err = b.await.unwrap().unwrap_err();
         assert!(matches!(
             err,
-            Error::DriverGone { .. } | Error::DriverPanicked { .. }
+            Error::Transport {
+                kind: crate::error::TransportFailure::DriverGone,
+                ..
+            } | Error::Internal {
+                kind: crate::error::InternalFailure::Panicked(_),
+                ..
+            }
         ));
         assert_eq!(err.attempt(), Some(InFlight));
     }
@@ -2942,7 +3155,13 @@ mod withdrawal {
         let fillers = fill(&conn).await;
         let err = conn.noop(SHORT).await.unwrap_err();
         assert_eq!(err.attempt(), Some(Unsent));
-        assert!(matches!(err, Error::Timeout { .. }));
+        assert!(matches!(
+            err,
+            Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
+                ..
+            }
+        ));
         assert!(conn.is_reusable());
         conn.terminate().await;
         let _ = a.await;
@@ -2956,7 +3175,13 @@ mod withdrawal {
         let capacity = conn.cmd_tx.capacity();
         let err = conn.noop(Duration::ZERO).await.unwrap_err();
         assert_eq!(conn.cmd_tx.capacity(), capacity);
-        assert!(matches!(err, Error::Timeout { .. }));
+        assert!(matches!(
+            err,
+            Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
+                ..
+            }
+        ));
         assert_eq!(err.attempt(), Some(Unsent));
         let conn2 = Arc::clone(&conn);
         let c = tokio::spawn(async move { conn2.capability(LONG).await });
@@ -2994,7 +3219,7 @@ mod withdrawal {
         buffered(&conn, one_queued(&conn)).await;
         let err = b.await.unwrap().unwrap_err();
         assert!(
-            matches!(&err, Error::MoveFallbackIncomplete {stored_deleted:false,source,..} if matches!(source.as_ref(),Error::Timeout {..}))
+            matches!(&err, Error::MoveFallbackIncomplete {stored_deleted:false,source,..} if matches!(source.as_ref(),Error::Transport { kind: crate::error::TransportFailure::Timeout, .. }))
         );
         assert_eq!(err.attempt(), Some(Unsent));
         assert!(conn.is_reusable());
@@ -3112,94 +3337,6 @@ mod withdrawal {
         assert_eq!(b.await.unwrap().unwrap_err().attempt(), Some(Unsent));
         assert!(conn.is_reusable());
         next_capability(&conn, &mut server, a, &tag).await;
-    }
-}
-
-struct ExitFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
-impl Drop for ExitFlag {
-    fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-#[tokio::test]
-async fn a_value_retained_by_a_running_driver_is_released_only_at_driver_exit() {
-    let (conn, peer) =
-        test_support::driver_pair(&test_support::preauth_greeting("IMAP4rev1")).await;
-    let driver = conn.driver_task();
-    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    driver.retain_until_exit(Box::new(ExitFlag(Arc::clone(&flag))));
-    assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
-    drop(peer);
-    driver.finish_or_abort(LOGOUT_DRAIN_TIMEOUT).await;
-    assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(driver.has_exited());
-}
-
-#[test]
-fn a_value_retained_after_driver_exit_is_released_at_once() {
-    let driver = DriverTask::absent();
-    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    driver.retain_until_exit(Box::new(ExitFlag(Arc::clone(&flag))));
-    assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(driver.has_exited());
-}
-
-#[tokio::test]
-async fn aborting_a_driver_before_its_first_poll_releases_its_retained_values() {
-    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let driver = DriverTask::spawn(
-        std::future::pending(),
-        Arc::default(),
-        vec![Box::new(ExitFlag(Arc::clone(&flag)))],
-    );
-    driver.abort();
-    driver.abort_and_join().await;
-    assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(driver.has_exited());
-}
-
-struct ExitOrder(Arc<std::sync::Mutex<Vec<&'static str>>>, &'static str);
-impl Drop for ExitOrder {
-    fn drop(&mut self) {
-        self.0.lock().unwrap().push(self.1);
-    }
-}
-
-struct ExitOrderFuture {
-    _guard: ExitOrder,
-    pending: bool,
-}
-impl std::future::Future for ExitOrderFuture {
-    type Output = ();
-    fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        if self.pending {
-            std::task::Poll::Pending
-        } else {
-            std::task::Poll::Ready(())
-        }
-    }
-}
-
-#[tokio::test]
-async fn the_driver_future_is_destroyed_before_its_retained_values() {
-    for abort in [false, true] {
-        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let guard = ExitOrder(Arc::clone(&order), "driver");
-        let driver = DriverTask::spawn(
-            ExitOrderFuture {
-                _guard: guard,
-                pending: abort,
-            },
-            Arc::default(),
-            vec![Box::new(ExitOrder(Arc::clone(&order), "lease"))],
-        );
-        if abort {
-            driver.abort_and_join().await;
-        } else {
-            driver.finish_or_abort(LOGOUT_DRAIN_TIMEOUT).await;
-        }
-        assert_eq!(*order.lock().unwrap(), ["driver", "lease"]);
     }
 }
 
@@ -3348,7 +3485,13 @@ mod transition_refresh {
         respond(&mut server, &format!("{} NO not now\r\n", tag_of(&next))).await;
 
         let err = login.await.unwrap().unwrap_err();
-        assert!(matches!(err, Error::No { .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::ServerStatus(crate::error::ServerStatus::No { .. })
+            ),
+            "{err:?}"
+        );
         assert!(
             !conn.is_reusable(),
             "an authenticated session with the pre-authentication capability \
@@ -3370,7 +3513,16 @@ mod transition_refresh {
         assert!(next.ends_with(" CAPABILITY\r\n"), "{next:?}");
 
         let err = login.await.unwrap().unwrap_err();
-        assert!(matches!(err, Error::Timeout { .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Transport {
+                    kind: crate::error::TransportFailure::Timeout,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert_eq!(
             err.attempt(),
             Some(bifrost_types::TransmissionState::InFlight),
@@ -3398,7 +3550,13 @@ mod transition_refresh {
         respond(&mut server, &format!("{} BAD no\r\n", tag_of(&next))).await;
 
         let err = task.await.unwrap().unwrap_err();
-        assert!(matches!(err, Error::Bad { .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::ServerStatus(crate::error::ServerStatus::Bad { .. })
+            ),
+            "{err:?}"
+        );
         assert!(!conn.is_reusable());
     }
 }
@@ -3432,7 +3590,13 @@ async fn local_driver_queries_bound_admission_and_reply() {
                     .await
                     .expect_err("a stalled socket option must time out")
             };
-            assert!(matches!(error, Error::Timeout { .. }));
+            assert!(matches!(
+                error,
+                Error::Transport {
+                    kind: crate::error::TransportFailure::Timeout,
+                    ..
+                }
+            ));
             assert_eq!(
                 error.attempt(),
                 Some(bifrost_types::TransmissionState::Unsent)

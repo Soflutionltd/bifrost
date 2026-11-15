@@ -124,7 +124,7 @@ async fn run_committed_idle(
                         debug!(tag, "ignoring unexpected continuation during IDLE");
                     }
                     crate::types::Response::Greeting(_) => {
-                        return Err(Error::Protocol("unexpected greeting during IDLE".into()));
+                        return Err(Error::Provider(crate::error::ProviderFailure::Protocol("unexpected greeting during IDLE".into())));
                     }
                 }
                 false
@@ -190,11 +190,11 @@ async fn wait_for_idle_grant(
                 return Err(match t.status {
                     StatusKind::No => Error::no_with_code(t.text, t.code),
                     StatusKind::Bad => Error::bad_with_code(t.text, t.code),
-                    StatusKind::Ok => Error::ProtocolMissing(
+                    StatusKind::Ok => Error::Provider(crate::error::ProviderFailure::Missing(
                         "IDLE completed with a tagged OK before the server sent the `+` \
                          continuation it owes (RFC 2177 Section 3, RFC 9051 Section 6.3.13)"
                             .into(),
-                    ),
+                    )),
                 });
             }
             crate::types::Response::Untagged(_) => {}
@@ -202,9 +202,9 @@ async fn wait_for_idle_grant(
                 unreachable!("ReadLoop rejects foreign tags");
             }
             crate::types::Response::Greeting(_) => {
-                return Err(Error::Protocol(
+                return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
                     "unexpected greeting while waiting for the IDLE continuation".into(),
-                ));
+                )));
             }
         }
     }
@@ -245,9 +245,9 @@ async fn drain_idle_responses(
                 // Ignore unexpected continuation while draining DONE.
             }
             crate::types::Response::Greeting(_) => {
-                return Err(Error::Protocol(
+                return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
                     "unexpected greeting during IDLE drain".into(),
-                ));
+                )));
             }
         }
     }

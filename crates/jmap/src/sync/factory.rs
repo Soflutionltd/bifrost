@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use futures::stream::StreamExt;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::account::Account as JmapMailAccount;
+type JmapMailAccount<T> = crate::account::Account<T, capability::Mail>;
 use crate::client::{Client, Credentials};
 use crate::core::capability;
 use crate::core::capability::Capability;
@@ -25,6 +25,7 @@ use super::account::JmapAccount;
 use super::capabilities;
 use super::foreign;
 use super::push::{PushRouting, ReconnectPolicy, WsState};
+use super::registry::{Registry, Slot};
 use super::state;
 
 // pub: re-exported through crate::sync for engine AccountFactory registration.
@@ -207,13 +208,9 @@ impl AccountFactory for JmapAccountFactory {
             } = resolve_optional_families(&client);
             let session = client.session();
             let SeededOpenState {
-                seed_states,
-                email_states,
+                mut registry,
                 lifecycle_mailbox_states,
                 mailbox_names,
-                primary_id,
-                foreign_mail,
-                foreign_submission,
                 skipped_scopes,
             } = validate_and_seed(&client, &mail).await?;
             let self_emails = fetch_self_emails(&client, &config.credentials).await;
@@ -227,22 +224,27 @@ impl AccountFactory for JmapAccountFactory {
                 attachment_upload: client.session_state().upload_url().is_ok(),
                 submission: submission.is_some(),
                 max_delayed_send,
-                foreign_submission: !foreign_submission.is_empty(),
+                foreign_submission: registry.has_shared_submission(),
                 vacation: vacation.is_some(),
                 quota: quota.is_some(),
                 sieve: sieve.is_some(),
                 contacts: contacts.is_some(),
                 calendar: calendars.is_some(),
             };
-            let (caps, limits) = capabilities::build(&session, support)?;
+            let (caps, _) = capabilities::build(&session, support)?;
 
+            // Install each typed family before the next so optional families
+            // sharing an account reuse one observation cell even without Mail.
+            registry.families.submission = submission.map(|handle| registry.install_family(handle));
+            registry.families.vacation = vacation.map(|handle| registry.install_family(handle));
+            registry.families.quota = quota.map(|handle| registry.install_family(handle));
+            registry.families.sieve = sieve.map(|handle| registry.install_family(handle));
+            registry.families.contacts = contacts.map(|handle| registry.install_family(handle));
+            registry.families.calendars = calendars.map(|handle| registry.install_family(handle));
+            registry.families.max_delayed_send = max_delayed_send;
+            let registry = Arc::new(registry);
             let shutdown = CancellationToken::new();
-            // Snapshot of who this session syncs: push notifications are
-            // keyed by accountId (RFC 8620 s7.1) and the reader routes a
-            // foreign account's Email changes onto its one seeded
-            // account-level `Folder` scope instead of the primary type
-            // scope.
-            let push_routing = Arc::new(PushRouting::new(primary_id.clone(), seed_states.keys()));
+            let push_routing = Arc::new(PushRouting::from_registry(Arc::clone(&registry)));
             let ws = WsState::new(
                 client.clone(),
                 caps.push_in_process(),
@@ -253,25 +255,15 @@ impl AccountFactory for JmapAccountFactory {
 
             let account = JmapAccount::new(
                 client,
-                mail,
-                foreign_mail,
-                foreign_submission,
-                submission,
-                max_delayed_send,
-                vacation,
-                quota,
-                sieve,
-                contacts,
-                calendars,
+                registry,
                 self_emails,
                 caps,
-                limits,
-                seed_states,
                 ws,
                 shutdown,
-                email_states,
-                lifecycle_mailbox_states,
-                mailbox_names,
+                super::discover::LifecycleTopology {
+                    positions: lifecycle_mailbox_states,
+                    names: mailbox_names,
+                },
             );
 
             Ok(OpenedAccount {
@@ -286,14 +278,10 @@ impl AccountFactory for JmapAccountFactory {
 /// account: the primary account's two states, and one probe per foreign
 /// (shared/delegate) mail account.
 struct SeededOpenState<Tr: HttpTransport> {
-    seed_states: HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
-    email_states: HashMap<String, Option<crate::core::id::ObjectState<crate::email::Email>>>,
     lifecycle_mailbox_states:
         HashMap<String, Option<crate::core::id::ObjectState<crate::mailbox::Mailbox>>>,
     mailbox_names: HashMap<String, String>,
-    primary_id: String,
-    foreign_mail: HashMap<crate::core::id::AccountId, JmapMailAccount<Tr>>,
-    foreign_submission: HashSet<String>,
+    registry: Registry<Tr>,
     skipped_scopes: Vec<SkippedScope>,
 }
 
@@ -314,7 +302,7 @@ async fn validate_and_seed<Tr: HttpTransport>(
     mail: &JmapMailAccount<Tr>,
 ) -> Result<SeededOpenState<Tr>, AccountError> {
     let session = client.session();
-    capabilities::validate_session(&session)?;
+    let limits = capabilities::validate_session(&session)?;
 
     let (email_state, mailbox_state, mailbox_names) =
         seed_account_state(mail).await.map_err(|err| {
@@ -325,33 +313,28 @@ async fn validate_and_seed<Tr: HttpTransport>(
             )
         })?;
 
-    let mut seed_states = HashMap::new();
-    seed_states.insert(
-        CursorScope::Type(ObjectType::Email),
-        state::encode_for_scope(
-            &CursorScope::Type(ObjectType::Email),
-            email_state.clone().into_string(),
-        )
-        .expect("static email cursor scope is supported"),
-    );
-    seed_states.insert(
-        CursorScope::Type(ObjectType::Mailbox),
-        state::encode_for_scope(
-            &CursorScope::Type(ObjectType::Mailbox),
-            mailbox_state.clone().into_string(),
-        )
-        .expect("static mailbox cursor scope is supported"),
-    );
-
-    // Per-accountId state caches. The primary account's id keys
-    // the same maps every foreign account does - no primary-vs-
-    // foreign branch in the cache itself.
     let primary_id = mail.id_str().to_string();
-    let mut email_states: HashMap<
-        String,
-        Option<crate::core::id::ObjectState<crate::email::Email>>,
-    > = HashMap::new();
-    email_states.insert(primary_id.clone(), Some(email_state.clone()));
+    let mut primary = Slot::from_mail(mail.clone(), limits);
+    primary.email_states = super::state_cache::StateCache::seeded(Some(email_state.clone()));
+    primary.scopes = vec![
+        (
+            CursorScope::Type(ObjectType::Email),
+            state::encode_for_scope(
+                &CursorScope::Type(ObjectType::Email),
+                email_state.into_string(),
+            )
+            .expect("static email scope"),
+        ),
+        (
+            CursorScope::Type(ObjectType::Mailbox),
+            state::encode_for_scope(
+                &CursorScope::Type(ObjectType::Mailbox),
+                mailbox_state.clone().into_string(),
+            )
+            .expect("static mailbox scope"),
+        ),
+    ];
+    let mut registry = Registry::new(primary);
     let mut lifecycle_mailbox_states = HashMap::new();
     lifecycle_mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
 
@@ -374,8 +357,6 @@ async fn validate_and_seed<Tr: HttpTransport>(
     // down. And skipping silently would erase the share for the
     // session with no signal anywhere.
     let foreign_ids = foreign_mail_account_ids(&session, &primary_id);
-    let mut foreign_mail: HashMap<crate::core::id::AccountId, JmapMailAccount<Tr>> = HashMap::new();
-    let mut foreign_submission = HashSet::new();
     let mut skipped_scopes: Vec<SkippedScope> = Vec::new();
     // Probing the shares concurrently bounds open latency by the
     // slowest share instead of their sum, but the concurrency has
@@ -387,7 +368,9 @@ async fn validate_and_seed<Tr: HttpTransport>(
     // overlapping API requests, so the bound lives here.
     let probe_concurrency = api_request_concurrency(&session);
     let foreign_results = futures::stream::iter(foreign_ids.into_iter().map(|foreign_id| {
-        let foreign_account = JmapMailAccount::new(client.clone(), JmapAccountId::new(&foreign_id));
+        let foreign_account = client
+            .account::<capability::Mail>(JmapAccountId::new(&foreign_id))
+            .expect("foreign ids were selected from accounts advertising Mail");
         async move {
             let result = seed_foreign_account_or_skip(&foreign_id, &foreign_account).await;
             (foreign_id, foreign_account, result)
@@ -397,18 +380,20 @@ async fn validate_and_seed<Tr: HttpTransport>(
     .collect::<Vec<_>>()
     .await;
     // Completion order is arrival order; installation order must
-    // not be. Sorting by accountId keeps `foreign_mail`,
-    // `seed_states`, and `skipped_scopes` identical across runs.
+    // not be. Sorting by accountId keeps registry installation and
+    // skipped-scope reporting identical across runs.
     let mut foreign_results = foreign_results;
     foreign_results.sort_by(|a, b| a.0.cmp(&b.0));
     for (foreign_id, foreign_account, result) in foreign_results {
         match result {
             Ok(seed) => {
-                apply_foreign_seed(&foreign_id, seed, &mut seed_states, &mut email_states);
-                if account_advertises_submission(&session, &foreign_id) {
-                    foreign_submission.insert(foreign_id.clone());
-                }
-                foreign_mail.insert(foreign_id.into(), foreign_account);
+                let slot = foreign_seed_slot(
+                    foreign_account,
+                    limits,
+                    seed,
+                    account_advertises_submission(&session, &foreign_id),
+                );
+                registry.insert_shared(slot);
             }
             Err(skip) => {
                 // Leave the share out of this session's surface
@@ -421,13 +406,9 @@ async fn validate_and_seed<Tr: HttpTransport>(
     }
 
     Ok(SeededOpenState {
-        seed_states,
-        email_states,
         lifecycle_mailbox_states,
         mailbox_names,
-        primary_id,
-        foreign_mail,
-        foreign_submission,
+        registry,
         skipped_scopes,
     })
 }
@@ -463,12 +444,12 @@ pub(super) fn api_request_concurrency(session: &crate::core::session::Session) -
 /// capability object is gibberish - is a guaranteed `Unsupported` (or
 /// worse, a request built from limits nobody could read) one layer up.
 struct OptionalFamilies<Tr: HttpTransport> {
-    submission: Option<JmapMailAccount<Tr>>,
-    vacation: Option<JmapMailAccount<Tr>>,
-    quota: Option<JmapMailAccount<Tr>>,
-    sieve: Option<JmapMailAccount<Tr>>,
-    contacts: Option<JmapMailAccount<Tr>>,
-    calendars: Option<JmapMailAccount<Tr>>,
+    submission: Option<crate::account::Account<Tr, capability::Submission>>,
+    vacation: Option<crate::account::Account<Tr, capability::VacationResponseCap>>,
+    quota: Option<crate::account::Account<Tr, capability::Quota>>,
+    sieve: Option<crate::account::Account<Tr, capability::Sieve>>,
+    contacts: Option<crate::account::Account<Tr, capability::Contacts>>,
+    calendars: Option<crate::account::Account<Tr, capability::Calendars>>,
     /// RFC 8621 `maxDelayedSend`, in seconds. Non-zero only when the
     /// selected account's Submission block is parseable and advertises a window.
     max_delayed_send: usize,
@@ -643,7 +624,10 @@ fn primary_mail_owner(
 
 fn self_principal_lookup<Tr: HttpTransport>(
     client: &Client<Tr>,
-) -> Option<(crate::account::Account<Tr>, crate::principal::PrincipalId)> {
+) -> Option<(
+    crate::account::Account<Tr, capability::Principals>,
+    crate::principal::PrincipalId,
+)> {
     let session = client.session();
     if let Some(id) = session
         .principals_capabilities()
@@ -657,7 +641,11 @@ fn self_principal_lookup<Tr: HttpTransport>(
     let id = owner.principal_id()?.clone();
     let account = owner
         .account_id_for_principal()
-        .map(|account_id| crate::account::Account::new(client.clone(), account_id.clone()))
+        .and_then(|account_id| {
+            client
+                .account::<capability::Principals>(account_id.clone())
+                .ok()
+        })
         .or_else(|| client.primary_account::<capability::Principals>().ok())?;
     Some((account, id))
 }
@@ -725,18 +713,21 @@ async fn seed_foreign_account<T: HttpTransport>(
 /// One scope per account, never one per mailbox: `Email/changes` is
 /// account-wide, so per-mailbox cursors would each replay the identical
 /// change set and a foreign push would fan out to every one of them.
-/// Pure over its maps so the seeded topology is unit-pinnable.
-fn apply_foreign_seed(
-    foreign_id: &str,
+/// The installer is generic over transport so tests probe and inspect the real slot.
+fn foreign_seed_slot<T: HttpTransport>(
+    mail: JmapMailAccount<T>,
+    limits: capabilities::CoreLimits,
     seed: ForeignSeed,
-    seed_states: &mut HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
-    email_states: &mut HashMap<String, Option<crate::core::id::ObjectState<crate::email::Email>>>,
-) {
-    let scope = CursorScope::Folder(foreign::encode_foreign_account(foreign_id));
+    submission: bool,
+) -> Slot<T> {
+    let scope = CursorScope::Folder(foreign::encode_foreign_account(mail.id_str()));
     let encoded = state::encode_for_scope(&scope, seed.email_state.clone().into_string())
-        .expect("the account-level foreign scope always carries the codec separator");
-    seed_states.insert(scope, encoded);
-    email_states.insert(foreign_id.to_string(), Some(seed.email_state));
+        .expect("foreign account scope is supported");
+    let mut slot = Slot::from_mail(mail, limits);
+    slot.email_states = super::state_cache::StateCache::seeded(Some(seed.email_state));
+    slot.scopes.push((scope, encoded));
+    slot.submission = submission;
+    slot
 }
 
 /// Seed one foreign account, or turn its probe failure into the
@@ -762,12 +753,12 @@ async fn seed_foreign_account_or_skip<T: HttpTransport>(
             let error = super::error::into_account_error(
                 err,
                 super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Discover)
-                    .with_scope(bifrost_types::ErrorScope::Mailbox {
+                    .with_scope(bifrost_types::ErrorScope::Owner {
                         id: (foreign_id.to_string()).into(),
                     }),
             );
             Err(SkippedScope {
-                scope: bifrost_types::ErrorScope::Mailbox {
+                scope: bifrost_types::ErrorScope::Owner {
                     id: (foreign_id.to_string()).into(),
                 },
                 error,
@@ -1389,6 +1380,49 @@ mod tests {
         scripted_client_with_session(session(), replies)
     }
 
+    #[tokio::test]
+    async fn capability_family_slots_share_observations_without_manufacturing_mail() {
+        let session = serde_json::from_value(serde_json::json!({
+            "capabilities": {}, "accounts": {},
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "mail",
+                "urn:ietf:params:jmap:contacts": "pim", "urn:ietf:params:jmap:calendars": "pim"},
+            "username": "test", "apiUrl": "https://example.test/api",
+            "uploadUrl": "https://example.test/{accountId}",
+            "downloadUrl": "https://example.test/{accountId}/{blobId}",
+            "eventSourceUrl": "https://example.test/events", "state": "s1"
+        }))
+        .unwrap();
+        let client = Client::with_transport(
+            super::super::registry::RegistryTransport,
+            session,
+            "https://example.test/session",
+        )
+        .unwrap();
+        let mail = client.primary_account::<capability::Mail>().unwrap();
+        let limits = mail.client().session().object_limits();
+        let mut registry = Registry::new(Slot::from_mail(mail, limits));
+        registry.families.contacts = Some(
+            registry.install_family(client.primary_account::<capability::Contacts>().unwrap()),
+        );
+        registry.families.calendars = Some(
+            registry.install_family(client.primary_account::<capability::Calendars>().unwrap()),
+        );
+        let contacts = registry.family(&registry.families.contacts).unwrap();
+        let calendars = registry.family(&registry.families.calendars).unwrap();
+        contacts
+            .email_states
+            .observe_probe(None, "pim-state".into())
+            .await;
+        assert_eq!(
+            calendars.email_states.guard().await.as_deref(),
+            Some("pim-state")
+        );
+        assert!(registry.primary.email_states.guard().await.is_none());
+        assert_eq!(contacts.id_str(), "pim");
+        assert!(contacts.view::<capability::Mail>().is_err());
+        assert_eq!(registry.shared().count(), 0);
+    }
+
     /// A session whose `primaryAccounts` names an account for every
     /// optional family, so the ONLY thing that can switch a family off is
     /// the shape of its capability block. `blocks` supplies those blocks.
@@ -1929,9 +1963,13 @@ mod tests {
         let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
         let seed = seed_foreign_account(&shared).await.expect("shared seed");
 
-        let mut seed_states = HashMap::new();
-        let mut email_states = HashMap::new();
-        apply_foreign_seed("shared", seed, &mut seed_states, &mut email_states);
+        let slot = foreign_seed_slot(
+            shared,
+            capabilities::validate_session(&client.session()).unwrap(),
+            seed,
+            false,
+        );
+        let seed_states: HashMap<_, _> = slot.scopes.iter().cloned().collect();
 
         assert_eq!(
             seed_states.len(),
@@ -1956,7 +1994,7 @@ mod tests {
             seeded_state, "email-s",
             "the account scope is seeded from the account's Email state"
         );
-        assert_eq!(email_states.get("shared"), Some(&Some("email-s".into())));
+        assert_eq!(slot.email_states.guard().await.as_deref(), Some("email-s"));
     }
 
     /// The account-level foreign scope inventories the WHOLE account: one
@@ -1989,7 +2027,7 @@ mod tests {
         ]);
         let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
         let scope = CursorScope::Folder(foreign::encode_foreign_account("shared"));
-        let owner = Some(bifrost_types::MailboxId("shared".to_string()));
+        let owner = Some(bifrost_types::PrincipalId("shared".to_string()));
         let mut stream = crate::sync::inventory::stream(
             shared,
             super::capabilities::CoreLimits {
@@ -2011,8 +2049,8 @@ mod tests {
                     assert!(entry.memberships.contains(&MembershipScope::Folder(
                         foreign::encode_foreign("shared", "inbox")
                     )));
-                    assert!(entry.memberships.contains(&MembershipScope::Mailbox(
-                        bifrost_types::MailboxId("shared".to_string())
+                    assert!(entry.memberships.contains(&MembershipScope::Owner(
+                        bifrost_types::PrincipalId("shared".to_string())
                     )));
                 }
                 other => panic!("expected one qualified inventory entry, got {other:?}"),
@@ -2344,7 +2382,7 @@ mod tests {
                 "s0"
             ])]),
         ]);
-        let owner = bifrost_types::MailboxId("shared".to_string());
+        let owner = bifrost_types::PrincipalId("shared".to_string());
         let mut stream = crate::sync::inventory::stream(
             crate::account::Account::new(client.clone(), JmapAccountId::new("shared")),
             super::capabilities::CoreLimits {
@@ -2383,7 +2421,7 @@ mod tests {
         assert!(
             entry
                 .memberships
-                .contains(&bifrost_types::MembershipScope::Mailbox(owner)),
+                .contains(&bifrost_types::MembershipScope::Owner(owner)),
             "the owner tag is appended: {:?}",
             entry.memberships
         );
@@ -2420,17 +2458,17 @@ mod tests {
             ];
             let targets = Box::pin(futures::stream::iter(ids.clone()));
             let stream = crate::sync::mutation::set_flags(
-                primary,
-                Arc::new(HashMap::from([("shared".into(), shared)])),
-                // A batch bound of one forces the per-owner flush path
-                // rather than a single end-of-input drain.
-                super::capabilities::CoreLimits {
-                    max_objects_in_get: 1,
-                    max_objects_in_set: 1,
-                },
-                // Deliberately empty: a skip must not consult, probe, or
-                // populate the Email-state cache.
-                Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
+                    primary,
+                    Arc::new(HashMap::from([("shared".into(), shared)])), // A batch bound of one forces the per-owner flush path
+                    // rather than a single end-of-input drain.
+                    super::capabilities::CoreLimits {
+                        max_objects_in_get: 1,
+                        max_objects_in_set: 1,
+                    }, // Deliberately empty: a skip must not consult, probe, or
+                    // populate the Email-state cache.
+                    crate::sync::state_cache::seeded(std::collections::HashMap::new()),
+                )),
                 targets,
                 op.clone(),
                 idempotency_key(),
@@ -2479,13 +2517,15 @@ mod tests {
         )]));
         let targets = Box::pin(futures::stream::iter([foreign_id.clone()]));
         let mut stream = crate::sync::mutation::set_flags(
-            primary,
-            Arc::new(HashMap::from([("shared".into(), shared)])),
-            super::capabilities::CoreLimits {
-                max_objects_in_get: 1,
-                max_objects_in_set: 1,
-            },
-            states,
+            std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
+                primary,
+                Arc::new(HashMap::from([("shared".into(), shared)])),
+                super::capabilities::CoreLimits {
+                    max_objects_in_get: 1,
+                    max_objects_in_set: 1,
+                },
+                states,
+            )),
             targets,
             FlagOp::Add(bifrost_types::FlagSet::from(["$seen".to_string()])),
             idempotency_key(),
@@ -2531,9 +2571,10 @@ mod tests {
         let primary = JmapMailAccount::new(client.clone(), JmapAccountId::new("primary"));
 
         let error = crate::sync::pim::set_keyword(
-            primary,
-            state_map(&[("primary", "primary-state")]),
-            "primary".to_string(),
+            crate::sync::registry::Slot::from_test(
+                primary.clone(),
+                state_map(&[("primary", "primary-state")]),
+            ),
             MutationTarget::Thread(bifrost_types::ThreadId("T9".to_string())),
             "$seen".into(),
             true,
@@ -2563,9 +2604,7 @@ mod tests {
         )]));
 
         crate::sync::pim::set_keyword(
-            shared,
-            states,
-            "shared".to_string(),
+            crate::sync::registry::Slot::from_test(shared.clone(), Arc::clone(&states)),
             MutationTarget::Message(foreign_id.clone()),
             "$seen".into(),
             true,
@@ -2614,13 +2653,15 @@ mod tests {
         ]));
 
         let mut stream = crate::sync::mutation::move_to(
-            primary,
-            Arc::new(HashMap::from([("shared".into(), shared)])),
-            super::capabilities::CoreLimits {
-                max_objects_in_get: 1,
-                max_objects_in_set: 1,
-            },
-            states,
+            std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
+                primary,
+                Arc::new(HashMap::from([("shared".into(), shared)])),
+                super::capabilities::CoreLimits {
+                    max_objects_in_get: 1,
+                    max_objects_in_set: 1,
+                },
+                states,
+            )),
             targets,
             MembershipScope::Mailbox(bifrost_types::MailboxId("inbox".to_string())),
             idempotency_key(),
@@ -2698,13 +2739,15 @@ mod tests {
         let targets = Box::pin(futures::stream::iter([foreign_id.clone()]));
 
         let mut stream = crate::sync::mutation::move_to(
-            primary,
-            Arc::new(HashMap::from([("shared".into(), shared)])),
-            super::capabilities::CoreLimits {
-                max_objects_in_get: 1,
-                max_objects_in_set: 1,
-            },
-            states,
+            std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
+                primary,
+                Arc::new(HashMap::from([("shared".into(), shared)])),
+                super::capabilities::CoreLimits {
+                    max_objects_in_get: 1,
+                    max_objects_in_set: 1,
+                },
+                states,
+            )),
             targets,
             MembershipScope::Mailbox(bifrost_types::MailboxId(destination.0)),
             idempotency_key(),
@@ -2749,9 +2792,7 @@ mod tests {
         let states = state_map(&[("shared", "shared-state")]);
 
         let error = crate::sync::pim::add_to_container(
-            shared,
-            states,
-            "shared".to_string(),
+            crate::sync::registry::Slot::from_test(shared.clone(), Arc::clone(&states)),
             MutationTarget::Message(foreign_id),
             ContainerId("inbox".to_string()),
         )
@@ -2792,13 +2833,15 @@ mod tests {
         ]));
 
         let mut stream = crate::sync::mutation::set_flags(
-            primary,
-            Arc::new(HashMap::from([("shared".into(), shared)])),
-            super::capabilities::CoreLimits {
-                max_objects_in_get: 1,
-                max_objects_in_set: 2,
-            },
-            states,
+            std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
+                primary,
+                Arc::new(HashMap::from([("shared".into(), shared)])),
+                super::capabilities::CoreLimits {
+                    max_objects_in_get: 1,
+                    max_objects_in_set: 2,
+                },
+                states,
+            )),
             targets,
             FlagOp::Add(bifrost_types::FlagSet::from(["$seen".to_string()])),
             idempotency_key(),
@@ -3156,7 +3199,7 @@ mod tests {
         };
 
         assert!(
-            matches!(&skip.scope, bifrost_types::ErrorScope::Mailbox { id } if id.0 == "shared"),
+            matches!(&skip.scope, bifrost_types::ErrorScope::Owner { id } if id.0 == "shared"),
             "the skip names the degraded foreign account: {:?}",
             skip.scope
         );
@@ -3183,7 +3226,7 @@ mod tests {
         };
 
         assert!(
-            matches!(&skip.scope, bifrost_types::ErrorScope::Mailbox { id } if id.0 == "shared"),
+            matches!(&skip.scope, bifrost_types::ErrorScope::Owner { id } if id.0 == "shared"),
             "the skip names the degraded foreign account: {:?}",
             skip.scope
         );
@@ -3321,15 +3364,18 @@ mod tests {
         cursor.server_state.envelope_version = bifrost_types::PayloadVersion::new(1);
 
         let mut stream = crate::sync::changes::stream(
-            primary,
-            "primary".to_string(),
-            super::capabilities::CoreLimits {
-                max_objects_in_get: 4,
-                max_objects_in_set: 4,
+            {
+                let mut slot = crate::sync::registry::Slot::from_test(
+                    primary,
+                    state_map(&[("primary", "s1")]),
+                );
+                slot.limits = super::capabilities::CoreLimits {
+                    max_objects_in_get: 4,
+                    max_objects_in_set: 4,
+                };
+                slot
             },
             cursor,
-            None,
-            state_map(&[("primary", "s1")]),
         );
 
         match stream.next().await {
@@ -3392,12 +3438,15 @@ mod tests {
                 .primary_account::<capability::Mail>()
                 .expect("primary mail account");
             let mut stream = crate::sync::changes::stream(
-                primary,
-                "primary".to_string(),
-                limits,
+                {
+                    let mut slot = crate::sync::registry::Slot::from_test(
+                        primary,
+                        state_map(&[("primary", "s1")]),
+                    );
+                    slot.limits = limits;
+                    slot
+                },
                 cursor,
-                None,
-                state_map(&[("primary", "s1")]),
             );
             match stream.next().await {
                 Some(bifrost_types::SyncEvent::Terminated(err)) => {
@@ -3440,8 +3489,10 @@ mod tests {
         let thread = foreign_thread("shared", "T9");
 
         let hydration = crate::sync::pim::thread_hydrate(
-            primary,
-            foreign_map("shared", shared),
+            std::sync::Arc::new(crate::sync::registry::Registry::from_test(
+                primary,
+                foreign_map("shared", shared),
+            )),
             thread.clone(),
         )
         .await
@@ -3493,8 +3544,10 @@ mod tests {
         let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
 
         let hydration = crate::sync::pim::thread_hydrate(
-            primary,
-            foreign_map("shared", shared),
+            std::sync::Arc::new(crate::sync::registry::Registry::from_test(
+                primary,
+                foreign_map("shared", shared),
+            )),
             bifrost_types::ThreadId("T9".to_string()),
         )
         .await
@@ -3530,9 +3583,10 @@ mod tests {
         let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
 
         crate::sync::pim::set_keyword(
-            shared,
-            state_map(&[("primary", "primary-state"), ("shared", "shared-state")]),
-            "shared".to_string(),
+            crate::sync::registry::Slot::from_test(
+                shared.clone(),
+                state_map(&[("primary", "primary-state"), ("shared", "shared-state")]),
+            ),
             MutationTarget::Thread(foreign_thread("shared", "T9")),
             "$seen".into(),
             true,
@@ -3584,9 +3638,10 @@ mod tests {
             .expect("primary mail account");
 
         let error = crate::sync::pim::set_keyword(
-            primary,
-            state_map(&[("primary", "primary-state")]),
-            "primary".to_string(),
+            crate::sync::registry::Slot::from_test(
+                primary.clone(),
+                state_map(&[("primary", "primary-state")]),
+            ),
             MutationTarget::Thread(foreign_thread("revoked", "T9")),
             "$seen".into(),
             true,
@@ -3620,9 +3675,10 @@ mod tests {
         let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
 
         crate::sync::pim::move_thread(
-            shared,
-            state_map(&[("shared", "shared-state")]),
-            "shared".to_string(),
+            crate::sync::registry::Slot::from_test(
+                shared.clone(),
+                state_map(&[("shared", "shared-state")]),
+            ),
             foreign_thread("shared", "T9"),
             ContainerId(foreign::encode_foreign("shared", "archive").0),
             None,
@@ -3658,9 +3714,10 @@ mod tests {
         let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
 
         let error = crate::sync::pim::move_thread(
-            shared,
-            state_map(&[("shared", "shared-state")]),
-            "shared".to_string(),
+            crate::sync::registry::Slot::from_test(
+                shared.clone(),
+                state_map(&[("shared", "shared-state")]),
+            ),
             foreign_thread("shared", "T9"),
             ContainerId("archive".to_string()),
             None,
@@ -3698,9 +3755,10 @@ mod tests {
         let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
 
         crate::sync::pim::delete_thread(
-            shared,
-            state_map(&[("shared", "shared-state")]),
-            "shared".to_string(),
+            crate::sync::registry::Slot::from_test(
+                shared.clone(),
+                state_map(&[("shared", "shared-state")]),
+            ),
             foreign_thread("shared", "T9"),
             None,
         )
@@ -3764,11 +3822,11 @@ mod tests {
         let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
 
         crate::sync::pim::delete_thread(
-            shared,
-            state_map(&[("shared", "shared-state")]),
-            "shared".to_string(),
-            foreign_thread("shared", "T9"),
-            // The caller's container id arrives owner-qualified, the way
+            crate::sync::registry::Slot::from_test(
+                shared.clone(),
+                state_map(&[("shared", "shared-state")]),
+            ),
+            foreign_thread("shared", "T9"), // The caller's container id arrives owner-qualified, the way
             // `containers_list` mints it for a share.
             Some(ContainerId(foreign::encode_object(
                 "shared",
@@ -3796,5 +3854,87 @@ mod tests {
             set_args.get("update").is_none(),
             "already-in-Trash must destroy, not move: {set_args}"
         );
+    }
+    #[tokio::test]
+    async fn primary_qualification_stays_literal_at_mail_request_doors() {
+        // A qualifier naming primary is not a registered share. An Outlook
+        // user must never mutate the bare primary item under that identity.
+        let qualified = foreign::encode_object("primary", "M1");
+        let client = scripted_client([email_set_reply("primary", "s1", "s2", &qualified)]);
+        let mail = JmapMailAccount::new(client.clone(), "primary");
+        let slot = Slot::from_mail(
+            mail,
+            capabilities::validate_session(&client.session()).unwrap(),
+        );
+        crate::sync::pim::set_keyword(
+            slot,
+            MutationTarget::Message(ObjectId(qualified.clone())),
+            "$seen".into(),
+            true,
+        )
+        .await
+        .expect("script acknowledges the submitted identity");
+        let calls = client.transport().requests();
+        assert!(
+            calls[0]["methodCalls"][0][1]["update"]
+                .get(&qualified)
+                .is_some()
+        );
+        assert!(calls[0]["methodCalls"][0][1]["update"].get("M1").is_none());
+
+        let updated = serde_json::Map::from_iter([(qualified.clone(), Value::Null)]);
+        let client = scripted_client([method_reply(vec![json!([
+            "Mailbox/set", {"accountId": "primary", "oldState": "m1", "newState": "m2", "updated": updated}, "s0"
+        ])])]);
+        let slot = Slot::from_mail(
+            JmapMailAccount::new(client.clone(), "primary"),
+            capabilities::validate_session(&client.session()).unwrap(),
+        );
+        crate::sync::pim::container_rename(
+            slot,
+            ContainerId(qualified.clone()),
+            "renamed".into(),
+            None,
+        )
+        .await
+        .expect("script acknowledges the submitted container");
+        let calls = client.transport().requests();
+        assert!(
+            calls[0]["methodCalls"][0][1]["update"]
+                .get(&qualified)
+                .is_some()
+        );
+        assert!(calls[0]["methodCalls"][0][1]["update"].get("M1").is_none());
+    }
+
+    #[tokio::test]
+    async fn seeded_registry_keeps_scopes_and_guards_with_their_handles() {
+        let client = scripted_client([open_reply("primary", "p"), open_reply("shared", "s")]);
+        let primary = client.primary_account::<capability::Mail>().unwrap();
+        let seeded = validate_and_seed(&client, &primary).await.unwrap();
+        assert!(seeded.skipped_scopes.is_empty());
+        let registry = seeded.registry;
+        assert_eq!(registry.primary.id_str(), "primary");
+        assert_eq!(
+            registry.primary.email_states.guard().await.as_deref(),
+            Some("email-p")
+        );
+        let shared = registry.shared_slot("shared").unwrap();
+        assert_eq!(shared.id_str(), "shared");
+        assert_eq!(
+            shared.email_states.guard().await.as_deref(),
+            Some("email-s")
+        );
+        assert_eq!(
+            registry.push_scope("shared"),
+            Some(&CursorScope::Folder(foreign::encode_foreign_account(
+                "shared"
+            )))
+        );
+        assert_eq!(
+            registry.memberships(),
+            vec![MembershipScope::Owner("shared".into())]
+        );
+        assert_eq!(registry.cursor_scopes().len(), 3);
     }
 }

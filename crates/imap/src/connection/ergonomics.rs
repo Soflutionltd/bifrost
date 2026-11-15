@@ -101,12 +101,12 @@ impl ImapConnection {
         let sequence_set = request.uids.as_sequence_set();
         if let crate::types::FetchChanges::SinceWithVanished(mod_seq) = request.changes {
             let (fetches, vanished) = self
-                .uid_fetch_vanished(sequence_set, &request.attrs, mod_seq.get(), timeout)
+                .uid_fetch_vanished(sequence_set, &request.attrs, mod_seq, timeout)
                 .await?;
             Ok(crate::types::SyncFetchResult { fetches, vanished })
         } else if let crate::types::FetchChanges::Since(mod_seq) = request.changes {
             let fetches = self
-                .uid_fetch_changed_since(sequence_set, &request.attrs, mod_seq.get(), timeout)
+                .uid_fetch_changed_since(sequence_set, &request.attrs, mod_seq, timeout)
                 .await?;
             Ok(crate::types::SyncFetchResult {
                 fetches,
@@ -129,7 +129,7 @@ impl ImapConnection {
     /// FETCH responses instead of shared HydratedObject batches.
     pub async fn uid_fetch_each<F>(
         &self,
-        uids: &crate::types::UidSet,
+        uids: &crate::types::UidSetExpr,
         attrs: &[FetchAttr],
         timeout: Duration,
         mut on_fetch: F,
@@ -153,9 +153,9 @@ impl ImapConnection {
     /// Collect a UID FETCH with a caller-supplied memory budget.
     ///
     /// The budget is enforced in the FETCH consumer: responses beyond the
-    /// budget are not retained, and the method returns [`Error::FetchLimit`]
+    /// budget are not retained, and the method returns [`crate::error::ResultLimit::Fetch`]
     /// after the tagged completion. A literal declaration larger than the
-    /// remaining budget returns [`Error::FetchLiteralLimit`] before its
+    /// remaining budget returns [`crate::error::ResultLimit::FetchLiteral`] before its
     /// payload is read and retires the connection, because the unread literal
     /// cannot be skipped safely. Callers that need strict back-pressure should
     /// use [`uid_fetch_each`](Self::uid_fetch_each).
@@ -165,7 +165,7 @@ impl ImapConnection {
     /// Direct API counterpart to Account get/blob streams for buffered callers.
     pub async fn uid_fetch_limited(
         &self,
-        uids: &crate::types::UidSet,
+        uids: &crate::types::UidSetExpr,
         attrs: &[FetchAttr],
         max_estimated_bytes: usize,
         timeout: Duration,
@@ -197,7 +197,7 @@ impl ImapConnection {
     /// Direct API counterpart to Account full-message hydration.
     pub async fn uid_fetch_full_messages(
         &self,
-        uids: &crate::types::UidSet,
+        uids: &crate::types::UidSetExpr,
         max_estimated_bytes: usize,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {

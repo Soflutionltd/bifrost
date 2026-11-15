@@ -20,6 +20,13 @@
 //! itself - well-known probe, fallback predicate, configured base - is
 //! `DavDispatch::discover_current_user_principal`.
 
+//! Collection mechanics are shared too: `collection::Dialect` supplies syntax,
+//! parsers and replay policy to `DavCollectionClient`; `DavCollectionAccount`
+//! owns cursor, inventory, page and relocation contracts. Protocol hooks keep
+//! CalDAV sync-collection/scheduling and CardDAV ctag/directory behavior local.
+
+pub mod collection;
+pub mod collection_account;
 pub mod content_line;
 mod discovery;
 mod dispatch;
@@ -35,6 +42,7 @@ mod snapshot;
 #[cfg(any(feature = "test-support", test))]
 pub mod test_support;
 mod transport;
+mod unsupported;
 pub mod url;
 mod xml;
 
@@ -66,6 +74,7 @@ pub use snapshot::{
 pub use transport::{
     DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body, url_origin,
 };
+pub use url::DavHref;
 pub use xml::{
     APPLE_CALENDAR_NAMESPACE, CALDAV_NAMESPACE, CALENDAR_SERVER_NAMESPACE, CARDDAV_NAMESPACE,
     DAV_NAMESPACE, DavHrefKey, XmlName, append_path, dav_href_key, escape_xml, local_name,

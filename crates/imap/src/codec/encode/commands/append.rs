@@ -59,13 +59,17 @@ pub(crate) fn encode_append(
     opts: &EncodeOptions,
 ) -> Result<(), crate::Error> {
     if messages.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            "MULTIAPPEND requires at least one message".into(),
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "MULTIAPPEND requires at least one message".into(),
+            ),
         ));
     }
     if !multi && messages.len() != 1 {
-        return Err(crate::Error::InvalidInput(
-            "APPEND carries exactly one message; use MULTIAPPEND for several".into(),
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "APPEND carries exactly one message; use MULTIAPPEND for several".into(),
+            ),
         ));
     }
 

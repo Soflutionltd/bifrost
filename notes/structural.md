@@ -24,53 +24,6 @@ Each entry names the hunt scope(s) that reported it. Where hunters disagreed,
 both readings are recorded. The raw reports are in the commit that precedes
 this file's.
 
-## STR-001 - `MembershipScope::Mailbox` / `MailboxId` means three things
-
-**Reported by:** types (LATENT, edging LIVE), jmap-account (latent collision).
-
-Producers: JMAP primary inventory emits `MembershipScope::Mailbox(native
-mailbox id)` and JMAP lifecycle emits `Created/Renamed/Deleted(Mailbox(id))`
-for primary mailboxes; JMAP foreign inventory (`qualify_foreign_memberships`)
-rewrites each `Mailbox(native)` into `Folder(encode_foreign(owner, native))`
-and then APPENDS `Mailbox(owner)` as an owner tag - same crate, same variant,
-opposite meaning. Graph's `Mailbox(owner)` is only ever the owner tag
-(`graph/src/account/foreign.rs::owner_tag`). `ids.rs` documents `MailboxId` as
-"Either a JMAP mailbox id, or ... the shared/delegate-mailbox routing key".
-
-Consumers: `sync/src/engine/attach.rs::scope_covers_membership` treats
-`Folder(id)` cursors as covering `Mailbox(id)` by string equality, justified by
-"Graph maps folders 1:1 to mailboxes" - which no longer describes Graph.
-`sync/src/multiplexer/mod.rs::membership_scopes` maps a lifecycle `Mailbox(x)`
-onto `Folder(x)` / `FolderType { folder: x, .. }`; a provider emitting
-lifecycle for an owner tag would mint a cursor scope named after a principal.
-`ErrorScope::Mailbox { id }`, `ThrottleKey::Mailbox`, `SendAs::{As,
-OnBehalfOf}(MailboxId)`, `Container::owner` all use the owner meaning. A JMAP
-account whose primary mailbox id equals a foreign `accountId` (Stalwart-style
-one-letter ids make this plausible) produces two indistinguishable memberships.
-
-Proposal: `MembershipScope::Owner(PrincipalId)` for owner tags, `Mailbox` for
-containers only, and a `PrincipalId`/`OwnerId` newtype for `Container::owner`,
-`SendAs`, `ThrottleKey::Mailbox` and `ErrorScope::Mailbox`. The engine then has
-to state what an owner tag covers instead of string-comparing it with a folder.
-Renaming `ThrottleKey::Mailbox` / `ErrorScope::Mailbox` needs the owner; adding
-`Owner` and the newtype is a shape change.
-
-The jmap-account hunter reached the same collision hazard from inside JMAP:
-`discover::memberships` emits the primary account's mailbox ids as
-`MembershipScope::Mailbox(id)` in the same list as the owner tags
-`MembershipScope::Mailbox(accountId)` (from `foreign::owner_tag`), and servers
-minting short sequential ids for both (Stalwart uses single-letter base32 ids for
-both) can produce a primary mailbox and a shared account with the same id. The
-shared account's identity is typed as a mailbox id almost everywhere it crosses a
-function boundary: `changes::stream`, `inventory::stream`, `email_inventory_loop`
-take `owner: Option<TypesMailboxId>` (and `changes::stream` additionally takes
-`account_id: String` and the routed `mail` handle - three parameters for one fact,
-assembled from `mail_for_scope`, `account_id_for_scope`, `owner_of_scope`);
-`container_from_mailbox` sets `Container::with_owner(MailboxId(accountId))`;
-open-time skips use `ErrorScope::Mailbox { id: accountId }`. It too wants a
-first-class `MembershipScope::Owner(..)` (or a field on the entry) in
-`bifrost-types`.
-
 ## STR-002 - Owner-qualified ids travel as in-band separator strings
 
 **Reported by:** types (LATENT), jmap-account (latent disagreement among the stripping functions).
@@ -85,6 +38,13 @@ into must have the same owner" (JMAP `owner_of`; Graph `folder_owner` /
 (`namespace`, `owner`, `owner_local_id`, `owner_email`, and `native_id`, the
 encoded form) - two representations of one fact, kept consistent per producer.
 
+**Partly resolved.** JMAP now has one codec and one stripping rule
+(`foreign::Owner`, `JmapRef`, `registry::Route`, `Slot::wire`), and a
+primary-qualified id stays literal at every door. What remains is the
+cross-crate half: Graph keeps its own `\u{1f}` / `\u{1e}` codecs and owner
+checks, and no shared `Qualified<T>` exists in `bifrost-types`. The JMAP
+mint-site gap (a native id containing the separator) is tracked under STR-097.
+
 The JMAP module doc argues a shared type "would be a false generalization"
 because JMAP's owner is an `accountId` and Graph's a `/users/{id}` key. The
 hunter answers that this is about the owner string's MEANING, which stays
@@ -96,53 +56,6 @@ Proposal: `Qualified<T> { owner: Option<PrincipalId>, native: T }` (or an
 `owner()` accessor plus one codec) for the id newtypes that can be foreign, with
 one encoding and one "same owner?" check. If the in-band string must survive for
 persisted keys, the codec still belongs in one place.
-
-The jmap-account hunter calls this the crate's dominant missing type and counts
-the JMAP decode sites: `account.rs` `route_object_id`, `route_mutation_target`
-(unregistered owner -> primary, literal), `resolve_foreign_account_id` and
-`owner_of_scope` (`None`), `is_unregistered_foreign` (terminal `ScopeRevoked`),
-`hydrate.rs` `route_for_id` / `HydrationRoute`, `mutation.rs`
-`account_id_for_target`, `blob.rs` `foreign_split`, `pim.rs` `thread_owner` (all
-primary, literal), `pim.rs` `search_owner` / `route_search` (`Request(Malformed)`),
-the `owner_of` callers (ignore registration), `push.rs` `PushRouting::new`
-(dropped). The wire form is derived four times, and they already disagree
-(latent): `hydrate::wire_object_id(id, owner)` strips only when the route is
-foreign and the owner matches; `mutation::wire_email_id(id, account_id,
-foreign_account: bool)` only when the caller passed `true` and the owner matches;
-`mutation::wire_mailbox_id` likewise; `pim::wire_id_for_mail(id, account_id)`
-strips whenever the owner equals `mail.id_str()`, INCLUDING on the primary route,
-so a primary-qualified id is stripped by `pim` and kept literal by `hydrate` and
-`mutation` (no producer mints that shape today; `hydrate::wire_object_id`'s doc
-says it "must match what the mutation pipeline does"). Nothing validates at the
-mint sites that a server-minted native id does not itself contain `\u{1f}`; the
-codec's soundness rests on RFC 8620 id syntax, so a non-conformant primary id
-containing the separator silently routes as foreign. Its shape: `enum Owner {
-Primary, Shared(JmapAccountId) }`, `struct JmapRef<K> { owner, native: Id<K> }`,
-`enum Route<'a> { Primary(&'a Slot), Shared(&'a Slot), Departed(JmapAccountId) }`;
-`JmapRef::parse` refuses a native part containing the separator,
-`JmapRef::to_consumer()` is the one encoder, `Route::wire(&ref)` the one stripping
-rule, and each door states its `Departed` policy in one `match`. The prose
-distinction between "declared owner" (`owner_of`) and "reachable owner" (the
-registered predicates) becomes `ref.owner` vs `registry.route(&ref)` (STR-097).
-
-## STR-003 - `EventTime` is a string with a sibling bool
-
-**Reported by:** types (LIVE through BUG-001).
-
-`EventTime { value: String, timezone: Option<String> }` holds either RFC 3339 or
-`YYYY-MM-DD`; whether it is a date lives on the enclosing
-`CalendarEvent::is_all_day` / `EventCreate::is_all_day` /
-`EventPatch::is_all_day`. Every crate re-derives "date or date-time" from
-`value.len() == 10` or the bool and re-parses: CalDAV `comparable_time`,
-`caldav_query_time`, `ical_time_from_event_time`; JMAP `comparable_time`,
-`local_datetime`, `end_from_start_duration`; Google `event_time`,
-`google_range_bound`, `reject_unexpressible_all_day_patch`; Graph `event_time`,
-`is_all_day_value`, `all_day_date`. The all-day-exclusive-end contract is
-enforced by each producer by hand. `ReminderTrigger::Relative { offset: String
-}` and `Absolute(String)` repeat the pattern. `jiff` is already a dependency.
-
-Proposal: `enum EventTime { Date(civil::Date), Floating(civil::DateTime),
-Zoned(..) }`, `is_all_day` derived, and an `EventRange` that owns overlap.
 
 ## STR-005 - `BatchItemId(String)` has three meanings
 
@@ -205,39 +118,6 @@ type-state field). Cross-crate, every provider decides at write time which
 ETag checks, Graph's ETag paths) with no read-side mint naming the door it is valid
 for. Owner: `bifrost-types`, a version minted by the read path with its object type
 (and, for JMAP, owner) inside it.
-
-## STR-010 - Classified failures flattened to prose at degradation seams
-
-**Reported by:** types.
-
-- `account_compose.rs::drain_sub_discovery` folds a composed sub-account's
-  `Terminated(AccountError)` into `Warning::support_only(WarningKind::Other,
-  format!(... message_key ...))`, discarding recovery class, scope and
-  remediation; a consumer cannot tell a revoked CalDAV grant from a 503.
-- Graph discovery (`graph/src/account/scopes.rs`) reports a skipped shared
-  mailbox as prose, while `containers_list`, `search` and `AccountFactory::open`
-  report the same event as a classified `SkippedScope`.
-- `Warning` has no slot for an error or a scope; `WarningKind::Other` has
-  roughly twenty producers across imap, sync and types.
-- `StateCause::OperatorOverrideNeeded { reason: String }` flows into
-  `EngineDirective::OperatorOverrideRequired { reason: String }`; a machine
-  caller branching on why an operator is needed has only prose.
-
-Proposal: give `Warning` an optional `SkippedScope` (or `Option<AccountError>` +
-`Option<ErrorScope>`), give discovery streams a skip lane, and type the
-operator-override reason.
-
-The imap-account hunter adds the strategy downgrade: `bifrost_types::StrategyDowngrade`
-exists (used only by the dead `error::strategy_failure`), but every live
-downgrade is `Warning::support_only(WarningKind::StrategyDowngraded, reason)`
-with `protocol_detail = format!("{from:?}->{to:?}")` (`run_inventory`,
-`send_strategy_downgrade`), and the scripted tests assert on that Debug string
-(`downgrade_detail`); a consumer wanting "this folder is now on Basic" must parse
-Rust Debug output. Make the kind carry the typed value
-(`WarningKind::StrategyDowngraded(StrategyDowngrade)` or a structured field).
-Also prose-only: `warn_if_uid_count_mismatch` (`WarningKind::Other`, counts in
-prose), `DavScopeIndex::build` collisions (`OperatorAttentionNeeded`, href only
-in text), and `push_stream`'s "NOTIFY SET refused: ..." (`Other`).
 
 ## STR-012 - The engine's consumer API lives in the contract crate
 
@@ -367,51 +247,6 @@ places the message by `containers: Vec<ContainerId>` while inventory uses
 provider knowledge (Gmail fills the former with label ids, the latter with
 `MembershipScope::Label`).
 
-## STR-027 - Engine failures reach callers only as prose
-
-**Reported by:** sync-engine.
-
-- `Error::Other(String)` is constructed about 98 times in `crates/sync/src`.
-  Branchable cases inside it: scheduler admission refusal ("lane is full",
-  "admission was abandoned", "account budget was forgotten" - detached,
-  "poisoned"), where every caller re-sleeps on a guess (poll loop a cadence,
-  deferred inventory 1s, campaigns 100ms) and none can tell the account is
-  gone; writer channel closed (BUG-010); "one mutation target has conflicting
-  caller versions"; wrong-scope `Done` in `fuse_inventory_done`.
-- `Error::EstablishCursorFailed(String)` carries "unknown CursorEstablishment
-  variant" and "recovery wait budget exhausted", two unrelated outcomes.
-- `Error::CheckpointStore(String)` carries "acknowledgement names an unknown
-  publication", a caller-side rejection, not a store failure;
-  `AckFailure::{Rejected, Store}` is the typed distinction and collapses at the
-  public boundary.
-- `ack_checkpoint` returns `Ok(())` for both durable and withheld outcomes
-  (`AckPersistOutcome::Withheld` for `OpenDebt`, `WalkNotWhole`, `Unvouchable`,
-  prior-attachment backfill rows). Return `AckOutcome::{Durable,
-  Withheld(CompletionRefusal)}`.
-- Control waits cut short by detach (BUG-011).
-- Engine-synthesized warnings are told apart only by text, all
-  `WarningKind::OperatorAttentionNeeded` or `Other`: "recovery wait budget
-  exhausted", "scope re-establishment retry budget exhausted", "schema recovery
-  could not clear durable checkpoints", "shared folder access revoked; scope
-  disabled", "scope capability downgraded", "push transport disconnected",
-  "push stream terminated with retryable recovery" (which also drops the
-  `AccountError` it was about), "reconcile requested dedupe-by-client-id".
-  `PauseReason` is already bounded; the warnings deserve an engine-notice kind
-  per case carrying scope and originating error. Related: STR-010.
-
-The sync-lanes hunter reports the lane-side warnings the same way: barrier stop
-with a count (runner and fusion, two copies of the text), degraded inventory
-with a count, "inventory walk superseded by a reset or deletion" (`Other`),
-"push transport disconnected" (`Other`, two sites), "push stream terminated with
-retryable recovery" (`Other`). A consumer wanting to render "operator must
-waive N regions in scope S" distinctly from "push is down" must match on
-English. Its proposal: a typed attention payload carried on the warning
-(`AttentionReason::BarrierStop { regions }`, `DegradedCoverage { obligations }`,
-`WalkSuperseded`, `PushDown { lane }`, ...). Also `BackfillState { Pending,
-Running, Completed }` folds "never started", "failed and retrying on the ramp",
-"parked on a throttle", "blocked by an operator-blocked barrier" and "walk lost
-pages, restarting" into `Pending`; it wants a richer state.
-
 ## STR-028 - The per-account actor is split across three bundles
 
 **Reported by:** sync-engine (the hunter calls it a big but clean rewrite).
@@ -449,67 +284,6 @@ construction, so the bug class disappears rather than being defended.
 `InvalidationSinkInner`'s map is legitimately engine-wide (the consumer
 addresses it by id) and is not part of this.
 
-## STR-029 - `engine/reattach.rs` does several unrelated jobs
-
-**Reported by:** sync-engine.
-
-In about 2,700 lines: the recovery dispatcher, the directive arms,
-`DeferredScopeRepairs` and `DeferredSchemaReset` (parking actors), schema reset,
-`RepairPacing`, scope restart and disable, the reattach transaction,
-`ReattachGuard` and its drop-time cleanup, replacement open, establishment,
-warning and termination broadcast helpers, jitter. The reopen listener (the
-account's serial supervisor, the real entry to all of it) is an inline closure
-inside `attach_opened` in `attach.rs`.
-
-Suggested layout under `engine/`: `supervisor.rs` (listener loop and
-`ReopenRequest`, moved out of `multiplexer/`), `recovery/dispatch.rs` (the
-CON-012 dispatcher and directive arms), `recovery/parked.rs` (the two
-deferred-obligation actors), `recovery/pacing.rs` (`RepairPacing` plus CON-015
-backoff), `reattach/{transaction,guard}.rs`, `establish.rs` (CON-017).
-`ReopenRequest` belongs to the supervisor: most variants are documented as
-"engine plumbing" and raised by non-multiplexer code.
-
-## STR-030 - `multiplexer/mod.rs` holds four subsystems
-
-**Reported by:** sync-engine.
-
-In about 3,800 lines: (1) `ChangeDelivery` and `ChangesReceiver`, the engine's
-consumer-facing output port (receiver numbering, departure sweeps, lag), on
-which the backfill lane, repair and push depend - its own `delivery/` module
-with CON-019 applied; (2) the lifecycle reader, a roughly 170-line closure
-inline in `Multiplexer::run` - its own worker type, file and tests; (3) the poll
-loop, scope tokens and drive outcome - what "multiplexer" should mean; (4)
-membership to scope mapping (CON-016), which belongs in `bifrost-types` or
-`cursor/`. Also `multiplexer/changes.rs` defines `AckRequest`, `WriterRequest`
-and `OperatorDecision`, the writer's protocol, consumed only by `engine/ack.rs`
-and `backfill/checkpoint.rs`; they belong next to the writer (`engine/writer/`).
-That placement is how `WriterRequest` leaked into the public surface (BUG-013).
-
-## STR-031 - The checkpoint writer is a 600-line match over five concerns
-
-**Reported by:** sync-engine.
-
-`engine/ack.rs` mixes ack persistence and completion-sentinel judgement,
-reattach provisional ownership, repair parking and acknowledgement pairing,
-scope and account resets, and operator decisions and barriers. Beside it,
-`reject_unloaded_request` is a second exhaustive match deciding per variant what
-"ledger unavailable" means, away from the variant. Proposal: a `Writer` struct
-with a method per concern (`ProvisionalRows`, `RepairPairing`, ledger ops per
-CON-022), a `WriterRequest` impl giving each variant its `requires_ledger()`
-answer, and the detach-phase helpers (`take_ack_writer`, `await_*_until`) moved
-to the teardown code they serve.
-
-The sync-lanes hunter adds the placement half: `WriterRequest` (fifteen
-variants, carrying the provisional-row and publication-identity semantics) is
-defined in `multiplexer/changes.rs` while its server is `engine/ack.rs`, and
-`WriterHandle`, the typed wrapper, is `pub(crate)` in `engine/ack.rs` with
-`pub(super)` methods, so the lanes (`inventory_walk`, runner, fusion,
-`engine/backfill.rs`, `repair.rs`, `BackfillCheckpointWriter`) all build
-oneshots by hand against the raw sender (BUG-010). Proposal: a `writer` module,
-plausibly `cursor/writer.rs` since the writer is the custodian of the cursor
-store and ledger, owning `WriterRequest`, `WriterHandle` and the reply typing;
-every lane takes `WriterHandle`.
-
 ## STR-032 - `run_bulk_pipeline` is one 850-line function over untyped campaign state
 
 **Reported by:** sync-engine.
@@ -532,21 +306,6 @@ them. Proposal: the state machine moves into `mutation/campaign.rs` (pure state
 plus transitions), with `engine/bulk.rs` keeping the async driving.
 `MutationCounters` has public fields next to `record_*` methods, allowing both
 direct and method writes; pick one.
-
-## STR-033 - `recovery.rs` mixes plan dispatch, the throttle bucket and an error catalogue
-
-**Reported by:** sync-engine.
-
-(1) Plan dispatch (`plan_recovery`, delays); (2) the throttle bucket and its
-free-function API; (3) a catalogue of engine-authored `AccountError`
-constructors (`restart_scope_error`, `establish_failure_error`,
-`inventory_resume_contract_failure`, `inventory_removal_scope_contract_failure`,
-`recovery_exhaustion_error`, `cursor_decode_failure`,
-`batch_boundary_violation`, `backfill_checkpoint_on_changes`,
-`fresh_cursor_contract_error`), with `control.rs::control_wait_ended` a stray
-member. Proposal: `recovery/plan.rs`, `throttle.rs` (with CON-013) and
-`engine_errors.rs`; with every engine-minted error in one file, BUG-006 and
-BUG-011 are visible side by side.
 
 ## STR-034 - The sync test layout mirrors history, not the design
 
@@ -708,55 +467,6 @@ the scope's `DriveGeneration` (a fence change already revives it), `ScopeTokens`
 shrinks to poll-task bookkeeping, and `RegistryState` replacement merges
 per-scope state field by field (BUG-022).
 
-## STR-049 - IMAP has six representations of "a set of UIDs / sequence numbers", and they disagree on reversed ranges
-
-**Reported by:** imap-protocol (the hunter's top-ranked move; latent disagreement).
-
-The hunter's thesis for the whole protocol layer: it owns a good typed
-vocabulary (`Uid`, `Seq`, `UidValidity`, `ModSeq`, `UidSet`, `SeqSet`,
-`SearchCriteria`, `FetchAttr`, `StatusItem`, `MailboxRights`, `AuthMechanism`,
-`ObjectId`, `ImapAtom`, `GmailMessageId`) and almost none survives to the place
-that acts on it: values are rendered to `String` / `u32` / `u64` one hop before
-the encoder, which re-parses and re-validates, and the decoder produces raw
-numbers and strings that every consumer re-judges. "Render early, re-parse
-late." The biggest payoff is a rewrite carrying typed values from builder to
-wire and wire to consumer, the encoder a pure renderer and the decoder the one
-place wire tolerance is decided. This entry and STR-050 to STR-058 are its
-parts.
-
-Representations: `SequenceSet(String)` (`types/validated.rs`; `new_known`
-rejects `*`/`$` by `contains`); `UidSet(SequenceSet)` / `SeqSet(SequenceSet)`
-(`types/ids.rs`; constructors format strings and `expect` the validator;
-`coalesce_numbers` and `UidSet::from_ranges` are two coalescers); `UidRange`
-(`types/uid_range.rs`; public `start: u32`, `end: Option<u32>` plus two hidden
-`*_is_star` bools; `single(n)` and `range(n, n)` are distinct values for one set;
-`Default` is the invalid zero UID; `range` only debug-asserts non-zero;
-`try_range` permits reversed ranges; it carries sequence numbers too);
-`ParsedUidSet(Vec<(u32, u32)>)` (re-parses a `SequenceSet`, maps `*` to
-`u32::MAX`); `CompactUidSet { ranges: Vec<UidRange> }`
-(`account/folder_registry.rs`, the real set algebra, plus `normalized_range`,
-which exists only because `UidRange` has two spellings of one UID);
-`expand_uid_ranges` (`connection/mod.rs`, its own sort/merge/expand). The cursor
-codec (`account/envelope.rs`) encodes a single UID as an `end = 0` sentinel, and
-`InventoryPartition::Uid` is half-open `u64`.
-
-"What does a reversed range mean": decoder `uid_range` / `seq_range` swap
-(Postel); `ParsedUidSet::new` and `intersect_uid_ranges` swap;
-`CompactUidSet::from_ranges` DROPS (`end >= start` filter);
-`CompactUidSet::remove_range` swaps and clamps to 1; `expand_uid_ranges` DROPS
-("names no messages"); the cursor decoder REJECTS as schema-incompatible;
-`account/mutate.rs` and `connection/dispatch.rs` swap inline. The decoder
-normalizes first, but any `UidRange` built through `try_range` or the public
-fields can reach a consumer reversed.
-
-Proposal: one value type, `types::set::UidSet` = sorted, disjoint, maximally
-merged `RangeInclusive<Uid>` (no dual spellings, no zero, no reversed), with
-`CompactUidSet`'s algebra moved onto it; a `SeqNumSet` twin over `Seq`; a
-separate command operand `SetExpr { Set(UidSet), All, SavedResult, ..WithStar
-}` for the wire-only `*` / `$` forms. The decoder produces `UidSet`, the encoder
-renders it, the cursor serializes it, and the one conversion to the engine's
-half-open `u64` partition lives beside it.
-
 ## STR-050 - UID versus sequence number is not in the IMAP response types
 
 **Reported by:** imap-protocol.
@@ -795,53 +505,6 @@ writes the modseq cache. Its target adds `Command::UidFetch { uids: UidSet, .. }
 / `Command::Fetch { seqs: SeqSet, .. }` for STORE/COPY/MOVE/EXPUNGE/SEARCH too,
 `AppendUid { validity: UidValidity, uid: Uid }`, and `ModSeq` in every modseq
 position.
-
-## STR-051 - IMAP typed identifiers never reach their consumers
-
-**Reported by:** imap-protocol.
-
-- `ImapAtom`, `validated::ObjectId`, `GmailMessageId`, `GmailThreadId`,
-  `types::Address` and the `EnvelopeAddress -> Address` conversions are used
-  only by their own tests (hidden by the crate-root `allow(dead_code)`).
-- `Uid` / `UidValidity` / `ModSeq` reach two places (`account/targets.rs`,
-  `account/mod.rs::select_options`); everywhere else is raw:
-  `ResponseCode::UidValidity(u32)`, `AppendUid { uid_validity: u32 }`,
-  `SelectedMailbox { uid_validity: Option<u32>, uid_next: Option<u32>,
-  highest_mod_seq: Option<u64>, mailbox_id: Option<String> }`, `FetchResponse {
-  mod_seq, email_id, thread_id, gmail_msg_id }`, `FolderCursor { uidvalidity:
-  u32, modseq: u64 }`, `DecodedObjectId { uidvalidity: u32, uid: u32 }`,
-  `ModSeqCache { uidvalidity: Option<u32>, by_uid: HashMap<u32, u64> }`,
-  `Error::FetchLimit { seq: Option<u32>, uid: Option<u32> }`.
-- The PUBLISHED surface uses bare `NonZeroU32` for two swappable siblings:
-  `ImapMessageRef::new(container, uid_validity: NonZeroU32, uid: NonZeroU32)`,
-  `UidScan { uid_validity, from, through }`, `UidPage { completed_through,
-  next_from }`, `FolderObservation { uid_validity, uid_next }`,
-  `RawMessage::GenerationChanged { observed }`. Nothing stops a UID going where
-  a UIDVALIDITY goes; publishing `Uid` / `UidValidity` and retyping the fields
-  is a shape change.
-- Two typed views of one `(folder, uidvalidity, uid)` triple: `DecodedObjectId`
-  (raw `u32`) and public `ImapMessageRef` (`NonZeroU32`), the latter rebuilt
-  from the former with `expect("the id decoder rejects zero")`. One `MessageRef`
-  with typed fields would serve both.
-
-The imap-account hunter ranks this its top finding: the triple travels in at
-least seven shapes in `account/` - `DecodedObjectId`, `DecodedThreadId {
-uidvalidity: u32, uids: Vec<u32> }`, `DecodedPartHandle` (`parts.rs`),
-`SearchPosition { folder, uidvalidity: u32, key: u32 }`, `FolderEffect { uids:
-Vec<u32>, uidvalidity: u32 }`, `ImapMessageRef` (std `NonZeroU32`, a third
-numeric representation), `FolderCursor::{QResync, Condstore, Basic} {
-uidvalidity: u32, modseq: u64, uidnext: u32 }`, `RawFetchOutcome::GenerationChanged
-{ observed: u32 }`, `ModSeqCache`, `MutationKind::ConditionalFlags(FlagOp, u64)`,
-and `append_message`'s `Option<(u32, u32)>` destructured positionally in
-`draft_create` and `append_to_sent_or_fallback`. `encode_object_id(folder,
-uidvalidity: u32, uid: u32)` and `encode_thread_id` take two adjacent `u32`s every
-call site and test (`encode_object_id(&f, 7, 42)`) can swap silently. Its
-proposal: one `ImapRef { folder: MailboxName, epoch: UidValidity, uid: Uid }`
-(plus `ImapThreadRef`) owned by one codec module through which every durable IMAP
-string goes - `imap1`/`imap2` object ids, `imapthread1`/`2`, `imapsearch1`
-cursors, `imappart2`/`3` part handles, the `imapmsgid1` correlation token,
-`DraftHandle` ("an object id in a costume"), `imap-idle-N` subscription handles;
-`ImapMessageRef` a thin public wrapper over it; `FolderCursor` fields typed.
 
 ## STR-056 - Smaller IMAP protocol axes
 
@@ -913,22 +576,6 @@ behind four locks, and is the implicit (unexercised) owner of folder roles;
 making roles, ownership and the shared-error mapping explicit registry
 responsibilities (BUG-028, BUG-046) gives those decisions a home.
 
-## STR-063 - The IMAP crate error is a flat bag with per-variant side tables
-
-**Reported by:** imap-protocol.
-
-`Error` is about 30 variants with a hand-written `PartialEq` (because of
-`Arc<io::Error>`), plus `is_connection_fatal`, `attempt`, `with_attempt`,
-`response_code` as four more per-variant tables. `attempt: Option<ImapAttempt>`
-(a one-field newtype over `TransmissionState`) is optional on `No` / `Bad`
-although the docs say a tagged NO/BAD is by definition acknowledged. Proposal:
-`ServerStatus { status: No | Bad | Bye | AuthRejected, text, code }`
-(acknowledged by construction), `Transport { kind, attempt: TransmissionState
-}`, `LocalRefusal { kind }` (InvalidInput, InvalidState,
-MissingCapability(Capability), StateChangedBeforeSend, ...) and `Internal {
-mid_exchange: Option<TransmissionState> }`, making fatality and attempt state
-functions of the category.
-
 ## STR-064 - IMAP test layout mirrors the pre-split monolith
 
 **Reported by:** imap-protocol, imap-connection.
@@ -956,23 +603,6 @@ should sit with the grammar they pin (or be golden transcript tables per
 response family), which also makes the CON-032 tables testable per row. The
 `capability_matrix` oracle is a test copy of production logic and should go once
 production is exhaustive.
-
-## STR-068 - `connection/mod.rs` does seven jobs
-
-**Reported by:** imap-connection.
-
-(a) Protocol vocabulary (`TlsMode`, `TcpKeepalive`, `SessionState`, `IdleEvent`,
-`SearchResult`, `NotifyFlags`); (b) the `ImapConnection` handle, its `Drop`, and
-event draining; (c) driver-task lifetime machinery (`DriverExit`, `ExitState`,
-`DriverScope`, `LeaseHandoff`, `DriverTask`, `InFlightGuard`); (d) SELECT
-response assembly (`build_selected_mailbox`, `extract_selected_code` with
-`#[allow(clippy::too_many_arguments)]` and nine `&mut` out-params,
-`selected_mailbox_effective_responses`); (e) NOTIFY LIST heuristics
-(`is_notify_selection_mismatch`, `is_notify_list_event`); (f) ESEARCH expansion
-(`expand_uid_ranges`); (g) STORE flag filtering. (d) to (g) are consumer logic
-for `dispatch/` beside their only callers (`select.rs`, `list.rs`, `search.rs`);
-(c) belongs in `driver/`; `SessionState` and `NotifyFlags` in `types/`.
-`extract_selected_code` should be a builder (`SelectedMailboxBuilder::apply(&ResponseCode)`).
 
 ## STR-069 - Twelve `impl ImapConnection` files each restate their gates; a request layer collapses them
 
@@ -1143,29 +773,6 @@ designed with IMAP in mind (`types.md` says as much), and the bounded backfill
 lane depends on partitions, but no production crate mints a `Uid` partition.
 Related: STR-046.
 
-## STR-087 - A capability-scoped JMAP account forgets its capability
-
-**Reported by:** jmap-protocol.
-
-`Client::primary_account::<C>()` selects the account by capability and returns
-`Account<Tr>`, discarding `C`. `JmapAccount` holds `mail`, `submission`,
-`vacation`, `quota`, `sieve`, `contacts`, `calendars` and every foreign account
-as the same `MailAccount` type, so handing the mail account to a
-`CalendarEventGet` compiles and silently addresses the wrong `accountId` on a
-server whose capabilities use different primary accounts. `Request::call` knows
-`M::Cap` but uses it only to fill `using`. `Request::new` defaults to
-`Session::default_account_id`, the lowest-URI primary - documented as an open
-product decision about generic requests. Proposal: `Account<C, Tr>` (or
-`CapAccount<C>`), with `call<M: JmapMethod<Cap = C>>` or a `ServedBy<C>` bound for
-methods any account serves (`Blob/copy`, core); with every request built from a
-capability-scoped account, the generic default-account fallback has no caller and
-the open question dissolves.
-
-A partial migration was refused (it would break sync or leave the untyped door
-open): completing this needs capability-typed sync fields, factory and helper
-signatures, and checked cross-capability views for foreign submission and core
-methods. A wave of one owning both halves of `crates/jmap`.
-
 ## STR-091 - Delete JMAP's `HttpTransport` generic; it is a test seam above `AccountNet`
 
 **Reported by:** jmap-protocol (its top-ranked move; "the largest single simplification available in the crate").
@@ -1236,23 +843,21 @@ they pin; the agreement tables go when their duplication goes.
 
 **Reported by:** jmap-account (its dominant missing owner; the hunter recommends a rewrite of the account layer's internal plumbing rather than local fixes).
 
-`JmapAccount` has twenty-five fields and a twenty-one-argument positional
-constructor (`#[allow(clippy::too_many_arguments)]`) that tests call with
-`HashMap::new()` five times in a row. The per-JMAP-account facts are spread across
-six maps keyed by bare `String` ids (`foreign_mail`, `foreign_submission`,
-`seed_states`, `email_states`, `mailbox_states`, `PushRouting::foreign_scopes`),
-built at open in `factory.rs` (`SeededOpenState`, `apply_foreign_seed`) and
-re-joined by every door. Trait methods are mostly one-line forwards passing
-`(handle.clone(), Arc::clone(&self.email_states), handle.id_str().to_string())`
-into a free function - about twenty-five such call sites in `account.rs`. Nothing
-stops a door pairing one handle with another account's state key. Proposal:
-`Registry { primary: Slot, shared: BTreeMap<JmapAccountId, Slot> }` plus
-`registry.route(&JmapRef) -> Route` (STR-002). `Slot` owns `handle`, `limits`
-(CON-045), `email_state: StateCell` (BUG-068), `families` (submission, vacation,
-... per slot, making shared-account submission an ordinary slot bit instead of
-`foreign_submission: HashSet<String>`), and its `JmapScope` (STR-098).
-`PushRouting` becomes a view of the registry rather than a second copy built from
-`seed_states`. Doors take `&Slot` or `Route` and nothing else.
+The core landed: `sync/registry.rs` holds `Registry { primary, accounts }` of
+`Slot`s, each owning its handle, limits, state cell, scopes and submission bit,
+with `Registry::route` / `Route` as the one owner lookup. What remains:
+
+- `LifecycleTopology` (`discover.rs`, consumed in `account.rs` and `factory.rs`)
+  is still keyed by bare strings rather than by registry slot.
+- The optional families (submission, vacation, quota, sieve, contacts,
+  calendars) live once on `Registry::families`, not per slot, so a shared
+  account's family handles are not ordinary slot facts.
+- About ten `foreign::owner_of` declared-owner reads remain, mostly in
+  `pim.rs` plus `mutation.rs`; each should become `JmapRef::parse(..).owner`
+  against `registry.route`.
+- No mint site checks that a server-minted native id does not itself contain
+  the `\u{1f}` separator; a non-conformant id containing it would silently
+  route as foreign.
 
 ## STR-102 - JMAP refusals reach callers as prose
 
@@ -1292,29 +897,6 @@ duration parsing (BUG-060) and time classification; the conversion half is a pur
 mapping module, and the parts restating shared-vocabulary rules (window overlap,
 recurrence validation) belong in `bifrost-types` (BUG-001). Same question for IMAP:
 STR-079.
-
-## STR-115 - `GraphAccount` is a bag of about twenty-five shared fields with no owners
-
-**Reported by:** graph (the hunter says this is where concentrating invariants pays most, given the standing lesson that teardown and lifetime fixes move holes).
-
-`account/mod.rs` holds the primary and shared clients; capabilities and the push
-mode and endpoint; the push lease, push tasks, two topology watches,
-`pending_gaps`, the EWS ledger, two subscription maps and the recreated-id ledger;
-the cursor index, folder tree, etag index and trash cache; the public-folder state
-(routing map, metadata, item classes, scope); the user email, folder seed and
-shutdown token. The behaviour is free functions in other files reaching into the
-fields: `webhook.rs` locks `graph_subscriptions`, `recreated_subscription_ids` and
-`graph_topology` by hand, and documents lock-ordering invariants in prose ("Every
-write and the teardown snapshot happen under the `graph_subscriptions` write
-lock"). The real components: `MailboxRouter` (primary and shared clients,
-`client_for_*`, `budget_for_*`, `owner_of_scope`, the identity of BUG-077);
-`PublicFolders` (`routing_map`, `public_folder_meta`, `public_item_classes`, the
-public-folder scope, the resolver of BUG-079); `WebhookRegistry` (groups, the
-recreated-id ledger, the topology watch, pending gaps, teardown and renewal as
-methods owning their locks); `EwsRegistry` (subscriptions, topology watch, release
-ledger); `EtagIndex` (BUG-076's API) and the trash cache. `GraphAccount` composes
-them, and invariants stated in comments become private to the type holding the
-lock. The JMAP twin is STR-097.
 
 ## STR-118 - Graph test layout mirrors the order the code was written
 
@@ -1359,47 +941,6 @@ arbitrary provider state, and `AccountNet` exposes no Net-owned slot for it. The
 move needs a Net-scoped provider-state store (a typed, keyed slot owned by the
 `Net` and reachable through `AccountNet`) first; the registry site records this.
 
-## STR-135 - bifrost-sasl should own the SASL client, not only the arithmetic
-
-**Reported by:** smtp-sasl.
-
-The crate's stated scope - "computation-only: no I/O, no async, no protocol command
-flow" - is right, but drawn too close to the math: a SASL client exchange (initial
-response, step on a challenge, verify, done) is itself pure, protocol-neutral
-computation. Because sasl stops at `scram_client_final`, every consumer
-reimplements the client around it (BUG-030, BUG-100 to BUG-102), and the crate's
-docs carry rules for its consumers ("a PLUS consumer MUST build client-first from
-this, or the desync this type prevents re-enters at the consumer boundary"). The
-SCRAM exchange is written twice: SMTP `ScramExchange` ("Mirrors IMAP's
-`AuthenticateScramConsumer`") and IMAP `AuthenticateScramConsumer` each hold
-`client_nonce`, `client_first_bare`, `binding`, the prepared password,
-`expected_server_signature` and a three-or-four-state enum, each formats
-`n={user},r={nonce}`, prefixes the GS2 header, calls `scram_client_final`, stores the
-signature and calls `verify_server_final`. LOGIN and OAuth are stateless encoders
-pretending: `Mechanism::response_with_token_at_index(credentials, challenge,
-challenge_index: usize, oauth_token: Option<&str>)` drives LOGIN's username-then-password
-by an index the connection loop must count correctly (the comment warns it must not
-derive from the remaining-challenge budget), and the OAuth `None` token is a "driver
-bug" error at runtime (`oauth_identity_and_token`). Target surface: `Mechanism`
-(shared vocabulary, names, `from_advertised`, credential exposure);
-`negotiate(advertised, policy, encrypted, binding) -> Ladder` with typed skips
-(absorbing `select_scram_rung`, both ladders, the cleartext gate); a `SaslClient`
-per mechanism (`Plain`, `Login`, `CramMd5`, `XOAuth2`, `OAuthBearer`, `Scram { hash,
-binding }`) with `initial_response()` and `step(challenge) -> Step { Reply(Secret),
-Done }`, owning nonce, GS2 header, client-first-bare, expected signature, OAuth
-error-continuation answer and LOGIN position, so "OAuth mechanism without a token"
-cannot be constructed; `ChannelBindingData` + `binding_from_peer_certificate`
-(STR-134); typed `SaslError` (STR-133) with one `refusal_class()`. What stays in IMAP
-and SMTP: framing (`AUTHENTICATE` + `+` vs `AUTH` + `334`, SASL-IR, base64 line
-framing), the `235 v=...` field quirk, capability snapshots, deadlines; ManageSieve
-becomes a third thin framing layer and gets OAUTHBEARER and SCRAM for free. Lateral:
-bifrost-sasl is described as private and "not public", but it is in the
-`install-shape` published set and its `Secret` appears in IMAP's and SMTP's
-internals, so the "private" framing will mislead if it ever becomes a public type of
-a published crate; and `strip_frame_delim` in `oauth.rs` silently rewrites a
-credential containing `\x01` rather than refusing it (to keep the builders
-infallible) - behind a fallible `SaslClient`, refusing is free and honest.
-
 ## STR-138 - Smaller SMTP axes and placement notes
 
 **Reported by:** smtp-sasl.
@@ -1414,53 +955,14 @@ exist yet. (The rest of `authentication.rs` moving to bifrost-sasl is STR-135.)
 
 **Reported by:** smtp-sasl.
 
-`client/core.rs` is a deliberate sans-IO design for the transaction
-(MAIL/RCPT/DATA/BDAT/RSET/LMTP drain). Its header lists what it leaves to the
-adapters: "connecting, the greeting and EHLO/LHLO exchange, the AUTH ladder, the
-STARTTLS upgrade, reply-line reading and parsing ...". Everything on that list
-except connecting and deadlines is protocol, and each is written twice: AUTH
-(`SmtpConnection::auth` / `auth_scram` / `auth_legacy` / `verify_scram_server_final` /
-`write_auth_continuation` and the async versions, including the `334`-vs-`235`
-server-final branch, the ten-challenge loop, and `decode_scram_payload`'s
-enhanced-code skip); reply framing (line cap, total cap, UTF-8 check,
-unsolicited-reply check, `nom` incomplete handling, "incomplete response" on EOF, in
-`read_response_until` and its async twin); STARTTLS (the "unsolicited reply before
-the STARTTLS upgrade" refusal); and the `try_smtp!` macro ("mirrors the sync
-sibling"). The blocking and async connection files carry parallel suites with the
-same test names (`starttls_downgrade_is_refused_without_a_wire_command`,
-`starttls_refuses_plaintext_bytes_buffered_after_the_reply`, ...), so a rule is
-pinned twice and can drift once. Proposal: extend `Op` / `OpOutcome` /
-`ProtocolMachine` to a session machine (`Greeting -> Hello -> (StartTls -> Hello)? ->
-Auth(ladder) -> Ready`, with `Op::UpgradeTls` and `Op::ResolveToken` - the one place
-blocking and async genuinely differ: async awaits `current()`, blocking takes
-`snapshot()`), plus a sans-IO `ReplyAssembler` fed lines; both adapters shrink to
-read-a-line / write-bytes / upgrade / deadline, and one transcript-driven
-conformance suite runs every scenario through both. Side note: EOF mid-reply is
-reported by both readers as `error::parse("incomplete response")` - a provider
-contract violation - for what is a connection closing under us; a transport drop
-with InFlight evidence is the truthful class.
-
-## STR-140 - Four SMTP protocol machines for one transaction
-
-**Reported by:** smtp-sasl.
-
-`DirectSmtp`, `DirectLmtp`, `BatchSmtp`, `BatchLmtp` share a skeleton (`Writing`,
-`MailReply`, `RcptReply`, `WindowWritten`, `WindowOpened`, `MailWindowReply`,
-`RcptWindowReply`, `WindowClosing`, `DataReply`, `BodyWritten`, `FinalReply` /
-`FinalStatus`) and each re-decides what a negative MAIL FROM, a negative RCPT, a
-421 and a write failure mean. It has already drifted: `DirectLmtp`'s MAIL FROM arm
-carries the comment "Aborting here cost one reconnect per rejected envelope ... and
-made the direct LMTP path differ from both `DirectSmtp` and `BatchLmtp`", and
-`closing_channel` exists because "the end-of-data arms had it and the envelope arms
-did not". Capability asymmetries fall out of the split rather than design:
-`DirectLmtp` and `BatchLmtp` never pipeline; the batch API has no BDAT
-(`build_batch` passes `allow_binary_mime = false`, `BatchSmtp` has no `BodyKind`);
-`PhasedError`'s "cannot ship undecorated" guarantee applies to `DirectSmtp` only
-while `DirectLmtp` uses `or_phase`. Proposal: one machine, generic over a dialect
-(SMTP: one final reply for all accepted; LMTP: one per accepted; STR-132) and a
-recipient policy (`FailFast` - RSET on the first rejection - vs `PerRecipient`),
-always recording into `SendProgress` (BUG-105); the four public result shapes become
-projections, and CON-057's disagreement becomes an explicit policy parameter.
+The session machine, the shared `ReplyAssembler` (`client/reply.rs`, EOF now a
+transport loss), and the transcript-driven `client/conformance.rs` suite have
+landed. What remains: the send-path transcript suites are still twinned across
+`client/connection.rs` and `client/async_connection.rs` (for example
+`a_421_data_final_reply_aborts_instead_of_parking_a_dying_connection` and
+`a_421_data_final_reply_aborts_the_batch_connection_too` exist in both), so a
+send rule is still pinned twice and can drift once. Move them into the
+conformance suite, run through both adapters.
 
 ## STR-141 - The SMTP 2x2 product at the public surface, and a Lettre-vestige executor that owns dialing
 
@@ -1487,80 +989,26 @@ dropping the `E` parameter needs the owner. `ConnectionOptions` exists "keeping 
 dial signature stable across features" - a symptom of the parameter list living in
 the wrong place.
 
-## STR-146 - URLs travel as `String` through every net and DAV layer
-
-**Reported by:** net-dav.
-
-`RequestBuilderInner.url` (re-parsed for the host on every hop and again for
-redirect classification), `redirect_guard: Fn(&str, &str)`,
-`RedirectStep.next_url: String`, `DavRequest.url`, `DavResponse.url` and
-`DavBody.url`, `DavDispatch::trusted_origins: Vec<String>` and `base_url: String`,
-and every DAV native id. `reqwest::Url` is already a dependency; with an `Origin` and
-a `DavHref` on top (BUG-112), several of the CON-060 and BUG-112 disagreements become
-unrepresentable. Related: CON-047.
-
-## STR-151 - bifrost-net needs a public exchange core; `send_streaming_inner` does five jobs
-
-**Reported by:** net-dav (one of its two "substantial rewrite" verdicts).
-
-`send_streaming_inner` runs about 580 lines and builds `InternalStreaming` in four
-places. The hop state is a dozen `let mut` locals rewritten by hand in the redirect
-arm: method, url, body, headers, host, quota scope, cost, cost units,
-`auth_for_next_hop`, `carrying_auth` and `auth_self_stripped` - exactly the state DAV
-rebuilds as `DavRequest` plus its own flags. Today DAV cannot use net's redirect
-walk, 401 recovery, deadline or attempt evidence, so it re-implements all four, and
-the copies already disagree (BUG-110, CON-060). Proposed split: a `Hop` with
-`follow(step)`, `rate_key()` and `credential()`; the `AttemptLedger` (BUG-110); a
-public `RequestDeadline`; a pass-through outcome constructor; plus the per-hop policy
-trait of CON-060 (credential minting, method-rewrite mode, header rewrite, target
-guard) - one hop state, one attempt ledger, one deadline. A related missing mode
-(STR-154) completes it.
-
 ## STR-152 - bifrost-dav-core is half a consolidation; the account layer is still mirrored in caldav and carddav
 
 **Reported by:** net-dav (its other "substantial rewrite" verdict).
 
-dav-core owns the dispatcher, the 207 machine and the snapshot codec. Still
-duplicated line for line, with "twin of" or "must stay in step" comments - in
-`client.rs`: `MULTIGET_BATCH_SIZE` and `MULTIGET_LEG_CONCURRENCY`; `fetch_events` /
-`fetch_vcards` (chunking, body building, buffered fan-out, the `worse_recovery`
-fold); `accumulate_leg`, `run_leg`, `MultigetLeg` and `MultigetFetch::settle`;
-`href_query_leg` and `HrefLeg`; the per-property text-search fan-out with the
-`FilterUnsupported` degrade; `multiget_failure`, `listing_failure` and
-`complete_failure_error`; `QUERY_HREF_PROPS`; six error-constructor shims. In
-`account.rs`: `RelocateFailure` and `relocation_error` (byte-identical apart from the
-scope constructor); `relocate_*` (MOVE, with copy-then-delete fallback);
-`put_condition` and `resource_file_name`; `worse_recovery_option`; the cursor
-wrappers (`cursor_from_snapshot`, `encode_cursor_snapshot`, `decode_cursor_snapshot`,
-`cursor_error`, the diff and preserve wrappers); `validate_*_scope`,
-`collection_url_for_scope`, `scope_collection_url`, `collection_coverage_domain`,
-`default_collection_url`, `discovered_collection_urls`; `skipped_*_scope`,
-`one_outcome_per_id`, `decode_*_page_cursor`; `*_PAGE_SIZE = 250`; about sixty mail,
-compose, filter and settings `Unsupported` stubs per crate; `unsupported_future` and
-`unsupported_stream`. The two `client.rs` test modules re-test dav-core's dispatcher
-under the same names in both crates (credential origin, cross-origin redirect, hop
-count, plaintext home, the discovery fallbacks, the multiget concurrency bound).
-Proposal: (1) turn `DavProtocol` into a `Dialect` trait carrying what genuinely
-differs - multiget element and namespace, data property, file extension, item
-`ErrorScope` and `ResourceKind` (BUG-115), cursor magic, token kind (sync-token or
-ctag), listing and multiget parsers, the typed item; (2) move a generic
-`DavCollectionAccount<D: Dialect>` kernel into dav-core - snapshot polling, inventory,
-changes (with a dialect hook so CalDAV can use `sync-collection`), paging,
-relocation, conditional CRUD, the unsupported lanes; (3) CalDAV keeps iCalendar,
-scheduling, recurrence ids and `sync-collection`, CardDAV keeps vCard, the directory
-guard and the ctag lane; (4) the mirrored tests move into dav-core, parameterized over
-both dialects - the dispatcher move applied one layer up.
+Steps (1) to (3) landed: a `Dialect` trait (`caldav/src/dialect.rs`,
+`carddav/src/dialect.rs`), the generic collection kernel
+(`dav-core/src/collection.rs`, `collection_account.rs`) and the shared
+`Unsupported` lanes (`dav-core/src/unsupported.rs`). What remains:
 
-## STR-154 - bifrost-net forces consumers to rebuild responses it already turned into errors
-
-**Reported by:** net-dav.
-
-Net turns every 4xx and 5xx into `Err`. DAV, Graph (`graph_envelope_evidence`) and
-Google (308 handling, `UnexpectedResponse`) all need some statuses as data. DAV's
-`wire_outcome` therefore unwraps `AttemptHistory.terminal()` to rebuild a response,
-special-cases 501 inside `RetryBudgetExhausted` for the MOVE fallback, and carries
-its private refusal list (BUG-110). Proposal: a per-request `statuses_as_data(set)`
-mode returning `Ok(Response)` for the listed statuses with the ledger attached;
-classifying the response is then the caller's call against the shared ladder
-(BUG-072).
+- The two `client.rs` test modules still re-test dav-core's dispatcher under the
+  same names in both crates (credential origin, cross-origin redirect, hop count,
+  plaintext home, the discovery fallbacks, the multiget concurrency bound). They
+  should move into dav-core, parameterized over both dialects.
+- Small twins survive: `one_outcome_per_id` in both `account.rs` files, although
+  `dav-core::collection_account::one_outcome_per_id` now exists, and
+  `multiget_failure` / `listing_failure` in both `client.rs` files.
+- bifrost-net now has a pass-through exchange mode (`RequestBuilder::
+  statuses_as_data`), but DAV does not use it: `wire_outcome` still rebuilds the
+  response from `AttemptHistory`, special-cases 501 for the MOVE fallback, and
+  keeps its private refusal list. Moving DAV onto `statuses_as_data` (and onto
+  net's redirect walk, 401 recovery, deadline and attempt evidence) is the
+  residue of the net exchange-core work.
 

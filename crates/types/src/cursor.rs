@@ -6,7 +6,10 @@
 //! between an engine that can multiplex four protocols and one that
 //! pretends one of them does not exist.
 
-use crate::ids::{FolderId, LabelId, MailboxId, QueryId};
+mod topology;
+pub use topology::{RemovalProjection, ScopeShapes};
+
+use crate::ids::{FolderId, LabelId, MailboxId, PrincipalId, QueryId};
 
 /// Protocol-owned payload layout. Deliberately distinct from the trait envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -75,7 +78,7 @@ pub enum CursorScope {
     },
 }
 
-/// Container an object lives in.
+/// Container membership or ownership annotation carried by an object.
 ///
 /// Distinct from `CursorScope` because a single message can sit in many
 /// labels or mailboxes simultaneously even when the change cursor for
@@ -86,6 +89,8 @@ pub enum MembershipScope {
     Folder(FolderId),
     Label(LabelId),
     Mailbox(MailboxId),
+    /// Ownership annotation, never a container or lifecycle cursor identity.
+    Owner(PrincipalId),
     Query(QueryId),
 }
 

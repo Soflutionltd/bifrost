@@ -91,11 +91,7 @@ fn folder_preflight_err<'a>(
     folder: &'a MailboxName,
     op: AccountOperation,
 ) -> impl Fn(Error) -> AccountError + Copy + 'a {
-    move |error| {
-        folder_err(account, folder, op)(
-            error.with_attempt(bifrost_types::TransmissionState::Unsent),
-        )
-    }
+    move |error| folder_err(account, folder, op)(error.for_unsent_operation())
 }
 
 /// Memory budget for the one-shot full-message `BODY[]` fetch in
@@ -112,8 +108,8 @@ pub(crate) const PREVIEW_FETCH_BYTES: u64 = 64 * 1024;
 /// One per-folder effect a direct PIM write committed.
 struct FolderEffect {
     folder: MailboxName,
-    uids: Vec<u32>,
-    uidvalidity: u32,
+    uids: super::UidSet,
+    uidvalidity: crate::types::UidValidity,
     effect: StepEffect,
     destination: Option<MailboxName>,
 }
@@ -144,7 +140,7 @@ impl From<AccountError> for FolderProgress {
 fn folder_effect_targets(effect: &FolderEffect) -> StepTargets {
     let mut refs: Vec<_> = effect
         .uids
-        .iter()
+        .identifiers()
         .map(|uid| {
             TargetRef::new(
                 if effect.destination.is_some() {
@@ -153,7 +149,7 @@ fn folder_effect_targets(effect: &FolderEffect) -> StepTargets {
                     TargetRole::Subject
                 },
                 ErrorScope::Message {
-                    id: encode_object_id(&effect.folder, effect.uidvalidity, *uid),
+                    id: encode_object_id(&effect.folder, effect.uidvalidity, uid),
                 },
             )
         })
@@ -476,7 +472,11 @@ pub(crate) fn draft_create(
             .append_message(&folder, message, account.command_timeout())
             .await
             .map_err(err)?;
-        let Some((uidvalidity, uid)) = appended else {
+        let Some(crate::types::AppendUid {
+            validity: uidvalidity,
+            uid,
+        }) = appended
+        else {
             return Err(super::error::unsupported(AccountOperation::DraftCreate));
         };
         Ok(DraftHandle(encode_object_id(&folder, uidvalidity, uid).0))
@@ -760,7 +760,10 @@ pub(super) async fn append_to_sent_or_fallback(
         .append_message(&sent, message, account.command_timeout())
         .await
     {
-        Ok(Some((uidvalidity, uid))) => {
+        Ok(Some(crate::types::AppendUid {
+            validity: uidvalidity,
+            uid,
+        })) => {
             let id = encode_object_id(&sent, uidvalidity, uid);
             SendReceipt::new(id.clone(), SentCopy::Filed { id: Some(id) })
         }
@@ -815,7 +818,7 @@ async fn fetch_full_message(
         .select_folder(&mut conn, &decoded.folder, super::SelectPurpose::Read)
         .await
         .map_err(err)?;
-    let operand = pim_operand([decoded.uid], AccountOperation::DraftSend)?;
+    let operand = pim_operand([decoded.uid.get()], AccountOperation::DraftSend)?;
     let uids = operand
         .uid_set()
         .ok_or_else(|| pim_malformed(AccountOperation::DraftSend, "draft object id has no UID"))?;
@@ -826,7 +829,7 @@ async fn fetch_full_message(
         .map_err(err)?;
     responses
         .into_iter()
-        .filter(|fetch| fetch.uid == Some(decoded.uid))
+        .filter(|fetch| fetch.uid == Some(decoded.uid.get()))
         .reduce(|mut held, later| {
             super::get::merge_fetch_response(&mut held, later);
             held
@@ -1141,7 +1144,7 @@ pub(crate) fn search(
                 }
             }
             pager.accept(&folder, uidvalidity, threads, |uids| {
-                encode_thread_id(&folder, uidvalidity, &uids)
+                encode_thread_id(&folder, uidvalidity, &super::UidSet::from_numbers(uids))
             })?;
         }
         Ok(pager.finish())
@@ -1185,7 +1188,11 @@ pub(crate) fn search_messages(
                 .map_err(err)?;
             let uids = result.ids.into_iter().map(|uid| (uid, uid)).collect();
             pager.accept(&folder, uidvalidity, uids, |uid| {
-                encode_object_id(&folder, uidvalidity, uid)
+                encode_object_id(
+                    &folder,
+                    uidvalidity,
+                    crate::types::Uid::new(uid).expect("wire UID is nonzero"),
+                )
             })?;
         }
         Ok(pager.finish())
@@ -1505,7 +1512,11 @@ pub(crate) fn message_hydrate(
         // The answer then carries the id as submitted (a legacy `imap1` or
         // non-canonical spelling included), so the caller gets back the key
         // it asked under, matching the batch hydration lane.
-        let wanted = encode_object_id(&decoded.folder, decoded.uidvalidity, decoded.uid);
+        let wanted = encode_object_id(
+            &decoded.folder,
+            decoded.uidvalidity,
+            crate::types::Uid::new(decoded.uid.get()).expect("wire UID is nonzero"),
+        );
         let messages = hydrate_decoded(
             &account,
             vec![decoded],
@@ -1789,7 +1800,7 @@ async fn result_mutation(
             for (epoch, uids) in &marked_deleted {
                 done.push(FolderEffect {
                     folder: folder.clone(),
-                    uids: uids.clone(),
+                    uids: super::UidSet::from_numbers(uids.iter().copied()),
                     uidvalidity: *epoch,
                     effect: StepEffect::MarkedDeleted,
                     destination: None,
@@ -1812,7 +1823,7 @@ async fn result_mutation(
                     .expect("engine answers under submitted identity");
                 let expunge_failed = marked_deleted
                     .iter()
-                    .any(|(epoch, uids)| *epoch == id.uidvalidity && uids.contains(&id.uid));
+                    .any(|(epoch, uids)| *epoch == id.uidvalidity && uids.contains(&id.uid.get()));
                 let stage = if expunge_failed {
                     Some(StepEffect::Deleted)
                 } else if matches!(
@@ -1833,7 +1844,7 @@ async fn result_mutation(
                 };
                 let targets = folder_effect_targets(&FolderEffect {
                     folder: folder.clone(),
-                    uids: vec![id.uid],
+                    uids: super::UidSet::from_uids([id.uid]),
                     uidvalidity: id.uidvalidity,
                     effect,
                     destination: destination.clone(),
@@ -1852,18 +1863,19 @@ async fn result_mutation(
             }
             // Preserve the selected epoch and aggregate one committed effect
             // per epoch/window, including successes beside a MODIFIED refusal.
-            let mut epochs: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+            let mut epochs: std::collections::BTreeMap<crate::types::UidValidity, Vec<u32>> =
+                Default::default();
             for item in succeeded {
                 let id = window
                     .iter()
                     .find(|id| id.id.0 == item.0)
                     .expect("engine answers under submitted identity");
-                epochs.entry(id.uidvalidity).or_default().push(id.uid);
+                epochs.entry(id.uidvalidity).or_default().push(id.uid.get());
             }
             for (uidvalidity, uids) in epochs {
                 done.push(FolderEffect {
                     folder: folder.clone(),
-                    uids,
+                    uids: super::UidSet::from_numbers(uids),
                     uidvalidity,
                     effect,
                     destination: destination.clone(),
@@ -1995,7 +2007,7 @@ async fn resolve_thread_members(
         let decoded = decode_thread_id(thread, op)?;
         return Ok(decoded
             .uids
-            .into_iter()
+            .identifiers()
             .map(|uid| DecodedObjectId::canonical(decoded.folder.clone(), decoded.uidvalidity, uid))
             .collect());
     };
@@ -2017,10 +2029,13 @@ async fn resolve_thread_members(
             .await
             .map_err(preflight)?
             .ids;
-        members.extend(
-            uids.into_iter()
-                .map(|uid| DecodedObjectId::canonical(folder.clone(), uidvalidity, uid)),
-        );
+        members.extend(uids.into_iter().map(|uid| {
+            DecodedObjectId::canonical(
+                folder.clone(),
+                uidvalidity,
+                crate::types::Uid::new(uid).expect("wire UID is nonzero"),
+            )
+        }));
     }
     Ok(members)
 }
@@ -2047,7 +2062,7 @@ fn decoded_targets(
             let decoded = decode_thread_id(thread, op)?;
             Ok(decoded
                 .uids
-                .into_iter()
+                .identifiers()
                 .map(|uid| {
                     DecodedObjectId::canonical(decoded.folder.clone(), decoded.uidvalidity, uid)
                 })
@@ -2096,7 +2111,7 @@ fn pim_operand<I: IntoIterator<Item = u32>>(
 
 fn valid_uids(
     ids: Vec<DecodedObjectId>,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     op: AccountOperation,
 ) -> Result<Vec<u32>, AccountError> {
     let mut uids = Vec::new();
@@ -2109,7 +2124,7 @@ fn valid_uids(
                 "UIDVALIDITY changed before IMAP operation",
             ));
         }
-        uids.push(id.uid);
+        uids.push(id.uid.get());
     }
     Ok(uids)
 }
@@ -2451,8 +2466,8 @@ const SEARCH_CURSOR_PREFIX: &str = "imapsearch1:";
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SearchPosition {
     folder: MailboxName,
-    uidvalidity: u32,
-    key: u32,
+    uidvalidity: crate::types::UidValidity,
+    key: crate::types::Uid,
 }
 
 impl SearchPosition {
@@ -2470,7 +2485,7 @@ impl SearchPosition {
             .ok_or_else(invalid)?;
         let decoded = decode_object_id(&ObjectId(payload.to_owned()), op).map_err(|_| invalid())?;
         Ok(Self {
-            folder: decoded.folder,
+            folder: decoded.folder.clone(),
             uidvalidity: decoded.uidvalidity,
             key: decoded.uid,
         })
@@ -2560,8 +2575,8 @@ impl<T> SearchPager<T> {
     fn check_epoch(
         &self,
         folder: &MailboxName,
-        uidvalidity: u32,
-    ) -> Result<Option<u32>, AccountError> {
+        uidvalidity: crate::types::UidValidity,
+    ) -> Result<Option<crate::types::Uid>, AccountError> {
         match &self.resume {
             Some(resume) if folder.cmp_account_order(&resume.folder).is_eq() => {
                 if resume.uidvalidity != uidvalidity {
@@ -2577,7 +2592,7 @@ impl<T> SearchPager<T> {
     fn accept<K>(
         &mut self,
         folder: &MailboxName,
-        uidvalidity: u32,
+        uidvalidity: crate::types::UidValidity,
         mut entries: Vec<(u32, K)>,
         mint: impl Fn(K) -> T,
     ) -> Result<(), AccountError> {
@@ -2588,13 +2603,14 @@ impl<T> SearchPager<T> {
             if self.is_full() {
                 break;
             }
-            if floor.is_some_and(|floor| key <= floor) {
+            if floor.is_some_and(|floor| key <= floor.get()) {
                 continue;
             }
             let position = SearchPosition {
                 folder: folder.clone(),
                 uidvalidity,
-                key,
+                key: crate::types::Uid::new(key)
+                    .ok_or_else(|| pim_malformed(self.op, "zero search position"))?,
             };
             self.collected.push((position, mint(entry)));
         }
@@ -2862,7 +2878,7 @@ fn attrs_for_hydration(projection: HydrationProjection) -> Vec<FetchAttr> {
 
 fn fetch_to_message(
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     mut fetch: crate::types::FetchResponse,
     projection: HydrationProjection,
 ) -> Option<Message> {
@@ -2902,7 +2918,7 @@ fn fetch_to_message(
         Importance::Normal
     };
     Some(Message {
-        id: encode_object_id(folder, uidvalidity, uid),
+        id: encode_object_id(folder, uidvalidity, crate::types::Uid::new(uid)?),
         thread_id: super::envelope::encode_server_thread_id(
             fetch.thread_id.as_deref(),
             fetch.gmail_thread_id,
@@ -2989,11 +3005,10 @@ fn is_incomplete_defect(defect: &Defect) -> bool {
 fn addresses(addresses: &[crate::types::EnvelopeAddress]) -> Vec<Address> {
     addresses
         .iter()
-        .filter_map(|addr| {
-            addr.email().map(|address| Address {
-                name: addr.name.clone(),
-                address,
-            })
+        .filter_map(crate::types::EnvelopeAddress::to_message_address)
+        .map(|addr| Address {
+            name: addr.name,
+            address: addr.email,
         })
         .collect()
 }
@@ -3104,7 +3119,7 @@ mod tests {
             vec![personal],
             vec![SharedFolderEntry {
                 info: shared,
-                owner: bifrost_types::MailboxId("alice".to_owned()),
+                owner: bifrost_types::PrincipalId("alice".to_owned()),
                 rights: rights.map(MailboxRights::parse),
                 namespace_prefix: "Shared/".to_owned(),
             }],
@@ -3167,10 +3182,10 @@ mod tests {
         let err = valid_uids(
             vec![DecodedObjectId::canonical(
                 MailboxName::new("INBOX").expect("valid mailbox"),
-                2,
-                5,
+                crate::types::UidValidity::new(2).expect("nonzero epoch"),
+                crate::types::Uid::new(5).expect("valid protocol test value"),
             )],
-            3,
+            crate::types::UidValidity::new(3).expect("valid protocol test value"),
             AccountOperation::BulkDestroy,
         )
         .expect_err("a UIDVALIDITY change is refused");
@@ -3265,7 +3280,7 @@ mod tests {
         assert_eq!(container.namespace, ContainerNamespace::Shared);
         assert_eq!(
             container.owner,
-            Some(bifrost_types::MailboxId("alice".to_owned()))
+            Some(bifrost_types::PrincipalId("alice".to_owned()))
         );
         // IMAP's owner-local id is the full path: it is already the native
         // id in the owner's namespace, and it matches the cursor-scope
@@ -3310,7 +3325,7 @@ mod tests {
                     delimiter: Some('/'),
                     ..Default::default()
                 },
-                owner: bifrost_types::MailboxId("alice".to_owned()),
+                owner: bifrost_types::PrincipalId("alice".to_owned()),
                 rights: Some(MailboxRights::parse("lr")),
                 namespace_prefix: "Shared/".to_owned(),
             }],
@@ -3390,7 +3405,7 @@ mod tests {
     #[test]
     fn send_as_rejected_unsupported() {
         let mut request = SendRequest::default();
-        request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
+        request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::PrincipalId(
             "shared@contoso.com".to_string(),
         )));
         let err = send_as_guard(&request).expect("send_as request must be rejected");
@@ -3813,7 +3828,7 @@ body text\r\n";
     fn quota_fallback_uses_only_personal_selectable_folders() {
         let mut shared = role_entry("A-shared", Some('/'), Vec::new());
         std::sync::Arc::get_mut(&mut shared).unwrap().shared_owner =
-            Some(bifrost_types::MailboxId("colleague".into()));
+            Some(bifrost_types::PrincipalId("colleague".into()));
         assert!(first_selectable_folder(vec![std::sync::Arc::clone(&shared)]).is_none());
         assert_eq!(
             first_selectable_folder(vec![
@@ -3958,9 +3973,12 @@ body text\r\n";
                 .find(|(name, _, _)| *name == folder.as_str())
                 .unwrap();
             let entries = uids.iter().map(|uid| (*uid, *uid)).collect();
-            pager.accept(&folder, *uidvalidity, entries, |uid| {
-                (folder.as_str().to_owned(), uid)
-            })?;
+            pager.accept(
+                &folder,
+                crate::types::UidValidity::new(*uidvalidity).unwrap(),
+                entries,
+                |uid| (folder.as_str().to_owned(), uid),
+            )?;
         }
         Ok(pager.finish())
     }
@@ -4074,13 +4092,21 @@ body text\r\n";
     fn the_search_cursor_encoding_is_frozen() {
         let position = SearchPosition {
             folder: MailboxName::new("INBOX").unwrap(),
-            uidvalidity: 7,
-            key: 9,
+            uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            key: crate::types::Uid::new(9).expect("valid protocol test value"),
         };
         let bytes = position.encode();
         assert_eq!(
             String::from_utf8(bytes.clone()).unwrap(),
-            format!("imapsearch1:{}", encode_object_id(&position.folder, 7, 9).0)
+            format!(
+                "imapsearch1:{}",
+                encode_object_id(
+                    &position.folder,
+                    crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                    crate::types::Uid::new(9).expect("valid protocol test value")
+                )
+                .0
+            )
         );
         assert_eq!(
             SearchPosition::decode(&bytes, AccountOperation::Search).unwrap(),
@@ -4455,8 +4481,13 @@ body text\r\n";
             ..Default::default()
         };
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let message =
-            fetch_to_message(&folder, 9, with, HydrationProjection::Headers).expect("uid present");
+        let message = fetch_to_message(
+            &folder,
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            with,
+            HydrationProjection::Headers,
+        )
+        .expect("uid present");
         assert_eq!(message.importance, Importance::High);
         assert_eq!(message.containers, vec![ContainerId("INBOX".to_owned())]);
         assert!(
@@ -4468,8 +4499,13 @@ body text\r\n";
             uid: Some(2),
             ..Default::default()
         };
-        let message = fetch_to_message(&folder, 9, without, HydrationProjection::Headers)
-            .expect("uid present");
+        let message = fetch_to_message(
+            &folder,
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            without,
+            HydrationProjection::Headers,
+        )
+        .expect("uid present");
         assert_eq!(message.importance, Importance::Normal);
     }
 
@@ -4485,8 +4521,13 @@ body text\r\n";
             ..Default::default()
         };
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let message = fetch_to_message(&folder, 9, fetch, HydrationProjection::FullWithBlobs)
-            .expect("uid present");
+        let message = fetch_to_message(
+            &folder,
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            fetch,
+            HydrationProjection::FullWithBlobs,
+        )
+        .expect("uid present");
         assert_eq!(message.body_text.as_deref(), Some("café"));
         assert_eq!(message.body_html.as_deref(), Some("<b>html</b>"));
         assert_eq!(message.references, ["a@test", "b@test"]);
@@ -4504,8 +4545,13 @@ body text\r\n";
     fn preview_projection_extracts_text_from_a_multipart_prefix() {
         let fetch = crate::types::FetchResponse { uid: Some(2), body_sections: vec![crate::types::fetch::BodySection { section: String::new(), origin: Some(0), data: Some(b"Content-Type: multipart/alternative; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\npreview prose\r\n--x--\r\n".to_vec().into()) }], ..Default::default() };
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let message = fetch_to_message(&folder, 9, fetch, HydrationProjection::Preview(200))
-            .expect("uid present");
+        let message = fetch_to_message(
+            &folder,
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            fetch,
+            HydrationProjection::Preview(200),
+        )
+        .expect("uid present");
         assert_eq!(message.body_text.as_deref(), Some("preview prose"));
         assert!(
             message
@@ -4535,8 +4581,13 @@ body text\r\n";
     fn truncated_fetch_marks_the_message_incomplete() {
         let fetch = crate::types::FetchResponse { uid: Some(2), body_sections: vec![crate::types::fetch::BodySection { section: String::new(), origin: None, data: Some(b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: application/octet-stream\r\n\r\nprefix".to_vec().into()) }], ..Default::default() };
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let message = fetch_to_message(&folder, 9, fetch, HydrationProjection::FullWithBlobs)
-            .expect("uid present");
+        let message = fetch_to_message(
+            &folder,
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            fetch,
+            HydrationProjection::FullWithBlobs,
+        )
+        .expect("uid present");
         assert!(message.incomplete);
         assert_eq!(message.attachments.len(), 1);
         assert!(message.attachments[0].truncated);
@@ -4586,24 +4637,33 @@ mod partial_commit_tests {
             let fetch = crate::types::FetchResponse {
                 uid: Some(1),
                 flags: Some(Vec::new()),
-                thread_id: objectid.map(str::to_owned),
-                gmail_thread_id: gmail,
+                thread_id: objectid.map(|id| crate::types::validated::ObjectId::new(id).unwrap()),
+                gmail_thread_id: gmail.map(crate::types::GmailThreadId::new),
                 ..Default::default()
             };
-            let inventory =
-                super::super::inventory::fetch_to_inventory(&folder, 7, fetch.clone(), None)
-                    .unwrap();
-            // The same conversation seen in another folder and epoch carries
-            // the same account-scoped id, so a consumer can group on it.
-            let elsewhere = super::super::inventory::fetch_to_inventory(
-                &MailboxName::new("Sent").unwrap(),
-                42,
+            let inventory = super::super::inventory::fetch_to_inventory(
+                &folder,
+                crate::types::UidValidity::new(7).expect("valid protocol test value"),
                 fetch.clone(),
                 None,
             )
             .unwrap();
-            let message =
-                fetch_to_message(&folder, 7, fetch, HydrationProjection::Headers).unwrap();
+            // The same conversation seen in another folder and epoch carries
+            // the same account-scoped id, so a consumer can group on it.
+            let elsewhere = super::super::inventory::fetch_to_inventory(
+                &MailboxName::new("Sent").unwrap(),
+                crate::types::UidValidity::new(42).expect("valid protocol test value"),
+                fetch.clone(),
+                None,
+            )
+            .unwrap();
+            let message = fetch_to_message(
+                &folder,
+                crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                fetch,
+                HydrationProjection::Headers,
+            )
+            .unwrap();
             assert_eq!(inventory.thread_id, message.thread_id);
             assert_eq!(elsewhere.thread_id, message.thread_id);
             let thread = message.thread_id.unwrap();
@@ -4630,11 +4690,13 @@ mod partial_commit_tests {
             )
             .await
             .unwrap();
-            assert_eq!(ids.iter().map(|id| id.uid).collect::<Vec<_>>(), [1, 9]);
-            assert!(
-                ids.iter()
-                    .all(|id| id.folder == folder && id.uidvalidity == 7)
+            assert_eq!(
+                ids.iter().map(|id| id.uid.get()).collect::<Vec<_>>(),
+                [1, 9]
             );
+            assert!(ids.iter().all(|id| id.folder == folder
+                && id.uidvalidity
+                    == crate::types::UidValidity::new(7).expect("valid protocol test value")));
             let _server = script.await.unwrap();
         }
     }
@@ -4726,7 +4788,15 @@ mod partial_commit_tests {
                 Vec::new(),
             ));
             for uid in [1, 2] {
-                parts.folders.record_modseq(&folder, 7, uid, 99).unwrap();
+                parts
+                    .folders
+                    .record_modseq(
+                        &folder,
+                        crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                        uid,
+                        crate::types::ModSeq::new(99).expect("positive test MODSEQ"),
+                    )
+                    .unwrap();
             }
             let account = ImapAccount::new(parts);
             let script = tokio::spawn(async move {
@@ -4752,7 +4822,13 @@ mod partial_commit_tests {
             });
             let ids = [1, 2]
                 .into_iter()
-                .map(|uid| DecodedObjectId::canonical(folder.clone(), 7, uid))
+                .map(|uid| {
+                    DecodedObjectId::canonical(
+                        folder.clone(),
+                        crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                        crate::types::Uid::new(uid).expect("nonzero test UID"),
+                    )
+                })
                 .collect();
             let op = if delete {
                 AccountOperation::RemoveFromContainer
@@ -4785,8 +4861,28 @@ mod partial_commit_tests {
                 })
             );
             assert_eq!(steps[0].targets().refs.len(), 1);
-            assert_eq!(account.folders.modseq(&folder, 7, 1), None);
-            assert_eq!(account.folders.modseq(&folder, 7, 2), Some(99));
+            assert_eq!(
+                account
+                    .folders
+                    .modseq(
+                        &folder,
+                        crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                        1
+                    )
+                    .map(crate::types::ModSeq::get),
+                None
+            );
+            assert_eq!(
+                account
+                    .folders
+                    .modseq(
+                        &folder,
+                        crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                        2
+                    )
+                    .map(crate::types::ModSeq::get),
+                Some(99)
+            );
             let _server = script.await.unwrap();
         }
     }
@@ -4810,9 +4906,21 @@ mod partial_commit_tests {
         let result = copy_messages(
             &account,
             vec![
-                DecodedObjectId::canonical(folder.clone(), 6, 1),
-                DecodedObjectId::canonical(folder.clone(), 6, 3),
-                DecodedObjectId::canonical(folder, 7, 2),
+                DecodedObjectId::canonical(
+                    folder.clone(),
+                    crate::types::UidValidity::new(6).expect("nonzero epoch"),
+                    crate::types::Uid::new(1).expect("valid protocol test value"),
+                ),
+                DecodedObjectId::canonical(
+                    folder.clone(),
+                    crate::types::UidValidity::new(6).expect("nonzero epoch"),
+                    crate::types::Uid::new(3).expect("valid protocol test value"),
+                ),
+                DecodedObjectId::canonical(
+                    folder,
+                    crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                    crate::types::Uid::new(2).expect("valid protocol test value"),
+                ),
             ],
             &MailboxName::new("Archive").unwrap(),
             AccountOperation::AddToContainer,
@@ -4862,7 +4970,13 @@ mod partial_commit_tests {
         });
         let ids = ["A", "B"]
             .into_iter()
-            .map(|name| DecodedObjectId::canonical(MailboxName::new(name).unwrap(), 7, 1))
+            .map(|name| {
+                DecodedObjectId::canonical(
+                    MailboxName::new(name).unwrap(),
+                    crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                    crate::types::Uid::new(1).expect("valid protocol test value"),
+                )
+            })
             .collect();
         let failure = match copy_messages(
             &account,
@@ -4917,7 +5031,11 @@ mod partial_commit_tests {
             }
             server
         });
-        let thread = encode_thread_id(&MailboxName::new("INBOX").unwrap(), 7, &[1]);
+        let thread = encode_thread_id(
+            &MailboxName::new("INBOX").unwrap(),
+            crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            &crate::types::set::UidSet::from_numbers([1]),
+        );
         let result = if delete {
             delete_thread(account, thread, Some(ContainerId("INBOX".into()))).await
         } else {
@@ -4988,7 +5106,11 @@ mod partial_commit_tests {
             }
             server
         });
-        let thread = encode_thread_id(&MailboxName::new("INBOX").unwrap(), 7, &[1]);
+        let thread = encode_thread_id(
+            &MailboxName::new("INBOX").unwrap(),
+            crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            &crate::types::set::UidSet::from_numbers([1]),
+        );
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             move_thread(
@@ -5036,7 +5158,11 @@ mod partial_commit_tests {
             .await;
             server
         });
-        let id = encode_object_id(&MailboxName::new("Drafts").unwrap(), 7, 1);
+        let id = encode_object_id(
+            &MailboxName::new("Drafts").unwrap(),
+            crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            crate::types::Uid::new(1).expect("valid protocol test value"),
+        );
         let error = draft_discard(account, DraftHandle(id.0)).await.unwrap_err();
         assert_eq!(
             error.partial_commit().unwrap().steps()[0].effect(),

@@ -22,11 +22,21 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
+use super::ImapConnection;
 use super::driver::{DriverCommand, IdleTermination};
 use super::typed_event::TypedEvent;
-use super::{IdleEvent, ImapConnection};
 use crate::error::Error;
 use bifrost_types::TransmissionState;
+
+/// Outcome of an IDLE wait. Server data retains the connection's event type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum IdleEvent {
+    Event(TypedEvent),
+    Timeout,
+    Cancelled,
+    ServerTerminated,
+}
 
 impl ImapConnection {
     /// Enter IDLE mode and wait for the first server event (RFC 2177).
@@ -70,8 +80,8 @@ impl ImapConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::DriverGone`] if the driver task has exited,
-    /// [`Error::Timeout`] if the DONE handshake does not complete within
+    /// Returns [`crate::error::TransportFailure::DriverGone`] if the driver task has exited,
+    /// [`crate::error::TransportFailure::Timeout`] if the DONE handshake does not complete within
     /// `done_timeout`, or any I/O or protocol error from the IDLE session.
     pub async fn idle(
         &self,
@@ -140,8 +150,8 @@ impl ImapConnection {
                         }
                         Ok(None) => break IdleEvent::Timeout,
                         Err(
-                            driver_death @ (Error::DriverGone { .. }
-                            | Error::DriverPanicked { .. }),
+                            driver_death @ (Error::Transport { kind: crate::error::TransportFailure::DriverGone, .. }
+                            | Error::Internal { kind: crate::error::InternalFailure::Panicked(_), .. }),
                         ) => {
                             // Driver exited  -  don't try to send DONE.
                             //

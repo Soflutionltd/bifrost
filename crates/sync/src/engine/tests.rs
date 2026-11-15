@@ -1,4 +1,3 @@
-use super::attach::scope_covers_membership;
 use super::backfill::BackfillScan;
 use super::bulk::{
     MutationBucket, classify_item_outcome, counters_from_outcomes, queue_unresolved_for_retry,
@@ -133,7 +132,7 @@ fn publish_a_marker(
         },
         walk_watermark,
     );
-    coverage.mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(1));
+    coverage.mark_delivered(&id, crate::delivery::ReceiverSequence::for_test(1));
     id
 }
 
@@ -144,7 +143,7 @@ fn publish_a_page(
     checkpoint: &bifrost_types::Checkpoint,
 ) -> crate::cursor::AckToken {
     let id = control.publish_checkpoint_without_report(checkpoint.clone());
-    coverage.mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(1));
+    coverage.mark_delivered(&id, crate::delivery::ReceiverSequence::for_test(1));
     id
 }
 
@@ -220,7 +219,7 @@ async fn a_discarded_backfill_attempt_cannot_be_rebuilt_by_a_late_ack() {
 
     // The page was in the consumer's hand the whole time, and it answers now.
     let (done, wait) = oneshot::channel();
-    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+    tx.send(WriterRequest::Ack(crate::engine::writer::AckRequest {
         scope: scope.clone(),
         checkpoint,
         publication: Some(publication),
@@ -291,7 +290,7 @@ async fn a_discard_fences_the_backfill_lane_and_leaves_live_acks_alone() {
     // The live batch was received before the discard and is acknowledged after
     // it. It has nothing to do with the backfill rows.
     let (done, wait) = oneshot::channel();
-    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+    tx.send(WriterRequest::Ack(crate::engine::writer::AckRequest {
         scope: scope.clone(),
         checkpoint: live_checkpoint,
         publication: Some(live_publication),
@@ -315,7 +314,7 @@ async fn a_discard_fences_the_backfill_lane_and_leaves_live_acks_alone() {
 
     // The discarded attempt's page is still refused.
     let (done, wait) = oneshot::channel();
-    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+    tx.send(WriterRequest::Ack(crate::engine::writer::AckRequest {
         scope: scope.clone(),
         checkpoint: page,
         publication: Some(page_publication),
@@ -382,9 +381,10 @@ async fn a_marker_ack_retried_after_a_store_failure_keeps_the_scopes_rows() {
 
     // The store fails once. The consumer is told so and retries.
     assert!(
-        ack(&tx, marker.clone(), Some(marker_publication.clone()))
-            .await
-            .is_err(),
+        matches!(
+            ack(&tx, marker.clone(), Some(marker_publication.clone())).await,
+            Err(Error::AckStore(_))
+        ),
         "the transient store failure reaches the consumer"
     );
     ack(&tx, marker, Some(marker_publication))
@@ -453,7 +453,7 @@ async fn a_marker_ack_retried_after_a_loss_still_discards_the_walks_rows() {
             generation: crate::cursor::WalkGeneration::for_test(0),
         },
     );
-    coverage.mark_delivered(&stranded, crate::multiplexer::ReceiverSequence::for_test(1));
+    coverage.mark_delivered(&stranded, crate::delivery::ReceiverSequence::for_test(1));
 
     let marker = backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
     let marker_publication =
@@ -531,9 +531,12 @@ async fn a_marker_ack_replayed_after_reattach_leaves_the_durable_marker() {
         None,
         "a prior attachment's id is not one this ledger can interpret"
     );
-    ack(&tx, marker, Some(replayed))
-        .await
-        .expect("a replayed acknowledgement is honoured");
+    assert_eq!(
+        ack(&tx, marker, Some(replayed))
+            .await
+            .expect("replay honoured"),
+        crate::AckOutcome::Withheld(crate::CompletionRefusal::Unvouchable),
+    );
 
     let stored = store
         .get_backfill(&account, &scope)
@@ -573,9 +576,12 @@ async fn a_replayed_marker_does_not_create_a_completion_the_new_attachment_never
 
     // A fresh attachment over an EMPTY store: nothing here has earned anything.
     let (account, store, _coverage, tx, writer) = writer_harness();
-    ack(&tx, marker, Some(replayed))
-        .await
-        .expect("a replayed acknowledgement is honoured");
+    assert_eq!(
+        ack(&tx, marker, Some(replayed))
+            .await
+            .expect("replay honoured"),
+        crate::AckOutcome::Withheld(crate::CompletionRefusal::Unvouchable),
+    );
 
     let stored = store
         .get_backfill(&account, &scope)
@@ -656,9 +662,12 @@ async fn a_ceilinged_discard_leaves_the_request_outstanding() {
 
     // The delayed W1 acknowledgement is refused and discards - ceilinged at W1's
     // marker.
-    ack(&tx, marker, Some(marker_publication))
-        .await
-        .expect("the consumer's acknowledgement is honoured");
+    assert_eq!(
+        ack(&tx, marker, Some(marker_publication))
+            .await
+            .expect("ack honoured"),
+        crate::AckOutcome::Withheld(crate::CompletionRefusal::WalkNotWhole),
+    );
 
     assert!(
         coverage.take_backfill_discard(&scope),
@@ -807,7 +816,7 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
     // Now the stale marker is acknowledged. It is refused, and its attempt is
     // discarded.
     let (done, wait) = oneshot::channel();
-    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+    tx.send(WriterRequest::Ack(crate::engine::writer::AckRequest {
         scope: scope.clone(),
         checkpoint: marker,
         publication: Some(marker_publication),
@@ -835,7 +844,7 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
 
     // The retry's page must still be acknowledgeable.
     let (done, wait) = oneshot::channel();
-    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+    tx.send(WriterRequest::Ack(crate::engine::writer::AckRequest {
         scope,
         checkpoint: retry_page,
         publication: Some(retry_publication),
@@ -882,9 +891,12 @@ async fn a_completion_marker_acknowledged_without_a_publication_is_withheld() {
     );
 
     let marker = backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
-    ack(&tx, marker, None)
-        .await
-        .expect("the consumer's acknowledgement is honoured");
+    assert_eq!(
+        ack(&tx, marker, None)
+            .await
+            .expect("acknowledgement honoured"),
+        crate::AckOutcome::Withheld(crate::CompletionRefusal::Unvouchable),
+    );
 
     let stored = store
         .get_backfill(&account, &email_scope())
@@ -949,9 +961,12 @@ async fn open_debt_does_not_mask_the_discard_a_lost_walk_needs() {
 
     // Both conditions now hold. The consumer's acknowledgement is honoured; the
     // marker is withheld either way, and the rows must go.
-    ack(&tx, marker, Some(marker_publication))
-        .await
-        .expect("the consumer's acknowledgement is honoured");
+    assert_eq!(
+        ack(&tx, marker, Some(marker_publication))
+            .await
+            .expect("ack honoured"),
+        crate::AckOutcome::Withheld(crate::CompletionRefusal::WalkNotWhole),
+    );
 
     assert!(
         store
@@ -1117,7 +1132,7 @@ async fn a_rejected_acknowledgement_frees_no_capacity() {
 
     // Y's token, X's checkpoint. The lanes disagree, so the ledger refuses.
     let (done, wait) = oneshot::channel();
-    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+    tx.send(WriterRequest::Ack(crate::engine::writer::AckRequest {
         scope: CursorScope::Account,
         checkpoint: x,
         publication: Some(y_id),
@@ -1186,7 +1201,7 @@ async fn a_failed_store_write_still_frees_the_bound() {
     assert_eq!(coverage.backfill_in_flight(), 2);
 
     let (done, wait) = oneshot::channel();
-    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+    tx.send(WriterRequest::Ack(crate::engine::writer::AckRequest {
         scope: CursorScope::Account,
         checkpoint: first,
         publication: Some(first_id),
@@ -1676,8 +1691,8 @@ async fn ack(
     tx: &mpsc::Sender<WriterRequest>,
     checkpoint: bifrost_types::Checkpoint,
     publication: Option<crate::cursor::AckToken>,
-) -> Result<(), Error> {
-    use crate::multiplexer::AckRequest;
+) -> Result<crate::AckOutcome, Error> {
+    use crate::engine::writer::AckRequest;
     let (done, wait) = oneshot::channel();
     tx.send(WriterRequest::Ack(AckRequest {
         scope: email_scope(),
@@ -2018,17 +2033,17 @@ async fn the_completion_sentinel_is_withheld_over_open_debt() {
 
     let completion =
         backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
-    let sentinel = register(
+    let sentinel = publish_a_marker(
         &coverage,
         &completion,
-        crate::cursor::CoverageClaim {
-            reports: Vec::new(),
-            generation: crate::cursor::WalkGeneration::for_test(1),
-        },
+        coverage.undelivered_watermark(&email_scope()),
     );
-    ack(&tx, completion, Some(sentinel))
-        .await
-        .expect("the acknowledgement itself still succeeds");
+    assert_eq!(
+        ack(&tx, completion, Some(sentinel))
+            .await
+            .expect("ack honoured"),
+        crate::AckOutcome::Withheld(crate::CompletionRefusal::OpenDebt),
+    );
 
     assert!(
         store
@@ -2061,7 +2076,7 @@ async fn a_recovery_backoff_is_cut_short_by_shutdown() {
     shutdown.cancel();
     let started = tokio::time::Instant::now();
     let completed =
-        super::reattach::sleep_unless_shutdown(Duration::from_secs(300), &shutdown).await;
+        super::recovery::pacing::sleep_unless_shutdown(Duration::from_secs(300), &shutdown).await;
     assert!(
         !completed,
         "a cancelled backoff must report that it was cut"
@@ -2073,7 +2088,7 @@ async fn a_recovery_backoff_is_cut_short_by_shutdown() {
 
     let live = CancellationToken::new();
     assert!(
-        super::reattach::sleep_unless_shutdown(Duration::from_millis(1), &live).await,
+        super::recovery::pacing::sleep_unless_shutdown(Duration::from_millis(1), &live).await,
         "an uncancelled backoff still runs to completion"
     );
 }
@@ -2160,7 +2175,7 @@ async fn a_waiver_releases_the_sentinel_without_claiming_proof() {
     let (done, wait) = oneshot::channel();
     tx.send(WriterRequest::OperatorDecision {
         key: bifrost_types::ObligationKey(b"broken".to_vec()),
-        decision: crate::multiplexer::OperatorDecision::Waive {
+        decision: crate::engine::writer::OperatorDecision::Waive {
             by: "operator".into(),
             at_unix_seconds: 1_700_000_000,
         },
@@ -2209,7 +2224,10 @@ async fn an_unknown_publication_is_refused_rather_than_assumed_complete() {
     )
     .await;
     assert!(
-        result.is_err(),
+        matches!(
+            result,
+            Err(Error::AckRejected(crate::AckRejection::UnknownPublication))
+        ),
         "an unrecognized publication must not be persisted as complete coverage"
     );
 
@@ -2543,7 +2561,7 @@ async fn repeated_stalled_splits_exhaust_the_lineage() {
 #[tokio::test]
 async fn an_aborted_reattach_spares_a_cursor_an_ack_has_claimed() {
     use crate::cursor::InMemoryCheckpointStore;
-    use crate::multiplexer::AckRequest;
+    use crate::engine::writer::AckRequest;
     use bifrost_types::{ChangeCursor, Checkpoint, OpaqueChangeState, ProtocolKind};
 
     fn cursor(name: &str) -> ChangeCursor {
@@ -3283,7 +3301,7 @@ fn a_downgraded_mutation_keeps_its_bucket_and_is_not_retried_or_read_back() {
     let mut outcomes = std::collections::HashMap::new();
     let mut retry = Vec::new();
     let mut dedupe = 0;
-    let throttles = crate::recovery::ThrottleBucket::new();
+    let throttles = crate::throttle::ThrottleBucket::new();
     let account = bifrost_types::AccountId("acc".into());
 
     let forwarded = classify_item_outcome(
@@ -3321,14 +3339,15 @@ fn per_item_engine_failure_returns_the_directive_for_forwarding() {
         AccountOperation, BatchFailure, BatchItemId, ItemOutcome, MutationSuccess,
     };
     let scope = CursorScope::Folder(FolderId("INBOX".into()));
-    let error = crate::recovery::restart_scope_error(scope.clone(), AccountOperation::UpdateFlags);
+    let error =
+        crate::engine_errors::restart_scope_error(scope.clone(), AccountOperation::UpdateFlags);
     let item: ItemOutcome<MutationSuccess> =
         ItemOutcome::Failed(BatchFailure::new(BatchItemId("message".into()), error));
     let mut outcomes = std::collections::HashMap::new();
     let mut retry = Vec::new();
     let mut dedupe = 0;
 
-    let throttles = crate::recovery::ThrottleBucket::new();
+    let throttles = crate::throttle::ThrottleBucket::new();
     let account = bifrost_types::AccountId("acc".into());
     let (directive, forwarded) = classify_item_outcome(
         item,
@@ -3490,7 +3509,7 @@ fn folder_type_scope_covers_matching_mailbox_membership() {
         ty: ObjectType::Email,
     };
     let membership = MembershipScope::Mailbox(bifrost_types::MailboxId("inbox".into()));
-    assert!(scope_covers_membership(&scope, &membership));
+    assert!(scope.covers(&membership));
 }
 
 #[test]
@@ -3500,7 +3519,7 @@ fn folder_type_scope_rejects_other_mailbox_membership() {
         ty: ObjectType::Email,
     };
     let membership = MembershipScope::Mailbox(bifrost_types::MailboxId("archive".into()));
-    assert!(!scope_covers_membership(&scope, &membership));
+    assert!(!scope.covers(&membership));
 }
 
 /// `disable_scope` quarantines a single shared-folder scope by
@@ -3508,13 +3527,13 @@ fn folder_type_scope_rejects_other_mailbox_membership() {
 /// poll loop self-drains on the next iteration once
 /// `cursors.snapshot(scope)` returns `None`. This pins the registry
 /// mechanism the quarantine relies on: a shared `Folder` scope tagged
-/// with its owning `Mailbox` membership is fully removed by
+/// with its owning `Owner` membership is fully removed by
 /// `CursorRegistry::delete` (cursor + membership), and an untargeted
 /// sibling scope is untouched.
 #[test]
 fn disable_scope_deletes_cursor_and_drops_membership() {
     use crate::cursor::CursorRegistry;
-    use bifrost_types::{ChangeCursor, MailboxId, OpaqueChangeState, ProtocolKind};
+    use bifrost_types::{ChangeCursor, OpaqueChangeState, PrincipalId, ProtocolKind};
 
     let cursors = CursorRegistry::new();
     let shared = CursorScope::Folder(FolderId("Shared/alice/INBOX".into()));
@@ -3533,7 +3552,7 @@ fn disable_scope_deletes_cursor_and_drops_membership() {
     cursors.put(mk(&shared));
     cursors.put(mk(&sibling));
     cursors.link_membership(
-        MembershipScope::Mailbox(MailboxId("alice".into())),
+        MembershipScope::Owner(PrincipalId("alice".into())),
         shared.clone(),
     );
     cursors.link_membership(
@@ -3548,7 +3567,7 @@ fn disable_scope_deletes_cursor_and_drops_membership() {
     assert!(cursors.snapshot(&shared).is_none());
     assert!(
         cursors
-            .scopes_for_membership(&MembershipScope::Mailbox(MailboxId("alice".into())))
+            .scopes_for_membership(&MembershipScope::Owner(PrincipalId("alice".into())))
             .is_empty()
     );
     // Sibling scope untouched.
@@ -4148,7 +4167,7 @@ async fn mismatched_ack_scopes_preserve_provisional_ownership_and_checkpoint_row
         };
         let publication = publish_a_page(&control, &coverage, &checkpoint);
         let (done, wait) = oneshot::channel();
-        tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+        tx.send(WriterRequest::Ack(crate::engine::writer::AckRequest {
             scope: provisional_cursor.scope.clone(),
             checkpoint: checkpoint.clone(),
             publication: Some(publication),
@@ -4158,7 +4177,10 @@ async fn mismatched_ack_scopes_preserve_provisional_ownership_and_checkpoint_row
         .await
         .expect("writer alive");
         assert!(
-            matches!(wait.await.expect("writer answered"), Err(Error::Other(_))),
+            matches!(
+                wait.await.expect("writer answered"),
+                Err(Error::AckRejected(crate::AckRejection::ScopeMismatch))
+            ),
             "the scope mismatch must be refused"
         );
         match checkpoint {
@@ -4207,8 +4229,11 @@ async fn mismatched_ack_scopes_preserve_provisional_ownership_and_checkpoint_row
 #[test]
 fn acknowledgement_scope_validation_rejects_a_mismatch() {
     let checkpoint = bifrost_types::Checkpoint::Change(change_cursor(b"checkpoint"));
-    let result = super::ack::validate_ack_scope(&CursorScope::Account, &checkpoint);
-    assert!(matches!(result, Err(Error::Other(_))));
+    let result = super::writer::validate_ack_scope(&CursorScope::Account, &checkpoint);
+    assert!(matches!(
+        result,
+        Err(Error::AckRejected(crate::AckRejection::ScopeMismatch))
+    ));
 }
 
 // A refused rollback must retain ownership, but that retained mark must still
@@ -4377,7 +4402,7 @@ fn legacy_empty_completion_rechecks_but_nonempty_completion_remains_valid() {
 async fn departed_writer_is_shutdown_for_reads_and_writes() {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     drop(rx);
-    let writer = super::ack::WriterHandle::new(tx);
+    let writer = super::writer::WriterHandle::new(tx);
     assert!(matches!(
         writer.get_change_cursor(CursorScope::Account, None).await,
         Err(Error::ShuttingDown)

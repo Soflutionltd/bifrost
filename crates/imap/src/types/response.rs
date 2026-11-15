@@ -134,7 +134,7 @@ pub enum UntaggedResponse {
         /// Matching message sequence numbers or UIDs.
         uids: Vec<u32>,
         /// Highest mod-sequence of matching messages (RFC 7162 Section 3.1.5).
-        mod_seq: Option<u64>,
+        mod_seq: Option<crate::types::ModSeq>,
     },
     /// `* ESEARCH (TAG "tag") [UID] result-data` (RFC 4731 Section 3.1).
     ///
@@ -208,7 +208,7 @@ pub enum UntaggedResponse {
         /// Sorted message numbers or UIDs (RFC 5256 Section 4).
         nums: Vec<u32>,
         /// Highest mod-sequence value of matching messages (RFC 7162 Section 3.1.6).
-        mod_seq: Option<u64>,
+        mod_seq: Option<crate::types::ModSeq>,
     },
     /// Unknown or unrecognized untagged response (RFC 9051 Section 2.2.2).
     ///
@@ -508,7 +508,7 @@ pub struct EsearchResponse {
     /// ALL  -  matching message numbers/UIDs as a uid-set (RFC 4731 Section 3.1).
     pub all: Vec<UidRange>,
     /// MODSEQ  -  highest mod-sequence of matching messages (RFC 7162 Section 3.1.10).
-    pub mod_seq: Option<u64>,
+    pub mod_seq: Option<crate::types::ModSeq>,
 }
 
 /// Removals an EXPUNGE, UID EXPUNGE or MOVE reported (RFC 3501 Section

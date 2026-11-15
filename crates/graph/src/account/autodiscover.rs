@@ -78,7 +78,8 @@ impl GraphAccount {
         user_email: &str,
     ) -> Result<PublicFolderRouting, AccountError> {
         let parsed = self
-            .client
+            .mailboxes
+            .primary()
             .soap_get_user_settings(
                 user_email,
                 &["PublicFolderInformation", "InternalRpcClientServer"],
@@ -100,7 +101,8 @@ impl GraphAccount {
         replica_smtp: &str,
     ) -> Result<String, AccountError> {
         let parsed = self
-            .client
+            .mailboxes
+            .primary()
             .soap_get_user_settings(replica_smtp, &["AutoDiscoverSMTPAddress"])
             .await?;
         parsed
@@ -120,6 +122,9 @@ impl GraphAccount {
         &self,
         user_email: &str,
     ) -> Result<Vec<SharedMailbox>, AccountError> {
-        self.client.discover_shared_mailboxes(user_email).await
+        self.mailboxes
+            .primary()
+            .discover_shared_mailboxes(user_email)
+            .await
     }
 }

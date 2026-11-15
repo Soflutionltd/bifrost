@@ -85,7 +85,10 @@ impl SyncEngine {
             return;
         };
         let warning = bifrost_types::Warning::user_safe(
-            bifrost_types::WarningKind::OperatorAttentionNeeded,
+            bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::IncompletePage {
+                skipped_scopes: page.skipped_scopes.len(),
+                failed_ids: page.failed_ids.len(),
+            }),
             format!(
                 "{method} returned an incomplete page: {} unsearched scope(s), \
                  {} resource(s) the provider could not return",

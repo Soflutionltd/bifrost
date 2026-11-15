@@ -26,7 +26,8 @@ pub const HINTLESS_HOLD_WAIT: std::time::Duration = std::time::Duration::from_se
 #[non_exhaustive]
 pub enum HoldTarget {
     Account,
-    Mailbox(crate::MailboxId),
+    Folder(crate::FolderId),
+    Owner(crate::PrincipalId),
     Budget(ThrottleBudget),
     CurrentOperation,
 }
@@ -119,7 +120,7 @@ impl AccountError {
     pub fn revoke_foreign_scope(
         self,
         scope: crate::CursorScope,
-        owner: Option<&crate::MailboxId>,
+        owner: Option<&crate::PrincipalId>,
     ) -> Self {
         let Some(owner) = owner else {
             return self;
@@ -268,10 +269,14 @@ impl AccountError {
             let target = match scope {
                 Some(ThrottleScope::Account) if hint.is_some() => HoldTarget::Account,
                 Some(ThrottleScope::Mailbox) => match error.scope() {
-                    Some(ErrorScope::Mailbox { id }) => HoldTarget::Mailbox(id.clone()),
-                    Some(ErrorScope::Cursor(crate::CursorScope::Folder(id))) => {
-                        HoldTarget::Mailbox(crate::MailboxId(id.0.clone()))
+                    Some(ErrorScope::Owner { id }) => HoldTarget::Owner(id.clone()),
+                    Some(ErrorScope::Mailbox { id }) => {
+                        HoldTarget::Folder(crate::FolderId::from(id))
                     }
+                    Some(ErrorScope::Cursor(
+                        crate::CursorScope::Folder(id)
+                        | crate::CursorScope::FolderType { folder: id, .. },
+                    )) => HoldTarget::Folder(id.clone()),
                     _ => HoldTarget::CurrentOperation,
                 },
                 _ if scope.is_some() || hint.is_some() || throttled => HoldTarget::CurrentOperation,
@@ -794,14 +799,14 @@ mod shared_constructor_tests {
     use super::*;
     use crate::{
         AccessCause, AccessErrorKind, AccountErrorBuilder, AttemptCause, Cause, CursorScope,
-        DiagnosticText, EngineDirective, FolderId, MailboxId, RequestCause, RequestErrorKind,
+        DiagnosticText, EngineDirective, FolderId, RequestCause, RequestErrorKind,
         TransmissionState,
     };
 
     #[test]
     fn foreign_revocation_preserves_original_source_and_support_evidence() {
         let scope = CursorScope::Folder(FolderId("shared".into()));
-        let owner = MailboxId("delegate".into());
+        let owner = crate::PrincipalId("delegate".into());
         let original = AccountErrorBuilder::new(
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied { resource: None }),
@@ -892,7 +897,7 @@ mod shared_constructor_tests {
         // (the scope-revoked message key), never as a prompt to reauthorize
         // or to contact support about the user's own account. The original
         // denial's ContactProviderSupport must not leak through the chain.
-        let owner = MailboxId("delegate".into());
+        let owner = crate::PrincipalId("delegate".into());
         let original = AccountErrorBuilder::new(
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied { resource: None }),

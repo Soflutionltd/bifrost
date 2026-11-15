@@ -303,7 +303,10 @@ async fn a_tagged_ok_before_the_literal_continuation_is_that_commands_missing_re
         .as_ref()
         .expect_err("an OK before the continuation is not a success");
     assert!(
-        matches!(err, crate::error::Error::ProtocolMissing(_)),
+        matches!(
+            err,
+            crate::error::Error::Provider(crate::error::ProviderFailure::Missing(_))
+        ),
         "wrong error: {err:?}"
     );
     assert!(!err.is_connection_fatal());
@@ -590,7 +593,10 @@ async fn a_pipelined_command_refused_at_its_second_marker_is_its_own_result(
         .as_ref()
         .expect_err("the refused command's NO is its own result");
     assert!(
-        matches!(err, crate::error::Error::No { .. }),
+        matches!(
+            err,
+            crate::error::Error::ServerStatus(crate::error::ServerStatus::No { .. })
+        ),
         "wrong error: {err:?}"
     );
     assert!(!err.is_connection_fatal());
@@ -776,7 +782,10 @@ async fn an_encoding_refusal_in_a_later_sub_batch_refuses_the_batch_before_any_b
         panic!("expected a driver refusal, got {err:?}");
     };
     assert!(
-        matches!(err, crate::error::Error::MissingCapability(_)),
+        matches!(
+            err,
+            crate::error::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(_))
+        ),
         "got {err:?}"
     );
 

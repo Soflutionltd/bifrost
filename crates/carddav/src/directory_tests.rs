@@ -14,7 +14,7 @@ fn answer(status: StatusCode, body: impl Into<String>) -> Canned {
         status,
         headers: HeaderMap::new(),
         body: body.into(),
-        url: String::new(),
+        url: bifrost_dav_core::DavHref::parse("https://dav.example.test/").expect("test DAV URL"),
     }
     .into()
 }
@@ -401,7 +401,8 @@ async fn directory_filter_refusals_never_enumerate() {
                 status,
                 headers: HeaderMap::new(),
                 body: body.into(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             })
         } else {
             vec![answer(status, body)]
@@ -1347,11 +1348,11 @@ async fn directory_round_three_existing_change_cursor_retires_after_later_marker
         ))
         .await
         .expect("open");
-        let cursor = cursor_from_snapshot(
+        let cursor = Kernel::cursor_from_snapshot(
             scope.clone(),
             &ContactSnapshot {
-                addressbook_url: format!("{BASE}/books/personal/"),
-                ctag: Some("unchanged".into()),
+                collection_url: format!("{BASE}/books/personal/"),
+                token: Some("unchanged".into()),
                 entries: vec![ContactSnapshotEntry {
                     uri: format!("{BASE}/books/personal/cached.vcf"),
                     etag: Some("v1".into()),
@@ -1391,11 +1392,11 @@ async fn directory_round_three_sync_redirect_retires_the_original_scope() {
     .await
     .expect("open");
     let scope = CursorScope::Folder(bifrost_types::FolderId(format!("{BASE}/books/personal/")));
-    let cursor = cursor_from_snapshot(
+    let cursor = Kernel::cursor_from_snapshot(
         scope.clone(),
         &ContactSnapshot {
-            addressbook_url: format!("{BASE}/books/personal/"),
-            ctag: None,
+            collection_url: format!("{BASE}/books/personal/"),
+            token: None,
             entries: Vec::new(),
             failed_hrefs: Vec::new(),
         },

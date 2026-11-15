@@ -1,15 +1,17 @@
-//! The shared DAV status-to-`AccountError` ladder and error constructors.
+//! Shared DAV error constructors and HTTP provider policy.
 //!
-//! The two protocol crates carried this ladder twice. The copies differed in
-//! exactly three tokens - the `ResourceKind` a 404 and a 403 name, the
-//! `Protocol` stamp, and the `field` label on a local argument error - so those
-//! are the parameter, and everything else is one implementation.
+//! HTTP status interpretation belongs to bifrost-net. DAV supplies the lock
+//! conflict override, resource identity and account throttle policy; its two
+//! dialects share construction and differ in their resource, protocol stamp
+//! and local argument field label.
 
+#[cfg(test)]
+use bifrost_types::ServerCause;
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause, Cause,
     DiagnosticText, Protocol, ProtocolErrorKind, RequestCause, RequestErrorKind, ResourceKind,
-    ServerCause, ServerErrorKind, StateCause, TransmissionState, TransportCause,
-    TransportErrorKind, TransportKind, WireCause,
+    ServerErrorKind, TransmissionState, TransportCause, TransportErrorKind, TransportKind,
+    WireCause,
 };
 use reqwest::StatusCode;
 
@@ -270,8 +272,8 @@ pub fn response_read_error(
 
 /// Classify a non-2xx status the server answered.
 ///
-/// DAV deliberately overrides generic HTTP conflicts: 409, conditional-write
-/// 412, and lock refusal 423 require a state refresh. A 410 is cursor invalid
+/// DAV declares lock refusal 423 as a conflict alongside the shared 409/412
+/// state-refresh classification. A 410 is cursor invalid
 /// only on sync-collection; that caller interprets it before this generic
 /// resource ladder. A 400/422 remains malformed and 408/502/503/504 unavailable,
 /// matching the shared HTTP classification. Synthetic member statuses pass an
@@ -332,73 +334,16 @@ fn status_error_for(
 ) -> AccountError {
     let retry_hint =
         bifrost_net::request::parse_retry_after_hint(headers.get(reqwest::header::RETRY_AFTER));
-    let kind = if status == StatusCode::UNAUTHORIZED {
-        AccountErrorKind::Authentication(bifrost_types::AuthErrorKind::ReauthorizationRequired)
-    } else if status == StatusCode::FORBIDDEN {
-        AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied)
-    } else if status == StatusCode::NOT_FOUND {
-        AccountErrorKind::NotFound(resource)
-    } else if status == StatusCode::CONFLICT
-        || status == StatusCode::PRECONDITION_FAILED
-        || status == StatusCode::LOCKED
-    {
-        AccountErrorKind::ConcurrencyConflict
-    } else if status == StatusCode::TOO_MANY_REQUESTS {
-        AccountErrorKind::Server(ServerErrorKind::RateLimited)
-    } else if matches!(status.as_u16(), 408 | 502 | 503 | 504) {
-        AccountErrorKind::Server(ServerErrorKind::Unavailable)
-    } else if status == StatusCode::INSUFFICIENT_STORAGE {
-        AccountErrorKind::Server(ServerErrorKind::QuotaExhausted)
-    } else if matches!(status.as_u16(), 400 | 422) {
-        AccountErrorKind::Request(RequestErrorKind::Malformed)
-    } else {
-        AccountErrorKind::Server(ServerErrorKind::Error {
-            status: Some(status.as_u16()),
-        })
-    };
-    let cause = if status == StatusCode::UNAUTHORIZED {
-        Cause::Auth(bifrost_types::AuthCause::ReauthorizationRequired)
-    } else if status == StatusCode::FORBIDDEN {
-        Cause::Access(bifrost_types::AccessCause::PermissionDenied {
-            resource: Some(resource),
-        })
-    } else if status == StatusCode::NOT_FOUND {
-        Cause::Request(RequestCause::NotFound {
-            what: resource,
-            id: None,
-        })
-    } else if status == StatusCode::CONFLICT
-        || status == StatusCode::PRECONDITION_FAILED
-        || status == StatusCode::LOCKED
-    {
-        Cause::State(StateCause::ConcurrencyConflict)
-    } else if status == StatusCode::TOO_MANY_REQUESTS {
-        Cause::Server(ServerCause::RateLimited { retry_hint })
-    } else if matches!(status.as_u16(), 408 | 502 | 503 | 504) {
-        Cause::Server(ServerCause::Unavailable { retry_hint })
-    } else if status == StatusCode::INSUFFICIENT_STORAGE {
-        Cause::Server(ServerCause::QuotaExhausted { retry_hint })
-    } else if matches!(status.as_u16(), 400 | 422) {
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some(protocol.field()),
-            message: None,
-        })
-    } else {
-        Cause::Server(ServerCause::Error {
-            status: Some(status.as_u16()),
-        })
-    };
-
-    let mut builder = AccountErrorBuilder::new(kind, cause)
+    let policy = http_error_policy(resource);
+    let class = bifrost_net::classify_status(status.as_u16(), None, retry_hint, policy.status);
+    let builder = AccountErrorBuilder::new(class.kind, class.cause)
         .push_cause(Cause::Attempt(AttemptCause::new(
             TransmissionState::Acknowledged,
         )))
         .protocol(protocol.protocol())
         .operation(operation)
         .status(Some(status.as_u16()));
-    if matches!(status.as_u16(), 429 | 507) {
-        builder = builder.throttle_scope(bifrost_types::ThrottleScope::Account);
-    }
+    let mut builder = policy.apply_throttle(builder, class.throttles);
     let body = body.trim();
     if !body.is_empty() {
         builder = builder.text(DiagnosticText::support_only(body.to_string()));
@@ -1055,16 +1000,90 @@ pub(crate) fn net_account_error(
     error: bifrost_net::Error,
     ctx: bifrost_net::NetErrorContext,
 ) -> AccountError {
-    bifrost_net::into_account_error_with_throttle_scope(
-        error,
-        ctx,
-        Some(bifrost_types::ThrottleScope::Account),
-    )
+    let policy = http_error_policy_for_protocol(ctx.protocol);
+    bifrost_net::into_account_error_with_throttle_scope(error, ctx, policy)
+}
+
+fn http_error_policy_for_protocol(protocol: Protocol) -> bifrost_net::HttpErrorPolicy {
+    let dialect = match protocol {
+        Protocol::CalDav => DavProtocol::CalDav,
+        Protocol::CardDav => DavProtocol::CardDav,
+        _ => unreachable!("DAV transport must name its dialect"),
+    };
+    http_error_policy(dialect.resource())
+}
+
+fn http_error_policy(resource: ResourceKind) -> bifrost_net::HttpErrorPolicy {
+    bifrost_net::HttpErrorPolicy {
+        status: bifrost_net::StatusPolicy {
+            resource: Some(resource),
+            // An Outlook user expects a locked DAV write to refresh state just
+            // like a failed validator, regardless of the response body format.
+            overrides: &[(423, bifrost_net::StatusOverride::ConcurrencyConflict)],
+        },
+        throttle_scope: Some(bifrost_types::ThrottleScope::Account),
+        throttle_budget: None,
+    }
 }
 
 #[cfg(test)]
 mod net_policy_tests {
     use super::*;
+
+    #[test]
+    fn shared_http_status_transport_and_dav_response_agree() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            for status in [
+                413, 400, 404, 408, 409, 410, 412, 422, 423, 429, 500, 502, 503, 504, 507, 599,
+            ] {
+                let code = StatusCode::from_u16(status).unwrap();
+                let headers = reqwest::header::HeaderMap::new();
+                let response = status_error(
+                    &headers,
+                    AccountOperation::Discover,
+                    code,
+                    String::new(),
+                    protocol,
+                );
+                let transport = net_account_error(
+                    bifrost_net::Error::RetryBudgetExhausted {
+                        final_response: Some(bifrost_net::FinalResponse {
+                            status: code,
+                            headers,
+                            body: bytes::Bytes::new(),
+                        }),
+                        retry_after_history: vec![],
+                        stop_reason: bifrost_net::RetryStopReason::AttemptBudget,
+                    },
+                    bifrost_net::NetErrorContext {
+                        provider: None,
+                        protocol: protocol.protocol(),
+                        operation: AccountOperation::Discover,
+                        scope: None,
+                    },
+                );
+                assert_eq!(
+                    response.kind(),
+                    transport.kind(),
+                    "{protocol:?} status {status}"
+                );
+                assert_eq!(
+                    response.recovery(),
+                    transport.recovery(),
+                    "{protocol:?} status {status}"
+                );
+                assert_eq!(
+                    response.chain().iter().next(),
+                    transport.chain().iter().next(),
+                    "{protocol:?} status {status}"
+                );
+                assert_eq!(
+                    response.telemetry_fields().throttle_scope,
+                    transport.telemetry_fields().throttle_scope
+                );
+            }
+        }
+    }
 
     #[test]
     fn generic_transport_throttle_matches_dav_status_policy() {

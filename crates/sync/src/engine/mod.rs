@@ -17,9 +17,12 @@
 //!   block, and the deferred-inventory worker.
 //! - `backfill` - the backfill orchestrator: rescan, resume planning,
 //!   and the per-partition walk.
-//! - `ack` - the account's single durable writer and `WriterHandle`.
-//! - `reattach` - recovery dispatch: reattach, restart, re-establish,
-//!   and the engine-directive arms.
+//! - `writer` - the account's single durable writer and typed protocol handle.
+//! - `teardown` - writer-last drains and bounded worker awaits.
+//! - `supervisor` - the serial recovery and scope-lifecycle listener.
+//! - `recovery` - directive dispatch, parked obligations and repair pacing.
+//! - `reattach` - replacement open, staged cutover and cancellation guard.
+//! - `establish` - shared cursor establishment and inventory fusion.
 //! - `bulk` - the bulk mutation pipeline and its campaign entry points.
 //! - `passthrough` - the read-only hydration and PIM forwarders.
 //! - `context` - `SlotContext`, the handle bundle the spawned workers
@@ -27,9 +30,8 @@
 //! - `lane` - the bounded backfill lane: producer-side flow control so a
 //!   cold start cannot outrun a consumer into the broadcast ring.
 //!
-//! The split is by concern only: nothing on the published surface moved,
-//! and every path that resolved through `crate::engine` before still
-//! does.
+//! Public entry points stay on `SyncEngine`; worker implementations own
+//! their protocols and state beneath this module.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -56,17 +58,17 @@ use crate::backfill::{
 use crate::cancel::{Boundary, BoundaryRequest};
 use crate::control::{SyncActivityGuard, SyncControl};
 use crate::cursor::CursorRegistry;
-use crate::cursor::store::{CheckpointTransition, DynCheckpointStore, InMemoryCheckpointStore};
-use crate::cursor::{ClaimLookup, PendingCoverage};
+use crate::cursor::PendingCoverage;
+#[cfg(test)]
+use crate::cursor::store::CheckpointTransition;
+use crate::cursor::store::{DynCheckpointStore, InMemoryCheckpointStore};
+use crate::delivery::{ChangeDelivery, EventScope, MultiplexerEvent};
 use crate::error::Error;
-use crate::multiplexer::changes::OperatorDecision;
-use crate::multiplexer::{
-    AckRequest, ChangeDelivery, EventScope, Multiplexer, MultiplexerEvent, MultiplexerHandle,
-    ReopenRequest, WriterRequest,
-};
+use crate::multiplexer::{Multiplexer, MultiplexerHandle};
 use crate::push::{InvalidationSinkInner, RegisteredSubscription, SubscriptionRegistry};
 use crate::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
 use crate::types::{AccountSlot, BackfillConfig, EngineConfig, WorkerTask};
+use writer::OperatorDecision;
 
 /// Result of a bounded best-effort close. Callers own logging and lifecycle
 /// cleanup; timing out drops only this close future, not their cleanup task.
@@ -84,34 +86,45 @@ async fn close_within(account: &dyn Account, timeout: Duration) -> CloseOutcome 
     }
 }
 
-mod ack;
 mod attach;
 mod backfill;
 pub mod backfill_bound;
 mod bulk;
 mod context;
 pub(crate) mod drive_start;
+mod establish;
 mod maintenance;
 mod orphan_teardown;
 mod passthrough;
 mod reattach;
-pub(crate) use reattach::DeferredSchemaReset;
-pub use reattach::{ReattachAttempt, ResetCount};
+mod recovery;
+pub(crate) mod supervisor;
+mod teardown;
+pub mod writer;
+pub use reattach::ReattachAttempt;
+pub(crate) use recovery::DeferredSchemaReset;
+pub use recovery::ResetCount;
+use supervisor::ReopenRequest;
 #[cfg(test)]
 mod tests;
 
 // Re-imported at the parent so every sibling module reaches them through
 // its own `use super::*`, exactly as they reached each other while this
 // was one file.
-use ack::{WriterHandle, ack_writer, await_ack_writer_until, await_worker_until, take_ack_writer};
 use attach::{discover_scopes_from, link_discovered_memberships, wait_for_real_subscriber};
 use backfill::{BackfillWiring, run_backfill_orchestrator};
 use backfill_bound::BackfillBound;
 use context::SlotContext;
-use reattach::{
-    DeferredScopeRepairs, RecoveryContext, RecoveryFollowUp, ReplacementOpen, accepted_push_scopes,
-    handle_account_error, log_open_skips, open_replacement, reattach_account,
+use reattach::{ReplacementOpen, accepted_push_scopes, open_replacement, reattach_account};
+use teardown::{await_ack_writer_until, await_worker_until, take_ack_writer};
+use writer::{WriterHandle, WriterRequest, ack_writer};
+
+use recovery::{
+    DeferredScopeRepairs, RecoveryContext, RecoveryFollowUp, handle_account_error, log_open_skips,
 };
+
+#[cfg(test)]
+mod reattach_tests;
 
 /// Top-level engine.
 pub struct SyncEngine {
@@ -153,7 +166,7 @@ pub struct SyncEngine {
     /// so a `Budget` deadline recorded by one account pauses every
     /// sibling that declares the same budget. Recovery paths record; the per-scope poll
     /// loop and the push reconciler consult it before driving work.
-    throttles: Arc<crate::recovery::ThrottleBucket>,
+    throttles: Arc<crate::throttle::ThrottleBucket>,
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -246,7 +259,7 @@ impl SyncEngineBuilder {
             bandwidth_registry: self.bandwidth_registry,
             ack_senders: DashMap::new(),
             lifecycle_inflight: Arc::new(AsyncMutex::new(std::collections::HashSet::new())),
-            throttles: Arc::new(crate::recovery::ThrottleBucket::new()),
+            throttles: Arc::new(crate::throttle::ThrottleBucket::new()),
         })
     }
 }
@@ -316,7 +329,7 @@ struct DetachingAccount {
     sink: Arc<InvalidationSinkInner>,
     budget: BudgetGate,
     backfill_registry: Arc<BackfillRegistry>,
-    throttles: Arc<crate::recovery::ThrottleBucket>,
+    throttles: Arc<crate::throttle::ThrottleBucket>,
     bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
 }
 
@@ -628,39 +641,20 @@ impl SyncEngine {
     /// Acknowledge a publication after committing its items to the consumer store.
     /// Persist the token with that transaction using `encode_ack_token` when
     /// acknowledgement may need to replay after a writer restart.
+    /// The result distinguishes a durable checkpoint, a withheld checkpoint
+    /// with its refusal reason, and a checkpoint-free repair acceptance.
+    /// Rejected tokens and failed persistence have distinct error variants.
     pub async fn ack(
         &self,
         account_id: &AccountId,
         token: crate::cursor::AckToken,
-    ) -> Result<(), Error> {
-        // The token binds checkpoint, lane and account identity. The caller still
-        // selects the account; that account's ledger answers a foreign token as
-        // unknown rather than replaying it as a prior attachment's receipt.
-        let Some(checkpoint) = token.checkpoint().cloned() else {
-            return self.ack_repair(account_id, token).await;
-        };
-        let scope = match &checkpoint {
-            Checkpoint::Change(cursor) => cursor.scope.clone(),
-            Checkpoint::Backfill(checkpoint) => checkpoint.scope.clone(),
-            _ => return Err(Error::SchemaIncompatible),
-        };
-        let publication = Some(token);
+    ) -> Result<crate::AckOutcome, Error> {
         let tx = self
             .ack_senders
             .get(account_id)
             .map(|r| r.value().clone())
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let (complete_tx, complete_rx) = oneshot::channel();
-        tx.send(WriterRequest::Ack(AckRequest {
-            scope,
-            checkpoint,
-            publication,
-            auto: false,
-            complete: Some(complete_tx),
-        }))
-        .await
-        .map_err(|_| Error::ShuttingDown)?;
-        complete_rx.await.map_err(|_| Error::ShuttingDown)?
+        WriterHandle::new(tx).ack(token).await
     }
 
     /// Build the published backfill checkpoint helper on this account's single
@@ -676,31 +670,8 @@ impl SyncEngine {
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         Ok(crate::backfill::BackfillCheckpointWriter::new(
             account_id.clone(),
-            crate::backfill::BackfillCheckpointTarget::attached(tx),
+            crate::backfill::BackfillCheckpointTarget::attached(WriterHandle::new(tx)),
         ))
-    }
-
-    /// Acknowledge an event publication that intentionally has no checkpoint.
-    /// Repair notifications use this path so coverage debt is discharged only
-    /// after the consumer has durably accepted the recovered object ids.
-    async fn ack_repair(
-        &self,
-        account_id: &AccountId,
-        publication: crate::cursor::AckToken,
-    ) -> Result<(), Error> {
-        let tx = self
-            .ack_senders
-            .get(account_id)
-            .map(|r| r.value().clone())
-            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let (done, wait) = oneshot::channel();
-        tx.send(WriterRequest::AcknowledgePublication {
-            publication: publication.clone(),
-            done,
-        })
-        .await
-        .map_err(|_| Error::ShuttingDown)?;
-        wait.await.map_err(|_| Error::ShuttingDown)?
     }
 
     /// Everything this account still owes: obligations no walk has resolved and
@@ -732,7 +703,7 @@ impl SyncEngine {
             .get(account_id)
             .map(|entry| entry.value().clone());
         if let Some(tx) = tx {
-            ack::WriterHandle::new(tx).get_ledger().await
+            writer::WriterHandle::new(tx).get_ledger().await
         } else {
             self.checkpoints.get_ledger(account_id).await
         }
@@ -786,7 +757,7 @@ impl SyncEngine {
             wait_for_run: true,
         };
         let (account, _activity, _admission, ledger) = loop {
-            let ledger = ack::WriterHandle::new(writer_tx.clone())
+            let ledger = writer::WriterHandle::new(writer_tx.clone())
                 .get_ledger()
                 .await?;
             if max_requests == 0 || ledger.repairable().next().is_none() {
@@ -800,7 +771,7 @@ impl SyncEngine {
             let (_account, activity, admission) = gate.acquire(&scopes).await?;
             // The writer read is another internal wait. Its answer may name
             // different scopes, and a reopen or hold may have landed meanwhile.
-            let ledger = ack::WriterHandle::new(writer_tx.clone())
+            let ledger = writer::WriterHandle::new(writer_tx.clone())
                 .get_ledger()
                 .await?;
             let scopes = ledger
@@ -812,7 +783,7 @@ impl SyncEngine {
                 scopes
                     .iter()
                     .flat_map(|scope| {
-                        crate::recovery::declared_keys(
+                        crate::throttle::declared_keys(
                             account,
                             account_id,
                             bifrost_types::ThrottleWork::Scope(scope),
@@ -841,12 +812,13 @@ impl SyncEngine {
         let observe = |error: &AccountError| {
             crate::recovery::observe_failure_throttles(&slot.throttles, account_id, error);
         };
+        let writer = WriterHandle::new(writer_tx.clone());
         tokio::select! {
             biased;
             () = slot.shutdown.cancelled() => Err(Error::ShuttingDown),
             result = crate::repair::run_repair_pass_observed(
                 account.as_ref().as_ref(), account_id, &ledger,
-                Some(&slot.delivery), &writer_tx, &slot.coverage, max_requests,
+                Some(&slot.delivery), &writer, &slot.coverage, max_requests,
                 Some(&observe),
             ) => result,
         }
@@ -1232,7 +1204,7 @@ impl SyncEngine {
     pub fn account_changes_stream(
         &self,
         account_id: &AccountId,
-    ) -> Result<crate::multiplexer::ChangesReceiver, Error> {
+    ) -> Result<crate::delivery::ChangesReceiver, Error> {
         let slot = self
             .accounts
             .get(account_id)
@@ -1277,7 +1249,7 @@ impl SyncEngine {
     pub fn account_changes_observer(
         &self,
         account_id: &AccountId,
-    ) -> Result<crate::multiplexer::ChangesReceiver, Error> {
+    ) -> Result<crate::delivery::ChangesReceiver, Error> {
         let slot = self
             .accounts
             .get(account_id)

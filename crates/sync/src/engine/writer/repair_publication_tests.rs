@@ -6,14 +6,14 @@
 //! for. A single batch stamped with whichever scope happened to be recovered
 //! first therefore delivers one scope's ids as another's, or drops them.
 
-mod common;
+use crate::test_common as common;
 
 use std::sync::Arc;
 
-use bifrost_sync::MultiplexerEvent;
-use bifrost_sync::cursor::{DebtLedger, PendingCoverage};
-use bifrost_sync::multiplexer::WriterRequest;
-use bifrost_sync::run_repair_pass;
+use super::{WriterHandle, WriterRequest};
+use crate::MultiplexerEvent;
+use crate::cursor::{DebtLedger, PendingCoverage};
+use crate::run_repair_pass;
 use bifrost_types::{
     AccountErrorBuilder, AccountErrorKind, Cause, CoverageDomain, CursorScope, DiagnosticText,
     FolderId, InventoryCoverageReport, InventoryEntry, InventoryObligation, InventoryRepairEvent,
@@ -86,7 +86,7 @@ async fn recovered_ids_are_published_under_their_own_scope() {
 
     let coverage = Arc::new(PendingCoverage::new());
     let (changes_tx, mut sentinel) = broadcast::channel::<MultiplexerEvent>(16);
-    let delivery = Arc::new(bifrost_sync::multiplexer::ChangeDelivery::new(changes_tx));
+    let delivery = Arc::new(crate::delivery::ChangeDelivery::new(changes_tx));
     // A publication only counts as delivered once a NUMBERED receiver - one
     // handed out by the delivery gate, as `account_changes_stream` does - has
     // taken it; the slot's sentinel and any observer do not count.
@@ -114,7 +114,7 @@ async fn recovered_ids_are_published_under_their_own_scope() {
         &bifrost_types::AccountId("acct".into()),
         &two_scope_ledger(),
         Some(&delivery),
-        &writer_tx,
+        &WriterHandle::new(writer_tx.clone()),
         &coverage,
         8,
     )
@@ -165,8 +165,8 @@ async fn recovered_ids_are_published_under_their_own_scope() {
 }
 
 // Mint test proof orders through the same owner as production walks.
-fn walk_generation(value: u64) -> bifrost_sync::cursor::WalkGeneration {
-    let coverage = bifrost_sync::cursor::PendingCoverage::new();
+fn walk_generation(value: u64) -> crate::cursor::WalkGeneration {
+    let coverage = crate::cursor::PendingCoverage::new();
     for _ in 0..value {
         let _ = coverage.next_generation();
     }

@@ -6,15 +6,25 @@ use crate::secret::Secret;
 /// Compute the base64 CRAM-MD5 response for a challenge.
 pub fn cram_md5_response(user: &str, pass: &str, challenge: &str) -> Result<Secret, SaslError> {
     use base64::Engine;
-    use hmac::Mac as _;
-    use std::fmt::Write;
-
     let challenge = base64::engine::general_purpose::STANDARD
         .decode(challenge.trim())
         .map_err(|e| SaslError::Protocol(format!("invalid CRAM-MD5 challenge: {e}")))?;
+    let response = cram_md5_payload(user, pass, &challenge)?;
+    Ok(base64::engine::general_purpose::STANDARD
+        .encode(response.as_bytes())
+        .into())
+}
+
+pub(crate) fn cram_md5_payload(
+    user: &str,
+    pass: &str,
+    challenge: &[u8],
+) -> Result<Secret, SaslError> {
+    use hmac::Mac as _;
+    use std::fmt::Write;
     let mut mac = <hmac::Hmac<md5::Md5> as hmac::digest::KeyInit>::new_from_slice(pass.as_bytes())
         .map_err(|e| SaslError::LocalRuntime(format!("invalid CRAM-MD5 key: {e}")))?;
-    mac.update(&challenge);
+    mac.update(challenge);
     let digest = zeroize::Zeroizing::new(mac.finalize().into_bytes().to_vec());
 
     let mut response =
@@ -25,9 +35,7 @@ pub fn cram_md5_response(user: &str, pass: &str, challenge: &str) -> Result<Secr
         let _ = write!(response, "{byte:02x}");
     }
 
-    Ok(base64::engine::general_purpose::STANDARD
-        .encode(response.as_bytes())
-        .into())
+    Ok(response.into())
 }
 
 #[cfg(test)]

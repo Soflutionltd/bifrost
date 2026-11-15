@@ -1,6 +1,7 @@
 #![allow(clippy::wildcard_imports)]
+use super::dispatch::filter_store_flags;
 use super::*;
-use crate::types::validated::ParsedUidSet;
+use crate::types::set::UidSet;
 
 const DEFAULT_FETCH_STREAM_CAPACITY: usize = 64;
 
@@ -41,7 +42,7 @@ impl ImapConnection {
         &self,
         sequence_set: &SequenceSet,
         items: &[FetchAttr],
-        mod_seq: u64,
+        mod_seq: crate::types::ModSeq,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
         self.fetch_impl(
@@ -63,7 +64,7 @@ impl ImapConnection {
         &'a self,
         sequence_set: &'a SequenceSet,
         items: &'a [FetchAttr],
-        mod_seq: u64,
+        mod_seq: crate::types::ModSeq,
         timeout: Duration,
     ) -> Result<
         (
@@ -91,7 +92,7 @@ impl ImapConnection {
     pub(super) async fn fetch_impl(
         &self,
         cmd: Command,
-        _changed_since: Option<u64>,
+        _changed_since: Option<crate::types::ModSeq>,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
         self.submit_regular(
@@ -123,7 +124,7 @@ impl ImapConnection {
         &self,
         sequence_set: &SequenceSet,
         items: &[FetchAttr],
-        mod_seq: u64,
+        mod_seq: crate::types::ModSeq,
         timeout: Duration,
     ) -> Result<(Vec<FetchResponse>, Vec<UidRange>), Error> {
         // RFC 7162 Section 3.2.6: VANISHED modifier requires QRESYNC to be ENABLEd.
@@ -131,7 +132,7 @@ impl ImapConnection {
         // Parse the requested set for defensive filtering of VANISHED (EARLIER)
         // UIDs. Returns None when the set contains `$` (RFC 5182), in which case
         // filtering is skipped inside the consumer.
-        let parsed_set = ParsedUidSet::new(sequence_set);
+        let parsed_set = UidSet::from_expression(sequence_set);
         let cmd = Command::UidFetch {
             sequence_set: sequence_set.clone(),
             items: items.to_vec().into(),
@@ -156,7 +157,7 @@ impl ImapConnection {
         &'a self,
         sequence_set: &'a SequenceSet,
         items: &'a [FetchAttr],
-        mod_seq: u64,
+        mod_seq: crate::types::ModSeq,
         timeout: Duration,
     ) -> Result<
         (
@@ -165,7 +166,7 @@ impl ImapConnection {
         ),
         Error,
     > {
-        let parsed_set = ParsedUidSet::new(sequence_set);
+        let parsed_set = UidSet::from_expression(sequence_set);
         let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_FETCH_STREAM_CAPACITY);
         let cmd = Command::UidFetch {
             sequence_set: sequence_set.clone(),
@@ -416,7 +417,7 @@ impl ImapConnection {
         sequence_set: &SequenceSet,
         operation: StoreOperation,
         flags: &[Flag],
-        unchanged_since: Option<u64>,
+        unchanged_since: Option<crate::types::ModSeqValzer>,
         timeout: Duration,
     ) -> Result<StoreResult, Error> {
         // RFC 3501 Section 2.3.2 / Section 9: \Recent is server-only and \*
@@ -443,7 +444,7 @@ impl ImapConnection {
     pub(super) async fn store_impl(
         &self,
         cmd: Command,
-        unchanged_since: Option<u64>,
+        unchanged_since: Option<crate::types::ModSeqValzer>,
         timeout: Duration,
     ) -> Result<StoreResult, Error> {
         self.submit_regular(
@@ -545,11 +546,13 @@ impl ImapConnection {
             // No MOVE, no UIDPLUS  -  cannot safely move messages.
             // Plain EXPUNGE would delete ALL \Deleted messages, not just the
             // requested set (RFC 9051 Section 6.4.3).
-            Err(Error::MissingCapability(
-                crate::error::CapabilityFailure::new(
-                    "MOVE".into(),
-                    crate::error::CapabilityFailureReason::Alternatives(vec!["UIDPLUS".into()]),
-                    "MOVE or UIDPLUS (plain EXPUNGE is unsafe for move fallback)",
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::MissingCapability(
+                    crate::error::CapabilityFailure::new(
+                        "MOVE".into(),
+                        crate::error::CapabilityFailureReason::Alternatives(vec!["UIDPLUS".into()]),
+                        "MOVE or UIDPLUS (plain EXPUNGE is unsafe for move fallback)",
+                    ),
                 ),
             ))
         }

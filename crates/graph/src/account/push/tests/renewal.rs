@@ -240,7 +240,7 @@ const RESOURCE: &str = "/me/mailFolders/inbox/messages";
 async fn account_with_stale_group(client: &GraphClient) -> (GraphAccount, SubscriptionHandle) {
     let account = webhook_account(client);
     let handle = SubscriptionHandle("h".to_string());
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         handle.clone(),
         GraphSubscriptionGroup::live(vec![expiring("stale", RESOURCE)]),
     );
@@ -288,7 +288,7 @@ async fn an_aborted_recreate_still_installs_what_it_created() {
     client.script_rest([created("fresh")]);
     let (account, handle) = account_with_stale_group(&client).await;
 
-    let blocked = account.graph_subscriptions.write().await;
+    let blocked = account.webhooks.groups_for_tests().write().await;
     let caller = spawn_recreate(&account, &handle);
     assert!(settle(|| client.wire_attempts() == 1).await, "create done");
     caller.abort();
@@ -296,11 +296,15 @@ async fn an_aborted_recreate_still_installs_what_it_created() {
     drop(blocked);
 
     let installed = settle(|| {
-        account.graph_subscriptions.try_read().is_ok_and(|groups| {
-            groups.get(&handle).is_some_and(|group| {
-                group.subscriptions.len() == 1 && group.subscriptions[0].server_id == "fresh"
+        account
+            .webhooks
+            .groups_for_tests()
+            .try_read()
+            .is_ok_and(|groups| {
+                groups.get(&handle).is_some_and(|group| {
+                    group.subscriptions.len() == 1 && group.subscriptions[0].server_id == "fresh"
+                })
             })
-        })
     })
     .await;
     assert!(installed, "the replacement takes the stale row's place");
@@ -320,7 +324,7 @@ async fn an_aborted_recreate_for_a_retired_handle_still_deletes_the_new_subscrip
     client.script_rest([created("fresh"), deleted()]);
     let (account, handle) = account_with_stale_group(&client).await;
 
-    let mut blocked = account.graph_subscriptions.write().await;
+    let mut blocked = account.webhooks.groups_for_tests().write().await;
     let caller = spawn_recreate(&account, &handle);
     assert!(settle(|| client.wire_attempts() == 1).await, "create done");
     caller.abort();
@@ -356,7 +360,7 @@ async fn a_recreate_racing_close_is_undone_not_installed() {
     client.script_rest([created("fresh"), deleted()]);
     let (account, handle) = account_with_stale_group(&client).await;
 
-    let blocked = account.graph_subscriptions.write().await;
+    let blocked = account.webhooks.groups_for_tests().write().await;
     let caller = spawn_recreate(&account, &handle);
     assert!(settle(|| client.wire_attempts() == 1).await, "create done");
     account.shutdown.cancel();
@@ -368,7 +372,7 @@ async fn a_recreate_racing_close_is_undone_not_installed() {
         crate::account::push::renewal::Replacement::HandleUnsubscribed
     );
     assert_eq!(client.wire_attempts(), 2, "the create was rolled back");
-    let groups = account.graph_subscriptions.read().await;
+    let groups = account.webhooks.groups_for_tests().read().await;
     let ids: Vec<&str> = groups[&handle]
         .subscriptions
         .iter()

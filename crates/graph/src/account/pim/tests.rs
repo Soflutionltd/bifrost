@@ -13,7 +13,7 @@ use base64::Engine;
 use bifrost_types::{
     AccessErrorKind, AccountOperation, AttachmentInline, AttachmentSource, ContainerContentClass,
     ContainerId, ContainerNamespace, DraftPatch, ErrorScope, FolderId, FolderRole,
-    HydrationProjection, Importance, MailboxId, MutationTarget, ObjectId, ProtocolErrorKind,
+    HydrationProjection, Importance, MutationTarget, ObjectId, PrincipalId, ProtocolErrorKind,
     SearchFilter, SearchRequest, SendAs, ThreadId,
 };
 use serde_json::Value;
@@ -112,7 +112,10 @@ async fn nc2a_single_id_hydration_refuses_returned_contact_after_mail_cache_hit(
         .await;
     let mut item = ews_item();
     item.item_class = "IPM.Note".to_string();
-    account.record_public_item_classes(&folder, &[item]).await;
+    account
+        .public_folders
+        .record_public_item_classes(&folder, &[item])
+        .await;
 
     let id = encode_public_item_id(&folder, "notice-1");
     let error = message_hydrate(account, id.clone(), HydrationProjection::Full)
@@ -434,7 +437,7 @@ fn shared_mailbox_folder_projects_as_shared_namespaced_container() {
     assert_eq!(container.namespace, ContainerNamespace::Shared);
     assert_eq!(
         container.owner,
-        Some(MailboxId("shared@contoso.com".to_string()))
+        Some(PrincipalId("shared@contoso.com".to_string()))
     );
     // `native_id` is the foreign-encoded form; `owner_local_id` is the
     // bare Graph folder id, never the encoded one.
@@ -1020,7 +1023,7 @@ async fn a_revoked_shared_mailbox_is_skipped_and_the_walk_continues() {
     let skip = &resumed.skipped_scopes[0];
     assert_eq!(
         skip.scope,
-        ErrorScope::Mailbox {
+        ErrorScope::Owner {
             id: ("b@contoso.com".to_string()).into()
         }
     );
@@ -1083,7 +1086,7 @@ async fn a_walk_ending_in_a_revoked_mailbox_completes_and_reports_the_skip() {
     assert_eq!(last.skipped_scopes.len(), 1);
     assert_eq!(
         last.skipped_scopes[0].scope,
-        ErrorScope::Mailbox {
+        ErrorScope::Owner {
             id: (mailbox.to_string()).into()
         }
     );
@@ -1649,7 +1652,7 @@ fn mailbox_address(value: &Value) -> Option<&str> {
 #[test]
 fn apply_send_as_as_sets_from_and_sender() {
     let mut message = json!({});
-    let send_as = SendAs::As(MailboxId("shared@contoso.com".to_string()));
+    let send_as = SendAs::As(PrincipalId("shared@contoso.com".to_string()));
     apply_send_as(&mut message, &send_as, Some("user@contoso.com"));
     assert_eq!(
         mailbox_address(message.get("from").expect("from")),
@@ -1664,7 +1667,7 @@ fn apply_send_as_as_sets_from_and_sender() {
 #[test]
 fn apply_send_as_on_behalf_sets_sender_to_user() {
     let mut message = json!({});
-    let send_as = SendAs::OnBehalfOf(MailboxId("shared@contoso.com".to_string()));
+    let send_as = SendAs::OnBehalfOf(PrincipalId("shared@contoso.com".to_string()));
     apply_send_as(&mut message, &send_as, Some("user@contoso.com"));
     assert_eq!(
         mailbox_address(message.get("from").expect("from")),
@@ -1679,7 +1682,7 @@ fn apply_send_as_on_behalf_sets_sender_to_user() {
 #[test]
 fn apply_send_as_on_behalf_omits_sender_without_user_email() {
     let mut message = json!({});
-    let send_as = SendAs::OnBehalfOf(MailboxId("shared@contoso.com".to_string()));
+    let send_as = SendAs::OnBehalfOf(PrincipalId("shared@contoso.com".to_string()));
     apply_send_as(&mut message, &send_as, None);
     assert_eq!(
         mailbox_address(message.get("from").expect("from")),
@@ -1693,7 +1696,7 @@ fn apply_send_as_on_behalf_honors_explicit_from() {
     let mut message = json!({
         "from": { "emailAddress": { "address": "author@contoso.com" } }
     });
-    let send_as = SendAs::OnBehalfOf(MailboxId("shared@contoso.com".to_string()));
+    let send_as = SendAs::OnBehalfOf(PrincipalId("shared@contoso.com".to_string()));
     apply_send_as(&mut message, &send_as, Some("user@contoso.com"));
     // Explicit author survives; only sender is stamped.
     assert_eq!(
@@ -1711,7 +1714,7 @@ fn apply_send_as_as_overrides_explicit_from() {
     let mut message = json!({
         "from": { "emailAddress": { "address": "author@contoso.com" } }
     });
-    let send_as = SendAs::As(MailboxId("shared@contoso.com".to_string()));
+    let send_as = SendAs::As(PrincipalId("shared@contoso.com".to_string()));
     apply_send_as(&mut message, &send_as, Some("user@contoso.com"));
     // `As` forces author == sender == mailbox.
     assert_eq!(
@@ -1726,7 +1729,7 @@ fn apply_send_as_as_overrides_explicit_from() {
 
 #[test]
 fn send_as_unknown_mailbox_is_malformed() {
-    let err = send_as_unknown_mailbox(&MailboxId("nobody@contoso.com".to_string()));
+    let err = send_as_unknown_mailbox(&PrincipalId("nobody@contoso.com".to_string()));
     assert!(matches!(
         err.kind(),
         bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
@@ -2049,7 +2052,7 @@ fn send_as_on_behalf_of_keeps_an_explicit_author_but_stamps_the_sender() {
     let mut message = json!({ "from": { "emailAddress": { "address": "author@contoso.com" } } });
     apply_send_as(
         &mut message,
-        &SendAs::OnBehalfOf(MailboxId("shared@contoso.com".to_string())),
+        &SendAs::OnBehalfOf(PrincipalId("shared@contoso.com".to_string())),
         Some("me@contoso.com"),
     );
     assert_eq!(
@@ -2067,7 +2070,7 @@ fn send_as_on_behalf_of_fills_a_missing_author_with_the_mailbox() {
     let mut message = json!({});
     apply_send_as(
         &mut message,
-        &SendAs::OnBehalfOf(MailboxId("shared@contoso.com".to_string())),
+        &SendAs::OnBehalfOf(PrincipalId("shared@contoso.com".to_string())),
         None,
     );
     assert_eq!(
@@ -2087,7 +2090,7 @@ fn send_as_overrides_any_consumer_supplied_author() {
     let mut message = json!({ "from": { "emailAddress": { "address": "author@contoso.com" } } });
     apply_send_as(
         &mut message,
-        &SendAs::As(MailboxId("shared@contoso.com".to_string())),
+        &SendAs::As(PrincipalId("shared@contoso.com".to_string())),
         Some("me@contoso.com"),
     );
     assert_eq!(
@@ -2502,13 +2505,15 @@ async fn typed_writes_refuse_public_folder_items_without_a_request() {
     client.script_rest([]);
     let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
     let public = encode_public_item_id(&FolderId("AAMkPF=".to_string()), "AAMkItem=");
-    account.routing_map.write().await.insert(
-        FolderId("AAMkPF=".to_string()),
-        crate::account::cursor::PublicFolderRouting {
-            anchor_mailbox: "content@contoso.com".to_string(),
-            public_folder_mailbox: Some("pf@contoso.com".to_string()),
-        },
-    );
+    account
+        .seed_public_folder_for_tests(
+            FolderId("AAMkPF=".to_string()),
+            crate::account::cursor::PublicFolderRouting {
+                anchor_mailbox: "content@contoso.com".to_string(),
+                public_folder_mailbox: Some("pf@contoso.com".to_string()),
+            },
+        )
+        .await;
     let expect_unsupported = |result: Result<(), bifrost_types::AccountError>, operation| {
         let error = result.expect_err("public-folder write must be refused");
         assert_eq!(error.kind(), &AccountErrorKind::Unsupported(operation));
@@ -2696,7 +2701,11 @@ async fn deferred_send_stamping_evicts_only_the_owning_mailbox_after_success() {
                 let requests = client.take_rest_requests();
                 assert_eq!(requests.len(), 1);
                 assert_eq!(requests[0].method, "PATCH");
-                let prefix = account.client_for_owner(owner).unwrap().api_path_prefix();
+                let prefix = account
+                    .mailboxes
+                    .client_for_owner(owner)
+                    .unwrap()
+                    .api_path_prefix();
                 assert!(
                     requests[0]
                         .url

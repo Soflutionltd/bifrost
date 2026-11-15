@@ -15,7 +15,7 @@ use crate::sieve::{
     Property as SieveProperty, SieveScriptGet, SieveScriptId, SieveScriptQuery, SieveScriptSet,
 };
 
-type SieveAccount<T> = crate::account::Account<T>;
+type SieveAccount<T> = crate::account::Account<T, crate::core::capability::Sieve>;
 
 const SIEVE_MIME: &str = "application/sieve";
 const SIEVE_DOWNLOAD_NAME: &str = "filter.sieve";

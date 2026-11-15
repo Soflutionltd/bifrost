@@ -1,7 +1,11 @@
 # bifrost-caldav reference
 
-DAV generic net translation explicitly passes account throttle scope, matching
-the DAV status ladder.
+DAV status errors and generic net failures use `bifrost_net::classify_status`
+with the same declared policy: a dialect resource hint and a 423 conflict
+override. Shared 409/412 conflicts refresh state, and 400/413/422 are malformed
+requests. An enterprise user gets the same recovery for the same refusal
+regardless of which transport path preserved it. The policy applies account
+throttle scope once for 429/507; dispatch does not stamp it again.
 
 Every request declares its `ReplayPolicy` at the call site. Every event PUT
 (create, conditional update and unconditional update alike), scheduling
@@ -148,7 +152,7 @@ read its terminal status after earlier proven refusals, the shared
 `bifrost_net::is_proven_refusal` rule (401, 429, 405 and 501); a 503 can
 follow an upstream commit, so it stays commit-ambiguous, and a history
 containing a 503 or transport ambiguity keeps reconciliation. Conditional
-412 and locked 423 remain DAV conflicts; 400/422 are malformed requests and
+412 and locked 423 remain DAV conflicts; 400/413/422 are malformed requests and
 408/502/503/504 are unavailable. Cursor-invalid 410 is interpreted only by the
 sync-collection caller before the generic resource ladder.
 
@@ -364,6 +368,16 @@ its scope and action.
   exclusive `EventTime` contract: an iCalendar all-day DTEND is neither
   decremented on read nor incremented on write (it matches bifrost-google's
   verbatim exclusive end).
+  The projection constructs shared parsed `EventTime` values. The writer reads
+  their kinds rather than an enclosing all-day flag, rejects malformed touched
+  bounds, and uses the shared exclusive-end and compatible-shape validation.
+  An explicit all-day/timed patch converts merged stored bounds before writing
+  them. Missing ends retain the omission policy below, and scalar patches leave
+  malformed untouched times alone. Relative and absolute reminder triggers are
+  parsed into shared timing types; malformed triggers remain `Unparsed`.
+  For an inconsistent observed timed DTSTART and date-only DTEND, the start
+  determines the event's mode. Both bounds remain available for inspection;
+  a damaged end must not turn a timed appointment into an all-day row.
   Tokenizing rather than using caldata's typed builder means strict
   singleton enforcement never hard-fails ingest: a duplicate DTSTART is
   resolved with a precedence picker (VALUE=DATE > TZID > UTC > floating)
@@ -669,14 +683,11 @@ Supported calendar primitives:
   is classified independently. A query leg that reports the filter unsupported
   degrades the WHOLE lane to the listing rather than the one property:
   answering out of the three properties a server happened to accept would
-  narrow the search with no signal to the consumer. Every leg goes through `accumulate_leg`, which
-  is the single funnel each leg result passes through: all four ways a leg can
-  fail - transport, a non-2xx status, a body that will not parse, and a 207
-  describing complete failure - are folded into `degraded` there, and the
-  function returns nothing, so a leg added later has no unrouted path
-  available to it. A malformed body is account-authored data, classified and
-  survived rather than asserted on. A leg that fails wholly after other legs
-  returned events keeps those events, and the worst recovery class
+  narrow the search with no signal to the consumer. The shared
+  `DavCollectionClient<D>::fetch` folds transport, HTTP, parse and complete-207
+  failures into one `degraded` lane. Parsing is inside the leg result, so a
+  malformed later body cannot discard earlier observations. A wholly failed
+  later leg keeps earlier events, and the worst recovery class
   encountered rides `MultigetFetch::degraded` into `Page::skipped_scopes` as
   an `ErrorScope::Calendar` entry - `failed_ids` carries ids with no
   classification, so folding a 401 into it would keep the data and destroy
@@ -1102,7 +1113,7 @@ DAV bound exists: no server advertises one and nothing needs one yet.
 `bifrost-net::ConcurrencyLimit` is available if one is ever wanted. Dispatch
 is ordered, so the
 merged report and the surviving degraded error do not depend on completion
-order. Offset continuations still re-run search so each page reflects a
+order. Watermark continuations still re-run search so each page reflects a
 fresh server observation and carries that observation's failure lanes.
 
 ## The shared layer: bifrost-dav-core
@@ -1117,6 +1128,18 @@ What moved: `DavRequest` / `DavResponse` / `DavBody`, `settle_body`,
 `normalize_http_etag`, `prepare_if_match`) and `PutCondition`, the whole
 status-to-`AccountError` ladder with its constructors, and
 `worse_recovery` (using `RecoveryClass::severity` for dominance).
+
+`DavRequest`, `DavResponse`, `DavBody` and the configured dispatch base carry
+`DavHref`, which keeps native spelling beside a parsed absolute HTTP(S) URL.
+Relative XML hrefs need resolution first. Fluent request construction and
+configured bases retain malformed input as a deferred local error. Dispatch
+hands the parsed target to net and still checks the original spelling against
+credential admission, including empty userinfo. Effective response hrefs retain
+the parsed target supplied by net's hop policy through body settlement.
+Account ids and cursor/XML serialization remain strings: enterprise users must keep the same resource
+identities across this representation change. `DavHref::key` uses the existing
+`DavHrefKey` rule for equivalence, including encoded path separators and query
+identity, rather than changing the saved spelling to a comparison key.
 
 `status_error` and `parse_error` stamp an `Attempt(Acknowledged)`. Every status
 the ladder classifies is one the server sent - on the response line, or as the
@@ -1241,7 +1264,7 @@ terminal status to be consumed after the shared walk refreshes a rejected token.
 remains data for MOVE fallback; a lone 503 reconciles and cannot consume a
 queued 405. A genuine first-attempt 412 stays a conflict.
 
-**Multi-step failures preserve the leaf.** Relocation returns crate-local
+**Multi-step failures preserve the leaf.** Relocation returns shared
 Before, MovedThenPut or CopiedThenDelete progress, and the public update attaches
 a record exactly once. The plan protects committed Blocking moves/copies
 without reclassifying the later error or restating an idempotency override.
@@ -1350,10 +1373,12 @@ the failures it carries come from two different legs. It was never published
 (this crate is private), and the two rules its tests pinned - a zero page size
 is an exhausted page rather than one pointing at its own watermark, and a
 watermark past every key is an empty final page - moved onto
-`slice_after_watermark`, which is where they actually live. What stays local is what
-genuinely differs: the magic bytes (`CALDAVET1` / `CDAVCTAG1`), the
-envelope-version and scope validation, the name of the token, and the crate's
-own `cursor_error`.
+`slice_after_watermark`, which is where they actually live. The protocol's
+`Dialect` now supplies the magic bytes (`CALDAVET1` /
+`CDAVCTAG1`) and payload version. `DavCollectionAccount<D>` owns envelope and
+scope validation, cursor errors, snapshot construction and preservation. The
+optional token remains opaque storage; protocol hooks alone interpret it as a
+sync-token or ctag.
 
 The filtered-query half lives in `bifrost_dav_core::query`: `FilteredHrefs`
 (matched, or the server will not run this filter), `HrefQuery` (candidate
@@ -1365,19 +1390,16 @@ So the drift rule from the next section still applies, but to a much smaller
 remainder: the query bodies, the property constants, the iCalendar projection,
 the scheduling lane, and the handful of error mappings listed below.
 
-Also NOT moved, and for the same reason as `not_found_error`:
-`bifrost-carddav` has its own `send_status_request` that returns the response
-ETag, where CalDAV's discards it. CardDAV's `put_vcard` and `delete_vcard`
-report the new validator to their callers and CalDAV's equivalents do not, so
-collapsing the two would have dropped an etag on every CardDAV write.
+`DavCollectionClient<D>` returns response ETags from PUT and unconditional
+DELETE. CardDAV retains the validator and CalDAV's delete wrapper discards it;
+sharing the mechanics does not discard information from either protocol.
+Conditional deletes retain the strong caller precondition and missing-target
+failure, while unconditional deletes absorb 404/410.
 
-The two dialects differed in exactly three values - the `ResourceKind` a 404 and
-a 403 name, the `Protocol` stamp, and the `field` label on a local argument
-error - so those became a `DavProtocol` parameter, and this crate binds it once
-as `const DAV: DavProtocol = DavProtocol::CalDav`. That binding is load-bearing
-for the crate's entire error surface, so
-`every_error_this_crate_mints_is_stamped_caldav` pins it; ablating the constant
-before that test existed failed exactly one unrelated assertion.
+`Dialect::DAV` binds the shared dispatch/status policy to the account's
+protocol and resource kinds. `dav_error_constructors!` binds the existing local
+error entry points once; `every_error_this_crate_mints_is_stamped_caldav` checks
+the resulting CalDAV stamp.
 
 What deliberately did NOT move: `not_found_error` differs between the crates in
 construction, though not in what it stamps. Both carry an `Acknowledged`
@@ -1414,41 +1436,71 @@ unreadable or missing stays `Usable`, with those resources in the failed lane
 yield fetched data or enter the benign missing-data lane. Successful propstats
 still admit a resource despite refused optional properties.
 
-## This crate and bifrost-carddav are near-duplicates, and drift is the defect
+## Shared collection kernel
 
-The transport, credential gate, error ladder, 207 parser, polling cursor and
-principal discovery walk are all shared through `bifrost-dav-core` now and can
-no longer drift - that includes the `ResponseParts` propstat state machine, href
-resolution, multiget classification, the cursor codec, the snapshot diff and
-the well-known fallback, all of which this section used to list as
-hand-mirrored. What remains duplicated is a much smaller remainder: the query
-bodies and property constants, the per-domain projections (`ical.rs` /
-`vcard.rs`), the discovery step after the principal (which genuinely differs:
-a multi-property principal PROPFIND here, an addressbook-home lookup there), the
-account-level orchestration around the shared pieces, and the `Unsupported`
-stubs each crate carries for the other's domain.
+`bifrost_dav_core::collection::Dialect` carries multiget element/namespace,
+data property, content type, extension, cursor magic/version, object type,
+protocol identity, item and skipped-scope constructors, href resolution, parsers
+and PUT replay policy. Each protocol binds one marker in `dialect.rs`.
+`DavProtocol` remains the dispatch/status policy value; the trait adds the
+collection syntax and account identity without a second HTTP status ladder.
 
-Nothing compares the two copies, so divergence is silent. Five separate defects
-in one hardening arc were exactly that: `escape_xml` quoting, the immediate
-collection-marker promotion, the eleven hand-maintained CalDAV `propstat_*`
-twins, the phantom-collection asymmetry, and `as_fetched_vcard` missing the
-`is_collection` guard its CalDAV twin already had (which surfaced an echoed
-collection as a phantom card).
+`DavCollectionClient<D>` borrows the existing `DavDispatch`, including its
+credential gate, meter and any per-hop directory guard. It owns the 50-resource
+multiget chunks, ordered four-leg buffer, raw filtered-query classification,
+whole-query filter degradation, result settlement, and conditional CRUD.
+`ResourceListing`, `FetchedResource`, `MultigetReport` and `MultigetFetch` are
+shared result types. The protocol parsers keep semantic local names as aliases.
+`QUERY_HREF_PROPS` and the default 250-resource page size have one definition.
 
-**Any fix to shared-shape code in one crate must be checked against the other.**
-Where the asymmetry is real - CardDAV has no `sync-collection` path and
-discovers addressbook-home-set plus optional directory-gateway properties - it is design, not oversight. Where the fix is to
-something both crates route through, it belongs in `bifrost-dav-core` rather
-than in one `account.rs`.
+`DavCollectionAccount<D>` is a stateless kernel called by both Account impls.
+It owns discovered-scope construction, routing and coverage, cursor encoding
+and validation, listing-to-snapshot construction, establishment, inventory and
+change-stream envelopes, resource paging, failure-lane settlement and relocation.
+`CollectionSnapshot` stores collection URL, opaque token, entries and transient
+failed hrefs. Complete inventory refuses partial member coverage before emitting
+items or a checkpoint. Legacy type scopes cover only the selected collection;
+folder scopes cover that folder. Persisted bytes and payload version 2 remain
+unchanged, including magic suffixes and the folder/payload URL cross-check.
 
-Collapsing the two published crates outright into a single `bifrost-dav`
-parameterized over the collection kind was considered and NOT taken. It would
-remove the remaining duplication, but it reshapes two published pre-1.0
-surfaces whose consumers are outside this workspace by definition, and the
-duplication count is not an argument that can settle a published-surface
-question. The private shared crate was taken instead, on the `bifrost-sasl`
-precedent: it kills the drift without either crate's contract moving. Reopening
-that choice is a repository-owner decision, not an engineering conclusion.
+Protocol hooks supply snapshots and changes. CalDAV reads sync-token and a
+VEVENT-filtered listing, with its existing unsupported-filter fallback; its
+change hook drains sync-collection when a token exists. CardDAV preflights the
+directory guard, reads ctag once per poll and skips listing an unchanged book.
+Both hooks use the same snapshot preservation and token-advancement decision.
+The kernel translates directory guard refusals into retirement of the original
+personal cursor scope, retaining transmission evidence.
+
+Relocation tries MOVE, then copies with If-None-Match before deleting the old
+resource when MOVE is unsupported. A failed cleanup retains typed committed
+progress and the failed leaf's recovery, hints and evidence. Resource filenames
+and item scopes come from the dialect. Calendar PUTs remain Never because
+replaying can send another scheduling message; vCard creates are Never and
+other PUTs retain IdempotentUnlessConditional. An enterprise user must retain
+both scheduling correctness and safe vCard retry behavior.
+
+`IdleLifecycle` keeps every subscriber pending until close and releases its
+close mutex before waking subscribers, allowing reentrant close calls. Common unsupported
+Account methods and local error bindings are declared once in dav-core macros.
+The multiget concurrency, partial HTTP/parse failure and wholly malformed-leg
+assertions live in `test_support::collection` and are instantiated by both
+protocol suites with their real dialects and parsers. Account tests continue to
+exercise each protocol's projection, scheduling, directory and token hooks.
+
+## Collection dialect boundary
+
+The collection account machinery is shared through `bifrost-dav-core` as well
+as the dispatcher, 207 machine and byte codec. Fixes to batching, settlement,
+paging, cursor envelopes, inventory coverage and relocation belong in that
+shared layer. The protocol crates keep their property sets, query builders,
+discovery after the principal and payload projections. CalDAV also keeps
+scheduling, recurrence-qualified ids and the RFC 6578 sync-collection drain;
+CardDAV keeps its directory guard and ctag polling hook.
+
+The two published factories and configuration types remain separate. An
+enterprise user gets the same partial-failure and cursor behavior for both
+protocols while their distinct scheduling and directory policies remain
+explicit.
 
 ## Unsupported error construction
 

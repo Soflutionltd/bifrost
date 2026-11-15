@@ -34,7 +34,7 @@ pub struct FetchResponse {
     /// Fetched body sections per `BODY[section]<partial>` (RFC 3501 Section 6.4.5).
     pub body_sections: Vec<BodySection>,
     /// `MODSEQ` value (RFC 7162 CONDSTORE Section 3.1.3).
-    pub mod_seq: Option<u64>,
+    pub mod_seq: Option<super::ModSeqValzer>,
     /// `SAVEDATE` timestamp string (RFC 8514 Section 3).
     ///
     /// The date-time when the message was saved to the mailbox, or `None` if
@@ -57,20 +57,20 @@ pub struct FetchResponse {
     ///
     /// A server-assigned unique identifier for this particular instance of a message.
     /// The value is an `objectid` string (1-255 alphanumeric/dash/underscore characters).
-    pub email_id: Option<String>,
+    pub email_id: Option<super::validated::ObjectId>,
     /// `THREADID` value (RFC 8474 Section 4).
     ///
     /// A server-assigned identifier grouping related messages into threads,
     /// or `None` if the server returned NIL (no thread association).
-    pub thread_id: Option<String>,
+    pub thread_id: Option<super::validated::ObjectId>,
     /// Gmail `X-GM-MSGID` value.
     ///
     /// Gmail assigns this stable unsigned 64-bit identifier to each message.
-    pub gmail_msg_id: Option<u64>,
+    pub gmail_msg_id: Option<super::ids::GmailMessageId>,
     /// Gmail `X-GM-THRID` value.
     ///
     /// Gmail assigns this stable unsigned 64-bit identifier to each thread.
-    pub gmail_thread_id: Option<u64>,
+    pub gmail_thread_id: Option<super::ids::GmailThreadId>,
     /// Gmail `X-GM-LABELS` values.
     ///
     /// These are exposed as the server returned them. The generic IMAP
@@ -371,7 +371,7 @@ pub struct StoreResult {
     /// Completion status from the tagged response.
     ///
     /// Always `Ok` for a STORE sent without `UNCHANGEDSINCE` - a tagged
-    /// `NO` there is a plain refusal and surfaces as `Error::No`. A
+    /// `NO` there is a plain refusal and surfaces as `crate::error::ServerStatus::No`. A
     /// conditional STORE preserves tagged `NO` so callers can attribute a
     /// `[MODIFIED ...]` rejection to the named messages.
     pub status: super::response::StatusKind,

@@ -378,9 +378,14 @@ async fn submit_batch_with_version(
             .iter()
             .map(super::batch::subrequest_replayable)
             .collect();
-        let response = match account.batch_resource(&request_ids) {
+        let response = match account.mailboxes.batch_resource(&request_ids) {
             Ok(resource) => {
-                super::batch::submit(&account.client, resource, &BatchRequest { requests }).await
+                super::batch::submit(
+                    account.mailboxes.primary(),
+                    resource,
+                    &BatchRequest { requests },
+                )
+                .await
             }
             Err(error) => Err(error),
         };
@@ -394,7 +399,7 @@ async fn submit_batch_with_version(
                     resolved,
                     kind,
                     &mut item_outcomes,
-                    &|id| account.budget_for_object(id),
+                    &|id| account.mailboxes.budget_for_object(id),
                     &replayable,
                 );
             }
@@ -733,7 +738,7 @@ pub(crate) async fn public_write_destination(
     account: &GraphAccount,
     folder: &bifrost_types::FolderId,
 ) -> bool {
-    account.is_known_public_folder(folder).await
+    account.public_folders.is_known_public_folder(folder).await
 }
 
 /// Admission is shared by both write doors before any preflight request.
@@ -764,6 +769,7 @@ pub(crate) async fn fetch_message_observation(
         GraphErrorContext::graph(operation).with_scope(ErrorScope::Message { id: id.clone() });
     let parsed = super::foreign::parse_message_id(id);
     let client = account
+        .mailboxes
         .client_for_owner(parsed.owner())
         .map_err(|error| into_account_error(error, context.clone()))?;
     let query = super::pim::select_query(select);
@@ -815,7 +821,10 @@ pub(crate) fn plan_message_write(
     etag: Option<&GraphETag>,
 ) -> Result<Option<BatchRequestItem>, crate::error::GraphError> {
     let parsed = super::foreign::parse_message_id(id);
-    let prefix = account.client_for_owner(parsed.owner())?.api_path_prefix();
+    let prefix = account
+        .mailboxes
+        .client_for_owner(parsed.owner())?
+        .api_path_prefix();
     let native = bifrost_net::url::encode_path_component(parsed.native_id());
     let (method, suffix, body) = match effect {
         MessageWrite::Patch(body) => {
@@ -1199,7 +1208,8 @@ mod tests {
             cache.insert("m2".into(), GraphETag::from_odata_annotation("W/\"m2\""));
         }
         account
-            .client
+            .mailboxes
+            .primary()
             .script_rest([crate::client::ScriptedRestResponse::json(
                 reqwest::StatusCode::OK,
                 json!({"responses": [{"id": "0", "status": 200, "body": {"id": "m2"}}]}),
@@ -1231,7 +1241,7 @@ mod tests {
             &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::UpdateFlags)
         );
         assert_eq!(success.item.0, "m2");
-        let requests = account.client.take_rest_requests();
+        let requests = account.mailboxes.primary().take_rest_requests();
         assert_eq!(requests.len(), 1, "{requests:?}");
         let subrequests = requests[0].body.as_ref().unwrap()["requests"]
             .as_array()
@@ -1247,7 +1257,7 @@ mod tests {
             &FolderId("AAMkPF=".to_string()),
             "AAMkItem=",
         );
-        account.client.script_rest([]);
+        account.mailboxes.primary().script_rest([]);
         let events = bulk_destroy_stream(
             account.clone(),
             Box::pin(futures::stream::iter([public.clone()])),
@@ -1265,20 +1275,22 @@ mod tests {
             failure.error.kind(),
             &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::BulkDestroy)
         );
-        assert!(account.client.take_rest_requests().is_empty());
+        assert!(account.mailboxes.primary().take_rest_requests().is_empty());
     }
 
     #[tokio::test]
     async fn move_into_a_discovered_public_folder_is_refused_before_any_request() {
         let account = shared_account();
-        account.routing_map.write().await.insert(
-            FolderId("AAMkPF=".to_string()),
-            crate::account::cursor::PublicFolderRouting {
-                anchor_mailbox: "content@contoso.com".to_string(),
-                public_folder_mailbox: Some("pf@contoso.com".to_string()),
-            },
-        );
-        account.client.script_rest([]);
+        account
+            .seed_public_folder_for_tests(
+                FolderId("AAMkPF=".to_string()),
+                crate::account::cursor::PublicFolderRouting {
+                    anchor_mailbox: "content@contoso.com".to_string(),
+                    public_folder_mailbox: Some("pf@contoso.com".to_string()),
+                },
+            )
+            .await;
+        account.mailboxes.primary().script_rest([]);
         let events = bulk_move_stream(
             account.clone(),
             Box::pin(futures::stream::iter([ObjectId("m1".into())])),
@@ -1297,7 +1309,7 @@ mod tests {
             failure.error.kind(),
             &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::BulkMove)
         );
-        assert!(account.client.take_rest_requests().is_empty());
+        assert!(account.mailboxes.primary().take_rest_requests().is_empty());
     }
 
     #[tokio::test]
@@ -1308,7 +1320,7 @@ mod tests {
             .write()
             .await
             .insert("m1".into(), GraphETag::from_odata_annotation("W/\"new\""));
-        account.client.script_rest([crate::client::ScriptedRestResponse::json(
+        account.mailboxes.primary().script_rest([crate::client::ScriptedRestResponse::json(
             reqwest::StatusCode::OK,
             json!({"responses": [
                 {"id": "0", "status": 412, "body": {"error": {"code": "ErrorIrresolvableConflict", "message": "stale"}}},
@@ -1349,7 +1361,7 @@ mod tests {
             &bifrost_types::AccountErrorKind::ConcurrencyConflict
         );
         assert_eq!(success.item.0, "m2");
-        let requests = account.client.take_rest_requests();
+        let requests = account.mailboxes.primary().take_rest_requests();
         assert_eq!(
             requests.len(),
             1,
@@ -1372,7 +1384,7 @@ mod tests {
             "m2".into(),
             GraphETag::from_odata_annotation("W/\"cached\""),
         );
-        account.client.script_rest([
+        account.mailboxes.primary().script_rest([
             crate::client::ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({
                 "responses": [{"id": "0", "status": 200, "body": {"id": "m1"}}]
             })),
@@ -1428,7 +1440,7 @@ mod tests {
             *conflict.error.kind(),
             bifrost_types::AccountErrorKind::ConcurrencyConflict
         );
-        let calls = account.client.take_rest_requests();
+        let calls = account.mailboxes.primary().take_rest_requests();
         assert_eq!(
             calls.len(),
             2,
@@ -1486,7 +1498,7 @@ mod tests {
                 bifrost_types::AccountErrorKind::Unsupported(operation)
             );
         }
-        assert!(account.client.take_rest_requests().is_empty());
+        assert!(account.mailboxes.primary().take_rest_requests().is_empty());
     }
 
     #[tokio::test]
@@ -2338,7 +2350,8 @@ mod tests {
                 .await
                 .insert("m1".into(), GraphETag::from_odata_annotation("W/\"e\""));
             account
-                .client
+                .mailboxes
+                .primary()
                 .script_rest([crate::client::ScriptedRestResponse::json(
                     reqwest::StatusCode::OK,
                     json!({"responses": [{"id": "0", "status": 200, "body": {"id": "m1"}}]}),
@@ -2362,7 +2375,7 @@ mod tests {
                 }),
                 "{op:?}: {batch:?}"
             );
-            let requests = account.client.take_rest_requests();
+            let requests = account.mailboxes.primary().take_rest_requests();
             assert_eq!(
                 requests[0].body.as_ref().unwrap()["requests"][0]["body"],
                 expected_body,
@@ -2382,7 +2395,8 @@ mod tests {
             .await
             .insert("m1".into(), GraphETag::from_odata_annotation("W/\"e\""));
         account
-            .client
+            .mailboxes
+            .primary()
             .script_rest([crate::client::ScriptedRestResponse::json(
                 reqwest::StatusCode::OK,
                 json!({"responses": [{"id": "0", "status": 200, "body": {"id": "m1"}}]}),
@@ -2611,7 +2625,8 @@ mod tests {
     async fn mutation_batches_are_paged_and_the_stream_end_is_the_terminus() {
         let account = shared_account();
         account
-            .client
+            .mailboxes
+            .primary()
             .script_rest([crate::client::ScriptedRestResponse::json(
                 reqwest::StatusCode::OK,
                 serde_json::json!({ "responses": [{ "id": "0", "status": 204 }] }),
@@ -2692,7 +2707,7 @@ mod tests {
         ] {
             let mut account = shared_account();
             account.capabilities.batching_policy.max_items = 2;
-            let client = account.client.clone();
+            let client = account.mailboxes.primary().clone();
             client.script_wire(
                 [
                     failure,
@@ -2771,7 +2786,7 @@ mod tests {
             "cached".to_string(),
             GraphETag::from_odata_annotation("etag"),
         );
-        account.client.script_rest([
+        account.mailboxes.primary().script_rest([
             // A 404 preflight now means the message vanished and is skipped, so
             // the preflight failure kept here must be a different refusal.
             crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::FORBIDDEN),
@@ -2799,7 +2814,7 @@ mod tests {
                 .iter()
                 .all(|item| matches!(item, ItemOutcome::Failed(_)))
         );
-        let requests = account.client.take_rest_requests();
+        let requests = account.mailboxes.primary().take_rest_requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[1].body.as_ref().unwrap()["requests"]
@@ -2823,7 +2838,8 @@ mod tests {
                 .insert(id.0.clone(), GraphETag::from_odata_annotation("etag"));
         }
         account
-            .client
+            .mailboxes
+            .primary()
             .script_rest([crate::client::ScriptedRestResponse::empty(
                 reqwest::StatusCode::BAD_REQUEST,
             )]);
@@ -2846,7 +2862,7 @@ mod tests {
                 .iter()
                 .all(|item| matches!(item, ItemOutcome::Failed(_)))
         );
-        let requests = account.client.take_rest_requests();
+        let requests = account.mailboxes.primary().take_rest_requests();
         assert_eq!(requests.len(), 1);
         let submitted = requests[0].body.as_ref().unwrap()["requests"]
             .as_array()

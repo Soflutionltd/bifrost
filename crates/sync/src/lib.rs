@@ -30,15 +30,18 @@ mod backoff;
 pub mod cancel;
 pub mod control;
 pub mod cursor;
+pub mod delivery;
 pub mod engine;
+mod engine_errors;
 pub mod error;
 mod inventory_walk;
 pub mod multiplexer;
 pub mod mutation;
 pub mod push;
-pub mod recovery;
+mod recovery;
 pub mod repair;
 pub mod scheduler;
+pub mod throttle;
 pub mod types;
 
 #[cfg(test)]
@@ -58,11 +61,13 @@ pub use bifrost_types::{InvalidationSink, SinkPush, WatchEvent};
 // Engine-side error and the shared warning vocabulary. Terminal
 // account errors are surfaced through `bifrost_types::Fatal` (the
 // engine boundary newtype) via `RecoveryPlan::Terminal`.
-pub use error::{Error, Warning};
+pub use error::{
+    AckOutcome, AckRejection, AdmissionFailure, CompletionRefusal, Error, EstablishFailure, Warning,
+};
 
 // Throttle bucket so consumers / instrumentation can observe engine
 // throttle state if needed.
-pub use recovery::ThrottleBucket;
+pub use throttle::ThrottleBucket;
 
 // Cursor and checkpoint plumbing.
 pub use cursor::{
@@ -100,8 +105,8 @@ pub use mutation::{
     ReadbackOutcome, run_readback_guard,
 };
 
-// Multiplexer types consumers want to pattern-match against (the
-// per-account broadcast yields `MultiplexerEvent`).
-pub use multiplexer::{ChangesReceiver, EventScope, MultiplexerEvent, ReopenRequest};
+// Consumer output types for the per-account change broadcast.
+pub use delivery::{ChangesReceiver, EventScope, MultiplexerEvent};
+pub use engine::supervisor::ReopenRequest;
 
 pub use push::health::{PushHealth, PushLaneHealth, PushLaneState};

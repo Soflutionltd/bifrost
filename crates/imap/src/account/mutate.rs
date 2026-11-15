@@ -9,7 +9,7 @@ use bifrost_types::{
     TargetRef, TargetRole,
 };
 #[cfg(test)]
-use bifrost_types::{RequestErrorKind, ServerErrorKind};
+use bifrost_types::{RequestErrorKind, ServerErrorKind, TransmissionState};
 #[cfg(test)]
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
@@ -17,16 +17,14 @@ use std::collections::{BTreeMap, HashMap};
 use bifrost_types::{
     AccountError, AccountErrorKind, AccountOperation, AccountStream, BatchFailure, BatchItemId,
     FlagOp, IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol,
-    SyncEvent, TransmissionState,
+    SyncEvent,
 };
 use futures::StreamExt;
 
 use crate::types::{Flag, MailboxName, ResponseCode, StoreOperation};
 
 use super::targets::{TargetBatch, Verdict};
-use super::{
-    CompactUidSet, DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id,
-};
+use super::{DecodedObjectId, ImapAccount, UidSet, batch, boxed_receiver_stream, decode_object_id};
 
 // The Account surface supplies an idempotency key to each bulk operation, but
 // IMAP has no request token that a server can use to deduplicate these
@@ -80,9 +78,12 @@ pub(crate) fn bulk_set_flags_if_version(
         };
         let kind = match version {
             bifrost_types::ServerVersion::ModSeq(modseq)
-                if modseq > 0 && single_store_flag_op(&op) =>
+                if crate::types::ModSeq::new(modseq).is_some() && single_store_flag_op(&op) =>
             {
-                MutationKind::ConditionalFlags(op.clone(), modseq)
+                MutationKind::ConditionalFlags(
+                    op.clone(),
+                    crate::types::ModSeq::new(modseq).expect("positive version within wire bounds"),
+                )
             }
             _ => {
                 return bifrost_types::mutation::refused_mail_target(
@@ -114,7 +115,7 @@ fn single_store_flag_op(op: &FlagOp) -> bool {
 
 pub(super) enum MutationKind {
     Flags(FlagOp),
-    ConditionalFlags(FlagOp, u64),
+    ConditionalFlags(FlagOp, crate::types::ModSeq),
     Move(MembershipScope),
     Destroy,
     Copy(MailboxName),
@@ -392,7 +393,7 @@ fn mutation_preflight_error(
     operation: AccountOperation,
 ) -> AccountError {
     account.folder_error(
-        error.with_attempt(TransmissionState::Unsent),
+        error.for_unsent_operation(),
         folder,
         super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
     )
@@ -410,7 +411,7 @@ struct FolderOpenFailure {
 async fn open_folder_for_mutation(
     account: &ImapAccount,
     folder: &MailboxName,
-) -> Result<(super::PooledConn, u32, u64, bool), FolderOpenFailure> {
+) -> Result<(super::PooledConn, crate::types::UidValidity, u64, bool), FolderOpenFailure> {
     let mut conn = account
         .checkout_for_folder(folder)
         .await
@@ -470,7 +471,7 @@ async fn run_folder_mutation_with(
     kind: &MutationKind,
     move_destination: Option<&MailboxName>,
     operation: AccountOperation,
-    deferred: Option<&mut Vec<(u32, Vec<u32>)>>,
+    deferred: Option<&mut Vec<(crate::types::UidValidity, Vec<u32>)>>,
 ) -> Result<(Vec<ItemOutcome<MutationSuccess>>, u64), FolderMutationFailure> {
     let (conn, uidvalidity, previous_bytes_in, has_modseq) =
         match open_folder_for_mutation(account, folder).await {
@@ -677,10 +678,10 @@ async fn run_destroy_mutation_groups(
     account: &ImapAccount,
     conn: &super::PooledConn,
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     ids: Vec<DecodedObjectId>,
     operation: AccountOperation,
-    mut deferred: Option<&mut Vec<(u32, Vec<u32>)>>,
+    mut deferred: Option<&mut Vec<(crate::types::UidValidity, Vec<u32>)>>,
 ) -> Vec<ItemOutcome<MutationSuccess>> {
     let mut results = Vec::new();
     for (unchanged_since, ids) in partition_by_modseq(account, folder, uidvalidity, ids) {
@@ -702,7 +703,7 @@ async fn run_destroy_mutation_groups(
                 uid_set.as_sequence_set(),
                 StoreOperation::AddSilent,
                 &[Flag::Deleted],
-                unchanged_since,
+                unchanged_since.map(Into::into),
                 account.command_timeout(),
             )
             .await;
@@ -783,10 +784,10 @@ async fn run_flag_mutation_groups(
     account: &ImapAccount,
     conn: &super::PooledConn,
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     ids: Vec<DecodedObjectId>,
     op: &FlagOp,
-    policy: (Option<u64>, AccountOperation),
+    policy: (Option<crate::types::ModSeq>, AccountOperation),
 ) -> Vec<ItemOutcome<MutationSuccess>> {
     let (expected, operation) = policy;
     let mut results = Vec::new();
@@ -881,7 +882,7 @@ struct PatchMutationWork<'a> {
     targets: TargetBatch,
     add: &'a FlagSet,
     remove: &'a FlagSet,
-    unchanged_since: Option<u64>,
+    unchanged_since: Option<crate::types::ModSeq>,
     caller_guard: bool,
 }
 
@@ -889,7 +890,7 @@ async fn run_patch_mutation_group(
     account: &ImapAccount,
     conn: &super::PooledConn,
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     work: PatchMutationWork<'_>,
 ) -> Vec<ItemOutcome<MutationSuccess>> {
     let target_batch = work.targets;
@@ -1003,13 +1004,13 @@ fn applied_uids_after_store(requested_uids: &[u32], outcome: &StoreWireOutcome) 
 fn partition_by_modseq(
     account: &ImapAccount,
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     ids: Vec<DecodedObjectId>,
-) -> Vec<(Option<u64>, Vec<DecodedObjectId>)> {
-    let mut protected: BTreeMap<u64, Vec<DecodedObjectId>> = BTreeMap::new();
+) -> Vec<(Option<crate::types::ModSeq>, Vec<DecodedObjectId>)> {
+    let mut protected: BTreeMap<crate::types::ModSeq, Vec<DecodedObjectId>> = BTreeMap::new();
     let mut unprotected = Vec::new();
     for id in ids {
-        if let Some(modseq) = account.folders.modseq(folder, uidvalidity, id.uid) {
+        if let Some(modseq) = account.folders.modseq(folder, uidvalidity, id.uid.get()) {
             protected.entry(modseq).or_default().push(id);
         } else {
             unprotected.push(id);
@@ -1029,7 +1030,7 @@ async fn apply_flag_op(
     conn: &super::PooledConn,
     set: &crate::types::SequenceSet,
     op: &FlagOp,
-    unchanged_since: Option<u64>,
+    unchanged_since: Option<crate::types::ModSeq>,
     timeout: std::time::Duration,
 ) -> Result<StoreWireOutcome, crate::Error> {
     match op {
@@ -1096,8 +1097,10 @@ async fn apply_flag_op(
         }
         // `FlagOp` is published and `#[non_exhaustive]`: this arm is a variant
         // added upstream that this crate has not learned, not a server gap.
-        _ => Err(crate::Error::UnsupportedOperation(
-            "flag operation not implemented by bifrost-imap".into(),
+        _ => Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::UnsupportedOperation(
+                "flag operation not implemented by bifrost-imap".into(),
+            ),
         )),
     }
 }
@@ -1114,13 +1117,19 @@ async fn store_flags(
     set: &crate::types::SequenceSet,
     operation: StoreOperation,
     flags: &FlagSet,
-    unchanged_since: Option<u64>,
+    unchanged_since: Option<crate::types::ModSeq>,
     timeout: std::time::Duration,
 ) -> Result<StoreWireOutcome, crate::Error> {
     let flags = store_flag_atoms(flags);
     let result = conn
         .connection()
-        .uid_store(set, operation, &flags, unchanged_since, timeout)
+        .uid_store(
+            set,
+            operation,
+            &flags,
+            unchanged_since.map(Into::into),
+            timeout,
+        )
         .await?;
     // Every `store_flags` caller is a flag mutation.
     if let Some(error) = store_permission_error(&result, AccountOperation::UpdateFlags) {
@@ -1156,8 +1165,8 @@ fn store_permission_error(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StoreWireOutcome {
     Applied,
-    Modified(CompactUidSet),
-    PendingRetry(CompactUidSet),
+    Modified(UidSet),
+    PendingRetry(UidSet),
     Failed,
 }
 
@@ -1179,11 +1188,11 @@ impl StoreWireOutcome {
     }
 }
 
-fn modified_uids(code: Option<&ResponseCode>) -> Option<CompactUidSet> {
+fn modified_uids(code: Option<&ResponseCode>) -> Option<UidSet> {
     match code {
         // Keep the server's set compact: classification asks membership only
         // for submitted targets, never expands unsolicited numeric spans.
-        Some(ResponseCode::Modified(ranges)) => Some(CompactUidSet::from_ranges(
+        Some(ResponseCode::Modified(ranges)) => Some(UidSet::from_ranges(
             ranges
                 .iter()
                 .map(|range| match (range.start_bound(), range.end_bound()) {
@@ -1193,7 +1202,7 @@ fn modified_uids(code: Option<&ResponseCode>) -> Option<CompactUidSet> {
                     (
                         crate::types::SeqBound::Number(start),
                         Some(crate::types::SeqBound::Number(end)),
-                    ) => crate::types::UidRange::range(start.min(end), start.max(end)),
+                    ) => crate::types::UidRange::range(start, end),
                     // MODIFIED does not carry the mailbox maximum or the
                     // original endpoint order. Any `*` range therefore maps
                     // to the whole possible UID space instead of being
@@ -1289,14 +1298,16 @@ pub(super) async fn expunge_uids_or_fall_back(
     let timeout = account.command_timeout();
     match conn.connection().uid_expunge(expunge_set, timeout).await {
         Ok(_) => return Ok(()),
-        Err(crate::Error::MissingCapability(_)) => {}
+        Err(crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(_))) => {}
         Err(err) => return Err(err),
     }
     let deleted = conn.connection().uid_search("DELETED", timeout).await?;
     let marked: std::collections::BTreeSet<u32> = expunge_uids.iter().copied().collect();
     let found: std::collections::BTreeSet<u32> = deleted.ids.into_iter().collect();
     if !found.is_subset(&marked) {
-        return Err(crate::Error::MissingCapability("UIDPLUS".into()));
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability("UIDPLUS".into()),
+        ));
     }
     conn.connection().expunge(timeout).await?;
     Ok(())
@@ -1317,7 +1328,13 @@ pub(super) async fn result_folder_mutation(
     ids: Vec<DecodedObjectId>,
     kind: &MutationKind,
     operation: AccountOperation,
-) -> Result<(Vec<ItemOutcome<MutationSuccess>>, Vec<(u32, Vec<u32>)>), AccountError> {
+) -> Result<
+    (
+        Vec<ItemOutcome<MutationSuccess>>,
+        Vec<(crate::types::UidValidity, Vec<u32>)>,
+    ),
+    AccountError,
+> {
     let mut marked_deleted = Vec::new();
     match run_folder_mutation_with(
         account,
@@ -1345,7 +1362,7 @@ pub(super) async fn result_folder_mutation(
 #[cfg(test)]
 fn destroy_expunge_error(
     folder: &MailboxName,
-    shared_owner: Option<&bifrost_types::MailboxId>,
+    shared_owner: Option<&bifrost_types::PrincipalId>,
     error: crate::Error,
 ) -> AccountError {
     let leaf = super::error::folder_error(
@@ -1432,10 +1449,7 @@ fn move_fallback_record(
         // when message detail is truncated (StepTargets::at_least).
         let mut remaining = 256usize;
         for range in dest_uids {
-            for uid in (range.start.min(range.end.unwrap_or(range.start))
-                ..=range.start.max(range.end.unwrap_or(range.start)))
-                .take(remaining)
-            {
+            for uid in (range.start()..=range.end().unwrap_or(range.start())).take(remaining) {
                 remaining -= 1;
                 if uid == 0 {
                     continue;
@@ -1443,7 +1457,12 @@ fn move_fallback_record(
                 refs.push(TargetRef::new(
                     TargetRole::Destination,
                     ErrorScope::Message {
-                        id: super::encode_object_id(destination, *uid_validity, uid),
+                        id: super::encode_object_id(
+                            destination,
+                            crate::types::UidValidity::new(*uid_validity)
+                                .expect("nonzero COPYUID epoch"),
+                            crate::types::Uid::new(uid).expect("nonzero COPYUID UID"),
+                        ),
                     },
                 ));
             }
@@ -1469,7 +1488,7 @@ fn move_fallback_record(
 
 fn split_by_uidvalidity(
     ids: Vec<DecodedObjectId>,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
 ) -> (Vec<DecodedObjectId>, Vec<DecodedObjectId>) {
     let mut valid = Vec::new();
     let mut stale = Vec::new();
@@ -1568,14 +1587,14 @@ mod tests {
                 crate::types::response::StatusKind::Ok,
                 Some(code.clone())
             )),
-            StoreWireOutcome::Modified(CompactUidSet::from_uids([2, 3]))
+            StoreWireOutcome::Modified(UidSet::from_numbers([2, 3]))
         );
         assert_eq!(
             StoreWireOutcome::from_store_result(&result(
                 crate::types::response::StatusKind::No,
                 Some(code)
             )),
-            StoreWireOutcome::PendingRetry(CompactUidSet::from_uids([2, 3]))
+            StoreWireOutcome::PendingRetry(UidSet::from_numbers([2, 3]))
         );
         assert_eq!(
             StoreWireOutcome::from_store_result(&result(
@@ -1595,10 +1614,18 @@ mod tests {
         // in-flight-drop analogue that queues for read-back).
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
         let ids = vec![
-            DecodedObjectId::canonical(folder.clone(), 7, 2),
-            DecodedObjectId::canonical(folder.clone(), 7, 5),
+            DecodedObjectId::canonical(
+                folder.clone(),
+                crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                crate::types::Uid::new(2).expect("valid protocol test value"),
+            ),
+            DecodedObjectId::canonical(
+                folder.clone(),
+                crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                crate::types::Uid::new(5).expect("valid protocol test value"),
+            ),
         ];
-        let outcome = StoreWireOutcome::PendingRetry(CompactUidSet::from_uids([2]));
+        let outcome = StoreWireOutcome::PendingRetry(UidSet::from_numbers([2]));
         let outcomes =
             TargetBatch::new(ids).settle(AccountOperation::UpdateFlags, &folder, |target| {
                 let verdict = mutation_verdict(
@@ -1636,14 +1663,14 @@ mod tests {
         assert_eq!(
             applied_uids_after_store(
                 &[1, 2, 3, 4],
-                &StoreWireOutcome::Modified(CompactUidSet::from_uids([2, 4])),
+                &StoreWireOutcome::Modified(UidSet::from_numbers([2, 4])),
             ),
             vec![1, 3]
         );
         assert!(
             applied_uids_after_store(
                 &[1, 2, 3, 4],
-                &StoreWireOutcome::PendingRetry(CompactUidSet::from_uids([2, 4])),
+                &StoreWireOutcome::PendingRetry(UidSet::from_numbers([2, 4])),
             )
             .is_empty()
         );
@@ -1699,11 +1726,10 @@ mod tests {
         let denied = destroy_expunge_error(
             &folder(),
             None,
-            crate::Error::No {
+            crate::Error::ServerStatus(crate::error::ServerStatus::No {
                 text: "permission denied".to_owned(),
                 code: Some(crate::types::ResponseCode::NoPerm),
-                attempt: None,
-            },
+            }),
         );
         assert!(
             matches!(
@@ -1717,11 +1743,10 @@ mod tests {
         let over_quota = destroy_expunge_error(
             &folder(),
             None,
-            crate::Error::No {
+            crate::Error::ServerStatus(crate::error::ServerStatus::No {
                 text: "over quota".to_owned(),
                 code: Some(crate::types::ResponseCode::OverQuota),
-                attempt: None,
-            },
+            }),
         );
         assert!(matches!(
             over_quota.kind(),
@@ -1737,12 +1762,11 @@ mod tests {
         // and the partial-commit record still rides on it.
         let revoked = destroy_expunge_error(
             &folder(),
-            Some(&bifrost_types::MailboxId("alice".to_owned())),
-            crate::Error::No {
+            Some(&bifrost_types::PrincipalId("alice".to_owned())),
+            crate::Error::ServerStatus(crate::error::ServerStatus::No {
                 text: "permission denied".to_owned(),
                 code: Some(crate::types::ResponseCode::NoPerm),
-                attempt: None,
-            },
+            }),
         );
         assert!(matches!(
             revoked.kind(),
@@ -1773,7 +1797,7 @@ mod tests {
 
     #[test]
     fn stream_terminating_keeps_account_authz_and_schema_terminal() {
-        use bifrost_types::{MailboxId, SyncStateErrorKind};
+        use bifrost_types::{PrincipalId, SyncStateErrorKind};
         let auth = crate::account::error::test_support::expired_auth();
         assert!(stream_terminating(&auth));
 
@@ -1788,13 +1812,12 @@ mod tests {
         // folder classification, is a scoped revocation that must not end
         // the stream.
         let shared_revoked = super::super::error::folder_error(
-            crate::Error::No {
+            crate::Error::ServerStatus(crate::error::ServerStatus::No {
                 text: "permission denied".to_owned(),
                 code: Some(crate::types::ResponseCode::NoPerm),
-                attempt: None,
-            },
+            }),
             &folder(),
-            Some(&MailboxId("alice".to_owned())),
+            Some(&PrincipalId("alice".to_owned())),
             super::super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags),
         );
         assert!(matches!(
@@ -1817,7 +1840,13 @@ mod tests {
 
     fn ids(uids: &[u32]) -> Vec<DecodedObjectId> {
         uids.iter()
-            .map(|uid| DecodedObjectId::canonical(folder(), 7, *uid))
+            .map(|uid| {
+                DecodedObjectId::canonical(
+                    folder(),
+                    crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                    crate::types::Uid::new(*uid).expect("nonzero test UID"),
+                )
+            })
             .collect()
     }
 
@@ -1867,13 +1896,13 @@ mod tests {
                 UidRange::single(2),
                 UidRange::range(5, 7),
             ]))),
-            Some(CompactUidSet::from_uids([2, 5, 6, 7]))
+            Some(UidSet::from_numbers([2, 5, 6, 7]))
         );
         // An empty MODIFIED list is still a MODIFIED response: the STORE
         // outcome must not silently degrade to "no conflict reported".
         assert_eq!(
             modified_uids(Some(&ResponseCode::Modified(Vec::new()))),
-            Some(CompactUidSet::default())
+            Some(UidSet::default())
         );
     }
 
@@ -1910,7 +1939,7 @@ mod tests {
     // named UIDs conflicted, everything else in the same command landed.
     #[test]
     fn modified_outcome_splits_conflicts_from_successes_per_uid() {
-        let outcome = StoreWireOutcome::Modified(CompactUidSet::from_uids([2]));
+        let outcome = StoreWireOutcome::Modified(UidSet::from_numbers([2]));
         let outcomes = settled(&[1, 2, 3], AccountOperation::UpdateFlags, |uid| {
             mutation_verdict(uid, &outcome, AccountOperation::UpdateFlags, &folder())
         });
@@ -1943,7 +1972,7 @@ mod tests {
 
     #[test]
     fn partially_conflicting_patch_only_succeeds_after_the_remove_lands() {
-        let first = StoreWireOutcome::Modified(CompactUidSet::from_uids([2]));
+        let first = StoreWireOutcome::Modified(UidSet::from_numbers([2]));
         let second = Ok(StoreWireOutcome::Applied);
         let outcomes = settled(&[1, 2, 3], AccountOperation::UpdateFlags, |uid| {
             patch_mutation_verdict(uid, &first, &second, &folder(), false)
@@ -1967,7 +1996,7 @@ mod tests {
 
     #[test]
     fn acknowledged_second_half_rejection_is_failed() {
-        let first = StoreWireOutcome::Modified(CompactUidSet::from_uids([2]));
+        let first = StoreWireOutcome::Modified(UidSet::from_numbers([2]));
         let second = Err(store_failed_error(AccountOperation::UpdateFlags, &folder()));
         let outcomes = settled(&[1, 2], AccountOperation::UpdateFlags, |uid| {
             patch_mutation_verdict(uid, &first, &second, &folder(), false)
@@ -2018,7 +2047,9 @@ mod tests {
         // The same classification `run_patch_mutation_group` applies to a
         // first-STORE wire error, through `ImapAccount::folder_error`.
         let error = super::super::error::folder_error(
-            crate::Error::Protocol("STORE never answered".into()),
+            crate::Error::Provider(crate::error::ProviderFailure::Protocol(
+                "STORE never answered".into(),
+            )),
             &folder(),
             None,
             super::super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags),
@@ -2045,7 +2076,14 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(
             failed[0].item,
-            BatchItemId(super::super::encode_object_id(&folder(), 7, 5).0),
+            BatchItemId(
+                super::super::encode_object_id(
+                    &folder(),
+                    crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                    crate::types::Uid::new(5).expect("valid protocol test value")
+                )
+                .0
+            ),
             "only the failing group's id may carry the failure",
         );
     }
@@ -2138,11 +2176,13 @@ mod tests {
     #[test]
     fn an_expunge_failure_applies_only_to_the_uids_it_marked() {
         let expunge_uids = [2u32];
-        let outcome = StoreWireOutcome::Modified(CompactUidSet::from_uids([3]));
+        let outcome = StoreWireOutcome::Modified(UidSet::from_numbers([3]));
         let expunge_error = destroy_expunge_error(
             &folder(),
             None,
-            crate::Error::Protocol("EXPUNGE refused".into()),
+            crate::Error::Provider(crate::error::ProviderFailure::Protocol(
+                "EXPUNGE refused".into(),
+            )),
         );
         let outcomes = settled(&[2, 3], AccountOperation::BulkDestroy, |uid| {
             if expunge_uids.contains(&uid) {
@@ -2193,15 +2233,32 @@ mod tests {
     fn stale_uidvalidity_targets_are_kept_for_failed_results() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
         let ids = vec![
-            DecodedObjectId::canonical(folder.clone(), 9, 1),
-            DecodedObjectId::canonical(folder, 10, 2),
+            DecodedObjectId::canonical(
+                folder.clone(),
+                crate::types::UidValidity::new(9).expect("nonzero epoch"),
+                crate::types::Uid::new(1).expect("valid protocol test value"),
+            ),
+            DecodedObjectId::canonical(
+                folder,
+                crate::types::UidValidity::new(10).expect("nonzero epoch"),
+                crate::types::Uid::new(2).expect("valid protocol test value"),
+            ),
         ];
 
-        let (valid, stale) = split_by_uidvalidity(ids, 10);
+        let (valid, stale) = split_by_uidvalidity(
+            ids,
+            crate::types::UidValidity::new(10).expect("valid protocol test value"),
+        );
         assert_eq!(valid.len(), 1);
-        assert_eq!(valid[0].uid, 2);
+        assert_eq!(
+            valid[0].uid,
+            crate::types::Uid::new(2).expect("valid protocol test value")
+        );
         assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0].uid, 1);
+        assert_eq!(
+            stale[0].uid,
+            crate::types::Uid::new(1).expect("valid protocol test value")
+        );
     }
     fn partial_retry() -> AccountError {
         crate::account::error::test_support::retryable_move()
@@ -2281,10 +2338,10 @@ mod tests {
         );
         assert!(matches!(
             error,
-            crate::Error::No {
+            crate::Error::ServerStatus(crate::error::ServerStatus::No {
                 code: Some(ResponseCode::NoPerm),
                 ..
-            }
+            })
         ));
     }
 
@@ -2316,7 +2373,9 @@ mod tests {
     #[test]
     fn partial_commit_move_fallback_expunge_missing_capability_keeps_copy() {
         let leaf = super::super::account_error_with(
-            crate::Error::MissingCapability("UIDPLUS".into()),
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(
+                "UIDPLUS".into(),
+            )),
             super::super::error::ImapErrorContext::operation(AccountOperation::BulkMove)
                 .with_folder_scope(&folder()),
         );
@@ -2333,7 +2392,9 @@ mod tests {
     #[test]
     fn partial_commit_move_fallback_state_changed_before_send_keeps_copy() {
         let leaf = super::super::account_error_with(
-            crate::Error::StateChangedBeforeSend("changed".into()),
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(
+                "changed".into(),
+            )),
             super::super::error::ImapErrorContext::operation(AccountOperation::BulkMove)
                 .with_folder_scope(&folder()),
         );

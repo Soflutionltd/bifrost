@@ -6,8 +6,9 @@ use crate::types::response::{
 };
 use crate::types::{CopyResult, ExpungeResult, MoveResult};
 
-use super::super::expand_uid_ranges;
 use super::{Consumer, ConsumerContext, Finalized};
+use crate::types::UidRange;
+use tracing::warn;
 
 /// Consumer for SEARCH and UID SEARCH (RFC 3501 Section6.4.4 / Section6.4.8).
 ///
@@ -27,7 +28,7 @@ pub(crate) struct SearchConsumer {
     /// Tagless ESEARCH responses (second priority).
     tagless_esearch: Vec<EsearchResponse>,
     /// Collected legacy SEARCH responses (lowest priority).
-    search_responses: Vec<(Vec<u32>, Option<u64>)>,
+    search_responses: Vec<(Vec<u32>, Option<crate::types::ModSeq>)>,
     /// Non-SEARCH/ESEARCH responses routed here via classification.
     buffered: Vec<UntaggedResponse>,
 }
@@ -150,11 +151,11 @@ impl Consumer for SearchConsumer {
         }
 
         Finalized::failure(
-            Error::ProtocolMissing(
+            Error::Provider(crate::error::ProviderFailure::Missing(
                 "SEARCH OK but no untagged SEARCH/ESEARCH response \
                  (RFC 3501 Section 6.4.4)"
                     .into(),
-            ),
+            )),
             self.buffered,
         )
     }
@@ -219,11 +220,11 @@ impl Consumer for EsearchConsumer {
         }
 
         let output = self.result.ok_or_else(|| {
-            Error::ProtocolMissing(
+            Error::Provider(crate::error::ProviderFailure::Missing(
                 "SEARCH RETURN OK but no ESEARCH response \
                  (RFC 4731 Section 3.1)"
                     .into(),
-            )
+            ))
         });
 
         Finalized {
@@ -668,6 +669,59 @@ impl Consumer for ExpungeConsumer {
     }
 }
 
+/// Expand a slice of [`UidRange`] into individual UIDs.
+///
+/// Used for backward-compatible conversion of ESEARCH ALL uid-set results
+/// into a flat `Vec<u32>` matching the legacy SEARCH response format.
+///
+/// Expansion is capped at [`MAX_EXPANDED_UIDS`] to prevent OOM when a
+/// server returns extremely large ranges (e.g. `1:4294967295`).
+///
+/// `*` is special wherever it appears in a sequence-set, not only as a range
+/// endpoint (RFC 9051 Section 9:
+/// `seq-number = nz-number / "*"`).  It means "the highest UID in the mailbox",
+/// a value unknown from the ESEARCH response alone, so any set naming it
+/// cannot be expanded at all.  Rather than return a partial result as if it
+/// were complete, this reports the incomplete expansion to the caller.
+///
+/// A sequence-set may legally repeat or overlap its elements, so the ranges
+/// are sorted and merged before both the cap check and the expansion: the
+/// result is ascending and duplicate-free, and `1:600000,1:600000` names
+/// 600000 UIDs, not 1200000.
+pub(in crate::connection) fn expand_uid_ranges(ranges: &[UidRange]) -> Result<Vec<u32>, Error> {
+    /// Safety cap to prevent OOM from malicious or buggy server responses.
+    const MAX_EXPANDED_UIDS: usize = 1_000_000;
+
+    let saw_star = ranges.iter().any(|range| !range.is_numeric());
+    let set = crate::types::set::UidSet::from_ranges(ranges.to_vec());
+    let requested = u64::try_from(set.uid_count()).unwrap_or(u64::MAX);
+
+    if saw_star {
+        return Err(Error::ResultLimit(
+            crate::error::ResultLimit::SearchTruncated {
+                returned: usize::try_from(requested).unwrap_or(usize::MAX),
+                omitted: None,
+            },
+        ));
+    }
+
+    let max_expanded = u64::try_from(MAX_EXPANDED_UIDS).unwrap_or(u64::MAX);
+    if requested > max_expanded {
+        warn!(
+            requested,
+            "UID ranges exceed the {MAX_EXPANDED_UIDS}-UID expansion limit"
+        );
+        return Err(Error::ResultLimit(
+            crate::error::ResultLimit::SearchTruncated {
+                returned: MAX_EXPANDED_UIDS,
+                omitted: Some(requested.saturating_sub(max_expanded)),
+            },
+        ));
+    }
+
+    Ok(set.to_uids())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -803,11 +857,17 @@ mod tests {
     #[test]
     fn search_ok_without_a_result_is_a_missing_response() {
         let result = Box::new(SearchConsumer::new()).finalize(tagged(StatusKind::Ok, None), &ctx());
-        assert!(matches!(result.output, Err(Error::ProtocolMissing(_))));
+        assert!(matches!(
+            result.output,
+            Err(Error::Provider(crate::error::ProviderFailure::Missing(_)))
+        ));
 
         let result =
             Box::new(EsearchConsumer::new()).finalize(tagged(StatusKind::Ok, None), &ctx());
-        assert!(matches!(result.output, Err(Error::ProtocolMissing(_))));
+        assert!(matches!(
+            result.output,
+            Err(Error::Provider(crate::error::ProviderFailure::Missing(_)))
+        ));
     }
 
     /// An untagged COPYUID OK that supplies the result is consumed, and the

@@ -9,7 +9,7 @@
 use super::{
     CommandWriter, QresyncParams, encode_changedsince_modifier,
     search_criteria_starts_with_charset, validate_and_filter_flags, validate_append_datetime,
-    validate_atom, validate_login_credential_ascii, validate_mod_sequence_valzer, validate_no_crlf,
+    validate_atom, validate_login_credential_ascii, validate_no_crlf,
     validate_sasl_initial_response, validate_sort_thread_charset, write_search,
 };
 use crate::types::validated::MailboxName;
@@ -140,12 +140,14 @@ pub(super) fn encode_search(
     // RFC 6855 Section 3: after ENABLE UTF8=ACCEPT, clients MUST NOT issue a
     // SEARCH command that contains a charset specification.
     if utf8 == crate::codec::utf7::WireMode::Utf8 && search_criteria_starts_with_charset(criteria) {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{cmd} must not include a CHARSET specification when UTF8=ACCEPT is active \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{cmd} must not include a CHARSET specification when UTF8=ACCEPT is active \
              (RFC 6855 Section 3)"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
     w.raw(tag.as_bytes());
@@ -189,7 +191,7 @@ pub(super) fn encode_fetch(
     tag: &str,
     sequence_set: &str,
     items: &crate::types::fetch::FetchItems,
-    changed_since: Option<u64>,
+    changed_since: Option<crate::types::ModSeq>,
 ) -> Result<(), crate::Error> {
     let wire = items.wire();
     let items = wire.as_ref();
@@ -203,7 +205,7 @@ pub(super) fn encode_fetch(
     w.raw(b" ");
     w.raw(items.as_bytes());
     if let Some(modseq) = changed_since {
-        encode_changedsince_modifier(w, modseq, false)?;
+        encode_changedsince_modifier(w, modseq, false);
     }
     w.raw(b"\r\n");
     Ok(())
@@ -217,7 +219,7 @@ pub(super) fn encode_store(
     sequence_set: &str,
     operation: crate::types::StoreOperation,
     flags: &[crate::types::Flag],
-    unchanged_since: Option<u64>,
+    unchanged_since: Option<crate::types::ModSeqValzer>,
 ) -> Result<(), crate::Error> {
     // Reject CRLF in sequence set to prevent command injection (RFC 3501 Section 2.2).
     validate_no_crlf(sequence_set, "STORE sequence set")?;
@@ -231,7 +233,6 @@ pub(super) fn encode_store(
 
     // CONDSTORE modifier (RFC 7162 Section 3.1.3): UNCHANGEDSINCE uses mod-sequence-valzer
     if let Some(modseq) = unchanged_since {
-        validate_mod_sequence_valzer(modseq, "UNCHANGEDSINCE")?;
         w.raw(b" (UNCHANGEDSINCE ");
         w.raw(modseq.to_string().as_bytes());
         w.raw(b")");
@@ -310,12 +311,14 @@ fn normalize_status_items_body(items: &str, context: &str) -> Result<String, cra
 /// for SORT and THREAD.
 fn validate_non_empty_search_criteria(criteria: &str, context: &str) -> Result<(), crate::Error> {
     if criteria.trim().is_empty() {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must contain at least one search criterion \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{context} must contain at least one search criterion \
              (RFC 3501 Section 6.4.4 / RFC 5256 Section 6)"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
     Ok(())
@@ -346,21 +349,25 @@ fn validate_non_empty_search_criteria(criteria: &str, context: &str) -> Result<(
 fn validate_single_fetch_att(attr: &str) -> Result<(), crate::Error> {
     let trimmed = attr.trim();
     if trimmed.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            "NOTIFY MessageNew fetch-att must not be empty \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "NOTIFY MessageNew fetch-att must not be empty \
              (RFC 5465 Section 8)"
-                .into(),
+                    .into(),
+            ),
         ));
     }
     // A single fetch-att never starts with '('  -  that's a fetch-att list.
     // Individual fetch-atts like BODY[HEADER.FIELDS (From)] contain
     // parentheses only after brackets, not at the top level.
     if trimmed.starts_with('(') {
-        return Err(crate::Error::InvalidInput(
-            "NOTIFY MessageNew fetch-att must be a single item, not a \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "NOTIFY MessageNew fetch-att must be a single item, not a \
              parenthesized list  -  use separate vector elements for each \
              fetch-att (RFC 5465 Section 8)"
-                .into(),
+                    .into(),
+            ),
         ));
     }
     // Delegate balanced-delimiter validation to the general helper.
@@ -370,32 +377,36 @@ fn validate_single_fetch_att(attr: &str) -> Result<(), crate::Error> {
 fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crate::Error> {
     let trimmed = items.trim();
     if trimmed.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must contain at least one message data item \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{context} must contain at least one message data item \
              (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
 
     if let Some(inner) = trimmed.strip_prefix('(') {
         let inner = inner.strip_suffix(')').ok_or_else(|| {
-            crate::Error::InvalidInput(
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
                 format!(
                     "{context} must use balanced parentheses for fetch-att list \
                  syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
                 )
                 .into(),
-            )
+            ))
         })?;
         if inner.trim().is_empty() {
-            return Err(crate::Error::InvalidInput(
-                format!(
-                    "{context} must contain at least one message data item \
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    format!(
+                        "{context} must contain at least one message data item \
                  (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-                )
-                .into(),
+                    )
+                    .into(),
+                ),
             ));
         }
     }
@@ -425,12 +436,14 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
             '[' => bracket_depth += 1,
             ']' => {
                 if bracket_depth == 0 {
-                    return Err(crate::Error::InvalidInput(
-                        format!(
-                            "{context} must use balanced quotes and delimiters for fetch-att \
+                    return Err(crate::Error::LocalRefusal(
+                        crate::error::LocalRefusal::InvalidInput(
+                            format!(
+                                "{context} must use balanced quotes and delimiters for fetch-att \
                          syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-                        )
-                        .into(),
+                            )
+                            .into(),
+                        ),
                     ));
                 }
                 bracket_depth -= 1;
@@ -438,12 +451,14 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
             '<' if bracket_depth == 0 => angle_depth += 1,
             '>' if bracket_depth == 0 => {
                 if angle_depth == 0 {
-                    return Err(crate::Error::InvalidInput(
-                        format!(
-                            "{context} must use balanced quotes and delimiters for fetch-att \
+                    return Err(crate::Error::LocalRefusal(
+                        crate::error::LocalRefusal::InvalidInput(
+                            format!(
+                                "{context} must use balanced quotes and delimiters for fetch-att \
                          syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-                        )
-                        .into(),
+                            )
+                            .into(),
+                        ),
                     ));
                 }
                 angle_depth -= 1;
@@ -451,12 +466,14 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
             '(' if bracket_depth == 0 && angle_depth == 0 => paren_depth += 1,
             ')' if bracket_depth == 0 && angle_depth == 0 => {
                 if paren_depth == 0 {
-                    return Err(crate::Error::InvalidInput(
-                        format!(
-                            "{context} must use balanced quotes and delimiters for fetch-att \
+                    return Err(crate::Error::LocalRefusal(
+                        crate::error::LocalRefusal::InvalidInput(
+                            format!(
+                                "{context} must use balanced quotes and delimiters for fetch-att \
                          syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-                        )
-                        .into(),
+                            )
+                            .into(),
+                        ),
                     ));
                 }
                 paren_depth -= 1;
@@ -466,12 +483,14 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
     }
 
     if in_quote || bracket_depth != 0 || angle_depth != 0 || paren_depth != 0 {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must use balanced quotes and delimiters for fetch-att \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "{context} must use balanced quotes and delimiters for fetch-att \
              syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-            )
-            .into(),
+                )
+                .into(),
+            ),
         ));
     }
 
@@ -503,8 +522,10 @@ pub(super) fn encode_mailbox_name(
         None if !name.can_reencode() => {
             // Lenient display decoding is not reversible. A mode change must
             // refuse this address instead of silently selecting another mailbox.
-            return Err(crate::Error::InvalidInput(
-                "mailbox wire identity cannot be preserved in this encoding mode".into(),
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    "mailbox wire identity cannot be preserved in this encoding mode".into(),
+                ),
             ));
         }
         None => encode_mailbox_str(name.as_str(), utf8).into_bytes(),
@@ -512,8 +533,8 @@ pub(super) fn encode_mailbox_name(
     // A mailbox string cannot carry NUL. Refuse here rather than relying on
     // the general string writer's command-final validation.
     if bytes.contains(&0) {
-        return Err(crate::Error::InvalidInput(
-            "mailbox wire name contains NUL".into(),
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput("mailbox wire name contains NUL".into()),
         ));
     }
     Ok(bytes)
@@ -526,8 +547,11 @@ pub(super) fn encode_mailbox_argument(
     match name {
         crate::types::MailboxArgument::Name(name) => encode_mailbox_name(name, utf8),
         crate::types::MailboxArgument::Text(text) => {
-            let name = MailboxName::new(text.clone())
-                .map_err(|err| crate::Error::InvalidInput(err.to_string().into()))?;
+            let name = MailboxName::new(text.clone()).map_err(|err| {
+                crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
+                    err.to_string().into(),
+                ))
+            })?;
             encode_mailbox_name(&name, utf8)
         }
     }
@@ -594,12 +618,12 @@ pub(super) fn encode_select_or_examine(
         w.raw(params.mod_seq.to_string().as_bytes());
         if let Some(known) = params.known() {
             w.raw(b" ");
-            w.raw(known.uids.as_str().as_bytes());
+            w.raw(known.uids.to_string().as_bytes());
             if let Some((seqs, uids)) = &known.seq_match {
                 w.raw(b" (");
-                w.raw(seqs.as_str().as_bytes());
+                w.raw(seqs.to_string().as_bytes());
                 w.raw(b" ");
-                w.raw(uids.as_str().as_bytes());
+                w.raw(uids.to_string().as_bytes());
                 w.raw(b")");
             }
         }
@@ -623,7 +647,7 @@ pub(super) fn encode_uid_fetch(
     tag: &str,
     sequence_set: &str,
     items: &crate::types::fetch::FetchItems,
-    changed_since: Option<u64>,
+    changed_since: Option<crate::types::ModSeq>,
     vanished: bool,
 ) -> Result<(), crate::Error> {
     let wire = items.wire();
@@ -631,8 +655,10 @@ pub(super) fn encode_uid_fetch(
     // RFC 7162 Section 3.2.6: VANISHED requires CHANGEDSINCE in the same
     // fetch modifier list.
     if vanished && changed_since.is_none() {
-        return Err(crate::Error::InvalidInput(
-            "VANISHED modifier requires CHANGEDSINCE per RFC 7162 Section 3.2.6".into(),
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "VANISHED modifier requires CHANGEDSINCE per RFC 7162 Section 3.2.6".into(),
+            ),
         ));
     }
     // Reject CRLF in raw parameters to prevent command injection (RFC 3501 Section 2.2).
@@ -645,7 +671,7 @@ pub(super) fn encode_uid_fetch(
     w.raw(b" ");
     w.raw(items.as_bytes());
     if let Some(modseq) = changed_since {
-        encode_changedsince_modifier(w, modseq, vanished)?;
+        encode_changedsince_modifier(w, modseq, vanished);
     }
     w.raw(b"\r\n");
     Ok(())
@@ -685,10 +711,12 @@ fn encode_store_flags(
                 // Valid per RFC 3501 Section 6.4.6 flag-list ABNF.
             }
             _ => {
-                return Err(crate::Error::InvalidInput(
-                    "STORE +FLAGS/-FLAGS requires at least one flag; adding or \
+                return Err(crate::Error::LocalRefusal(
+                    crate::error::LocalRefusal::InvalidInput(
+                        "STORE +FLAGS/-FLAGS requires at least one flag; adding or \
                      removing zero flags is a no-op (RFC 3501 Section 6.4.6)"
-                        .into(),
+                            .into(),
+                    ),
                 ));
             }
         }

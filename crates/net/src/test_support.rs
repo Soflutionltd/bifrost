@@ -47,11 +47,10 @@ use crate::retry::RetryPolicy;
 
 /// One scripted wire outcome, consumed by the next dispatch.
 ///
-/// Note what a `Response` means here: it is what the socket produced,
-/// *not* what `send()` returns. bifrost-net's retry loop converts every
-/// 4xx and 5xx into `Err`, so scripting a `Response` with a 404 exercises
-/// the error path, not a success path. A 2xx and a passed-through 3xx are
-/// the only statuses that surface to a caller as `Ok`.
+/// A response here is what the wire produced, before transport policy runs.
+/// By default every 4xx and 5xx becomes an error; only 2xx and passed-through
+/// 3xx statuses reach the caller as a response. A request can select additional
+/// statuses with RequestBuilder::statuses_as_data.
 pub enum Canned {
     /// A response the server produced, with the given status, headers,
     /// and body.

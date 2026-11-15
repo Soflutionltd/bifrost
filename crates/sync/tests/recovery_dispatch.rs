@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use bifrost_sync::ThrottleBucket;
 use bifrost_types::{
     AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, AttemptCause, AuthCause,
-    AuthErrorKind, Cause, EngineDirective, MailboxId, RecoveryClass, ResourceKind, StateCause,
+    AuthErrorKind, Cause, EngineDirective, FolderId, RecoveryClass, ResourceKind, StateCause,
     SyncStateErrorKind, ThrottleKey, ThrottleScope, TransmissionState, TransportCause,
     TransportErrorKind, TransportKind,
 };
@@ -132,13 +132,13 @@ fn throttle_bucket_account_does_not_cross_accounts() {
 fn throttle_bucket_mailbox_does_not_cross_accounts() {
     let bucket = ThrottleBucket::new();
     let now = Instant::now();
-    let mb_a = ThrottleKey::Mailbox {
+    let mb_a = ThrottleKey::Folder {
         account: AccountId("a".into()),
-        mailbox: MailboxId("INBOX".into()),
+        folder: FolderId("INBOX".into()),
     };
-    let mb_b = ThrottleKey::Mailbox {
+    let mb_b = ThrottleKey::Folder {
         account: AccountId("b".into()),
-        mailbox: MailboxId("INBOX".into()),
+        folder: FolderId("INBOX".into()),
     };
     bucket.record(mb_a.clone(), now + Duration::from_secs(7));
     assert!(bucket.wait_for(&mb_a, now).is_some());

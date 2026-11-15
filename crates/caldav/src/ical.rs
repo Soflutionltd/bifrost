@@ -159,9 +159,7 @@ fn project_event(
                 .first("DURATION")
                 .and_then(|duration| event_end_from_duration(&start, duration))
         })
-        .filter(|end| !end.value.is_empty());
-    let is_all_day =
-        dtstart.is_some_and(Prop::value_type_date) || dtend.is_some_and(Prop::value_type_date);
+        .filter(|end| !end.value().is_empty());
     let organizer = props
         .first_with_name("ORGANIZER")
         .and_then(organizer_from_property);
@@ -200,7 +198,6 @@ fn project_event(
         location,
         start,
         end,
-        is_all_day,
         status: event_status(props.first("STATUS")),
         availability: event_availability(props.first("TRANSP")),
         visibility: event_visibility(props.first("CLASS")),
@@ -262,8 +259,17 @@ pub(crate) fn create_to_ical(event: &EventCreate, uid: &str) -> Result<String, W
         "location",
         event.location.as_deref(),
     )?;
-    push_start(&mut vevent, &event.start, event.is_all_day)?;
-    push_end(&mut vevent, &event.end, event.is_all_day)?;
+    push_start(&mut vevent, &event.start)?;
+    push_end(&mut vevent, &event.end)?;
+    if !event.end.is_unspecified() {
+        event
+            .start
+            .validate_end(&event.end)
+            .map_err(|_| WriteError {
+                field: "end",
+                reason: "must follow start in the same time domain",
+            })?;
+    }
     vevent.push(format!("STATUS:{}", ical_event_status(event.status)));
     vevent.push(format!("TRANSP:{}", transparency(event.availability)));
     if let Some(classification) = classification(event.visibility) {
@@ -386,8 +392,8 @@ pub(crate) fn patch_to_ical(
         // the patch is the stored event's own (a body with no DTSTART, which
         // the projection tolerates): a patch that only flips `is_all_day`
         // leaves it alone rather than fail on a field it never touched.
-        if patch.start.is_some() || !merged.start.value.is_empty() {
-            push_start(&mut replacements, &merged.start, merged.is_all_day)?;
+        if patch.start.is_some() || !merged.start.value().is_empty() {
+            push_start(&mut replacements, &merged.start)?;
             replace_names.push("DTSTART");
         }
     }
@@ -397,10 +403,22 @@ pub(crate) fn patch_to_ical(
         // body with no DTEND and no DURATION, and ALSO for a DURATION it
         // cannot resolve, so neither an echoed `None` (merged here as the
         // empty time) nor an explicit empty end may delete either.
-        if !merged.end.value.is_empty() {
-            push_end(&mut replacements, &merged.end, merged.is_all_day)?;
+        if !merged.end.value().is_empty() {
+            push_end(&mut replacements, &merged.end)?;
             replace_names.extend(["DTEND", "DURATION"]);
         }
+    }
+    if (patch.start.is_some() || patch.end.is_some() || patch.is_all_day.is_some())
+        && !merged.start.is_unspecified()
+        && !merged.end.is_unspecified()
+    {
+        merged
+            .start
+            .validate_end(&merged.end)
+            .map_err(|_| WriteError {
+                field: "end",
+                reason: "must follow start in the same time domain",
+            })?;
     }
     if let Some(status) = patch.status {
         replacements.push(format!("STATUS:{}", ical_event_status(status)));
@@ -457,15 +475,24 @@ pub(crate) fn patch_event(current: &CalendarEvent, patch: &EventPatch) -> EventC
             .location
             .clone()
             .unwrap_or_else(|| current.location.clone()),
-        start: patch.start.clone().unwrap_or_else(|| current.start.clone()),
+        start: {
+            let time = patch.start.clone().unwrap_or_else(|| current.start.clone());
+            patch
+                .is_all_day
+                .map_or_else(|| time.clone(), |all_day| time.converted(all_day))
+        },
         // An `EventCreate` end is not optional, so no end merges as the empty
         // time, which every writer here reads as "write no DTEND".
         end: patch
             .end
             .clone()
             .or_else(|| current.end.clone())
+            .map(|time| {
+                patch
+                    .is_all_day
+                    .map_or_else(|| time.clone(), |all_day| time.converted(all_day))
+            })
             .unwrap_or_else(default_time),
-        is_all_day: patch.is_all_day.unwrap_or(current.is_all_day),
         status: patch.status.unwrap_or(current.status),
         availability: patch.availability.unwrap_or(current.availability),
         visibility: patch.visibility.unwrap_or(current.visibility),
@@ -572,9 +599,9 @@ pub(crate) fn rsvp_reply_ical(
             .to_datetime(Timestamp::now())
             .strftime("%Y%m%dT%H%M%SZ")
     ));
-    push_start(&mut lines, &current.start, current.is_all_day)?;
+    push_start(&mut lines, &current.start)?;
     if let Some(end) = &current.end {
-        push_end(&mut lines, end, current.is_all_day)?;
+        push_end(&mut lines, end)?;
     }
     lines.push(organizer_to_line(organizer)?);
     lines.push(attendee_to_line(&attendee)?);
@@ -878,12 +905,9 @@ fn trigger_from_property(prop: &Prop) -> Option<ReminderTrigger> {
             Some(related) if related.eq_ignore_ascii_case("END") => ReminderRelativeTo::End,
             _ => ReminderRelativeTo::Start,
         };
-        Some(ReminderTrigger::Relative {
-            offset: value.to_string(),
-            relative_to,
-        })
+        Some(ReminderTrigger::relative(value, relative_to))
     } else {
-        Some(ReminderTrigger::Absolute(format_ical_time(
+        Some(ReminderTrigger::absolute(&format_ical_time(
             value, false, false,
         )))
     }
@@ -964,13 +988,10 @@ impl Prop {
 
 fn event_time_from_property(prop: &Prop) -> EventTime {
     let tzid = prop.text_param("TZID");
-    EventTime {
-        value: format_ical_time(&prop.value, prop.value_type_date(), tzid.is_some()),
-        // Map Microsoft/Windows zone names ("W. Europe Standard Time") to
-        // their IANA equivalent when caldata's table knows them; otherwise
-        // pass the TZID through verbatim.
-        timezone: tzid.as_deref().map(canonical_tzid),
-    }
+    EventTime::from_observed(
+        format_ical_time(&prop.value, prop.value_type_date(), tzid.is_some()),
+        tzid.as_deref().map(canonical_tzid),
+    )
 }
 
 /// Resolve a raw TZID to its IANA name when it is a known Microsoft/Windows
@@ -1056,14 +1077,16 @@ fn event_end_from_duration(start: &EventTime, duration: &str) -> Option<EventTim
     let raw_duration = duration;
     let duration =
         SignedDuration::from_secs(caldata::types::parse_duration(duration).ok()?.num_seconds());
-    let value = if let Ok(value) = start.value.parse::<Timestamp>() {
+    let value = if let Some(value) = start.instant() {
         let end = Offset::UTC.to_datetime(value.checked_add(duration).ok()?);
-        if start.value.ends_with('Z') {
+        if start.value().ends_with('Z') {
             end.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
         } else {
             end.strftime("%Y-%m-%dT%H:%M:%S+00:00").to_string()
         }
-    } else if let Ok(value) = civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", &start.value) {
+    } else if let bifrost_types::EventTimeKind::Floating(value)
+    | bifrost_types::EventTimeKind::Zoned(value) = start.kind()
+    {
         // RFC 5545 s3.3.6 splits a duration in two: the DAY and WEEK parts are
         // NOMINAL (a day is "the same wall time tomorrow", DST or not) while
         // the time parts are EXACT seconds. Civil addition is right for the
@@ -1071,13 +1094,13 @@ fn event_end_from_duration(start: &EventTime, duration: &str) -> Option<EventTim
         // TZID-bearing DTSTART lands - so an exact duration under a known zone
         // is added through the zone, and everything else keeps the civil
         // arithmetic that was already correct for it.
-        match exact_zone_end(&start.timezone, value, duration, raw_duration) {
+        match exact_zone_end(start.timezone(), value, duration, raw_duration) {
             Some(end) => end,
             None => value.checked_add(duration).ok()?,
         }
         .strftime("%Y-%m-%dT%H:%M:%S")
         .to_string()
-    } else if let Ok(value) = civil::Date::strptime("%Y-%m-%d", &start.value) {
+    } else if let bifrost_types::EventTimeKind::Date(value) = start.kind() {
         value
             .to_datetime(civil::Time::MIN)
             .checked_add(duration)
@@ -1088,10 +1111,10 @@ fn event_end_from_duration(start: &EventTime, duration: &str) -> Option<EventTim
     } else {
         return None;
     };
-    Some(EventTime {
+    Some(EventTime::from_observed(
         value,
-        timezone: start.timezone.clone(),
-    })
+        start.timezone().map(str::to_owned),
+    ))
 }
 
 /// Add an EXACT (time-only) duration to a wall clock through its named zone,
@@ -1104,7 +1127,7 @@ fn event_end_from_duration(start: &EventTime, duration: &str) -> Option<EventTim
 /// fall-back fold takes the earlier instant, a spring-forward gap the post-gap
 /// offset.
 fn exact_zone_end(
-    timezone: &Option<String>,
+    timezone: Option<&str>,
     start: civil::DateTime,
     duration: SignedDuration,
     raw_duration: &str,
@@ -1112,7 +1135,7 @@ fn exact_zone_end(
     if !duration_is_exact(raw_duration) {
         return None;
     }
-    let tz = TimeZone::get(&canonical_tzid(timezone.as_deref()?)).ok()?;
+    let tz = TimeZone::get(&canonical_tzid(timezone?)).ok()?;
     let start = match tz.to_ambiguous_timestamp(start).offset() {
         AmbiguousOffset::Unambiguous { offset } => offset,
         AmbiguousOffset::Fold { before, .. } => before,
@@ -1131,24 +1154,25 @@ fn duration_is_exact(duration: &str) -> bool {
         .any(|character| matches!(character.to_ascii_uppercase(), 'D' | 'W'))
 }
 
-fn ical_time_from_event_time(time: &EventTime, is_all_day: bool) -> String {
-    if is_all_day {
+fn ical_time_from_event_time(time: &EventTime) -> String {
+    if time.is_all_day() {
         // `EventTime`'s all-day end is exclusive, matching iCalendar's
         // exclusive DTEND, so the date serializes verbatim - no +1 day.
-        return time.value.replace('-', "");
+        return time.value().replace('-', "");
     }
-    if let Ok(instant) = time.value.parse::<Timestamp>() {
-        if time.timezone.is_some() {
+    if let Some(instant) = time.instant() {
+        if time.timezone().is_some() {
             // Under a TZID the wall clock is what belongs on the wire. An
             // offset-carrying value renders in its own offset (the civil
             // parser accepts and drops a numeric offset); a `Z` value names
             // an instant, which must be projected into the TZID's wall clock
             // - emitting the UTC wall clock under the zone label would shift
             // the event by the zone offset.
-            let wall = time
-                .value
-                .parse::<civil::DateTime>()
-                .unwrap_or_else(|_| instant_zone_wall(time.timezone.as_deref(), instant));
+            let wall = if time.value().ends_with(['Z', 'z']) {
+                instant_zone_wall(time.timezone(), instant)
+            } else {
+                time.local_datetime().expect("parsed offset wall clock")
+            };
             return wall.strftime("%Y%m%dT%H%M%S").to_string();
         }
         return Offset::UTC
@@ -1156,18 +1180,15 @@ fn ical_time_from_event_time(time: &EventTime, is_all_day: bool) -> String {
             .strftime("%Y%m%dT%H%M%SZ")
             .to_string();
     }
-    let mut value = time.value.replace(['-', ':'], "");
-    if time.timezone.is_some() {
+    let mut value = time.value().replace(['-', ':'], "");
+    if time.timezone().is_some() {
         value = value.trim_end_matches('Z').to_string();
     }
     value
 }
 
 fn default_time() -> EventTime {
-    EventTime {
-        value: String::new(),
-        timezone: None,
-    }
+    EventTime::from_observed(String::new(), None)
 }
 
 /// An absent `STATUS` projects as `Confirmed`. RFC 5545 defines NO default for
@@ -1291,23 +1312,23 @@ fn push_optional(
 }
 
 fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) -> Result<(), WriteError> {
-    if event.is_all_day {
+    if event.is_all_day() {
         return Ok(());
     }
     let mut tzids = Vec::new();
     // An empty end writes no DTEND, so its zone has nothing to describe.
-    let end_zone = if event.end.value.is_empty() {
+    let end_zone = if event.end.value().is_empty() {
         &None
     } else {
-        &event.end.timezone
+        &event.end.timezone()
     };
-    for tzid in [&event.start.timezone, end_zone]
+    for tzid in [&event.start.timezone(), end_zone]
         .into_iter()
         .flatten()
         .filter(|tzid| !tzid.is_empty())
     {
         if !tzids.iter().any(|known: &String| known == tzid) {
-            tzids.push(tzid.clone());
+            tzids.push((*tzid).to_string());
         }
     }
     for tzid in tzids {
@@ -1316,7 +1337,7 @@ fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) -> Result<(), W
         // will resolve the DTSTART/DTEND against.
         let anchor = [&event.start, &event.end]
             .into_iter()
-            .find(|time| time.timezone.as_deref() == Some(tzid.as_str()))
+            .find(|time| time.timezone() == Some(tzid.as_str()))
             .and_then(event_naive_local);
 
         // Resolve the real UTC offset for the event's instant. `canonical_tzid`
@@ -1363,21 +1384,12 @@ fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) -> Result<(), W
 /// stored value is a local wall-clock instant (mirrors `push_time`, which
 /// strips the trailing `Z` and emits the date/time verbatim under the zone).
 fn event_naive_local(time: &EventTime) -> Option<civil::DateTime> {
-    if let Ok(parsed) = time.value.parse::<civil::DateTime>() {
-        return Some(parsed);
+    if time.value().ends_with(['Z', 'z'])
+        && let Some(instant) = time.instant()
+    {
+        return Some(instant_zone_wall(time.timezone(), instant));
     }
-    // A `Z`-suffixed RFC 3339 value names an instant (the civil parser
-    // rejects it because Temporal reads `Z` as an unknown offset). The
-    // VTIMEZONE anchor must be that instant's wall clock IN THE ZONE;
-    // reading the UTC wall clock as zone-local can resolve the offset on
-    // the wrong side of a DST transition.
-    if let Ok(instant) = time.value.parse::<Timestamp>() {
-        return Some(instant_zone_wall(time.timezone.as_deref(), instant));
-    }
-    // Fall back to parsing a bare iCalendar-style `YYYYMMDDTHHMMSS` value.
-    let raw = time.value.replace(['-', ':'], "");
-    let raw = raw.trim_end_matches('Z');
-    civil::DateTime::strptime("%Y%m%dT%H%M%S", raw).ok()
+    time.local_datetime()
 }
 
 /// Project an instant into `tzid`'s wall clock. Falls back to the UTC wall
@@ -1424,18 +1436,8 @@ fn format_utc_offset(offset: Offset) -> String {
 /// iCalendar, and unlike an end there is no honest reading of "no start" - the
 /// event has no position. Providers project an empty `EventTime` for "did not
 /// say", and a consumer's read-modify-write echoes it back here.
-fn push_start(
-    lines: &mut Vec<String>,
-    time: &EventTime,
-    is_all_day: bool,
-) -> Result<(), WriteError> {
-    push_time(
-        lines,
-        "DTSTART",
-        time,
-        is_all_day,
-        ("start", "start timezone"),
-    )
+fn push_start(lines: &mut Vec<String>, time: &EventTime) -> Result<(), WriteError> {
+    push_time(lines, "DTSTART", time, ("start", "start timezone"))
 }
 
 /// Write `DTEND`, or nothing when the end is empty.
@@ -1447,37 +1449,37 @@ fn push_start(
 /// stated" and is omitted, which round-trips: the stored event reads back with
 /// an empty end again. It is neither refused (a valid read-then-create would
 /// fail) nor written as `DTEND:` (invalid).
-fn push_end(lines: &mut Vec<String>, time: &EventTime, is_all_day: bool) -> Result<(), WriteError> {
-    if time.value.is_empty() {
+fn push_end(lines: &mut Vec<String>, time: &EventTime) -> Result<(), WriteError> {
+    if time.value().is_empty() {
         return Ok(());
     }
-    push_time(lines, "DTEND", time, is_all_day, ("end", "end timezone"))
+    push_time(lines, "DTEND", time, ("end", "end timezone"))
 }
 
 fn push_time(
     lines: &mut Vec<String>,
     name: &str,
     time: &EventTime,
-    is_all_day: bool,
     (field, timezone_field): (&'static str, &'static str),
 ) -> Result<(), WriteError> {
-    plain_value(field, &time.value)?;
+    plain_value(field, time.value())?;
+    time.validate().map_err(|_| WriteError {
+        field,
+        reason: "is not a valid event time",
+    })?;
     // An empty TZID (the projection yields `Some("")` for `TZID=`) is no zone:
     // `;TZID=:` is not a valid parameter, and the value must render as it does
     // for a zoneless time (a `Z` instant stays UTC).
     let zoneless;
-    let time = if time.timezone.as_deref() == Some("") {
-        zoneless = EventTime {
-            value: time.value.clone(),
-            timezone: None,
-        };
+    let time = if time.timezone() == Some("") {
+        zoneless = EventTime::from_observed(time.value().to_owned(), None);
         &zoneless
     } else {
         time
     };
-    let value = ical_time_from_event_time(time, is_all_day);
-    let timezone = time.timezone.as_deref();
-    if is_all_day {
+    let value = ical_time_from_event_time(time);
+    let timezone = time.timezone();
+    if time.is_all_day() {
         lines.push(format!("{name};VALUE=DATE:{value}"));
     } else if let Some(tzid) = timezone {
         lines.push(format!(
@@ -1711,7 +1713,7 @@ mod tests {
 
         assert_eq!(event.uid.as_deref(), Some("u1"));
         assert_eq!(event.title.as_deref(), Some("Meet, now"));
-        assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
+        assert_eq!(event.start.value(), "2026-06-02T12:00:00Z");
         assert_eq!(event.attendees[0].status, RsvpStatus::Accepted);
     }
 
@@ -1737,8 +1739,8 @@ mod tests {
         );
 
         assert_eq!(event.title.as_deref(), Some("Real"));
-        assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
-        assert_eq!(event.start.timezone, None);
+        assert_eq!(event.start.value(), "2026-06-02T12:00:00Z");
+        assert_eq!(event.start.timezone(), None);
         assert_eq!(
             event.reminders.len(),
             1,
@@ -1768,12 +1770,12 @@ mod tests {
         // 01:00 + 10 exact hours over the 02:00 -> 03:00 jump is 12:00, where
         // DST-blind civil addition answers 11:00.
         let exact = event("PT10H").end.expect("resolved end");
-        assert_eq!(exact.value, "2026-03-29T12:00:00");
-        assert_eq!(exact.timezone.as_deref(), Some("Europe/Oslo"));
+        assert_eq!(exact.value(), "2026-03-29T12:00:00");
+        assert_eq!(exact.timezone(), Some("Europe/Oslo"));
 
         // A nominal day keeps the wall clock across the same transition.
         assert_eq!(
-            event("P1D").end.expect("resolved end").value,
+            event("P1D").end.expect("resolved end").value(),
             "2026-03-30T01:00:00"
         );
     }
@@ -1787,8 +1789,8 @@ mod tests {
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000+0200\r\nDTEND:20260602T130000+0200\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         );
 
-        assert_eq!(event.start.value, "2026-06-02T12:00:00+02:00");
-        assert_eq!(event.end.expect("end").value, "2026-06-02T13:00:00+02:00");
+        assert_eq!(event.start.value(), "2026-06-02T12:00:00+02:00");
+        assert_eq!(event.end.expect("end").value(), "2026-06-02T13:00:00+02:00");
     }
 
     #[test]
@@ -1803,12 +1805,12 @@ mod tests {
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART;TZID=Europe/Oslo:20260602T120000\r\nDTEND;TZID=Europe/Oslo:20260602T130000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         );
 
-        assert_eq!(event.start.value, "2026-06-02T12:00:00");
-        assert!(!event.start.value.ends_with('Z'));
-        assert_eq!(event.start.timezone.as_deref(), Some("Europe/Oslo"));
+        assert_eq!(event.start.value(), "2026-06-02T12:00:00");
+        assert!(!event.start.value().ends_with('Z'));
+        assert_eq!(event.start.timezone(), Some("Europe/Oslo"));
         let end = event.end.expect("end");
-        assert_eq!(end.value, "2026-06-02T13:00:00");
-        assert_eq!(end.timezone.as_deref(), Some("Europe/Oslo"));
+        assert_eq!(end.value(), "2026-06-02T13:00:00");
+        assert_eq!(end.timezone(), Some("Europe/Oslo"));
     }
 
     #[test]
@@ -1822,8 +1824,8 @@ mod tests {
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART;TZID=W. Europe Standard Time:20260602T120000\r\nDTEND;TZID=W. Europe Standard Time:20260602T130000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         );
 
-        assert_eq!(event.start.timezone.as_deref(), Some("Europe/Berlin"));
-        assert_eq!(event.start.value, "2026-06-02T12:00:00");
+        assert_eq!(event.start.timezone(), Some("Europe/Berlin"));
+        assert_eq!(event.start.value(), "2026-06-02T12:00:00");
     }
 
     #[test]
@@ -1838,8 +1840,8 @@ mod tests {
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000\r\nDTSTART;TZID=Europe/Oslo:20260602T130000\r\nDTEND:20260602T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         );
 
-        assert_eq!(event.start.timezone.as_deref(), Some("Europe/Oslo"));
-        assert_eq!(event.start.value, "2026-06-02T13:00:00");
+        assert_eq!(event.start.timezone(), Some("Europe/Oslo"));
+        assert_eq!(event.start.value(), "2026-06-02T13:00:00");
     }
 
     #[test]
@@ -1853,8 +1855,8 @@ mod tests {
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART;TZID=\"Custom:Zone;X\":20260602T120000\r\nATTENDEE;CN=\"Doe, John\";PARTSTAT=ACCEPTED:mailto:john@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         );
 
-        assert_eq!(event.start.value, "2026-06-02T12:00:00");
-        assert_eq!(event.start.timezone.as_deref(), Some("Custom:Zone;X"));
+        assert_eq!(event.start.value(), "2026-06-02T12:00:00");
+        assert_eq!(event.start.timezone(), Some("Custom:Zone;X"));
         assert_eq!(event.attendees.len(), 1);
         assert_eq!(event.attendees[0].name.as_deref(), Some("Doe, John"));
         assert_eq!(event.attendees[0].email, "john@example.test");
@@ -1938,15 +1940,8 @@ mod tests {
                 title: None,
                 description: None,
                 location: None,
-                start: EventTime {
-                    value: "2026-06-02".to_string(),
-                    timezone: None,
-                },
-                end: EventTime {
-                    value: "2026-06-03".to_string(),
-                    timezone: None,
-                },
-                is_all_day: true,
+                start: EventTime::from_observed("2026-06-02".to_string(), None),
+                end: EventTime::from_observed("2026-06-03".to_string(), None),
                 status: EventStatus::Confirmed,
                 availability: EventAvailability::Busy,
                 visibility: EventVisibility::Default,
@@ -1966,12 +1961,12 @@ mod tests {
             None,
             &body,
         );
-        assert_eq!(event.start.value, "2026-06-02");
-        assert_eq!(event.end.expect("end").value, "2026-06-03");
+        assert_eq!(event.start.value(), "2026-06-02");
+        assert_eq!(event.end.expect("end").value(), "2026-06-03");
     }
 
     #[test]
-    fn dtend_date_marks_event_all_day() {
+    fn mixed_observed_bounds_keep_the_start_time_kind() {
         // The exclusive iCalendar all-day DTEND passes through verbatim
         // into the exclusive `EventTime` end - no inclusive decrement.
         let event = parse_event(
@@ -1981,8 +1976,11 @@ mod tests {
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T000000Z\r\nDTEND;VALUE=DATE:20260603\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         );
 
-        assert!(event.is_all_day);
-        assert_eq!(event.end.expect("end").value, "2026-06-03");
+        // A damaged end must not turn a user's timed appointment into an
+        // all-day row. Preserve both observations; the typed start owns mode.
+        assert!(!event.is_all_day());
+        assert_eq!(event.start.value(), "2026-06-02T00:00:00Z");
+        assert_eq!(event.end.expect("end").value(), "2026-06-03");
     }
 
     #[test]
@@ -2013,7 +2011,7 @@ mod tests {
         );
 
         assert_eq!(event.title.as_deref(), Some("Master"));
-        assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
+        assert_eq!(event.start.value(), "2026-06-02T12:00:00Z");
         assert_eq!(
             event.recurrence.rrule.as_deref(),
             Some("FREQ=WEEKLY;COUNT=2")
@@ -2076,7 +2074,7 @@ mod tests {
         assert_eq!(
             event.reminders[0].trigger,
             ReminderTrigger::Relative {
-                offset: "-PT15M".to_string(),
+                offset: "-PT15M".parse().unwrap(),
                 relative_to: ReminderRelativeTo::Start,
             }
         );
@@ -2084,13 +2082,13 @@ mod tests {
         assert_eq!(
             event.reminders[1].trigger,
             ReminderTrigger::Relative {
-                offset: "PT5M".to_string(),
+                offset: "PT5M".parse().unwrap(),
                 relative_to: ReminderRelativeTo::End,
             }
         );
         assert_eq!(
             event.reminders[2].trigger,
-            ReminderTrigger::Absolute("2026-06-02T11:00:00Z".to_string())
+            ReminderTrigger::Absolute("2026-06-02T11:00:00Z".parse().unwrap())
         );
     }
 
@@ -2102,15 +2100,8 @@ mod tests {
                 title: Some("Planning".to_string()),
                 description: None,
                 location: None,
-                start: EventTime {
-                    value: "2026-06-02T12:00:00Z".to_string(),
-                    timezone: None,
-                },
-                end: EventTime {
-                    value: "2026-06-02T13:00:00Z".to_string(),
-                    timezone: None,
-                },
-                is_all_day: false,
+                start: EventTime::from_observed("2026-06-02T12:00:00Z".to_string(), None),
+                end: EventTime::from_observed("2026-06-02T13:00:00Z".to_string(), None),
                 status: EventStatus::Confirmed,
                 availability: EventAvailability::Busy,
                 visibility: EventVisibility::Default,
@@ -2134,15 +2125,8 @@ mod tests {
                 title: None,
                 description: None,
                 location: None,
-                start: EventTime {
-                    value: "2026-06-02T12:00:00Z".to_string(),
-                    timezone: None,
-                },
-                end: EventTime {
-                    value: "2026-06-02T13:00:00Z".to_string(),
-                    timezone: None,
-                },
-                is_all_day: false,
+                start: EventTime::from_observed("2026-06-02T12:00:00Z".to_string(), None),
+                end: EventTime::from_observed("2026-06-02T13:00:00Z".to_string(), None),
                 status: EventStatus::Confirmed,
                 availability: EventAvailability::Busy,
                 visibility: EventVisibility::Default,
@@ -2167,15 +2151,8 @@ mod tests {
                 title: None,
                 description: None,
                 location: None,
-                start: EventTime {
-                    value: "2026-06-02T12:00:00+02:00".to_string(),
-                    timezone: None,
-                },
-                end: EventTime {
-                    value: "2026-06-02T13:00:00+02:00".to_string(),
-                    timezone: None,
-                },
-                is_all_day: false,
+                start: EventTime::from_observed("2026-06-02T12:00:00+02:00".to_string(), None),
+                end: EventTime::from_observed("2026-06-02T13:00:00+02:00".to_string(), None),
                 status: EventStatus::Confirmed,
                 availability: EventAvailability::Busy,
                 visibility: EventVisibility::Default,
@@ -2198,15 +2175,14 @@ mod tests {
                 title: None,
                 description: None,
                 location: None,
-                start: EventTime {
-                    value: "2026-06-02T12:00:00Z".to_string(),
-                    timezone: Some("Europe/Oslo".to_string()),
-                },
-                end: EventTime {
-                    value: "2026-06-02T13:00:00Z".to_string(),
-                    timezone: Some("Europe/Oslo".to_string()),
-                },
-                is_all_day: false,
+                start: EventTime::from_observed(
+                    "2026-06-02T12:00:00Z".to_string(),
+                    Some("Europe/Oslo".to_string()),
+                ),
+                end: EventTime::from_observed(
+                    "2026-06-02T13:00:00Z".to_string(),
+                    Some("Europe/Oslo".to_string()),
+                ),
                 status: EventStatus::Confirmed,
                 availability: EventAvailability::Busy,
                 visibility: EventVisibility::Default,
@@ -2241,15 +2217,14 @@ mod tests {
                 title: None,
                 description: None,
                 location: None,
-                start: EventTime {
-                    value: "2026-01-15T12:00:00Z".to_string(),
-                    timezone: Some("Europe/Oslo".to_string()),
-                },
-                end: EventTime {
-                    value: "2026-01-15T13:00:00Z".to_string(),
-                    timezone: Some("Europe/Oslo".to_string()),
-                },
-                is_all_day: false,
+                start: EventTime::from_observed(
+                    "2026-01-15T12:00:00Z".to_string(),
+                    Some("Europe/Oslo".to_string()),
+                ),
+                end: EventTime::from_observed(
+                    "2026-01-15T13:00:00Z".to_string(),
+                    Some("Europe/Oslo".to_string()),
+                ),
                 status: EventStatus::Confirmed,
                 availability: EventAvailability::Busy,
                 visibility: EventVisibility::Default,
@@ -2274,15 +2249,14 @@ mod tests {
                 title: None,
                 description: None,
                 location: None,
-                start: EventTime {
-                    value: "2026-06-02T12:00:00Z".to_string(),
-                    timezone: Some("Custom/Bogus".to_string()),
-                },
-                end: EventTime {
-                    value: "2026-06-02T13:00:00Z".to_string(),
-                    timezone: Some("Custom/Bogus".to_string()),
-                },
-                is_all_day: false,
+                start: EventTime::from_observed(
+                    "2026-06-02T12:00:00Z".to_string(),
+                    Some("Custom/Bogus".to_string()),
+                ),
+                end: EventTime::from_observed(
+                    "2026-06-02T13:00:00Z".to_string(),
+                    Some("Custom/Bogus".to_string()),
+                ),
                 status: EventStatus::Confirmed,
                 availability: EventAvailability::Busy,
                 visibility: EventVisibility::Default,
@@ -2331,15 +2305,8 @@ mod tests {
                 title: None,
                 description: None,
                 location: None,
-                start: EventTime {
-                    value: "2026-06-02T12:00:00Z".to_string(),
-                    timezone: None,
-                },
-                end: EventTime {
-                    value: "2026-06-02T13:00:00Z".to_string(),
-                    timezone: None,
-                },
-                is_all_day: false,
+                start: EventTime::from_observed("2026-06-02T12:00:00Z".to_string(), None),
+                end: EventTime::from_observed("2026-06-02T13:00:00Z".to_string(), None),
                 status: EventStatus::Tentative,
                 availability: EventAvailability::Free,
                 visibility: EventVisibility::Private,
@@ -3004,15 +2971,8 @@ mod tests {
                 title: Some("A".repeat(90)),
                 description: None,
                 location: None,
-                start: EventTime {
-                    value: "2026-06-02T12:00:00Z".to_string(),
-                    timezone: None,
-                },
-                end: EventTime {
-                    value: "2026-06-02T13:00:00Z".to_string(),
-                    timezone: None,
-                },
-                is_all_day: false,
+                start: EventTime::from_observed("2026-06-02T12:00:00Z".to_string(), None),
+                end: EventTime::from_observed("2026-06-02T13:00:00Z".to_string(), None),
                 status: EventStatus::Confirmed,
                 availability: EventAvailability::Busy,
                 visibility: EventVisibility::Default,
@@ -3054,7 +3014,7 @@ mod tests {
         )
         .expect("non-ASCII property value remains a per-resource value");
 
-        assert_eq!(event.start.value, "\u{20ac}".repeat(5));
+        assert_eq!(event.start.value(), "\u{20ac}".repeat(5));
     }
 
     #[test]
@@ -3066,8 +3026,8 @@ mod tests {
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDURATION:PT1H\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         );
 
-        assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
-        assert_eq!(event.end.expect("end").value, "2026-06-02T13:00:00Z");
+        assert_eq!(event.start.value(), "2026-06-02T12:00:00Z");
+        assert_eq!(event.end.expect("end").value(), "2026-06-02T13:00:00Z");
     }
 
     #[test]
@@ -3082,10 +3042,10 @@ mod tests {
         let body = patch_to_ical(
             &current,
             &EventPatch {
-                end: Some(EventTime {
-                    value: "2026-06-02T14:00:00Z".to_string(),
-                    timezone: None,
-                }),
+                end: Some(EventTime::from_observed(
+                    "2026-06-02T14:00:00Z".to_string(),
+                    None,
+                )),
                 ..EventPatch::default()
             },
         )
@@ -3375,7 +3335,7 @@ mod tests {
         );
 
         assert!(line.contains("TZID=Custom\\Zone:"));
-        assert_eq!(event.start.timezone.as_deref(), Some(tzid));
+        assert_eq!(event.start.timezone(), Some(tzid));
     }
 
     #[test]
@@ -3430,15 +3390,14 @@ mod tests {
                 title: Some("Plan\r\nNext".to_string()),
                 description: None,
                 location: None,
-                start: EventTime {
-                    value: "2026-06-02T12:00:00Z".to_string(),
-                    timezone: Some("Europe/Oslo:Main".to_string()),
-                },
-                end: EventTime {
-                    value: "2026-06-02T13:00:00Z".to_string(),
-                    timezone: Some("Europe/Oslo:Main".to_string()),
-                },
-                is_all_day: false,
+                start: EventTime::from_observed(
+                    "2026-06-02T12:00:00Z".to_string(),
+                    Some("Europe/Oslo:Main".to_string()),
+                ),
+                end: EventTime::from_observed(
+                    "2026-06-02T13:00:00Z".to_string(),
+                    Some("Europe/Oslo:Main".to_string()),
+                ),
                 status: EventStatus::Confirmed,
                 availability: EventAvailability::Busy,
                 visibility: EventVisibility::Default,
@@ -3459,15 +3418,8 @@ mod tests {
             title: Some("Plan".to_string()),
             description: None,
             location: None,
-            start: EventTime {
-                value: "2026-06-02T12:00:00Z".to_string(),
-                timezone: None,
-            },
-            end: EventTime {
-                value: "2026-06-02T13:00:00Z".to_string(),
-                timezone: None,
-            },
-            is_all_day: false,
+            start: EventTime::from_observed("2026-06-02T12:00:00Z".to_string(), None),
+            end: EventTime::from_observed("2026-06-02T13:00:00Z".to_string(), None),
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -3526,11 +3478,17 @@ mod tests {
         assert_eq!(refusal(&event).field, "organizer email");
 
         let mut event = writable_create();
-        event.start.value = "2026-06-02T12:00:00Z\r\nX-EVIL:1".to_string();
+        event.start = EventTime::from_observed(
+            "2026-06-02T12:00:00Z\r\nX-EVIL:1".to_string(),
+            event.start.timezone().map(str::to_owned),
+        );
         assert_eq!(refusal(&event).field, "start");
 
         let mut event = writable_create();
-        event.end.value = "2026-06-02T13:00:00Z\nX-EVIL:1".to_string();
+        event.end = EventTime::from_observed(
+            "2026-06-02T13:00:00Z\nX-EVIL:1".to_string(),
+            event.end.timezone().map(str::to_owned),
+        );
         assert_eq!(refusal(&event).field, "end");
     }
 
@@ -3544,7 +3502,10 @@ mod tests {
             "a@example.test",
             Some("Ada \"The\" Countess\r\nX-EVIL:1"),
         )];
-        event.start.timezone = Some("Europe/Oslo".to_string());
+        event.start = event
+            .start
+            .clone()
+            .with_timezone(Some("Europe/Oslo".to_string()));
         let body = super::create_to_ical(&event, "uid-1").expect("encodable parameters");
         assert!(!body.contains("\r\nX-EVIL"), "{body}");
         let projected = event_from_ical(
@@ -3573,7 +3534,10 @@ mod tests {
         assert_eq!(refusal(&event).field, "organizer name");
 
         let mut event = writable_create();
-        event.start.timezone = Some("Europe/\u{1}Oslo".to_string());
+        event.start = event
+            .start
+            .clone()
+            .with_timezone(Some("Europe/\u{1}Oslo".to_string()));
         assert_eq!(refusal(&event).field, "start timezone");
     }
 
@@ -3613,10 +3577,10 @@ mod tests {
         assert_eq!(error.field, "attendee email");
 
         let start = EventPatch {
-            start: Some(EventTime {
-                value: "2026-06-02T12:00:00Z\nX-EVIL:1".to_string(),
-                timezone: None,
-            }),
+            start: Some(EventTime::from_observed(
+                "2026-06-02T12:00:00Z\nX-EVIL:1".to_string(),
+                None,
+            )),
             ..EventPatch::default()
         };
         let Err(PatchError::Write(error)) = patch_to_ical(&current, &start) else {
@@ -3691,18 +3655,12 @@ mod tests {
     #[test]
     fn an_empty_start_is_refused_on_create_and_patch() {
         let mut event = writable_create();
-        event.start = EventTime {
-            value: String::new(),
-            timezone: None,
-        };
+        event.start = EventTime::from_observed(String::new(), None);
         let error = refusal(&event);
         assert_eq!((error.field, error.reason), ("start", "is empty"));
 
         let patch = EventPatch {
-            start: Some(EventTime {
-                value: String::new(),
-                timezone: None,
-            }),
+            start: Some(EventTime::from_observed(String::new(), None)),
             ..EventPatch::default()
         };
         let Err(PatchError::Write(error)) = patch_to_ical(&patch_target(), &patch) else {
@@ -3717,10 +3675,7 @@ mod tests {
     #[test]
     fn an_empty_end_on_create_writes_no_dtend() {
         let mut event = writable_create();
-        event.end = EventTime {
-            value: String::new(),
-            timezone: Some("Europe/Oslo".to_string()),
-        };
+        event.end = EventTime::from_observed(String::new(), Some("Europe/Oslo".to_string()));
         let body = super::create_to_ical(&event, "uid-1").expect("an empty end is writable");
         assert!(!body.contains("DTEND"), "{body}");
         assert!(
@@ -3736,7 +3691,7 @@ mod tests {
         )
         .expect("reads back");
         assert_eq!(projected.end, None);
-        assert_eq!(projected.start.value, "2026-06-02T12:00:00Z");
+        assert_eq!(projected.start.value(), "2026-06-02T12:00:00Z");
     }
 
     /// An empty end on a patch leaves the stored DTEND, and a stored DURATION
@@ -3747,10 +3702,7 @@ mod tests {
     fn an_empty_end_on_a_patch_leaves_the_stored_end_untouched() {
         let empty_end = EventPatch {
             title: Some(Some("Renamed".to_string())),
-            end: Some(EventTime {
-                value: String::new(),
-                timezone: None,
-            }),
+            end: Some(EventTime::from_observed(String::new(), None)),
             ..EventPatch::default()
         };
         let body = patch_to_ical(&patch_target(), &empty_end).expect("splices");
@@ -3774,7 +3726,7 @@ mod tests {
     #[test]
     fn an_empty_timezone_writes_no_tzid_parameter() {
         let mut event = writable_create();
-        event.start.timezone = Some(String::new());
+        event.start = event.start.clone().with_timezone(Some(String::new()));
         let body = super::create_to_ical(&event, "uid-1").expect("writable");
         assert!(body.contains("DTSTART:20260602T120000Z\r\n"), "{body}");
     }

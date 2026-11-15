@@ -6,7 +6,7 @@ use serde::{Serialize, Serializer};
 use crate::client::{Client, SessionState};
 use crate::core::transport::HttpTransport;
 
-use super::capability::Capability;
+use super::capability::{Capability, Core};
 use super::id::AccountId;
 use super::method::JmapMethod;
 use super::response::Response;
@@ -113,17 +113,22 @@ impl CallLimit {
 }
 
 /// A JMAP request batch.
-pub(crate) struct Request<'x, T: HttpTransport = crate::transport_reqwest::ReqwestTransport> {
+pub(crate) struct Request<
+    'x,
+    T: HttpTransport = crate::transport_reqwest::ReqwestTransport,
+    C: Capability = Core,
+> {
     client: &'x Client<T>,
     session_state: std::sync::Arc<SessionState>,
     account_id: AccountId,
+    capability: PhantomData<fn() -> C>,
     pub(crate) using: Vec<&'static str>,
-    pub(crate) method_calls: Vec<RawMethodCall>,
+    method_calls: Vec<RawMethodCall>,
     pub(crate) created_ids: Option<std::collections::HashMap<String, String>>,
     max_calls: CallLimit,
 }
 
-impl<T: HttpTransport> Serialize for Request<'_, T> {
+impl<T: HttpTransport, C: Capability> Serialize for Request<'_, T, C> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let field_count = if self.created_ids.is_some() { 3 } else { 2 };
         let mut s = serializer.serialize_struct("Request", field_count)?;
@@ -136,15 +141,16 @@ impl<T: HttpTransport> Serialize for Request<'_, T> {
     }
 }
 
-impl<'x, T: HttpTransport> Request<'x, T> {
-    pub(crate) fn new(client: &'x Client<T>) -> Self {
+impl<'x, T: HttpTransport, C: Capability> Request<'x, T, C> {
+    fn scoped(client: &'x Client<T>, account_id: AccountId) -> Self {
         let session_state = client.session_state();
         let max_calls = CallLimit::read(session_state.session());
         Request {
             using: vec!["urn:ietf:params:jmap:core"],
             method_calls: Vec::new(),
             created_ids: None,
-            account_id: session_state.default_account_id().clone(),
+            account_id,
+            capability: PhantomData,
             client,
             session_state,
             max_calls,
@@ -160,6 +166,11 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         &self.session_state
     }
 
+    #[cfg(test)]
+    pub(crate) fn call_count(&self) -> usize {
+        self.method_calls.len()
+    }
+
     /// The wire replay policy of this batch: `Idempotent` when every call is
     /// replay-safe (an empty request has no effect and qualifies), else
     /// `Never`.
@@ -171,14 +182,13 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         }
     }
 
-    pub(crate) fn account_id(mut self, account_id: impl Into<AccountId>) -> Self {
-        self.account_id = account_id.into();
-        self
+    pub(crate) fn for_account(account: &'x crate::account::Account<T, C>) -> Self {
+        Self::scoped(account.client(), account.id().clone())
     }
 
-    /// The default account ID for this request.
-    pub(crate) fn default_account_id(&self) -> &AccountId {
-        &self.account_id
+    #[cfg(test)]
+    pub(crate) fn test_scoped(client: &'x Client<T>, account_id: impl Into<AccountId>) -> Self {
+        Self::scoped(client, account_id.into())
     }
 
     /// Add a method call to the batch. Returns a typed handle for
@@ -188,10 +198,24 @@ impl<'x, T: HttpTransport> Request<'x, T> {
     /// [`JmapMethod::set_account_id`] just before serialization, so
     /// callers no longer pass `accountId` through every method-struct
     /// constructor.
-    pub(crate) fn call<M: JmapMethod>(
+    pub(crate) fn call<M: JmapMethod<Cap = C>>(
         &mut self,
-        mut method: M,
+        method: M,
     ) -> Result<CallHandle<M>, crate::Error> {
+        self.push(method)
+    }
+
+    /// Explicit cross-family call on this same account, checked against the
+    /// request's frozen session. Existing result references stay in this batch.
+    pub(crate) fn call_as<M: JmapMethod>(
+        &mut self,
+        method: M,
+    ) -> Result<CallHandle<M>, crate::Error> {
+        require_capability::<M::Cap>(self.session_state.session(), &self.account_id)?;
+        self.push(method)
+    }
+
+    fn push<M: JmapMethod>(&mut self, mut method: M) -> Result<CallHandle<M>, crate::Error> {
         if let Some(max) = self.max_calls.enforced()
             && self.method_calls.len() >= max
         {
@@ -266,8 +290,8 @@ impl<'x, T: HttpTransport> Request<'x, T> {
     }
 
     /// Add a capability URI to the `using` array.
-    pub(crate) fn add_capability<C: Capability>(&mut self) {
-        let uri = C::URI;
+    pub(crate) fn add_capability<D: Capability>(&mut self) {
+        let uri = D::URI;
         if !self.using.contains(&uri) {
             self.using.push(uri);
         }
@@ -342,26 +366,26 @@ type MethodTupleExtractor<R> = Box<dyn FnOnce(Response) -> crate::Result<R> + Se
 
 /// Trait implemented for tuples of `JmapMethod` values, for typed
 /// batch sends. See [`Request::send_methods`].
-pub(crate) trait MethodTuple: Sized {
+pub(crate) trait MethodTuple<C: Capability>: Sized {
     type Responses;
 
     fn add_to_request<T: HttpTransport>(
         self,
-        request: &mut Request<'_, T>,
+        request: &mut Request<'_, T, C>,
     ) -> Result<MethodTupleExtractor<Self::Responses>, crate::Error>;
 }
 
 macro_rules! impl_method_tuple {
     ($($M:ident),+ $(,)?) => {
-        impl<$($M),+> MethodTuple for ($($M,)+)
+        impl<C: Capability, $($M),+> MethodTuple<C> for ($($M,)+)
         where
-            $($M: JmapMethod + 'static),+
+            $($M: JmapMethod<Cap = C> + 'static),+
         {
             type Responses = ($($M::Response,)+);
 
             fn add_to_request<TR: HttpTransport>(
                 self,
-                request: &mut Request<'_, TR>,
+                request: &mut Request<'_, TR, C>,
             ) -> Result<MethodTupleExtractor<Self::Responses>, crate::Error> {
                 #[allow(non_snake_case)]
                 let ($($M,)+) = self;
@@ -386,7 +410,7 @@ impl_method_tuple!(M1, M2, M3, M4, M5, M6);
 impl_method_tuple!(M1, M2, M3, M4, M5, M6, M7);
 impl_method_tuple!(M1, M2, M3, M4, M5, M6, M7, M8);
 
-impl<T: HttpTransport> Request<'_, T> {
+impl<T: HttpTransport, C: Capability> Request<'_, T, C> {
     /// Send a tuple of methods in one batch and return their typed
     /// responses as a tuple. See the module-level note on result
     /// references.
@@ -395,7 +419,7 @@ impl<T: HttpTransport> Request<'_, T> {
     /// exceeds `max_size` - the caller then falls back to smaller
     /// requests rather than handing the server a batch it will reject
     /// wholesale with a request-level `limit` error.
-    pub(crate) async fn send_methods_within<M: MethodTuple>(
+    pub(crate) async fn send_methods_within<M: MethodTuple<C>>(
         mut self,
         methods: M,
         max_size: usize,
@@ -417,7 +441,7 @@ impl<T: HttpTransport> Request<'_, T> {
 }
 
 #[cfg(feature = "websockets")]
-impl Request<'_, crate::transport_reqwest::ReqwestTransport> {
+impl<C: Capability> Request<'_, crate::transport_reqwest::ReqwestTransport, C> {
     pub(crate) async fn send_ws(self) -> crate::Result<String> {
         self.client.send_ws(self).await
     }
@@ -427,6 +451,37 @@ impl Request<'_, crate::transport_reqwest::ReqwestTransport> {
     /// [`Request::send`].
     pub(crate) async fn send_ws_awaiting(self) -> crate::Result<Response> {
         self.client.send_ws_awaiting(self).await?.response().await
+    }
+}
+
+impl<'x, T: HttpTransport> Request<'x, T, Core> {
+    /// Accountless core requests (Echo and PushSubscription) need no primary.
+    pub(crate) fn new(client: &'x Client<T>) -> Self {
+        Self::scoped(client, AccountId::new(""))
+    }
+}
+
+/// A primaryAccounts entry itself proves selection even on older servers
+/// omitting an optional account block. Explicit foreign views require the
+/// capability on that account; another account's primary is never a fallback.
+pub(crate) fn require_capability<C: Capability>(
+    session: &super::session::Session,
+    id: &AccountId,
+) -> crate::Result<()> {
+    if C::URI == Core::URI
+        || session
+            .primary_accounts()
+            .any(|(uri, account)| uri.as_str() == C::URI && account == id)
+        || session
+            .account(id.as_str())
+            .is_some_and(|value| value.capability(C::URI).is_some())
+    {
+        Ok(())
+    } else {
+        Err(crate::Error::AccountCapability {
+            account_id: id.clone(),
+            capability: C::URI,
+        })
     }
 }
 

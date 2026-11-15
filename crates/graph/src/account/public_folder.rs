@@ -103,9 +103,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
     AccountOperation, AccountStream, Change, ChangeCursor, Checkpoint, CursorScope, ErrorScope,
-    Fingerprint, FolderId, InventoryEntry, MailboxId, MembershipScope, ObjectChange,
-    ObjectChangeKind, ObjectId, PageBoundary, ScopeChange, ScopeChangeKind, ServerVersion,
-    SyncEvent, Warning, WarningKind,
+    Fingerprint, FolderId, InventoryEntry, MembershipScope, ObjectChange, ObjectChangeKind,
+    ObjectId, PageBoundary, PrincipalId, ScopeChange, ScopeChangeKind, ServerVersion, SyncEvent,
+    Warning, WarningKind,
 };
 
 use super::GraphAccount;
@@ -561,7 +561,7 @@ pub(crate) fn item_to_inventory_entry(
         id: super::foreign::encode_public_item_id(folder, &item.item_id),
         memberships: vec![
             MembershipScope::Folder(folder.clone()),
-            MembershipScope::Mailbox(MailboxId(content_mailbox.to_string())),
+            MembershipScope::Owner(PrincipalId(content_mailbox.to_string())),
         ],
         blob_id: None,
         fingerprint: Fingerprint {
@@ -590,7 +590,7 @@ pub(crate) fn item_to_inventory_entry(
 /// Anchoring on the caller's own mailbox is what Exchange does when no
 /// hierarchy hint is published, and it keeps `anchor_mailbox` a real,
 /// non-empty identity - the value that later becomes the owner
-/// `MailboxId` on every item this leg emits. An empty anchor would tag
+/// `PrincipalId` on every item this leg emits. An empty anchor would tag
 /// every public item with `Mailbox("")`.
 ///
 /// Pure so the degradation decision is unit-pinnable without Autodiscover.
@@ -675,7 +675,12 @@ fn unhandled_classes_warning(folder_id: &str, unhandled: &[String]) -> Option<Wa
 /// The emitted id is folder-qualified, identical to what the inventory
 /// projection mints for the same item, so a changed item hydrates through
 /// the EWS arm exactly like a backfilled one.
-fn emit_item_added(changes: &mut Vec<Change>, item_id: &str, folder: &FolderId, owner: &MailboxId) {
+fn emit_item_added(
+    changes: &mut Vec<Change>,
+    item_id: &str,
+    folder: &FolderId,
+    owner: &PrincipalId,
+) {
     let id = super::foreign::encode_public_item_id(folder, item_id);
     changes.push(Change::ObjectChange(ObjectChange {
         id: id.clone(),
@@ -688,7 +693,7 @@ fn emit_item_added(changes: &mut Vec<Change>, item_id: &str, folder: &FolderId, 
     }));
     changes.push(Change::ScopeChange(ScopeChange {
         id,
-        membership: MembershipScope::Mailbox(owner.clone()),
+        membership: MembershipScope::Owner(owner.clone()),
         kind: ScopeChangeKind::Added,
     }));
 }
@@ -709,11 +714,16 @@ fn now_unix_secs() -> u64 {
 /// could only loop.
 pub(crate) fn ews_client(account: &GraphAccount) -> Result<EwsClient, EwsError> {
     account
-        .client
+        .mailboxes
+        .primary()
         .account_net()
         .map(|net| {
-            EwsClient::new(net, account.client.ews_url(), account.client.outlook_auth())
-                .with_tally(account.client.batch_tally())
+            EwsClient::new(
+                net,
+                account.mailboxes.primary().ews_url(),
+                account.mailboxes.primary().outlook_auth(),
+            )
+            .with_tally(account.mailboxes.primary().batch_tally())
         })
         .ok_or_else(|| EwsError::Internal("EWS client has no attached account transport".into()))
 }
@@ -864,9 +874,7 @@ pub(crate) async fn discover_public_folder_scopes(
     let mut warnings = Vec::new();
     // Every early return below leaves this false: only a browse that reached
     // the end of the whole hierarchy may prove a folder absent.
-    account
-        .public_folder_discovery_complete
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+    account.public_folders.set_discovery_complete(false);
     let mut complete = true;
 
     let Some(user_email) = account.user_email.clone() else {
@@ -1014,9 +1022,7 @@ pub(crate) async fn discover_public_folder_scopes(
         }
     }
 
-    account
-        .public_folder_discovery_complete
-        .store(complete, std::sync::atomic::Ordering::SeqCst);
+    account.public_folders.set_discovery_complete(complete);
     (scopes, warnings)
 }
 
@@ -1035,19 +1041,18 @@ async fn seed_and_scope(
 ) -> Option<CursorScope> {
     let folder_id = FolderId(folder.folder_id.clone());
     account
-        .routing_map
-        .write()
-        .await
-        .insert(folder_id.clone(), routing);
-    account.public_folder_meta.write().await.insert(
-        folder_id.clone(),
-        PublicFolderMeta {
-            display_name: folder.display_name.clone(),
-            folder_class: folder.folder_class.clone(),
-            parent,
-            effective_rights: folder.effective_rights.clone(),
-        },
-    );
+        .public_folders
+        .seed(
+            folder_id.clone(),
+            routing,
+            PublicFolderMeta {
+                display_name: folder.display_name.clone(),
+                folder_class: folder.folder_class.clone(),
+                parent,
+                effective_rights: folder.effective_rights.clone(),
+            },
+        )
+        .await;
     (folder.folder_class.as_deref().is_some_and(|class| {
         crate::ews::EwsItemKind::from_folder_class(class) == crate::ews::EwsItemKind::Mail
     }) && scope_policy.syncs(&folder_id))
@@ -1115,9 +1120,9 @@ pub(crate) fn public_folder_inventory_stream_admitted(
     folder: FolderId,
 ) -> AccountStream<bifrost_types::InventoryEvent> {
     Box::pin(async_stream::stream! {
-        let Some(routing) = account.public_folder_routing(&folder).await else {
+        let Some(routing) = account.public_folders.public_folder_routing(&folder).await else {
             yield bifrost_types::InventoryEvent::Terminated(
-                account.missing_public_collection_route_error(
+                account.public_folders.missing_public_collection_route_error(
                     AccountOperation::SyncInventory,
                     &folder,
                     ErrorScope::Cursor(scope.clone()),
@@ -1126,7 +1131,7 @@ pub(crate) fn public_folder_inventory_stream_admitted(
                 ));
             return;
         };
-        let owner = MailboxId(routing.anchor_mailbox.clone());
+        let owner = PrincipalId(routing.anchor_mailbox.clone());
 
         let (account, tally) = account.metered();
 
@@ -1167,7 +1172,7 @@ pub(crate) fn public_folder_inventory_stream_admitted(
         // The walk parsed every item's `ItemClass`; retain it so hydration
         // can build a class-conditional `GetItem` for an id whose class no
         // amount of parsing the id could recover.
-        account.record_public_item_classes(&folder, &walk.items).await;
+        account.public_folders.record_public_item_classes(&folder, &walk.items).await;
         if let Some(warning) = unhandled_classes_warning(&folder.0, &unhandled) {
             yield bifrost_types::InventoryEvent::Warning(warning);
         }
@@ -1286,7 +1291,7 @@ fn reduce_public_folder_poll(
     let scan = scan.cloned().map(admit_mail);
 
     let folder = FolderId(pf.folder_id.clone());
-    let owner = MailboxId(pf.routing.anchor_mailbox.clone());
+    let owner = PrincipalId(pf.routing.anchor_mailbox.clone());
     let mut changes: Vec<Change> = Vec::new();
     let mut warnings: Vec<Warning> = Vec::new();
     // Ids emitted this poll, so the deletion-scan additions pass does not
@@ -1491,7 +1496,7 @@ pub(crate) fn public_folder_changes_stream(
         // gate it on the discovery map: an Outlook user expects a saved public
         // folder to keep syncing while hierarchy discovery is unavailable.
         // Live EWS errors remain authoritative for a vanished folder.
-        let owner = MailboxId(pf.routing.anchor_mailbox.clone());
+        let owner = PrincipalId(pf.routing.anchor_mailbox.clone());
         let folder = FolderId(pf.folder_id.clone());
 
         let (account, tally) = account.metered();
@@ -1526,7 +1531,7 @@ pub(crate) fn public_folder_changes_stream(
 
         // Retain the polled items' classes for hydration (see the inventory
         // pass); the poll is the only place a NEW item's class is seen.
-        account.record_public_item_classes(&folder, &poll.items).await;
+        account.public_folders.record_public_item_classes(&folder, &poll.items).await;
 
         // 2. Throttled deletion reconcile: fetch the full scan only when it
         // is due AND the incremental poll completed (a stalled poll retries
@@ -1547,7 +1552,7 @@ pub(crate) fn public_folder_changes_stream(
             None
         };
         if let Some(scan) = &scan {
-            account.record_public_item_classes(&folder, &scan.items).await;
+            account.public_folders.record_public_item_classes(&folder, &scan.items).await;
         }
 
         match reduce_public_folder_poll(pf, &poll, scan.as_ref(), now) {
@@ -1572,7 +1577,7 @@ pub(crate) fn public_folder_changes_stream(
                 // hydrated again, and the cap is an admission bound, so a
                 // retained dead entry permanently denies a live one its
                 // slot. Prune before the batch goes out.
-                account.forget_public_item_classes(&destroyed_ids(&changes)).await;
+                account.public_folders.forget_public_item_classes(&destroyed_ids(&changes)).await;
                 for warning in warnings {
                     yield SyncEvent::Warning(warning);
                 }
@@ -1623,11 +1628,15 @@ mod tests {
         // Wrong cached classes cannot alter inventory admission.
         let mut cached = item("contact", None, false);
         account
+            .public_folders
             .record_public_item_classes(&folder, &[cached.clone()])
             .await;
         cached.item_id = "meeting".to_string();
         cached.item_class = "IPM.Contact".to_string();
-        account.record_public_item_classes(&folder, &[cached]).await;
+        account
+            .public_folders
+            .record_public_item_classes(&folder, &[cached])
+            .await;
         let mut stream = public_folder_inventory_stream(account, CursorScope::Folder(folder));
         assert!(matches!(
             stream.next().await,
@@ -1746,16 +1755,23 @@ mod tests {
             assert!(result.is_none(), "{class}");
             assert_eq!(
                 account
-                    .public_folder_meta
-                    .read()
+                    .public_folders
+                    .snapshot()
                     .await
+                    .metadata
                     .get(&id)
                     .expect("hierarchy metadata")
                     .folder_class
                     .as_deref(),
                 Some(class)
             );
-            assert!(account.public_folder_routing(&id).await.is_some());
+            assert!(
+                account
+                    .public_folders
+                    .public_folder_routing(&id)
+                    .await
+                    .is_some()
+            );
         }
     }
 
@@ -1923,7 +1939,7 @@ mod tests {
 
     // An unanswered `PublicFolderInformation` degrades the anchor to the
     // account's own mailbox rather than abandoning the whole leg. The anchor
-    // must stay a real identity: it becomes the owner `MailboxId` on every
+    // must stay a real identity: it becomes the owner `PrincipalId` on every
     // item this leg emits.
     #[test]
     fn missing_hierarchy_hint_anchors_on_the_account_mailbox() {
@@ -2468,6 +2484,7 @@ mod tests {
         let account = class_cache_account();
         let folder = FolderId("AAMkPF=".to_string());
         account
+            .public_folders
             .record_public_item_classes(
                 &folder,
                 &[item("known", None, false), {
@@ -2477,7 +2494,7 @@ mod tests {
                 }],
             )
             .await;
-        assert_eq!(account.public_item_classes.read().await.len(), 2);
+        assert_eq!(account.public_folders.item_classes().await.len(), 2);
 
         // Cycle 1 folds `fresh` into the baseline; cycle 2's complete scan
         // no longer sees it, so the reducer emits its Destroyed - the same
@@ -2505,10 +2522,11 @@ mod tests {
         assert_eq!(count_object_change(&changes, "fresh", true), 1);
 
         account
+            .public_folders
             .forget_public_item_classes(&destroyed_ids(&changes))
             .await;
 
-        let map = account.public_item_classes.read().await;
+        let map = account.public_folders.item_classes().await;
         assert!(
             !map.contains_key(&emitted_id("fresh")),
             "the destroyed item's class entry must not survive the poll"
@@ -2531,16 +2549,20 @@ mod tests {
         let filler: Vec<EwsItem> = (0..super::super::PUBLIC_ITEM_CLASS_CACHE_CAP)
             .map(|n| item(&format!("fill-{n}"), None, false))
             .collect();
-        account.record_public_item_classes(&folder, &filler).await;
+        account
+            .public_folders
+            .record_public_item_classes(&folder, &filler)
+            .await;
         assert_eq!(
-            account.public_item_classes.read().await.len(),
+            account.public_folders.item_classes().await.len(),
             super::super::PUBLIC_ITEM_CLASS_CACHE_CAP
         );
 
         account
+            .public_folders
             .record_public_item_classes(&folder, &[item("late", None, false)])
             .await;
-        let map = account.public_item_classes.read().await;
+        let map = account.public_folders.item_classes().await;
         assert_eq!(map.len(), super::super::PUBLIC_ITEM_CLASS_CACHE_CAP);
         assert!(
             !map.contains_key(&emitted_id("late")),
@@ -2564,13 +2586,17 @@ mod tests {
         let filler: Vec<EwsItem> = (0..super::super::PUBLIC_ITEM_CLASS_CACHE_CAP)
             .map(|n| item(&format!("fill-{n}"), None, false))
             .collect();
-        account.record_public_item_classes(&folder, &filler).await;
+        account
+            .public_folders
+            .record_public_item_classes(&folder, &filler)
+            .await;
         assert_eq!(
-            account.public_item_classes.read().await.len(),
+            account.public_folders.item_classes().await.len(),
             super::super::PUBLIC_ITEM_CLASS_CACHE_CAP
         );
         assert_eq!(
             account
+                .public_folders
                 .public_item_shape(&emitted_id("fill-0"), &folder)
                 .await,
             crate::ews::EwsItemShape::Message
@@ -2580,16 +2606,18 @@ mod tests {
         let mut reclassed = item("fill-0", None, false);
         reclassed.item_class = "IPM.Contact".to_string();
         account
+            .public_folders
             .record_public_item_classes(&folder, &[reclassed])
             .await;
 
         assert_eq!(
-            account.public_item_classes.read().await.len(),
+            account.public_folders.item_classes().await.len(),
             super::super::PUBLIC_ITEM_CLASS_CACHE_CAP,
             "an overwrite must not grow the map"
         );
         assert_eq!(
             account
+                .public_folders
                 .public_item_shape(&emitted_id("fill-0"), &folder)
                 .await,
             crate::ews::EwsItemShape::NonMessage,
@@ -3087,17 +3115,18 @@ mod tests {
             assert_eq!(scopes, expected_scopes, "policy {policy:?}");
             // Both folders are routable and projectable under either policy.
             assert_eq!(
-                account.routing_map.read().await.len(),
+                account.public_folders.snapshot().await.routing.len(),
                 2,
                 "policy {policy:?}"
             );
             assert_eq!(
-                account.public_folder_meta.read().await.len(),
+                account.public_folders.snapshot().await.metadata.len(),
                 2,
                 "policy {policy:?}"
             );
             assert!(
                 account
+                    .public_folders
                     .public_folder_routing(&FolderId("AAMkPF1=".to_string()))
                     .await
                     .is_some(),
@@ -3136,7 +3165,7 @@ mod tests {
         assert!(
             entry
                 .memberships
-                .contains(&MembershipScope::Mailbox(MailboxId(
+                .contains(&MembershipScope::Owner(PrincipalId(
                     "content@contoso.com".to_string()
                 )))
         );

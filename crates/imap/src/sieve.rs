@@ -377,11 +377,38 @@ async fn authenticate(
     tls_active: bool,
 ) -> Result<(), Error> {
     let offered = capabilities.sasl.clone();
-    // ManageSieve's exchange currently supports PLAIN and XOAUTH2. Its support
-    // set filters the common ladder; wire sequencing remains protocol-owned.
     let (allowed, oauth): (&[_], _) = match credentials.kind() {
-        CredentialsKind::Password { .. } => (&[AuthMechanism::Plain], false),
-        CredentialsKind::OAuth2 { .. } => (&[AuthMechanism::Xoauth2], true),
+        CredentialsKind::Password { .. } => (
+            &[
+                AuthMechanism::ScramSha256Plus,
+                AuthMechanism::ScramSha1Plus,
+                AuthMechanism::ScramSha256,
+                AuthMechanism::ScramSha1,
+                AuthMechanism::Plain,
+            ],
+            false,
+        ),
+        CredentialsKind::OAuth2 { .. } => {
+            (&[AuthMechanism::OAuthBearer, AuthMechanism::Xoauth2], true)
+        }
+    };
+    let binding = if !oauth
+        && allowed
+            .iter()
+            .any(|m| m.scram().is_some() && supports_mechanism(&offered, m.name()))
+    {
+        let der = match &stream.transport {
+            SieveTransport::Tls(tls) => tls
+                .get_ref()
+                .peer_certificate()
+                .map_err(io_error)?
+                .map(|cert| cert.to_der().map_err(io_error))
+                .transpose()?,
+            _ => None,
+        };
+        bifrost_sasl::binding_from_peer_certificate(der.as_deref())?
+    } else {
+        None
     };
     let mut rejected = Vec::new();
     let mut selected = None;
@@ -393,11 +420,11 @@ async fn authenticate(
             oauth,
         },
         tls_active,
-        None,
+        binding.as_ref(),
     ) {
         match result {
-            Ok(_) => {
-                selected = Some(mechanism);
+            Ok(selection) => {
+                selected = Some(selection);
                 break;
             }
             Err(reason) => rejected.push(AuthMechanismRejection::new(
@@ -411,48 +438,140 @@ async fn authenticate(
             )),
         }
     }
-    let mechanism =
+    let selection =
         selected.ok_or_else(|| Error::AuthPolicy(AuthPolicyFailure::new(offered, rejected)))?;
+    let mechanism = selection.mechanism;
     // Resolve tokens only after policy admission, as for IMAP and SMTP.
-    let payload = match credentials.kind() {
+    let mut client = match credentials.kind() {
         CredentialsKind::Password { username, password } => {
-            bifrost_sasl::plain_payload("", username, password.as_str())?
+            if let Some(rung) = selection.scram {
+                let hash = mechanism
+                    .scram()
+                    .ok_or_else(|| Error::Internal("SCRAM selection without hash".into()))?
+                    .0;
+                let mut bytes = [0u8; 18];
+                getrandom::fill(&mut bytes).map_err(|e| {
+                    Error::Sasl(bifrost_sasl::SaslError::LocalRuntime(format!(
+                        "failed to generate SCRAM nonce: {e}"
+                    )))
+                })?;
+                let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+                bifrost_sasl::SaslClient::scram(hash, rung.binding, username, password, nonce)?
+            } else {
+                bifrost_sasl::SaslClient::plain("", username, password)?
+            }
         }
         CredentialsKind::OAuth2 {
             identity,
             token_source,
         } => {
             let token = token_source.current().await.map_err(Error::OAuthToken)?;
-            bifrost_sasl::xoauth2_payload(identity, token.as_str())
+            let oauth = if mechanism == AuthMechanism::OAuthBearer {
+                bifrost_sasl::OAuthMechanism::OAuthBearer
+            } else {
+                bifrost_sasl::OAuthMechanism::Xoauth2
+            };
+            bifrost_sasl::SaslClient::oauth(oauth, identity, token.as_str())?
         }
     };
+    let payload = client
+        .initial_response()
+        .ok_or_else(|| Error::Internal("SASL initial response missing".into()))?;
     let command = authentication_command(mechanism, &payload);
     write_command(stream, timeout, command.as_bytes()).await?;
-    match read_response(stream, timeout).await?.status {
-        SieveStatus::Ok => Ok(()),
-        // The four RFC 5804 codes that say WHY authentication was refused
-        // classify better than a bare auth failure: a too-weak mechanism
-        // or a missing TLS layer is a policy block the user cannot fix by
-        // re-entering a password. Anything else (including no code at all)
-        // stays a plain auth failure rather than falling through to the
-        // sieve table's server-refused default.
-        SieveStatus::No { code, message } => Err(match code {
-            Some(
-                code @ (SieveResponseCode::AuthTooWeak
-                | SieveResponseCode::EncryptNeeded
-                | SieveResponseCode::TransitionNeeded
-                | SieveResponseCode::Sasl),
-            ) => Error::Sieve {
-                code: Some(code),
-                message,
-            },
-            // The mechanism is known here, so the refusal can say which rung
-            // the server turned down rather than only that one was turned
-            // down.
-            _ => Error::Auth { message, mechanism },
-        }),
-        SieveStatus::Bye { code, message } => Err(Error::Sieve { code, message }),
+    loop {
+        let line = read_line(stream, timeout).await?;
+        if let Some(status) = SieveStatus::parse(&line) {
+            return match status {
+                SieveStatus::Ok => {
+                    // RFC 5804 permits SASL success data in the terminal OK.
+                    if let Some(data) = sasl_success_data(&line)? {
+                        match client.step(&data)? {
+                            bifrost_sasl::Step::Done => {}
+                            _ => {
+                                return Err(Error::Parse(
+                                    "unexpected SASL reply on success".into(),
+                                ));
+                            }
+                        }
+                    }
+                    client.finish().map_err(Error::from)
+                }
+                // The four RFC 5804 codes that say WHY authentication was refused
+                // classify better than a bare auth failure: a too-weak mechanism
+                // or a missing TLS layer is a policy block the user cannot fix by
+                // re-entering a password. Anything else (including no code at all)
+                // stays a plain auth failure rather than falling through to the
+                // sieve table's server-refused default.
+                SieveStatus::No { code, message } => Err(match code {
+                    Some(
+                        code @ (SieveResponseCode::AuthTooWeak
+                        | SieveResponseCode::EncryptNeeded
+                        | SieveResponseCode::TransitionNeeded
+                        | SieveResponseCode::Sasl),
+                    ) => Error::Sieve {
+                        code: Some(code),
+                        message,
+                    },
+                    // The mechanism is known here, so the refusal can say which rung
+                    // the server turned down rather than only that one was turned
+                    // down.
+                    _ => Error::Auth { message, mechanism },
+                }),
+                SieveStatus::Bye { code, message } => Err(Error::Sieve { code, message }),
+            };
+        }
+        let encoded = if let Some(len) = literal_len(&line) {
+            if len > 64 * 1024 {
+                return Err(Error::Parse("SASL challenge exceeded 64KiB".into()));
+            }
+            let bytes = read_exact_len(stream, timeout, len).await?;
+            if !read_line(stream, timeout).await?.is_empty() {
+                return Err(Error::Parse("invalid SASL literal terminator".into()));
+            }
+            String::from_utf8(bytes).map_err(|_| Error::Parse("non-ASCII SASL challenge".into()))?
+        } else {
+            let (value, end) = parse_quoted(&line, 0)
+                .ok_or_else(|| Error::Parse("invalid SASL challenge string".into()))?;
+            if !line[end..].trim().is_empty() {
+                return Err(Error::Parse("trailing SASL challenge data".into()));
+            }
+            value
+        };
+        let challenge = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| Error::Parse(format!("invalid SASL challenge base64: {e}")))?;
+        let reply = match client.step(&challenge)? {
+            bifrost_sasl::Step::Reply(reply) => reply,
+            bifrost_sasl::Step::Done => bifrost_sasl::Secret::default(),
+            _ => return Err(Error::Internal("unmapped SASL step".into())),
+        };
+        let encoded = zeroize::Zeroizing::new(
+            base64::engine::general_purpose::STANDARD.encode(reply.as_bytes()),
+        );
+        let command = bifrost_sasl::Secret::from(format!("\"{}\"\r\n", encoded.as_str()));
+        write_command(stream, timeout, command.as_bytes()).await?;
     }
+}
+
+fn sasl_success_data(line: &str) -> Result<Option<Vec<u8>>, Error> {
+    let (_, rest) = split_token(line);
+    let Some(rest) = rest.trim_start().strip_prefix('(') else {
+        return Ok(None);
+    };
+    let (code, rest) = split_token(rest);
+    if !code.eq_ignore_ascii_case("SASL") {
+        return Ok(None);
+    }
+    let (encoded, end) =
+        parse_quoted(rest, 0).ok_or_else(|| Error::Parse("invalid SASL success data".into()))?;
+    if !rest[end..].trim_start().starts_with(')') {
+        return Err(Error::Parse("invalid SASL success code".into()));
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map(Some)
+        .map_err(|e| Error::Parse(format!("invalid SASL success base64: {e}")))
 }
 
 fn supports_mechanism(offered: &[String], mechanism: &str) -> bool {
@@ -1010,10 +1129,12 @@ mod tests {
                 Some(b"\0user\0pw".as_slice()),
             ),
             (
-                Credentials::oauth2("u\x01ser", "tok\x01en"),
+                Credentials::oauth2("user", "token"),
                 "XOAUTH2",
                 Some(b"user=user\x01auth=Bearer token\x01\x01".as_slice()),
             ),
+            (Credentials::oauth2("u\x01ser", "token"), "XOAUTH2", None),
+            (Credentials::oauth2("user", "tok\x01en"), "XOAUTH2", None),
             (Credentials::password("user\0other", "pw"), "PLAIN", None),
             (Credentials::password("user", "pw\0other"), "PLAIN", None),
         ] {
@@ -1054,6 +1175,148 @@ mod tests {
                 );
             }
         }
+    }
+
+    async fn peer_line(peer: &mut tokio::io::DuplexStream) -> String {
+        let mut line = Vec::new();
+        loop {
+            let byte = peer.read_u8().await.unwrap();
+            line.push(byte);
+            if byte == b'\n' {
+                break;
+            }
+        }
+        String::from_utf8(line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn scram_authentication_frames_challenges_and_terminal_success_data() {
+        for hash in [
+            bifrost_sasl::ScramHash::Sha1,
+            bifrost_sasl::ScramHash::Sha256,
+        ] {
+            for success_data in [false, true] {
+                let mechanism = hash.mechanism_name(bifrost_sasl::ChannelBinding::None);
+                let (client, mut peer) = tokio::io::duplex(4096);
+                let mut stream = SieveStream {
+                    transport: SieveTransport::Memory(client),
+                    budget: bifrost_net::BandwidthBudget::default(),
+                    sink: None,
+                };
+                let credentials = Credentials::password("user", "pencil");
+                let capabilities = SieveCapabilities {
+                    sasl: vec![mechanism.to_owned(), "PLAIN".into()],
+                    ..SieveCapabilities::default()
+                };
+                let policy = AuthPolicy::default();
+                let auth = authenticate(
+                    &mut stream,
+                    Duration::from_secs(5),
+                    &credentials,
+                    &policy,
+                    &capabilities,
+                    true,
+                );
+                let server = async {
+                    let first = peer_line(&mut peer).await;
+                    assert!(first.starts_with(&format!("AUTHENTICATE \"{mechanism}\" \"")));
+                    let (_, offset) =
+                        parse_quoted(first.trim_start_matches("AUTHENTICATE "), 0).unwrap();
+                    let (encoded, _) =
+                        parse_quoted(first.trim_start_matches("AUTHENTICATE "), offset).unwrap();
+                    let first = String::from_utf8(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let bare = first.strip_prefix("n,,").unwrap();
+                    let nonce = bare.strip_prefix("n=user,r=").unwrap();
+                    let server_first = format!("r={nonce}server,s=QSXCR+Q6sek8bf92,i=4096");
+                    let (expected, signature) = bifrost_sasl::scram_client_final(
+                        hash,
+                        &bifrost_sasl::prepare_scram_password("pencil").unwrap(),
+                        nonce,
+                        bare,
+                        &server_first,
+                        &bifrost_sasl::ScramChannelBinding::None,
+                    )
+                    .unwrap();
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(server_first);
+                    // Both RFC 5804 string forms carry the same SASL bytes.
+                    let challenge = if success_data {
+                        format!("{{{}}}\r\n{encoded}\r\n", encoded.len())
+                    } else {
+                        format!("\"{encoded}\"\r\n")
+                    };
+                    peer.write_all(challenge.as_bytes()).await.unwrap();
+                    assert_eq!(
+                        peer_line(&mut peer).await,
+                        format!("\"{}\"\r\n", expected.as_str())
+                    );
+                    let verifier = format!(
+                        "v={}",
+                        base64::engine::general_purpose::STANDARD.encode(signature)
+                    );
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(verifier);
+                    if success_data {
+                        peer.write_all(format!("OK (SASL \"{encoded}\")\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    } else {
+                        peer.write_all(format!("\"{encoded}\"\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                        assert_eq!(peer_line(&mut peer).await, "\"\"\r\n");
+                        peer.write_all(b"OK\r\n").await.unwrap();
+                    }
+                };
+                let (result, ()) = tokio::join!(auth, server);
+                result.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oauthbearer_error_continuation_is_acknowledged_before_refusal() {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let mut stream = SieveStream {
+            transport: SieveTransport::Memory(client),
+            budget: bifrost_net::BandwidthBudget::default(),
+            sink: None,
+        };
+        let credentials = Credentials::oauth2("user", "token");
+        let policy = AuthPolicy::default();
+        let capabilities = SieveCapabilities {
+            sasl: vec!["XOAUTH2".into(), "OAUTHBEARER".into()],
+            ..SieveCapabilities::default()
+        };
+        let auth = authenticate(
+            &mut stream,
+            Duration::from_secs(5),
+            &credentials,
+            &policy,
+            &capabilities,
+            true,
+        );
+        let server = async {
+            assert!(
+                peer_line(&mut peer)
+                    .await
+                    .starts_with("AUTHENTICATE \"OAUTHBEARER\"")
+            );
+            peer.write_all(b"\"e30=\"\r\n").await.unwrap();
+            assert_eq!(peer_line(&mut peer).await, "\"AQ==\"\r\n");
+            peer.write_all(b"NO \"refused\"\r\n").await.unwrap();
+        };
+        let (result, ()) = tokio::join!(auth, server);
+        assert!(matches!(
+            result,
+            Err(Error::Auth {
+                mechanism: AuthMechanism::OAuthBearer,
+                ..
+            })
+        ));
     }
 
     #[tokio::test(start_paused = true)]

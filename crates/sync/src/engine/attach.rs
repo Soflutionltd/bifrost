@@ -186,8 +186,8 @@ impl SyncEngine {
         // its number, and a departing receiver's unregister and its sweep - which
         // is what makes "can any live receiver still reach this page" an exact
         // question rather than an approximate one. See
-        // `multiplexer::ChangeDelivery`.
-        let delivery = Arc::new(crate::multiplexer::ChangeDelivery::new(changes_tx));
+        // `delivery::ChangeDelivery`.
+        let delivery = Arc::new(crate::delivery::ChangeDelivery::new(changes_tx));
 
         // Per-account control broadcast. The engine publishes
         // `AccountControl::Pause(reason)` on this channel when it
@@ -211,7 +211,7 @@ impl SyncEngine {
         // unwinds the opened account without leaving a running unseeded lane.
         // The same lifecycle guard excludes the preceding attachment's writer.
         let pending_coverage =
-            Arc::new(ack::restore_proof_order(&account_id, self.checkpoints.as_ref()).await?);
+            Arc::new(writer::restore_proof_order(&account_id, self.checkpoints.as_ref()).await?);
 
         // Wire boundary + priority watches.
         let (boundary, boundary_view) = Boundary::new();
@@ -272,9 +272,9 @@ impl SyncEngine {
         for scope in &scopes {
             match writer.get_change_cursor(scope.clone(), None).await {
                 Ok(Some(cursor))
-                    if crate::recovery::classify_envelope(
+                    if crate::engine_errors::classify_envelope(
                         &cursor,
-                        crate::recovery::CursorOrigin::Stored,
+                        crate::engine_errors::CursorOrigin::Stored,
                         bifrost_types::AccountOperation::EstablishCursor,
                         scope,
                     )
@@ -388,7 +388,7 @@ impl SyncEngine {
         // backpressure crosses into a scope the sender does not own; the bare
         // observation that the channel is bounded and the listener is serial
         // is not that evidence.
-        let (reopen_tx, mut reopen_rx) = mpsc::channel::<ReopenRequest>(16);
+        let (reopen_tx, reopen_rx) = mpsc::channel::<ReopenRequest>(16);
 
         let sink_target = crate::push::SinkTarget {
             ingress: Arc::clone(&ingress),
@@ -625,129 +625,10 @@ impl SyncEngine {
             );
         }
 
-        // Spawn the reopen listener.
-        let reopen_ctx = ctx.clone();
+        // The account supervisor serializes recovery and lifecycle requests.
         spawn(
             crate::types::WorkerRole::ReopenListener,
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        () = reopen_ctx.shutdown.cancelled() => return,
-                        req = reopen_rx.recv() => {
-                            let Some(req) = req else { return; };
-                            match req {
-                                ReopenRequest::PushRecovery { scope, error, generation } => {
-                                    reopen_ctx
-                                        .recover(scope, error, Some(generation))
-                                        .await;
-                                }
-                                ReopenRequest::Recovery {
-                                    scope,
-                                    error,
-                                    generation,
-                                } => {
-                                    reopen_ctx.recover(scope, error, generation).await;
-                                }
-                                // Both run under the reopen lock, like every
-                                // other scope repair.
-                                ReopenRequest::EstablishIfAbsent { scope, epoch } => {
-                                    let writer = reopen_ctx.writer();
-                                    let recovery = reopen_ctx.recovery(&writer);
-                                    let _guard = reopen_ctx.reopen_lock.lock().await;
-                                    let followup = super::reattach::establish_if_absent(
-                                        &recovery, scope, epoch,
-                                    )
-                                    .await;
-                                    reopen_ctx.park_followup(followup);
-                                }
-                                // The epoch is read here, under the lock, not by
-                                // the multiplexer: a deletion queued ahead of
-                                // this request has bumped it by now, and one
-                                // queued behind it bumps it later and retires
-                                // what this establishes.
-                                ReopenRequest::ScopeCreated { scope } => {
-                                    let writer = reopen_ctx.writer();
-                                    let recovery = reopen_ctx.recovery(&writer);
-                                    let _guard = reopen_ctx.reopen_lock.lock().await;
-                                    let epoch = reopen_ctx.cursors.lifecycle_epoch(&scope);
-                                    let followup = super::reattach::establish_if_absent(
-                                        &recovery, scope, epoch,
-                                    )
-                                    .await;
-                                    reopen_ctx.park_followup(followup);
-                                }
-                                ReopenRequest::SchemaReset {
-                                    reestablish,
-                                    parked_at,
-                                } => {
-                                    let writer = reopen_ctx.writer();
-                                    let recovery = reopen_ctx.recovery(&writer);
-                                    let _guard = reopen_ctx.reopen_lock.lock().await;
-                                    let followup = super::reattach::run_parked_schema_reset(
-                                        &recovery,
-                                        reestablish,
-                                        parked_at,
-                                    )
-                                    .await;
-                                    reopen_ctx.park_followup(followup);
-                                }
-                                ReopenRequest::ScopeDeleted { scope } => {
-                                    // A repair or schema reset parked for this
-                                    // scope under a pause must not establish it
-                                    // after resume: the folder it was for is
-                                    // gone.
-                                    reopen_ctx.deferred_repairs.unpark(&scope);
-                                    reopen_ctx.deferred_schema_reset.unpark_scope(&scope);
-                                    // A cursor here was established after the
-                                    // deletion was raised: a `Created` whose
-                                    // repair was still queued ahead of this
-                                    // request on this same channel. Retire it
-                                    // exactly as the multiplexer retires a
-                                    // registered scope - epoch, fence, then
-                                    // registry, then the poll token - before
-                                    // purging its rows, or the rows would be
-                                    // deleted out from under a live cursor for
-                                    // a folder that no longer exists. The
-                                    // retirement runs unconditionally: this
-                                    // second epoch bump and fence raise is what
-                                    // revokes an establishment still in flight
-                                    // for the scope.
-                                    let registered = reopen_ctx.cursors.snapshot(&scope).is_some();
-                                    crate::multiplexer::retire_deleted_scope(
-                                        &reopen_ctx.cursors,
-                                        &reopen_ctx.control,
-                                        &scope,
-                                    );
-                                    if registered {
-                                        crate::multiplexer::cancel_scope_token(
-                                            &reopen_ctx.scope_tokens,
-                                            &scope,
-                                        );
-                                    }
-                                    // A provider-deleted folder retires its
-                                    // durable rows in full: change cursor and
-                                    // backfill rows, completion marker
-                                    // included. A surviving marker would make
-                                    // a folder recreated under the same id
-                                    // skip its cold-start walk entirely.
-                                    let writer = reopen_ctx.writer();
-                                    if let Err(error) =
-                                        writer.reset_scope_for_deletion(scope.clone()).await
-                                    {
-                                        tracing::warn!(
-                                            target: "bifrost.sync.changes",
-                                            account = ?reopen_ctx.account_id,
-                                            scope = ?scope,
-                                            error = %error,
-                                            "failed to purge durable rows for a provider-deleted scope"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }),
+            tokio::spawn(super::supervisor::run(ctx.clone(), reopen_rx)),
         );
 
         if let Some(interval) = self.config.push.orphan_teardown_retry_interval {
@@ -841,8 +722,8 @@ impl SyncEngine {
         cursors: Arc<CursorRegistry>,
     ) -> Result<InitialScope, Error> {
         let fresh = stored.is_none();
-        match super::reattach::establishment(account, &scope, stored).await? {
-            super::reattach::Establishment::Ready(cursor) => {
+        match super::establish::establishment(account, &scope, stored).await? {
+            super::establish::Establishment::Ready(cursor) => {
                 if fresh {
                     // No coverage claim: the single writer preserves debt.
                     writer.persist_established(cursor.clone()).await?;
@@ -850,14 +731,14 @@ impl SyncEngine {
                 cursors.put(cursor);
                 Ok(InitialScope::Ready)
             }
-            super::reattach::Establishment::Resume { cursor, .. } => {
+            super::establish::Establishment::Resume { cursor, .. } => {
                 Ok(InitialScope::DeferredInventory(DeferredInventory {
                     epoch: cursors.lifecycle_epoch(&scope),
                     fence: crate::cursor::PendingCoverage::initial_fence(),
                     kind: DeferredKind::Resume(cursor),
                 }))
             }
-            super::reattach::Establishment::Inventory => {
+            super::establish::Establishment::Inventory => {
                 Ok(InitialScope::DeferredInventory(DeferredInventory {
                     epoch: cursors.lifecycle_epoch(&scope),
                     fence: crate::cursor::PendingCoverage::initial_fence(),
@@ -898,55 +779,6 @@ pub(super) async fn discover_scopes_from(account: &dyn Account) -> Result<Vec<Cu
     Ok(out)
 }
 
-/// True if the given cursor scope covers the given membership scope.
-///
-/// The mapping is engine policy: account-wide cursors cover every
-/// membership; folder-typed cursors cover only the matching folder;
-/// query cursors cover only the matching query.
-pub(super) fn scope_covers_membership(scope: &CursorScope, membership: &MembershipScope) -> bool {
-    use bifrost_types::{FolderId, ObjectType};
-    match (scope, membership) {
-        // Account-wide cursors cover every membership.
-        (CursorScope::Account, _) => true,
-        // A DAV type must not claim mail solely because its id matches.
-        (CursorScope::Type(ty), MembershipScope::Mailbox(_)) => {
-            matches!(
-                ty,
-                ObjectType::Email | ObjectType::Mailbox | ObjectType::Thread
-            )
-        }
-        (CursorScope::Type(_), _) => true,
-        // Folder-typed cursors cover the matching folder only.
-        (CursorScope::Folder(folder), MembershipScope::Folder(m)) => folder == m,
-        // Folder memberships carry no object type. Preserve exact FolderId
-        // matching here; unlike Mailbox, this variant cannot distinguish DAV
-        // from mail without a richer membership identity.
-        (CursorScope::FolderType { folder, .. }, MembershipScope::Folder(m)) => folder == m,
-        // Folder-typed cursors over an arbitrary folder match mailbox
-        // memberships that share the same id: the side index compares
-        // the underlying FolderId / MailboxId strings without converting
-        // between provider-specific identities.
-        (CursorScope::Folder(FolderId(folder_id)), MembershipScope::Mailbox(mbx)) => {
-            folder_id == &mbx.0
-        }
-        (
-            CursorScope::FolderType {
-                folder: FolderId(folder_id),
-                ty,
-            },
-            MembershipScope::Mailbox(mbx),
-        ) => {
-            matches!(
-                ty,
-                ObjectType::Email | ObjectType::Mailbox | ObjectType::Thread
-            ) && folder_id == &mbx.0
-        }
-        // Query cursors cover the same query membership.
-        (CursorScope::Query(q), MembershipScope::Query(mq)) => q == mq,
-        _ => false,
-    }
-}
-
 pub(super) async fn run_deferred_inventory_establishment(
     ctx: SlotContext,
     scopes: Vec<DeferredInventory>,
@@ -961,7 +793,7 @@ pub(super) async fn run_deferred_inventory_establishment(
     let scheduler = ctx.scheduler.clone();
     let shutdown = ctx.shutdown.clone();
     let throttles = Arc::clone(&ctx.throttles);
-    let writer_tx = ctx.writer_tx.clone();
+    let writer_tx = ctx.writer();
     // The walks run one after another, so a scope held by a throttle on IT
     // ALONE (a key the account declares for that scope, such as one mailbox's
     // budget) goes to the back of the queue instead of being slept on: the
@@ -1066,7 +898,7 @@ pub(super) async fn run_deferred_inventory_establishment(
                 expected_fence: inventory.fence,
                 account_id: account_id.clone(),
                 cursors: Arc::clone(&cursors),
-                publisher: crate::multiplexer::PagePublisher::new(
+                publisher: crate::delivery::PagePublisher::new(
                     Arc::clone(&ctx.delivery),
                     control.clone(),
                     writer_tx.clone(),
@@ -1183,7 +1015,7 @@ pub(super) async fn run_deferred_inventory_establishment(
 /// closes the window. Structural rather than tested: the interleaving sits
 /// between two statements of one poll, and no test can preempt a poll there.
 pub(super) async fn wait_for_real_subscriber(
-    delivery: &crate::multiplexer::ChangeDelivery,
+    delivery: &crate::delivery::ChangeDelivery,
     subscriber_notify: &Notify,
     shutdown: &CancellationToken,
 ) -> bool {
@@ -1218,7 +1050,7 @@ pub(super) async fn link_discovered_memberships(
                 let known_scopes = cursors.all_scopes();
                 for membership in batch.items {
                     for scope in &known_scopes {
-                        if scope_covers_membership(scope, &membership) {
+                        if scope.covers(&membership) {
                             cursors.link_membership(membership.clone(), scope.clone());
                         }
                     }

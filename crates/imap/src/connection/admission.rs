@@ -9,10 +9,12 @@ use crate::types::{Capability, Command};
 /// The refusal for a command whose prerequisite capability is not usable on
 /// this connection (I6). One wording for every command: `<cmd> requires <cap>`.
 fn missing(cmd: &str, cap: &str) -> crate::Error {
-    crate::Error::MissingCapability(crate::error::CapabilityFailure::new(
-        cap.into(),
-        crate::error::CapabilityFailureReason::NotAdvertised,
-        format!("{cmd} requires {cap}"),
+    crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(
+        crate::error::CapabilityFailure::new(
+            cap.into(),
+            crate::error::CapabilityFailureReason::NotAdvertised,
+            format!("{cmd} requires {cap}"),
+        ),
     ))
 }
 
@@ -33,12 +35,12 @@ impl SessionView<'_> {
         // Keep the typed capability rather than round-tripping it through its
         // wire spelling: callers and tests match on `CapabilityFailure::capability`.
         let message = format!("command requires {cap}");
-        Err(Error::MissingCapability(
-            crate::error::CapabilityFailure::new(
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(crate::error::CapabilityFailure::new(
                 cap,
                 crate::error::CapabilityFailureReason::NotAdvertised,
                 message,
-            ),
+            )),
         ))
     }
 
@@ -50,10 +52,12 @@ impl SessionView<'_> {
             // An Outlook user expects negotiation before using a supported mode.
             // Advertising a mode without enabling it is caller sequencing, just
             // like UTF8=ONLY, rather than an unsupported server operation.
-            Err(Error::InvalidState(LocalFailure::state(
-                StateRequirement::Enabled(cap.clone()),
-                format!("command requires ENABLE {cap} confirmation"),
-            )))
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidState(LocalFailure::state(
+                    StateRequirement::Enabled(cap.clone()),
+                    format!("command requires ENABLE {cap} confirmation"),
+                )),
+            ))
         }
     }
 
@@ -69,10 +73,12 @@ pub(super) fn admit(command: &Command, session: &SessionView<'_>) -> Result<(), 
     let kind = command.kind();
     session.require_state(kind)?;
     if matches!(command, Command::StartTls) && session.tls_active {
-        return Err(Error::InvalidState(LocalFailure::state(
-            StateRequirement::Unencrypted,
-            "STARTTLS requires an unencrypted connection",
-        )));
+        return Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidState(LocalFailure::state(
+                StateRequirement::Unencrypted,
+                "STARTTLS requires an unencrypted connection",
+            )),
+        ));
     }
     let opts = encode_options(session.snapshot);
     // Criteria contribute requirements through the same literal-aware walk
@@ -91,8 +97,10 @@ pub(super) fn admit(command: &Command, session: &SessionView<'_>) -> Result<(), 
             criteria.validate_raw(opts.literal_mode)?;
             for capability in criteria.required_capabilities() {
                 if !session.supports(&capability) {
-                    return Err(crate::Error::MissingCapability(
-                        capability.to_string().into(),
+                    return Err(crate::Error::LocalRefusal(
+                        crate::error::LocalRefusal::MissingCapability(
+                            capability.to_string().into(),
+                        ),
                     ));
                 }
             }
@@ -105,7 +113,9 @@ pub(super) fn admit(command: &Command, session: &SessionView<'_>) -> Result<(), 
             // upgrade to fail as STARTTLS unavailable on every entry path.
             // An already encrypted session is sequencing, checked above.
             if !opts.has_capability(&Capability::StartTls) {
-                return Err(Error::StartTlsUnavailable);
+                return Err(Error::LocalRefusal(
+                    crate::error::LocalRefusal::StartTlsUnavailable,
+                ));
             }
         }
         Command::Enable { .. } => {
@@ -340,11 +350,13 @@ impl SessionView<'_> {
         if needs_utf8 {
             // A mode the caller has not established, not a missing server
             // capability: the same request succeeds after the ENABLE.
-            return Err(Error::InvalidState(crate::error::LocalFailure::state(
-                crate::error::StateRequirement::Enabled(Capability::Utf8Accept),
-                "server requires ENABLE UTF8=ACCEPT before use \
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidState(crate::error::LocalFailure::state(
+                    crate::error::StateRequirement::Enabled(Capability::Utf8Accept),
+                    "server requires ENABLE UTF8=ACCEPT before use \
                  (UTF8=ONLY advertised, RFC 6855 Section 3)",
-            )));
+                )),
+            ));
         }
         Ok(())
     }
@@ -357,13 +369,15 @@ impl SessionView<'_> {
             return Err(refusal);
         }
         if kind.refused_after_selection() && mailbox_selected {
-            return Err(Error::InvalidState(crate::error::LocalFailure::state(
-                crate::error::StateRequirement::BeforeFirstSelection { command: kind },
-                format!(
-                    "{kind:?} is not valid once a mailbox has been selected in the session \
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidState(crate::error::LocalFailure::state(
+                    crate::error::StateRequirement::BeforeFirstSelection { command: kind },
+                    format!(
+                        "{kind:?} is not valid once a mailbox has been selected in the session \
                  (RFC 5161 Section 3.1)"
-                ),
-            )));
+                    ),
+                )),
+            ));
         }
         Ok(())
     }
@@ -372,7 +386,9 @@ impl SessionView<'_> {
         let has_condstore = snap.session.supports(&Capability::Condstore);
 
         if !has_condstore {
-            return Err(Error::MissingCapability("CONDSTORE".into()));
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::MissingCapability("CONDSTORE".into()),
+            ));
         }
         Ok(())
     }
@@ -382,7 +398,9 @@ impl SessionView<'_> {
         let has_searchres = snap.session.supports(&Capability::SearchRes);
 
         if !has_searchres {
-            return Err(Error::MissingCapability("SEARCHRES".into()));
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::MissingCapability("SEARCHRES".into()),
+            ));
         }
         Ok(())
     }
@@ -400,10 +418,12 @@ impl SessionView<'_> {
         return_options: &[crate::types::command_options::ListReturn],
     ) -> Result<(), Error> {
         if patterns.is_empty() {
-            return Err(Error::InvalidInput(
-                "LIST-EXTENDED requires at least one mailbox pattern \
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    "LIST-EXTENDED requires at least one mailbox pattern \
                  (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
-                    .into(),
+                        .into(),
+                ),
             ));
         }
 
@@ -411,7 +431,9 @@ impl SessionView<'_> {
             let snap = self.snapshot;
 
             if patterns.len() > 1 && !snap.session.supports(&Capability::ListExtended) {
-                return Err(Error::MissingCapability("LIST-EXTENDED".into()));
+                return Err(Error::LocalRefusal(
+                    crate::error::LocalRefusal::MissingCapability("LIST-EXTENDED".into()),
+                ));
             }
 
             // RFC 5258 Section 3 defines selection options and return options as
@@ -421,16 +443,20 @@ impl SessionView<'_> {
             let needs_list_extended = !selection_options.is_empty() || !return_options.is_empty();
 
             if needs_list_extended && !snap.session.supports(&Capability::ListExtended) {
-                return Err(Error::MissingCapability("LIST-EXTENDED".into()));
+                return Err(Error::LocalRefusal(
+                    crate::error::LocalRefusal::MissingCapability("LIST-EXTENDED".into()),
+                ));
             }
 
             for option in selection_options {
                 let trimmed = option.trim();
                 if trimmed.is_empty() {
-                    return Err(Error::InvalidInput(
-                        "LIST-EXTENDED selection options must not be empty \
+                    return Err(Error::LocalRefusal(
+                        crate::error::LocalRefusal::InvalidInput(
+                            "LIST-EXTENDED selection options must not be empty \
                          (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
-                            .into(),
+                                .into(),
+                        ),
                     ));
                 }
                 if matches!(
@@ -438,7 +464,9 @@ impl SessionView<'_> {
                     crate::types::command_options::ListSelect::SpecialUse
                 ) && !snap.session.supports(&Capability::SpecialUse)
                 {
-                    return Err(Error::MissingCapability("SPECIAL-USE".into()));
+                    return Err(Error::LocalRefusal(
+                        crate::error::LocalRefusal::MissingCapability("SPECIAL-USE".into()),
+                    ));
                 }
             }
         }
@@ -452,10 +480,12 @@ impl SessionView<'_> {
         for option in return_options {
             let trimmed = option.trim();
             if trimmed.is_empty() {
-                return Err(Error::InvalidInput(
-                    "LIST-EXTENDED return options must not be empty \
+                return Err(Error::LocalRefusal(
+                    crate::error::LocalRefusal::InvalidInput(
+                        "LIST-EXTENDED return options must not be empty \
                      (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
-                        .into(),
+                            .into(),
+                    ),
                 ));
             }
 
@@ -466,7 +496,9 @@ impl SessionView<'_> {
                     crate::types::command_options::ListReturn::SpecialUse
                 ) && !snap.session.supports(&Capability::SpecialUse)
                 {
-                    return Err(Error::MissingCapability("SPECIAL-USE".into()));
+                    return Err(Error::LocalRefusal(
+                        crate::error::LocalRefusal::MissingCapability("SPECIAL-USE".into()),
+                    ));
                 }
             }
 
@@ -494,11 +526,13 @@ impl SessionView<'_> {
                     )
             })
         {
-            return Err(Error::InvalidInput(
-                "LIST-EXTENDED selection option RECURSIVEMATCH requires another \
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    "LIST-EXTENDED selection option RECURSIVEMATCH requires another \
                  non-REMOTE selection option (RFC 5258 Section 3 / \
                  RFC 9051 Section 6.3.9)"
-                    .into(),
+                        .into(),
+                ),
             ));
         }
 
@@ -512,12 +546,14 @@ impl SessionView<'_> {
             match item {
                 crate::types::command_options::StatusAttribute::Recent => {
                     if self.is_rev2() {
-                        return Err(Error::MissingCapability(
-                            crate::error::CapabilityFailure::new(
-                                "IMAP4rev2".into(),
-                                crate::error::CapabilityFailureReason::RemovedInRev2,
-                                "STATUS item RECENT was removed in IMAP4rev2 \
+                        return Err(Error::LocalRefusal(
+                            crate::error::LocalRefusal::MissingCapability(
+                                crate::error::CapabilityFailure::new(
+                                    "IMAP4rev2".into(),
+                                    crate::error::CapabilityFailureReason::RemovedInRev2,
+                                    "STATUS item RECENT was removed in IMAP4rev2 \
                              (RFC 9051 Section 6.3.11)",
+                                ),
                             ),
                         ));
                     }
@@ -532,28 +568,36 @@ impl SessionView<'_> {
                     // QUOTA=RES-MESSAGE. The gate therefore names exactly
                     // those two sources.
                     if !self.is_rev2() && !self.has_quota_resource("MESSAGE") {
-                        return Err(Error::MissingCapability(
-                            crate::error::CapabilityFailure::new(
-                                "QUOTA=RES-MESSAGE".into(),
-                                crate::error::CapabilityFailureReason::Alternatives(vec![
-                                    "IMAP4rev2".into(),
-                                ]),
-                                "STATUS item DELETED requires IMAP4rev2 or \
+                        return Err(Error::LocalRefusal(
+                            crate::error::LocalRefusal::MissingCapability(
+                                crate::error::CapabilityFailure::new(
+                                    "QUOTA=RES-MESSAGE".into(),
+                                    crate::error::CapabilityFailureReason::Alternatives(vec![
+                                        "IMAP4rev2".into(),
+                                    ]),
+                                    "STATUS item DELETED requires IMAP4rev2 or \
                              QUOTA=RES-MESSAGE (RFC 9051 Section 6.3.11 / \
                              RFC 9208 Section 4.1.4)",
+                                ),
                             ),
                         ));
                     }
                 }
                 crate::types::command_options::StatusAttribute::DeletedStorage => {
                     if !self.has_quota_resource("STORAGE") {
-                        return Err(Error::MissingCapability("QUOTA=RES-STORAGE".into()));
+                        return Err(Error::LocalRefusal(
+                            crate::error::LocalRefusal::MissingCapability(
+                                "QUOTA=RES-STORAGE".into(),
+                            ),
+                        ));
                     }
                 }
                 crate::types::command_options::StatusAttribute::Size => {
                     let snap = self.snapshot;
                     if !snap.session.supports(&Capability::StatusSize) {
-                        return Err(Error::MissingCapability("STATUS=SIZE".into()));
+                        return Err(Error::LocalRefusal(
+                            crate::error::LocalRefusal::MissingCapability("STATUS=SIZE".into()),
+                        ));
                     }
                 }
                 crate::types::command_options::StatusAttribute::HighestModSeq => {
@@ -568,13 +612,17 @@ impl SessionView<'_> {
                         crate::types::profile::AppendLimitPolicy::NotAdvertised
                     );
                     if !has_appendlimit {
-                        return Err(Error::MissingCapability("APPENDLIMIT".into()));
+                        return Err(Error::LocalRefusal(
+                            crate::error::LocalRefusal::MissingCapability("APPENDLIMIT".into()),
+                        ));
                     }
                 }
                 crate::types::command_options::StatusAttribute::MailboxId => {
                     let snap = self.snapshot;
                     if !snap.session.supports(&Capability::ObjectId) {
-                        return Err(Error::MissingCapability("OBJECTID".into()));
+                        return Err(Error::LocalRefusal(
+                            crate::error::LocalRefusal::MissingCapability("OBJECTID".into()),
+                        ));
                     }
                 }
                 _ => {}
@@ -672,15 +720,21 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
         } => {
             session.require_enabled(Capability::QResync)?;
             if changed_since.is_none() {
-                return Err(Error::InvalidInput("VANISHED requires CHANGEDSINCE".into()));
+                return Err(Error::LocalRefusal(
+                    crate::error::LocalRefusal::InvalidInput(
+                        "VANISHED requires CHANGEDSINCE".into(),
+                    ),
+                ));
             }
         }
         Command::Login { .. } if session.supports(&Capability::LoginDisabled) => {
-            return Err(Error::MissingCapability(
-                crate::error::CapabilityFailure::new(
-                    Capability::LoginDisabled,
-                    crate::error::CapabilityFailureReason::ProhibitedByServer,
-                    "LOGIN disabled by server (LOGINDISABLED)",
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::MissingCapability(
+                    crate::error::CapabilityFailure::new(
+                        Capability::LoginDisabled,
+                        crate::error::CapabilityFailureReason::ProhibitedByServer,
+                        "LOGIN disabled by server (LOGINDISABLED)",
+                    ),
                 ),
             ));
         }
@@ -768,21 +822,25 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
                 && messages.iter().any(|msg| msg.data.contains(&0))
                 && !session.supports(&Capability::Binary)
             {
-                return Err(Error::MissingCapability(
-                    crate::error::CapabilityFailure::new(
-                        Capability::Binary,
-                        crate::error::CapabilityFailureReason::NotAdvertised,
-                        "APPEND data containing NUL requires BINARY literal8 support",
+                return Err(Error::LocalRefusal(
+                    crate::error::LocalRefusal::MissingCapability(
+                        crate::error::CapabilityFailure::new(
+                            Capability::Binary,
+                            crate::error::CapabilityFailureReason::NotAdvertised,
+                            "APPEND data containing NUL requires BINARY literal8 support",
+                        ),
                     ),
                 ));
             }
         }
         Command::Check | Command::Lsub { .. } if session.is_rev2() => {
-            return Err(Error::MissingCapability(
-                crate::error::CapabilityFailure::new(
-                    "IMAP4rev2".into(),
-                    crate::error::CapabilityFailureReason::RemovedInRev2,
-                    format!("{:?} is not available in IMAP4rev2", command.kind()),
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::MissingCapability(
+                    crate::error::CapabilityFailure::new(
+                        "IMAP4rev2".into(),
+                        crate::error::CapabilityFailureReason::RemovedInRev2,
+                        format!("{:?} is not available in IMAP4rev2", command.kind()),
+                    ),
                 ),
             ));
         }
@@ -957,7 +1015,12 @@ mod tests {
             (fetch("1", "BINARY.PEEK[]"), Capability::Binary),
         ] {
             assert!(
-                matches!(check(&cmd, &base), Err(Error::MissingCapability(_))),
+                matches!(
+                    check(&cmd, &base),
+                    Err(Error::LocalRefusal(
+                        crate::error::LocalRefusal::MissingCapability(_)
+                    ))
+                ),
                 "{cmd:?}"
             );
             let mut available = base.clone();
@@ -994,11 +1057,16 @@ mod tests {
         let vanished = Command::UidFetch {
             sequence_set: SequenceSet::new("1").unwrap(),
             items: "UID".into(),
-            changed_since: Some(2),
+            changed_since: Some(crate::types::ModSeq::new(2).expect("valid protocol test value")),
             vanished: true,
         };
         for cmd in [&select, &vanished] {
-            assert!(matches!(check(cmd, &snap), Err(Error::InvalidState(_))));
+            assert!(matches!(
+                check(cmd, &snap),
+                Err(Error::LocalRefusal(
+                    crate::error::LocalRefusal::InvalidState(_)
+                ))
+            ));
         }
         std::sync::Arc::make_mut(&mut snap.session)
             .enabled
@@ -1015,7 +1083,12 @@ mod tests {
             sequence_set: SequenceSet::new("1").unwrap(),
             mailbox: crate::types::MailboxName::new("Archive").unwrap(),
         };
-        assert!(matches!(check(&cmd, &snap), Err(Error::InvalidState(_))));
+        assert!(matches!(
+            check(&cmd, &snap),
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidState(_)
+            ))
+        ));
         std::sync::Arc::make_mut(&mut snap.session)
             .enabled
             .insert(Capability::Utf8Accept);
@@ -1029,7 +1102,9 @@ mod tests {
         snap.mailbox_selected = false;
         assert_eq!(
             check(&Command::StartTls, &snap),
-            Err(Error::StartTlsUnavailable)
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::StartTlsUnavailable
+            ))
         );
         std::sync::Arc::make_mut(&mut snap.session)
             .capabilities
@@ -1043,7 +1118,9 @@ mod tests {
                     tls_active: true
                 }
             ),
-            Err(Error::InvalidState(_))
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidState(_)
+            ))
         ));
     }
 
@@ -1062,7 +1139,10 @@ mod tests {
         assert!(super::super::driver::admit_live(&state, &cmd).is_ok());
         state.apply_capability_fetch(Vec::new());
         let error = super::super::driver::admit_live(&state, &cmd).unwrap_err();
-        assert!(matches!(&error, Error::StateChangedBeforeSend(_)));
+        assert!(matches!(
+            &error,
+            Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(_))
+        ));
         assert_eq!(
             error.attempt(),
             Some(bifrost_types::TransmissionState::Unsent)
@@ -1113,7 +1193,9 @@ mod tests {
             ));
             assert!(matches!(
                 check(&cmd, &snapshot(vec![Capability::Notify], &[])),
-                Err(Error::MissingCapability(_))
+                Err(Error::LocalRefusal(
+                    crate::error::LocalRefusal::MissingCapability(_)
+                ))
             ));
             assert!(
                 check(

@@ -21,6 +21,8 @@
 //! Gated behind the `test-support` feature; the DAV crates enable it as a
 //! dev-dependency.
 
+pub mod collection;
+
 use std::sync::Arc;
 use std::time::Duration;
 

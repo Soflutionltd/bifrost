@@ -35,7 +35,7 @@ pub use account::{
     SubmissionTls, UidListing, UidPage, UidScan,
 };
 pub use connection::ImapConfig;
-pub use types::{AuthPolicy, Credentials};
+pub use types::{AuthPolicy, Credentials, Uid, UidValidity};
 
 pub(crate) use connection::ImapConnection;
 pub(crate) use error::Error;

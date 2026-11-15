@@ -23,7 +23,9 @@ async fn login_rejects_non_ascii_before_submitting_to_the_driver() {
         .login("älice", "password", std::time::Duration::from_secs(1))
         .await
         .expect_err("non-ASCII LOGIN credentials must not reach the driver");
-    assert!(matches!(error, Error::InvalidInput(message) if message.contains("ASCII-only")));
+    assert!(
+        matches!(error, Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(message)) if message.contains("ASCII-only"))
+    );
 }
 
 /// X-GM-LABELS is a Gmail extension attribute like X-GM-MSGID / X-GM-THRID,
@@ -34,7 +36,7 @@ fn gmail_labels_fetch_requires_x_gm_ext_1() {
     let without = conn(vec![]);
     assert!(matches!(
         without.validate_requested_fetch_items(&[FetchAttr::GmailLabels]),
-        Err(Error::MissingCapability(failure)) if failure.capability == Capability::XGmExt1
+        Err(Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(failure))) if failure.capability == Capability::XGmExt1
     ));
     let with = conn(vec![Capability::XGmExt1]);
     assert!(
@@ -227,7 +229,9 @@ fn require_condstore_accepts_either_capability() {
     assert!(conn(vec![Capability::QResync]).require_condstore().is_ok());
     assert!(matches!(
         conn(vec![]).require_condstore(),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }
 
@@ -274,7 +278,9 @@ fn require_searchres_is_implied_by_rev2() {
     );
     assert!(matches!(
         conn(vec![Capability::Imap4Rev1]).require_searchres(),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }
 
@@ -300,7 +306,9 @@ fn require_state_gates_on_session_state() {
     assert!(
         matches!(
             c.require_state(CommandKind::Fetch),
-            Err(Error::InvalidState(_))
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidState(_)
+            ))
         ),
         "Authenticated must not satisfy a Selected-only command"
     );
@@ -364,7 +372,9 @@ fn status_deleted_requires_rev2_or_quota_res_message() {
 fn status_deleted_storage_requires_quota_res_storage() {
     assert!(matches!(
         conn(vec![Capability::Imap4Rev2]).validate_requested_status_items("DELETED-STORAGE"),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(
         conn(vec![Capability::from_imap_str("QUOTA=RES-STORAGE")])
@@ -465,7 +475,9 @@ fn objectid_and_savedate_items_are_not_implied_by_rev2() {
             assert!(
                 matches!(
                     conn(caps.clone()).validate_requested_fetch_items(std::slice::from_ref(&item)),
-                    Err(Error::MissingCapability(_))
+                    Err(Error::LocalRefusal(
+                        crate::error::LocalRefusal::MissingCapability(_)
+                    ))
                 ),
                 "{item:?} must need its capability on {caps:?}"
             );
@@ -473,7 +485,9 @@ fn objectid_and_savedate_items_are_not_implied_by_rev2() {
     }
     assert!(matches!(
         conn(vec![Capability::Imap4Rev2]).validate_requested_status_items("MAILBOXID"),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 
     let objectid = conn(vec![Capability::Imap4Rev2, Capability::ObjectId]);
@@ -548,7 +562,9 @@ fn list_extended_requires_at_least_one_pattern() {
     let c = conn(vec![Capability::ListExtended]);
     assert!(matches!(
         c.validate_list_extended_request(&[], &[], &[]),
-        Err(Error::InvalidInput(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(_)
+        ))
     ));
 }
 
@@ -557,7 +573,9 @@ fn list_extended_multiple_patterns_need_the_capability() {
     let plain = conn(vec![Capability::Imap4Rev1]);
     assert!(matches!(
         plain.validate_list_extended_request(&["a", "b"], &[], &[]),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(
         plain
@@ -576,11 +594,15 @@ fn list_extended_options_need_the_capability() {
     let plain = conn(vec![Capability::Imap4Rev1]);
     assert!(matches!(
         plain.validate_list_extended_request(&["*"], &["SUBSCRIBED"], &[]),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         plain.validate_list_extended_request(&["*"], &[], &["CHILDREN"]),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }
 
@@ -589,11 +611,15 @@ fn list_extended_rejects_empty_option_strings() {
     let c = conn(vec![Capability::ListExtended]);
     assert!(matches!(
         c.validate_list_extended_request(&["*"], &["  "], &[]),
-        Err(Error::InvalidInput(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(_)
+        ))
     ));
     assert!(matches!(
         c.validate_list_extended_request(&["*"], &[], &["  "]),
-        Err(Error::InvalidInput(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(_)
+        ))
     ));
 }
 
@@ -602,7 +628,9 @@ fn list_extended_special_use_option_is_gated() {
     let c = conn(vec![Capability::ListExtended]);
     assert!(matches!(
         c.validate_list_extended_request(&["*"], &["SPECIAL-USE"], &[]),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     let with = conn(vec![Capability::ListExtended, Capability::SpecialUse]);
     assert!(
@@ -616,7 +644,9 @@ fn list_extended_status_return_option_is_gated_by_list_status() {
     let c = conn(vec![Capability::ListExtended]);
     assert!(matches!(
         c.validate_list_extended_request(&["*"], &[], &["STATUS (MESSAGES)"]),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     let with = conn(vec![Capability::ListExtended, Capability::ListStatus]);
     assert!(
@@ -642,11 +672,15 @@ fn list_extended_recursivematch_needs_a_partner_option() {
     let c = conn(vec![Capability::ListExtended]);
     assert!(matches!(
         c.validate_list_extended_request(&["*"], &["RECURSIVEMATCH"], &[]),
-        Err(Error::InvalidInput(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(_)
+        ))
     ));
     assert!(matches!(
         c.validate_list_extended_request(&["*"], &["RECURSIVEMATCH", "REMOTE"], &[]),
-        Err(Error::InvalidInput(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(_)
+        ))
     ));
     assert!(
         c.validate_list_extended_request(&["*"], &["RECURSIVEMATCH", "SUBSCRIBED"], &[])

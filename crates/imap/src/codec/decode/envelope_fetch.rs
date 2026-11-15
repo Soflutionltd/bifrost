@@ -513,7 +513,7 @@ fn fetch_attr_value<'a>(
                 let (rest, _) = char('(').parse(rest)?;
                 if let Ok((rest, n)) = number64(rest) {
                     let (rest, _) = char(')').parse(rest)?;
-                    fr.mod_seq = Some(n);
+                    fr.mod_seq = crate::types::ModSeqValzer::new(n);
                     Ok((rest, ()))
                 } else {
                     // Malformed MODSEQ value  -  skip past the closing ')'.
@@ -552,7 +552,7 @@ fn fetch_attr_value<'a>(
                 let (rest, val) =
                     map(objectid, |a| String::from_utf8_lossy(a).into_owned()).parse(rest)?;
                 let (rest, _) = char(')').parse(rest)?;
-                fr.email_id = Some(val);
+                fr.email_id = Some(crate::types::validated::ObjectId::from_observed(val));
                 Ok((rest, ()))
             })
         }
@@ -586,7 +586,7 @@ fn fetch_attr_value<'a>(
                     let (rest, val) =
                         map(objectid, |a| String::from_utf8_lossy(a).into_owned()).parse(rest)?;
                     let (rest, _) = char(')').parse(rest)?;
-                    fr.thread_id = Some(val);
+                    fr.thread_id = Some(crate::types::validated::ObjectId::from_observed(val));
                     Ok((rest, ()))
                 }
             })
@@ -594,13 +594,13 @@ fn fetch_attr_value<'a>(
         "X-GM-MSGID" => fetch_value_policy(true, || {
             let (rest, _) = attr_sp(input)?;
             let (rest, value) = gmail_id(rest)?;
-            fr.gmail_msg_id = Some(value);
+            fr.gmail_msg_id = Some(crate::types::GmailMessageId::new(value));
             Ok((rest, ()))
         }),
         "X-GM-THRID" => fetch_value_policy(true, || {
             let (rest, _) = attr_sp(input)?;
             let (rest, value) = gmail_id(rest)?;
-            fr.gmail_thread_id = Some(value);
+            fr.gmail_thread_id = Some(crate::types::GmailThreadId::new(value));
             Ok((rest, ()))
         }),
         "X-GM-LABELS" => fetch_value_policy(true, || {

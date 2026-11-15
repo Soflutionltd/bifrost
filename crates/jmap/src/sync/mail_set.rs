@@ -1,12 +1,12 @@
 //! Email/set execution and per-target answers shared by bulk and single doors.
-use super::state_cache::{self, StateMap};
+use super::state_cache;
 use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailGet, EmailId, EmailSet};
 use bifrost_types::{
     AccountOperation, BatchFailure, BatchItemId, BatchSuccess, ErrorScope, ItemOutcome,
     MutationSuccess, ObjectId,
 };
-type MailAccount<T> = crate::account::Account<T>;
+type MailAccount<T> = super::registry::Slot<T>;
 
 /// Outlook users expect narrow edits to survive unrelated mailbox activity.
 /// Whole-property replacements use a cached guard with one refusal-only refresh.
@@ -27,15 +27,15 @@ impl Guard<'_> {
 
 pub(super) async fn execute<T: HttpTransport>(
     mail: &MailAccount<T>,
-    email_states: &StateMap,
-    account_id: &str,
     guard: Guard<'_>,
     mut make_set: impl FnMut() -> crate::Result<EmailSet>,
 ) -> crate::Result<crate::core::set::SetResponse<Email>> {
+    let email_states = &mail.email_states;
+
     let state = match guard {
         Guard::Unconditional => None,
         Guard::Exact(state) => Some(state.clone()),
-        Guard::Replacement => Some(current_or_probe_state(mail, email_states, account_id).await?),
+        Guard::Replacement => Some(current_or_probe_state(mail).await?),
     };
     let set = make_set()?;
     let set = match state {
@@ -47,21 +47,19 @@ pub(super) async fn execute<T: HttpTransport>(
         Err(error)
             if matches!(guard, Guard::Replacement) && super::error::is_state_mismatch(&error) =>
         {
-            let expected = state_cache::guard(email_states, account_id).await;
+            let expected = email_states.guard().await;
             let fresh = probe_email_state(mail).await?;
-            let fresh =
-                state_cache::observe_probe(email_states, account_id, expected.as_ref(), fresh)
-                    .await;
+            let fresh = email_states.observe_probe(expected.as_ref(), fresh).await;
             mail.call(make_set()?.if_in_state(fresh)).await?
         }
         result => result?,
     };
-    state_cache::observe_set(
-        email_states,
-        account_id,
-        state_cache::set_transition(response.old_state(), response.new_state()),
-    )
-    .await;
+    email_states
+        .observe_set(state_cache::set_transition(
+            response.old_state(),
+            response.new_state(),
+        ))
+        .await;
     Ok(response)
 }
 
@@ -116,14 +114,14 @@ pub(super) fn classify_set_response(
 
 async fn current_or_probe_state<T: HttpTransport>(
     mail: &MailAccount<T>,
-    email_states: &StateMap,
-    account_id: &str,
 ) -> crate::Result<crate::core::id::ObjectState<Email>> {
-    if let Some(state) = state_cache::guard(email_states, account_id).await {
+    let email_states = &mail.email_states;
+
+    if let Some(state) = email_states.guard().await {
         return Ok(state);
     }
     let state = probe_email_state(mail).await?;
-    Ok(state_cache::observe_probe(email_states, account_id, None, state).await)
+    Ok(email_states.observe_probe(None, state).await)
 }
 
 pub(crate) async fn probe_email_state<T: HttpTransport>(

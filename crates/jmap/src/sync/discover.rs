@@ -27,7 +27,7 @@ pub(crate) struct LifecycleTopology {
 
 type Topology = Arc<Mutex<LifecycleTopology>>;
 
-type MailAccount<T> = crate::account::Account<T>;
+type MailAccount<T> = crate::account::Account<T, crate::core::capability::Mail>;
 
 pub(crate) fn cursor_scopes(scopes: Vec<CursorScope>) -> AccountStream<SyncEvent<CursorScope>> {
     Box::pin(async_stream::stream! {
@@ -76,7 +76,7 @@ pub(crate) fn memberships<T: HttpTransport>(
                     .collect::<Vec<_>>();
 
                 // Each foreign (shared/delegate) account contributes its
-                // owner tag (`Mailbox(accountId)`) so the consumer maps
+                // owner tag (`Owner(accountId)`) so the consumer maps
                 // its foreign scopes to the shared-account identity.
                 items.extend(foreign_owners);
 

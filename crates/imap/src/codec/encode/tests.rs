@@ -122,7 +122,7 @@ fn assert_string_nul_rejected(data: &[u8]) {
     w.raw(b"\r\n");
     assert!(matches!(
         w.finish(),
-        Err(crate::Error::InvalidInput(message)) if message.contains("must not contain NUL")
+        Err(crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(message))) if message.contains("must not contain NUL")
     ));
 }
 
@@ -545,7 +545,9 @@ fn encode_store_with_condstore() {
         sequence_set: SequenceSet::new("5").unwrap(),
         operation: crate::types::StoreOperation::Remove,
         flags: vec![crate::types::Flag::Deleted],
-        unchanged_since: Some(12345),
+        unchanged_since: Some(
+            crate::types::ModSeqValzer::new(12345).expect("valid protocol test value"),
+        ),
     };
     encode_command_to_buf(&mut buf, "A005", &cmd, &default_opts()).unwrap();
     assert_eq!(
@@ -785,7 +787,7 @@ fn encode_list_extended_rejects_empty_pattern_list() {
 
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
-        matches!(result, Err(crate::Error::InvalidInput(ref msg)) if msg.contains("RFC 5258 Section 3")),
+        matches!(result, Err(crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(ref msg))) if msg.contains("RFC 5258 Section 3")),
         "empty LIST-EXTENDED patterns must be rejected per RFC 5258 Section 3 / RFC 9051 Section 6.3.9: {result:?}"
     );
 }
@@ -825,7 +827,7 @@ fn encode_list_extended_rejects_recursivematch_without_base_option() {
 
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
-        matches!(result, Err(crate::Error::InvalidInput(ref msg)) if msg.contains("RECURSIVEMATCH")),
+        matches!(result, Err(crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(ref msg))) if msg.contains("RECURSIVEMATCH")),
         "LIST-EXTENDED must reject bare RECURSIVEMATCH per RFC 5258 Section 3 / RFC 9051 Section 6.3.9: {result:?}"
     );
 }
@@ -844,7 +846,7 @@ fn encode_list_extended_rejects_bare_status_return_option() {
 
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
-        matches!(result, Err(crate::Error::InvalidInput(ref msg)) if msg.contains("STATUS (") || msg.contains("STATUS (<items>)")),
+        matches!(result, Err(crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(ref msg))) if msg.contains("STATUS (") || msg.contains("STATUS (<items>)")),
         "LIST-EXTENDED must reject bare STATUS return option per RFC 5819 Section 4 / RFC 9051 Section 7: {result:?}"
     );
 }
@@ -1212,7 +1214,7 @@ fn encode_search_return_rejects_embedded_whitespace_in_option() {
         .expect_err("SEARCH RETURN option with embedded whitespace must be rejected");
 
     assert!(
-        matches!(err, crate::Error::InvalidInput(ref message) if message.contains("SEARCH RETURN option")),
+        matches!(err, crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(ref message)) if message.contains("SEARCH RETURN option")),
         "expected Protocol error mentioning SEARCH RETURN option, got {err:?}"
     );
 }
@@ -2494,7 +2496,7 @@ fn encode_fetch_changedsince() {
     let cmd = Command::Fetch {
         sequence_set: SequenceSet::new("1:*").unwrap(),
         items: "(FLAGS)".into(),
-        changed_since: Some(12345),
+        changed_since: Some(crate::types::ModSeq::new(12345).expect("valid protocol test value")),
     };
     encode_command_to_buf(&mut buf, "A011", &cmd, &default_opts()).unwrap();
     assert_eq!(&buf[..], b"A011 FETCH 1:* (FLAGS) (CHANGEDSINCE 12345)\r\n");
@@ -2518,7 +2520,7 @@ fn encode_uid_fetch_changedsince() {
     let cmd = Command::UidFetch {
         sequence_set: SequenceSet::new("1:500").unwrap(),
         items: "(FLAGS ENVELOPE)".into(),
-        changed_since: Some(67890),
+        changed_since: Some(crate::types::ModSeq::new(67890).expect("valid protocol test value")),
         vanished: false,
     };
     encode_command_to_buf(&mut buf, "A013", &cmd, &default_opts()).unwrap();
@@ -2536,7 +2538,7 @@ fn encode_uid_fetch_changedsince_vanished() {
     let cmd = Command::UidFetch {
         sequence_set: SequenceSet::new("1:*").unwrap(),
         items: "(FLAGS)".into(),
-        changed_since: Some(12345),
+        changed_since: Some(crate::types::ModSeq::new(12345).expect("valid protocol test value")),
         vanished: true,
     };
     encode_command_to_buf(&mut buf, "A014", &cmd, &default_opts()).unwrap();
@@ -2569,7 +2571,7 @@ fn encode_uid_fetch_changedsince_without_vanished_unchanged() {
     let cmd = Command::UidFetch {
         sequence_set: SequenceSet::new("1:500").unwrap(),
         items: "(FLAGS ENVELOPE)".into(),
-        changed_since: Some(67890),
+        changed_since: Some(crate::types::ModSeq::new(67890).expect("valid protocol test value")),
         vanished: false,
     };
     encode_command_to_buf(&mut buf, "A016", &cmd, &default_opts()).unwrap();
@@ -2761,7 +2763,7 @@ fn append_nul_body_without_binary_is_refused() {
     )
     .expect_err("literal8 needs BINARY");
     assert!(
-        matches!(err, crate::Error::MissingCapability(ref m) if m.contains("requires BINARY")),
+        matches!(err, crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(ref m)) if m.contains("requires BINARY")),
         "got {err:?}"
     );
 }
@@ -2880,7 +2882,7 @@ fn rev2_does_not_imply_binary_for_append() {
     let err = append_command("A", "INBOX", &[append_nul_msg(100)], false, &rev2)
         .expect_err("pure rev2 without BINARY cannot carry a NUL body");
     assert!(
-        matches!(err, crate::Error::MissingCapability(ref m) if m.contains("requires BINARY")),
+        matches!(err, crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(ref m)) if m.contains("requires BINARY")),
         "got {err:?}"
     );
 }
@@ -3953,17 +3955,21 @@ fn append_shape_and_capability_validation() {
 
     assert!(matches!(
         append_command("A", "INBOX", &one, true, &without_cap),
-        Err(crate::Error::MissingCapability(ref m)) if m.capability == Capability::MultiAppend
+        Err(crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(ref m))) if m.capability == Capability::MultiAppend
     ));
     // A plain APPEND never needs it.
     assert!(append_command("A", "INBOX", &one, false, &without_cap).is_ok());
     assert!(matches!(
         append_command("A", "INBOX", &[], true, &with_cap),
-        Err(crate::Error::InvalidInput(_))
+        Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(_)
+        ))
     ));
     assert!(matches!(
         append_command("A", "INBOX", &two, false, &with_cap),
-        Err(crate::Error::InvalidInput(_))
+        Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(_)
+        ))
     ));
 }
 
@@ -4007,7 +4013,7 @@ fn encode_fetch_changedsince_minimum_valid() {
     let cmd = Command::Fetch {
         sequence_set: SequenceSet::new("1:*").unwrap(),
         items: "(FLAGS)".into(),
-        changed_since: Some(1),
+        changed_since: Some(crate::types::ModSeq::new(1).expect("valid protocol test value")),
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
     assert_eq!(&buf[..], b"A001 FETCH 1:* (FLAGS) (CHANGEDSINCE 1)\r\n");
@@ -4020,7 +4026,7 @@ fn encode_uid_fetch_changedsince_minimum_valid() {
     let cmd = Command::UidFetch {
         sequence_set: SequenceSet::new("1:*").unwrap(),
         items: "(FLAGS)".into(),
-        changed_since: Some(1),
+        changed_since: Some(crate::types::ModSeq::new(1).expect("valid protocol test value")),
         vanished: false,
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
@@ -4173,7 +4179,7 @@ fn encode_string_rejects_nul_without_rewriting_the_command() {
 
     assert!(matches!(
         w.finish(),
-        Err(crate::Error::InvalidInput(message)) if message.contains("must not contain NUL")
+        Err(crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(message))) if message.contains("must not contain NUL")
     ));
 }
 
@@ -4248,7 +4254,12 @@ fn test_append_rejects_invalid_month() {
 fn test_append_rejects_garbage_date() {
     let result = append_with_date("not-a-date");
     assert!(
-        matches!(result, Err(crate::Error::InvalidAppendDate(_))),
+        matches!(
+            result,
+            Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidAppendDate(_)
+            ))
+        ),
         "garbage date string should be rejected per RFC 3501 Section 9: {result:?}"
     );
 }
@@ -4438,33 +4449,13 @@ fn spec_audit_multi_append_utf8_mailbox_quoted() {
 /// RFC 7162 Section 7: CHANGEDSINCE uses mod-sequence-value (>= 1).
 #[test]
 fn encode_fetch_changedsince_rejects_zero() {
-    let cmd = Command::Fetch {
-        sequence_set: SequenceSet::new("1:*").unwrap(),
-        items: "FLAGS".into(),
-        changed_since: Some(0),
-    };
-    let mut buf = BytesMut::new();
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
-    assert!(
-        result.is_err(),
-        "CHANGEDSINCE 0 must be rejected per RFC 7162 Section 7"
-    );
+    assert!(crate::types::ModSeq::new(0).is_none());
 }
 
 /// RFC 7162 Section 7: mod-sequence-value must be <= 2^63-1.
 #[test]
 fn encode_fetch_changedsince_rejects_overflow() {
-    let cmd = Command::Fetch {
-        sequence_set: SequenceSet::new("1:*").unwrap(),
-        items: "FLAGS".into(),
-        changed_since: Some(u64::MAX),
-    };
-    let mut buf = BytesMut::new();
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
-    assert!(
-        result.is_err(),
-        "CHANGEDSINCE > i64::MAX must be rejected per RFC 7162 Section 7"
-    );
+    assert!(crate::types::ModSeq::new(u64::MAX).is_none());
 }
 
 /// RFC 7162 Section 7: UNCHANGEDSINCE uses mod-sequence-valzer (allows 0).
@@ -4474,7 +4465,7 @@ fn encode_store_unchangedsince_allows_zero() {
         sequence_set: SequenceSet::new("1").unwrap(),
         operation: crate::types::StoreOperation::Add,
         flags: vec![crate::types::Flag::Seen],
-        unchanged_since: Some(0),
+        unchanged_since: Some(crate::types::ModSeqValzer::new(0).unwrap()),
     };
     let mut buf = BytesMut::new();
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
@@ -4487,52 +4478,19 @@ fn encode_store_unchangedsince_allows_zero() {
 /// RFC 7162 Section 7: mod-sequence-valzer must be <= 2^63-1.
 #[test]
 fn encode_store_unchangedsince_rejects_overflow() {
-    let cmd = Command::Store {
-        sequence_set: SequenceSet::new("1").unwrap(),
-        operation: crate::types::StoreOperation::Add,
-        flags: vec![crate::types::Flag::Seen],
-        unchanged_since: Some(u64::MAX),
-    };
-    let mut buf = BytesMut::new();
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
-    assert!(
-        result.is_err(),
-        "UNCHANGEDSINCE > i64::MAX must be rejected per RFC 7162 Section 7"
-    );
+    assert!(crate::types::ModSeqValzer::new(u64::MAX).is_none());
 }
 
 /// RFC 7162 Section 7: UID FETCH CHANGEDSINCE also uses mod-sequence-value.
 #[test]
 fn encode_uid_fetch_changedsince_rejects_zero() {
-    let cmd = Command::UidFetch {
-        sequence_set: SequenceSet::new("1:*").unwrap(),
-        items: "FLAGS".into(),
-        changed_since: Some(0),
-        vanished: false,
-    };
-    let mut buf = BytesMut::new();
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
-    assert!(
-        result.is_err(),
-        "UID FETCH CHANGEDSINCE 0 must be rejected per RFC 7162 Section 7"
-    );
+    assert!(crate::types::ModSeq::new(0).is_none());
 }
 
 /// RFC 7162 Section 7: UID STORE UNCHANGEDSINCE must reject > `i64::MAX`.
 #[test]
 fn encode_uid_store_unchangedsince_rejects_overflow() {
-    let cmd = Command::UidStore {
-        sequence_set: SequenceSet::new("1").unwrap(),
-        operation: crate::types::StoreOperation::Add,
-        flags: vec![crate::types::Flag::Seen],
-        unchanged_since: Some(u64::MAX),
-    };
-    let mut buf = BytesMut::new();
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
-    assert!(
-        result.is_err(),
-        "UID STORE UNCHANGEDSINCE > i64::MAX must be rejected per RFC 7162 Section 7"
-    );
+    assert!(crate::types::ModSeqValzer::new(u64::MAX).is_none());
 }
 
 /// RFC 7162 Section 7: known-uids / known-sequence-set / known-uid-set
@@ -4812,7 +4770,9 @@ fn encode_non_uid_store_with_condstore_typical_value() {
         sequence_set: SequenceSet::new("1:3").unwrap(),
         operation: crate::types::StoreOperation::Remove,
         flags: vec![crate::types::Flag::Seen],
-        unchanged_since: Some(12345),
+        unchanged_since: Some(
+            crate::types::ModSeqValzer::new(12345).expect("valid protocol test value"),
+        ),
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
     assert_eq!(
@@ -5851,7 +5811,13 @@ fn criteria_literal_count_is_written_canonically() {
 #[test]
 fn criteria_non_synchronizing_literal_without_an_extension_is_refused() {
     let err = uid_search("SUBJECT {5+}\r\nhello", &default_opts()).unwrap_err();
-    assert!(matches!(err, crate::Error::MissingCapability(_)), "{err:?}");
+    assert!(
+        matches!(
+            err,
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(_))
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -5940,7 +5906,7 @@ fn encode_login_rejects_utf8_credentials_even_when_utf8_enabled() {
     let result = encode_command("A001", &cmd, &opts(LiteralMode::Synchronizing, true));
 
     assert!(
-        matches!(result, Err(crate::Error::InvalidInput(ref msg)) if msg.contains("RFC 6855 Section 5")),
+        matches!(result, Err(crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(ref msg))) if msg.contains("RFC 6855 Section 5")),
         "LOGIN with non-ASCII credentials must be rejected even when UTF8=ACCEPT is active \
          (RFC 6855 Section 5); got: {result:?}"
     );
@@ -6387,7 +6353,10 @@ fn search_rejects_non_synchronizing_literal_without_extension() {
     // The refusal must arrive as a capability gap, not be flattened into
     // malformed input.
     assert!(
-        matches!(err, crate::Error::MissingCapability(_)),
+        matches!(
+            err,
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(_))
+        ),
         "got {err:?}"
     );
 }
@@ -6402,7 +6371,7 @@ fn an_encoder_validation_refusal_arrives_as_invalid_input() {
     let mut buf = BytesMut::new();
     let err = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts())
         .expect_err("empty SEARCH criteria are refused");
-    let crate::Error::InvalidInput(message) = err else {
+    let crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(message)) = err else {
         panic!("expected InvalidInput, got {err:?}");
     };
     assert!(
@@ -6418,7 +6387,7 @@ fn an_encoder_capability_refusal_names_the_command_and_the_capability() {
     let cmd = Command::UidFetch {
         sequence_set: SequenceSet::new("1:*").unwrap(),
         items: "FLAGS".into(),
-        changed_since: Some(5),
+        changed_since: Some(crate::types::ModSeq::new(5).expect("valid protocol test value")),
         vanished: false,
     };
     let no_condstore = EncodeOptions {
@@ -6432,10 +6401,12 @@ fn an_encoder_capability_refusal_names_the_command_and_the_capability() {
     let err = admit_and_encode("A001", &cmd, &no_condstore).unwrap_err();
     assert_eq!(
         err,
-        crate::Error::MissingCapability(crate::error::CapabilityFailure::new(
-            Capability::Condstore,
-            crate::error::CapabilityFailureReason::NotAdvertised,
-            "UID FETCH (CHANGEDSINCE) requires CONDSTORE",
+        crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(
+            crate::error::CapabilityFailure::new(
+                Capability::Condstore,
+                crate::error::CapabilityFailureReason::NotAdvertised,
+                "UID FETCH (CHANGEDSINCE) requires CONDSTORE",
+            )
         ))
     );
 }
@@ -6598,7 +6569,10 @@ fn thread_rejects_oversized_non_synchronizing_literal_in_literal_minus_mode() {
          in LITERAL- mode (RFC 7888 Section 5 / RFC 9051 Section 4.3)",
     );
     assert!(
-        matches!(err, crate::Error::MissingCapability(_)),
+        matches!(
+            err,
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(_))
+        ),
         "LITERAL- without LITERAL+ is a capability gap; got {err:?}"
     );
 }
@@ -6797,7 +6771,7 @@ fn encode_search_rejects_charset_when_utf8_enabled() {
     let result = encode_command("A001", &cmd, &opts(LiteralMode::Synchronizing, true));
 
     assert!(
-        matches!(result, Err(crate::Error::InvalidInput(ref msg)) if msg.contains("RFC 6855 Section 3")),
+        matches!(result, Err(crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(ref msg))) if msg.contains("RFC 6855 Section 3")),
         "SEARCH with CHARSET must be rejected when UTF8=ACCEPT is active \
          (RFC 6855 Section 3); got: {result:?}"
     );
@@ -8139,7 +8113,9 @@ fn list_status_return_option_rejects_unbalanced_leading_paren() {
     assert!(
         matches!(
             encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()),
-            Err(crate::Error::InvalidInput(_))
+            Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(_)
+            ))
         ),
         "an unbalanced STATUS list must not be emitted"
     );
@@ -8250,7 +8226,9 @@ fn mailbox_wire_nul_is_refused_instead_of_addressing_a_different_name() {
     let mut buf = BytesMut::new();
     assert!(matches!(
         encode_command_to_buf(&mut buf, "A1", &cmd, &opts(LiteralMode::LiteralPlus, true)),
-        Err(crate::Error::InvalidInput(_))
+        Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(_)
+        ))
     ));
     assert!(buf.is_empty());
 }
@@ -8325,7 +8303,12 @@ fn a_mode_change_refuses_noncanonical_addresses_before_writing() {
         },
         &opts(LiteralMode::LiteralPlus, true),
     );
-    assert!(matches!(result, Err(crate::Error::InvalidInput(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(_)
+        ))
+    ));
     assert!(bytes.is_empty());
 }
 
@@ -8405,13 +8388,17 @@ fn typed_search_capability_requirements_follow_keys_and_raw_declarations() {
     );
     assert!(matches!(
         admit_and_encode("A001", &Command::Search { criteria }, &options),
-        Err(crate::Error::MissingCapability(_))
+        Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     let criteria =
         crate::types::SearchCriteria::raw("X-LOCAL value".to_owned(), vec![Capability::Within]);
     assert!(matches!(
         admit_and_encode("A001", &Command::Search { criteria }, &options),
-        Err(crate::Error::MissingCapability(_))
+        Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }
 
@@ -8439,6 +8426,8 @@ fn typed_fetch_preserves_header_operands_during_admission() {
     };
     assert!(matches!(
         admit_and_encode("A001", &cmd, &options),
-        Err(crate::Error::MissingCapability(_))
+        Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }

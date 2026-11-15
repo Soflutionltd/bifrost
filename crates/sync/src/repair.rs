@@ -63,17 +63,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cursor::DebtLedger;
+use crate::delivery::{ChangeDelivery, EventScope, MultiplexerEvent};
+use crate::error::Error;
 use bifrost_types::{
     Account, AccountId, Change, CursorScope, InventoryEntry, InventoryRepairEvent,
     InventoryRepairOutcome, InventoryRepairRequest, InventoryRepairTarget, ObjectChange,
     ObjectChangeKind, ObligationKey, RegionRepairProof, RepairAttemptId, SyncEvent,
 };
 use futures::stream::StreamExt;
-use tokio::sync::{mpsc, oneshot};
-
-use crate::cursor::DebtLedger;
-use crate::error::Error;
-use crate::multiplexer::{ChangeDelivery, EventScope, MultiplexerEvent, WriterRequest};
 
 /// How many completed attempts a lineage gets before it stops being retried
 /// automatically.
@@ -123,7 +121,7 @@ pub async fn run_repair_pass(
     account_id: &AccountId,
     ledger: &DebtLedger,
     delivery: Option<&ChangeDelivery>,
-    writer_tx: &mpsc::Sender<WriterRequest>,
+    writer_tx: &crate::engine::writer::WriterHandle,
     coverage: &Arc<crate::cursor::PendingCoverage>,
     max_requests: usize,
 ) -> Result<usize, Error> {
@@ -147,7 +145,7 @@ pub(crate) async fn run_repair_pass_observed(
     account_id: &AccountId,
     ledger: &DebtLedger,
     delivery: Option<&ChangeDelivery>,
-    writer_tx: &mpsc::Sender<WriterRequest>,
+    writer_tx: &crate::engine::writer::WriterHandle,
     coverage: &Arc<crate::cursor::PendingCoverage>,
     max_requests: usize,
     observe: Option<&(dyn Fn(&bifrost_types::AccountError) + Sync)>,
@@ -369,16 +367,7 @@ pub(crate) async fn run_repair_pass_observed(
         let resolutions = grouped.remove(&scope).unwrap_or_default();
         let ids = ids_by_scope.remove(&scope).unwrap_or_default();
         let publication = publish_recovered(delivery, coverage, &scope, &ids);
-        let (done, wait) = oneshot::channel();
-        writer_tx
-            .send(WriterRequest::ApplyRepair {
-                resolutions,
-                publication,
-                done,
-            })
-            .await
-            .map_err(|_| Error::ShuttingDown)?;
-        wait.await.map_err(|_| Error::ShuttingDown)??;
+        writer_tx.apply_repair(resolutions, publication).await?;
     }
     Ok(resolved)
 }

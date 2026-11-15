@@ -171,7 +171,9 @@ impl SubmissionTransport {
         // Keep this conversion: relay/starttls_relay only construct local TLS
         // parameters, and cannot produce a network or handshake failure.
         let smtp_config_err = |e: bifrost_smtp::transport::smtp::Error| {
-            crate::Error::InvalidInput(e.to_string().into())
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
+                e.to_string().into(),
+            ))
         };
         let mut builder = bifrost_smtp::submission::SubmissionConfig::new(&cfg.host, cfg.tls)
             .map_err(smtp_config_err)?

@@ -133,9 +133,9 @@ impl WireReader {
     /// returns the first complete response. This is the only response reader
     /// in the crate.
     ///
-    /// * On parse error -> `Err(Error::Parse)`
-    /// * On I/O error -> `Err(Error::Io)`
-    /// * On EOF (zero-byte read) -> `Err(Error::Closed)`
+    /// * On parse error -> `Err(crate::error::ProviderFailure::Parse)`
+    /// * On I/O error -> `Err(crate::error::TransportFailure::Io)`
+    /// * On EOF (zero-byte read) -> `Err(crate::error::TransportFailure::Closed)`
     ///
     /// `utf8_mode` should be `WireMode::Utf8` when `UTF8=ACCEPT` (RFC 6855
     /// Section 3) has been enabled or `IMAP4rev2` is active (RFC 9051
@@ -433,7 +433,9 @@ impl WireReader {
                     return Ok(Option::None);
                 }
                 warn!("greeting parse error: {e}");
-                Err(Error::Parse(format!("greeting parse error: {e}")))
+                Err(Error::Provider(crate::error::ProviderFailure::Parse(
+                    format!("greeting parse error: {e}"),
+                )))
             }
         }
     }
@@ -475,7 +477,9 @@ impl WireReader {
                 Err(nom::Err::Incomplete(_)) => Ok(None),
                 Err(e) => {
                     warn!("response parse error: {e}");
-                    Err(Error::Parse(format!("response parse error: {e}")))
+                    Err(Error::Provider(crate::error::ProviderFailure::Parse(
+                        format!("response parse error: {e}"),
+                    )))
                 }
             };
         }
@@ -516,7 +520,9 @@ impl WireReader {
             }
             Err(e) => {
                 warn!("response parse error: {e}");
-                Err(Error::Parse(format!("response parse error: {e}")))
+                Err(Error::Provider(crate::error::ProviderFailure::Parse(
+                    format!("response parse error: {e}"),
+                )))
             }
         }
     }
@@ -553,7 +559,10 @@ pub(in crate::connection) async fn peer_io<T>(
     };
     let remaining = *budget.0.lock().expect("peer budget lock poisoned");
     if remaining.is_zero() {
-        return Err(Error::Timeout { attempt: None });
+        return Err(Error::Transport {
+            kind: crate::error::TransportFailure::Timeout,
+            attempt: None,
+        });
     }
     // Admission has already completed. The guard also spends peer wait time
     // when the I/O future is cancelled, so cancellation cannot reset the clock.
@@ -563,7 +572,10 @@ pub(in crate::connection) async fn peer_io<T>(
     };
     tokio::time::timeout(remaining, io)
         .await
-        .map_err(|_| Error::Timeout { attempt: None })?
+        .map_err(|_| Error::Transport {
+            kind: crate::error::TransportFailure::Timeout,
+            attempt: None,
+        })?
         .map_err(Error::from)
 }
 
@@ -658,7 +670,7 @@ impl WireMetering {
 /// (e.g., multi-body FETCH responses).
 ///
 /// `Ok(false)` means "not yet"  -  the caller must read more bytes.
-/// `Err(Error::Parse)` means "never": the server declared a literal whose
+/// `Err(crate::error::ProviderFailure::Parse)` means "never": the server declared a literal whose
 /// octets cannot be delivered to this process, so no amount of reading will
 /// complete the response. Returning `Ok(false)` there would park the read
 /// loop forever, which is why this is fallible at all. The threshold matches
@@ -699,10 +711,12 @@ fn response_frame_len_limited(buf: &[u8], limit: Option<usize>) -> Result<Option
             // dedicated fatal variant keeps that distinction while retiring
             // the connection, since unread literal octets prevent framing the
             // next response safely.
-            return Err(Error::FetchLiteralLimit {
-                estimated: literal_bytes,
-                limit,
-            });
+            return Err(Error::ResultLimit(
+                crate::error::ResultLimit::FetchLiteral {
+                    estimated: literal_bytes,
+                    limit,
+                },
+            ));
         }
         Ok(())
     };
@@ -819,7 +833,9 @@ fn advance_past_literal(base: usize, marker: usize, literal_len: usize) -> Resul
     base.checked_add(marker)
         .and_then(|offset| offset.checked_add(literal_len))
         .ok_or_else(|| {
-            Error::Parse("literal framing offsets exceed the addressable buffer".to_owned())
+            Error::Provider(crate::error::ProviderFailure::Parse(
+                "literal framing offsets exceed the addressable buffer".to_owned(),
+            ))
         })
 }
 
@@ -853,14 +869,14 @@ fn try_parse_literal_marker(buf: &[u8], crlf_pos: usize) -> Result<Option<usize>
         return Ok(None);
     }
     if let LiteralMarker::CountOutOfRange { size, .. } = parsed {
-        return Err(Error::Parse(format!(
-            "literal count {size} exceeds the RFC 9051 number64 range"
+        return Err(Error::Provider(crate::error::ProviderFailure::Parse(
+            format!("literal count {size} exceeds the RFC 9051 number64 range"),
         )));
     }
     usize::try_from(size).map(Some).map_err(|_| {
-        Error::Parse(format!(
+        Error::Provider(crate::error::ProviderFailure::Parse(format!(
             "literal count {size} exceeds this platform's addressable range"
-        ))
+        )))
     })
 }
 

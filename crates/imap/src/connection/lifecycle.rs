@@ -1,7 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 use tokio::net::TcpStream;
 
-use crate::error::ImapAttempt;
 use bifrost_types::TransmissionState;
 
 use super::*;
@@ -68,14 +67,17 @@ impl ImapConnection {
 
         debug!(host, port, ?tls_mode, "connecting to IMAP server");
 
-        let unsent = ImapAttempt::new(TransmissionState::Unsent);
+        let unsent = TransmissionState::Unsent;
         let tcp = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
             .await
-            .map_err(|_| Error::Timeout {
+            .map_err(|_| Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
                 attempt: Some(unsent),
             })?
-            .map_err(|e| Error::Io {
-                source: std::sync::Arc::new(e),
+            .map_err(|e| Error::Transport {
+                kind: crate::error::TransportFailure::Io(crate::error::IoFailure(
+                    std::sync::Arc::new(e),
+                )),
                 attempt: Some(unsent),
             })?;
         // Wrapped before anything is layered on it, so every octet the socket
@@ -88,11 +90,14 @@ impl ImapConnection {
             let connector = tokio_native_tls::TlsConnector::from(tls_connector.clone());
             let tls_stream = tokio::time::timeout(timeout, connector.connect(host, tcp))
                 .await
-                .map_err(|_| Error::Timeout {
+                .map_err(|_| Error::Transport {
+                    kind: crate::error::TransportFailure::Timeout,
                     attempt: Some(unsent),
                 })?
-                .map_err(|e| Error::Io {
-                    source: std::sync::Arc::new(std::io::Error::other(e)),
+                .map_err(|e| Error::Transport {
+                    kind: crate::error::TransportFailure::Io(crate::error::IoFailure(
+                        std::sync::Arc::new(std::io::Error::other(e)),
+                    )),
                     attempt: Some(unsent),
                 })?;
             ImapStream::Tls(tls_stream)
@@ -127,9 +132,9 @@ impl ImapConnection {
             .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
 
         let Response::Greeting(g) = &greeting else {
-            return Err(Error::Protocol(
+            return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
                 "expected greeting from server (RFC 3501 Section 7.1)".into(),
-            ));
+            )));
         };
 
         // Apply greeting to protocol state (sets session state, caches
@@ -177,7 +182,12 @@ impl ImapConnection {
             // library bug in the consumer/erased-output machinery.
             let caps = result
                 .downcast::<Vec<Capability>>()
-                .map_err(|_| Error::Internal("CapabilityConsumer output downcast failed".into()))?;
+                .map_err(|_| Error::Internal {
+                    kind: crate::error::InternalFailure::Invariant(
+                        "CapabilityConsumer output downcast failed".into(),
+                    ),
+                    mid_exchange: None,
+                })?;
             proto_state.apply_capability_fetch(*caps);
         }
 
@@ -254,9 +264,9 @@ impl ImapConnection {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Timeout`] if admission or execution exceeds `timeout`.
-    /// Returns [`Error::Io`] if the `setsockopt` call fails.
-    /// Returns [`Error::DriverGone`] if the driver task has exited.
+    /// Returns [`crate::error::TransportFailure::Timeout`] if admission or execution exceeds `timeout`.
+    /// Returns [`crate::error::TransportFailure::Io`] if the `setsockopt` call fails.
+    /// Returns [`crate::error::TransportFailure::DriverGone`] if the driver task has exited.
     pub async fn set_keepalive(
         &self,
         keepalive: TcpKeepalive,
@@ -341,9 +351,9 @@ impl ImapConnection {
                     .map(|s| *s)
                     .or_else(|p| p.downcast::<&'static str>().map(|s| s.to_string()))
                     .unwrap_or_else(|_| "driver panicked (payload not a String)".to_string());
-                Error::DriverPanicked {
-                    message: panic_msg,
-                    attempt: Some(crate::error::ImapAttempt::new(phase)),
+                Error::Internal {
+                    kind: crate::error::InternalFailure::Panicked(panic_msg),
+                    mid_exchange: Some(phase),
                 }
             }
             Ok(()) | Err(_) => Error::driver_gone_at(phase),
@@ -426,7 +436,9 @@ fn ensure_starttls_available(state: &super::state::ProtocolState) -> Result<(), 
 /// a TLS-policy error instead of reporting a stale command-state transition.
 fn ensure_starttls_session(state: &super::state::ProtocolState) -> Result<(), Error> {
     if state.session_state() != super::SessionState::NotAuthenticated {
-        return Err(Error::StartTlsUnavailable);
+        return Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::StartTlsUnavailable,
+        ));
     }
     Ok(())
 }
@@ -440,7 +452,10 @@ pub(super) async fn setup_timeout<T>(
     let deadline = tokio::time::Instant::now() + timeout;
     tokio::time::timeout_at(deadline, exchange)
         .await
-        .map_err(|_| Error::Timeout { attempt: None })?
+        .map_err(|_| Error::Transport {
+            kind: crate::error::TransportFailure::Timeout,
+            attempt: None,
+        })?
 }
 
 #[cfg(test)]
@@ -517,7 +532,13 @@ mod bandwidth_review_tests {
         })
         .await;
         assert!(
-            matches!(result, Err(Error::Timeout { .. })),
+            matches!(
+                result,
+                Err(Error::Transport {
+                    kind: crate::error::TransportFailure::Timeout,
+                    ..
+                })
+            ),
             "phase {phase}: {result:?}"
         );
         assert_eq!(start.elapsed(), timeout, "phase {phase}");
@@ -594,7 +615,13 @@ mod bandwidth_review_tests {
             }
         })
         .await;
-        assert!(matches!(result, Err(Error::Timeout { .. })));
+        assert!(matches!(
+            result,
+            Err(Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
+                ..
+            })
+        ));
         assert_eq!(start.elapsed(), Duration::from_millis(100));
         writer.abort();
     }
@@ -630,7 +657,9 @@ mod starttls_policy_tests {
 
         assert!(matches!(
             ensure_starttls_available(&state),
-            Err(Error::InvalidState(_))
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidState(_)
+            ))
         ));
     }
 
@@ -647,7 +676,9 @@ mod starttls_policy_tests {
 
         assert_eq!(
             ensure_starttls_session(&state),
-            Err(Error::StartTlsUnavailable)
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::StartTlsUnavailable
+            ))
         );
     }
 
@@ -666,7 +697,35 @@ mod starttls_policy_tests {
         state.apply_capability_fetch(Vec::new());
         assert_eq!(
             ensure_starttls_available(&state),
-            Err(Error::StartTlsUnavailable)
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::StartTlsUnavailable
+            ))
         );
     }
+}
+
+/// Build the default native-tls connector.
+pub(super) fn build_default_tls_connector() -> Result<native_tls::TlsConnector, Error> {
+    native_tls::TlsConnector::new().map_err(|e| Error::Transport {
+        kind: crate::error::TransportFailure::Io(crate::error::IoFailure(Arc::new(
+            std::io::Error::other(e),
+        ))),
+        attempt: None,
+    })
+}
+
+pub(super) fn validate_tls_server_name(host: &str) -> Result<(), Error> {
+    if host.is_empty() {
+        return Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput("TLS server name must not be empty".into()),
+        ));
+    }
+    if host.bytes().any(|b| b == 0 || b.is_ascii_whitespace()) {
+        return Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!("invalid TLS server name: {host:?}").into(),
+            ),
+        ));
+    }
+    Ok(())
 }

@@ -161,9 +161,34 @@ Moves have no field and are never reasserted.
 - Graph and DAV collections: `FolderType { folder, ty }`.
 
 `MembershipScope` answers where an object belongs:
-`Folder`, `Mailbox`, `Label`, or `Query`. The two enums must not be
+`Folder`, `Mailbox`, `Label`, `Query`, or `Owner(PrincipalId)`. The two enums must not be
 collapsed. One account-wide cursor can cover many memberships, and one
 object can have several memberships.
+
+`MailboxId` identifies a native mail container. `PrincipalId` identifies its
+owner or send-as route; `Container::owner` and `SendAs` carry `PrincipalId`.
+These identities remain distinct even when their strings match. An enterprise
+Outlook user opening a share expects its owner to stay separate from a personal
+folder with the same server id.
+
+`cursor::ScopeShapes` and `CursorScope::{covers, removal_projection}` own the
+membership topology exhaustively in this crate. `ScopeShapes::scopes_for`
+generates only advertised per-membership shapes that cover the membership.
+`MembershipScope::folder_id` is the explicit native Mailbox-to-Folder bridge;
+`canonical` supplies container index keys; `same_container` supplies the same
+identity comparison for readback and removal
+consumers. Owners never cross that bridge or generate lifecycle folder cursors.
+They are annotations covered generically by account-wide cursors only;
+a narrow owner hint needs provider knowledge and otherwise uses the engine's
+existing unknown-membership fallback. No owner is inferred from an opaque
+folder string. Mailbox memberships admit Email/Mailbox/Thread types; labels
+admit Email/Thread. Folder and query memberships carry no object type,
+so a type-wide cursor conservatively covers them. A type cursor cannot claim
+an owner: JMAP primary Type(Email) and foreign-account folders coexist, and
+linking a foreign owner to the primary cursor would miss its changes.
+Removal projections destroy objects for account/type scopes and remove canonical Folder/Query memberships
+for narrow scopes. Compare a canonical Folder removal with native mailbox
+membership using `same_container`.
 
 `ChangeCursor` combines a scope, protocol-tagged opaque server state,
 an optional progress marker, and an outer envelope version. The outer version
@@ -495,6 +520,7 @@ crates/types/src/
                       convenience defaults
   capabilities.rs     declarative feature and dispatch shapes
   cursor.rs           cursor scope, membership scope, cursor state
+  cursor/topology.rs  coverage, container identity, lifecycle shapes, removals
   events.rs           SyncEvent, Batch, Checkpoint, Control, push hints
   push.rs             lanes, sessions, stop, maintenance gate, pacing and lease
   coverage.rs         inventory coverage domains, reports, obligations
@@ -618,7 +644,40 @@ projects `mayShare`, IMAP projects ACL administration, and EWS EffectiveRights
 leaves it unknown. `PushCapability::Webhook` describes Graph webhooks; EWS
 streaming uses `InProcess`.
 
-## Calendar range guard
+## Calendar times and range guard
+
+`EventTime` is immutable parsed state. `EventTimeKind` distinguishes a civil
+Date, a Floating local date-time, a Zoned local date-time with a retained
+provider timezone, and an Offset instant. `parse(value, timezone)` refuses
+missing or malformed input; `From<Date>`, `From<DateTime>` and `From<Timestamp>`
+also construct valid bounds. `value()` retains the original spelling, including
+offset and fractional precision; `timezone()` retains unknown provider TZIDs.
+`kind()`, `instant()` and `local_datetime()` read the parsed state without
+repeating provider-local shape grammars. A named timezone is an annotation,
+not proof that the local time resolves uniquely in an IANA database.
+
+`from_observed` additionally preserves Unspecified and Invalid observations.
+These let a consumer inspect a tombstone or edit metadata on a damaged meeting
+without fabricating a time. Writers validate touched bounds; an untouched
+malformed bound must not prevent an unrelated scalar patch. Empty-end policy
+remains provider-specific. `validate_end` owns compatible bound shapes and
+ordering: a date-only end is exclusive and must be later than the start; an
+explicit timed instant may have equal bounds. Local times in different named
+zones are not ordered by their wall clocks.
+
+`CalendarEvent::is_all_day()` and `EventCreate::is_all_day()` derive their
+answer from the typed start. Neither payload stores a sibling flag.
+`EventPatch::is_all_day` remains an explicit conversion instruction for stored
+bounds, including a patch that supplies no new times. It is not an alternative
+type tag. `EventTime::converted` produces a date for an all-day conversion and
+midnight in its retained timezone (floating when absent) for a date converted
+to timed. Providers retain their
+conversion limitations, such as Google's requirement for both bounds.
+
+`ReminderTrigger::Relative` carries a parsed `ReminderOffset`; its `span()`
+retains nominal days separately from exact hours. `Absolute` carries a
+`Timestamp`. Invalid provider triggers remain explicit `Unparsed` observations,
+so event detail can report damaged data without inventing or dropping an alarm.
 
 `EventRange::new(calendar_id, start, end)` constructs a first window with no
 page cursor or result limit. It preserves the supplied bounds without validation;
@@ -740,7 +799,9 @@ are selected by lane, including calendar RSVP, never unioned across accounts.
 This protocol-neutral owner lives beside typed routing and discovery fan-in
 because these are account-contract decisions, rather than IMAP wire policy.
 Factory attach failures retain the typed `OpenedAccount::skipped_scopes` lane;
-discovery fan-in retains its existing warning semantics.
+discovery fan-in emits `WarningKind::ScopeSkipped` with the originating
+`AccountError` and its optional scope. The warning is advisory; the merged
+stream still returns primary and healthy delegate items followed by `Done`.
 
 ## Validated windows and account policy values
 

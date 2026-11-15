@@ -25,12 +25,14 @@ pub(in crate::codec::encode) fn encode_set_quota(
         // RFC 2087 Section 4.1: resource name must be an atom
         validate_atom(resource, "SETQUOTA resource name")?;
         if *limit > u64::from(u32::MAX) {
-            return Err(crate::Error::InvalidInput(
-                format!(
-                    "SETQUOTA resource limit {limit} for \"{resource}\" exceeds u32::MAX \
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    format!(
+                        "SETQUOTA resource limit {limit} for \"{resource}\" exceeds u32::MAX \
                  (RFC 2087 Section 4.1: number is constrained to 32 bits per RFC 3501 Section 9)"
-                )
-                .into(),
+                    )
+                    .into(),
+                ),
             ));
         }
     }

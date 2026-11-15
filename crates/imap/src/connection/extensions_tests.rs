@@ -199,44 +199,64 @@ async fn extension_commands_reject_missing_capabilities_without_touching_the_wir
 
     assert!(matches!(
         bare.compress(t).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         bare.namespace(t).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         bare.id(&[("name", Some("bifrost"))], t).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         bare.get_quota("", t).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         bare.set_quota("", &[("STORAGE", 1)], t).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         bare.get_acl("INBOX", t).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         bare.my_rights("INBOX", t).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         bare.get_metadata("INBOX", &["/shared/comment"], None, None, t)
             .await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         bare.notify_none(t).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         bare.enable(&["QRESYNC"], t).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }
 
@@ -252,7 +272,9 @@ async fn enable_is_authenticated_state_only() {
         selected
             .enable(&["QRESYNC"], Duration::from_millis(50))
             .await,
-        Err(Error::InvalidState(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidState(_)
+        ))
     ));
 }
 
@@ -291,7 +313,13 @@ async fn enable_is_refused_after_a_mailbox_was_selected_and_closed() {
         .enable(&["QRESYNC"], Duration::from_secs(5))
         .await
         .expect_err("ENABLE after a selection is illegal");
-    assert!(matches!(err, Error::InvalidState(_)), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::LocalRefusal(crate::error::LocalRefusal::InvalidState(_))
+        ),
+        "got {err:?}"
+    );
 
     let noop = conn.noop(Duration::from_secs(5));
     let script = async {
@@ -316,6 +344,8 @@ async fn compress_is_rejected_before_authentication() {
     );
     assert!(matches!(
         not_auth.compress(Duration::from_millis(50)).await,
-        Err(Error::InvalidState(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidState(_)
+        ))
     ));
 }

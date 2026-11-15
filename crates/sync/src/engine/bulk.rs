@@ -1,6 +1,7 @@
 //! The bulk mutation pipeline and its campaign entry points.
 
 use super::*;
+use crate::engine_errors::mutation_outcome_contract_failure;
 
 impl SyncEngine {
     /// Drive a single-account bulk-flag campaign against an attached
@@ -399,7 +400,7 @@ impl SyncEngine {
                     continue;
                 }
                 let keys = if cohort.phase == CohortPhase::Readback {
-                    crate::recovery::declared_keys(
+                    crate::throttle::declared_keys(
                         account.as_ref().as_ref(),
                         account_id,
                         bifrost_types::ThrottleWork::Objects(&ids),
@@ -414,7 +415,7 @@ impl SyncEngine {
                     cohort.retry_at
                 };
                 if let Some(wait) =
-                    crate::recovery::throttle_wait(&slot.throttles, account_id, &keys)
+                    crate::throttle::throttle_wait(&slot.throttles, account_id, &keys)
                 {
                     ready_at = ready_at.max(now + wait);
                 }
@@ -447,7 +448,7 @@ impl SyncEngine {
                 _ = boundary.changed(), if aborting => { continue; },
                 admitted = gate.admit_keys(crate::scheduler::WorkKind::Mutation, |account| {
                     if cohorts[index].phase == CohortPhase::Readback {
-                        crate::recovery::declared_keys(account, account_id, bifrost_types::ThrottleWork::Objects(&remaining))
+                        crate::throttle::declared_keys(account, account_id, bifrost_types::ThrottleWork::Objects(&remaining))
                     } else {
                         campaign_keys(account, account_id, &remaining, &op)
                     }
@@ -939,9 +940,9 @@ impl SyncEngine {
                                 if wants_dedupe {
                                     dedupe_count = dedupe_count.saturating_add(1);
                                     let warning = bifrost_types::Warning::user_safe(
-                                        bifrost_types::WarningKind::OperatorAttentionNeeded,
+                                        bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::DedupeByClientId),
                                         "reconcile requested dedupe-by-client-id; consumer must dedupe",
-                                    );
+                                    ).with_error(original.clone());
                                     slot.delivery.publish_warning(EventScope::Account, warning);
                                 }
                                 break;
@@ -1102,9 +1103,7 @@ impl BulkTargets {
         for target in targets {
             if let Some(previous) = versions.get(&target.id) {
                 if previous != &target.expected_version {
-                    return Err(Error::Other(
-                        "one mutation target has conflicting caller versions".into(),
-                    ));
+                    return Err(Error::ConflictingCallerVersions(target.id));
                 }
                 continue;
             }
@@ -1247,19 +1246,19 @@ fn campaign_keys(
 ) -> Vec<bifrost_types::ThrottleKey> {
     use bifrost_types::ThrottleWork;
     let mut keys =
-        crate::recovery::declared_keys(account, account_id, ThrottleWork::Objects(targets));
+        crate::throttle::declared_keys(account, account_id, ThrottleWork::Objects(targets));
     if let BulkPipelineOp::Move {
         destination,
         source,
     } = op
     {
-        keys.extend(crate::recovery::declared_keys(
+        keys.extend(crate::throttle::declared_keys(
             account,
             account_id,
             ThrottleWork::Membership(destination),
         ));
         if let Some(source) = source {
-            keys.extend(crate::recovery::declared_keys(
+            keys.extend(crate::throttle::declared_keys(
                 account,
                 account_id,
                 ThrottleWork::Membership(source),
@@ -1475,7 +1474,7 @@ pub(super) fn classify_item_outcome(
     outcomes: &mut HashMap<bifrost_types::ObjectId, MutationBucket>,
     retry_ids: &mut Vec<bifrost_types::ObjectId>,
     dedupe_count: &mut u64,
-    throttles: &crate::recovery::ThrottleBucket,
+    throttles: &crate::throttle::ThrottleBucket,
     account_id: &AccountId,
     // The retry advice of the per-item failures that were QUEUED for
     // resubmission, folded to the longest delay. A stream that ends `Done`
@@ -1583,22 +1582,6 @@ pub(super) fn classify_item_outcome(
             None
         }
     }
-}
-
-/// Invalid answers stop this round; unanswered submitted writes remain uncertain.
-fn mutation_outcome_contract_failure() -> AccountError {
-    let kind = bifrost_types::InternalErrorKind::AccountContract;
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Internal(kind),
-        bifrost_types::Cause::Internal(bifrost_types::InternalCause::new(
-            kind,
-            Some(bifrost_types::DiagnosticText::support_only(
-                "mutation outcomes contain unknown, duplicate or missing targets",
-            )),
-        )),
-    )
-    .try_build()
-    .expect("valid mutation outcome contract failure")
 }
 
 /// Deliver one action's engine directives to the reopen listener. Returns
@@ -1889,7 +1872,7 @@ mod campaign_tests {
                 &mut outcomes,
                 &mut retry,
                 &mut dedupe,
-                &crate::recovery::ThrottleBucket::default(),
+                &crate::throttle::ThrottleBucket::default(),
                 &AccountId("test".into()),
                 &mut advice,
             );
@@ -1913,7 +1896,7 @@ mod campaign_tests {
         let mut outcomes = HashMap::new();
         let mut retries = Vec::new();
         let mut dedupe = 0;
-        let throttles = crate::recovery::ThrottleBucket::new();
+        let throttles = crate::throttle::ThrottleBucket::new();
         let item = ItemOutcome::Succeeded(BatchSuccess::new(
             BatchItemId(id.0.clone()),
             MutationSuccess::Downgraded {
@@ -2075,7 +2058,7 @@ mod partial_commit_throttle_tests {
     use super::*;
     use bifrost_types::{
         AccountErrorBuilder, AccountErrorKind, Application, Cause, CompensationOutcome, ErrorScope,
-        MailboxId, PartialCommitBuilder, PrimaryLeg, RetryHint, ServerCause, ServerErrorKind,
+        PartialCommitBuilder, PrimaryLeg, PrincipalId, RetryHint, ServerCause, ServerErrorKind,
         StepEffect, StepReplay, StepTargets, ThrottleBudget, ThrottleKey, ThrottleScope,
     };
     fn throttle(mailbox: &str, seconds: u64, budget: Option<&str>) -> AccountError {
@@ -2085,8 +2068,8 @@ mod partial_commit_throttle_tests {
                 retry_hint: Some(RetryHint::After(Duration::from_secs(seconds))),
             }),
         )
-        .scope(ErrorScope::Mailbox {
-            id: MailboxId(mailbox.into()),
+        .scope(ErrorScope::Owner {
+            id: PrincipalId(mailbox.into()),
         })
         .throttle_scope(ThrottleScope::Mailbox);
         if let Some(budget) = budget {
@@ -2125,15 +2108,15 @@ mod partial_commit_throttle_tests {
         .try_build()
         .unwrap();
         assert!(error.recovery().is_terminal());
-        let bucket = crate::recovery::ThrottleBucket::default();
+        let bucket = crate::throttle::ThrottleBucket::default();
         let account = AccountId("account".into());
         crate::recovery::observe_failure_throttles(&bucket, &account, &error);
         let now = tokio::time::Instant::now();
         assert_eq!(
             bucket.wait_for(
-                &ThrottleKey::Mailbox {
+                &ThrottleKey::Owner {
                     account: account.clone(),
-                    mailbox: MailboxId("A".into())
+                    owner: PrincipalId("A".into())
                 },
                 now
             ),
@@ -2145,9 +2128,9 @@ mod partial_commit_throttle_tests {
         );
         assert_eq!(
             bucket.wait_for(
-                &ThrottleKey::Mailbox {
+                &ThrottleKey::Owner {
                     account: account.clone(),
-                    mailbox: MailboxId("B".into())
+                    owner: PrincipalId("B".into())
                 },
                 now
             ),

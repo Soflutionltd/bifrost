@@ -439,13 +439,18 @@ fn lookup(params: &[(String, String)], key: &str) -> Option<String> {
 /// A decoded part handle: everything needed to re-issue the FETCH.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecodedPartHandle {
-    pub(crate) folder: MailboxName,
-    pub(crate) uidvalidity: u32,
-    pub(crate) uid: u32,
+    pub(crate) message: super::envelope::MessageRef,
     pub(crate) path: PartPath,
     /// Classification plus the server's original token, both as they were at
     /// mint time.
     pub(crate) encoding: PartEncoding,
+}
+
+impl std::ops::Deref for DecodedPartHandle {
+    type Target = super::envelope::MessageRef;
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
 }
 
 impl DecodedPartHandle {
@@ -458,7 +463,7 @@ impl DecodedPartHandle {
     /// instead of quietly streaming the wrong message's bytes.
     pub(crate) fn verify_uidvalidity(
         &self,
-        live: u32,
+        live: crate::types::UidValidity,
         op: AccountOperation,
     ) -> Result<(), AccountError> {
         if self.uidvalidity == live {
@@ -499,8 +504,8 @@ impl DecodedPartHandle {
 ///   a split-on-separator decode would then read one field as another.
 pub(crate) fn encode_part_handle(
     folder: &MailboxName,
-    uidvalidity: u32,
-    uid: u32,
+    uidvalidity: crate::types::UidValidity,
+    uid: crate::types::Uid,
     path: &PartPath,
     encoding: &PartEncoding,
 ) -> String {
@@ -574,10 +579,15 @@ pub(crate) fn decode_part_handle(
             op,
         ));
     }
+    let uidvalidity =
+        crate::types::UidValidity::new(uidvalidity).expect("part decoder rejects zero epochs");
+    let uid = crate::types::Uid::new(uid).expect("part decoder rejects zero UIDs");
     Ok(DecodedPartHandle {
-        folder,
-        uidvalidity,
-        uid,
+        message: super::envelope::MessageRef {
+            folder,
+            uidvalidity,
+            uid,
+        },
         path,
         encoding: PartEncoding {
             classified,
@@ -657,7 +667,13 @@ mod wire_identity_tests {
             classified: TransferEncoding::Base64,
             token: "base64".into(),
         };
-        let current = encode_part_handle(&folder, 7, 9, &PartPath(vec![1]), &encoding);
+        let current = encode_part_handle(
+            &folder,
+            crate::types::UidValidity::new(7).expect("valid protocol test value"),
+            crate::types::Uid::new(9).expect("valid protocol test value"),
+            &PartPath(vec![1]),
+            &encoding,
+        );
         assert!(current.starts_with("imappart3:"));
         assert_eq!(decode_part_handle(&current, op).unwrap().folder, folder);
     }

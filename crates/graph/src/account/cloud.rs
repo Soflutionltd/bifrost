@@ -17,7 +17,7 @@
 //! touching the wire path.
 //!
 //! Mailbox routing: hosting always uploads into the *primary* user's OneDrive
-//! (`account.client`, the `/me/drive` prefix), even when the draft being
+//! (`account.mailboxes.primary()`, the `/me/drive` prefix), even when the draft being
 //! composed belongs to a shared/delegate mailbox (`send_as`). This is
 //! deliberate - a shared Exchange mailbox has no OneDrive of its own, and the
 //! attachment is shared via a link rather than embedded, so the authenticated
@@ -412,7 +412,7 @@ async fn upload_and_link(
     bytes: Bytes,
     meta: CloudUploadMeta,
 ) -> Result<HostedAttachment, UploadFailure> {
-    let client = &account.client;
+    let client = account.mailboxes.primary();
     let mut facts = UploadFacts::default();
     let session = create_upload_session(client, &meta.file_name)
         .await

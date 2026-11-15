@@ -660,9 +660,11 @@ impl SearchCriteria {
     pub fn uid(mut self, set: &str) -> Result<Self, crate::Error> {
         // RFC 3501 Section 9: validate sequence-set ABNF.
         if !is_valid_sequence_set(set) {
-            return Err(crate::Error::InvalidInput(
-                format!("invalid sequence-set for UID search per RFC 3501 Section 9: {set:?}")
-                    .into(),
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    format!("invalid sequence-set for UID search per RFC 3501 Section 9: {set:?}")
+                        .into(),
+                ),
             ));
         }
         self.sep();
@@ -684,8 +686,10 @@ impl SearchCriteria {
     pub fn sequence(mut self, set: &str) -> Result<Self, crate::Error> {
         // RFC 3501 Section 9: validate sequence-set ABNF.
         if !is_valid_sequence_set(set) {
-            return Err(crate::Error::InvalidInput(
-                format!("invalid sequence-set per RFC 3501 Section 9: {set:?}").into(),
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    format!("invalid sequence-set per RFC 3501 Section 9: {set:?}").into(),
+                ),
             ));
         }
         self.sep();
@@ -712,7 +716,9 @@ impl SearchCriteria {
     /// Requires [`Capability::Condstore`](crate::types::Capability::Condstore).
     pub fn mod_seq(self, value: u64) -> Result<Self, crate::Error> {
         let value = super::ModSeqValzer::new(value).ok_or_else(|| {
-            crate::Error::InvalidInput("SEARCH MODSEQ exceeds the 63-bit protocol ceiling".into())
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
+                "SEARCH MODSEQ exceeds the 63-bit protocol ceiling".into(),
+            ))
         })?;
         Ok(self.push_number("MODSEQ", value.get()))
     }
@@ -816,4 +822,18 @@ impl PartialEq<&str> for SearchCriteria {
     fn eq(&self, other: &&str) -> bool {
         self.buf == *other
     }
+}
+
+/// Result of a SEARCH or UID SEARCH command.
+///
+/// Contains both the matching sequence numbers/UIDs and the optional
+/// highest mod-sequence value (RFC 7162 Section 3.1.5).
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub(crate) struct SearchResult {
+    /// Matching message sequence numbers (SEARCH) or UIDs (UID SEARCH).
+    pub(crate) ids: Vec<u32>,
+    /// Highest mod-sequence of matching messages, if MODSEQ was used
+    /// in the search criteria (RFC 7162 Section 3.1.5).
+    pub(crate) mod_seq: Option<crate::types::ModSeq>,
 }

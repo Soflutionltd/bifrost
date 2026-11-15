@@ -2,8 +2,8 @@ use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountStream, Batch, Change, ChangeCursor, Checkpoint, CursorScope,
-    MailboxId as TypesMailboxId, ObjectChange, ObjectChangeKind, ObjectId, PageBoundary, SyncEvent,
+    AccountStream, Batch, Change, ChangeCursor, Checkpoint, CursorScope, ObjectChange,
+    ObjectChangeKind, ObjectId, PageBoundary, PrincipalId as TypesPrincipalId, SyncEvent,
 };
 
 use crate::core::changes::{ChangesMethod, ChangesObject, ChangesResponse};
@@ -13,20 +13,23 @@ use crate::mailbox::{Mailbox, MailboxChanges};
 
 use super::capabilities::CoreLimits;
 use super::state::{self, JmapScopeRepr};
-use super::state_cache::{self, StateMap};
+use super::state_cache::StateCache;
+#[cfg(test)]
+use super::state_cache::StateMap;
 use super::state_walk::ChangesWalk;
 
-type MailAccount<T> = crate::account::Account<T>;
+type MailAccount<T> = super::registry::Slot<T>;
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream<T: HttpTransport>(
     mail: MailAccount<T>,
-    account_id: String,
-    limits: CoreLimits,
     cursor: ChangeCursor,
-    owner: Option<TypesMailboxId>,
-    email_states: StateMap,
 ) -> AccountStream<SyncEvent<Change>> {
+    let limits = mail.limits;
+    let owner = mail
+        .owner()
+        .shared()
+        .map(|id| TypesPrincipalId(id.to_owned()));
+    let email_states = mail.email_states.clone();
     let decoded = state::decode_cursor(&cursor);
     let (scope, state_string) = match decoded {
         Ok(decoded) => decoded,
@@ -43,7 +46,6 @@ pub(crate) fn stream<T: HttpTransport>(
     match scope {
         JmapScopeRepr::Email => changes_walk::<T, EmailChanges, Email>(
             mail,
-            account_id,
             limits,
             cursor.scope.clone(),
             state_string.into(),
@@ -52,7 +54,6 @@ pub(crate) fn stream<T: HttpTransport>(
         ),
         JmapScopeRepr::Mailbox => changes_walk::<T, MailboxChanges, Mailbox>(
             mail,
-            account_id,
             limits,
             cursor.scope.clone(),
             state_string.into(),
@@ -82,7 +83,6 @@ pub(crate) fn stream<T: HttpTransport>(
         // discovered anymore.
         JmapScopeRepr::Folder { .. } => changes_walk::<T, EmailChanges, Email>(
             mail,
-            account_id,
             limits,
             cursor.scope.clone(),
             state_string.into(),
@@ -119,12 +119,11 @@ pub(crate) fn stream<T: HttpTransport>(
 /// anchor. The callers retain their distinct event and coverage behavior.
 fn changes_walk<T, M, O>(
     mail: MailAccount<T>,
-    account_id: String,
     limits: CoreLimits,
     scope: CursorScope,
     mut since_state: crate::core::id::ObjectState<O>,
-    owner: Option<TypesMailboxId>,
-    states: Option<StateMap<O>>,
+    owner: Option<TypesPrincipalId>,
+    states: Option<StateCache<O>>,
 ) -> AccountStream<SyncEvent<Change>>
 where
     T: HttpTransport,
@@ -134,7 +133,12 @@ where
     // `Sync` is not implied by `JmapMethod`: `Request::send_single` holds
     // a `&CallHandle<M>` across its await, so the call future is only
     // `Send` when `M` is `Sync`. Every generated `*/changes` struct is.
-    M: ChangesMethod<Object = O, Response = ChangesResponse<O>> + Sync + 'static,
+    M: ChangesMethod<
+            Object = O,
+            Response = ChangesResponse<O>,
+            Cap = crate::core::capability::Mail,
+        > + Sync
+        + 'static,
 {
     Box::pin(async_stream::stream! {
         // One accumulator for the whole paged walk; each emitted page
@@ -196,7 +200,7 @@ where
             // page. A stale cached state only causes a server-side
             // `stateMismatch` and refresh, never a skipped change page.
             if let Some(states) = &states {
-                state_cache::observe_changes(states, &account_id, &since_state, new_state.clone()).await;
+                states.observe_changes(&since_state, new_state.clone()).await;
             }
 
             yield SyncEvent::Batch(Batch {
@@ -543,7 +547,7 @@ mod tests {
     }
 
     fn empty_states() -> StateMap {
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+        crate::sync::state_cache::seeded(std::collections::HashMap::new())
     }
 
     /// Drive `stream` to exhaustion against a recording transport and
@@ -551,7 +555,7 @@ mod tests {
     async fn drive(
         account_id: &str,
         cursor: ChangeCursor,
-        owner: Option<TypesMailboxId>,
+        owner: Option<TypesPrincipalId>,
     ) -> (Vec<SyncEvent<Change>>, RequestLog) {
         let log = RequestLog::new();
         let client = crate::client::Client::with_transport(
@@ -564,14 +568,18 @@ mod tests {
             "https://example.test/.well-known/jmap",
         )
         .expect("client builds");
-        let mail = crate::account::Account::new(client, account_id);
+        let mail = crate::sync::registry::Slot::new(client, account_id);
+        assert_eq!(
+            mail.owner().shared(),
+            owner.as_ref().map(|id| id.0.as_str())
+        );
         let events = stream(
-            mail,
-            account_id.to_string(),
-            limits(),
+            {
+                let mut slot = crate::sync::registry::Slot::from_test(mail, empty_states());
+                slot.limits = limits();
+                slot
+            },
             cursor,
-            owner,
-            empty_states(),
         )
         .collect::<Vec<_>>()
         .await;
@@ -603,13 +611,13 @@ mod tests {
                 "shared",
                 CursorScope::Folder(super::super::foreign::encode_foreign_account("shared")),
                 "Email/changes",
-                Some(TypesMailboxId("shared".to_string())),
+                Some(TypesPrincipalId("shared".to_string())),
             ),
             (
                 "shared",
                 CursorScope::Folder(super::super::foreign::encode_foreign("shared", "mbx-1")),
                 "Email/changes",
-                Some(TypesMailboxId("shared".to_string())),
+                Some(TypesPrincipalId("shared".to_string())),
             ),
         ] {
             let cursor = state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
@@ -662,15 +670,15 @@ mod tests {
                 "https://example.test/.well-known/jmap",
             )
             .expect("client builds");
-            let mail = crate::account::Account::new(client, "primary");
+            let mail = crate::sync::registry::Slot::new(client, "primary");
             let cursor = state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
             let events = stream(
-                mail,
-                "primary".to_string(),
-                limits(),
+                {
+                    let mut slot = crate::sync::registry::Slot::from_test(mail, empty_states());
+                    slot.limits = limits();
+                    slot
+                },
                 cursor,
-                None,
-                empty_states(),
             )
             .collect::<Vec<_>>()
             .await;
@@ -717,15 +725,15 @@ mod tests {
                 "https://example.test/.well-known/jmap",
             )
             .expect("client builds");
-            let mail = crate::account::Account::new(client, "primary");
+            let mail = crate::sync::registry::Slot::new(client, "primary");
             let cursor = state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
             let events = stream(
-                mail,
-                "primary".to_string(),
-                limits(),
+                {
+                    let mut slot = crate::sync::registry::Slot::from_test(mail, empty_states());
+                    slot.limits = limits();
+                    slot
+                },
                 cursor,
-                None,
-                empty_states(),
             )
             .collect::<Vec<_>>()
             .await;

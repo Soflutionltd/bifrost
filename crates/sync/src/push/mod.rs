@@ -20,8 +20,10 @@ pub mod subscription;
 pub(crate) mod supervisor;
 
 use crate::cancel::{BoundaryRequest, BoundaryView};
-use crate::multiplexer::{ChangeDelivery, EventScope, MultiplexerEvent, ReopenRequest};
-use crate::recovery::{RecoveryPlan, ThrottleBucket};
+use crate::delivery::{ChangeDelivery, EventScope, MultiplexerEvent};
+use crate::engine::supervisor::ReopenRequest;
+use crate::recovery::RecoveryPlan;
+use crate::throttle::ThrottleBucket;
 use bifrost_types::{
     AccountId, InvalidationSink, SinkPush, SyncEvent, Warning, WarningKind, WatchEvent,
 };
@@ -110,6 +112,15 @@ impl InvalidationSink for InvalidationSinkInner {
 pub(crate) fn broadcast(target: &SinkTarget, event: SyncEvent<bifrost_types::Change>) {
     // Push status is advisory; no cursor or acknowledgement depends on delivery.
     // Callers supply status events, never checkpoint-bearing data.
+    let event = match event {
+        SyncEvent::Warning(warning) => {
+            target
+                .delivery
+                .publish_warning(EventScope::Account, warning);
+            return;
+        }
+        event => event,
+    };
     let _ = target.delivery.publish_unacked(MultiplexerEvent::unacked(
         EventScope::Account,
         Arc::new(event),
@@ -134,7 +145,7 @@ pub(crate) fn route_watch_event(
         WatchEvent::Disconnected => broadcast(
             target,
             SyncEvent::Warning(Warning::user_safe(
-                WarningKind::Other,
+                WarningKind::Engine(bifrost_types::EngineNotice::PushDisconnected { lane: None }),
                 "push transport disconnected",
             )),
         ),
@@ -172,10 +183,13 @@ pub(crate) fn route_watch_event(
                 // engine has no transport handle it could reopen here.
                 broadcast(
                     target,
-                    SyncEvent::Warning(Warning::user_safe(
-                        WarningKind::Other,
-                        "push stream terminated with retryable recovery",
-                    )),
+                    SyncEvent::Warning(
+                        Warning::user_safe(
+                            WarningKind::Engine(bifrost_types::EngineNotice::PushRetrying),
+                            "push stream terminated with retryable recovery",
+                        )
+                        .with_error(error),
+                    ),
                 );
             }
             RecoveryPlan::Terminal(fatal) => {
@@ -379,7 +393,7 @@ mod tests {
             SinkPush::Accepted
         ));
         assert_eq!(
-            crate::recovery::account_throttle_wait(&target.throttles, &account),
+            crate::throttle::account_throttle_wait(&target.throttles, &account),
             Some(std::time::Duration::from_secs(20))
         );
         assert!(matches!(

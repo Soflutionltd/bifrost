@@ -70,6 +70,10 @@
 //! entry counters must match the lineage row, and inert barrier counters are
 //! discarded. Waiver identities and signed Unix seconds keep their wire form.
 //!
+//! Version 13 adds the Owner error scope (tag 15), carrying PrincipalId.
+//! Older rows retain their native Mailbox scope spelling; ambiguous historical
+//! ids are never guessed into principals.
+//!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
 //! checkpoint codec owns that layout and its migration chain, and a second
@@ -109,8 +113,8 @@ use bifrost_types::{ObligationKey, wire::Reader};
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
-// Version 12 removes the mirrored policy attempt counter.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 12;
+// Version 13 adds the principal error scope.
+pub const LEDGER_ENVELOPE_VERSION: u32 = 13;
 const _: () = assert!(LEDGER_ENVELOPE_VERSION >= bifrost_types::wire::ledger::VOCABULARY_VERSION);
 
 /// Lowest ledger envelope version still readable by this engine.
@@ -890,6 +894,84 @@ mod tests {
             let restored = decode_ledger(&bytes).expect("inert barrier count migrates");
             assert_eq!(encode_ledger(&restored), encode_ledger(&ledger));
         }
+    }
+
+    /// A whole version-12 row - open split lineage, barrier and budget table -
+    /// is the last pre-Owner layout a consumer can hold on disk. It must read
+    /// back to the same ledger, and an Owner scope (tag 15) inside it is a
+    /// version-13 tag that row could never have carried.
+    #[test]
+    fn a_whole_version_twelve_ledger_decodes() {
+        let mut ledger = DebtLedger::new();
+        ledger.ingest(
+            &bifrost_types::InventoryCoverageReport::degraded(
+                bifrost_types::CoverageDomain::full(CursorScope::Account),
+                vec![replayable("root")],
+            ),
+            crate::cursor::WalkGeneration::for_test(1),
+            100,
+        );
+        let root = bifrost_types::ObligationKey(b"root".to_vec());
+        ledger
+            .replace_obligation(
+                &root,
+                &[],
+                &[replayable("a"), replayable("b")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
+            .expect("replacement accepted");
+        ledger.record_attempt(&bifrost_types::ObligationKey(b"a".to_vec()), 3);
+        let obligation = replayable("barrier");
+        ledger.record_barrier(super::BarrierIncident {
+            key: obligation.key().clone(),
+            domain: bifrost_types::CoverageDomain::full(CursorScope::Account),
+            generation: crate::cursor::WalkGeneration::for_test(1),
+            failure_label: "unknown extent".into(),
+            evidence: obligation.error().into(),
+            policy: super::BarrierPolicy::Undecided,
+            resume_from: None,
+        });
+        let current = encode_ledger(&ledger);
+        let mut v12 = current.clone();
+        v12[4..8].copy_from_slice(&12u32.to_le_bytes());
+        let restored = decode_ledger(&v12).expect("version 12 ledger decodes");
+        assert_eq!(restored.entries().count(), ledger.entries().count());
+        assert_eq!(restored.barriers().count(), 1);
+        assert_eq!(restored.lineages(), ledger.lineages());
+        assert_eq!(encode_ledger(&restored), current);
+
+        let mut owned = DebtLedger::new();
+        let owner_obligation = bifrost_types::InventoryObligation::Region {
+            key: bifrost_types::ObligationKey(b"owner".to_vec()),
+            failure_label: "truncated".into(),
+            error: bifrost_types::AccountErrorBuilder::new(
+                AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+                bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
+                    detail: bifrost_types::DiagnosticText::support_only("unrepresentable"),
+                }),
+            )
+            .scope(bifrost_types::ErrorScope::Owner {
+                id: bifrost_types::PrincipalId("shared".into()),
+            })
+            .try_build()
+            .expect("valid account error classification"),
+            recovery: bifrost_types::RegionRecovery::DurableReplay {
+                token: b"tok".to_vec(),
+            },
+        };
+        owned.ingest(
+            &bifrost_types::InventoryCoverageReport::degraded(
+                bifrost_types::CoverageDomain::full(CursorScope::Account),
+                vec![owner_obligation],
+            ),
+            crate::cursor::WalkGeneration::for_test(1),
+            100,
+        );
+        let mut owned_v12 = encode_ledger(&owned);
+        decode_ledger(&owned_v12).expect("current version reads the Owner scope");
+        owned_v12[4..8].copy_from_slice(&12u32.to_le_bytes());
+        assert!(decode_ledger(&owned_v12).is_err());
     }
 
     /// Decode validates rather than heals: an open member whose budget row

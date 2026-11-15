@@ -192,7 +192,7 @@ impl InventoryFusion {
                     // contradicts the coverage beside it is an account breaking
                     // its stream contract, terminated as a classified violation.
                     if let Err(violation) = completion.validate() {
-                        let error = crate::recovery::batch_boundary_violation(
+                        let error = crate::engine_errors::batch_boundary_violation(
                             violation,
                             completion.checkpoint.offered(),
                             bifrost_types::AccountOperation::SyncInventory,
@@ -204,7 +204,7 @@ impl InventoryFusion {
                     }
                     let crossed = if completion.coverage.has_barrier() {
                         crate::inventory_walk::cross_waived_barriers(
-                            Some(&self.publisher.writer_tx),
+                            Some(&self.publisher.writer),
                             &completion.coverage,
                             self.generation,
                         )
@@ -279,7 +279,7 @@ impl InventoryFusion {
                     // a consumer the walk stopped. Terminate the walk with a
                     // classified provider-contract violation instead.
                     if let Err(violation) = batch.validate_boundary() {
-                        let error = crate::recovery::batch_boundary_violation(
+                        let error = crate::engine_errors::batch_boundary_violation(
                             violation,
                             batch.checkpoint.offered(),
                             bifrost_types::AccountOperation::SyncInventory,
@@ -299,7 +299,7 @@ impl InventoryFusion {
                     // certifies a prefix that ends before this region begins.
                     let crossed = if batch.coverage.has_barrier() {
                         crate::inventory_walk::cross_waived_barriers(
-                            Some(&self.publisher.writer_tx),
+                            Some(&self.publisher.writer),
                             &batch.coverage,
                             self.generation,
                         )
@@ -366,7 +366,7 @@ impl InventoryFusion {
         delivery.publish_warning(
             EventScope::Cursor(scope.clone()),
             bifrost_types::Warning::user_safe(
-                bifrost_types::WarningKind::Other,
+                bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::WalkSuperseded),
                 "inventory walk superseded by a reset or deletion of its scope",
             ),
         );
@@ -385,7 +385,7 @@ impl InventoryFusion {
         claim: crate::cursor::CoverageClaim,
     ) -> Result<FusionOutcome, Error> {
         if let Err(error) =
-            crate::inventory_walk::record_refused_debt(Some(&self.publisher.writer_tx), claim).await
+            crate::inventory_walk::record_refused_debt(Some(&self.publisher.writer), claim).await
         {
             tracing::warn!(%error, "could not record refused inventory debt");
         }
@@ -414,7 +414,7 @@ impl InventoryFusion {
         resume_from: Option<Checkpoint>,
     ) -> Result<(), Error> {
         let result = crate::inventory_walk::record_barriers(
-            Some(&self.publisher.writer_tx),
+            Some(&self.publisher.writer),
             coverage,
             self.generation,
             resume_from,
@@ -452,7 +452,13 @@ impl InventoryFusion {
             .filter(|obligation| obligation.is_barrier())
             .count();
         let warning = bifrost_types::Warning::user_safe(
-            bifrost_types::WarningKind::OperatorAttentionNeeded,
+            bifrost_types::WarningKind::Engine(if barriers > 0 {
+                bifrost_types::EngineNotice::BarrierStop { regions: barriers }
+            } else {
+                bifrost_types::EngineNotice::DegradedCoverage {
+                    obligations: obligations.len(),
+                }
+            }),
             if barriers > 0 {
                 format!(
                     "inventory stopped at {barriers} region(s) it cannot represent and cannot \
@@ -553,10 +559,10 @@ impl InventoryFusion {
             return Ok(FusionOutcome::NoCursor);
         };
         if cursor.scope != expected_scope {
-            return Err(Error::Other(format!(
-                "inventory Done returned cursor for the wrong scope: expected {:?}, got {:?}",
-                expected_scope, cursor.scope,
-            )));
+            return Err(Error::InventoryScopeMismatch {
+                expected: expected_scope,
+                actual: cursor.scope,
+            });
         }
         if !self.cursors.put_if(cursor, || {
             self.publisher.coverage.scope_fence(&expected_scope) == self.expected_fence
@@ -587,27 +593,20 @@ impl InventoryFusion {
 fn validate_checkpoint_envelope(checkpoint: Option<&Checkpoint>) -> Result<(), Error> {
     match checkpoint {
         Some(Checkpoint::Change(cursor)) => cursor.validate_envelope().map_err(|_| {
-            Error::Account(crate::recovery::fresh_cursor_contract_error(
+            Error::Account(crate::engine_errors::fresh_cursor_contract_error(
                 checkpoint,
                 bifrost_types::AccountOperation::SyncInventory,
                 &cursor.scope,
             ))
         }),
-        Some(Checkpoint::Backfill(_)) => Err(Error::Other(
-            "inventory fusion batch carried a backfill checkpoint; the fusion path publishes \
-             without a delivery stamp, so such a publication is charged against the backfill \
-             bound and never swept"
-                .into(),
-        )),
+        Some(Checkpoint::Backfill(_)) => Err(Error::InventoryCheckpointUnsupported),
         None => Ok(()),
-        Some(_) => Err(Error::Other(
-            "inventory fusion carried an unsupported checkpoint variant".into(),
-        )),
+        Some(_) => Err(Error::InventoryCheckpointUnsupported),
     }
 }
 
 fn inventory_cursor_contract_error(scope: CursorScope) -> bifrost_types::AccountError {
-    crate::recovery::inventory_resume_contract_failure(scope)
+    crate::engine_errors::inventory_resume_contract_failure(scope)
 }
 
 fn forward_resume_contract_failure(
@@ -676,7 +675,7 @@ mod tests {
                 publisher: super::super::PagePublisher::new(
                     Arc::clone(&delivery),
                     control,
-                    writer_tx,
+                    crate::engine::writer::WriterHandle::new(writer_tx),
                     tokio_util::sync::CancellationToken::new(),
                 ),
                 generation: crate::cursor::WalkGeneration::for_test(1),
@@ -782,11 +781,11 @@ mod tests {
     async fn a_fusion_page_under_a_moved_fence_is_refused_and_its_debt_recorded() {
         let (mut fusion, _delivery, mut rx, _views) = guarded_fusion();
         let (tx, mut requests) = tokio::sync::mpsc::channel(4);
-        fusion.publisher.writer_tx = tx;
+        fusion.publisher.writer = crate::engine::writer::WriterHandle::new(tx);
         let writer = tokio::spawn(async move {
             let mut count = 0;
             while let Some(request) = requests.recv().await {
-                let crate::multiplexer::WriterRequest::RecordDebt { report, done, .. } = request
+                let crate::engine::writer::WriterRequest::RecordDebt { report, done, .. } = request
                 else {
                     panic!("debt request")
                 };
@@ -900,11 +899,11 @@ mod tests {
     async fn a_fusion_with_a_stub_writer_refuses_a_stale_checkpoint_page() {
         let (mut fusion, _delivery, mut rx, _views) = guarded_fusion();
         let (tx, mut requests) = tokio::sync::mpsc::channel(4);
-        fusion.publisher.writer_tx = tx;
+        fusion.publisher.writer = crate::engine::writer::WriterHandle::new(tx);
         let writer = tokio::spawn(async move {
             let mut count = 0;
             while let Some(request) = requests.recv().await {
-                let crate::multiplexer::WriterRequest::RecordDebt { report, done, .. } = request
+                let crate::engine::writer::WriterRequest::RecordDebt { report, done, .. } = request
                 else {
                     panic!("debt request")
                 };
@@ -1107,10 +1106,10 @@ mod tests {
     }
 
     fn fusion_with_writer(
-        writer_tx: tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>,
+        writer_tx: tokio::sync::mpsc::Sender<crate::engine::writer::WriterRequest>,
     ) -> InventoryFusion {
         let (mut fusion, _delivery, _receiver, _views) = guarded_fusion();
-        fusion.publisher.writer_tx = writer_tx;
+        fusion.publisher.writer = crate::engine::writer::WriterHandle::new(writer_tx);
         fusion
     }
 
@@ -1249,7 +1248,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let writer = tokio::spawn(async move {
             while let Some(request) = rx.recv().await {
-                if let crate::multiplexer::WriterRequest::RecordBarrier { done, .. } = request {
+                if let crate::engine::writer::WriterRequest::RecordBarrier { done, .. } = request {
                     let _ = done.send(Err(Error::Other("store write failed".into())));
                 }
             }

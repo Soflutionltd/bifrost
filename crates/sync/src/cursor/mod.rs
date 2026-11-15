@@ -91,46 +91,7 @@ struct RegistryState {
     reach: ScopeShapes,
 }
 
-/// The cursor-scope shapes an account model uses, independent of which
-/// concrete scopes currently hold a cursor.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct ScopeShapes {
-    /// A `CursorScope::Folder` was seen.
-    pub(crate) folder: bool,
-    /// Every object type a `CursorScope::FolderType` was seen with.
-    pub(crate) folder_types: Vec<bifrost_types::ObjectType>,
-    /// A `CursorScope::Query` was seen.
-    pub(crate) query: bool,
-    /// An account-wide or type-wide scope was seen.
-    pub(crate) wide: bool,
-}
-
-impl ScopeShapes {
-    fn record(&mut self, scope: &CursorScope) {
-        match scope {
-            CursorScope::Folder(_) => self.folder = true,
-            CursorScope::FolderType { ty, .. } => {
-                if !self.folder_types.contains(ty) {
-                    self.folder_types.push(*ty);
-                }
-            }
-            CursorScope::Query(_) => self.query = true,
-            CursorScope::Account | CursorScope::Type(_) => self.wide = true,
-            _ => {}
-        }
-    }
-
-    fn merge(&mut self, other: &Self) {
-        self.folder |= other.folder;
-        self.query |= other.query;
-        self.wide |= other.wide;
-        for ty in &other.folder_types {
-            if !self.folder_types.contains(ty) {
-                self.folder_types.push(*ty);
-            }
-        }
-    }
-}
+pub(crate) use bifrost_types::ScopeShapes;
 
 /// Topology replacement order, minted by the cursor registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -409,7 +370,10 @@ impl CursorRegistry {
     /// as filter).
     pub fn link_membership(&self, membership: MembershipScope, scope: CursorScope) {
         let mut guard = self.state.write().expect("poisoned");
-        let entry = guard.membership_index.entry(membership).or_default();
+        let entry = guard
+            .membership_index
+            .entry(membership.canonical())
+            .or_default();
         if !entry.contains(&scope) {
             entry.push(scope);
         }
@@ -421,7 +385,7 @@ impl CursorRegistry {
         let guard = self.state.read().expect("poisoned");
         guard
             .membership_index
-            .get(membership)
+            .get(&membership.canonical())
             .cloned()
             .unwrap_or_default()
     }
@@ -1054,3 +1018,6 @@ mod tests {
         drop(held);
     }
 }
+
+/// Membership projection through the registry cursor model.
+pub mod membership;

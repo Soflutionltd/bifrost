@@ -439,6 +439,11 @@ pub(crate) enum Error {
         /// `urn:ietf:params:jmap:websocket`).
         capability: &'static str,
     },
+    /// This account does not advertise the requested capability.
+    AccountCapability {
+        account_id: core::id::AccountId,
+        capability: &'static str,
+    },
     /// The session lists no primary account for the requested capability.
     NoPrimaryAccount {
         /// The capability URI that was looked up (e.g.
@@ -615,6 +620,13 @@ impl Display for Error {
             Error::MalformedCapability { capability } => write!(
                 f,
                 "Session advertises capability {capability} with an unparseable object"
+            ),
+            Error::AccountCapability {
+                account_id,
+                capability,
+            } => write!(
+                f,
+                "Account {account_id} does not serve capability {capability}"
             ),
             Error::NoPrimaryAccount { capability } => write!(
                 f,

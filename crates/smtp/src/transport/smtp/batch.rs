@@ -191,17 +191,6 @@ impl SendProgress {
         }
     }
 
-    /// Mark all `Accepted` recipients as `Rejected` with the given DATA-level
-    /// response. Used when the DATA command reply is negative before the body
-    /// was started.
-    pub(crate) fn mark_accepted_rejected_with_response(&mut self, response: Response) {
-        for rec in &mut self.recipients {
-            if matches!(rec.rcpt, RcptProgress::Accepted) {
-                rec.rcpt = RcptProgress::Rejected(response.clone());
-            }
-        }
-    }
-
     pub(crate) fn set_data_issued(&mut self) {
         self.phase = SendPhase::DataIssued;
     }
@@ -908,43 +897,6 @@ mod tests {
         // No record_lmtp_final, no mark_uncertain_unresolved: bug path.
         let outcome = progress.resolve();
         assert_eq!(outcome.uncertain().len(), 1);
-    }
-
-    #[test]
-    fn lmtp_data_command_negative_reply_marks_recipients_failed() {
-        // smtp-D1 / P0 regression: LMTP DATA-command negative reply after
-        // RCPT acceptances must produce per-recipient `Failed` lanes and a
-        // succeeded outcome at the batch boundary, NEVER a batch-level
-        // `Err`. The previous shape returned `Err((Network+Unsent,
-        // progress))` after RCPT acceptances; the engine then classified
-        // `Send` as `Retry::SameRequest` and resent the entire non-
-        // idempotent message to every recipient after the server already
-        // rejected it.
-        let mut progress = SendProgress::new(
-            Dialect::Lmtp,
-            vec![recip("a", "a@x.com"), recip("b", "b@x.com")],
-        );
-        progress.record_rcpt_accepted(0);
-        progress.record_rcpt_accepted(1);
-        // Now the LMTP DATA command returns a negative reply; this is the
-        // shape `mark_accepted_rejected_with_response` produces. No body
-        // was sent; no LMTP final-status drain ran.
-        progress.mark_accepted_rejected_with_response(negative_data_final());
-
-        let outcome = progress.resolve();
-        assert_eq!(outcome.succeeded().len(), 0);
-        assert_eq!(outcome.uncertain().len(), 0);
-        assert_eq!(outcome.failed().len(), 2);
-        // The recovery class must be terminal-or-retry, never Reconcile
-        // (Reconcile would indicate non-idempotent uncertain). Since the
-        // server explicitly rejected, recovery must be acknowledged.
-        for failed in outcome.failed() {
-            let recovery = failed.error.recovery();
-            assert!(
-                !recovery.requires_reconciliation(),
-                "LMTP DATA-command negative reply must not produce a Reconcile lane: {recovery:?}"
-            );
-        }
     }
 
     #[test]

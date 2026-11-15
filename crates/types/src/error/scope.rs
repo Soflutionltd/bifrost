@@ -3,7 +3,7 @@ use serde::Serialize;
 use crate::calendar::{CalendarId, EventId};
 use crate::contact::ContactId;
 use crate::cursor::{CursorScope, ObjectType};
-use crate::ids::{MailboxId, ObjectId, ThreadId};
+use crate::ids::{MailboxId, ObjectId, PrincipalId, ThreadId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -21,6 +21,11 @@ pub enum ErrorScope {
         prefix: String,
     },
     Cursor(CursorScope),
+    /// A principal whose shared account surface failed.
+    Owner {
+        id: PrincipalId,
+    },
+    /// A native mail container, distinct from its owning principal.
     Mailbox {
         id: MailboxId,
     },
@@ -64,7 +69,8 @@ impl ErrorScope {
             Self::Calendar { .. } | Self::CalendarCollection => Some(ResourceKind::Calendar),
             Self::Event { .. } => Some(ResourceKind::Event),
             Self::Contact { .. } | Self::ContactCollection => Some(ResourceKind::Contact),
-            Self::Submission { .. }
+            Self::Owner { .. }
+            | Self::Submission { .. }
             | Self::CloudFile { .. }
             | Self::UploadSession
             | Self::Account
@@ -83,6 +89,7 @@ impl ErrorScope {
             Self::Submission { id } => Some(&id.0),
             Self::CloudFile { id } => Some(id),
             Self::Mailbox { id } => Some(&id.0),
+            Self::Owner { id } => Some(&id.0),
             Self::Message { id } => Some(&id.0),
             Self::Thread { id } => Some(&id.0),
             Self::Calendar { id } => Some(&id.0),
@@ -145,6 +152,7 @@ fn scope_fields(scope: &ErrorScope) -> ScopeFields<'_> {
         ErrorScope::Account => fields.push("kind", "account"),
         ErrorScope::Namespace { prefix } => fields.push("kind", "namespace").push("prefix", prefix),
         ErrorScope::Cursor(cursor) => cursor_scope_fields(fields.push("kind", "cursor"), cursor),
+        ErrorScope::Owner { id } => fields.push("kind", "owner").push("id", &id.0),
         ErrorScope::Mailbox { id } => fields.push("kind", "mailbox").push("id", &id.0),
         ErrorScope::Message { id } => fields.push("kind", "message").push("id", &id.0),
         ErrorScope::Thread { id } => fields.push("kind", "thread").push("id", &id.0),

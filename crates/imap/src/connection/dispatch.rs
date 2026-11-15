@@ -27,10 +27,7 @@ mod search;
 mod select;
 mod thread_sort;
 
-pub(crate) use auth::{
-    AuthenticateCramMd5Consumer, AuthenticatePlainConsumer, AuthenticateScramConsumer,
-    AuthenticateXoauth2Consumer, LoginConsumer,
-};
+pub(crate) use auth::{AuthenticateSaslConsumer, AuthenticateScramConsumer, LoginConsumer};
 #[cfg(test)]
 pub(crate) use fetch::StreamingFetchConsumer;
 pub(crate) use fetch::{
@@ -149,8 +146,8 @@ pub(crate) struct Finalized<T> {
     /// something buried in the erased `Box<dyn Any>`, because the driver reads
     /// it: `is_connection_fatal` decides whether to close the command receiver
     /// and move protocol state BEFORE the result is published. A consumer
-    /// failure can be connection-fatal (`Error::Protocol`: SCRAM completing
-    /// before the server-final verification) or not (`Error::ProtocolMissing`:
+    /// failure can be connection-fatal (`crate::error::ProviderFailure::Protocol`: SCRAM completing
+    /// before the server-final verification) or not (`crate::error::ProviderFailure::Missing`:
     /// CAPABILITY with no capability data, STATUS with no matching response,
     /// which the tagged completion leaves with the framing intact), and hiding
     /// either inside `Any` would take that decision away from the driver.
@@ -341,11 +338,11 @@ impl Consumer for CapabilityConsumer {
             // `is_connection_fatal` before publishing the result. An omission
             // after the tagged OK is not fatal: the connection stays usable.
             return Finalized::failure(
-                Error::ProtocolMissing(
+                Error::Provider(crate::error::ProviderFailure::Missing(
                     "CAPABILITY OK but no capability data in response \
                      (RFC 3501 Section 6.1.1)"
                         .into(),
-                ),
+                )),
                 self.buffered,
             );
         };
@@ -403,11 +400,11 @@ impl Consumer for LogoutConsumer {
         }
         if !self.saw_bye {
             return Finalized::failure(
-                Error::ProtocolMissing(
+                Error::Provider(crate::error::ProviderFailure::Missing(
                     "LOGOUT: server did not send mandatory BYE \
                      (RFC 3501 Section 6.1.3)"
                         .into(),
-                ),
+                )),
                 self.buffered,
             );
         }
@@ -500,7 +497,7 @@ fn resolve_appenduid(
     }
 }
 
-/// The `(uid_validity, uid)` pairs an APPENDUID code assigns to the
+/// The `crate::types::AppendUid { validity: uid_validity, uid: crate::types::Uid::new(uid).expect("UID range is nonzero") }` pairs an APPENDUID code assigns to the
 /// `submitted` messages of a MULTIAPPEND, or `None` when it is not an
 /// APPENDUID or its uid-set does not name exactly `submitted` UIDs.
 ///
@@ -515,13 +512,17 @@ fn resolve_appenduid(
 /// an error on a non-idempotent APPEND invites a retry that duplicates them -
 /// but the code cannot say which UID went to which message, so it is
 /// discarded, exactly as if the server had no UIDPLUS.
-fn appenduid_pairs(code: Option<ResponseCode>, submitted: usize) -> Option<Vec<(u32, u32)>> {
+fn appenduid_pairs(
+    code: Option<ResponseCode>,
+    submitted: usize,
+) -> Option<Vec<crate::types::AppendUid>> {
     let Some(ResponseCode::AppendUid { uid_validity, uids }) = code else {
         return None;
     };
-    let bounds = |range: &crate::types::response::UidRange| match range.end {
-        Some(end) => (range.start.min(end), range.start.max(end)),
-        None => (range.start, range.start),
+    let uid_validity = crate::types::UidValidity::new(uid_validity)?;
+    let bounds = |range: &crate::types::response::UidRange| match range.end() {
+        Some(end) => (range.start(), end),
+        None => (range.start(), range.start()),
     };
     let named = uids.iter().fold(0u64, |total, range| {
         let (low, high) = bounds(range);
@@ -539,7 +540,10 @@ fn appenduid_pairs(code: Option<ResponseCode>, submitted: usize) -> Option<Vec<(
     let mut pairs = Vec::with_capacity(submitted);
     for range in &uids {
         let (low, high) = bounds(range);
-        pairs.extend((low..=high).map(|uid| (uid_validity, uid)));
+        pairs.extend((low..=high).map(|uid| crate::types::AppendUid {
+            validity: uid_validity,
+            uid: crate::types::Uid::new(uid).expect("UID range is nonzero"),
+        }));
     }
     Some(pairs)
 }
@@ -565,7 +569,7 @@ pub(crate) struct AppendConsumer {
 }
 
 impl Consumer for AppendConsumer {
-    type Output = Option<(u32, u32)>;
+    type Output = Option<crate::types::AppendUid>;
 
     fn on_response(
         &mut self,
@@ -586,7 +590,7 @@ impl Consumer for AppendConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Finalized<Option<(u32, u32)>> {
+    ) -> Finalized<Option<crate::types::AppendUid>> {
         // On failure everything is surrendered, the untagged APPENDUID OK
         // included: it is whole, so it is a faithful event, and it was
         // classified `Either` so it may equally be an asynchronous notice.
@@ -609,7 +613,12 @@ impl Consumer for AppendConsumer {
                 // and refusing it would turn an appended draft into
                 // `draft_create`'s `Unsupported`, inviting a retry that
                 // appends it again.
-                uids.first().map(|r| (uid_validity, r.start))
+                crate::types::UidValidity::new(uid_validity).and_then(|validity| {
+                    uids.first().map(|r| crate::types::AppendUid {
+                        validity,
+                        uid: crate::types::Uid::new(r.start()).expect("UID range is nonzero"),
+                    })
+                })
             }
             _ => None,
         };
@@ -621,7 +630,7 @@ impl Consumer for AppendConsumer {
 ///
 /// Same as [`AppendConsumer`] but extracts multiple UIDs from the
 /// `[APPENDUID]` response code. Each UID range is expanded into
-/// individual `(uid_validity, uid)` pairs, once the code is known to name
+/// individual `crate::types::AppendUid { validity: uid_validity, uid: crate::types::Uid::new(uid).expect("UID range is nonzero") }` pairs, once the code is known to name
 /// exactly as many UIDs as messages were submitted (`appenduid_pairs`).
 /// Retains an untagged `* OK [APPENDUID ...]` whole, exactly as
 /// [`AppendConsumer`] does.
@@ -646,7 +655,7 @@ impl MultiAppendConsumer {
 }
 
 impl Consumer for MultiAppendConsumer {
-    type Output = Vec<(u32, u32)>;
+    type Output = Vec<crate::types::AppendUid>;
 
     fn on_response(
         &mut self,
@@ -667,7 +676,7 @@ impl Consumer for MultiAppendConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Finalized<Vec<(u32, u32)>> {
+    ) -> Finalized<Vec<crate::types::AppendUid>> {
         // Same disposition as `AppendConsumer`.
         let Self {
             mut buffered,
@@ -737,9 +746,9 @@ impl Consumer for IdConsumer {
         match self.pairs {
             Some(pairs) => Finalized::success(pairs, self.buffered),
             None => Finalized::failure(
-                Error::ProtocolMissing(
+                Error::Provider(crate::error::ProviderFailure::Missing(
                     "ID OK but no untagged ID response (RFC 2971 Section 3.2)".into(),
-                ),
+                )),
                 self.buffered,
             ),
         }
@@ -797,9 +806,9 @@ impl Consumer for NamespaceConsumer {
         match self.namespace {
             Some(namespace) => Finalized::success(namespace, self.buffered),
             None => Finalized::failure(
-                Error::ProtocolMissing(
+                Error::Provider(crate::error::ProviderFailure::Missing(
                     "NAMESPACE OK but no untagged NAMESPACE response (RFC 2342 Section 5)".into(),
-                ),
+                )),
                 self.buffered,
             ),
         }
@@ -867,3 +876,22 @@ impl Consumer for EnableConsumer {
 #[cfg(test)]
 #[path = "dispatch_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(in crate::connection) use search::expand_uid_ranges;
+
+/// Filter flags not valid in STORE flag lists (RFC 3501 Section 2.3.2).
+///
+/// `\Recent` is server-only and `\*` (wildcard) is not valid in STORE.
+pub(in crate::connection) fn filter_store_flags(
+    flags: &[crate::types::Flag],
+) -> Vec<crate::types::Flag> {
+    flags
+        .iter()
+        .filter(|flag| flag.is_writable())
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+pub(in crate::connection) use list::{is_notify_list_event, is_notify_selection_mismatch};

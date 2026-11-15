@@ -8,7 +8,7 @@
 //! multiplexer uses to synthesize `RestartScope` recoveries.
 
 use bifrost_sync::CursorRegistry;
-use bifrost_sync::multiplexer::membership_to_cursor_scopes;
+use bifrost_sync::cursor::membership::membership_to_cursor_scopes;
 use bifrost_sync::push::scopes_for_hint;
 use bifrost_types::{
     ChangeCursor, CursorScope, FolderId, HintPayload, LabelId, MailboxId, MembershipScope,
@@ -180,4 +180,23 @@ fn membership_to_cursor_scope_mapping_respects_registered_shapes() {
         ),
         Vec::<CursorScope>::new()
     );
+}
+
+#[test]
+fn membership_index_bridges_container_spellings_and_keeps_same_named_owners_separate() {
+    let registry = CursorRegistry::new();
+    let scope = CursorScope::Folder(FolderId("a".into()));
+    let mailbox = MembershipScope::Mailbox(MailboxId("a".into()));
+    let folder = MembershipScope::Folder(FolderId("a".into()));
+    let owner = MembershipScope::Owner(bifrost_types::PrincipalId("a".into()));
+    registry.put(cursor(&scope));
+    registry.link_membership(mailbox.clone(), scope.clone());
+    assert_eq!(registry.scopes_for_membership(&folder), vec![scope.clone()]);
+    registry.link_membership(folder.clone(), scope.clone());
+    assert_eq!(registry.scopes_for_membership(&folder), vec![scope.clone()]);
+    assert_eq!(registry.scopes_for_membership(&mailbox), vec![scope]);
+    assert!(registry.scopes_for_membership(&owner).is_empty());
+    assert!(membership_to_cursor_scopes(&registry, &owner).is_empty());
+    registry.delete(&CursorScope::Folder(FolderId("a".into())));
+    assert!(registry.scopes_for_membership(&folder).is_empty());
 }

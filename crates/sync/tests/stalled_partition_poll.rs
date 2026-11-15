@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_sync::backfill::{BackfillRunner, LiveSupersedes};
+use bifrost_sync::delivery::{ChangeDelivery, PagePublisher};
 use bifrost_sync::engine::backfill_bound::BackfillBound;
-use bifrost_sync::multiplexer::{ChangeDelivery, PagePublisher};
 use bifrost_sync::{Boundary, Error, SyncControl};
 use bifrost_sync::{BudgetGate, ConcurrencyBudget, Scheduler, SchedulerConfig};
 use bifrost_types::{Account, AccountId, CursorScope, InventoryPartition, Priority};
@@ -59,8 +59,13 @@ async fn cancelled_partition(with_lane: bool) {
     std::mem::forget((view, p, b));
     let control = SyncControl::new(account_id.clone(), boundary, priority, bandwidth);
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
-    let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(4);
-    drop(writer_rx);
+    let (writer_tx, writer_task) = bifrost_sync::engine::writer::WriterHandle::spawn(
+        bifrost_types::AccountId("stalled-partition".into()),
+        Arc::new(bifrost_sync::InMemoryCheckpointStore::new()),
+        control.clone(),
+        4,
+    );
+    writer_task.abort();
     let publisher = PagePublisher::new(
         Arc::new(ChangeDelivery::new(tx)),
         control.clone(),

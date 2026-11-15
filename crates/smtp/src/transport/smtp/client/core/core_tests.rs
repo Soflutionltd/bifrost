@@ -12,7 +12,7 @@ use super::{super::PIPELINING_RECIPIENT_WINDOW, *};
 use crate::{
     address::Address,
     transport::smtp::{
-        batch::SmtpBatchRecipient,
+        batch::{RcptProgress, SmtpBatchRecipient},
         commands::{Mail, Rcpt},
         error::ErrorKind,
         response::{Category, Code, Detail, Response, Severity},
@@ -184,7 +184,7 @@ fn a_421_at_any_envelope_boundary_aborts_instead_of_parking() {
             SmtpCommandPhase::DataCommand,
         ),
     ] {
-        let mut machine = DirectLmtp::new(mail(), rcpts(1), BodyKind::Data);
+        let mut machine = DirectLmtp::new(mail(), rcpts(1), false, BodyKind::Data);
         let mut harness = Harness::new(script);
         let error = harness.run(&mut machine).expect_err("the peer is closing");
         assert_eq!(error.phase(), Some(phase));
@@ -204,14 +204,11 @@ fn a_421_at_any_envelope_boundary_aborts_instead_of_parking() {
         let run = |script: Vec<OpOutcome>| {
             let progress = SendProgress::new(protocol, batch_recipients(2));
             let mut harness = Harness::new(script);
-            let progress = if protocol == Dialect::Smtp {
-                let mut machine = BatchSmtp::new(mail(), rcpts(2), false, progress);
-                harness.run(&mut machine)
-            } else {
-                let mut machine = BatchLmtp::new(mail(), rcpts(2), progress);
-                harness.run(&mut machine)
-            }
-            .expect("a closing peer is not a batch-level error");
+            let mut machine =
+                BatchTransaction::batch(mail(), rcpts(2), false, BodyKind::Data, progress);
+            let progress = harness
+                .run(&mut machine)
+                .expect("a closing peer is not a batch-level error");
             (progress.resolve(), harness.ops)
         };
 
@@ -269,7 +266,7 @@ fn a_421_at_any_envelope_boundary_aborts_instead_of_parking() {
 /// Ablation: restoring either abort fails the matching case on its last op.
 #[test]
 fn a_rejected_lmtp_envelope_follows_the_smtp_reset_or_keep_rules() {
-    let mut machine = DirectLmtp::new(mail(), rcpts(1), BodyKind::Data);
+    let mut machine = DirectLmtp::new(mail(), rcpts(1), false, BodyKind::Data);
     let mut harness = Harness::new(vec![OpOutcome::Reply(rejection())]);
     let error = harness
         .run(&mut machine)
@@ -284,7 +281,7 @@ fn a_rejected_lmtp_envelope_follows_the_smtp_reset_or_keep_rules() {
         harness.ops
     );
 
-    let mut machine = DirectLmtp::new(mail(), rcpts(1), BodyKind::Data);
+    let mut machine = DirectLmtp::new(mail(), rcpts(1), false, BodyKind::Data);
     let mut harness = Harness::new(vec![
         OpOutcome::Reply(ok_reply()),
         OpOutcome::Reply(ok_reply()),
@@ -331,7 +328,9 @@ enum Aim {
 /// Non-write patterns match exactly, so `READ` never selects a `READG`.
 fn selector(op: &Op) -> String {
     match op {
-        Op::Write(_) => render(op),
+        Op::Write(_) | Op::WriteSecret(_) => render(op),
+        Op::UpgradeTls(_) => "TLS".to_owned(),
+        Op::ResolveToken(_) => "TOKEN".to_owned(),
         Op::WriteBody => "BODY".to_owned(),
         Op::WriteBdat => "BDAT".to_owned(),
         Op::OpenReplyGroup => "OPEN".to_owned(),
@@ -472,6 +471,9 @@ impl Harness {
 fn render(op: &Op) -> String {
     match op {
         Op::Write(bytes) => format!("W:{}", bytes.replace("\r\n", "|")),
+        Op::WriteSecret(_) => "SECRET".to_owned(),
+        Op::UpgradeTls(_) => "TLS".to_owned(),
+        Op::ResolveToken(_) => "TOKEN".to_owned(),
         Op::WriteBody => "BODY".to_owned(),
         Op::WriteBdat => "BDAT".to_owned(),
         Op::OpenReplyGroup => "OPEN".to_owned(),
@@ -746,7 +748,7 @@ fn bdat_sends_no_data_command_and_carries_its_own_phase() {
 /// order, and the drain retires the connection either way.
 #[test]
 fn lmtp_reads_one_final_status_per_accepted_recipient() {
-    let mut machine = DirectLmtp::new(mail(), rcpts(3), BodyKind::Data);
+    let mut machine = DirectLmtp::new(mail(), rcpts(3), false, BodyKind::Data);
     let mut harness = Harness::new(vec![
         OpOutcome::Reply(ok_reply()),
         OpOutcome::Reply(ok_reply()),
@@ -786,7 +788,7 @@ fn lmtp_reads_one_final_status_per_accepted_recipient() {
 #[test]
 fn lmtp_batch_finals_land_on_the_accepted_recipient_indexes() {
     let progress = SendProgress::new(Dialect::Lmtp, batch_recipients(3));
-    let mut machine = BatchLmtp::new(mail(), rcpts(3), progress);
+    let mut machine = BatchTransaction::batch(mail(), rcpts(3), false, BodyKind::Data, progress);
     let mut harness = Harness::new(vec![
         OpOutcome::Reply(ok_reply()),
         OpOutcome::Reply(rejection()),
@@ -827,14 +829,11 @@ fn a_rejected_data_command_fails_recipients_rather_than_the_batch() {
         ];
         let progress = SendProgress::new(protocol, batch_recipients(1));
         let mut harness = Harness::new(script);
-        let progress = if protocol == Dialect::Smtp {
-            let mut machine = BatchSmtp::new(mail(), rcpts(1), false, progress);
-            harness.run(&mut machine)
-        } else {
-            let mut machine = BatchLmtp::new(mail(), rcpts(1), progress);
-            harness.run(&mut machine)
-        }
-        .expect("a rejected DATA is not a batch-level failure");
+        let mut machine =
+            BatchTransaction::batch(mail(), rcpts(1), false, BodyKind::Data, progress);
+        let progress = harness
+            .run(&mut machine)
+            .expect("a rejected DATA is not a batch-level failure");
 
         assert_eq!(progress.resolve().failed().len(), 1);
         assert!(
@@ -852,7 +851,7 @@ fn a_rejected_data_command_fails_recipients_rather_than_the_batch() {
 #[test]
 fn a_drop_before_data_marks_recipients_unsent() {
     let progress = SendProgress::new(Dialect::Smtp, batch_recipients(2));
-    let mut machine = BatchSmtp::new(mail(), rcpts(2), false, progress);
+    let mut machine = BatchTransaction::batch(mail(), rcpts(2), false, BodyKind::Data, progress);
     let mut harness = Harness::new(vec![
         OpOutcome::Reply(ok_reply()),
         OpOutcome::Reply(ok_reply()),
@@ -871,7 +870,7 @@ fn a_drop_before_data_marks_recipients_unsent() {
 #[test]
 fn a_rejected_batch_mail_from_aborts() {
     let progress = SendProgress::new(Dialect::Smtp, batch_recipients(1));
-    let mut machine = BatchSmtp::new(mail(), rcpts(1), false, progress);
+    let mut machine = BatchTransaction::batch(mail(), rcpts(1), false, BodyKind::Data, progress);
     let mut harness = Harness::new(vec![OpOutcome::Reply(rejection())]);
     let (error, _progress) = harness
         .run(&mut machine)
@@ -922,7 +921,7 @@ fn a_failed_rset_write_aborts_instead_of_keeping_the_connection() {
 fn a_failure_at_a_pipelined_group_boundary_returns_without_a_second_abort() {
     // OpenReplyGroup: nothing has been read yet, so no recipient is resolved.
     let progress = SendProgress::new(Dialect::Smtp, batch_recipients(2));
-    let mut machine = BatchSmtp::new(mail(), rcpts(2), true, progress);
+    let mut machine = BatchTransaction::batch(mail(), rcpts(2), true, BodyKind::Data, progress);
     let mut harness = Harness::positive(8).aiming(Aim::Kind("OPEN", 0));
     let (error, progress) = harness
         .run(&mut machine)
@@ -947,7 +946,7 @@ fn a_failure_at_a_pipelined_group_boundary_returns_without_a_second_abort() {
     // CloseReplyGroup: every reply in the window was read, so the acceptances
     // survive the failure that closes it.
     let progress = SendProgress::new(Dialect::Smtp, batch_recipients(2));
-    let mut machine = BatchSmtp::new(mail(), rcpts(2), true, progress);
+    let mut machine = BatchTransaction::batch(mail(), rcpts(2), true, BodyKind::Data, progress);
     let mut harness = Harness::positive(8).aiming(Aim::Kind("CLOSE", 0));
     let (error, progress) = harness
         .run(&mut machine)
@@ -976,7 +975,7 @@ fn a_failure_at_a_pipelined_group_boundary_returns_without_a_second_abort() {
 #[test]
 fn a_failure_closing_the_lmtp_drain_preserves_the_recipient_outcomes() {
     let progress = SendProgress::new(Dialect::Lmtp, batch_recipients(2));
-    let mut machine = BatchLmtp::new(mail(), rcpts(2), progress);
+    let mut machine = BatchTransaction::batch(mail(), rcpts(2), false, BodyKind::Data, progress);
     let mut harness = Harness::new(vec![
         OpOutcome::Reply(ok_reply()),
         OpOutcome::Reply(ok_reply()),
@@ -1002,7 +1001,7 @@ fn a_failure_closing_the_lmtp_drain_preserves_the_recipient_outcomes() {
 
     // The direct path has no per-recipient tracker to preserve, so the same
     // failure is simply reported, with the drain's phase.
-    let mut machine = DirectLmtp::new(mail(), rcpts(1), BodyKind::Data);
+    let mut machine = DirectLmtp::new(mail(), rcpts(1), false, BodyKind::Data);
     let mut harness = Harness::new(vec![
         OpOutcome::Reply(ok_reply()),
         OpOutcome::Reply(ok_reply()),
@@ -1031,7 +1030,7 @@ fn a_failure_closing_the_lmtp_drain_preserves_the_recipient_outcomes() {
 #[test]
 fn a_failed_lmtp_group_open_leaves_the_recipients_uncertain_not_the_batch_unsent() {
     let progress = SendProgress::new(Dialect::Lmtp, batch_recipients(2));
-    let mut machine = BatchLmtp::new(mail(), rcpts(2), progress);
+    let mut machine = BatchTransaction::batch(mail(), rcpts(2), false, BodyKind::Data, progress);
     let mut harness = Harness::new(vec![
         OpOutcome::Reply(ok_reply()),
         OpOutcome::Reply(ok_reply()),
@@ -1065,7 +1064,7 @@ fn a_failed_direct_lmtp_bdat_chunk_carries_the_bdat_phase() {
         (BodyKind::Bdat, SmtpCommandPhase::BdatBody),
         (BodyKind::Data, SmtpCommandPhase::DataBody),
     ] {
-        let mut machine = DirectLmtp::new(mail(), rcpts(1), body);
+        let mut machine = DirectLmtp::new(mail(), rcpts(1), false, body);
         let mut harness = Harness::positive(6).aiming(Aim::Kind(
             match body {
                 BodyKind::Bdat => "BDAT",
@@ -1159,4 +1158,144 @@ fn intermediate_reset_reply_aborts_the_connection() {
     let epilogue = Epilogue::ResetReading(());
     let result = epilogue.advance(OpOutcome::Reply(intermediate()));
     assert!(matches!(result, Ok((Epilogue::Aborting(()), Op::Abort))));
+}
+
+// The old tracker-only regression now drives the real DATA rejection path.
+#[test]
+fn lmtp_data_command_negative_reply_marks_recipients_failed() {
+    let progress = SendProgress::new(Dialect::Lmtp, batch_recipients(2));
+    let mut machine = BatchTransaction::batch(mail(), rcpts(2), false, BodyKind::Data, progress);
+    let mut harness = Harness::new(vec![
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(rejection()),
+        OpOutcome::Reply(ok_reply()),
+    ]);
+    let outcome = harness
+        .run(&mut machine)
+        .expect("DATA rejection keeps recipient lanes")
+        .resolve();
+    assert!(outcome.succeeded().is_empty());
+    assert!(outcome.uncertain().is_empty());
+    assert_eq!(outcome.failed().len(), 2);
+    for failed in outcome.failed() {
+        assert!(!failed.error.recovery().requires_reconciliation());
+        assert!(failed.error.chain().iter().any(|cause| matches!(cause,
+            bifrost_types::Cause::Attempt(attempt) if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+        )), "the DATA rejection must survive, not become a generic unsent fallback");
+    }
+}
+
+#[test]
+fn dialect_and_body_framing_share_envelope_and_recipient_accounting() {
+    for dialect in [Dialect::Smtp, Dialect::Lmtp] {
+        for body in [BodyKind::Data, BodyKind::Bdat] {
+            for pipelined in [false, true] {
+                let mut script = vec![
+                    OpOutcome::Reply(ok_reply()),
+                    OpOutcome::Reply(ok_reply()),
+                    OpOutcome::Reply(rejection()),
+                    OpOutcome::Reply(ok_reply()),
+                ];
+                if body == BodyKind::Data {
+                    script.push(OpOutcome::Reply(intermediate()));
+                }
+                script.push(OpOutcome::Reply(ok_reply()));
+                if dialect == Dialect::Lmtp {
+                    script.push(OpOutcome::Reply(rejection()));
+                }
+                let progress = SendProgress::new(dialect, batch_recipients(3));
+                let mut machine =
+                    BatchTransaction::batch(mail(), rcpts(3), pipelined, body, progress);
+                let mut harness = Harness::new(script);
+                let result = harness.run(&mut machine).unwrap().resolve();
+                assert_eq!(
+                    result.succeeded().len(),
+                    if dialect == Dialect::Smtp { 2 } else { 1 }
+                );
+                assert_eq!(result.failed()[0].item.0, "item-1");
+                if dialect == Dialect::Lmtp {
+                    assert_eq!(result.failed()[1].item.0, "item-2");
+                }
+                assert!(result.uncertain().is_empty());
+                assert_eq!(
+                    harness
+                        .ops
+                        .iter()
+                        .filter(|op| op.as_str() == "W:DATA|")
+                        .count(),
+                    usize::from(body == BodyKind::Data)
+                );
+                if pipelined {
+                    assert!(
+                        harness.ops[0].contains("RCPT TO:<rcpt-2@example.com>"),
+                        "{:?}",
+                        harness.ops
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_closing_lmtp_final_preserves_answers_and_stops_the_drain() {
+    for pipelined in [false, true] {
+        let script = || {
+            vec![
+                OpOutcome::Reply(ok_reply()),
+                OpOutcome::Reply(ok_reply()),
+                OpOutcome::Reply(ok_reply()),
+                OpOutcome::Reply(ok_reply()),
+                OpOutcome::Reply(intermediate()),
+                OpOutcome::Reply(ok_reply()),
+                OpOutcome::Reply(closing()),
+            ]
+        };
+        let progress = SendProgress::new(Dialect::Lmtp, batch_recipients(3));
+        let mut machine =
+            BatchTransaction::batch(mail(), rcpts(3), pipelined, BodyKind::Data, progress);
+        let mut harness = Harness::new(script());
+        let result = harness.run(&mut machine).unwrap().resolve();
+        assert_eq!(result.succeeded()[0].item.0, "item-0");
+        assert_eq!(result.failed()[0].item.0, "item-1");
+        assert_eq!(result.uncertain()[0].item.0, "item-2");
+        assert_eq!(harness.ops.last().unwrap(), "ABORT");
+        assert_eq!(
+            harness
+                .ops
+                .iter()
+                .filter(|op| op.as_str() == "READG")
+                .count(),
+            if pipelined { 6 } else { 2 }
+        );
+        let mut machine = DirectLmtp::new(mail(), rcpts(3), pipelined, BodyKind::Data);
+        let mut harness = Harness::new(script());
+        let error = harness.run(&mut machine).unwrap_err();
+        assert_eq!(error.status().map(u16::from), Some(421));
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::LmtpFinalStatus));
+        assert_eq!(error.attempt(), Some(SmtpTransmissionState::InFlight));
+    }
+}
+
+#[test]
+fn a_closing_reply_while_draining_rejected_mail_keeps_the_mail_refusal() {
+    let mut machine = DirectSmtp::new(mail(), rcpts(3), true, BodyKind::Data);
+    let mut harness = Harness::new(vec![
+        OpOutcome::Reply(rejection()),
+        OpOutcome::Reply(closing()),
+    ]);
+    let error = harness.run(&mut machine).unwrap_err();
+    assert_eq!(error.status().map(u16::from), Some(550));
+    assert_eq!(error.phase(), Some(SmtpCommandPhase::MailFrom));
+    assert_eq!(harness.ops.last().unwrap(), "ABORT");
+    assert_eq!(
+        harness
+            .ops
+            .iter()
+            .filter(|op| op.as_str() == "READG")
+            .count(),
+        2
+    );
 }

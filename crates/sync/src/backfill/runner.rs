@@ -53,9 +53,9 @@ use bifrost_types::{
 };
 use futures::stream::StreamExt;
 
+use crate::delivery::{EventScope, MultiplexerEvent};
 use crate::error::Error;
 use crate::inventory_walk::{InventoryWalk, WalkDecision, cross_waived_barriers, record_barriers};
-use crate::multiplexer::{EventScope, MultiplexerEvent};
 
 use super::partitioner::partition_key;
 
@@ -356,7 +356,7 @@ impl BackfillRunner {
         partition: InventoryPartition,
         live: &LiveSupersedes,
         envelope_version: bifrost_types::TraitEnvelopeVersion,
-        publisher: &crate::multiplexer::PagePublisher,
+        publisher: &crate::delivery::PagePublisher,
         generation: crate::cursor::WalkGeneration,
         bound: Option<&crate::engine::backfill_bound::BackfillBound>,
         walk_fence: crate::cursor::ScopeFence,
@@ -367,7 +367,7 @@ impl BackfillRunner {
             return Err(Error::Other("backfill bound ledger mismatch".into()));
         }
         let control = &publisher.control;
-        let writer_tx = &publisher.writer_tx;
+        let writer_tx = &publisher.writer;
         let delivery = &publisher.delivery;
         let _activity = control.begin_activity().ok_or(Error::Paused)?;
         let partition_key = partition_key(&partition);
@@ -421,7 +421,7 @@ impl BackfillRunner {
             match event {
                 bifrost_types::InventoryEvent::Batch(batch) => {
                     if let Err(violation) = batch.validate_boundary() {
-                        let error = crate::recovery::batch_boundary_violation(
+                        let error = crate::engine_errors::batch_boundary_violation(
                             violation,
                             batch.checkpoint.offered(),
                             bifrost_types::AccountOperation::SyncInventory,
@@ -613,7 +613,7 @@ impl BackfillRunner {
                     // stream contract, and its `end` declaration is no more
                     // trustworthy than its checkpoint.
                     if let Err(violation) = completion.validate() {
-                        let error = crate::recovery::batch_boundary_violation(
+                        let error = crate::engine_errors::batch_boundary_violation(
                             violation,
                             completion.checkpoint.offered(),
                             bifrost_types::AccountOperation::SyncInventory,
@@ -659,23 +659,13 @@ impl BackfillRunner {
                         // that cumulativeness instead would be an assumption
                         // about every future provider.
                         {
-                            let writer = writer_tx;
-                            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-                            if writer
-                                .send(crate::multiplexer::WriterRequest::RecordDebt {
-                                    report: completion.coverage.clone(),
-                                    generation,
-                                    done: done_tx,
-                                })
+                            // A store refusal stays retained by the writer. Channel
+                            // loss is teardown, rather than another store failure.
+                            if let Ok(Err(error)) = writer_tx
+                                .record_debt(completion.coverage.clone(), generation)
                                 .await
-                                .is_ok()
                             {
-                                // A store refusal is retained by the writer, but
-                                // must remain visible for diagnosis. Channel loss
-                                // is teardown, not a second persistence failure.
-                                if let Ok(Err(error)) = done_rx.await {
-                                    tracing::warn!(error = %error, "could not persist terminal inventory debt");
-                                }
+                                tracing::warn!(error = %error, "could not persist terminal inventory debt");
                             }
                         }
                     }
@@ -727,7 +717,7 @@ impl BackfillRunner {
 // summary) and the terminal summary itself, but not every page: one warning
 // per page of a large degraded folder is noise the user cannot act on.
 fn warn_incomplete(
-    tx: &crate::multiplexer::ChangeDelivery,
+    tx: &crate::delivery::ChangeDelivery,
     scope: &CursorScope,
     coverage: &bifrost_types::InventoryCoverageReport,
 ) {
@@ -735,7 +725,9 @@ fn warn_incomplete(
         return;
     }
     let warning = bifrost_types::Warning::user_safe(
-        bifrost_types::WarningKind::OperatorAttentionNeeded,
+        bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::DegradedCoverage {
+            obligations: coverage.obligations().len(),
+        }),
         format!(
             "inventory reported {} object(s) or region(s) it could not represent; \
              the scope is live but incomplete",
@@ -746,7 +738,7 @@ fn warn_incomplete(
 }
 
 fn warn_barrier(
-    tx: &crate::multiplexer::ChangeDelivery,
+    tx: &crate::delivery::ChangeDelivery,
     scope: &CursorScope,
     coverage: &bifrost_types::InventoryCoverageReport,
 ) {
@@ -756,7 +748,9 @@ fn warn_barrier(
         .filter(|obligation| obligation.is_barrier())
         .count();
     let warning = bifrost_types::Warning::user_safe(
-        bifrost_types::WarningKind::OperatorAttentionNeeded,
+        bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::BarrierStop {
+            regions: count,
+        }),
         format!(
             "inventory stopped at {count} region(s) it cannot represent and cannot replay; \
              the scope cannot advance past them until an operator waives them"

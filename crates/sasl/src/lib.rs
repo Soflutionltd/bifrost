@@ -1,19 +1,14 @@
-//! Private shared SASL/SCRAM computation layer for the bifrost protocol crates.
+//! Shared SASL clients and authentication policy for the bifrost protocol crates.
 //!
-//! This crate is private to bifrost. It is computation-only: no I/O, no async,
-//! no protocol command flow. The protocol crates (`bifrost-imap` and
-//! `bifrost-smtp`) own the wire sequencing - driving `+` continuations, framing
-//! commands - and call into the pure transition functions here.
-//!
-//! The surface is deliberately small: a zeroizing [`Secret`] wrapper, a minimal
-//! [`SaslError`], the [`ScramHash`] selector, the SCRAM transition functions,
-//! the CRAM-MD5 response builder, and shared mechanism negotiation policy.
-//! Each protocol crate maps [`SaslError`]
-//! back into its own error enum at the call boundary.
+//! Published as a support crate; protocol crates adapt its mechanisms and errors
+//! to their own API. Exchanges are computation-only, with no I/O or async work.
+//! [`SaslClient`] owns mechanism state, while adapters own wire commands,
+//! base64 framing, deadlines and token-source resolution.
 
 #![forbid(unsafe_code)]
 
 mod channel_binding;
+mod client;
 mod cram;
 mod error;
 mod negotiation;
@@ -23,6 +18,7 @@ mod scram;
 mod secret;
 
 pub use channel_binding::tls_server_end_point;
+pub use client::{SaslClient, Step};
 pub use cram::cram_md5_response;
 pub use error::{RefusalClass, SaslError, ScramServerError};
 pub use negotiation::{

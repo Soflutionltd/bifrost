@@ -66,11 +66,11 @@ impl Consumer for QuotaConsumer {
         }
         let Some(resources) = self.result else {
             return Finalized::failure(
-                Error::ProtocolMissing(format!(
+                Error::Provider(crate::error::ProviderFailure::Missing(format!(
                     "server sent OK but no QUOTA response for root '{}' \
                      (RFC 2087 Section 4.2)",
                     self.root,
-                )),
+                ))),
                 self.buffered,
             );
         };
@@ -147,11 +147,11 @@ impl Consumer for QuotaRootConsumer {
 
         let Some(roots) = self.roots else {
             return Finalized::failure(
-                Error::ProtocolMissing(format!(
+                Error::Provider(crate::error::ProviderFailure::Missing(format!(
                     "server sent OK but no QUOTAROOT response for mailbox '{}' \
                      (RFC 2087 Section 4.3)",
                     self.mailbox,
-                )),
+                ))),
                 self.buffered,
             );
         };
@@ -179,11 +179,11 @@ impl Consumer for QuotaRootConsumer {
             // result is published. `buffered` still goes out; the only thing
             // lost is the (empty) resource partition.
             return Finalized::failure(
-                Error::ProtocolMissing(format!(
+                Error::Provider(crate::error::ProviderFailure::Missing(format!(
                     "server sent OK but no QUOTA response for QUOTAROOT mailbox \
                      '{}' (RFC 2087 Section 4.3)",
                     self.mailbox,
-                )),
+                ))),
                 buffered,
             );
         }
@@ -247,11 +247,11 @@ impl Consumer for AclConsumer {
         }
         let Some(entries) = self.result else {
             return Finalized::failure(
-                Error::ProtocolMissing(format!(
+                Error::Provider(crate::error::ProviderFailure::Missing(format!(
                     "server sent OK but no ACL response for mailbox '{}' \
                      (RFC 4314 Section 3.3)",
                     self.mailbox,
-                )),
+                ))),
                 self.buffered,
             );
         };
@@ -323,11 +323,11 @@ impl Consumer for ListRightsConsumer {
         }
         let Some(result) = self.result else {
             return Finalized::failure(
-                Error::ProtocolMissing(format!(
+                Error::Provider(crate::error::ProviderFailure::Missing(format!(
                     "server sent OK but no LISTRIGHTS response for mailbox '{}' \
                      and identifier '{}' (RFC 4314 Section 3.4)",
                     self.mailbox, self.identifier,
-                )),
+                ))),
                 self.buffered,
             );
         };
@@ -389,11 +389,11 @@ impl Consumer for MyRightsConsumer {
         }
         let Some(rights) = self.result else {
             return Finalized::failure(
-                Error::ProtocolMissing(format!(
+                Error::Provider(crate::error::ProviderFailure::Missing(format!(
                     "server sent OK but no MYRIGHTS response for mailbox '{}' \
                      (RFC 4314 Section 3.5)",
                     self.mailbox,
-                )),
+                ))),
                 self.buffered,
             );
         };
@@ -489,11 +489,11 @@ impl Consumer for MetadataConsumer {
 
         if !self.saw_matching {
             return Finalized::failure(
-                Error::ProtocolMissing(
+                Error::Provider(crate::error::ProviderFailure::Missing(
                     "server completed GETMETADATA without the required METADATA \
                      response for the requested mailbox (RFC 5464 Section 4.2)"
                         .into(),
-                ),
+                )),
                 self.buffered,
             );
         }

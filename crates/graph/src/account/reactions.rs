@@ -135,8 +135,9 @@ pub(crate) async fn message_reactions(
             .map(super::batch::subrequest_replayable)
             .collect();
         match super::batch::submit(
-            &account.client,
+            account.mailboxes.primary(),
             account
+                .mailboxes
                 .batch_resource(&chunk)
                 .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?,
             &BatchRequest { requests },

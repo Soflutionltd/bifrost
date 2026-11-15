@@ -6,10 +6,10 @@ use bifrost_types::{
 };
 use futures::StreamExt as _;
 
-use crate::types::{FetchAttr, FetchResponse, MailboxName, UidSet};
+use crate::types::{FetchAttr, FetchResponse, MailboxName, UidSetExpr};
 
 use super::{
-    BATCH_ITEMS, CompactUidSet, ImapAccount, ScopeHandler, batch, encode_cursor, encode_object_id,
+    BATCH_ITEMS, ImapAccount, ScopeHandler, UidSet, batch, encode_cursor, encode_object_id,
     folder_scope, membership_scope, route_scope, terminated_event,
 };
 
@@ -150,11 +150,15 @@ impl ObligationLedger {
 /// not represent it, so its prior state is kept and repaired by id later.
 fn unrepresented_object(
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     uid: u32,
     error: crate::Error,
 ) -> bifrost_types::InventoryObligation {
-    let id = encode_object_id(folder, uidvalidity, uid);
+    let id = encode_object_id(
+        folder,
+        uidvalidity,
+        crate::types::Uid::new(uid).expect("wire UID is nonzero"),
+    );
     bifrost_types::InventoryObligation::Object {
         key: bifrost_types::ObligationKey(id.0.as_bytes().to_vec()),
         id,
@@ -241,7 +245,7 @@ impl From<ChannelDropped> for InventoryError {
 
 async fn run_inventory(
     account: ImapAccount,
-    _scope: CursorScope,
+    scope: CursorScope,
     folder: super::ImapFolder,
     tx: tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
     qresync_warning: &QresyncWarningTicket,
@@ -249,13 +253,14 @@ async fn run_inventory(
 ) -> Result<(), InventoryError> {
     if let Some(reason) = qresync_warning.take() {
         tx.send(SyncEvent::Warning(
-            Warning::support_only(WarningKind::StrategyDowngraded, reason).with_protocol_detail(
-                DiagnosticText::support_only(format!(
+            Warning::support_only(WarningKind::StrategyDowngraded, reason)
+                .with_strategy_downgrade(bifrost_types::StrategyDowngrade::QResyncToCondstore)
+                .with_scope(bifrost_types::ErrorScope::Cursor(scope.clone()))
+                .with_protocol_detail(DiagnosticText::support_only(format!(
                     "{:?}->{:?}",
                     SyncStrategy::QResync,
                     SyncStrategy::Condstore
-                )),
-            ),
+                ))),
         ))
         .await
         .map_err(|_| ChannelDropped)?;
@@ -301,7 +306,7 @@ async fn run_inventory(
     let include_modseq = selected.mailbox.modseq().is_some();
     let mut attrs = inventory_attrs(include_modseq);
     super::hydration::push_native_thread_attrs(&mut attrs, &conn.connection().server_profile());
-    let all_uids = UidSet::all();
+    let all_uids = UidSetExpr::all();
     let (mut fetch_rx, fetch_fut) = conn.connection().uid_fetch_stream(
         all_uids.as_sequence_set(),
         &attrs,
@@ -383,7 +388,7 @@ async fn run_inventory(
         }
     }
 
-    let known_uids = CompactUidSet::from_uids(known);
+    let known_uids = UidSet::from_numbers(known);
     let cursor = account.cursor_from_select(&selected.mailbox, Some(known_uids))?;
     let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
     finish_inventory(
@@ -447,35 +452,43 @@ pub(crate) fn inventory_attrs(include_modseq: bool) -> Vec<FetchAttr> {
 
 pub(crate) fn fetch_to_inventory(
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     fetch: FetchResponse,
-    shared_owner: Option<&bifrost_types::MailboxId>,
+    shared_owner: Option<&bifrost_types::PrincipalId>,
 ) -> Result<InventoryEntry, crate::Error> {
     // Missing observation is not an empty flag set: inventing it can make
     // an enterprise client's cached read/flagged state silently regress.
     let uid = fetch.uid.filter(|uid| *uid != 0).ok_or_else(|| {
-        crate::Error::ProtocolMissing("FETCH response lacked a nonzero UID".into())
+        crate::Error::Provider(crate::error::ProviderFailure::Missing(
+            "FETCH response lacked a nonzero UID".into(),
+        ))
     })?;
     let flags = fetch.flags.as_deref().ok_or_else(|| {
-        crate::Error::ProtocolMissing(format!("FETCH response lacked FLAGS for UID {uid}"))
+        crate::Error::Provider(crate::error::ProviderFailure::Missing(format!(
+            "FETCH response lacked FLAGS for UID {uid}"
+        )))
     })?;
     let flags_hash = flags_hash(flags);
     let envelope = fetch.envelope;
     // A shared/other-user folder's inventory item carries both its
-    // `Folder` membership and its owning `Mailbox(owner)` membership so
+    // `Folder` membership and its owning `Owner(owner)` membership so
     // the consumer can map the item to a shared mailbox identity (A5c).
     let mut memberships = vec![membership_scope(folder)];
     if let Some(owner) = shared_owner {
-        memberships.push(bifrost_types::MembershipScope::Mailbox(owner.clone()));
+        memberships.push(bifrost_types::MembershipScope::Owner(owner.clone()));
     }
     Ok(InventoryEntry {
-        id: encode_object_id(folder, uidvalidity, uid),
+        id: encode_object_id(
+            folder,
+            uidvalidity,
+            crate::types::Uid::new(uid).expect("wire UID is nonzero"),
+        ),
         memberships,
         blob_id: None,
         fingerprint: Fingerprint {
             server_version: fetch
                 .mod_seq
-                .map(ServerVersion::ModSeq)
+                .map(|value| ServerVersion::ModSeq(value.get()))
                 .unwrap_or(ServerVersion::Unavailable),
             size: fetch.rfc822_size,
             flags_hash,
@@ -743,7 +756,7 @@ mod tests {
 
     #[tokio::test]
     async fn inventory_cursor_waits_for_terminal_checkpoint_admission() {
-        use super::super::folder_registry::{CompactUidSet, FolderRegistry};
+        use super::super::folder_registry::FolderRegistry;
         for has_items in [false, true] {
             let folder = folder();
             let folders = FolderRegistry::from_list(vec![crate::types::MailboxInfo {
@@ -751,15 +764,15 @@ mod tests {
                 ..Default::default()
             }]);
             let cursor = super::super::FolderCursor::Basic {
-                uidvalidity: 7,
-                uidnext: 2,
-                known_uids: CompactUidSet::from_uids([1]),
+                uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                uidnext: crate::types::Uid::new(2),
+                known_uids: UidSet::from_numbers([1]),
             };
             let items = if has_items {
                 vec![
                     fetch_to_inventory(
                         &folder,
-                        7,
+                        crate::types::UidValidity::new(7).expect("valid protocol test value"),
                         FetchResponse {
                             flags: Some(Vec::new()),
                             uid: Some(1),
@@ -787,9 +800,9 @@ mod tests {
             assert!(finish.await.is_err());
             assert!(folders.get(&folder).unwrap().cursor().is_none());
             let cursor = super::super::FolderCursor::Basic {
-                uidvalidity: 7,
-                uidnext: 2,
-                known_uids: CompactUidSet::from_uids([1]),
+                uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                uidnext: crate::types::Uid::new(2),
+                known_uids: UidSet::from_numbers([1]),
             };
             let (tx, _rx) = tokio::sync::mpsc::channel(2);
             assert!(
@@ -865,11 +878,21 @@ mod tests {
                     flags,
                     ..Default::default()
                 };
-                let result = fetch_to_inventory(&folder(), 9, fetch, None);
+                let result = fetch_to_inventory(
+                    &folder(),
+                    crate::types::UidValidity::new(9).expect("valid protocol test value"),
+                    fetch,
+                    None,
+                );
                 if valid {
                     assert!(result.is_ok());
                 } else {
-                    assert!(matches!(result, Err(crate::Error::ProtocolMissing(_))));
+                    assert!(matches!(
+                        result,
+                        Err(crate::Error::Provider(
+                            crate::error::ProviderFailure::Missing(_)
+                        ))
+                    ));
                 }
             }
         }
@@ -880,30 +903,49 @@ mod tests {
         let fetch = FetchResponse {
             flags: Some(Vec::new()),
             uid: Some(42),
-            mod_seq: Some(7),
+            mod_seq: Some(crate::types::ModSeqValzer::new(7).expect("valid protocol test value")),
             rfc822_size: Some(1024),
             ..Default::default()
         };
-        let personal = fetch_to_inventory(&folder(), 9, fetch.clone(), None).unwrap();
+        let personal = fetch_to_inventory(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            fetch.clone(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             personal.memberships,
             vec![bifrost_types::MembershipScope::Folder(
                 bifrost_types::FolderId("INBOX".to_owned())
             )]
         );
-        assert_eq!(personal.id, encode_object_id(&folder(), 9, 42));
+        assert_eq!(
+            personal.id,
+            encode_object_id(
+                &folder(),
+                crate::types::UidValidity::new(9).expect("nonzero epoch"),
+                crate::types::Uid::new(42).expect("valid protocol test value")
+            )
+        );
         assert_eq!(personal.fingerprint.size, Some(1024));
         assert_eq!(
             personal.fingerprint.server_version,
             ServerVersion::ModSeq(7)
         );
 
-        let owner = bifrost_types::MailboxId("alice".to_owned());
-        let shared = fetch_to_inventory(&folder(), 9, fetch, Some(&owner)).unwrap();
+        let owner = bifrost_types::PrincipalId("alice".to_owned());
+        let shared = fetch_to_inventory(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            fetch,
+            Some(&owner),
+        )
+        .unwrap();
         assert!(
             shared
                 .memberships
-                .contains(&bifrost_types::MembershipScope::Mailbox(owner)),
+                .contains(&bifrost_types::MembershipScope::Owner(owner)),
             "a shared folder's item must also carry its owning mailbox",
         );
         assert_eq!(shared.memberships.len(), 2);
@@ -919,7 +961,13 @@ mod tests {
             uid: Some(1),
             ..Default::default()
         };
-        let entry = fetch_to_inventory(&folder(), 9, fetch, None).unwrap();
+        let entry = fetch_to_inventory(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            fetch,
+            None,
+        )
+        .unwrap();
         assert_eq!(entry.fingerprint.server_version, ServerVersion::Unavailable);
         assert_eq!(entry.fingerprint.size, None);
     }
@@ -929,11 +977,20 @@ mod tests {
         let both = FetchResponse {
             flags: Some(Vec::new()),
             uid: Some(1),
-            thread_id: Some("T-objectid".to_owned()),
-            gmail_thread_id: Some(1234),
+            thread_id: Some(
+                crate::types::validated::ObjectId::new("T-objectid".to_owned())
+                    .expect("valid objectid"),
+            ),
+            gmail_thread_id: Some(crate::types::GmailThreadId::new(1234)),
             ..Default::default()
         };
-        let entry = fetch_to_inventory(&folder(), 9, both, None).unwrap();
+        let entry = fetch_to_inventory(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            both,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             entry.thread_id,
             crate::account::envelope::encode_server_thread_id(Some("T-objectid"), None)
@@ -942,13 +999,22 @@ mod tests {
         let gmail_only = FetchResponse {
             flags: Some(Vec::new()),
             uid: Some(1),
-            gmail_thread_id: Some(1234),
+            gmail_thread_id: Some(crate::types::GmailThreadId::new(1234)),
             ..Default::default()
         };
-        let entry = fetch_to_inventory(&folder(), 9, gmail_only, None).unwrap();
+        let entry = fetch_to_inventory(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            gmail_only,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             entry.thread_id,
-            crate::account::envelope::encode_server_thread_id(None, Some(1234))
+            crate::account::envelope::encode_server_thread_id(
+                None,
+                Some(crate::types::GmailThreadId::new(1234))
+            )
         );
     }
 
@@ -965,7 +1031,13 @@ mod tests {
             envelope: Some(envelope),
             ..Default::default()
         };
-        let entry = fetch_to_inventory(&folder(), 9, fetch, None).unwrap();
+        let entry = fetch_to_inventory(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            fetch,
+            None,
+        )
+        .unwrap();
         assert_eq!(entry.message_id.as_deref(), Some("abc@example.test"));
         assert_eq!(entry.in_reply_to.as_deref(), Some("parent@example.test"));
         // IMAP ENVELOPE has no References field, so the list stays empty.

@@ -5,8 +5,9 @@ use crate::ews::{self, contacts::Node};
 use bifrost_types::{ErrorScope, FolderId};
 
 pub(super) async fn books(account: &GraphAccount) -> Vec<AddressBook> {
-    let routing = account.routing_map.read().await;
-    let meta = account.public_folder_meta.read().await;
+    let discovery = account.public_folders.snapshot().await;
+    let routing = &discovery.routing;
+    let meta = &discovery.metadata;
     let mut books: Vec<_> = meta
         .iter()
         .filter(|(folder, meta)| {
@@ -41,21 +42,24 @@ async fn routing(
     operation: AccountOperation,
 ) -> Result<ews::EwsHeaders, AccountError> {
     account
+        .public_folders
         .public_folder_routing(&FolderId(folder.to_string()))
         .await
         .map(|route| route.headers())
         .ok_or_else(|| {
-            account.missing_public_collection_route_error(
-                operation,
-                &FolderId(folder.to_string()),
-                ErrorScope::ContactCollection,
-                // Contact, matching what `ContactCollection.resource()`
-                // reports: an Outlook user sees a vanished address book in
-                // the contacts UI, so a consumer routing on either the kind
-                // or the scope must reach the same contacts handling.
-                bifrost_types::ResourceKind::Contact,
-                folder,
-            )
+            account
+                .public_folders
+                .missing_public_collection_route_error(
+                    operation,
+                    &FolderId(folder.to_string()),
+                    ErrorScope::ContactCollection,
+                    // Contact, matching what `ContactCollection.resource()`
+                    // reports: an Outlook user sees a vanished address book in
+                    // the contacts UI, so a consumer routing on either the kind
+                    // or the scope must reach the same contacts handling.
+                    bifrost_types::ResourceKind::Contact,
+                    folder,
+                )
         })
 }
 
@@ -500,7 +504,9 @@ Second</t:Street><t:City>London</t:City><t:State>Region</t:State><t:PostalCode>1
     #[tokio::test]
     async fn nc2b_public_books_are_discoverable_read_only_without_pins() {
         let (script, mut account) = account(vec![r#"{"value":[]}"#.into()]);
-        account.public_folders = Some(super::super::super::PublicFolderScope::hierarchy_only());
+        account
+            .public_folders
+            .set_policy(super::super::super::PublicFolderScope::hierarchy_only());
         for (folder, class, read) in [
             ("people", "IPF.Contact.Custom", true),
             ("lookalike", "IPF.Contactless", true),

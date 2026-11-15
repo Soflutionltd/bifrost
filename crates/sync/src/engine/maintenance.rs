@@ -6,7 +6,7 @@ pub(super) struct MaintenanceGate<'a> {
     pub control: &'a SyncControl,
     pub scheduler: &'a Scheduler,
     pub current: &'a ArcSwap<crate::types::Incarnation>,
-    pub throttles: &'a crate::recovery::ThrottleBucket,
+    pub throttles: &'a crate::throttle::ThrottleBucket,
     pub account_id: &'a AccountId,
     pub shutdown: &'a CancellationToken,
     pub boundary_tx: &'a watch::Sender<BoundaryRequest>,
@@ -67,7 +67,7 @@ impl MaintenanceGate<'_> {
                 () = self.shutdown.cancelled() => return Err(Error::ShuttingDown),
                 _ = boundary.changed() => continue,
                 admitted = gate.admit_keys(crate::scheduler::WorkKind::Sync, |account| {
-                    scopes.iter().flat_map(|scope| crate::recovery::declared_keys(
+                    scopes.iter().flat_map(|scope| crate::throttle::declared_keys(
                         account, self.account_id, bifrost_types::ThrottleWork::Scope(scope),
                     )).collect()
                 }) => admitted,

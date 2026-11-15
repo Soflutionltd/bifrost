@@ -124,7 +124,9 @@ fn fetch_consumer_propagates_terminal_no_and_surrenders_buffered_events() {
         Err(err) => err,
         Ok(_) => panic!("terminal NO must fail FETCH"),
     };
-    assert!(matches!(err, Error::No { text, .. } if text == "Rejected"));
+    assert!(
+        matches!(err, Error::ServerStatus(crate::error::ServerStatus::No { text, .. }) if text == "Rejected")
+    );
     assert_eq!(
         finalized.reclassified_as_events,
         vec![UntaggedResponse::Exists(12)],
@@ -158,7 +160,9 @@ async fn streaming_fetch_consumer_propagates_terminal_no_and_closes_channel() {
         Err(err) => err,
         Ok(_) => panic!("terminal NO must fail streaming FETCH"),
     };
-    assert!(matches!(err, Error::No { text, .. } if text == "Rejected"));
+    assert!(
+        matches!(err, Error::ServerStatus(crate::error::ServerStatus::No { text, .. }) if text == "Rejected")
+    );
     assert_eq!(
         finalized.reclassified_as_events,
         vec![UntaggedResponse::Exists(12)],
@@ -188,7 +192,9 @@ fn expunge_consumer_propagates_terminal_bad_and_surrenders_both_buffers() {
         Err(err) => err,
         Ok(_) => panic!("terminal BAD must fail EXPUNGE"),
     };
-    assert!(matches!(err, Error::Bad { text, .. } if text == "Bad command"));
+    assert!(
+        matches!(err, Error::ServerStatus(crate::error::ServerStatus::Bad { text, .. }) if text == "Bad command")
+    );
     assert_eq!(
         finalized.reclassified_as_events,
         vec![UntaggedResponse::Exists(12), UntaggedResponse::Expunge(3)],
@@ -210,7 +216,7 @@ fn sort_consumer_empty_result_returns_ok() {
     let result = consumer.finalize(tagged_ok(), &default_ctx());
     let sorted = result.output.expect("an empty SORT result is not an error");
     assert!(sorted.ids.is_empty());
-    assert_eq!(sorted.mod_seq, None);
+    assert_eq!(sorted.mod_seq.map(crate::types::ModSeq::get), None);
     assert!(result.reclassified_as_events.is_empty());
 }
 
@@ -242,10 +248,12 @@ fn search_consumer_keeps_the_solicited_reply_when_uid_expansion_is_incomplete() 
     let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
     assert!(matches!(
         result.output,
-        Err(Error::SearchResultTruncated {
-            returned: 1_000_000,
-            omitted: Some(2_000_000),
-        })
+        Err(Error::ResultLimit(
+            crate::error::ResultLimit::SearchTruncated {
+                returned: 1_000_000,
+                omitted: Some(2_000_000),
+            }
+        ))
     ));
     assert_eq!(
         result.reclassified_as_events,
@@ -304,7 +312,9 @@ fn search_consumer_rejects_a_bare_star_and_counts_overlap_once() {
     assert!(
         matches!(
             Box::new(consumer).finalize(tagged_ok(), &ctx).output,
-            Err(Error::SearchResultTruncated { omitted: None, .. })
+            Err(Error::ResultLimit(
+                crate::error::ResultLimit::SearchTruncated { omitted: None, .. }
+            ))
         ),
         "a standalone `*` must not expand to the literal id 4294967295"
     );
@@ -417,7 +427,13 @@ fn append_consumer_uses_an_untagged_appenduid_as_the_answer() {
     );
 
     let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
-    assert_eq!(result.output.expect("tagged OK"), Some((4242, 12)));
+    assert_eq!(
+        result.output.expect("tagged OK"),
+        Some(crate::types::AppendUid {
+            validity: crate::types::UidValidity::new(4242).unwrap(),
+            uid: crate::types::Uid::new(12).unwrap()
+        })
+    );
     assert_eq!(
         result.reclassified_as_events,
         vec![UntaggedResponse::Exists(3)],
@@ -441,7 +457,13 @@ fn append_consumer_surrenders_an_untagged_appenduid_the_tagged_code_outranks() {
         }),
         &ctx,
     );
-    assert_eq!(result.output.expect("tagged OK"), Some((9, 7)));
+    assert_eq!(
+        result.output.expect("tagged OK"),
+        Some(crate::types::AppendUid {
+            validity: crate::types::UidValidity::new(9).unwrap(),
+            uid: crate::types::Uid::new(7).unwrap()
+        })
+    );
     assert_eq!(result.reclassified_as_events, vec![untagged]);
 }
 
@@ -477,7 +499,24 @@ fn multi_append_consumer_expands_an_untagged_appenduid_and_surrenders_on_failure
     let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
     assert_eq!(
         result.output.expect("tagged OK"),
-        vec![(5, 10), (5, 11), (5, 12), (5, 20)]
+        vec![
+            crate::types::AppendUid {
+                validity: crate::types::UidValidity::new(5).unwrap(),
+                uid: crate::types::Uid::new(10).unwrap()
+            },
+            crate::types::AppendUid {
+                validity: crate::types::UidValidity::new(5).unwrap(),
+                uid: crate::types::Uid::new(11).unwrap()
+            },
+            crate::types::AppendUid {
+                validity: crate::types::UidValidity::new(5).unwrap(),
+                uid: crate::types::Uid::new(12).unwrap()
+            },
+            crate::types::AppendUid {
+                validity: crate::types::UidValidity::new(5).unwrap(),
+                uid: crate::types::Uid::new(20).unwrap()
+            }
+        ]
     );
     assert!(
         result.reclassified_as_events.is_empty(),
@@ -491,7 +530,7 @@ fn multi_append_consumer_expands_an_untagged_appenduid_and_surrenders_on_failure
     assert_eq!(result.reclassified_as_events, vec![untagged]);
 }
 
-fn multi_append_answer(submitted: usize, uids: Vec<UidRange>) -> Vec<(u32, u32)> {
+fn multi_append_answer(submitted: usize, uids: Vec<UidRange>) -> Vec<crate::types::AppendUid> {
     let consumer = MultiAppendConsumer::new(submitted);
     let tagged = tagged_ok_with(ResponseCode::AppendUid {
         uid_validity: 7,
@@ -527,7 +566,20 @@ fn multi_append_consumer_refuses_an_appenduid_whose_count_disagrees_without_expa
 fn multi_append_consumer_expands_a_backwards_range() {
     assert_eq!(
         multi_append_answer(3, vec![UidRange::range(12, 10)]),
-        vec![(7, 10), (7, 11), (7, 12)]
+        vec![
+            crate::types::AppendUid {
+                validity: crate::types::UidValidity::new(7).unwrap(),
+                uid: crate::types::Uid::new(10).unwrap()
+            },
+            crate::types::AppendUid {
+                validity: crate::types::UidValidity::new(7).unwrap(),
+                uid: crate::types::Uid::new(11).unwrap()
+            },
+            crate::types::AppendUid {
+                validity: crate::types::UidValidity::new(7).unwrap(),
+                uid: crate::types::Uid::new(12).unwrap()
+            }
+        ]
     );
 }
 

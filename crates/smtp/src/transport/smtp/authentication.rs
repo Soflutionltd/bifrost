@@ -44,11 +44,6 @@ pub(crate) use framing::{decode_auth_challenge, decode_scram_payload};
 use credentials::oauth_token_error;
 pub use credentials::{Credentials, IntoSecretString};
 
-// This exchange remains SMTP-owned: it interprets 334 challenge framing and
-// drives SMTP continuation writes. Cryptographic SCRAM computation delegates
-// to bifrost-sasl; moving this state machine there would couple that private
-// computation layer to SMTP's Error and reply semantics.
-
 /// Represents authentication mechanisms
 #[derive(PartialEq, Eq, Copy, Clone, Hash, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -129,78 +124,41 @@ impl Mechanism {
         }
     }
 
-    /// Returns the string to send to the server, using the provided
-    /// username, password and challenge in some cases.
-    ///
-    /// `oauth_token` is the access token already resolved from the
-    /// credential's `TokenSource` by the connection's auth driver (which
-    /// has the async/blocking context to read it). It is `None` for
-    /// password mechanisms and ignored by them.
-    pub(crate) fn response_with_token(
+    /// Prepare a password exchange before writing AUTH. SCRAM's selected
+    /// channel binding is carried separately by its framing adapter.
+    pub(crate) fn password_client(
         self,
         credentials: &Credentials,
-        challenge: Option<&str>,
-        oauth_token: Option<&str>,
-    ) -> Result<Secret, Error> {
-        self.response_with_token_at_index(credentials, challenge, 0, oauth_token)
+    ) -> Result<bifrost_sasl::SaslClient, Error> {
+        let (username, password) = credentials.password_parts()?;
+        match self {
+            Self::Plain => {
+                bifrost_sasl::SaslClient::plain("", username, password).map_err(Error::from)
+            }
+            Self::Login => Ok(bifrost_sasl::SaslClient::login(username, password.into())),
+            _ => Err(error::invalid_input(
+                "mechanism requires OAuth credentials or a SCRAM binding",
+            )),
+        }
     }
 
-    pub(crate) fn response_with_token_at_index(
+    /// OAuth exchange construction requires the token already resolved by the
+    /// adapter. There is no optional token in the client construction path.
+    pub(crate) fn oauth_client(
         self,
-        credentials: &Credentials,
-        challenge: Option<&str>,
-        challenge_index: usize,
-        oauth_token: Option<&str>,
-    ) -> Result<Secret, Error> {
-        match self {
-            Mechanism::ScramSha1
-            | Mechanism::ScramSha256
-            | Mechanism::ScramSha1Plus
-            | Mechanism::ScramSha256Plus => Err(error::invalid_input(
-                "SCRAM is driven by the SCRAM exchange, not the stateless mechanism encoder",
-            )),
-            Mechanism::Plain => match challenge {
-                Some(_) => Err(error::parse("This mechanism does not expect a challenge")),
-                None => {
-                    let (username, password) = credentials.password_parts()?;
-                    bifrost_sasl::plain_payload("", username, password).map_err(Error::from)
-                }
-            },
-            Mechanism::Login => {
-                let (username, password) = credentials.password_parts()?;
-                challenge.ok_or_else(|| {
-                    error::invalid_input("This mechanism does expect a challenge")
-                })?;
-                match challenge_index {
-                    0 => Ok(Secret::from(username)),
-                    1 => Ok(Secret::from(password)),
-                    _ => Err(error::parse("Unexpected LOGIN challenge")),
-                }
+        identity: &str,
+        token: &str,
+    ) -> Result<bifrost_sasl::SaslClient, Error> {
+        let mechanism = match self {
+            Self::Xoauth2 => bifrost_sasl::OAuthMechanism::Xoauth2,
+            Self::OAuthBearer => bifrost_sasl::OAuthMechanism::OAuthBearer,
+            _ => {
+                return Err(error::invalid_input(
+                    "mechanism does not accept OAuth credentials",
+                ));
             }
-            Mechanism::Xoauth2 => match challenge {
-                Some(_) => Ok(Secret::from(
-                    bifrost_sasl::OAuthMechanism::Xoauth2.error_ack(),
-                )),
-                None => {
-                    let (identity, access_token) =
-                        credentials.oauth_identity_and_token(oauth_token)?;
-                    // Shared bifrost-sasl builder returns the raw payload as a
-                    // zeroizing Secret; the AUTH command base64-frames it. The
-                    // Secret drops and zeroizes after this owned copy.
-                    Ok(bifrost_sasl::xoauth2_payload(identity, access_token))
-                }
-            },
-            Mechanism::OAuthBearer => match challenge {
-                Some(_) => Ok(Secret::from(
-                    bifrost_sasl::OAuthMechanism::OAuthBearer.error_ack(),
-                )),
-                None => {
-                    let (identity, access_token) =
-                        credentials.oauth_identity_and_token(oauth_token)?;
-                    Ok(bifrost_sasl::oauthbearer_payload(identity, access_token))
-                }
-            },
-        }
+        };
+        bifrost_sasl::SaslClient::oauth(mechanism, identity, token).map_err(Error::from)
     }
 }
 
@@ -312,7 +270,7 @@ const SMTP_MECHANISMS: &[Mechanism] = &[
 ///
 /// OAuth credentials never flow through the SCRAM/password ladder; they pick
 /// the first allowed `OAUTHBEARER` / `XOAUTH2` rung in shared order and run
-/// the legacy stateless encoder. Returns `None` for password credentials so
+/// the shared SASL client. Returns `None` for password credentials so
 /// the caller falls through to [`password_mechanism`].
 pub(crate) fn oauth_mechanism(
     mechanisms: &[Mechanism],
@@ -349,27 +307,7 @@ pub(crate) enum ScramStep {
     Complete,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScramExchangeState {
-    /// Sent client-first, waiting for server-first.
-    AwaitServerFirst,
-    /// Sent client-final, waiting for server-final.
-    AwaitServerFinal,
-    Done,
-}
-
-/// Stateful SCRAM exchange computation for SMTP.
-///
-/// Mirrors IMAP's `AuthenticateScramConsumer`: it only computes the next
-/// client line from a decoded server continuation; it never owns the socket.
-/// The connection's `auth_scram` driver frames the wire `334` rounds and feeds
-/// each decoded continuation into [`ScramExchange::step`].
-/// Classify a `bifrost-sasl` failure, then name the mechanism being driven.
-///
-/// Classification happens before typed diagnostic attribution. A
-/// mechanism token is not secret (it travels in clear on the AUTH command line
-/// and in the EHLO advertisement); it is support-only because the telemetry
-/// tier carries no free-form text at all.
+/// Classify a shared SASL failure before adding SMTP mechanism attribution.
 fn named_sasl_error(mechanism: Mechanism, error: bifrost_sasl::SaslError) -> Error {
     let mapped: Error = error.into();
     mapped.with_phase(SmtpCommandPhase::Auth {
@@ -377,17 +315,11 @@ fn named_sasl_error(mechanism: Mechanism, error: bifrost_sasl::SaslError) -> Err
     })
 }
 
+/// SMTP base64 framing adapter for the shared SASL client.
 pub(crate) struct ScramExchange {
-    hash: ScramHash,
-    binding: ScramChannelBinding,
-    /// Prepared (RFC 4013 `SASLprep`) in `new`, before the AUTH line is sent, so a password the
-    /// caller supplied that cannot be prepared is refused locally rather than
-    /// discovered after the server-first message.
-    password: bifrost_sasl::ScramPassword,
-    client_nonce: String,
-    client_first_bare: Zeroizing<String>,
-    expected_server_signature: Option<Vec<u8>>,
-    state: ScramExchangeState,
+    client: bifrost_sasl::SaslClient,
+    first: Secret,
+    mechanism: Mechanism,
 }
 
 impl ScramExchange {
@@ -395,77 +327,45 @@ impl ScramExchange {
         hash: ScramHash,
         binding: ScramChannelBinding,
         username: &str,
-        password: bifrost_sasl::Secret,
-    ) -> Result<ScramExchange, Error> {
-        let client_nonce = generate_scram_nonce()?;
-        let username = Zeroizing::new(bifrost_sasl::prepare_scram_username(username)?);
-        let client_first_bare = Zeroizing::new(format!("n={},r={client_nonce}", username.as_str()));
-        let password = bifrost_sasl::prepare_scram_password(password.as_str())?;
-        Ok(ScramExchange {
+        password: Secret,
+    ) -> Result<Self, Error> {
+        let mut client = bifrost_sasl::SaslClient::scram(
             hash,
             binding,
-            password,
-            client_nonce,
-            client_first_bare,
-            expected_server_signature: None,
-            state: ScramExchangeState::AwaitServerFirst,
+            username,
+            &password,
+            generate_scram_nonce()?,
+        )?;
+        let mechanism = SMTP_MECHANISMS
+            .iter()
+            .copied()
+            .find(|m| m.shared() == client.mechanism())
+            .ok_or_else(|| error::internal("unmapped SCRAM mechanism"))?;
+        let first = client
+            .initial_response()
+            .ok_or_else(|| error::internal("SCRAM initial response missing"))?;
+        Ok(Self {
+            client,
+            first: crate::base64::encode_zeroizing(first.as_bytes()).into(),
+            mechanism,
         })
     }
 
-    fn mechanism(&self) -> Mechanism {
-        match (self.hash, self.binding.binding()) {
-            (ScramHash::Sha1, bifrost_sasl::ChannelBinding::None) => Mechanism::ScramSha1,
-            (ScramHash::Sha256, bifrost_sasl::ChannelBinding::None) => Mechanism::ScramSha256,
-            (ScramHash::Sha1, _) => Mechanism::ScramSha1Plus,
-            (ScramHash::Sha256, _) => Mechanism::ScramSha256Plus,
-            _ => unreachable!("unsupported SCRAM hash"),
-        }
-    }
-
-    /// The client-first message to send after the server's first `334`,
-    /// already base64-encoded: `base64(gs2_header || client_first_bare)`. The
-    /// GS2 header comes from the binding so it can never desync from the `c=`
-    /// value computed in `scram_client_final`.
     pub(crate) fn client_first(&self) -> Secret {
-        let client_first = Zeroizing::new(format!(
-            "{}{}",
-            self.binding.gs2_header(),
-            self.client_first_bare.as_str()
-        ));
-        Secret::from(crate::base64::encode_zeroizing(client_first.as_bytes()))
+        self.first.clone()
     }
 
-    /// Advance the exchange given a decoded (UTF-8) server continuation.
     pub(crate) fn step(&mut self, server_line: &str) -> Result<ScramStep, Error> {
-        match self.state {
-            ScramExchangeState::AwaitServerFirst => {
-                let (client_final, server_signature) = bifrost_sasl::scram_client_final(
-                    self.hash,
-                    &self.password,
-                    &self.client_nonce,
-                    self.client_first_bare.as_str(),
-                    server_line,
-                    &self.binding,
-                )
-                .map_err(|e| named_sasl_error(self.mechanism(), e))?;
-                self.expected_server_signature = Some(server_signature);
-                self.state = ScramExchangeState::AwaitServerFinal;
-                // bifrost-sasl returns the already-base64 client line. Keep
-                // its framing and zeroizing owner through the SMTP write.
-                Ok(ScramStep::Reply(client_final))
-            }
-            ScramExchangeState::AwaitServerFinal => {
-                let expected = self.expected_server_signature.take().ok_or_else(|| {
-                    error::parse("SCRAM server signature missing from client state")
-                })?;
-                bifrost_sasl::verify_server_final(server_line, &expected)
-                    .map_err(|e| named_sasl_error(self.mechanism(), e))?;
-                self.state = ScramExchangeState::Done;
-                Ok(ScramStep::Complete)
-            }
-            ScramExchangeState::Done => Err(error::parse(
-                "unexpected SCRAM continuation after server-final",
+        match self
+            .client
+            .step(server_line.as_bytes())
+            .map_err(|e| named_sasl_error(self.mechanism, e))?
+        {
+            bifrost_sasl::Step::Reply(reply) => Ok(ScramStep::Reply(
+                crate::base64::encode_zeroizing(reply.as_bytes()).into(),
             )),
+            bifrost_sasl::Step::Done => Ok(ScramStep::Complete),
+            _ => Err(error::internal("unmapped SASL step")),
         }
     }
 }
@@ -767,16 +667,16 @@ mod test {
     }
 
     #[test]
-    fn scram_response_encoder_is_an_error() {
-        let credentials = Credentials::password("u".to_owned(), "p".to_owned());
+    fn scram_requires_its_binding_aware_constructor() {
+        let credentials = Credentials::password("u", "p");
         assert!(
             Mechanism::ScramSha256
-                .response_with_token(&credentials, None, None)
+                .password_client(&credentials)
                 .is_err()
         );
         assert!(
             Mechanism::ScramSha256Plus
-                .response_with_token(&credentials, Some("anything"), None)
+                .password_client(&credentials)
                 .is_err()
         );
     }
@@ -1352,187 +1252,135 @@ mod test {
         );
     }
 
+    fn reply(step: bifrost_sasl::Step) -> bifrost_sasl::Secret {
+        match step {
+            bifrost_sasl::Step::Reply(reply) => reply,
+            _ => panic!("expected SASL reply"),
+        }
+    }
+
     #[test]
     fn test_plain() {
-        let mechanism = Mechanism::Plain;
-
-        let credentials = Credentials::password("username".to_owned(), "password".to_owned());
-
+        let mut client = Mechanism::Plain
+            .password_client(&Credentials::password("username", "password"))
+            .unwrap();
         assert_eq!(
-            mechanism
-                .response_with_token(&credentials, None, None)
-                .unwrap()
-                .as_str(),
-            "\u{0}username\u{0}password"
+            client.initial_response().unwrap().as_str(),
+            "\0username\0password"
         );
-        assert!(
-            mechanism
-                .response_with_token(&credentials, Some("test"), None)
-                .is_err()
-        );
+        assert!(client.step(b"test").is_err());
     }
 
     #[test]
     fn plain_rejects_nul_in_credentials() {
-        let mechanism = Mechanism::Plain;
-
-        // authzid injection: the NUL would open a third PLAIN field.
-        let injected =
-            Credentials::password("admin\u{0}username".to_owned(), "password".to_owned());
-        assert!(
-            mechanism
-                .response_with_token(&injected, None, None)
-                .is_err()
-        );
-
-        let injected_password =
-            Credentials::password("username".to_owned(), "pass\u{0}word".to_owned());
-        assert!(
-            mechanism
-                .response_with_token(&injected_password, None, None)
-                .is_err()
-        );
+        for credentials in [
+            Credentials::password("admin\0username", "password"),
+            Credentials::password("username", "pass\0word"),
+        ] {
+            assert!(Mechanism::Plain.password_client(&credentials).is_err());
+        }
     }
 
     #[test]
     fn test_login() {
-        let mechanism = Mechanism::Login;
-
-        let credentials = Credentials::password("alice".to_owned(), "wonderland".to_owned());
-
+        let mut client = Mechanism::Login
+            .password_client(&Credentials::password("alice", "wonderland"))
+            .unwrap();
+        assert!(client.initial_response().is_none());
+        assert_eq!(reply(client.step(b"Username").unwrap()).as_str(), "alice");
         assert_eq!(
-            mechanism
-                .response_with_token(&credentials, Some("Username"), None)
-                .unwrap()
-                .as_str(),
-            "alice"
-        );
-        assert_eq!(
-            mechanism
-                .response_with_token_at_index(&credentials, Some("Password"), 1, None)
-                .unwrap()
-                .as_str(),
+            reply(client.step(b"Password").unwrap()).as_str(),
             "wonderland"
         );
-        assert!(
-            mechanism
-                .response_with_token(&credentials, None, None)
-                .is_err()
-        );
+        assert!(client.step(b"again").is_err());
     }
 
     #[test]
     fn login_challenges_are_positional_not_prompt_matched() {
-        let mechanism = Mechanism::Login;
-
-        let credentials = Credentials::password("alice".to_owned(), "wonderland".to_owned());
-
+        let mut client = Mechanism::Login
+            .password_client(&Credentials::password("alice", "wonderland"))
+            .unwrap();
         assert_eq!(
-            mechanism
-                .response_with_token_at_index(&credentials, Some("Nom d'utilisateur: "), 0, None)
-                .unwrap()
-                .as_str(),
+            reply(client.step(b"Nom d'utilisateur: ").unwrap()).as_str(),
             "alice"
         );
         assert_eq!(
-            mechanism
-                .response_with_token_at_index(&credentials, Some("Enter password: "), 1, None)
-                .unwrap()
-                .as_str(),
+            reply(client.step(b"Enter password: ").unwrap()).as_str(),
             "wonderland"
-        );
-        assert!(
-            mechanism
-                .response_with_token(&credentials, None, None)
-                .is_err()
         );
     }
 
     #[test]
     fn oauth_error_answers_do_not_reuse_the_initial_payload() {
-        let credentials = Credentials::oauth2("user", "token");
         for (mechanism, expected) in [(Mechanism::Xoauth2, ""), (Mechanism::OAuthBearer, "\x01")] {
-            let answer = mechanism
-                .response_with_token_at_index(&credentials, Some(r#"{"status":"401"}"#), 0, None)
-                .unwrap();
-            assert_eq!(answer.as_str(), expected);
+            let mut client = mechanism.oauth_client("user", "token").unwrap();
+            client.initial_response().unwrap();
+            assert_eq!(
+                reply(client.step(br#"{"status":"401"}"#).unwrap()).as_str(),
+                expected
+            );
+            assert!(client.step(b"repeat").is_err());
+        }
+    }
+
+    #[test]
+    fn oauth_frame_delimiters_are_local_refusals() {
+        for mechanism in [Mechanism::Xoauth2, Mechanism::OAuthBearer] {
+            for (identity, token) in [("u\x01ser", "token"), ("user", "tok\x01en")] {
+                let error = mechanism.oauth_client(identity, token).unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    &crate::transport::smtp::error::ErrorKind::InvalidInput
+                );
+            }
         }
     }
 
     #[test]
     fn test_xoauth2() {
-        let mechanism = Mechanism::Xoauth2;
-
-        let credentials = Credentials::oauth2(
-            "username".to_owned(),
-            "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==".to_owned(),
-        );
-
-        let token = "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==";
+        let mut client = Mechanism::Xoauth2
+            .oauth_client("username", "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==")
+            .unwrap();
         assert_eq!(
-            mechanism
-                .response_with_token(&credentials, None, Some(token))
-                .unwrap()
-                .as_str(),
+            client.initial_response().unwrap().as_str(),
             "user=username\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01"
         );
-        // XOAUTH2 requires an empty acknowledgement before the final failure.
         assert_eq!(
-            mechanism
-                .response_with_token(&credentials, Some(r#"{"status":"401"}"#), Some(token))
-                .unwrap()
-                .as_str(),
+            reply(client.step(br#"{"status":"401"}"#).unwrap()).as_str(),
             ""
         );
     }
 
     #[test]
     fn test_oauthbearer() {
-        let mechanism = Mechanism::OAuthBearer;
-
-        let credentials = Credentials::oauth2(
-            "user@example.com".to_owned(),
-            "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==".to_owned(),
-        );
-
-        let token = "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==";
-        let response = mechanism
-            .response_with_token(&credentials, None, Some(token))
-            .unwrap();
-        assert_eq!(
-            response.as_str(),
-            "n,a=user@example.com,\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01"
-        );
-        assert!(!response.contains("\x01host="));
-        assert!(!response.contains("\x01port="));
-        assert_eq!(
-            mechanism
-                .response_with_token(&credentials, Some("{}"), Some(token))
-                .unwrap()
-                .as_str(),
-            "\x01"
-        );
-        assert_eq!(
-            mechanism
-                .response_with_token(
-                    &credentials,
-                    Some(r#"{"status":"invalid_token"}"#),
-                    Some(token)
+        for challenge in [
+            b"{}".as_slice(),
+            br#"{"status":"invalid_token"}"#.as_slice(),
+        ] {
+            let mut client = Mechanism::OAuthBearer
+                .oauth_client(
+                    "user@example.com",
+                    "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==",
                 )
-                .unwrap()
-                .as_str(),
-            "\x01"
-        );
+                .unwrap();
+            let response = client.initial_response().unwrap();
+            assert_eq!(
+                response.as_str(),
+                "n,a=user@example.com,\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01"
+            );
+            assert!(!response.contains("\x01host="));
+            assert!(!response.contains("\x01port="));
+            assert_eq!(reply(client.step(challenge).unwrap()).as_str(), "\x01");
+        }
     }
 
     #[test]
     fn test_oauthbearer_escapes_gs2_identity() {
-        let mechanism = Mechanism::OAuthBearer;
-        let credentials = Credentials::oauth2("a,b=c".to_owned(), "token".to_owned());
-
         assert_eq!(
-            mechanism
-                .response_with_token(&credentials, None, Some("token"))
+            Mechanism::OAuthBearer
+                .oauth_client("a,b=c", "token")
+                .unwrap()
+                .initial_response()
                 .unwrap()
                 .as_str(),
             "n,a=a=2Cb=3Dc,\x01auth=Bearer token\x01\x01"
@@ -1543,22 +1391,15 @@ mod test {
     fn test_rejects_wrong_credential_kind() {
         assert!(
             Mechanism::Plain
-                .response_with_token(
-                    &Credentials::oauth2("alice".to_owned(), "token".to_owned()),
-                    None,
-                    Some("token"),
-                )
+                .password_client(&Credentials::oauth2("alice", "token"))
                 .is_err()
         );
         assert!(
             Mechanism::Xoauth2
-                .response_with_token(
-                    &Credentials::password("alice".to_owned(), "wonderland".to_owned()),
-                    None,
-                    None,
-                )
+                .password_client(&Credentials::password("alice", "wonderland"))
                 .is_err()
         );
+        assert!(Mechanism::Plain.oauth_client("alice", "token").is_err());
     }
 
     #[tokio::test]
@@ -1573,11 +1414,13 @@ mod test {
         // The token threads through the source convenience constructor and
         // is read back by both the async and the blocking resolver.
         let (_identity, blocking_token) = credentials.oauth2_token_blocking().unwrap();
-        let (_identity, token) = credentials.oauth2_token().await.unwrap();
+        let (identity, token) = credentials.oauth2_token().await.unwrap();
         assert_eq!(blocking_token.as_str(), token.as_str());
         assert_eq!(
             Mechanism::Xoauth2
-                .response_with_token(&credentials, None, Some(token.as_str()))
+                .oauth_client(&identity, token.as_str())
+                .unwrap()
+                .initial_response()
                 .unwrap()
                 .as_str(),
             "user=alice\x01auth=Bearer access-token\x01\x01"
@@ -1595,9 +1438,11 @@ mod test {
 
         // The SASL payload is built from the token the source currently
         // holds, both through the async read and the blocking read.
-        let (_identity, token) = credentials.oauth2_token().await.unwrap();
+        let (identity, token) = credentials.oauth2_token().await.unwrap();
         let payload = Mechanism::OAuthBearer
-            .response_with_token(&credentials, None, Some(token.as_str()))
+            .oauth_client(&identity, token.as_str())
+            .unwrap()
+            .initial_response()
             .unwrap();
         assert!(
             payload.contains("auth=Bearer old-token"),
@@ -1608,9 +1453,11 @@ mod test {
         // Rotate the token on the shared source; the next read presents the
         // new token with no reconstruction of the credential.
         source.set(AccessToken::new("new-token", None));
-        let (_identity, token) = credentials.oauth2_token().await.unwrap();
+        let (identity, token) = credentials.oauth2_token().await.unwrap();
         let payload = Mechanism::Xoauth2
-            .response_with_token(&credentials, None, Some(token.as_str()))
+            .oauth_client(&identity, token.as_str())
+            .unwrap()
+            .initial_response()
             .unwrap();
         assert!(
             payload.contains("auth=Bearer new-token"),
@@ -1634,9 +1481,10 @@ mod standalone_tests {
             password_mechanism(PASSWORD_MECHANISMS, &ServerInfo::default(), None).unwrap_err();
         assert!(refused.is_policy());
         let credentials = Credentials::password("user", "password");
-        let malformed = Mechanism::Plain
-            .response_with_token(&credentials, Some("unexpected"), None)
-            .unwrap_err();
+        let mut client = Mechanism::Plain.password_client(&credentials).unwrap();
+        client.initial_response().unwrap();
+        let malformed =
+            crate::transport::smtp::error::Error::from(client.step(b"unexpected").unwrap_err());
         assert!(malformed.is_parse());
         let (_, token) = Credentials::oauth2("user", "token")
             .oauth2_token_blocking()

@@ -26,6 +26,7 @@ use crate::error::{
     Error, FinalResponse, STATUS_BODY_CAP, STATUS_BODY_CONNECTION_MARKER,
     STATUS_BODY_TIMEOUT_MARKER,
 };
+use crate::exchange::{Hop, RequestDeadline};
 use crate::net::{AccountNet, into_byte_stream, wrap_delivery, wrap_metered};
 use crate::rate::{RateGeneration, RateLimitGovernor};
 use crate::redirect::{
@@ -112,119 +113,16 @@ enum TimeoutOverride {
     Inherit,
     Unbounded,
     Bounded(Duration),
+    Deadline(RequestDeadline),
 }
 
 impl TimeoutOverride {
-    fn resolve(self, inherited: Option<Duration>) -> Option<Duration> {
+    fn resolve(self, inherited: Option<Duration>) -> RequestDeadline {
         match self {
-            Self::Inherit => inherited,
-            Self::Unbounded => None,
-            Self::Bounded(duration) => Some(duration),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct RequestDeadline(Option<tokio::time::Instant>);
-
-impl RequestDeadline {
-    fn from_timeout(timeout: Option<Duration>) -> Self {
-        Self(timeout.map(|timeout| tokio::time::Instant::now() + timeout))
-    }
-
-    /// Deadline check for the response-body path.
-    ///
-    /// Expiry here is not the same event as expiry before dispatch:
-    /// response headers already arrived, so the server acted on the
-    /// request and the evidence is `Acknowledged`. That routes to
-    /// `Protocol(PartialResponse)` rather than a transport class, which
-    /// is what a truncated body is. The point is that a body cut short
-    /// by the deadline must never surface as a clean end-of-stream -
-    /// `send()` would otherwise hand back a prefix of the payload as if
-    /// it were the whole response.
-    pub(crate) fn check_body(self) -> Result<(), Error> {
-        match self.0 {
-            Some(at) if tokio::time::Instant::now() >= at => Err(Error::Timeout {
-                transmission_state: TransmissionState::Acknowledged,
-            }),
-            _ => Ok(()),
-        }
-    }
-
-    /// Bound a wait on the response-body path by the total deadline.
-    /// Shared bandwidth admission waits are the reason this exists: they are the one class of wait the
-    /// retry loop never sees, and with a low cap they can outlast the
-    /// caller's total timeout by minutes.
-    pub(crate) async fn bound_body<F: std::future::Future>(
-        self,
-        future: F,
-    ) -> Result<F::Output, Error> {
-        match self.0 {
-            Some(at) => tokio::time::timeout_at(at, future)
-                .await
-                .map_err(|_| Error::Timeout {
-                    transmission_state: TransmissionState::Acknowledged,
-                }),
-            None => Ok(future.await),
-        }
-    }
-
-    fn remaining(self) -> Result<Option<Duration>, Error> {
-        self.0
-            .map(|deadline| {
-                deadline
-                    .checked_duration_since(tokio::time::Instant::now())
-                    .filter(|remaining| !remaining.is_zero())
-                    .ok_or(Error::Timeout {
-                        transmission_state: TransmissionState::Unsent,
-                    })
-            })
-            .transpose()
-    }
-
-    /// Bound a pre-acknowledgement wait by the total deadline.
-    ///
-    /// Everything this covers - rate-limit admission, token lookup, the
-    /// forced refresh after a 401 - happens before the replacement
-    /// attempt puts anything on the wire, so expiry is `Unsent`. The
-    /// post-header counterpart is `bound_body`, which is `Acknowledged`;
-    /// keeping the two apart is the whole point of routing every wait
-    /// through this type rather than reaching for the instant directly.
-    async fn bound<F: std::future::Future>(self, future: F) -> Result<F::Output, Error> {
-        match self.0 {
-            Some(at) => tokio::time::timeout_at(at, future)
-                .await
-                .map_err(|_| Error::Timeout {
-                    transmission_state: TransmissionState::Unsent,
-                }),
-            None => Ok(future.await),
-        }
-    }
-
-    /// Bound dispatch, including upload admission, by the absolute deadline.
-    /// Once dispatch starts, expiry carries in-flight transmission evidence.
-    async fn bound_dispatch<F: std::future::Future>(self, future: F) -> Result<F::Output, Error> {
-        match self.0 {
-            Some(at) => tokio::time::timeout_at(at, future)
-                .await
-                .map_err(|_| Error::Timeout {
-                    transmission_state: TransmissionState::InFlight,
-                }),
-            None => Ok(future.await),
-        }
-    }
-
-    async fn sleep(self, delay: Duration) -> Result<(), Error> {
-        match self.0 {
-            Some(deadline) => tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
-                .await
-                .map_err(|_| Error::Timeout {
-                    transmission_state: TransmissionState::Unsent,
-                }),
-            None => {
-                tokio::time::sleep(delay).await;
-                Ok(())
-            }
+            Self::Inherit => RequestDeadline::from_timeout(inherited),
+            Self::Unbounded => RequestDeadline::from_timeout(None),
+            Self::Bounded(duration) => RequestDeadline::from_timeout(Some(duration)),
+            Self::Deadline(deadline) => deadline,
         }
     }
 }
@@ -364,7 +262,7 @@ pub struct RequestBuilder {
 }
 
 type ErrorObserver = Arc<dyn Fn(&FinalResponse) + Send + Sync>;
-type RedirectGuard = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+type RedirectGuard = Arc<dyn Fn(&reqwest::Url, &reqwest::Url) -> bool + Send + Sync>;
 
 /// Backing state for the builder. Kept private so the request
 /// pipeline can replace the representation without touching call
@@ -376,7 +274,9 @@ struct RequestBuilderInner {
     /// HTTP method.
     method: reqwest::Method,
     /// Target URL.
-    url: String,
+    url: Result<reqwest::Url, Error>,
+    /// Preserve lexical userinfo rejection before URL parsing discards empty `@`.
+    credential_origin_error: Option<Error>,
     /// Caller-provided headers. Merged with transport-injected
     /// `Authorization` and `traceparent` at send time.
     headers: HeaderMap,
@@ -433,6 +333,7 @@ struct RequestBuilderInner {
     // Session URL admission covers exactly one destination. Shared dispatch
     // funnels may customize accounting, but cannot widen credential authority.
     session_policy: bool,
+    statuses_as_data: Vec<StatusCode>,
 }
 
 impl RequestBuilder {
@@ -463,7 +364,7 @@ impl RequestBuilder {
     #[must_use]
     pub fn redirect_guard(
         mut self,
-        guard: impl Fn(&str, &str) -> bool + Send + Sync + 'static,
+        guard: impl Fn(&reqwest::Url, &reqwest::Url) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.inner.redirect_guard = Some(Arc::new(guard));
         self
@@ -510,15 +411,58 @@ impl RequestBuilder {
         self
     }
 
+    /// Return these statuses with their full body and exchange evidence before
+    /// status retries, authentication recovery or redirect following. The caller
+    /// owns their interpretation, including an explicitly selected 401 or 3xx.
+    /// Other statuses retain the normal transport policy. Error observers run
+    /// only for statuses that remain transport errors.
+    #[must_use]
+    pub fn statuses_as_data(mut self, statuses: impl IntoIterator<Item = StatusCode>) -> Self {
+        self.inner.statuses_as_data = statuses.into_iter().collect();
+        self
+    }
+
+    /// Share an absolute deadline across several protocol requests. Body reads
+    /// and every retry use the same deadline; later timeout setters replace it.
+    #[must_use]
+    pub fn deadline(mut self, deadline: RequestDeadline) -> Self {
+        self.inner.timeout = TimeoutOverride::Deadline(deadline);
+        self
+    }
+
     /// Construct a builder from an account-scoped transport, method,
     /// and URL. The account-scoped wrappers (`AccountNet::get` etc.)
     /// call this.
-    pub(crate) fn new(account: AccountNet, method: reqwest::Method, url: &str) -> Self {
+    pub(crate) fn new(
+        account: AccountNet,
+        method: reqwest::Method,
+        url: impl reqwest::IntoUrl,
+    ) -> Self {
+        // Admission remains conditional on authentication at send time. Retain
+        // lexical refusals here because the parser erases empty userinfo.
+        let has_userinfo = crate::url::has_userinfo(url.as_str());
+        let url = url.into_url().map_err(|error| Error::InvalidRequest {
+            field: "url",
+            detail: error.to_string(),
+        });
+        let credential_origin_error = account.inner.trusted_origins.as_ref().and_then(|origins| {
+            if has_userinfo {
+                Some(Error::InvalidRequest {
+                    field: "url",
+                    detail: "credential destination must not contain userinfo".into(),
+                })
+            } else {
+                url.as_ref()
+                    .ok()
+                    .and_then(|url| origins.admit_url(url).err())
+            }
+        });
         Self {
             inner: RequestBuilderInner {
                 account,
                 method,
-                url: url.to_owned(),
+                url,
+                credential_origin_error,
                 headers: HeaderMap::new(),
                 body: None,
                 cost: None,
@@ -537,6 +481,7 @@ impl RequestBuilder {
                 hop_policy: None,
                 credential_url: false,
                 session_policy: false,
+                statuses_as_data: Vec::new(),
             },
         }
     }
@@ -789,6 +734,7 @@ impl RequestBuilder {
     }
 
     async fn send_buffered(self) -> Result<Response, Error> {
+        let credential_url = self.inner.credential_url;
         let limit = self.inner.account.max_buffered_response();
         let internal = send_streaming_inner(self).await?;
         // Held until the body is drained: this function returning, by any
@@ -830,6 +776,16 @@ impl RequestBuilder {
             body: Bytes::from(accum),
             bytes_in: internal.bytes_in.bytes_in(),
             bytes_out: internal.bytes_out,
+            evidence: {
+                let evidence = evidence
+                    .expect("body completed without error")
+                    .into_evidence();
+                if credential_url {
+                    evidence.redact_request_text()
+                } else {
+                    evidence
+                }
+            },
         })
     }
 
@@ -855,6 +811,7 @@ impl RequestBuilder {
         );
         // Redacted after `wrap_stream`, which attaches the earlier attempts'
         // evidence to a body error, so that history is redacted too.
+        let ledger = internal.evidence.ledger.clone();
         let mut body = internal.evidence.wrap_stream(metered);
         if credential_url {
             use futures::TryStreamExt;
@@ -866,6 +823,7 @@ impl RequestBuilder {
             body: hold_permit(body, internal.permit),
             bytes_in: internal.bytes_in,
             bytes_out: internal.bytes_out,
+            ledger,
         })
     }
 }
@@ -883,9 +841,46 @@ pub struct Response {
     pub bytes_in: u64,
     /// Payload bytes submitted across this request's wire attempts.
     pub bytes_out: u64,
+    /// Ordered wire evidence, including the final response status.
+    evidence: crate::RequestEvidence,
 }
 
 impl Response {
+    /// Exchange evidence in wire order, including the terminal response.
+    #[must_use]
+    pub fn evidence(&self) -> &crate::RequestEvidence {
+        &self.evidence
+    }
+
+    /// Classify this response through the ordinary status-error funnel without
+    /// losing earlier attempts. The body is capped only at this conversion.
+    /// Feed the result to the shared account-error translator and its status
+    /// policy; provider body refinements can still inspect the terminal status.
+    #[must_use]
+    pub fn into_status_error(self) -> Error {
+        let (mut attempts, ledger) = self.evidence.into_parts();
+        // The final response's metadata was retained for body-read failures.
+        // Replace that marker with the complete, capped terminal response.
+        attempts.pop();
+        let source = Error::Status {
+            code: self.status,
+            headers: self.headers,
+            body: crate::error::cap_status_body(self.body),
+        };
+        // A gateway's server error can follow a committed write. Selecting
+        // that response as data must not authorize blind engine replay if
+        // the caller later rejects it through the shared classification.
+        if self.status.is_server_error()
+            && ledger.verdict() == crate::CommitEvidence::MayHaveCommitted
+        {
+            return Error::AttemptHistory {
+                source: Box::new(source),
+                evidence: crate::RequestEvidence::from_ledger(attempts, ledger),
+            };
+        }
+        AttemptEvidence { attempts, ledger }.finish(source)
+    }
+
     /// HTTP status code of the final attempt.
     #[must_use]
     pub fn status(&self) -> StatusCode {
@@ -952,6 +947,8 @@ pub struct StreamingResponse {
     pub bytes_in: RequestByteCounter,
     /// Payload bytes submitted before response headers surfaced.
     pub bytes_out: u64,
+    /// Ordered wire evidence, including the final response status.
+    pub ledger: crate::AttemptLedger,
 }
 
 impl StreamingResponse {
@@ -992,6 +989,10 @@ pub(crate) struct AttemptEvidence {
 }
 
 impl AttemptEvidence {
+    fn into_evidence(self) -> crate::RequestEvidence {
+        crate::RequestEvidence::from_ledger(self.attempts, self.ledger)
+    }
+
     pub(crate) fn finish(self, source: Error) -> Error {
         // Dispatch records each wire outcome once. The terminal stage remains
         // separate evidence and must not be counted as another wire attempt.
@@ -1023,6 +1024,23 @@ impl AttemptEvidence {
         Box::pin(body.map(move |chunk| {
             chunk.map_err(|error| evidence.take().unwrap_or_default().finish(error))
         }))
+    }
+}
+
+/// The pass-through boundary is independent of body metering and admission.
+struct ExchangeBody {
+    status: StatusCode,
+    headers: HeaderMap,
+    response: reqwest::Response,
+}
+
+impl ExchangeBody {
+    fn new(response: reqwest::Response) -> Self {
+        Self {
+            status: response.status(),
+            headers: response.headers().clone(),
+            response,
+        }
     }
 }
 
@@ -1141,14 +1159,15 @@ pub(crate) async fn send_streaming_inner(
         account,
         method,
         url,
+        mut credential_origin_error,
         mut headers,
         body,
-        mut cost,
+        cost,
         quota_scope: quota_scope_override,
         retry,
         timeout,
         follow_redirects: redirect_override,
-        mut replay,
+        replay,
         bearer_auth,
         pending_error,
         bytes_in: caller_bytes_in,
@@ -1160,6 +1179,7 @@ pub(crate) async fn send_streaming_inner(
         // Applied by `send` and `send_streaming` around this function.
         credential_url: _,
         session_policy: _,
+        statuses_as_data,
     } = builder.inner;
 
     // Surface any deferred error from a fluent setter (e.g. `json()`
@@ -1169,11 +1189,12 @@ pub(crate) async fn send_streaming_inner(
     if let Some(err) = pending_error {
         return Err(err);
     }
+    let url = url?;
 
     let policy = retry.unwrap_or_else(|| account.default_retry().clone());
     let retry_attempt_limit = policy.max_attempts;
     let redirect_policy = redirect_override.unwrap_or_else(|| account.follow_redirects().clone());
-    let deadline = RequestDeadline::from_timeout(timeout.resolve(account.request_timeout()));
+    let deadline = timeout.resolve(account.request_timeout());
     // Claims for the whole logical request, taken before the first attempt
     // and bounded by the same total deadline as every other wait, so an
     // expiry here is `Timeout { Unsent }`. Held across retries and redirect
@@ -1189,33 +1210,23 @@ pub(crate) async fn send_streaming_inner(
         })?;
         headers.insert(reqwest::header::USER_AGENT, value);
     }
-    // Per-request method, URL, body, headers, host, cost. These
-    // change across redirect hops: 301/302/303 rewrite to GET and
-    // drop the body, 307/308 preserve, and a cross-host hop changes
-    // the host bucket the rate-limit governor uses.
-    let mut method = method;
-    let mut url = url;
-    let mut body = body;
-    let mut headers = headers;
-    let mut auth_for_next_hop = bearer_auth;
-    // Whether the request as written presented a credential at all -
-    // either the token-source bearer or a caller-built `Authorization`
-    // header (JMAP Basic auth takes the latter route).
-    let mut carrying_auth = bearer_auth || headers.contains_key(AUTHORIZATION);
-    // Set once the redirect walker itself removes the credential on a
-    // cross-origin hop. A later 401 then proves nothing about the
-    // credential, only that an unauthenticated request was refused, so
-    // it must not be reported as credential loss.
-    let mut auth_self_stripped = false;
-    let mut host = host_from_url(&url);
-    let mut quota_scope =
-        resolve_quota_scope(&account, host.as_deref(), quota_scope_override.as_ref());
-    let mut cost_units = recompute_cost_units(
-        account.net().governor(),
-        host.as_deref(),
-        &quota_scope,
+    let mut hop = Hop {
+        method,
+        url,
+        body,
+        carrying_auth: bearer_auth || headers.contains_key(AUTHORIZATION),
+        headers,
+        auth_for_next_hop: bearer_auth,
+        auth_self_stripped: false,
+        prior_url: None,
+        replay,
+        host: None,
         cost,
-    );
+        quota_scope_override,
+        quota_scope: crate::QuotaScope::HostOnly,
+        cost_units: 1,
+    };
+    hop.resolve_rate_key(&account);
 
     let mut retry_after_history: Vec<bifrost_types::RetryHint> = Vec::new();
     let mut bytes_out = 0_u64;
@@ -1250,61 +1261,51 @@ pub(crate) async fn send_streaming_inner(
     // replaying the original operation.
     let mut ledger = crate::AttemptLedger::default();
     let mut pending_response = None;
-    let mut prior_url = None;
     let mut refreshed_token = None;
     let outcome = async {
         'outer: loop {
             deadline.remaining()?;
-            let hop_credential = if let Some(policy) = &hop_policy {
-                let parsed = reqwest::Url::parse(&url).map_err(|error| Error::InvalidRequest {
-                    field: "url",
-                    detail: error.to_string(),
-                })?;
-                // Admission precedes token lookup. In particular, a redirect
-                // cannot inherit the previous origin's Authorization header.
-                headers.remove(AUTHORIZATION);
-                let credential = policy.admit(prior_url.as_ref(), &parsed)?;
-                Some(credential)
-            } else {
-                None
-            };
+            let hop_credential = hop.credential(hop_policy.as_deref())?;
             // Per-leg HopPolicy admission above is authoritative for its own
             // source, including Outlook and DAV on composed account handles.
             // Account bearers and caller Authorization headers must pass account
             // admission before lookup or dispatch. HopPolicy owns its credentials.
             if hop_policy.is_none()
-                && (headers.contains_key(AUTHORIZATION)
-                    || (auth_for_next_hop && account.token_source().is_some()))
+                && (hop.headers.contains_key(AUTHORIZATION)
+                    || (hop.auth_for_next_hop && account.token_source().is_some()))
                 && let Some(origins) = &account.inner.trusted_origins
             {
-                let _admitted = origins.admit(&url)?;
+                if let Some(error) = credential_origin_error.take() {
+                    return Err(error);
+                }
+                let _admitted = origins.admit_url(&hop.url)?;
             }
             let hop_source = match &hop_credential {
                 Some(crate::HopCredential::Bearer(source)) => Some(Arc::clone(source.as_source())),
                 Some(_) => None,
-                None if auth_for_next_hop => account.token_source().cloned(),
+                None if hop.auth_for_next_hop => account.token_source().cloned(),
                 None => None,
             };
             if let Some(crate::HopCredential::Header(value)) = &hop_credential {
-                headers.insert(AUTHORIZATION, value.clone());
+                hop.headers.insert(AUTHORIZATION, value.clone());
             }
             let attempt = attempts.begin();
             // Resolved per attempt rather than once, because a redirect hop
             // can rewrite the method: RFC 7231 section 6.4 turns a 301/302/303 on a
             // POST into a GET, and the GET that results is replayable even
             // though the request the caller wrote was not.
-            let replayable = request_is_replayable(replay, &method, &headers);
+            let replayable = request_is_replayable(hop.replay, &hop.method, &hop.headers);
             // Acquire a rate-limit slot. No-op if no host is configured.
             // Surfaces `Error::CostExceedsBurst` if the caller asked for
             // more units than the host's bucket can ever hold; that is a
             // configuration bug, not a transient condition, so we do not
             // burn retry budget on it.
-            let rate_generation = if let Some(ref h) = host {
+            let rate_generation = if let Some(ref h) = hop.host {
                 deadline
                     .bound(account.net().governor().acquire_generation_scoped(
                         h,
-                        &quota_scope,
-                        cost_units,
+                        &hop.quota_scope,
+                        hop.cost_units,
                     ))
                     .await??
             } else {
@@ -1315,12 +1316,12 @@ pub(crate) async fn send_streaming_inner(
             // response arrives the guard is disarmed because the server
             // has consumed the attempt. Explicit retry and redirect paths
             // below retain their existing refund rules.
-            let mut rate_debit = host.as_ref().map(|h| {
+            let mut rate_debit = hop.host.as_ref().map(|h| {
                 RateDebit::new(
                     account.net().governor().clone(),
                     h.clone(),
-                    quota_scope.clone(),
-                    cost_units,
+                    hop.quota_scope.clone(),
+                    hop.cost_units,
                     rate_generation,
                 )
             });
@@ -1347,7 +1348,7 @@ pub(crate) async fn send_streaming_inner(
                     _ => Some(deadline.bound(source.current()).await??),
                 }
             } else {
-                if hop_policy.is_none() && auth_for_next_hop {
+                if hop_policy.is_none() && hop.auth_for_next_hop {
                     return Err(Error::InvalidRequest {
                         field: "bearer_auth",
                         detail: "bearer authentication requires an AccountSpec token source".into(),
@@ -1357,14 +1358,10 @@ pub(crate) async fn send_streaming_inner(
             };
 
             if let Some(policy) = &hop_policy {
-                let parsed = reqwest::Url::parse(&url).map_err(|error| Error::InvalidRequest {
-                    field: "url",
-                    detail: error.to_string(),
-                })?;
                 // Dialect exclusions can change while admission or token
                 // lookup waits. Check the final targets immediately before
                 // dispatch, including on retries of the same hop.
-                policy.check_target(&method, &parsed, &headers)?;
+                policy.check_target(&hop.method, &hop.url, &hop.headers)?;
             }
 
             if let Some(key) = hold_gate.as_ref()
@@ -1387,7 +1384,7 @@ pub(crate) async fn send_streaming_inner(
             // attempt did put bytes on the wire. Header bytes are
             // intentionally excluded - the meter is a payload sizing
             // tool, not a TCP byte counter.
-            if let Some(ref b) = body {
+            if let Some(ref b) = hop.body {
                 let out_n = u64::try_from(b.len()).unwrap_or(u64::MAX);
                 account.meter().record_bytes_out(out_n);
                 bytes_out = bytes_out.saturating_add(out_n);
@@ -1396,10 +1393,10 @@ pub(crate) async fn send_streaming_inner(
             let header_clock = crate::upload::HeaderClock::new();
             let request = build_reqwest(
                 account.net().client(),
-                &method,
-                &url,
-                &headers,
-                &body,
+                &hop.method,
+                &hop.url,
+                &hop.headers,
+                &hop.body,
                 token.as_ref(),
                 deadline.remaining()?,
                 &account,
@@ -1450,7 +1447,7 @@ pub(crate) async fn send_streaming_inner(
 
             let status = response.status();
 
-            if status.as_u16() >= 400 {
+            if status.as_u16() >= 400 && !statuses_as_data.contains(&status) {
                 let evidence = final_response_from_response(
                     response,
                     &account,
@@ -1483,15 +1480,16 @@ pub(crate) async fn send_streaming_inner(
                 }
                 if status == StatusCode::UNAUTHORIZED
                     && hop_policy.is_none()
-                    && auth_self_stripped
-                    && !auth_for_next_hop
+                    && hop.auth_self_stripped
+                    && !hop.auth_for_next_hop
                 {
                     pending_response = None;
                     return Err(Error::UnauthenticatedRedirectHop {
                         message: format!(
-                            "redirect hop to {url} answered 401 after the redirect walker stripped \
+                            "redirect hop to {} answered 401 after the redirect walker stripped \
                          Authorization on a cross-origin hop; the account credential was never \
-                         presented to this hop"
+                         presented to this hop",
+                            hop.url
                         ),
                         final_response: evidence,
                     });
@@ -1543,115 +1541,51 @@ pub(crate) async fn send_streaming_inner(
                 return Err(status_evidence(&evidence));
             }
 
-            // 2xx: return directly. 3xx: classify against the redirect
-            // policy. The classifier yields `PassThrough` for non-followed
-            // 3xx (304 Not Modified, 305, 306) so conditional-request
-            // flows (`If-None-Match` -> 304) and protocol-specific
-            // surfaces (Graph's 304 on `$delta`) keep working.
-            if status.is_success() {
-                let headers_out = response.headers().clone();
-                let stream = into_byte_stream(response, account.read_timeout());
-                return Ok(InternalStreaming {
-                    evidence: AttemptEvidence::default(),
-                    status,
-                    headers: headers_out,
-                    body: stream,
-                    account,
-                    deadline,
-                    bytes_out,
-                    bytes_in,
-                    permit,
-                });
+            // Successful and selected statuses share one body
+            // path. A selected redirect bypasses following just like a selected
+            // 401 bypasses refresh: the caller owns that complete response.
+            // Enterprise consumers need complete precondition/fallback bodies,
+            // with the same limits and evidence as any other response.
+            let pass_through = status.is_success() || statuses_as_data.contains(&status);
+            if pass_through {
+                return Ok(ExchangeBody::new(response));
             }
 
             if status.is_redirection() {
                 let resp_headers = response.headers().clone();
-                // Do not refund the rate-limit slot at this point: a 3xx
-                // is a real server response. The refund happens only on
-                // the `RedirectAction::Follow` path below, where the
-                // next hop will issue a fresh request that should debit
-                // anew.
                 let active_policy: Option<&RedirectPolicy> = match &redirect_policy {
                     FollowRedirects::Disabled => None,
                     FollowRedirects::Enabled(p) => Some(p),
                 };
                 match active_policy {
-                    None => {
-                        // Pass 3xx through to the caller exactly as the
-                        // original implementation did. Caller code
-                        // (conditional GET, 304 handling) reads the
-                        // status + headers.
-                        let stream = into_byte_stream(response, account.read_timeout());
-                        return Ok(InternalStreaming {
-                            evidence: AttemptEvidence::default(),
-                            status,
-                            headers: resp_headers,
-                            body: stream,
-                            account,
-                            deadline,
-                            bytes_out,
-                            bytes_in,
-                            permit,
-                        });
-                    }
+                    None => return Ok(ExchangeBody::new(response)),
                     Some(policy) => {
                         let response = response;
-                        let parsed_url =
-                            reqwest::Url::parse(&url).map_err(|e| Error::InvalidRequest {
-                                field: "url",
-                                detail: format!("could not re-parse request URL for redirect: {e}"),
-                            })?;
                         let action = if let Some(hop_policy) = &hop_policy {
                             classify_redirect_with_mode(
                                 policy,
-                                &method,
-                                &parsed_url,
+                                &hop.method,
+                                &hop.url,
                                 status,
                                 &resp_headers,
                                 hop_policy.method_rewrite(),
                             )?
                         } else {
-                            classify_redirect(policy, &method, &parsed_url, status, &resp_headers)?
+                            classify_redirect(policy, &hop.method, &hop.url, status, &resp_headers)?
                         };
                         match action {
                             RedirectAction::PassThrough => {
-                                // Hand the body up exactly as the
-                                // redirects-disabled arm above does. A
-                                // passed-through 3xx is a terminal response
-                                // from the caller's point of view, and the
-                                // caller - not this loop - decides whether
-                                // its body is interesting. 304/305/306
-                                // ordinarily carry nothing, and Drive's
-                                // header-only `308 Resume Incomplete` yields
-                                // an empty stream on its own; but a followed
-                                // status with no `Location` also lands here,
-                                // and that shape can carry a real explanatory
-                                // body. Discarding it made those bytes
-                                // invisible to the caller AND to the
-                                // request-local byte counter, which counts
-                                // only what a body reader actually reads.
-                                let stream = into_byte_stream(response, account.read_timeout());
-                                return Ok(InternalStreaming {
-                                    evidence: AttemptEvidence::default(),
-                                    status,
-                                    headers: resp_headers,
-                                    body: stream,
-                                    account,
-                                    deadline,
-                                    bytes_out,
-                                    bytes_in,
-                                    permit,
-                                });
+                                return Ok(ExchangeBody::new(response));
                             }
                             RedirectAction::Follow(step) => {
                                 if redirect_guard
                                     .as_ref()
-                                    .is_some_and(|guard| !guard(&url, &step.next_url))
+                                    .is_some_and(|guard| !guard(&hop.url, &step.next_url))
                                 {
                                     return Err(Error::RedirectRejected {
                                         message: format!(
-                                            "request redirect guard rejected {url} -> {}",
-                                            step.next_url
+                                            "request redirect guard rejected {} -> {}",
+                                            hop.url, step.next_url
                                         ),
                                     });
                                 }
@@ -1669,97 +1603,8 @@ pub(crate) async fn send_streaming_inner(
                                 if let Some(debit) = rate_debit.as_ref() {
                                     debit.refund_acknowledged();
                                 }
-                                if step.next_method != method {
-                                    replay = None;
-                                }
-                                if let Some(policy) = &hop_policy {
-                                    let next =
-                                        reqwest::Url::parse(&step.next_url).map_err(|error| {
-                                            Error::InvalidRequest {
-                                                field: "url",
-                                                detail: error.to_string(),
-                                            }
-                                        })?;
-                                    // The gate must admit before a protocol header rewrite can
-                                    // name this namespace as a secondary write target.
-                                    policy.admit(Some(&parsed_url), &next)?;
-                                    policy.rewrite_headers(&parsed_url, &next, &mut headers)?;
-                                }
+                                hop.follow(step, hop_policy.as_deref(), &account)?;
                                 refreshed_token = None;
-                                prior_url = Some(parsed_url);
-                                method = step.next_method;
-                                url = step.next_url;
-                                if !step.preserve_body {
-                                    body = None;
-                                    // RFC 7231 section 6.4 also drops content-
-                                    // describing headers when the body is
-                                    // dropped, otherwise the next hop
-                                    // carries a content-type for a body
-                                    // that no longer exists.
-                                    strip_body_headers(&mut headers);
-                                }
-                                auth_for_next_hop = step.keep_auth && auth_for_next_hop;
-                                // Strip caller-set `Authorization` headers
-                                // too on cross-host hops, not just the
-                                // token-source-derived bearer. Otherwise
-                                // JMAP Basic-auth (or any caller that
-                                // builds its own Authorization header)
-                                // leaks credentials across a host
-                                // boundary even when the bearer-injection
-                                // path is suppressed.
-                                if !step.keep_auth {
-                                    headers.remove(AUTHORIZATION);
-                                    // Every other caller-supplied credential
-                                    // header goes with it. The walk re-mints
-                                    // only Authorization (through the token
-                                    // source or a HopPolicy admission); a
-                                    // Cookie or Proxy-Authorization set for
-                                    // the prior origin must never reach the
-                                    // next one. This holds on the HopPolicy
-                                    // path too, which re-admits Authorization
-                                    // alone.
-                                    strip_origin_bound_credentials(&mut headers);
-                                    // Remember that the credential left the
-                                    // request by our own hand, not the
-                                    // caller's. A 401 further down the
-                                    // chain - including on a hop back to
-                                    // the original origin, which arrives
-                                    // unauthenticated because `keep_auth`
-                                    // ANDs monotonically - is then reported
-                                    // as a redirect fault rather than as a
-                                    // dead credential.
-                                    auth_self_stripped |= carrying_auth;
-                                    carrying_auth = false;
-                                }
-                                let prior_host = host.clone();
-                                host = host_from_url(&url);
-                                // A per-request `.cost(n)` is chosen in the
-                                // ORIGINAL host's quota units. Another
-                                // host's bucket meters something else
-                                // entirely (Graph counts requests, Gmail
-                                // counts quota units), so carrying the
-                                // number verbatim onto a cross-host hop
-                                // debits a bucket in units the caller never
-                                // spoke. Drop the override on a host change
-                                // and let the hop re-resolve the new host's
-                                // registered default, which is what the
-                                // no-override path already did per hop.
-                                cost = cost_override_for_hop(
-                                    prior_host.as_deref(),
-                                    host.as_deref(),
-                                    cost,
-                                );
-                                quota_scope = resolve_quota_scope(
-                                    &account,
-                                    host.as_deref(),
-                                    quota_scope_override.as_ref(),
-                                );
-                                cost_units = recompute_cost_units(
-                                    account.net().governor(),
-                                    host.as_deref(),
-                                    &quota_scope,
-                                    cost,
-                                );
                                 // Reset retry counter for the next hop:
                                 // a redirect is a fresh logical request,
                                 // its retries should not eat into the
@@ -1793,10 +1638,17 @@ pub(crate) async fn send_streaming_inner(
         ledger,
     };
     match outcome {
-        Ok(mut response) => {
-            response.evidence = evidence;
-            Ok(response)
-        }
+        Ok(response) => Ok(InternalStreaming {
+            evidence,
+            status: response.status,
+            headers: response.headers,
+            body: into_byte_stream(response.response, account.read_timeout()),
+            account,
+            deadline,
+            bytes_out,
+            bytes_in,
+            permit,
+        }),
         Err(error) => Err(evidence.finish(error)),
     }
 }
@@ -1809,7 +1661,7 @@ pub(crate) async fn send_streaming_inner(
 fn build_reqwest(
     client: &reqwest::Client,
     method: &reqwest::Method,
-    url: &str,
+    url: &reqwest::Url,
     headers: &HeaderMap,
     body: &Option<Bytes>,
     token: Option<&AccessToken>,
@@ -1817,7 +1669,7 @@ fn build_reqwest(
     account: &AccountNet,
     clock: &Arc<crate::upload::HeaderClock>,
 ) -> reqwest::RequestBuilder {
-    let mut req = client.request(method.clone(), url);
+    let mut req = client.request(method.clone(), url.clone());
     for (k, v) in headers {
         req = req.header(k.clone(), v.clone());
     }
@@ -2063,118 +1915,6 @@ fn append_status_marker(buf: &mut Vec<u8>, marker: &[u8]) {
     buf.extend_from_slice(marker);
 }
 
-/// Extract host string from a URL. Returns `None` if the URL is not
-/// parseable; the rate-limit governor then no-ops for this request.
-fn host_from_url(url: &str) -> Option<String> {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_owned))
-}
-
-/// Resolve the rate-limit cost units for `host`, honoring the
-/// per-request override `cost_override` when present and falling
-/// back to the governor's registered host default. Used at request
-/// start and recomputed on every redirect hop because a cross-host
-/// hop changes which host bucket the request debits against.
-/// Decide which quota scope a wire attempt debits.
-///
-/// An explicit `RequestBuilder::quota_scope` wins for every hop of the
-/// request. Otherwise the account's declared scope for this host
-/// applies; an account that declared no scope for the host falls back
-/// to the empty host-only bucket, which is also the only bucket an
-/// unregistered host could ever match.
-fn resolve_quota_scope(
-    account: &AccountNet,
-    host: Option<&str>,
-    override_: Option<&crate::QuotaScope>,
-) -> crate::QuotaScope {
-    match override_ {
-        Some(scope) => scope.clone(),
-        None => {
-            // Only an unscoped request to a multi-scope host is ambiguous.
-            // Warn here, per request, rather than at attach: an operator
-            // should hear about the misrouted request, not about a correct
-            // per-surface declaration.
-            if let Some(host) = host
-                && account.has_ambiguous_rate_scope(host)
-            {
-                tracing::warn!(
-                    host = %host,
-                    default_scope = %account.rate_scope_for(host),
-                    "request reached a host with several declared quota scopes \
-                     without RequestBuilder::quota_scope; debiting the \
-                     first-declared scope",
-                );
-            }
-            host.map_or(crate::QuotaScope::HostOnly, |host| {
-                account.rate_scope_for(host).clone()
-            })
-        }
-    }
-}
-
-/// Decide whether a per-request `.cost(n)` override still applies after
-/// a redirect hop.
-///
-/// A cost is denominated in the quota units of the host the caller
-/// addressed: Graph counts requests, Gmail counts quota units, and a
-/// host the caller never named counts whatever it counts. Carrying the
-/// number verbatim across an origin boundary debits a foreign bucket in
-/// units nobody agreed on - and an override larger than the new host's
-/// burst is rejected outright as `CostExceedsBurst`, failing a request
-/// the caller never over-costed. On a host change the override is
-/// dropped so the hop re-resolves that host's registered default, which
-/// is what the no-override path already did per hop. A same-host hop
-/// keeps it: the units mean the same thing on the same bucket.
-///
-/// Host comparison is case-insensitive (RFC 3986 section 3.2.2), matching the
-/// redirect classifier's own same-origin test.
-fn cost_override_for_hop(
-    prior_host: Option<&str>,
-    next_host: Option<&str>,
-    cost: Option<u32>,
-) -> Option<u32> {
-    let same_host = match (prior_host, next_host) {
-        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-        (None, None) => true,
-        _ => false,
-    };
-    if same_host { cost } else { None }
-}
-
-fn recompute_cost_units(
-    governor: &crate::rate::RateLimitGovernor,
-    host: Option<&str>,
-    quota_scope: &crate::QuotaScope,
-    cost_override: Option<u32>,
-) -> u32 {
-    match cost_override {
-        Some(n) => n,
-        None => host
-            .and_then(|h| governor.cost_default_for_scoped(h, quota_scope))
-            .unwrap_or(1),
-    }
-}
-
-/// Strip body-describing headers after a redirect demands the body
-/// be dropped (RFC 7231 section 6.4 method rewrite to GET). Without this,
-/// the next hop carries `Content-Type` / `Content-Length` /
-/// `Content-Encoding` for a body that no longer exists.
-fn strip_body_headers(headers: &mut HeaderMap) {
-    headers.remove(reqwest::header::CONTENT_TYPE);
-    headers.remove(reqwest::header::CONTENT_LENGTH);
-    headers.remove(reqwest::header::CONTENT_ENCODING);
-}
-
-/// Remove caller-supplied credential headers the redirect walk does not
-/// re-mint. Called on every origin change alongside the Authorization strip:
-/// a credential is bound to the origin it was set for, so a cookie jar value
-/// or proxy credential never follows a redirect to another origin.
-fn strip_origin_bound_credentials(headers: &mut HeaderMap) {
-    headers.remove(reqwest::header::COOKIE);
-    headers.remove(reqwest::header::PROXY_AUTHORIZATION);
-}
-
 /// Exponential backoff with jitter. The base doubles per attempt,
 /// capped at `policy.max_backoff`. Decorrelated jitter (half-to-full
 /// of the base) prevents thundering-herd retries from one shared
@@ -2259,6 +1999,278 @@ mod tests {
 
     fn hv(value: &str) -> HeaderValue {
         HeaderValue::from_str(value).expect("test header value")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_core_selected_statuses_keep_full_bodies_without_transport_recovery() {
+        for code in [401, 404, 412, 429, 501, 503, 507, 308] {
+            let status = StatusCode::from_u16(code).unwrap();
+            let payload = Bytes::from(vec![b'x'; STATUS_BODY_CAP + 73]);
+            let mut headers = HeaderMap::new();
+            headers.insert(LOCATION, hv("https://elsewhere.test/next"));
+            headers.insert(RETRY_AFTER, hv("600"));
+            let script = ScriptedDispatch::new([
+                Canned::Response {
+                    status,
+                    headers,
+                    body: payload.clone(),
+                },
+                canned(StatusCode::OK, b"must remain unused"),
+            ]);
+            let account = scripted_account(&script, NetConfig::default(), vec![], two_attempts());
+            let observed = Arc::new(AtomicU64::new(0));
+            let observer = Arc::clone(&observed);
+            let response = account
+                .get("https://exchange.test/data")
+                .statuses_as_data([status])
+                .observe_errors(move |_| {
+                    observer.fetch_add(1, Ordering::Relaxed);
+                })
+                .send()
+                .await
+                .expect("selected response is data");
+            assert_eq!(response.status, status);
+            assert_eq!(response.body, payload);
+            assert_eq!(response.bytes_in(), payload.len() as u64);
+            assert_eq!(response.headers[RETRY_AFTER], "600");
+            assert_eq!(observed.load(Ordering::Relaxed), 0);
+            assert_eq!(script.requests().len(), 1);
+            assert_eq!(script.remaining(), 1);
+            assert!(matches!(response.evidence().ledger().outcomes(),
+                [crate::AttemptOutcome::Response(got)] if *got == status));
+            assert_eq!(account.meter().bytes_in(), payload.len() as u64);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_core_unselected_statuses_keep_the_existing_policy() {
+        let script = ScriptedDispatch::new([
+            canned(StatusCode::NOT_IMPLEMENTED, b"retry"),
+            canned(StatusCode::OK, b"recovered"),
+            canned(StatusCode::NOT_FOUND, b"missing"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), vec![], two_attempts());
+        let response = account
+            .get("https://exchange.test/data")
+            .statuses_as_data([StatusCode::NOT_FOUND])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(script.requests().len(), 2);
+        let error = account
+            .get("https://exchange.test/data")
+            .statuses_as_data([StatusCode::NOT_IMPLEMENTED])
+            .send()
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error.terminal(),
+            Error::Status {
+                code: StatusCode::NOT_FOUND,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_core_status_conversion_keeps_replay_safety_and_shared_classification() {
+        use bifrost_types::{AccountErrorKind, AccountOperation, RecoveryClass};
+        for (code, expected_partial) in [(503, true), (412, false), (501, false)] {
+            let script = ScriptedDispatch::new([canned(
+                StatusCode::from_u16(code).unwrap(),
+                b"provider body",
+            )]);
+            let account = scripted_account(&script, NetConfig::default(), vec![], two_attempts());
+            let response = account
+                .post("https://exchange.test/write")
+                .statuses_as_data([StatusCode::from_u16(code).unwrap()])
+                .replay(ReplayPolicy::Never)
+                .send()
+                .await
+                .unwrap();
+            let error =
+                classify_replay_error(response.into_status_error(), AccountOperation::SetIsRead);
+            assert_eq!(
+                matches!(error.recovery(), RecoveryClass::Reconcile(_)),
+                expected_partial
+            );
+            assert_eq!(error.telemetry_fields().status, Some(code));
+            if code == 412 {
+                assert_eq!(error.kind(), &AccountErrorKind::ConcurrencyConflict);
+            }
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(LOCATION, hv("/after-write"));
+        let script = ScriptedDispatch::new([
+            canned_with_headers(StatusCode::SEE_OTHER, headers, b"committed"),
+            canned(StatusCode::PRECONDITION_FAILED, b"terminal"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), vec![], two_attempts());
+        let response = account
+            .post("https://exchange.test/write")
+            .statuses_as_data([StatusCode::PRECONDITION_FAILED])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.evidence().ledger().outcomes().len(), 2);
+        assert_eq!(
+            response.evidence().verdict(),
+            crate::CommitEvidence::MayHaveCommitted
+        );
+        let error = response.into_status_error();
+        assert!(matches!(&error, Error::AttemptHistory { evidence, .. }
+            if evidence.ledger().outcomes().len() == 2 && evidence.attempts().len() == 1));
+        let error = classify_replay_error(error, AccountOperation::SetIsRead);
+        assert!(matches!(error.recovery(), RecoveryClass::Reconcile(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_core_selected_stream_preserves_failures_and_releases_claims() {
+        use futures::StreamExt;
+        let mut headers = HeaderMap::new();
+        headers.insert(LOCATION, hv("/redirected"));
+        let script = ScriptedDispatch::new([
+            canned_with_headers(StatusCode::TEMPORARY_REDIRECT, headers, b"hop"),
+            Canned::StreamThenError {
+                status: StatusCode::NOT_IMPLEMENTED,
+                headers: HeaderMap::new(),
+                chunks: vec![Bytes::from_static(b"prefix")],
+                message: "broken response".into(),
+            },
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), vec![], two_attempts());
+        let limit = ConcurrencyLimit::new(1);
+        let mut response = account
+            .get("https://exchange.test/data")
+            .statuses_as_data([StatusCode::NOT_IMPLEMENTED])
+            .concurrency_limit(limit.clone())
+            .send_streaming()
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.ledger.outcomes().len(), 2);
+        assert_eq!(limit.in_flight(), 1);
+        assert_eq!(response.body.next().await.unwrap().unwrap(), b"prefix"[..]);
+        let error = response.body.next().await.unwrap().unwrap_err();
+        assert!(matches!(&error, Error::AttemptHistory { evidence, .. }
+            if evidence.ledger().outcomes().len() == 2 && evidence.attempts().len() == 2));
+        assert_eq!(limit.in_flight(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_core_selected_body_still_obeys_the_absolute_deadline() {
+        let script = ScriptedDispatch::new([Canned::StreamThenStall {
+            status: StatusCode::NOT_IMPLEMENTED,
+            headers: HeaderMap::new(),
+            chunks: vec![Bytes::from_static(b"prefix")],
+        }]);
+        let account = scripted_account(&script, NetConfig::default(), vec![], two_attempts());
+        let started = tokio::time::Instant::now();
+        let deadline = RequestDeadline::from_timeout(Some(Duration::from_secs(2)));
+        let error = account
+            .get("https://exchange.test/data")
+            .statuses_as_data([StatusCode::NOT_IMPLEMENTED])
+            .deadline(deadline)
+            .send()
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(matches!(
+            error.terminal(),
+            Error::Timeout {
+                transmission_state: TransmissionState::Acknowledged,
+            }
+        ));
+        assert!(matches!(error, Error::AttemptHistory { evidence, .. }
+            if matches!(evidence.ledger().outcomes(),
+                [crate::AttemptOutcome::Response(StatusCode::NOT_IMPLEMENTED)])));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_core_selected_body_obeys_buffer_limits() {
+        let script =
+            ScriptedDispatch::new([canned(StatusCode::PRECONDITION_FAILED, &[b'x'; 4096])]);
+        let mut spec = crate::AccountSpec::new(None);
+        spec.max_buffered_response = Some(1024);
+        let account = crate::test_support::scripted_net(&script, NetConfig::default())
+            .attach_account(crate::AccountId("selected-limit".into()), spec);
+        let error = account
+            .get("https://exchange.test/data")
+            .without_bearer_auth()
+            .statuses_as_data([StatusCode::PRECONDITION_FAILED])
+            .send()
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error.terminal(),
+            Error::ResponseTooLarge { limit: 1024 }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_core_absolute_deadline_is_shared_across_protocol_legs() {
+        let script = ScriptedDispatch::new([
+            canned(StatusCode::OK, b"first"),
+            canned(StatusCode::OK, b"must remain unused"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), vec![], two_attempts());
+        let deadline = RequestDeadline::from_timeout(Some(Duration::from_secs(2)));
+        account
+            .get("https://exchange.test/first")
+            .deadline(deadline)
+            .send()
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let error = account
+            .get("https://exchange.test/second")
+            .deadline(deadline)
+            .send()
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            Error::Timeout {
+                transmission_state: TransmissionState::Unsent
+            }
+        ));
+        assert_eq!(script.requests().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_core_credential_response_history_stays_redacted() {
+        let script = ScriptedDispatch::new([
+            Canned::Error(Error::Network {
+                message: "failed https://exchange.test/secret-token".into(),
+                transmission_state: TransmissionState::Unsent,
+                source: None,
+            }),
+            canned(StatusCode::NOT_FOUND, b"missing"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), vec![], two_attempts());
+        let response = account
+            .get("https://exchange.test/secret-token")
+            .credential_url()
+            .statuses_as_data([StatusCode::NOT_FOUND])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.evidence().ledger().outcomes().len(), 2);
+        assert!(!format!("{:?}", response.evidence()).contains("secret-token"));
+        let error = response.into_status_error();
+        assert!(!format!("{error:?}").contains("secret-token"));
+        assert!(matches!(
+            error.terminal(),
+            Error::Status {
+                code: StatusCode::NOT_FOUND,
+                ..
+            }
+        ));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -2370,6 +2382,16 @@ mod tests {
             let account = crate::test_support::scripted_net(&script, NetConfig::default())
                 .attach_account(crate::AccountId("origin-gate".to_owned()), spec);
             let mut request = account.get("https://denied.test/resource");
+            if explicit {
+                request = request
+                    .without_bearer_auth()
+                    .header("Authorization", "Basic secret");
+            }
+            assert!(request.send().await.is_err());
+            assert!(script.requests().is_empty());
+            // URL parsing erases empty userinfo. Retaining the lexical refusal
+            // is necessary when the walker now receives a parsed target.
+            let mut request = account.get("https://@allowed.test/resource");
             if explicit {
                 request = request
                     .without_bearer_auth()
@@ -3768,113 +3790,6 @@ mod tests {
         );
     }
 
-    // ---- cost resolution ---------------------------------------------
-
-    #[test]
-    fn cost_precedence_is_override_then_host_default_then_one() {
-        let governor = RateLimitGovernor::new();
-        governor.register(RateLimit {
-            host: "cost.test".to_owned(),
-            quota_scope: crate::QuotaScope::HostOnly,
-            quota_per_second: 10.0,
-            cost_default: 5,
-            burst: 50,
-        });
-
-        assert_eq!(
-            recompute_cost_units(
-                &governor,
-                Some("cost.test"),
-                &crate::QuotaScope::HostOnly,
-                Some(9)
-            ),
-            9,
-            "an explicit .cost(n) wins over the host default"
-        );
-        assert_eq!(
-            recompute_cost_units(
-                &governor,
-                Some("cost.test"),
-                &crate::QuotaScope::HostOnly,
-                None
-            ),
-            5,
-            "without an override the host's registered default applies"
-        );
-        assert_eq!(
-            recompute_cost_units(
-                &governor,
-                Some("unknown.test"),
-                &crate::QuotaScope::HostOnly,
-                None
-            ),
-            1,
-            "an unregistered host falls back to one unit"
-        );
-        assert_eq!(
-            recompute_cost_units(&governor, None, &crate::QuotaScope::HostOnly, None),
-            1,
-            "an unparseable URL has no host bucket and costs one unit"
-        );
-    }
-
-    // ---- URL / header helpers ----------------------------------------
-
-    #[test]
-    fn host_extraction_handles_ports_userinfo_and_junk() {
-        assert_eq!(
-            host_from_url("https://a.example/path?q=1"),
-            Some("a.example".to_owned())
-        );
-        assert_eq!(
-            host_from_url("https://user:pw@b.example:8443/p"),
-            Some("b.example".to_owned()),
-            "the bucket key is the host alone, without userinfo or port"
-        );
-        assert_eq!(host_from_url("not a url"), None);
-        assert_eq!(
-            host_from_url("https://A.EXAMPLE/"),
-            Some("a.example".to_owned()),
-            "reqwest lowercases the host, so bucket keys are case-normalised"
-        );
-    }
-
-    #[test]
-    fn body_headers_are_stripped_but_others_survive() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        headers.insert(
-            reqwest::header::CONTENT_LENGTH,
-            HeaderValue::from_static("42"),
-        );
-        headers.insert(
-            reqwest::header::CONTENT_ENCODING,
-            HeaderValue::from_static("gzip"),
-        );
-        headers.insert(
-            HeaderName::from_static("x-keep"),
-            HeaderValue::from_static("yes"),
-        );
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer t"));
-
-        strip_body_headers(&mut headers);
-
-        assert!(!headers.contains_key(reqwest::header::CONTENT_TYPE));
-        assert!(!headers.contains_key(reqwest::header::CONTENT_LENGTH));
-        assert!(!headers.contains_key(reqwest::header::CONTENT_ENCODING));
-        assert!(
-            headers.contains_key(HeaderName::from_static("x-keep")),
-            "only body-describing headers are dropped on a method rewrite"
-        );
-        assert!(
-            headers.contains_key(AUTHORIZATION),
-            "Authorization is the redirect loop's business, not the body strip's"
-        );
-    }
-
     // ---- deferred builder errors -------------------------------------
 
     /// `RequestBuilder::header` defers a rejected header name or value
@@ -4046,34 +3961,6 @@ mod tests {
     /// when it does not (including a mixed-case spelling of the same
     /// host, which is the same origin and the same bucket), so existing
     /// same-host callers see no behavior change.
-    #[test]
-    fn cost_override_is_kept_per_host_and_dropped_across_hosts() {
-        assert_eq!(
-            cost_override_for_hop(Some("a.test"), Some("a.test"), Some(20)),
-            Some(20),
-            "a same-host hop keeps the caller's units"
-        );
-        assert_eq!(
-            cost_override_for_hop(Some("a.test"), Some("A.Test"), Some(20)),
-            Some(20),
-            "hosts are case-insensitive; this is the same bucket"
-        );
-        assert_eq!(
-            cost_override_for_hop(Some("a.test"), Some("b.test"), Some(20)),
-            None,
-            "a cross-host hop must re-resolve the new host's own default"
-        );
-        assert_eq!(
-            cost_override_for_hop(Some("a.test"), None, Some(20)),
-            None,
-            "a hop with no resolvable host has no bucket the units apply to"
-        );
-        assert_eq!(
-            cost_override_for_hop(Some("a.test"), Some("b.test"), None),
-            None,
-            "no override stays no override"
-        );
-    }
 
     #[tokio::test(start_paused = true)]
     async fn concurrent_streams_share_one_inbound_schedule() {

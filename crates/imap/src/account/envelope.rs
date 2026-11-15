@@ -10,7 +10,7 @@ use super::error::schema_incompatible;
 
 use crate::types::MailboxName;
 
-use super::CompactUidSet;
+use super::UidSet;
 
 pub(crate) const ENVELOPE_VERSION: u32 = 1;
 const MAGIC: &[u8; 8] = b"IMAPCUR1";
@@ -19,19 +19,19 @@ const MAGIC: &[u8; 8] = b"IMAPCUR1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FolderCursor {
     QResync {
-        uidvalidity: u32,
-        modseq: u64,
+        uidvalidity: crate::types::UidValidity,
+        modseq: crate::types::ModSeq,
         baseline: UidBaseline,
     },
     Condstore {
-        uidvalidity: u32,
-        modseq: u64,
-        known_uids: CompactUidSet,
+        uidvalidity: crate::types::UidValidity,
+        modseq: crate::types::ModSeq,
+        known_uids: UidSet,
     },
     Basic {
-        uidvalidity: u32,
-        uidnext: u32,
-        known_uids: CompactUidSet,
+        uidvalidity: crate::types::UidValidity,
+        uidnext: Option<crate::types::Uid>,
+        known_uids: UidSet,
     },
 }
 
@@ -40,12 +40,12 @@ pub(crate) enum FolderCursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) enum UidBaseline {
-    Complete(CompactUidSet),
-    Legacy(CompactUidSet),
+    Complete(UidSet),
+    Legacy(UidSet),
 }
 
 impl UidBaseline {
-    fn uids(&self) -> &CompactUidSet {
+    fn uids(&self) -> &UidSet {
         match self {
             Self::Complete(uids) | Self::Legacy(uids) => uids,
         }
@@ -53,7 +53,7 @@ impl UidBaseline {
 }
 
 impl FolderCursor {
-    pub(crate) fn uidvalidity(&self) -> u32 {
+    pub(crate) fn uidvalidity(&self) -> crate::types::UidValidity {
         match self {
             Self::QResync { uidvalidity, .. }
             | Self::Condstore { uidvalidity, .. }
@@ -61,7 +61,7 @@ impl FolderCursor {
         }
     }
 
-    pub(crate) fn known_uids(&self) -> &CompactUidSet {
+    pub(crate) fn known_uids(&self) -> &UidSet {
         match self {
             Self::QResync { baseline, .. } => baseline.uids(),
             Self::Condstore { known_uids, .. } | Self::Basic { known_uids, .. } => known_uids,
@@ -106,8 +106,8 @@ fn encode_folder_cursor(cursor: &FolderCursor) -> Vec<u8> {
             baseline,
         } => {
             out.push(1);
-            push_u32(&mut out, *uidvalidity);
-            push_u64(&mut out, *modseq);
+            push_u32(&mut out, uidvalidity.get());
+            push_u64(&mut out, modseq.get());
             encode_uid_set(&mut out, baseline.uids());
             out.push(u8::from(matches!(baseline, UidBaseline::Complete(_))));
         }
@@ -117,8 +117,8 @@ fn encode_folder_cursor(cursor: &FolderCursor) -> Vec<u8> {
             known_uids,
         } => {
             out.push(2);
-            push_u32(&mut out, *uidvalidity);
-            push_u64(&mut out, *modseq);
+            push_u32(&mut out, uidvalidity.get());
+            push_u64(&mut out, modseq.get());
             encode_uid_set(&mut out, known_uids);
         }
         FolderCursor::Basic {
@@ -127,8 +127,8 @@ fn encode_folder_cursor(cursor: &FolderCursor) -> Vec<u8> {
             known_uids,
         } => {
             out.push(3);
-            push_u32(&mut out, *uidvalidity);
-            push_u32(&mut out, *uidnext);
+            push_u32(&mut out, uidvalidity.get());
+            push_u32(&mut out, uidnext.map(crate::types::Uid::get).unwrap_or(0));
             encode_uid_set(&mut out, known_uids);
         }
     }
@@ -141,7 +141,7 @@ fn decode_folder_cursor(bytes: &[u8]) -> Result<FolderCursor, AccountError> {
     let tag = input.take_u8()?;
     match tag {
         1 => {
-            let uidvalidity = input.take_u32()?;
+            let uidvalidity = input.take_uidvalidity()?;
             let modseq = input.take_modseq()?;
             // Three on-disk shapes are accepted:
             //   * pre-baseline v1: no bytes after modseq -> empty set,
@@ -152,7 +152,7 @@ fn decode_folder_cursor(bytes: &[u8]) -> Result<FolderCursor, AccountError> {
             //     this shape hardcodes `complete: true`)
             //   * current shape: uid set bytes followed by a u8 flag
             let (known_uids, known_uids_complete) = if input.remaining() == 0 {
-                (CompactUidSet::default(), false)
+                (UidSet::default(), false)
             } else {
                 let set = input.take_uid_set()?;
                 let complete = if input.remaining() == 0 {
@@ -173,24 +173,26 @@ fn decode_folder_cursor(bytes: &[u8]) -> Result<FolderCursor, AccountError> {
             })
         }
         2 => Ok(FolderCursor::Condstore {
-            uidvalidity: input.take_u32()?,
+            uidvalidity: input.take_uidvalidity()?,
             modseq: input.take_modseq()?,
             known_uids: input.take_uid_set()?,
         }),
         3 => Ok(FolderCursor::Basic {
-            uidvalidity: input.take_u32()?,
-            uidnext: input.take_u32()?,
+            uidvalidity: input.take_uidvalidity()?,
+            uidnext: crate::types::Uid::new(input.take_u32()?),
             known_uids: input.take_uid_set()?,
         }),
         _ => Err(schema_incompatible("unknown IMAP cursor tag")),
     }
 }
 
-fn encode_uid_set(out: &mut Vec<u8>, set: &CompactUidSet) {
-    push_u32(out, u32::try_from(set.ranges().len()).unwrap_or(u32::MAX));
-    for range in set.ranges() {
-        push_u32(out, range.start);
-        push_u32(out, range.end.unwrap_or(0));
+fn encode_uid_set(out: &mut Vec<u8>, set: &UidSet) {
+    push_u32(out, u32::try_from(set.range_count()).unwrap_or(u32::MAX));
+    for range in set.typed_ranges() {
+        let start = range.start().get();
+        let end = range.end().get();
+        push_u32(out, start);
+        push_u32(out, if start == end { 0 } else { end });
     }
 }
 
@@ -250,11 +252,15 @@ impl<'a> CursorBytes<'a> {
         Ok(u32::from_le_bytes(bytes))
     }
 
+    fn take_uidvalidity(&mut self) -> Result<crate::types::UidValidity, AccountError> {
+        crate::types::UidValidity::new(self.take_u32()?)
+            .ok_or_else(|| schema_incompatible("invalid persisted IMAP UIDVALIDITY"))
+    }
+
     // Saved state must obey the same bound as live command operands. An
     // enterprise user expects invalid durable state rebuilt before sync runs.
-    fn take_modseq(&mut self) -> Result<u64, AccountError> {
+    fn take_modseq(&mut self) -> Result<crate::types::ModSeq, AccountError> {
         crate::types::ModSeq::new(self.take_u64()?)
-            .map(crate::types::ModSeq::get)
             .ok_or_else(|| schema_incompatible("invalid persisted IMAP MODSEQ"))
     }
 
@@ -266,7 +272,7 @@ impl<'a> CursorBytes<'a> {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    fn take_uid_set(&mut self) -> Result<CompactUidSet, AccountError> {
+    fn take_uid_set(&mut self) -> Result<UidSet, AccountError> {
         let count = self.take_u32()? as usize;
         // A range consumes two u32 fields. Do not reserve from the
         // untrusted declared count when the payload cannot contain that
@@ -292,15 +298,28 @@ impl<'a> CursorBytes<'a> {
             .ok_or_else(|| schema_incompatible("IMAP cursor UID range contains a zero UID"))?;
             ranges.push(range);
         }
-        Ok(CompactUidSet::from_ranges(ranges))
+        Ok(UidSet::from_ranges(ranges))
+    }
+}
+
+/// Canonical account identity shared by decoded targets and the public poller.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct MessageRef {
+    pub(crate) folder: MailboxName,
+    pub(crate) uidvalidity: crate::types::UidValidity,
+    pub(crate) uid: crate::types::Uid,
+}
+
+impl std::ops::Deref for DecodedObjectId {
+    type Target = MessageRef;
+    fn deref(&self) -> &MessageRef {
+        &self.message
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecodedObjectId {
-    pub(crate) folder: MailboxName,
-    pub(crate) uidvalidity: u32,
-    pub(crate) uid: u32,
+    pub(crate) message: MessageRef,
     /// The exact string this target answers to: the id as submitted when it
     /// was decoded, the canonical encoding when it was synthesized (a thread
     /// expansion). Every outcome, error scope and hydrated id echoes this
@@ -314,12 +333,18 @@ pub(crate) struct DecodedObjectId {
 
 impl DecodedObjectId {
     /// A target with no submitted spelling, answering to the canonical id.
-    pub(crate) fn canonical(folder: MailboxName, uidvalidity: u32, uid: u32) -> Self {
+    pub(crate) fn canonical(
+        folder: MailboxName,
+        uidvalidity: crate::types::UidValidity,
+        uid: crate::types::Uid,
+    ) -> Self {
         let id = encode_object_id(&folder, uidvalidity, uid);
         Self {
-            folder,
-            uidvalidity,
-            uid,
+            message: MessageRef {
+                folder,
+                uidvalidity,
+                uid,
+            },
             id,
         }
     }
@@ -328,11 +353,15 @@ impl DecodedObjectId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecodedThreadId {
     pub(crate) folder: MailboxName,
-    pub(crate) uidvalidity: u32,
-    pub(crate) uids: Vec<u32>,
+    pub(crate) uidvalidity: crate::types::UidValidity,
+    pub(crate) uids: UidSet,
 }
 
-pub(crate) fn encode_object_id(folder: &MailboxName, uidvalidity: u32, uid: u32) -> ObjectId {
+pub(crate) fn encode_object_id(
+    folder: &MailboxName,
+    uidvalidity: crate::types::UidValidity,
+    uid: crate::types::Uid,
+) -> ObjectId {
     ObjectId(format!(
         "imap2:{}:{}:{}:{}",
         folder.account_id().len(),
@@ -348,15 +377,23 @@ pub(crate) fn decode_object_id(
 ) -> Result<DecodedObjectId, AccountError> {
     let (folder, rest) = decode_len_prefixed("imap1", "imap2", &id.0, op)?;
     let mut parts = rest.split(':');
-    let uidvalidity = parse_nonzero_u32(parts.next(), "IMAP object id uidvalidity", op)?;
-    let uid = parse_nonzero_u32(parts.next(), "IMAP object id uid", op)?;
+    let uidvalidity = crate::types::UidValidity::new(parse_nonzero_u32(
+        parts.next(),
+        "IMAP object id uidvalidity",
+        op,
+    )?)
+    .expect("validated epoch");
+    let uid = crate::types::Uid::new(parse_nonzero_u32(parts.next(), "IMAP object id uid", op)?)
+        .expect("validated UID");
     if parts.next().is_some() {
         return Err(malformed("invalid IMAP object id", op));
     }
     Ok(DecodedObjectId {
-        folder,
-        uidvalidity,
-        uid,
+        message: MessageRef {
+            folder,
+            uidvalidity,
+            uid,
+        },
         id: id.clone(),
     })
 }
@@ -389,7 +426,7 @@ pub(crate) struct NativeThread {
 // the server exposes neither key.
 pub(crate) fn encode_server_thread_id(
     objectid: Option<&str>,
-    gmail: Option<u64>,
+    gmail: Option<crate::types::GmailThreadId>,
 ) -> Option<ThreadId> {
     if let Some(id) = objectid {
         return Some(ThreadId(format!("imapnative2:objectid:{id}")));
@@ -408,13 +445,9 @@ pub(crate) fn decode_server_thread_id(
     match kind {
         // RFC 8474 objectid = 1*255(ALPHA / DIGIT / "_" / "-"); anything else
         // could inject SEARCH criteria, so it is refused before any I/O.
-        "objectid"
-            if !key.is_empty()
-                && key.len() <= 255
-                && key
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
-        {
+        "objectid" => {
+            let key = crate::types::validated::ObjectId::new(key)
+                .map_err(|_| malformed("invalid IMAP server thread id", op))?;
             Ok(Some(NativeThread {
                 kind: NativeThreadKind::ObjectId,
                 criteria: format!("THREADID {key}"),
@@ -425,6 +458,7 @@ pub(crate) fn decode_server_thread_id(
                 .parse::<u64>()
                 .ok()
                 .filter(|value| *value != 0)
+                .map(crate::types::GmailThreadId::new)
                 .ok_or_else(|| malformed("invalid Gmail thread id", op))?;
             Ok(Some(NativeThread {
                 kind: NativeThreadKind::Gmail,
@@ -435,13 +469,14 @@ pub(crate) fn decode_server_thread_id(
     }
 }
 
-pub(crate) fn encode_thread_id(folder: &MailboxName, uidvalidity: u32, uids: &[u32]) -> ThreadId {
-    let mut uids = uids.to_vec();
-    uids.sort_unstable();
-    uids.dedup();
+pub(crate) fn encode_thread_id(
+    folder: &MailboxName,
+    uidvalidity: crate::types::UidValidity,
+    uids: &UidSet,
+) -> ThreadId {
     let uid_list = uids
-        .iter()
-        .map(std::string::ToString::to_string)
+        .identifiers()
+        .map(|uid| uid.to_string())
         .collect::<Vec<_>>()
         .join(",");
     ThreadId(format!(
@@ -459,7 +494,12 @@ pub(crate) fn decode_thread_id(
 ) -> Result<DecodedThreadId, AccountError> {
     let (folder, rest) = decode_len_prefixed("imapthread1", "imapthread2", &id.0, op)?;
     let mut parts = rest.splitn(2, ':');
-    let uidvalidity = parse_nonzero_u32(parts.next(), "IMAP thread id uidvalidity", op)?;
+    let uidvalidity = crate::types::UidValidity::new(parse_nonzero_u32(
+        parts.next(),
+        "IMAP thread id uidvalidity",
+        op,
+    )?)
+    .expect("validated epoch");
     let uid_part = parts
         .next()
         .ok_or_else(|| malformed("missing IMAP thread uid set", op))?;
@@ -479,7 +519,7 @@ pub(crate) fn decode_thread_id(
     Ok(DecodedThreadId {
         folder,
         uidvalidity,
-        uids,
+        uids: UidSet::from_numbers(uids),
     })
 }
 
@@ -583,17 +623,26 @@ mod tests {
         ] {
             for cursor in [
                 FolderCursor::QResync {
-                    uidvalidity: 7,
-                    modseq,
-                    baseline: UidBaseline::Complete(CompactUidSet::default()),
+                    uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                    modseq: crate::types::ModSeq::new(1).unwrap(),
+                    baseline: UidBaseline::Complete(UidSet::default()),
                 },
                 FolderCursor::Condstore {
-                    uidvalidity: 7,
-                    modseq,
-                    known_uids: CompactUidSet::default(),
+                    uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                    modseq: crate::types::ModSeq::new(1).unwrap(),
+                    known_uids: UidSet::default(),
                 },
             ] {
-                let encoded = encode_cursor(scope.clone(), &cursor);
+                let mut cursor = cursor;
+                let mut encoded = encode_cursor(scope.clone(), &cursor);
+                encoded.server_state.bytes[13..21].copy_from_slice(&modseq.to_le_bytes());
+                if let Some(value) = crate::types::ModSeq::new(modseq) {
+                    match &mut cursor {
+                        FolderCursor::QResync { modseq, .. }
+                        | FolderCursor::Condstore { modseq, .. } => *modseq = value,
+                        _ => unreachable!(),
+                    }
+                }
                 let result = decode_cursor(&encoded);
                 if crate::types::ModSeq::new(modseq).is_some() {
                     assert_eq!(result.unwrap(), cursor);
@@ -624,9 +673,13 @@ mod tests {
             let id = ObjectId(submitted.to_owned());
             let decoded = decode_object_id(&id, AccountOperation::Hydrate).unwrap();
             assert_eq!(decoded.id, id);
-            assert_eq!((decoded.uidvalidity, decoded.uid), (7, 9));
+            assert_eq!((decoded.uidvalidity.get(), decoded.uid.get()), (7, 9));
         }
-        let synthesized = DecodedObjectId::canonical(MailboxName::new("INBOX").unwrap(), 7, 9);
+        let synthesized = DecodedObjectId::canonical(
+            MailboxName::new("INBOX").unwrap(),
+            crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            crate::types::Uid::new(9).expect("valid protocol test value"),
+        );
         assert_eq!(synthesized.id.0, "imap2:5:INBOX:7:9");
     }
 
@@ -649,8 +702,16 @@ mod tests {
                     .folder,
                 folder
             );
-            let object = encode_object_id(&folder, 7, 9);
-            let thread = encode_thread_id(&folder, 7, &[9]);
+            let object = encode_object_id(
+                &folder,
+                crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                crate::types::Uid::new(9).expect("valid protocol test value"),
+            );
+            let thread = encode_thread_id(
+                &folder,
+                crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                &UidSet::from_numbers([9]),
+            );
             assert!(object.0.starts_with("imap2:"));
             assert!(thread.0.starts_with("imapthread2:"));
             assert_eq!(
@@ -684,10 +745,21 @@ mod tests {
         let a = MailboxName::from_wire("a".into(), b"&AGE-", false);
         let b = MailboxName::new("a").unwrap();
         let op = AccountOperation::SyncChanges;
-        let a_id = encode_object_id(&a, 7, 9);
-        assert_ne!(a_id, encode_object_id(&b, 7, 9));
+        let a_id = encode_object_id(
+            &a,
+            crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            crate::types::Uid::new(9).expect("valid protocol test value"),
+        );
+        assert_ne!(
+            a_id,
+            encode_object_id(
+                &b,
+                crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                crate::types::Uid::new(9).expect("valid protocol test value")
+            )
+        );
         let decoded = decode_object_id(&a_id, op).unwrap();
-        assert_eq!(decoded.folder, a);
+        assert_eq!(decoded.folder.clone(), a);
         assert_eq!(decoded.folder.wire_bytes(false), Some(b"&AGE-".as_slice()));
         let controls = MailboxName::from_wire("line\r\nbreak".into(), b"line\r\nbreak", true);
         let restored = MailboxName::from_account_id(&controls.account_id()).unwrap();
@@ -707,21 +779,21 @@ mod tests {
     fn cursor_envelope_roundtrips_all_tiers() {
         let cursors = [
             FolderCursor::QResync {
-                uidvalidity: 7,
-                modseq: 99,
-                baseline: crate::account::envelope::UidBaseline::Complete(
-                    CompactUidSet::from_uids([1, 2]),
-                ),
+                uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                modseq: crate::types::ModSeq::new(99).expect("valid protocol test value"),
+                baseline: crate::account::envelope::UidBaseline::Complete(UidSet::from_numbers([
+                    1, 2,
+                ])),
             },
             FolderCursor::Condstore {
-                uidvalidity: 7,
-                modseq: 99,
-                known_uids: CompactUidSet::from_uids([1, 3, 4]),
+                uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                modseq: crate::types::ModSeq::new(99).expect("valid protocol test value"),
+                known_uids: UidSet::from_numbers([1, 3, 4]),
             },
             FolderCursor::Basic {
-                uidvalidity: 7,
-                uidnext: 20,
-                known_uids: CompactUidSet::from_uids([1, 2, 10]),
+                uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                uidnext: crate::types::Uid::new(20),
+                known_uids: UidSet::from_numbers([1, 2, 10]),
             },
         ];
 
@@ -736,9 +808,9 @@ mod tests {
         let mut change = encode_cursor(
             CursorScope::Account,
             &FolderCursor::QResync {
-                uidvalidity: 1,
-                modseq: 2,
-                baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::default()),
+                uidvalidity: crate::types::UidValidity::new(1).expect("nonzero epoch"),
+                modseq: crate::types::ModSeq::new(2).expect("valid protocol test value"),
+                baseline: crate::account::envelope::UidBaseline::Complete(UidSet::default()),
             },
         );
         change.server_state.envelope_version =
@@ -766,9 +838,9 @@ mod tests {
         assert_eq!(
             cursor,
             FolderCursor::QResync {
-                uidvalidity: 7,
-                modseq: 99,
-                baseline: crate::account::envelope::UidBaseline::Legacy(CompactUidSet::default()),
+                uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                modseq: crate::types::ModSeq::new(99).expect("valid protocol test value"),
+                baseline: crate::account::envelope::UidBaseline::Legacy(UidSet::default()),
             }
         );
     }
@@ -780,17 +852,17 @@ mod tests {
         bytes.push(1);
         push_u32(&mut bytes, 7);
         push_u64(&mut bytes, 99);
-        encode_uid_set(&mut bytes, &CompactUidSet::from_uids([1, 2]));
+        encode_uid_set(&mut bytes, &UidSet::from_numbers([1, 2]));
 
         let cursor = decode_folder_cursor(&bytes).expect("decode mid-pr qresync");
         assert_eq!(
             cursor,
             FolderCursor::QResync {
-                uidvalidity: 7,
-                modseq: 99,
-                baseline: crate::account::envelope::UidBaseline::Complete(
-                    CompactUidSet::from_uids([1, 2])
-                ),
+                uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                modseq: crate::types::ModSeq::new(99).expect("valid protocol test value"),
+                baseline: crate::account::envelope::UidBaseline::Complete(UidSet::from_numbers([
+                    1, 2
+                ])),
             }
         );
     }
@@ -798,9 +870,9 @@ mod tests {
     #[test]
     fn qresync_cursor_roundtrips_incomplete_baseline() {
         let cursor = FolderCursor::QResync {
-            uidvalidity: 7,
-            modseq: 99,
-            baseline: crate::account::envelope::UidBaseline::Legacy(CompactUidSet::default()),
+            uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            modseq: crate::types::ModSeq::new(99).expect("valid protocol test value"),
+            baseline: crate::account::envelope::UidBaseline::Legacy(UidSet::default()),
         };
         let change = encode_cursor(CursorScope::Account, &cursor);
         assert_eq!(decode_cursor(&change).expect("decode"), cursor);
@@ -852,24 +924,37 @@ mod tests {
     #[test]
     fn object_ids_tolerate_colons_in_folder_names() {
         let folder = MailboxName::new("Work:Clients").expect("valid folder");
-        let id = encode_object_id(&folder, 10, 42);
+        let id = encode_object_id(
+            &folder,
+            crate::types::UidValidity::new(10).expect("nonzero epoch"),
+            crate::types::Uid::new(42).expect("valid protocol test value"),
+        );
         let decoded = decode_object_id(&id, AccountOperation::Hydrate).expect("object id");
-        assert_eq!(decoded.folder, folder);
-        assert_eq!(decoded.uidvalidity, 10);
-        assert_eq!(decoded.uid, 42);
+        assert_eq!(decoded.folder.clone(), folder);
+        assert_eq!(
+            decoded.uidvalidity,
+            crate::types::UidValidity::new(10).expect("valid protocol test value")
+        );
+        assert_eq!(
+            decoded.uid,
+            crate::types::Uid::new(42).expect("valid protocol test value")
+        );
     }
 
     #[test]
     fn server_thread_handles_are_account_scoped_and_reject_criteria_injection() {
         let folder = MailboxName::new("Team: replies").unwrap();
-        let thread = encode_server_thread_id(Some("T-key"), Some(99)).unwrap();
+        let thread =
+            encode_server_thread_id(Some("T-key"), Some(crate::types::GmailThreadId::new(99)))
+                .unwrap();
         assert_eq!(thread.0, "imapnative2:objectid:T-key");
         let native = decode_server_thread_id(&thread, AccountOperation::HydrateThread)
             .unwrap()
             .unwrap();
         assert_eq!(native.kind, NativeThreadKind::ObjectId);
         assert_eq!(native.criteria, "THREADID T-key");
-        let gmail = encode_server_thread_id(None, Some(99)).unwrap();
+        let gmail =
+            encode_server_thread_id(None, Some(crate::types::GmailThreadId::new(99))).unwrap();
         let native = decode_server_thread_id(&gmail, AccountOperation::HydrateThread)
             .unwrap()
             .unwrap();
@@ -880,7 +965,11 @@ mod tests {
             let thread = encode_server_thread_id(Some(key), None).unwrap();
             assert!(decode_server_thread_id(&thread, AccountOperation::HydrateThread).is_err());
         }
-        let snapshot = encode_thread_id(&folder, 7, &[1, 9]);
+        let snapshot = encode_thread_id(
+            &folder,
+            crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            &crate::types::set::UidSet::from_numbers([1, 9]),
+        );
         assert!(
             decode_server_thread_id(&snapshot, AccountOperation::HydrateThread)
                 .unwrap()
@@ -890,18 +979,25 @@ mod tests {
             decode_thread_id(&snapshot, AccountOperation::HydrateThread)
                 .unwrap()
                 .uids,
-            [1, 9]
+            crate::types::set::UidSet::from_numbers([1, 9])
         );
     }
 
     #[test]
     fn thread_id_tolerates_colons_in_folder_names() {
         let folder = MailboxName::new("Work:Clients").expect("valid folder");
-        let id = encode_thread_id(&folder, 10, &[3, 1, 3]);
+        let id = encode_thread_id(
+            &folder,
+            crate::types::UidValidity::new(10).expect("nonzero epoch"),
+            &crate::types::set::UidSet::from_numbers([3, 1, 3]),
+        );
         let decoded = decode_thread_id(&id, AccountOperation::HydrateThread).expect("thread id");
-        assert_eq!(decoded.folder, folder);
-        assert_eq!(decoded.uidvalidity, 10);
-        assert_eq!(decoded.uids, vec![1, 3]);
+        assert_eq!(decoded.folder.clone(), folder);
+        assert_eq!(
+            decoded.uidvalidity,
+            crate::types::UidValidity::new(10).expect("valid protocol test value")
+        );
+        assert_eq!(decoded.uids.to_uids(), vec![1, 3]);
     }
 
     /// UID 0 is not an RFC 9051 `nz-number` and this crate never mints it.
@@ -960,9 +1056,9 @@ mod tests {
         let mut change = encode_cursor(
             CursorScope::Account,
             &FolderCursor::Basic {
-                uidvalidity: 1,
-                uidnext: 2,
-                known_uids: CompactUidSet::default(),
+                uidvalidity: crate::types::UidValidity::new(1).expect("nonzero epoch"),
+                uidnext: crate::types::Uid::new(2),
+                known_uids: UidSet::default(),
             },
         );
         change.server_state.protocol = ProtocolKind::Jmap;
@@ -1034,12 +1130,22 @@ mod tests {
         // The length prefix is a BYTE count, so a folder whose name is not
         // pure ASCII must still slice back out on a char boundary.
         let folder = MailboxName::new("Ünread/Läst").expect("valid folder");
-        let id = encode_object_id(&folder, 3, 9);
+        let id = encode_object_id(
+            &folder,
+            crate::types::UidValidity::new(3).expect("nonzero epoch"),
+            crate::types::Uid::new(9).expect("valid protocol test value"),
+        );
         let decoded =
             decode_object_id(&id, AccountOperation::Hydrate).expect("multibyte folder decodes");
-        assert_eq!(decoded.folder, folder);
-        assert_eq!(decoded.uidvalidity, 3);
-        assert_eq!(decoded.uid, 9);
+        assert_eq!(decoded.folder.clone(), folder);
+        assert_eq!(
+            decoded.uidvalidity,
+            crate::types::UidValidity::new(3).expect("valid protocol test value")
+        );
+        assert_eq!(
+            decoded.uid,
+            crate::types::Uid::new(9).expect("valid protocol test value")
+        );
     }
 
     #[test]

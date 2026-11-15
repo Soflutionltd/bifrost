@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 
-use crate::ids::{MailboxId, ObjectId};
+use crate::ids::{ObjectId, PrincipalId};
 
 /// Opaque handle to a server-side uploaded attachment.
 ///
@@ -114,19 +114,19 @@ pub enum SendAs {
     /// whole contract of `As` is "the recipient sees only the shared
     /// mailbox." A consumer that wants `from` to diverge from the
     /// sending mailbox wants `OnBehalfOf`, not `As`.
-    As(MailboxId),
+    As(PrincipalId),
     /// Send **on behalf of** the shared mailbox: when the consumer does not
     /// supply `from`, the mailbox is the author (`From`); the authenticated
     /// user is the sender (`Sender`). A provider may preserve an explicit
     /// consumer `from`. The recipient sees "user on behalf of mailbox".
-    OnBehalfOf(MailboxId),
+    OnBehalfOf(PrincipalId),
 }
 
 impl SendAs {
     /// The shared mailbox identity, regardless of mode - the
     /// `/users/{id}` routing key.
     #[must_use]
-    pub fn mailbox(&self) -> &MailboxId {
+    pub fn mailbox(&self) -> &PrincipalId {
         match self {
             Self::As(m) | Self::OnBehalfOf(m) => m,
         }
@@ -597,7 +597,7 @@ mod scheduled_send_tests {
 mod send_as_tests {
     use super::{SendAs, SendRequest};
     use crate::capabilities::PimMethodSupport;
-    use crate::ids::MailboxId;
+    use crate::ids::PrincipalId;
 
     #[test]
     fn send_as_defaults_none() {
@@ -611,7 +611,7 @@ mod send_as_tests {
 
     #[test]
     fn send_as_mailbox_accessor() {
-        let mailbox = MailboxId("shared@contoso.com".to_string());
+        let mailbox = PrincipalId("shared@contoso.com".to_string());
         assert_eq!(SendAs::As(mailbox.clone()).mailbox(), &mailbox);
         assert_eq!(SendAs::OnBehalfOf(mailbox.clone()).mailbox(), &mailbox);
     }

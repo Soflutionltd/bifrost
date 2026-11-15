@@ -40,23 +40,17 @@ pub(crate) fn removals<'a>(
     removed: impl IntoIterator<Item = &'a bifrost_types::ObjectId>,
 ) -> Result<Vec<bifrost_types::Change>, bifrost_types::AccountError> {
     use bifrost_types::{
-        Change, CursorScope, MembershipScope, ObjectChange, ObjectChangeKind, ScopeChange,
-        ScopeChangeKind,
+        Change, ObjectChange, ObjectChangeKind, RemovalProjection, ScopeChange, ScopeChangeKind,
     };
     let mut removed = removed.into_iter().peekable();
     if removed.peek().is_none() {
         return Ok(Vec::new());
     }
-    let membership = match scope {
-        CursorScope::Folder(folder) | CursorScope::FolderType { folder, .. } => {
-            Some(MembershipScope::Folder(folder.clone()))
-        }
-        CursorScope::Query(query) => Some(MembershipScope::Query(query.clone())),
-        CursorScope::Account | CursorScope::Type(_) => None,
+    let membership = match scope.removal_projection() {
+        RemovalProjection::Membership(membership) => Some(membership),
+        RemovalProjection::Destroy => None,
         _ => {
-            return Err(crate::recovery::inventory_removal_scope_contract_failure(
-                scope,
-            ));
+            return Err(crate::engine_errors::inventory_removal_scope_contract_failure(scope));
         }
     };
     Ok(removed
@@ -166,7 +160,7 @@ pub(crate) fn barrier_incidents(
 /// silently defeats the operator-block path as well. The caller must refuse to
 /// announce the barrier when this returns `Err`.
 pub(crate) async fn record_barriers(
-    writer: Option<&tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>>,
+    writer: Option<&crate::engine::writer::WriterHandle>,
     coverage: &InventoryCoverageReport,
     generation: crate::cursor::WalkGeneration,
     resume_from: Option<Checkpoint>,
@@ -175,15 +169,7 @@ pub(crate) async fn record_barriers(
         return Ok(());
     };
     for incident in barrier_incidents(coverage, generation, resume_from.clone()) {
-        let (done, recv) = tokio::sync::oneshot::channel();
-        if writer
-            .send(crate::multiplexer::WriterRequest::RecordBarrier { incident, done })
-            .await
-            .is_err()
-        {
-            return Ok(());
-        }
-        match recv.await {
+        match writer.record_barrier(incident).await {
             Ok(result) => result?,
             Err(_) => return Ok(()),
         }
@@ -198,26 +184,17 @@ pub(crate) async fn record_barriers(
 /// not from a walk-start snapshot: an operator decision racing an in-flight
 /// walk is ordered against this request by the single writer.
 pub(crate) async fn cross_waived_barriers(
-    writer: Option<&tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>>,
+    writer: Option<&crate::engine::writer::WriterHandle>,
     coverage: &InventoryCoverageReport,
     generation: crate::cursor::WalkGeneration,
 ) -> Result<bool, Error> {
     let Some(writer) = writer else {
         return Ok(false);
     };
-    let (done, recv) = tokio::sync::oneshot::channel();
-    if writer
-        .send(crate::multiplexer::WriterRequest::CrossWaivedBarriers {
-            report: coverage.clone(),
-            generation,
-            done,
-        })
+    match writer
+        .cross_waived_barriers(coverage.clone(), generation)
         .await
-        .is_err()
     {
-        return Ok(false);
-    }
-    match recv.await {
         Ok(result) => result,
         Err(_) => Ok(false),
     }
@@ -238,21 +215,13 @@ pub(crate) async fn cross_waived_barriers(
 /// takes no admission, activity or reopen lock, so this cannot deadlock against
 /// whatever the producer holds.
 pub(crate) async fn record_refused_debt(
-    writer_tx: Option<&tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>>,
+    writer_tx: Option<&crate::engine::writer::WriterHandle>,
     claim: crate::cursor::CoverageClaim,
 ) -> Result<(), Error> {
     let claim = claim.debt_only();
     for report in claim.reports {
         let tx = writer_tx.ok_or(Error::ShuttingDown)?;
-        let (done, reply) = tokio::sync::oneshot::channel();
-        tx.send(crate::multiplexer::WriterRequest::RecordDebt {
-            report,
-            generation: claim.generation,
-            done,
-        })
-        .await
-        .map_err(|_| Error::ShuttingDown)?;
-        match reply.await.map_err(|_| Error::ShuttingDown)? {
+        match tx.record_debt(report, claim.generation).await? {
             Ok(()) => {}
             Err(error) => {
                 tracing::warn!(
@@ -431,7 +400,7 @@ mod tests {
         };
 
         let scope = CursorScope::Type(ObjectType::Email);
-        let error = crate::recovery::inventory_removal_scope_contract_failure(&scope);
+        let error = crate::engine_errors::inventory_removal_scope_contract_failure(&scope);
         assert_eq!(
             error.kind(),
             &AccountErrorKind::Internal(InternalErrorKind::AccountContract)
@@ -444,14 +413,15 @@ mod tests {
     fn incident_writer(
         answer: Option<Result<(), Error>>,
     ) -> (
-        tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>,
+        crate::engine::writer::WriterHandle,
         tokio::task::JoinHandle<usize>,
     ) {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let worker = tokio::spawn(async move {
             let mut served = 0_usize;
             while let Some(request) = rx.recv().await {
-                let crate::multiplexer::WriterRequest::RecordBarrier { done, .. } = request else {
+                let crate::engine::writer::WriterRequest::RecordBarrier { done, .. } = request
+                else {
                     continue;
                 };
                 served += 1;
@@ -470,7 +440,7 @@ mod tests {
             }
             served
         });
-        (tx, worker)
+        (crate::engine::writer::WriterHandle::new(tx), worker)
     }
 
     /// The failure the round-3 code accepted as success: the writer ANSWERS,
@@ -530,6 +500,7 @@ mod tests {
         // And a channel already closed before the send even lands.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
+        let tx = crate::engine::writer::WriterHandle::new(tx);
         record_barriers(
             Some(&tx),
             &barrier(),

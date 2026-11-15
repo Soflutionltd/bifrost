@@ -1,13 +1,28 @@
 //! Validated SELECT and synchronization FETCH request operands.
 
-use super::{FetchAttr, ModSeq, SeqSet, SequenceSet, UidSet, UidValidity};
+use super::{FetchAttr, ModSeq, SeqSetExpr, SequenceSet, UidSetExpr, UidValidity};
 
 /// Finite cached UID knowledge. Wildcards and saved-search references are
 /// live queries, not a statement of the client's cached mailbox state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KnownUids {
-    pub uids: SequenceSet,
-    pub seq_match: Option<(SequenceSet, SequenceSet)>,
+    pub uids: super::set::UidSet,
+    pub seq_match: Option<(super::set::SeqNumSet, super::set::UidSet)>,
+}
+
+fn finite<I: super::set::SetId>(
+    expr: &SequenceSet,
+) -> Result<super::set::NumberSet<I>, crate::Error> {
+    if !expr.is_finite() {
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput("QRESYNC knowledge must be finite".into()),
+        ));
+    }
+    super::set::NumberSet::from_expression(expr).ok_or_else(|| {
+        crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
+            "QRESYNC knowledge must be finite".into(),
+        ))
+    })
 }
 
 /// QRESYNC operands retain their validated protocol identities until encoding.
@@ -27,8 +42,8 @@ impl QresyncParams {
         }
     }
 
-    pub fn with_known(mut self, uids: UidSet) -> Result<Self, crate::Error> {
-        let uids = SequenceSet::new_known(uids.to_string())?;
+    pub fn with_known(mut self, uids: UidSetExpr) -> Result<Self, crate::Error> {
+        let uids = finite::<super::Uid>(uids.as_sequence_set())?;
         self.known = Some(KnownUids {
             uids,
             seq_match: None,
@@ -36,13 +51,19 @@ impl QresyncParams {
         Ok(self)
     }
 
-    pub fn with_seq_match(mut self, seqs: SeqSet, uids: UidSet) -> Result<Self, crate::Error> {
+    pub fn with_seq_match(
+        mut self,
+        seqs: SeqSetExpr,
+        uids: UidSetExpr,
+    ) -> Result<Self, crate::Error> {
         let known = self.known.as_mut().ok_or_else(|| {
-            crate::Error::InvalidInput("QRESYNC seq-match-data requires known-uids".into())
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
+                "QRESYNC seq-match-data requires known-uids".into(),
+            ))
         })?;
         known.seq_match = Some((
-            SequenceSet::new_known(seqs.to_string())?,
-            SequenceSet::new_known(uids.to_string())?,
+            finite::<super::ids::Seq>(seqs.as_sequence_set())?,
+            finite::<super::Uid>(uids.as_sequence_set())?,
         ));
         Ok(self)
     }
@@ -59,19 +80,21 @@ impl QresyncParams {
         seq_match: Option<(String, String)>,
     ) -> Result<Self, crate::Error> {
         let validity = UidValidity::new(uidvalidity).ok_or_else(|| {
-            crate::Error::InvalidInput("QRESYNC UIDVALIDITY must be nonzero".into())
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
+                "QRESYNC UIDVALIDITY must be nonzero".into(),
+            ))
         })?;
         let modseq = ModSeq::new(modseq).ok_or_else(|| {
-            crate::Error::InvalidInput(
+            crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
                 "QRESYNC MODSEQ must be positive and at most ModSeq::MAX".into(),
-            )
+            ))
         })?;
         let mut params = Self::new(validity, modseq);
         if let Some(known) = known {
-            params = params.with_known(UidSet::parse(known)?)?;
+            params = params.with_known(UidSetExpr::parse(known)?)?;
         }
         if let Some((seqs, uids)) = seq_match {
-            params = params.with_seq_match(SeqSet::parse(seqs)?, UidSet::parse(uids)?)?;
+            params = params.with_seq_match(SeqSetExpr::parse(seqs)?, UidSetExpr::parse(uids)?)?;
         }
         Ok(params)
     }
@@ -120,7 +143,7 @@ impl SelectOptions {
         mut self,
         validity: UidValidity,
         modseq: ModSeq,
-        known: Option<UidSet>,
+        known: Option<UidSetExpr>,
     ) -> Result<Self, crate::Error> {
         let mut params = QresyncParams::new(validity, modseq);
         if let Some(known) = known {
@@ -146,7 +169,7 @@ pub enum FetchChanges {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncFetchRequest {
     /// UID set to fetch.
-    pub uids: UidSet,
+    pub uids: UidSetExpr,
     /// Attributes to request.
     pub attrs: Vec<FetchAttr>,
     /// Delta mode, with VANISHED structurally requiring CHANGEDSINCE.
@@ -157,7 +180,7 @@ impl SyncFetchRequest {
     /// Fetch flags and UID for all messages.
     pub fn flags() -> Self {
         Self {
-            uids: UidSet::all(),
+            uids: UidSetExpr::all(),
             attrs: vec![FetchAttr::Uid, FetchAttr::Flags, FetchAttr::ModSeq],
             changes: FetchChanges::All,
         }
@@ -166,7 +189,7 @@ impl SyncFetchRequest {
     /// Fetch envelope-sized metadata for all messages.
     pub fn envelope() -> Self {
         Self {
-            uids: UidSet::all(),
+            uids: UidSetExpr::all(),
             attrs: vec![
                 FetchAttr::Uid,
                 FetchAttr::Flags,
@@ -181,7 +204,7 @@ impl SyncFetchRequest {
 
     /// Fetch full RFC 5322 message bytes for the given UID set without
     /// setting `\Seen`.
-    pub fn full_messages(uids: UidSet) -> Self {
+    pub fn full_messages(uids: UidSetExpr) -> Self {
         Self {
             uids,
             attrs: vec![
@@ -218,19 +241,19 @@ mod tests {
     #[test]
     fn qresync_params_preserve_seq_match_data() {
         let params = QresyncParams::new(UidValidity::new(77).unwrap(), ModSeq::new(9000).unwrap())
-            .with_known(UidSet::parse("10:20").unwrap())
+            .with_known(UidSetExpr::parse("10:20").unwrap())
             .unwrap()
             .with_seq_match(
-                SeqSet::parse("1:5").unwrap(),
-                UidSet::parse("10:14").unwrap(),
+                SeqSetExpr::parse("1:5").unwrap(),
+                UidSetExpr::parse("10:14").unwrap(),
             )
             .unwrap();
         assert_eq!(params.uid_validity.get(), 77);
         assert_eq!(params.mod_seq.get(), 9000);
         let known = params.known().unwrap();
-        assert_eq!(known.uids.as_str(), "10:20");
+        assert_eq!(known.uids.to_string(), "10:20");
         let (seqs, uids) = known.seq_match.as_ref().unwrap();
-        assert_eq!(seqs.as_str(), "1:5");
-        assert_eq!(uids.as_str(), "10:14");
+        assert_eq!(seqs.to_string(), "1:5");
+        assert_eq!(uids.to_string(), "10:14");
     }
 }

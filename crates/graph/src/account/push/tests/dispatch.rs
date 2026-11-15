@@ -133,8 +133,15 @@ async fn a_public_folder_scope_is_rejected_in_both_push_modes() {
             err.kind(),
             AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
         ));
-        assert!(account.graph_subscriptions.read().await.is_empty());
-        assert!(account.ews_subscriptions.read().await.is_empty());
+        assert!(account.webhooks.groups_for_tests().read().await.is_empty());
+        assert!(
+            account
+                .ews
+                .registrations_for_tests()
+                .read()
+                .await
+                .is_empty()
+        );
     }
 }
 
@@ -171,7 +178,7 @@ async fn an_unsubscribable_ews_scope_does_not_sink_its_valid_siblings() {
         result.outcomes().failed()[0].error.scope(),
         Some(ErrorScope::Cursor(CursorScope::Account))
     ));
-    let registered = account.ews_subscriptions.read().await;
+    let registered = account.ews.registrations_for_tests().read().await;
     let state = registered.get(&handle).expect("the group is registered");
     assert_eq!(state.scopes.len(), 1);
     assert_eq!(state.scopes[0].ews_folder_id, "ews-inbox");
@@ -202,8 +209,15 @@ async fn subscribing_to_no_scopes_is_rejected_in_both_modes() {
             error.kind(),
             AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         ));
-        assert!(account.graph_subscriptions.read().await.is_empty());
-        assert!(account.ews_subscriptions.read().await.is_empty());
+        assert!(account.webhooks.groups_for_tests().read().await.is_empty());
+        assert!(
+            account
+                .ews
+                .registrations_for_tests()
+                .read()
+                .await
+                .is_empty()
+        );
     }
 }
 
@@ -298,7 +312,7 @@ async fn a_ledger_that_cannot_close_leaves_nothing_registered_in_either_mode() {
         &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
     );
     assert!(
-        account.graph_subscriptions.read().await.is_empty(),
+        account.webhooks.groups_for_tests().read().await.is_empty(),
         "no group may be registered behind an Err that carries no handle"
     );
     let requests = client.take_rest_requests();
@@ -337,8 +351,15 @@ async fn a_ledger_that_cannot_close_leaves_nothing_registered_in_either_mode() {
         error.kind(),
         &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
     );
-    assert!(account.ews_subscriptions.read().await.is_empty());
-    assert_eq!(*account.ews_topology.borrow(), 0);
+    assert!(
+        account
+            .ews
+            .registrations_for_tests()
+            .read()
+            .await
+            .is_empty()
+    );
+    assert_eq!(*account.ews.topology_for_tests().borrow(), 0);
 }
 
 /// The same rule on the EWS arm, where every scope is refused by
@@ -366,7 +387,12 @@ async fn an_ews_request_whose_every_translation_is_refused_is_a_whole_request_er
         Some(&ErrorScope::Cursor(email_scope("inbox")))
     );
     assert!(
-        account.ews_subscriptions.read().await.is_empty(),
+        account
+            .ews
+            .registrations_for_tests()
+            .read()
+            .await
+            .is_empty(),
         "no registration survives a request that subscribed nothing"
     );
 }
@@ -399,8 +425,15 @@ async fn shared_non_mail_scopes_are_refused_before_either_push_transport() {
             ));
             assert_eq!(error.scope(), Some(&ErrorScope::Cursor(scope)));
             assert!(client.take_rest_requests().is_empty());
-            assert!(account.graph_subscriptions.read().await.is_empty());
-            assert!(account.ews_subscriptions.read().await.is_empty());
+            assert!(account.webhooks.groups_for_tests().read().await.is_empty());
+            assert!(
+                account
+                    .ews
+                    .registrations_for_tests()
+                    .read()
+                    .await
+                    .is_empty()
+            );
         }
     }
 }

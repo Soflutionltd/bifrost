@@ -9,7 +9,7 @@ use crate::account::graph_error::{
 };
 use crate::client::Resource;
 use base64::Engine;
-use bifrost_types::{AccountError, AccountOperation, DraftHandle, MailboxId, ObjectId, SendAs};
+use bifrost_types::{AccountError, AccountOperation, DraftHandle, ObjectId, PrincipalId, SendAs};
 use bifrost_types::{
     Application, ErrorScope, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets,
     TargetRef, TargetRole,
@@ -38,7 +38,7 @@ pub(crate) async fn send_message(
     // draft-create-stamp-send cycle through the shared mailbox's
     // `/users/{id}` client so the draft is owned by the shared mailbox.
     let client = match &request.send_as {
-        None => &account.client,
+        None => account.mailboxes.primary(),
         // The two answers mean different things and the capability flag picks
         // between them (`SendRequest::send_as` is the governing statement).
         // An EMPTY map is `pim_methods.send_as == false`: the feature is
@@ -46,15 +46,15 @@ pub(crate) async fn send_message(
         // telling the caller to correct an argument would send them to fix a
         // request that no argument could have satisfied. A non-empty map is
         // the flag being true, so an id that is not in it is a bad argument.
-        Some(_) if account.shared_clients.is_empty() => {
+        Some(_) if account.mailboxes.shared().is_empty() => {
             return Err(crate::account::graph_error::unsupported_account_error(
                 AccountOperation::Send,
             ));
         }
-        Some(send_as) => {
-            crate::account::shared_client(&account.shared_clients, &send_as.mailbox().0)
-                .ok_or_else(|| send_as_unknown_mailbox(send_as.mailbox()))?
-        }
+        Some(send_as) => account
+            .mailboxes
+            .shared_client(&send_as.mailbox().0)
+            .ok_or_else(|| send_as_unknown_mailbox(send_as.mailbox()))?,
     };
     let mut message = message_from_send_request(&request)?;
     if let Some(send_as) = &request.send_as {
@@ -101,7 +101,7 @@ pub(crate) async fn send_raw_message(
     // base64 of the octets to `/messages` with `Content-Type: text/plain`,
     // which creates a draft; we then send that draft. Graph always files
     // the sent copy in Sent, so `save_to_sent` has no Graph-side toggle.
-    let client = &account.client;
+    let client = account.mailboxes.primary();
     let base64_mime = base64::engine::general_purpose::STANDARD.encode(&raw);
     let path = format!("{}/messages", client.api_path_prefix());
     let created: Value = client
@@ -143,8 +143,9 @@ pub(super) fn client_for_scheduled_send_handle<'a>(
     // Share routing with every other persisted owner-qualified identity. Keep
     // the send door's caller-facing refusal for an unconfigured send-as owner.
     account
+        .mailboxes
         .client_for_owner(mailbox)
-        .map_err(|_| send_as_unknown_mailbox(&MailboxId(mailbox.unwrap_or_default().to_string())))
+        .map_err(|_| send_as_unknown_mailbox(&PrincipalId(mailbox.unwrap_or_default().to_string())))
 }
 
 /// Stamp Graph's `from` / `sender` fields from a `SendAs` directive.
@@ -202,7 +203,7 @@ pub(super) fn apply_send_as(message: &mut Value, send_as: &SendAs, user_email: O
 /// get this answer from, and a UI that highlights the offending input
 /// should not have to know which one it is talking to.
 #[must_use]
-pub(super) fn send_as_unknown_mailbox(mailbox: &MailboxId) -> AccountError {
+pub(super) fn send_as_unknown_mailbox(mailbox: &PrincipalId) -> AccountError {
     invalid_argument_account_error(
         AccountOperation::Send,
         "send_as.mailbox",

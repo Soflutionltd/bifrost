@@ -673,25 +673,6 @@ impl Session {
         self.primary_accounts.iter()
     }
 
-    /// Stable fallback account selection for generic request construction.
-    /// Capability-specific callers should select their own primary account.
-    ///
-    /// The fallback is the lowest capability URI in `primaryAccounts`, so a
-    /// session advertising only calendars serves a mail-shaped generic
-    /// request off the calendar account. That is documented behaviour, not a
-    /// defect: narrowing it (refusing a generic request whose implied
-    /// capability the session does not name) is a product decision the
-    /// 2026-09-04 bug hunt raised and left open. What IS refused is an
-    /// EMPTY id - a session with no `primaryAccounts` at all - which
-    /// `Request::call` reports as `NoPrimaryAccount` naming the method's
-    /// own capability rather than shipping `"accountId": ""`. Methods
-    /// without an accountId, such as PushSubscription, need no primary.
-    pub(crate) fn default_account_id(&self) -> Option<&str> {
-        self.primary_accounts()
-            .min_by_key(|(capability, _)| *capability)
-            .map(|(_, account_id)| account_id.as_str())
-    }
-
     pub(crate) fn username(&self) -> &str {
         &self.username
     }
@@ -1152,10 +1133,18 @@ mod tests {
     }
 
     #[test]
-    fn default_account_id_is_stable_across_session_map_seeds() {
+    fn capability_primary_selection_is_stable_across_session_map_seeds() {
         for _ in 0..32 {
             let session = session_with_multiple_primaries();
-            assert_eq!(session.default_account_id(), Some("calendar-account"));
+            assert_eq!(
+                session
+                    .primary_accounts()
+                    .find(|(uri, _)| uri.as_str() == "urn:ietf:params:jmap:calendars")
+                    .unwrap()
+                    .1
+                    .as_str(),
+                "calendar-account"
+            );
         }
     }
 

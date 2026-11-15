@@ -1,8 +1,8 @@
 use bifrost_dav_core::MultistatusError;
 use bifrost_dav_core::{
     APPLE_CALENDAR_NAMESPACE, CALDAV_NAMESPACE, DAV_NAMESPACE, MultiStatusSink, PropSet,
-    ResponseParts, XmlName, classify_207, commit_if_present, normalize_etag, parse_multistatus,
-    same_dav_url, trimmed,
+    ResponseParts, XmlName, commit_if_present, normalize_etag, parse_multistatus, same_dav_url,
+    trimmed,
 };
 pub(crate) use bifrost_dav_core::{
     extract_href_properties_in_namespace, extract_href_property_in_namespace,
@@ -35,11 +35,7 @@ pub(crate) struct CalendarCollection {
     pub(crate) sync_token: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CalDavEventEntry {
-    pub(crate) uri: String,
-    pub(crate) etag: Option<String>,
-}
+pub(crate) type CalDavEventEntry = bifrost_dav_core::collection::ResourceEntry;
 
 /// Outcome of a depth-1 event PROPFIND or a `calendar-query`: the resources
 /// whose propstat succeeded (`entries`) plus the resources the server reported
@@ -54,18 +50,9 @@ pub(crate) struct CalDavEventEntry {
 /// candidate set plus a bare list of hrefs, and the recovery class of that
 /// refusal was unreachable: a consumer saw an empty page and recorded a
 /// completed walk.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct CalDavEventListing {
-    pub(crate) entries: Vec<CalDavEventEntry>,
-    pub(crate) failed: Vec<CalDavFailedResource>,
-}
+pub(crate) type CalDavEventListing = bifrost_dav_core::collection::ResourceListing;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CalDavFetchedEvent {
-    pub(crate) uri: String,
-    pub(crate) etag: Option<String>,
-    pub(crate) data: String,
-}
+pub(crate) type CalDavFetchedEvent = bifrost_dav_core::collection::FetchedResource;
 
 /// One resource inside a 207 that yielded nothing usable, with the status the
 /// server gave it (when it gave one). Both member lanes use it - the multiget
@@ -74,7 +61,7 @@ pub(crate) struct CalDavFetchedEvent {
 pub(crate) type CalDavFailedResource = bifrost_dav_core::FailedResource;
 
 /// Outcome of a `calendar-multiget` / `calendar-query` REPORT: the
-/// resources that came back with usable `calendar-data` (`events`) plus
+/// resources that came back with usable `calendar-data` (`items`) plus
 /// the ones that did not (`failed`).
 ///
 /// A 207 Multi-Status is per-resource by construction, so a single bad
@@ -84,55 +71,11 @@ pub(crate) type CalDavFailedResource = bifrost_dav_core::FailedResource;
 /// says a 207 body may describe success, partial success, OR complete
 /// failure, so a body in which every resource failed must not be
 /// handed back as an empty success. See `classify`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct CalDavMultigetReport {
-    pub(crate) events: Vec<CalDavFetchedEvent>,
-    pub(crate) failed: Vec<CalDavFailedResource>,
-    /// Resources that returned a successful response but omitted the
-    /// requested `calendar-data`. They are per-resource absences, not DAV
-    /// failures, so they surface through `Page::failed_ids` but cannot turn
-    /// a 207 into a synthetic server error.
-    pub(crate) missing_data: Vec<String>,
-}
+pub(crate) type CalDavMultigetReport = bifrost_dav_core::collection::MultigetReport;
 
 /// What a parsed 207 body actually represents, per RFC 4918 s13.
+#[cfg(test)]
 pub(crate) type MultigetOutcome = bifrost_dav_core::MultiStatusOutcome;
-
-impl CalDavMultigetReport {
-    /// Fold another chunk's report into this one. Multiget is chunked
-    /// and text search runs one REPORT per property, so both lanes have
-    /// to accumulate across calls.
-    pub(crate) fn extend(&mut self, other: CalDavMultigetReport) {
-        self.events.extend(other.events);
-        self.failed.extend(other.failed);
-        self.missing_data.extend(other.missing_data);
-    }
-
-    pub(crate) fn failed_hrefs(&self) -> Vec<String> {
-        self.failed
-            .iter()
-            .map(|failure| failure.href.clone())
-            .chain(self.missing_data.iter().cloned())
-            .collect()
-    }
-
-    /// Classify the body rather than merely parsing it.
-    ///
-    /// An empty body is `Usable`: a query that matched nothing is a
-    /// legitimate empty result, not a failure. A body with at least one
-    /// usable resource is `Usable` too - the failures are real, and the
-    /// caller still reports them, but the request as a whole worked.
-    ///
-    /// A body where EVERY resource failed is only benign if every
-    /// failure was a missing resource (404/410), which is what happens
-    /// when hrefs are deleted between the listing and the multiget.
-    /// If any of them was an auth, permission, or server condition,
-    /// the body is a complete failure and the caller must surface it as
-    /// an error instead of an empty page.
-    pub(crate) fn classify(&self) -> MultigetOutcome {
-        classify_207(!self.events.is_empty(), &self.failed)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CalDavSyncReport {
@@ -193,48 +136,6 @@ pub(crate) fn declared_non_vevent(content_type: Option<&str>) -> bool {
 impl CalendarCollection {
     pub(crate) fn resolve_href(&mut self, request_url: &str) {
         self.href = resolve_href(request_url, &self.href);
-    }
-}
-
-impl CalDavEventListing {
-    pub(crate) fn resolve_hrefs(&mut self, request_url: &str) {
-        for entry in &mut self.entries {
-            entry.uri = resolve_href(request_url, &entry.uri);
-        }
-        for failure in &mut self.failed {
-            failure.href = resolve_href(request_url, &failure.href);
-        }
-    }
-
-    /// The refused hrefs, for the lanes that only carry ids (`Page::failed_ids`
-    /// and the snapshot-diff preservation guard).
-    pub(crate) fn failed_hrefs(&self) -> Vec<String> {
-        self.failed
-            .iter()
-            .map(|failure| failure.href.clone())
-            .collect()
-    }
-
-    /// Read this 207 through the RFC 4918 s13 ladder, the same one the multiget
-    /// lanes use. A listing with any committed entry is `Usable` however many
-    /// siblings were refused - a per-member failure beside successes stays a
-    /// per-id failure and the page is served.
-    pub(crate) fn classify(&self) -> MultigetOutcome {
-        classify_207(!self.entries.is_empty(), &self.failed)
-    }
-}
-
-impl CalDavMultigetReport {
-    pub(crate) fn resolve_hrefs(&mut self, request_url: &str) {
-        for event in &mut self.events {
-            event.uri = resolve_href(request_url, &event.uri);
-        }
-        for failed in &mut self.failed {
-            failed.href = resolve_href(request_url, &failed.href);
-        }
-        for href in &mut self.missing_data {
-            *href = resolve_href(request_url, href);
-        }
     }
 }
 
@@ -526,7 +427,7 @@ impl MultiStatusSink for MultigetSink {
 
     fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
         if let Some((href, data)) = parts.fetched() {
-            self.report.events.push(CalDavFetchedEvent {
+            self.report.items.push(CalDavFetchedEvent {
                 uri: href.to_string(),
                 etag: parts.props().etag.clone(),
                 data: data.to_string(),
@@ -986,8 +887,8 @@ END:VCALENDAR</C:calendar-data></D:prop>
           </D:response></D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("valid XML");
-        assert_eq!(report.events.len(), 1);
-        assert_eq!(report.events[0].uri, "/cal/opaque-id");
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].uri, "/cal/opaque-id");
     }
 
     /// An etag echoed back inside a REFUSED propstat is not evidence about
@@ -1029,7 +930,7 @@ END:VCALENDAR</C:calendar-data></D:prop>
           </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("valid XML");
-        assert!(report.events.is_empty());
+        assert!(report.items.is_empty());
     }
 
     #[test]
@@ -1046,7 +947,7 @@ END:VCALENDAR</C:calendar-data></D:prop>
 </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("a 207 is not a parse failure");
-        assert!(report.events.is_empty());
+        assert!(report.items.is_empty());
         assert_eq!(report.failed_hrefs(), vec!["/cal/missing.ics".to_string()]);
         assert_eq!(report.failed[0].status, Some(404));
         // Every resource failed, but the only failure was a vanished
@@ -1081,8 +982,8 @@ END:VCALENDAR</C:calendar-data>
 </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("a 207 is not a parse failure");
-        assert_eq!(report.events.len(), 1);
-        assert_eq!(report.events[0].uri, "/cal/good.ics");
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].uri, "/cal/good.ics");
         assert_eq!(report.failed_hrefs(), vec!["/cal/missing.ics".to_string()]);
         // Partial success: the 403 is reported, not fatal.
         assert_eq!(report.classify(), MultigetOutcome::Usable);
@@ -1102,7 +1003,7 @@ END:VCALENDAR</C:calendar-data>
 </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("a 207 is not a parse failure");
-        assert!(report.events.is_empty());
+        assert!(report.items.is_empty());
         assert_eq!(report.failed_hrefs(), vec!["/cal/empty.ics".to_string()]);
         assert!(report.failed.is_empty());
         assert_eq!(report.missing_data, vec!["/cal/empty.ics"]);
@@ -1125,7 +1026,7 @@ END:VCALENDAR</C:calendar-data>
 </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("a 207 is not a parse failure");
-        assert!(report.events.is_empty());
+        assert!(report.items.is_empty());
         assert!(report.failed.is_empty());
         assert_eq!(report.classify(), MultigetOutcome::Usable);
     }
@@ -1148,8 +1049,8 @@ END:VCALENDAR</C:calendar-data>
 </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("embedded 200 should pass");
-        assert_eq!(report.events.len(), 1);
-        assert_eq!(report.events[0].etag.as_deref(), Some("abc"));
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].etag.as_deref(), Some("abc"));
         assert!(report.failed.is_empty());
     }
 
@@ -1192,12 +1093,12 @@ END:VCALENDAR</C:calendar-data>
             let xml = two_propstat_multiget(data_first);
             let report = parse_multiget_report(&xml).expect("valid 207");
             assert_eq!(
-                report.events.len(),
+                report.items.len(),
                 1,
                 "data_first={data_first}: usable calendar-data was dropped"
             );
-            assert_eq!(report.events[0].uri, "/cal/split.ics");
-            assert_eq!(report.events[0].etag.as_deref(), Some("ok"));
+            assert_eq!(report.items[0].uri, "/cal/split.ics");
+            assert_eq!(report.items[0].etag.as_deref(), Some("ok"));
             assert!(report.failed.is_empty());
         }
     }
@@ -1224,7 +1125,7 @@ END:VCALENDAR</C:calendar-data></D:prop>
 
         let report = parse_multiget_report(xml).expect("valid 207");
         assert!(
-            report.events.is_empty(),
+            report.items.is_empty(),
             "calendar-data from a 403 propstat must not be served as an event"
         );
         assert_eq!(report.failed_hrefs(), vec!["/cal/refused.ics".to_string()]);
@@ -1299,7 +1200,7 @@ END:VCALENDAR</C:calendar-data>
 
         let report = parse_multiget_report(xml).expect("valid 207");
         assert!(
-            report.events.is_empty(),
+            report.items.is_empty(),
             "an unreadable status must not commit the property beside it"
         );
     }
@@ -1319,7 +1220,7 @@ END:VCALENDAR</C:calendar-data>
 </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("valid 207");
-        assert!(report.events.is_empty());
+        assert!(report.items.is_empty());
         assert_eq!(report.failed_hrefs(), vec!["/cal/gone.ics".to_string()]);
         assert_eq!(report.failed[0].status, Some(404));
         assert_eq!(report.classify(), MultigetOutcome::Usable);
@@ -1350,7 +1251,7 @@ END:VCALENDAR</C:calendar-data>
 </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("valid 207");
-        assert!(report.events.is_empty());
+        assert!(report.items.is_empty());
         let terse = report
             .failed
             .iter()
@@ -1396,7 +1297,7 @@ END:VCALENDAR</C:calendar-data>
 </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("valid 207");
-        assert!(report.events.is_empty());
+        assert!(report.items.is_empty());
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.missing_data, vec!["/cal/empty.ics"]);
         assert_eq!(report.classify(), MultigetOutcome::Usable);
@@ -1407,7 +1308,7 @@ END:VCALENDAR</C:calendar-data>
         // A query that matched nothing is a legitimate empty result.
         let xml = r#"<D:multistatus xmlns:D="DAV:"></D:multistatus>"#;
         let report = parse_multiget_report(xml).expect("valid 207");
-        assert!(report.events.is_empty());
+        assert!(report.items.is_empty());
         assert!(report.failed.is_empty());
         assert_eq!(report.classify(), MultigetOutcome::Usable);
     }

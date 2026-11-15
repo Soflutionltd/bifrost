@@ -26,7 +26,7 @@ use crate::types::response::{
     AclEntry, EsearchResponse, ListRightsResponse, MetadataResult, NamespaceResponse,
     QuotaResource, QuotaRootResponse, ThreadNode, UidRange,
 };
-use crate::types::validated::ParsedUidSet;
+use crate::types::set::UidSet;
 use crate::types::{
     Capability, Command, CopyResult, ExpungeResult, FetchResponse, MoveResult, StatusResult,
     StoreResult,
@@ -309,7 +309,7 @@ impl<'conn, T> Pipeline<'conn, T> {
         fn fetch(
             sequence_set: SequenceSet,
             items: impl Into<crate::types::fetch::FetchItems>,
-            changed_since: Option<u64>,
+            changed_since: Option<crate::types::ModSeq>,
         ) -> Vec<FetchResponse>;
         command = Command::Fetch { sequence_set, items: items.into(), changed_since };
         consumer = dispatch::FetchConsumer::new();
@@ -321,7 +321,7 @@ impl<'conn, T> Pipeline<'conn, T> {
             sequence_set: SequenceSet,
             operation: StoreOperation,
             flags: Vec<Flag>,
-            unchanged_since: Option<u64>,
+            unchanged_since: Option<crate::types::ModSeqValzer>,
         ) -> StoreResult;
         command = Command::Store { sequence_set, operation, flags, unchanged_since };
         consumer = dispatch::StoreConsumer::new(unchanged_since);
@@ -375,18 +375,18 @@ impl<'conn, T> Pipeline<'conn, T> {
     /// regardless of the `vanished` flag so that VANISHED responses
     /// are always captured when the server sends them.
     ///
-    /// Parses the `sequence_set` into a [`ParsedUidSet`] for defensive
+    /// Parses the `sequence_set` into a [`UidSet`] for defensive
     /// filtering of `VANISHED (EARLIER)` UIDs (RFC 7162 Section 3.2.6).
     #[allow(clippy::type_complexity)]
     pub fn uid_fetch(
         mut self,
         sequence_set: SequenceSet,
         items: impl Into<crate::types::fetch::FetchItems>,
-        changed_since: Option<u64>,
+        changed_since: Option<crate::types::ModSeq>,
         vanished: bool,
     ) -> Pipeline<'conn, ((Vec<FetchResponse>, Vec<UidRange>), T)> {
         // Parse before moving sequence_set into the command.
-        let parsed_set = ParsedUidSet::new(&sequence_set);
+        let parsed_set = UidSet::from_expression(&sequence_set);
         self.commands.push(Command::UidFetch {
             sequence_set,
             items: items.into(),
@@ -410,7 +410,7 @@ impl<'conn, T> Pipeline<'conn, T> {
             sequence_set: SequenceSet,
             operation: StoreOperation,
             flags: Vec<Flag>,
-            unchanged_since: Option<u64>,
+            unchanged_since: Option<crate::types::ModSeqValzer>,
         ) -> StoreResult;
         command = Command::UidStore { sequence_set, operation, flags, unchanged_since };
         consumer = dispatch::StoreConsumer::new(unchanged_since);
@@ -732,10 +732,18 @@ impl<T> Pipeline<'_, T> {
             )
             .await
             .map_err(|error| match error {
-                Error::DriverGone { .. } | Error::DriverPanicked { .. } => {
-                    PipelineError::Disconnected(error)
+                Error::Transport {
+                    kind: crate::error::TransportFailure::DriverGone,
+                    ..
                 }
-                Error::Timeout { .. } => PipelineError::Timeout(error),
+                | Error::Internal {
+                    kind: crate::error::InternalFailure::Panicked(_),
+                    ..
+                } => PipelineError::Disconnected(error),
+                Error::Transport {
+                    kind: crate::error::TransportFailure::Timeout,
+                    ..
+                } => PipelineError::Timeout(error),
                 _ => PipelineError::Driver(error),
             })
     }

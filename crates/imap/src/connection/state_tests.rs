@@ -378,7 +378,9 @@ fn enable_is_refused_once_a_mailbox_has_been_selected_in_the_session() {
     assert!(
         matches!(
             live_state_refusal(&state, CommandKind::Enable),
-            Some(crate::error::Error::StateChangedBeforeSend(_))
+            Some(crate::error::Error::LocalRefusal(
+                crate::error::LocalRefusal::StateChangedBeforeSend(_)
+            ))
         ),
         "ENABLE after a mailbox was selected must be refused at the head of the queue"
     );

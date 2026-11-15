@@ -320,9 +320,8 @@ fn an_unattributed_auth_rejection_keeps_its_bare_text() {
 
 #[test]
 fn auth_policy_maps_to_policy_blocked() {
-    let err = Error::AuthPolicy(crate::error::AuthPolicyFailure::new(
-        vec!["PLAIN".into()],
-        Vec::new(),
+    let err = Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(
+        crate::error::AuthPolicyFailure::new(vec!["PLAIN".into()], Vec::new()),
     ));
     let account = into_account_error(err, ImapErrorContext::operation(AccountOperation::Discover));
 
@@ -354,7 +353,7 @@ fn shared_folder_permission_loss_derives_disable_scope() {
     let err = Error::no_with_code("no perm".into(), Some(ResponseCode::NoPerm))
         .with_attempt(TransmissionState::Acknowledged);
     let folder = mailbox("Shared/alice/INBOX");
-    let owner = bifrost_types::MailboxId("alice".to_owned());
+    let owner = bifrost_types::PrincipalId("alice".to_owned());
     let account = shared_folder_error(
         err,
         &folder,
@@ -446,10 +445,10 @@ fn bad_without_code_maps_to_request_malformed() {
 #[test]
 fn incomplete_uid_expansion_is_an_acknowledged_local_request_limit() {
     let account = into_account_error(
-        Error::SearchResultTruncated {
+        Error::ResultLimit(crate::error::ResultLimit::SearchTruncated {
             returned: 1_000_000,
             omitted: Some(2_000_000),
-        },
+        }),
         ImapErrorContext::operation(AccountOperation::SearchMessages),
     );
 
@@ -494,7 +493,7 @@ fn bye_with_unavailable_inflight_is_unavailable() {
 
 #[test]
 fn parse_maps_to_protocol_parse_failed() {
-    let err = Error::Parse("garbled".into());
+    let err = Error::Provider(crate::error::ProviderFailure::Parse("garbled".into()));
     let account = into_account_error(
         err,
         ImapErrorContext::operation(AccountOperation::SyncChanges),
@@ -507,7 +506,9 @@ fn parse_maps_to_protocol_parse_failed() {
 
 #[test]
 fn invalid_input_maps_to_request_malformed() {
-    let err = Error::InvalidInput("bad mailbox name".into());
+    let err = Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
+        "bad mailbox name".into(),
+    ));
     let account = into_account_error(
         err,
         ImapErrorContext::operation(AccountOperation::ContainerCreate),
@@ -520,7 +521,7 @@ fn invalid_input_maps_to_request_malformed() {
 
 #[test]
 fn missing_capability_with_push_subscribe_maps_to_unsupported() {
-    let err = Error::MissingCapability("IDLE".into());
+    let err = Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability("IDLE".into()));
     let account = into_account_error(
         err,
         ImapErrorContext::operation(AccountOperation::PushSubscribe),
@@ -539,7 +540,10 @@ fn a_client_side_failure_is_internal_not_a_provider_fault() {
     use bifrost_types::{InternalErrorKind, RemediationAction};
     for (error, kind) in [
         (
-            Error::Internal("missing pipeline result".into()),
+            Error::Internal {
+                kind: crate::error::InternalFailure::Invariant("missing pipeline result".into()),
+                mid_exchange: None,
+            },
             InternalErrorKind::InvariantViolated,
         ),
         (
@@ -550,13 +554,18 @@ fn a_client_side_failure_is_internal_not_a_provider_fault() {
             InternalErrorKind::InvariantViolated,
         ),
         (
-            Error::LocalRuntime("failed to generate SCRAM nonce".into()),
+            Error::Internal {
+                kind: crate::error::InternalFailure::Runtime(
+                    "failed to generate SCRAM nonce".into(),
+                ),
+                mid_exchange: None,
+            },
             InternalErrorKind::RuntimeFailure,
         ),
         (
-            Error::DriverPanicked {
-                message: "boom".into(),
-                attempt: Some(crate::error::ImapAttempt::new(TransmissionState::Unsent)),
+            Error::Internal {
+                kind: crate::error::InternalFailure::Panicked("boom".into()),
+                mid_exchange: Some(TransmissionState::Unsent),
             },
             InternalErrorKind::Panicked,
         ),
@@ -582,11 +591,15 @@ fn a_client_side_failure_is_internal_not_a_provider_fault() {
 #[test]
 fn a_missing_mandatory_response_is_missing_field_with_the_same_recovery() {
     let missing = into_account_error(
-        Error::ProtocolMissing("SELECT missing UIDVALIDITY".into()),
+        Error::Provider(crate::error::ProviderFailure::Missing(
+            "SELECT missing UIDVALIDITY".into(),
+        )),
         ImapErrorContext::operation(AccountOperation::SyncChanges),
     );
     let wrong = into_account_error(
-        Error::Protocol("unexpected tag".into()),
+        Error::Provider(crate::error::ProviderFailure::Protocol(
+            "unexpected tag".into(),
+        )),
         ImapErrorContext::operation(AccountOperation::SyncChanges),
     );
     assert_eq!(
@@ -608,7 +621,9 @@ fn a_missing_mandatory_response_is_missing_field_with_the_same_recovery() {
             .iter()
             .any(|cause| matches!(cause, Cause::Wire(WireCause::MalformedResponse { .. })))
     );
-    assert!(!Error::ProtocolMissing("x".into()).is_connection_fatal());
+    assert!(
+        !Error::Provider(crate::error::ProviderFailure::Missing("x".into())).is_connection_fatal()
+    );
 }
 
 /// A mid-exchange invariant failure retires the connection; the ordinary
@@ -616,8 +631,20 @@ fn a_missing_mandatory_response_is_missing_field_with_the_same_recovery() {
 #[test]
 fn only_the_mid_exchange_internal_failure_is_connection_fatal() {
     assert!(Error::internal_mid_exchange("x", TransmissionState::InFlight).is_connection_fatal());
-    assert!(!Error::Internal("x".into()).is_connection_fatal());
-    assert!(!Error::LocalRuntime("x".into()).is_connection_fatal());
+    assert!(
+        !Error::Internal {
+            kind: crate::error::InternalFailure::Invariant("x".into()),
+            mid_exchange: None
+        }
+        .is_connection_fatal()
+    );
+    assert!(
+        !Error::Internal {
+            kind: crate::error::InternalFailure::Runtime("x".into()),
+            mid_exchange: None
+        }
+        .is_connection_fatal()
+    );
 }
 
 /// The central safety property of the driver-death phase: a non-idempotent
@@ -627,9 +654,9 @@ fn only_the_mid_exchange_internal_failure_is_connection_fatal() {
 /// which used to lose the phase and so skipped reconciliation too.
 #[test]
 fn only_a_command_the_driver_owned_reconciles_after_driver_death() {
-    let panicked = |phase| Error::DriverPanicked {
-        message: "boom".into(),
-        attempt: Some(crate::error::ImapAttempt::new(phase)),
+    let panicked = |phase| Error::Internal {
+        kind: crate::error::InternalFailure::Panicked("boom".into()),
+        mid_exchange: Some(phase),
     };
     let classify = |error| {
         into_account_error(error, ImapErrorContext::operation(AccountOperation::Send))
@@ -659,7 +686,9 @@ fn only_a_command_the_driver_owned_reconciles_after_driver_death() {
 #[test]
 fn a_wrong_session_state_is_a_client_bug() {
     let account = into_account_error(
-        Error::InvalidState("command not valid in Authenticated state".into()),
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidState(
+            "command not valid in Authenticated state".into(),
+        )),
         ImapErrorContext::operation(AccountOperation::SyncChanges),
     );
     assert!(matches!(
@@ -675,7 +704,9 @@ fn a_wrong_session_state_is_a_client_bug() {
 #[test]
 fn state_moved_under_a_queued_command_is_a_retry_after_refresh() {
     let account = into_account_error(
-        Error::StateChangedBeforeSend("session moved to NotAuthenticated".into()),
+        Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(
+            "session moved to NotAuthenticated".into(),
+        )),
         ImapErrorContext::operation(AccountOperation::Send),
     );
     assert_eq!(*account.kind(), AccountErrorKind::ConcurrencyConflict);
@@ -700,7 +731,9 @@ fn state_moved_under_a_queued_command_is_a_retry_after_refresh() {
 #[test]
 fn an_operation_this_crate_does_not_implement_is_unsupported() {
     let account = into_account_error(
-        Error::UnsupportedOperation("flag operation not implemented".into()),
+        Error::LocalRefusal(crate::error::LocalRefusal::UnsupportedOperation(
+            "flag operation not implemented".into(),
+        )),
         ImapErrorContext::operation(AccountOperation::UpdateFlags),
     );
     assert!(matches!(
@@ -953,7 +986,11 @@ fn other_response_code_preserves_payload_in_wire_unknown() {
 
 #[test]
 fn uidvalidity_changed_derives_restart_scope() {
-    let account = super::uidvalidity_changed(&mailbox("INBOX"), 1, 2);
+    let account = super::uidvalidity_changed(
+        &mailbox("INBOX"),
+        crate::types::UidValidity::new(1).unwrap(),
+        crate::types::UidValidity::new(2).unwrap(),
+    );
     assert!(matches!(
         account.recovery(),
         RecoveryClass::Engine(EngineDirective::RestartScope(CursorScope::Folder(_)))
@@ -966,7 +1003,11 @@ fn uidvalidity_changed_derives_restart_scope() {
 
 #[test]
 fn modseq_reset_derives_restart_scope() {
-    let account = super::modseq_reset(&mailbox("INBOX"), 10, Some(5));
+    let account = super::modseq_reset(
+        &mailbox("INBOX"),
+        crate::types::ModSeq::new(10).expect("valid protocol test value"),
+        Some(crate::types::ModSeq::new(5).expect("valid protocol test value")),
+    );
     assert!(matches!(
         account.recovery(),
         RecoveryClass::Engine(EngineDirective::RestartScope(CursorScope::Folder(_)))
@@ -1041,7 +1082,7 @@ fn ctx_with_cursor_scope_helper_round_trip() {
 }
 
 #[test]
-fn auth_attempt_evidence_survives_account_translation_and_override() {
+fn auth_acknowledgement_survives_outer_phase_stamping() {
     for state in [
         TransmissionState::Unsent,
         TransmissionState::InFlight,
@@ -1054,7 +1095,7 @@ fn auth_attempt_evidence_survives_account_translation_and_override() {
         )
         .with_attempt(TransmissionState::InFlight)
         .with_attempt(state);
-        assert_eq!(error.attempt(), Some(state));
+        assert_eq!(error.attempt(), Some(TransmissionState::Acknowledged));
         let account = into_account_error(
             error,
             ImapErrorContext::operation(AccountOperation::SyncChanges),
@@ -1064,7 +1105,7 @@ fn auth_attempt_evidence_survives_account_translation_and_override() {
                 Cause::Attempt(attempt) => Some(attempt.transmission_state),
                 _ => None,
             }),
-            Some(state)
+            Some(TransmissionState::Acknowledged)
         );
     }
 }
@@ -1072,7 +1113,7 @@ fn auth_attempt_evidence_survives_account_translation_and_override() {
 #[test]
 fn starttls_refusal_does_not_claim_the_capability_was_absent() {
     let error = into_account_error(
-        Error::StartTlsUnavailable,
+        Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable),
         ImapErrorContext::operation(AccountOperation::Discover),
     );
     assert_eq!(
@@ -1120,7 +1161,7 @@ fn oauth_token_failures_preserve_net_classification_and_context() {
         let Error::OAuthToken(expected) = &tunneled else {
             panic!("token error must retain its classification");
         };
-        let expected = std::sync::Arc::clone(expected);
+        let expected = std::sync::Arc::clone(&expected.0);
         let account = into_account_error(
             tunneled,
             ImapErrorContext::operation(AccountOperation::SyncChanges)

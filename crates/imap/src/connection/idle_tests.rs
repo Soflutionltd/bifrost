@@ -57,7 +57,7 @@ fn idle_retains_server_and_local_event_payloads() {
         // Legacy SEARCH must retain MODSEQ and its original response type.
         TypedEvent::from(UntaggedResponse::Search {
             uids: vec![7],
-            mod_seq: Some(99),
+            mod_seq: Some(crate::types::ModSeq::new(99).expect("valid protocol test value")),
         }),
         TypedEvent::from(UntaggedResponse::Esearch(Default::default())),
         TypedEvent::from(UntaggedResponse::Status {

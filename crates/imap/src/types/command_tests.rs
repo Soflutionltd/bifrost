@@ -189,7 +189,10 @@ fn command_select_qresync() {
             let q = qresync.as_ref().unwrap();
             assert_eq!(q.uid_validity.get(), 67890);
             assert_eq!(q.mod_seq.get(), 12345);
-            assert_eq!(q.known().map(|known| known.uids.as_str()), Some("1:500"));
+            assert_eq!(
+                q.known().map(|known| known.uids.to_string()),
+                Some("1:500".to_owned())
+            );
         }
         _ => panic!("expected Select"),
     }
@@ -417,13 +420,18 @@ fn command_store_with_condstore() {
         sequence_set: SequenceSet::new("1").unwrap(),
         operation: StoreOperation::Replace,
         flags: vec![Flag::Flagged, Flag::Seen],
-        unchanged_since: Some(12345),
+        unchanged_since: Some(
+            crate::types::ModSeqValzer::new(12345).expect("valid protocol test value"),
+        ),
     };
     match &cmd {
         Command::Store {
             unchanged_since, ..
         } => {
-            assert_eq!(*unchanged_since, Some(12345));
+            assert_eq!(
+                *unchanged_since,
+                Some(crate::types::ModSeqValzer::new(12345).expect("valid protocol test value"))
+            );
         }
         _ => panic!("expected Store"),
     }
@@ -723,11 +731,14 @@ fn command_fetch_changedsince() {
     let cmd = Command::Fetch {
         sequence_set: SequenceSet::new("1:*").unwrap(),
         items: "(FLAGS)".into(),
-        changed_since: Some(12345),
+        changed_since: Some(crate::types::ModSeq::new(12345).expect("valid protocol test value")),
     };
     match &cmd {
         Command::Fetch { changed_since, .. } => {
-            assert_eq!(*changed_since, Some(12345));
+            assert_eq!(
+                *changed_since,
+                Some(crate::types::ModSeq::new(12345).expect("valid protocol test value"))
+            );
         }
         _ => panic!("expected Fetch"),
     }
@@ -738,12 +749,15 @@ fn command_uid_fetch_changedsince() {
     let cmd = Command::UidFetch {
         sequence_set: SequenceSet::new("1:*").unwrap(),
         items: "(UID FLAGS)".into(),
-        changed_since: Some(99999),
+        changed_since: Some(crate::types::ModSeq::new(99999).expect("valid protocol test value")),
         vanished: false,
     };
     match &cmd {
         Command::UidFetch { changed_since, .. } => {
-            assert_eq!(*changed_since, Some(99999));
+            assert_eq!(
+                *changed_since,
+                Some(crate::types::ModSeq::new(99999).expect("valid protocol test value"))
+            );
         }
         _ => panic!("expected UidFetch"),
     }
@@ -756,7 +770,7 @@ fn command_uid_fetch_vanished() {
     let cmd = Command::UidFetch {
         sequence_set: SequenceSet::new("1:*").unwrap(),
         items: "(FLAGS)".into(),
-        changed_since: Some(12345),
+        changed_since: Some(crate::types::ModSeq::new(12345).expect("valid protocol test value")),
         vanished: true,
     };
     match &cmd {
@@ -765,7 +779,10 @@ fn command_uid_fetch_vanished() {
             vanished,
             ..
         } => {
-            assert_eq!(*changed_since, Some(12345));
+            assert_eq!(
+                *changed_since,
+                Some(crate::types::ModSeq::new(12345).expect("valid protocol test value"))
+            );
             assert!(*vanished);
         }
         _ => panic!("expected UidFetch"),

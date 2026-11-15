@@ -18,7 +18,7 @@ No boxed-transport escape hatch. Supported transport is `tokio::net::TcpStream` 
 
 Every active exchange reads through `driver/read_loop.rs`. Its `LoopPolicy` admits the exchange's command tags, identifies which completion is terminal, disarms the effects armed for a command whose literal was answered by a premature tagged `OK`, and selects whether untagged responses route to the consumer or are published as events. A foreign tag retires the connection, including during IDLE. A pipeline's sent tags stay admitted after their completion, and a tag for a command not yet sent is rejected. `ReadLoop::next` returns after every frame, so IDLE re-enters its biased `DONE` select even when the peer keeps supplying buffered events. Shutdown LOGOUT is sent through the same encoded command sender and reads through LOGOUT's required BYE to its own tagged completion, bounded by the existing `LOGOUT_DRAIN_TIMEOUT`.
 
-Before the nom parser runs, `WireReader` asks a framing pre-check whether the buffer can hold a whole response, because the parser is in `complete` mode and cannot distinguish "truncated" from "malformed". The pre-check has three answers, not two: complete, need more bytes, and *unreachable*. Unreachable is a literal count this process can never be handed the octets for  -  above the RFC 9051 `number64` ceiling, or above `usize` on a narrow target, or a chain of counts whose running offset leaves the addressable buffer. Those return `Error::Parse` (connection-fatal, `ProviderContractViolation`) rather than "need more bytes", which would park the read loop until the peer closed. The bound matches `codec::decode::literal`, so the pre-check never accepts a count the decoder would reject and never rejects one the decoder would take.
+Before the nom parser runs, `WireReader` asks a framing pre-check whether the buffer can hold a whole response, because the parser is in `complete` mode and cannot distinguish "truncated" from "malformed". The pre-check has three answers, not two: complete, need more bytes, and *unreachable*. Unreachable is a literal count this process can never be handed the octets for  -  above the RFC 9051 `number64` ceiling, or above `usize` on a narrow target, or a chain of counts whose running offset leaves the addressable buffer. Those return `ProviderFailure::Parse` (connection-fatal, `ProviderContractViolation`) rather than "need more bytes", which would park the read loop until the peer closed. The bound matches `codec::decode::literal`, so the pre-check never accepts a count the decoder would reject and never rejects one the decoder would take.
 
 The literal marker parser (`connection/literals.rs`, `literal_marker_at`) is shared by the read side's framing pre-check and the encoder's walk over caller-written SEARCH / SORT / THREAD criteria. It answers three ways: a counted marker (count guaranteed `<= i64::MAX`), a well-formed marker whose count is above the RFC 9051 `number64` ceiling, and "not a marker". Each call site decides what the middle answer means for it - fatal framing on the read path; on the criteria walk it cannot arise, because the validator has already refused a count whose payload is not inside the criteria. A digit run too long even for `u64` is not recognizable framing at all and is handed to the decoder. The encoder never scans its OWN output: see "One command path" below.
 
@@ -117,11 +117,11 @@ Literal-free pipeline batches coalesce their chunk handles into one unsegmented 
 
 **Pending command effects** live in one tag-keyed map, `ProtocolState::pending`, shared by regular and pipeline dispatch. A `PendingEffect` is one of authentication (LOGIN / AUTHENTICATE), selection (SELECT / EXAMINE, carrying the mailbox), close (CLOSE / UNSELECT), logout, unauthentication, or a NOTIFY registration (NOTIFY SET or NOTIFY NONE, carrying the flags). `arm_effect` inserts it only after preparation (legality, then encoding) has succeeded and the caller has committed: `run_one_command` is `prepare_command` then `run_prepared_command`, which arms, and `run_pipeline` arms each command of a batch only after the whole batch has been prepared, immediately before its write (all together for a literal-free batch sent as one write, one by one when a synchronizing literal forces per-command sends). Preparation refusals therefore arm nothing and write nothing, so a command refused before its first byte cannot leave, say, a pending selection for the next command's tagged OK to complete. An effect is consumed only by the tagged completion carrying its own tag, on OK, NO or BAD alike; a foreign tag changes no command effect, although its response codes (CAPABILITY, NOTIFICATIONOVERFLOW) still apply. OK applies the effect; NO on a selection deselects and BAD does not (RFC 3501 Section 6.3.1); otherwise a refusal just drops it. An own tagged OK arriving before a required literal grant means the command never ran, and `disarm_effect` removes only that entry, because earlier pipelined commands still owe their completions. NOTIFICATIONOVERFLOW, tagged or untagged, clears the live NOTIFY flags and cancels only pending NOTIFY entries, never an unrelated session transition. A successful UNAUTHENTICATE clears the map with the rest of the session.
 
-**Every driver command arm** (single command, upgrade, pipeline, IDLE) calls `finish_exchange` before it publishes the state snapshot or answers the caller, so retirement is one decision made in one place. It reads the typed framing the read loop recorded on `ProtocolState` (`Untouched`, `Synchronized` or `Desynchronized`), never inferring framing from an error variant: the connection retires when the exchange ended `Desynchronized` (including a pipeline that ended early with responses still unread) or when the session reached Logout. A refusal before the first byte (a preparation refusal, or a whole pipeline refused before any write) stays `Untouched`. Logout is the explicit unusable-session signal for cases framing alone cannot express, and it retires the session even after a `Synchronized` completion: a tagged LOGOUT OK, a mandatory post-transition capability refresh that failed, an upgrade that poisoned the transport after its tagged OK, and an AUTHENTICATE or LOGIN whose tagged OK failed the client's verification (an incomplete SCRAM exchange) all mark Logout, so the connection retires rather than serving later commands with stale capabilities, a poisoned stream or an unverified session. `finish_exchange` also receives the exchange's own error: once the framing is not `Untouched`, a desynchronization-class error (`Error::is_connection_fatal`: `Protocol`, `Parse`, `FetchLiteralLimit`, `InternalMidExchange`, ...) retires the session even when the last frame was the command's tagged completion, because a consumer that could not interpret a well-framed answer leaves the client unsure what state the server is in. The same rule runs at the dispatch completion (`retire_if_completion_unusable`, which also covers the driver's internal commands) and over a completed pipeline's per-command slots. An enterprise Outlook user whose connection may be silently corrupt expects a fresh connection, never the next command run on it. Server refusals (`NO`/`BAD`) and `ProtocolMissing` stay reusable. `a_consumer_failure_on_a_tagged_ok_retires_the_connection` pins the single-command case. Gated commands that refuse before their first byte stay `Untouched` and reusable. The shutdown LOGOUT drain's error is discarded (`let _ =` on the bounded `logout_best_effort` in `driver_task`).
+**Every driver command arm** (single command, upgrade, pipeline, IDLE) calls `finish_exchange` before it publishes the state snapshot or answers the caller, so retirement is one decision made in one place. It reads the typed framing the read loop recorded on `ProtocolState` (`Untouched`, `Synchronized` or `Desynchronized`), never inferring framing from an error variant: the connection retires when the exchange ended `Desynchronized` (including a pipeline that ended early with responses still unread) or when the session reached Logout. A refusal before the first byte (a preparation refusal, or a whole pipeline refused before any write) stays `Untouched`. Logout is the explicit unusable-session signal for cases framing alone cannot express, and it retires the session even after a `Synchronized` completion: a tagged LOGOUT OK, a mandatory post-transition capability refresh that failed, an upgrade that poisoned the transport after its tagged OK, and an AUTHENTICATE or LOGIN whose tagged OK failed the client's verification (an incomplete SCRAM exchange) all mark Logout, so the connection retires rather than serving later commands with stale capabilities, a poisoned stream or an unverified session. `finish_exchange` also receives the exchange's own error: once the framing is not `Untouched`, a desynchronization-class error (`Error::is_connection_fatal`: `Protocol`, `Parse`, `FetchLiteralLimit`, `Internal` with exchange evidence, ...) retires the session even when the last frame was the command's tagged completion, because a consumer that could not interpret a well-framed answer leaves the client unsure what state the server is in. The same rule runs at the dispatch completion (`retire_if_completion_unusable`, which also covers the driver's internal commands) and over a completed pipeline's per-command slots. An enterprise Outlook user whose connection may be silently corrupt expects a fresh connection, never the next command run on it. Server refusals (`NO`/`BAD`) and `ProtocolMissing` stay reusable. `a_consumer_failure_on_a_tagged_ok_retires_the_connection` pins the single-command case. Gated commands that refuse before their first byte stay `Untouched` and reusable. The shutdown LOGOUT drain's error is discarded (`let _ =` on the bounded `logout_best_effort` in `driver_task`).
 
 **Transmission evidence for a failed write** comes from socket progress, not from which write failed. Every transport socket is wrapped at construction in `stream::Tracked`, which counts the octets the socket accepts; it sits BELOW TLS and below COMPRESS, because neither layer above reports its own partial progress (OpenSSL can push part of an encrypted record before its `poll_write` returns `Pending`, and a later poll can fail without ever having returned `Ok(n)`). The sender reads the counter when a command begins (for a coalesced pipeline batch, when the batch begins, never reset between its commands) and stamps any write or flush failure `Unsent` exactly when the counter has not moved, else `InFlight` (`write_failure_evidence`). A saturated counter reads as progress. TLS handshake and control traffic can only inflate the count, the conservative direction. The rule rests on two invariants: a failed write retires the connection, so nothing buffered above the socket is ever sent later, and COMPRESS drains its sync-flush output inside a successful write, so a new command cannot inherit undrained output. This is what lets a stale pooled connection's first-byte EPIPE stay `Unsent` (a plain retry) while a failure after any byte of a non-idempotent command reached the socket is `InFlight` (reconcile). Writes made inside an already-started exchange - IDLE's `DONE`, an AUTHENTICATE continuation reply - stay unconditionally `InFlight`, because their command is already on the wire.
 
-ESEARCH `ALL` sets are normalized before expansion into the flat compatibility `SearchResult`. Parsed sequence bounds retain `*` as `SeqBound::Star`, distinct from the legal numeric UID `4294967295`; `*` is refused wherever it appears because its concrete value is unknowable from the response. Legal numeric maximum values can therefore be expanded normally. Legal overlap or repetition is sorted and merged, so both the 1e6 safety cap and the expanded ids count each UID once. An expansion that cannot be completed is `Error::SearchResultTruncated`, never a partial list presented as complete, and the solicited ESEARCH stays consumed by the command rather than being republished as an asynchronous event.
+ESEARCH `ALL` sets are normalized before expansion into the flat compatibility `SearchResult`. Parsed sequence bounds retain `*` as `SeqBound::Star`, distinct from the legal numeric UID `4294967295`; `*` is refused wherever it appears because its concrete value is unknowable from the response. Legal numeric maximum values can therefore be expanded normally. Legal overlap or repetition is sorted and merged, so both the 1e6 safety cap and the expanded ids count each UID once. An expansion that cannot be completed is `ResultLimit::SearchTruncated`, never a partial list presented as complete, and the solicited ESEARCH stays consumed by the command rather than being republished as an asynchronous event.
 
 APPEND and MULTIAPPEND are `Command::Append { mailbox, messages, multi }`, encoded, validated and sent by the driver from live protocol state when the command reaches the head of the queue, exactly like every other command (see "One command path"). The handle (`ImapConnection::append` / `append_message` / `multi_append`) does only the client-side APPENDLIMIT check, then submits the command through `submit_regular` with `AppendConsumer` / `MultiAppendConsumer`; it makes no wire decision. That is the invariant: an earlier design built the bytes handle-side and queued them, which froze the mailbox encoding (modified UTF-7 versus UTF-8), the RFC 6855 `UTF8 (` wrapper, the RFC 7888 `+` markers and literal8 eligibility while the command sat behind another one. APPEND uses the driver's tag generator like every command. APPEND is not pipelinable (`CommandKind::pipelinable`): a batch does not run its APPENDLIMIT preflight, and the batch router does not hand an untagged `* OK [APPENDUID ...]` to an APPEND consumer that a head consumer claims first.
 
@@ -412,7 +412,7 @@ non-search command) takes the ordinary head-consumer path unchanged.
 The codec draws the line that decides which of those two buckets a bad
 response lands in. A response opening with a keyword the codec claims to
 parse cannot degrade to `UntaggedResponse::Unknown`: it becomes
-`nom::Err::Failure`, which the connection surfaces as `Error::Parse` and
+`nom::Err::Failure`, which the connection surfaces as `ProviderFailure::Parse` and
 the account boundary maps to `Protocol(ParseFailed)` /
 `ProviderContractViolation`. Inside FETCH the gate is per attribute
 (`codec/decode/envelope_fetch.rs::has_closed_grammar`): attributes with a
@@ -546,7 +546,7 @@ Three entry points:
 
 - `uid_fetch_streaming()` / `fetch_streaming()` - caller supplies an unbounded sender; the bounded receiver is drained onto it internally.
 - `uid_fetch_each(...)` - callback-based wrapper over the same bounded receiver.
-- `uid_fetch_limited(budget, ...)` - retained-object estimate enforced inside the driver consumer; returns `Error::FetchLimit` when crossed after parsing and drains to tagged OK. Before each response, the consumer also passes its remaining budget to the reader: the sum of declared literal lengths in that response cannot exceed it. A larger declaration is `Error::FetchLiteralLimit` and retires the connection without waiting for the payload. Reads can prefetch up to one 8 KiB chunk before a marker is inspected. This literal ceiling does not bound non-literal syntax or parser object overhead.
+- `uid_fetch_limited(budget, ...)` - retained-object estimate enforced inside the driver consumer; returns `ResultLimit::Fetch` when crossed after parsing and drains to tagged OK. Before each response, the consumer also passes its remaining budget to the reader: the sum of declared literal lengths in that response cannot exceed it. A larger declaration is `ResultLimit::FetchLiteral` and retires the connection without waiting for the payload. Reads can prefetch up to one 8 KiB chunk before a marker is inspected. This literal ceiling does not bound non-literal syntax or parser object overhead.
 
 Each shared FETCH literal pins at most eight times its payload length in backing capacity: its frame is at most four times its length, and the allocation at most twice the frame length. Smaller or disproportionate sections own compact copies. Small responses reuse the read allocation while retained outputs remain alive; large shared responses transfer ownership and require a replacement read allocation. The consumer estimate still counts payload lengths and a fixed response allowance, so it is not an exact allocator-memory ceiling. The declared-literal ceiling and shared measured-inbound counter are unchanged.
 
@@ -603,14 +603,17 @@ AUTH capabilities, profile advertisements and AUTHENTICATE commands carry the
 shared open `MechanismName`, preserving unknown extensions while recognizing
 known names independently of ASCII case. The encoder validates atom syntax.
 
-The shared OAuth AUTHENTICATE consumer uses `bifrost_sasl::OAuthMechanism`
-to select its error-continuation acknowledgement after the initial payload:
-XOAUTH2 sends an empty line; OAUTHBEARER sends base64 SOH (`AQ==`) plus CRLF.
-This applies both with SASL-IR and with a prompted initial response.
-
-SCRAM and CRAM-MD5 computation (`scram_client_final` / `verify_server_final`
-transitions, per-hash proofs, CRAM-MD5 response) lives in the private
-`bifrost-sasl` crate; the dispatch consumers (`AuthenticateScramConsumer`, `AuthenticateCramMd5Consumer`) drive the `+` continuation flow and map `bifrost_sasl::SaslError` into the IMAP error model at the boundary.
+`AuthenticateSaslConsumer` frames the shared `bifrost_sasl::SaslClient` for
+PLAIN, OAuth and CRAM-MD5. `AuthenticateScramConsumer` supplies SCRAM construction
+and delegates to the same framing consumer. SASL-IR and deferred initial
+responses use identical payloads. The shared client owns every mechanism's
+challenge position, OAuth error answer and SCRAM proof state; the consumer owns
+base64 and CRLF. Binary CRAM-MD5 challenges remain accepted. On tagged OK,
+`finish()` refuses incomplete or unverified authentication, including success
+after an OAuth error continuation. The driver retires such a session.
+OAuth fields containing frame delimiters are local invalid input before any
+AUTHENTICATE write; enterprise users expect a refusal rather than credentials
+silently changed into another identity or token.
 
 If a continuation consumer returns a non-fatal error, dispatch answers the
 outstanding SASL challenge with `*` and reads through the command's tagged
@@ -622,7 +625,8 @@ refusal can keep its auth error class without leaving the next command to be
 parsed as a SASL response. Errors already
 classified as connection-fatal retire the stream immediately; another
 continuation or a non-`NO` completion after cancellation is a protocol error.
-`Error::Auth` carries optional attempt evidence like tagged NO/BAD errors.
+`ServerStatus::Auth`, NO and BAD acknowledge their command by construction;
+outer driver phase stamps cannot remove that evidence.
 The driver records the acknowledged cancellation phase without losing the auth
 class, mechanism or response code, and account translation preserves it.
 
@@ -637,18 +641,63 @@ IMAP LOGIN command remains opt-in (`with_login`).
 
 `authenticate_best(credentials, policy)` intersects server-advertised, policy-allowed, and credentials-supported mechanisms, then runs the strongest. SASL-IR is used when advertised or implied by IMAP4rev2; malformed mechanism names are rejected before any wire write. `AuthOutcome` carries the selected mechanism.
 
-The password ladder adapts SASL-owned `negotiate` through the pure helper `password_mechanism_ladder(profile, policy, is_encrypted)` returning `PasswordCandidate::{Attempt, Reject}` in the fixed order SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > CRAM-MD5 > LOGIN. RFC 5802 Section 6 downgrade protection: when the server advertises `SCRAM-SHA-N-PLUS`, the matching unbound `SCRAM-SHA-N` rung becomes `Reject(ChannelBindingUnavailable)` so a MITM cannot strip the binding. For a PLUS `Attempt`, `authenticate_best` resolves the `tls-server-end-point` binding once via `resolve_scram_binding(deadline)` (peer-cert DER + `bifrost_sasl::binding_from_peer_certificate`), which delegates through the error adapter `scram_binding_from_der(Option<&[u8]>)` to the shared certificate resolver. The DER lookup is a queued driver request, so it runs under the attempt's own deadline, the same one the AUTHENTICATE exchange then spends; expiry is `Timeout` / `Unsent`, never read as a missing certificate. Only the *absence* of a peer certificate (plaintext, dead driver, no DER from native-tls) is a `ChannelBindingUnavailable` rejection that lets the ladder continue. A certificate that is present but whose binding cannot be computed (EdDSA leaf, unsupported sig-alg, malformed DER) is a hard `Error::Protocol` that aborts the ladder. Likewise, a server rejection of an attempted mechanism is terminal; only `MissingCapability` from live capability skew falls through to a weaker rung, because retrying after an explicit rejection risks a downgrade and another credential attempt. SMTP uses that same shared resolver. The resolved opaque `ChannelBindingData` feeds `scram_rung`, which supplies the exchange's actual GS2 input without destructuring an assumed bound enum variant.
+The password ladder adapts SASL-owned `negotiate` through the pure helper `password_mechanism_ladder(profile, policy, is_encrypted)` returning `PasswordCandidate::{Attempt, Reject}` in the fixed order SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > CRAM-MD5 > LOGIN. RFC 5802 Section 6 downgrade protection: when the server advertises `SCRAM-SHA-N-PLUS`, the matching unbound `SCRAM-SHA-N` rung becomes `Reject(ChannelBindingUnavailable)` so a MITM cannot strip the binding. For a PLUS `Attempt`, `authenticate_best` resolves the `tls-server-end-point` binding once via `resolve_scram_binding(deadline)` (peer-cert DER + `bifrost_sasl::binding_from_peer_certificate`), which delegates through the error adapter `scram_binding_from_der(Option<&[u8]>)` to the shared certificate resolver. The DER lookup is a queued driver request, so it runs under the attempt's own deadline, the same one the AUTHENTICATE exchange then spends; expiry is `Timeout` / `Unsent`, never read as a missing certificate. Only the *absence* of a peer certificate (plaintext, dead driver, no DER from native-tls) is a `ChannelBindingUnavailable` rejection that lets the ladder continue. A certificate that is present but whose binding cannot be computed (EdDSA leaf, unsupported sig-alg, malformed DER) is a hard `ProviderFailure::Protocol` that aborts the ladder. Likewise, a server rejection of an attempted mechanism is terminal; only `MissingCapability` from live capability skew falls through to a weaker rung, because retrying after an explicit rejection risks a downgrade and another credential attempt. SMTP uses that same shared resolver. The resolved opaque `ChannelBindingData` feeds `scram_rung`, which supplies the exchange's actual GS2 input without destructuring an assumed bound enum variant.
 
 ## Typed IDs and sets
 
-Newtypes with explicit `::new` constructors. No `From<u32>`/`From<u64>` to prevent accidental mixing across UID, sequence, message-id, and thread-id contexts:
+`Uid` and `UidValidity` are distinct public nonzero identifiers, exported beside
+the polling surface. Its constructors, observations, scans, page boundaries and
+generation-change outcomes retain those types. A UID cannot fill an epoch slot.
+`Seq` is the corresponding internal nonzero sequence identifier. Positive
+`ModSeq` values are bounded to 63 bits; `ModSeqValzer` additionally admits zero
+for UNCHANGEDSINCE. FETCH, SEARCH, selected mailbox state, cursor state,
+opportunistic cache entries and guarded mutation groups retain typed MODSEQs.
+Command and pipeline operands retain them through encoding; the encoder only
+renders them. FETCH observations use the zero-admitting type so a later zero
+can replace earlier state during response merging. That tolerated zero supplies
+no concurrency guard and does not reject the other attributes.
 
-- `Uid`, `Seq` - `NonZeroU32`-backed.
-- `UidValidity` - `NonZeroU32`.
-- `ModSeq` - `u64` (0 means "no CONDSTORE state").
-- `GmailMessageId`, `GmailThreadId` - `u64`.
+`types::set::NumberSet<I>` owns finite set algebra, specialized as `UidSet` and
+`SeqNumSet`. Its private ranges have typed nonzero endpoints, sorted, disjoint
+and maximally merged. Construction, membership, insertion, removal, intersection,
+linear diff and bounded ESEARCH expansion share this owner. The cursor registry
+has no separate set implementation. Equal finite membership has one value and
+one cursor spelling, including singleton and reversed input ranges.
 
-`UidSet` and `SeqSet` wrap the validated sequence-set encoder (`from_uids`, `from_seqs`, `all()`, `saved_search()` (`$`), or range constructors). `parse(&str)` is an escape hatch bypassing the typed discipline. Parsed `UidRange` bounds expose `SeqBound::{Number, Star}` so the legal numeric maximum is never confused with `*`; numeric fields remain the compatibility projection for existing consumers.
+`UidSetExpr` and `SeqSetExpr` are command operands, distinct from finite sets.
+They retain a parsed `SequenceSet` expression and its wire spelling. Numeric
+construction uses the finite-set owner; raw syntax is parsed once and retains
+saved-result and wildcard members. QRESYNC knowledge stores finite typed sets,
+without rendering and reparsing its inputs. `UidRange` is a canonical wire range
+with private nonzero bounds and explicit `SeqBound::{Number, Star}` views; it
+has no invalid default or writable numeric projection. Numeric `u32::MAX`
+remains distinct from `*`.
+
+VANISHED filtering intersects finite requested sets using the same algebra.
+Requests containing `*` or `$` cannot be resolved without mailbox state, so
+filtering is skipped. In particular, the actual mailbox maximum can be below a
+numeric wildcard endpoint: guessing `u32::MAX` can drop legitimate deletions.
+An enterprise user expects every reported deletion reconciled. ESEARCH expansion
+refuses unresolved wildcard results and retains its existing distinct-UID cap.
+Persisted cursor bytes retain their existing layout and singleton sentinel;
+zero epochs, invalid MODSEQs and reversed persisted ranges require a rebuild.
+
+Decoded object ids and the public polling reference share `MessageRef`, with a
+mailbox name, `UidValidity` and `Uid`. Part handles reuse that identity. Thread snapshots and committed mutation
+membership use the same finite UID set, and search positions retain `Uid`.
+The submitted object-id string is stored separately and still echoed exactly in
+outcomes and error scopes. APPEND returns named `AppendUid { validity, uid }`
+values. A zero APPENDUID epoch cannot identify a message and yields no usable
+reference. The connection still preserves the acknowledged APPEND; Sent-copy
+receipts retain their filed-without-id outcome. Draft creation retains its
+existing Unsupported outcome when an acknowledged append supplies no usable id.
+
+FETCH provider ids retain RFC 8474 `ObjectId`, `GmailMessageId` and
+`GmailThreadId` values through projection. RFC 8474 observations preserve the
+parser's existing tolerance for nonconforming server atoms; construction of a
+caller-supplied object id remains strict. Writable custom flag observations
+retain a validated `ImapAtom`; malformed observations remain lossless and are
+refused before output. ENVELOPE projection uses the shared address conversion.
 
 The account layer's string-typed object/thread ids (`imap2:` / `imapthread2:`, with literal-folder v1 decoding)
 enforce the same `nz-number` rule at the decode boundary:
@@ -686,19 +735,16 @@ not by convention. `TargetBatch` is the single owner of the derivation
 that used to hand-roll it - flag mutation and its two-sided patch group,
 destroy, move, and hydration in `get.rs` - all route through it:
 
-- `TargetBatch::new(ids)` splits the decoded ids into the ids the operand
-  carries and an explicit *excluded* lane for ids it cannot represent (the
-  only such UID is 0). The operand is built from the target ids and nothing
-  else; there is no constructor that takes UIDs from anywhere but the batch.
+- `TargetBatch::new(ids)` builds its operand directly from typed message
+  identities. Every decoded target is representable; there is no numeric
+  conversion that can silently exclude one.
 - `subset_uid_set` is the only way to build a follow-up operand (the applied
   subset of a guarded STORE, the UIDs to EXPUNGE after a `\Deleted` mark) and
   refuses any UID the batch was not given, so a second wire command can never
   name a message the first was not accountable for.
 - `settle` is the only way to mint the batch's outcomes, and exactly-once is
   a property of the types rather than of an assertion. `settle` consumes the
-  batch, mints the excluded lane itself as `Failed(Request(Malformed))` - a
-  UID the server never saw may become neither a fabricated success nor a
-  silent drop - and then *drives the classification itself*: it walks its own
+  batch and *drives the classification itself*: it walks its own
   targets and calls the caller once per target with a `Target`, returning the
   `Sealed` outcome that call produced.
   - `Target` is a non-`Clone` permit carrying the id and the `BatchItemId`
@@ -717,14 +763,13 @@ destroy, move, and hydration in `get.rs` - all route through it:
     only for an empty input, so `uid_set()` is `None` exactly when the target
     lane is empty, and the path that sends no command needs no classifier.
   - `settle_streaming` is the hydration variant for a path that publishes down
-    a channel: it hands back the target permits and the already-minted excluded
-    lane. Each permit still seals at most once; what this lane gives up is
+    a channel: it hands back the target permits. Each permit still seals at most once; what this lane gives up is
     total coverage, which it must, because the caller may abandon the walk (a
     dropped channel, a failed FETCH) and leave the rest to its own unresolved
     set.
 - The one property Rust cannot express is that a `TargetBatch` must be consumed
   at all - a value can always be dropped. That single residue is still a debug
-  assertion in `Drop`: a batch dropped with either lane non-empty panics in
+  assertion in `Drop`: a batch dropped with targets remaining panics in
   debug builds, so an early return that leaves an id unaccounted for cannot
   pass unnoticed. It has its own biting test.
 
@@ -734,10 +779,10 @@ server's answer, which is what made the shape fit: `mutation_verdict`,
 one UID to one `Verdict`, and the folder-level side effects (MODSEQ-cache
 clears) are resolved before the settle rather than inside it.
 
-Underneath it, `UidOperand` is the single constructor for a wire UID operand:
+For raw-number helpers, `UidOperand` owns wire UID admission:
 `UidOperand::build(uids)` keeps the UIDs a `UidSet` can carry, records the ones
-it cannot in `excluded()`, and is what `TargetBatch::new` and `subset_uid_set`
-build from. It exists so the lanes that owe no per-id outcome can share one
+it cannot in `excluded()`. Typed target batches build from their identities
+directly; both paths use the same finite-set owner. It exists so the lanes that owe no per-id outcome can share one
 definition of "what the operand carries" instead of re-deriving it:
 
 - The PIM read primitives (`hydrate_decoded` and the draft
@@ -761,18 +806,11 @@ This is the same move `StoreConsumer::new(unchanged_since)` and
 uid-0 decode bug's blast radius rode on is now unrepresentable rather than
 merely absent.
 
-Account cursors use `CompactUidSet`, a sorted, disjoint range list with
-range-native construction, membership, insertion, removal, and linear diff.
-QRESYNC mutates its live snapshot in that representation. VANISHED removal
-subtracts ranges directly and emits only the intersection with known UIDs;
-MODSEQ eviction checks cached keys rather than expanding server ranges.
-`CompactUidSet::diff` subtracts sorted ranges directly, so an unchanged large
-span is skipped without visiting each UID; only changed UIDs are expanded into
-the required output vectors. Because `UidRange::range(n, n)` and
-`UidRange::single(n)` are distinct values and `CompactUidSet` compares by its
-range vector, every construction and mutation path normalizes a one-element run
-to `single`. Two sets holding the same UIDs must compare equal and encode to
-the same cursor payload no matter which path built them.
+Account cursors use `types::set::UidSet`. QRESYNC mutates its compact live
+snapshot directly. VANISHED removal emits only known membership, MODSEQ eviction
+checks cached keys without expanding server spans, and linear range diff expands
+only changed UIDs. Singleton normalization belongs to the value, so construction
+and mutation cannot disagree about equality or cursor bytes.
 
 ## Configuration and connect
 
@@ -849,7 +887,7 @@ mode, authoritative replacement on every poll, and generation-scoped object
 handles (hydration and mutations must not reuse ephemeral UIDs after another
 selection). This requires changes outside the IMAP account layer.
 
-`SelectedMailbox` carries `uid_validity`, `uid_next`, `modseq_support` (a `ModSeqSupport` of `Unknown`, `NoModSeq` or `Highest`, read through `modseq()`; `NOMODSEQ` or `HIGHESTMODSEQ 0` anywhere in the SELECT wins over any nonzero `HIGHESTMODSEQ`), and the SELECT-side VANISHED list. A zero `UIDVALIDITY` or `UIDNEXT` is recorded as absent. A missing or zero `UIDVALIDITY` is a protocol error rather than a silent 0: the account layer judges it through one helper, `selected_uidvalidity`, at every site (sync lanes, PIM primitives, search, raw-body read), as `Error::ProtocolMissing` (`Protocol(MissingField)`, `ProviderContractViolation`) - the server's omission, never a caller-blaming `Request(Malformed)`. A tolerated `MODSEQ 0` in a FETCH response is ignored by the opportunistic STORE-guard cache; it does not fail the sync walk.
+`SelectedMailbox` carries `uid_validity`, `uid_next`, `modseq_support` (a `ModSeqSupport` of `Unknown`, `NoModSeq` or `Highest`, read through `modseq()`; `NOMODSEQ` or `HIGHESTMODSEQ 0` anywhere in the SELECT wins over any nonzero `HIGHESTMODSEQ`), and the SELECT-side VANISHED list. A zero `UIDVALIDITY` or `UIDNEXT` is recorded as absent. A missing or zero `UIDVALIDITY` is a protocol error rather than a silent 0: the account layer judges it through one helper, `selected_uidvalidity`, at every site (sync lanes, PIM primitives, search, raw-body read), as `ProviderFailure::Missing` (`Protocol(MissingField)`, `ProviderContractViolation`) - the server's omission, never a caller-blaming `Request(Malformed)`. A tolerated `MODSEQ 0` in a FETCH response is ignored by the opportunistic STORE-guard cache; it does not fail the sync walk.
 
 ## Account layer
 
@@ -861,9 +899,9 @@ The public account module re-exports the factory and config types (`ImapAccountF
 
 The one published surface beside the factory, added at the owner's request for consumers that track arrivals per folder by UID instead of running change streams (a message moved in with an old INTERNALDATE has a fresh UID, so a UID watermark sees what a date search misses). It is IMAP-specific on purpose: UIDVALIDITY and UID have no meaning on the other providers, so it is not on the `Account` trait.
 
-- `ImapMessageRef::parse(&ObjectId)` is the fallible typed view of a message id: container (the canonical `containers_list` spelling, wire identity preserved), nonzero UIDVALIDITY, nonzero UID. It normalises every spelling the decoder accepts (`imap1`, leading zeros); `object_id()` mints the canonical `imap2` id. The `Account` methods still answer under the exact submitted string; the ref is the place that canonicalises.
+- `ImapMessageRef::parse(&ObjectId)` is the fallible typed view of a message id: container (the canonical `containers_list` spelling, wire identity preserved), `UidValidity`, `Uid`. It normalises every spelling the decoder accepts (`imap1`, leading zeros); `object_id()` mints the canonical `imap2` id. The `Account` methods still answer under the exact submitted string; the ref is the place that canonicalises.
 - `ImapAccountFactory::open_with_poller(account_id)` opens through the same construction path as `open` and returns the `OpenedAccount` plus an `ImapPoller` over the same instance (shared pool and registry). Closing the account closes the poller (each call checks `closed` before checkout); a later open is a new instance an old poller never follows.
-- `ImapPoller::observe` reports UIDVALIDITY, UIDNEXT and EXISTS from one EXAMINE. A missing or zero UIDVALIDITY or UIDNEXT is `Error::ProtocolMissing`, never a guessed 0 (unlike `cursor_from_select`, which stores 0 for a Basic cursor's unknown UIDNEXT). A `UIDNOTSTICKY` folder (RFC 4315) is `Unsupported(op)` scoped to `Cursor(Folder)`, since UID tracking would see a generation change on every selection.
+- `ImapPoller::observe` reports UIDVALIDITY, UIDNEXT and EXISTS from one EXAMINE. A missing or zero UIDVALIDITY or UIDNEXT is `ProviderFailure::Missing`, never a guessed 0 (unlike `cursor_from_select`, whose Basic cursor retains absent UIDNEXT and encodes its existing zero sentinel). A `UIDNOTSTICKY` folder (RFC 4315) is `Unsupported(op)` scoped to `Cursor(Folder)`, since UID tracking would see a generation change on every selection.
 - `ImapPoller::list_uids(container, UidScan)` enumerates one generation. A UIDVALIDITY other than the scan's answers `UidListing::GenerationChanged` and lists nothing. The bound is `through` clamped to UIDNEXT - 1, and `from` above it returns an empty page with `completed_through: None` without sending a SEARCH, so `*` is never sent and the `n:*` rule (a range past the highest UID still matches it) cannot surface a UID below `from`. Otherwise it searches `UID lo:hi` windows of 65,536 UIDs (so no SEARCH nears the 1,000,000-UID ESEARCH expansion cap), at most 16 per call, filtering each to its window, sorting and deduplicating. The invariant: `refs` are exactly the UIDs the server reported in `from..=completed_through`; when the limit cuts a window, `completed_through` is the last kept UID; `next_from` resumes past it while the bound is not reached. UID-position continuation is expunge-stable. With an open `through` the bound is re-derived per call, so a caller needing a finite pass freezes it.
 - `ImapPoller::fetch_raw(&ImapMessageRef)` answers `RawMessage::{Message(Bytes), Absent, GenerationChanged { observed }}` through the same `run_fetch` core as `open_raw_rfc822` and its 256 MiB budget, refusing a `UIDNOTSTICKY` folder before the generation is judged; every other failure is the classified `Err`.
 - Errors carry `SearchMessages` (observe, list) or `OpenRawRfc822` (fetch); shared-folder permission denials map to `ScopeRevoked` as the raw read does.
@@ -1114,7 +1152,13 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
 `bifrost-imap` depends on `bifrost-smtp` (feature `tokio`; `account-error` is a
 default feature). SMTP has no path back to IMAP, so this is acyclic.
 
-With `ImapAccountConfig::with_manage_sieve(ManageSieveConfig)`, IMAP advertises `filter_rule_shape: Scripts` and all five filter flags true; `crate::sieve` speaks ManageSieve over implicit TLS / STARTTLS / plaintext, reuses the account credentials with SASL PLAIN or XOAUTH2, and maps scripts to `FilterScript { language: Sieve }`. Without it, filter flags stay false and calls return `Unsupported`.
+With `ImapAccountConfig::with_manage_sieve(ManageSieveConfig)`, IMAP advertises `filter_rule_shape: Scripts` and all five filter flags true; `crate::sieve` speaks ManageSieve over implicit TLS / STARTTLS / plaintext, reuses the account credentials with shared SASL SCRAM (both hashes and channel
+binding), PLAIN, XOAUTH2 or OAUTHBEARER, and maps scripts to `FilterScript { language: Sieve }`. Without it, filter flags stay false and calls return `Unsupported`.
+ManageSieve frames quoted or literal base64 challenges and quoted client replies.
+SCRAM server-final can arrive as a challenge or in `OK (SASL "...")` success
+data; success requires shared verification in both forms. Certificate binding
+resolution preserves a present but unusable certificate as a hard error.
+
 
 With `with_carddav(CardDavConfig)` / `with_caldav(CalDavConfig)`, IMAP opens a sibling `bifrost-carddav` / `bifrost-caldav` account at factory open and delegates the contact / calendar PIM primitives to it. Directory lookup and
 its `directory_search` / `directory_enumerate` capabilities forward from the
@@ -1128,7 +1172,7 @@ Composition is first-class for sync, not just primitives (subs are full `Arc<dyn
 
 Containers use native mailbox paths as primitive/provenance ids. `containers_list` maps SPECIAL-USE attributes to `FolderRole` (`\Sent`, `\Drafts`, `\Archive`, `\Trash`, `\Junk`, custom `\Inbox`), falling back to name-based INBOX/Sent/Drafts/Archive/Trash/Spam detection on the leaf selected with the LIST hierarchy delimiter. `folder_registry::leaf_name` is the single owner of that split, shared with the `draft_create` Drafts probe so a `.`-delimited server cannot advertise a draft capability whose APPEND target `role_folder` then fails to resolve; a NIL delimiter is a flat namespace, so the whole name is the leaf. When several folders map to one role, SPECIAL-USE wins over name fallback, and display name, wire octets, and encoding mode break remaining ties deterministically.
 
-`container_from_folder_entry` also projects the shared-namespace metadata: a folder with a `shared_owner` gets `namespace = Shared`, `owner = MailboxId(owner)`, and `owner_local_id` = the full mailbox path (IMAP has no separate per-owner id space - the path IS the native id in every namespace, so `native_id` stays byte-identical to the `CursorScope::Folder` string discovery emits). `rights` projects the MYRIGHTS set `discover_shared_folders` captured at open (`rights_from_myrights`, RFC 4314 Section 4: `l`+`r` -> read, `i` -> add, `t` -> remove, `s` -> seen, `w` -> keywords, `k`/`c` -> create child, `x`/`d` -> rename+delete, `p` -> submit). The rights set is now RETAINED on `FolderEntry`, not just used as the discovery read-gate - without it a read-only share is indistinguishable from a writable one downstream. `None` means unreported (a personal folder we never probed, or a server without ACL), which is distinct from an explicit empty rights set. A rename/recreate inherits both the owner tag and the rights, since a LIST/IDLE `MailboxInfo` carries neither.
+`container_from_folder_entry` also projects the shared-namespace metadata: a folder with a `shared_owner` gets `namespace = Shared`, `owner = PrincipalId(owner)`, and `owner_local_id` = the full mailbox path (IMAP has no separate per-owner id space - the path IS the native id in every namespace, so `native_id` stays byte-identical to the `CursorScope::Folder` string discovery emits). `rights` projects the MYRIGHTS set `discover_shared_folders` captured at open (`rights_from_myrights`, RFC 4314 Section 4: `l`+`r` -> read, `i` -> add, `t` -> remove, `s` -> seen, `w` -> keywords, `k`/`c` -> create child, `x`/`d` -> rename+delete, `p` -> submit). The rights set is now RETAINED on `FolderEntry`, not just used as the discovery read-gate - without it a read-only share is indistinguishable from a writable one downstream. `None` means unreported (a personal folder we never probed, or a server without ACL), which is distinct from an explicit empty rights set. A rename/recreate inherits both the owner tag and the rights, since a LIST/IDLE `MailboxInfo` carries neither.
 
 ### Shared account decisions
 
@@ -1154,11 +1198,11 @@ Output ordering is therefore input-window order, then folder display-name order 
   replies omit the requested body fail with Protocol MissingField, rather than
   inventing an empty message. Explicit empty body bytes are valid.
 - A requested UID the server never returns is `Failed(NotFound(Message))` rather than being silently dropped.
-- The valid (non-stale) ids of a folder become a `TargetBatch`, so the FETCH operand and the set the loop attributes results to are the same object. Its excluded lane is published alongside the stale failures, before the FETCH: like them it is known truth already, and unlike them it must never be able to reach the FETCH and be reported as hydrated.
+- The valid (non-stale) ids of a folder become a `TargetBatch`, so the FETCH operand and the set the loop attributes results to are the same object. Its typed identities all reach the operand. Stale-epoch failures are published before the FETCH, preserving known per-item truth if that command fails.
 - FETCH responses are merged per UID before conversion. A server may follow the solicited response with unsolicited FLAGS-only FETCHes for the same UID; the merge adopts later `FLAGS` / `MODSEQ` and Gmail labels (mutable state, so the fresher report wins) and fills gaps in every other item (preview, EMAILID / THREADID, the Gmail message and thread ids, body and BINARY sections, per-section `BINARY.SIZE`), but never blanks a data item or body section the earlier response carried, so a trailing partial response cannot turn a complete hydration into an empty one. `merge_fetch_response` is shared with the PIM lane: `pim::hydrate_decoded` folds the FETCH's responses into exactly one per REQUESTED UID (`merge_requested_fetches`), dropping unsolicited FETCHes for UIDs nobody asked about and responses without a UID, so a split or FLAGS-only-follow-up response can no longer hydrate as a duplicate, possibly bodiless, message.
 - `pim::message_hydrate` picks its answer by the canonical id rather than by position, and a UID the tagged OK never answered for (its UIDVALIDITY already matched, so the UID is a live name in this epoch) is `NotFound(Message)` with `Acknowledged` evidence - the message was expunged between the caller learning the id and the FETCH - not the caller's malformed request.
 - `Projection::Preview` and `Projection::TextOnly` both ask for `BODY.PEEK[]` (whole message, not the TEXT section) - preview bounded to a prefix, text-only unbounded. `BODY[TEXT]` is never requested by either: the hydrated value is raw MIME the consumer parses, and the TEXT section of a multipart message is boundaries and base64 with no headers to decode them by. `get.rs` and `pim.rs` use the same 64 KiB preview floor (`PREVIEW_FETCH_BYTES`), raised to the caller's limit when that is larger.
-- A projection that asks for a body section runs through `uid_fetch_limited` under `HYDRATION_FETCH_BUDGET` (256 MiB per batch); metadata and flag projections keep the unbudgeted `uid_fetch`, being bounded by their own response shape. The budget is a guard against a corrupt or adversarial server, not a per-message limit: crossing the retained-object estimate surfaces as `Error::FetchLimit` after the tagged completion. A literal declaration above the remaining budget instead fails before payload accumulation with `Error::FetchLiteralLimit` and retires the connection.
+- A projection that asks for a body section runs through `uid_fetch_limited` under `HYDRATION_FETCH_BUDGET` (256 MiB per batch); metadata and flag projections keep the unbudgeted `uid_fetch`, being bounded by their own response shape. The budget is a guard against a corrupt or adversarial server, not a per-message limit: crossing the retained-object estimate surfaces as `ResultLimit::Fetch` after the tagged completion. A literal declaration above the remaining budget instead fails before payload accumulation with `ResultLimit::FetchLiteral` and retires the connection.
 - Full and preview hydration parse the fetched RFC 5322 source through
   `bifrost-types::mime`. Full exposes text and HTML plus attachment metadata;
   `FullWithBlobs` carries decoded attachment bytes inline because IMAP has no
@@ -1170,7 +1214,7 @@ Output ordering is therefore input-window order, then folder display-name order 
 
 ### Blob openers
 
-`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`: the FETCH runs through the bounded streaming lane (`uid_fetch_stream_budgeted`), passing the remaining `RAW_FETCH_BUDGET` to the reader. The wire parser charges all literals in each FETCH response against that remaining amount before decoding, so an over-budget response is rejected before the literal is materialized. The consumer's back-pressure still reaches the socket through the driver's `OwnedPermit` reservation. The account drain retains a post-decode `Error::FetchLimit` check as a defensive guard. The whole body (`BODY[]`, no origin) of the requested UID is emitted as one `Bytes` page after its FETCH response has been buffered and decoded. The outcome is judged over the whole command after the tagged completion, not per response: responses for other UIDs are ignored, a body-less fragment for the UID (an unsolicited FLAGS update) beside the body is fine, an identical repeated body is emitted once, and a conflicting repeat, a NIL body, or the UID answered with no body at all is `Error::Protocol`. A tagged OK with no response for the UID means the message was expunged: the stream terminates `NotFound(Message)` keyed by the submitted id, never `Done` with zero batches. A zero-octet body is a delivered message. The command future stays authoritative for the wire outcome, as in inventory / CONDSTORE. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability is filed as imap-G1 and is being built in stages.
+`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`: the FETCH runs through the bounded streaming lane (`uid_fetch_stream_budgeted`), passing the remaining `RAW_FETCH_BUDGET` to the reader. The wire parser charges all literals in each FETCH response against that remaining amount before decoding, so an over-budget response is rejected before the literal is materialized. The consumer's back-pressure still reaches the socket through the driver's `OwnedPermit` reservation. The account drain retains a post-decode `ResultLimit::Fetch` check as a defensive guard. The whole body (`BODY[]`, no origin) of the requested UID is emitted as one `Bytes` page after its FETCH response has been buffered and decoded. The outcome is judged over the whole command after the tagged completion, not per response: responses for other UIDs are ignored, a body-less fragment for the UID (an unsolicited FLAGS update) beside the body is fine, an identical repeated body is emitted once, and a conflicting repeat, a NIL body, or the UID answered with no body at all is `ProviderFailure::Protocol`. A tagged OK with no response for the UID means the message was expunged: the stream terminates `NotFound(Message)` keyed by the submitted id, never `Done` with zero batches. A zero-octet body is a delivered message. The command future stays authoritative for the wire outcome, as in inventory / CONDSTORE. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability is filed as imap-G1 and is being built in stages.
 
 **imap-G1 stage 1 (`account/parts.rs`) - foundation, deliberately unwired.**
 Two pieces exist and are exercised by tests, but nothing calls them: no
@@ -1392,7 +1436,7 @@ flag true: an enterprise user expects a later reattach to recover missing shares
 and a failed probe is not evidence of a personal-only server. MYRIGHTS remains
 advisory because SELECT is authoritative.
 
-`factory::open` issues NAMESPACE after the personal LIST and enumerates each non-personal `other`/`shared` prefix via `LIST "" "<prefix>*"` (`discover_shared_folders`, prefix in the PATTERN - RFC 3501 6.3.8 leaves reference/pattern concatenation implementation-defined and a server that ignores the reference answers the reference form with the personal namespace), tagging each with its owning `MailboxId`. An other-user root (`#user/`) carries one descriptor for all users, so the principal is read per folder (`mailbox_owner_from_other_user_path`: the segment after the root, e.g. `#user/alice/INBOX` -> `alice`); a shared root collapses to itself (`mailbox_owner_for`). Under ACL, candidates are probed with MYRIGHTS and the parsed set rides out on the entry; a MYRIGHTS failure is non-fatal and defers to SELECT. Discovery no longer DROPS an unreadable candidate: the personal `LIST "" "*"` may echo the same path (RFC 2342), so dropping it left that echo behind as a bare personal entry and a read-only share presented downstream as a writable personal folder. The read decision moves one layer down to `shared_folder_is_selectable` (pure, `folder_registry.rs`): `\Noselect`/`\NonExistent` or a reported rights set without `l`+`r` clears `FolderEntry::selectable()`, which is exactly the flag `discover_cursor_scopes` filters on, so an unreadable share keeps its owner / `Shared` namespace / rights in `containers_list` and still never becomes a cursor scope. The owner rides on `FolderEntry.shared_owner` (via `FolderRegistry::from_lists`). Shared folders are ordinary `CursorScope::Folder` scopes (no new variant, no `route_typed_scope` change); discovery and inventory also emit `MembershipScope::Mailbox(owner)` per shared entry - explicitly, because `scope_covers_membership` does not link them (FolderId and MailboxId strings differ).
+`factory::open` issues NAMESPACE after the personal LIST and enumerates each non-personal `other`/`shared` prefix via `LIST "" "<prefix>*"` (`discover_shared_folders`, prefix in the PATTERN - RFC 3501 6.3.8 leaves reference/pattern concatenation implementation-defined and a server that ignores the reference answers the reference form with the personal namespace), tagging each with its owning `PrincipalId`. An other-user root (`#user/`) carries one descriptor for all users, so the principal is read per folder (`mailbox_owner_from_other_user_path`: the segment after the root, e.g. `#user/alice/INBOX` -> `alice`); a shared root collapses to itself (`mailbox_owner_for`). Under ACL, candidates are probed with MYRIGHTS and the parsed set rides out on the entry; a MYRIGHTS failure is non-fatal and defers to SELECT. Discovery no longer DROPS an unreadable candidate: the personal `LIST "" "*"` may echo the same path (RFC 2342), so dropping it left that echo behind as a bare personal entry and a read-only share presented downstream as a writable personal folder. The read decision moves one layer down to `shared_folder_is_selectable` (pure, `folder_registry.rs`): `\Noselect`/`\NonExistent` or a reported rights set without `l`+`r` clears `FolderEntry::selectable()`, which is exactly the flag `discover_cursor_scopes` filters on, so an unreadable share keeps its owner / `Shared` namespace / rights in `containers_list` and still never becomes a cursor scope. The owner rides on `FolderEntry.shared_owner` (via `FolderRegistry::from_lists`). Shared folders are ordinary `CursorScope::Folder` scopes (no new variant, no `route_typed_scope` change); discovery and inventory also emit `MembershipScope::Owner(owner)` per shared entry - explicitly, because `CursorScope::covers` never equates an owner with a folder.
 
 Two registry rules keep the shared tagging (and therefore the owner and the rights) attached to the entry:
 
@@ -1434,15 +1478,19 @@ when message-level diagnostic detail is truncated.
 
 ## Error model
 
-`Error` is `pub(crate)` and `#[non_exhaustive]` (variants include `AuthPolicy`, `FetchLimit`, `FetchLiteralLimit`, the server-status, transport and protocol variants, and the local-refusal variants below). The account boundary converts protocol errors into `bifrost_types::AccountError` via `error::into_account_error(error, ctx)`; consumers never see the crate-internal taxonomy.
+`Error` is `pub(crate)` and `#[non_exhaustive]`. Its categories are `ServerStatus`,
+`Transport`, `Bye`, `LocalRefusal`, `Provider`, `Internal` and `ResultLimit`, plus
+OAuth, incomplete-MOVE and unsent-operation wrappers. Payload kinds own their
+diagnostics and equality; I/O equality compares `io::ErrorKind`, and OAuth equality compares the
+retained classified error by pointer identity. Transport evidence uses `Option<TransmissionState>` directly. The account boundary converts protocol errors into `bifrost_types::AccountError` via `error::into_account_error(error, ctx)`; consumers never see the crate-internal taxonomy.
 
 `ImapErrorContext` carries the calling `AccountOperation` (required), optional `ErrorScope`, `Provider`, explicit `transmission_state`, and `idempotency_override`. Every `pim.rs` method threads its operation via a local `op_err` closure stamping `ImapErrorContext::operation(<op>)` on every `map_err`; multi-call helpers (`copy_messages`, `delete_messages`, `set_flag`, `hydrate_decoded`, `refresh_folders`, `folder_from_scope`) take an explicit `op: AccountOperation`. This lets recovery distinguish `Reconcile` from `Retry::SameRequest` for non-idempotent ops like `AddToContainer` and `DraftCreate`.
 
 `Error::response_code()` returns the structured `ResponseCode` from `[CODE ...]` brackets (first only); recovery consumes those via the typed `ImapResponseCode` wire variants.
 
-`Error::Protocol` is for the SERVER violating the wire contract. `is_connection_fatal` treats it as fatal: continuation consumers use it to decide whether cancellation is safe, and the driver's retirement applies it to any exchange that may have touched the wire, alongside typed framing and the explicit unusable-session signals above. It maps to `Protocol(ContractViolation)`, deriving `ProviderContractViolation`. `Error::ProtocolMissing` is its narrower case where the evidence is an OMISSION: the server completed a command without a response or field the protocol makes mandatory (a tagged OK without the untagged CAPABILITY / STATUS / QUOTA / QUOTAROOT / ACL / LISTRIGHTS / MYRIGHTS / METADATA / ID / NAMESPACE / SEARCH / ESEARCH it owes, a LOGOUT that succeeded without its BYE, SELECT/EXAMINE without FLAGS, EXISTS, or the revision's LIST/RECENT, a SELECT without UIDVALIDITY, a STATUS reply without the requested APPENDLIMIT, a tagged OK where a `+` continuation was owed). It shares `Protocol`'s display text and `ProviderContractViolation` recovery and differs in the account kind, `Protocol(MissingField)`, so diagnostics can tell "the server left something out" from "the server sent something wrong". It is NOT connection-fatal and is deliberately absent from `is_connection_fatal`: every producer raises it only once the exchange has completed (from a consumer's `finalize` on the command's own tagged OK, or from the account layer after the command returned), so the framing is intact and the next byte begins a fresh response. A producer that could raise it while the exchange is still open must use `Protocol` instead. The completion-time consumer failures are still real `Error`s in `Finalized::output`, so the driver makes the fatality decision before publishing. LOGOUT reads the tagged status first: RFC 3501 Section 6.1.3 owes the BYE only ahead of a tagged OK, so a tagged NO/BAD is the server's refusal and the answer, and a missing BYE is an omission only on a LOGOUT that succeeded.
+`ProviderFailure::Protocol` is for the SERVER violating the wire contract. `is_connection_fatal` treats it as fatal: continuation consumers use it to decide whether cancellation is safe, and the driver's retirement applies it to any exchange that may have touched the wire, alongside typed framing and the explicit unusable-session signals above. It maps to `Protocol(ContractViolation)`, deriving `ProviderContractViolation`. `ProviderFailure::Missing` is its narrower case where the evidence is an OMISSION: the server completed a command without a response or field the protocol makes mandatory (a tagged OK without the untagged CAPABILITY / STATUS / QUOTA / QUOTAROOT / ACL / LISTRIGHTS / MYRIGHTS / METADATA / ID / NAMESPACE / SEARCH / ESEARCH it owes, a LOGOUT that succeeded without its BYE, SELECT/EXAMINE without FLAGS, EXISTS, or the revision's LIST/RECENT, a SELECT without UIDVALIDITY, a STATUS reply without the requested APPENDLIMIT, a tagged OK where a `+` continuation was owed). It shares `Protocol`'s display text and `ProviderContractViolation` recovery and differs in the account kind, `Protocol(MissingField)`, so diagnostics can tell "the server left something out" from "the server sent something wrong". It is NOT connection-fatal and is deliberately absent from `is_connection_fatal`: every producer raises it only once the exchange has completed (from a consumer's `finalize` on the command's own tagged OK, or from the account layer after the command returned), so the framing is intact and the next byte begins a fresh response. A producer that could raise it while the exchange is still open must use `Protocol` instead. The completion-time consumer failures are still real `Error`s in `Finalized::output`, so the driver makes the fatality decision before publishing. LOGOUT reads the tagged status first: RFC 3501 Section 6.1.3 owes the BYE only ahead of a tagged OK, so a tagged NO/BAD is the server's refusal and the answer, and a missing BYE is an omission only on a LOGOUT that succeeded.
 
-Failures on the client side of the wire map to `Internal(_)` (`reference/error-model.md` owns its recovery: terminal `InternalFailure`, except `InFlight` on a non-idempotent operation, which reconciles), never to a provider fault. `Error::Internal` is a local invariant violation raised where the command framing is intact (before the first byte, or after the tagged completion), so it is not connection-fatal; it maps to `Internal(InvariantViolated)`. `Error::InternalMidExchange { message, attempt }` is a local invariant failure raised after bytes of the same exchange are on the wire: the SCRAM server signature missing from client state, the STARTTLS and COMPRESS refusals after the server's tagged OK (the stream is already swapped out), the post-STARTTLS CAPABILITY downcast, a literal continuation refused outside a pipeline, and the BYE digest without a status response. It also maps to `Internal(InvariantViolated)`, but the driver's view of the exchange can no longer be trusted, so it is connection-fatal, and its attempt state is REQUIRED (`Error::internal_mid_exchange(message, state)`), because some of the exchange was sent by construction and a missing state would read as `Unsent`. `Error::LocalRuntime` is a local facility failing at runtime (the system entropy source for a SCRAM nonce): neither the server's fault nor the caller's, not connection-fatal, `Internal(RuntimeFailure)`. `Error::DriverPanicked` maps to `Internal(Panicked)`; `Error::DriverGone` stays `Transport(Network)`. The phaseless `Error::driver_gone()` constructor is test-only: a missing phase reads as `Unsent`, so production mints through `driver_gone_at` or `observe_driver_panic`.
+Failures on the client side of the wire map to `Internal(_)` (`reference/error-model.md` owns its recovery: terminal `InternalFailure`, except `InFlight` on a non-idempotent operation, which reconciles), never to a provider fault. `Error::Internal { kind: Invariant(_), mid_exchange: None }` is a local invariant violation raised where the command framing is intact (before the first byte, or after the tagged completion), so it is not connection-fatal; it maps to `Internal(InvariantViolated)`. `Error::Internal { kind: Invariant(message), mid_exchange: Some(state) }` is a local invariant failure raised after bytes of the same exchange are on the wire: the SCRAM server signature missing from client state, the STARTTLS and COMPRESS refusals after the server's tagged OK (the stream is already swapped out), the post-STARTTLS CAPABILITY downcast, a literal continuation refused outside a pipeline, and the BYE digest without a status response. It also maps to `Internal(InvariantViolated)`, but the driver's view of the exchange can no longer be trusted, so it is connection-fatal, and its attempt state is REQUIRED (`Error::internal_mid_exchange(message, state)`), because some of the exchange was sent by construction and a missing state would read as `Unsent`. `InternalFailure::Runtime` is a local facility failing at runtime (the system entropy source for a SCRAM nonce): neither the server's fault nor the caller's, not connection-fatal, `Internal(RuntimeFailure)`. `InternalFailure::Panicked` maps to `Internal(Panicked)`; `TransportFailure::DriverGone` stays `Transport(Network)`. The phaseless `Error::driver_gone()` constructor is test-only: a missing phase reads as `Unsent`, so production mints through `driver_gone_at` or `observe_driver_panic`.
 
 A driver death carries the caller's phase. `ImapConnection::observe_driver_panic(phase)` turns a dead driver into `DriverPanicked` (with the panic message) or `DriverGone`, and stamps `phase` on every outcome, including when another caller already took the join handle, since the evidence cannot depend on being first. Only the caller knows the phase: `Unsent` when the driver never committed the command, `InFlight` once it had committed it. Admission failures and post-admission withdrawals are also `Unsent`. The submit helpers in `connection/auth.rs` (`submit_regular`, `submit_streaming`, `submit_with_continuations`, `submit_upgrade`), `set_keepalive`, IDLE's entry and completion waits, and `Pipeline` execution all pass it, so a non-idempotent command the driver had committed when it died reconciles rather than being declared failed, and a `DriverGone` no longer skips that reconciliation for lack of a phase. `PipelineError::Disconnected` carries the stamped error rather than being a bare variant.
 
@@ -1452,7 +1500,7 @@ Local refusals made before the first byte follow the cross-crate rule in `refere
 
 The scope readers inside `classify_response_code` (`resource_from_scope`, `id_from_scope`, `mailbox_throttle`) must each accept BOTH mailbox scope shapes. Folder producers build `ErrorScope::Cursor(Folder(id))` via `with_folder_scope`, not `ErrorScope::Mailbox { id }` - `with_mailbox` is reached only from tests. A reader matching just the latter degrades on every real folder-scoped failure while its mailbox-scoped test keeps passing, which is exactly how `ThrottleScope::Mailbox` became unreachable (widening per-mailbox `[LIMIT]` to account-wide pauses) and how the folder id was dropped from `RequestCause::NotFound`. Both fixed and pinned folder-side; keep new readers symmetric.
 
-The engine records a folder-scoped `[LIMIT]` as `ThrottleKey::Mailbox { account, mailbox }` over the folder's name, and reaches the work it should hold only through `Account::throttle_keys`: `ImapAccount` declares that same key for a folder scope (`ThrottleWork::Scope`, routed through `route_scope`, so a composed DAV collection answers for its sub-account and never as a mailbox), for each object in the folder (`ThrottleWork::Objects`, the folder decoded from the versioned object id) and for a folder membership that is not DAV-owned (`ThrottleWork::Membership`, a move destination or source). Every arm builds the key from the same `MailboxName::account_id()` `with_folder_scope` scopes the error with, so the recorded hold and the held work meet; `every_work_shape_on_a_folder_declares_the_key_its_limit_records` pins it. Before this declaration existed, the engine had no scope-to-mailbox mapping and a recorded per-folder hold reached no wait site at all.
+The engine records a folder-scoped `[LIMIT]` as `ThrottleKey::Folder { account, folder }` over the folder's name, and reaches the work it should hold only through `Account::throttle_keys`: `ImapAccount` declares that same key for a folder scope (`ThrottleWork::Scope`, routed through `route_scope`, so a composed DAV collection answers for its sub-account and never as a mailbox), for each object in the folder (`ThrottleWork::Objects`, the folder decoded from the versioned object id) and for a folder membership that is not DAV-owned (`ThrottleWork::Membership`, a move destination or source). Every arm builds the key from the same `MailboxName::account_id()` `with_folder_scope` scopes the error with, so the recorded hold and the held work meet; `every_work_shape_on_a_folder_declares_the_key_its_limit_records` pins it. Before this declaration existed, the engine had no scope-to-mailbox mapping and a recorded per-folder hold reached no wait site at all.
 
 ManageSieve carries its own response-code vocabulary (RFC 5804 1.3), parsed into `SieveResponseCode` and surfaced as `sieve::Error::Sieve { code, message }` - deliberately NOT folded into the IMAP `ResponseCode`, since recording a code the server never sent would corrupt the wire evidence support exports exist to preserve. The code rides out as `native_code`. `split_response_code` lifts the parenthesized code off the status line BEFORE the human-readable string, which is the ordering RFC 5804 specifies and the step whose absence caused the original defect: the code stayed inside the message as opaque text, so every rejection reached `fallback_status` and derived terminal `ProviderRefused`.
 
@@ -1469,7 +1517,8 @@ CHECKSCRIPT is the one path where a `NO` is normally not an error: it IS the val
 
 A `Transport(_)` kind must never carry an `Acknowledged` attempt - `try_build` rejects the pair (`TransportAcknowledged`) and this boundary `.expect`s, so producing it panics. `into_account_error` demotes it to `InFlight` rather than dropping the cause, since dropping would leave `derive` on its `Unsent` default and blind-retry a non-idempotent operation. Nothing builds the pair today, but `Error::with_attempt` permits it on the transport variants and the driver stamps `Acknowledged` after a tagged response.
 
-`Error::No` and `Error::Bad` carry `attempt: Option<ImapAttempt>`; `no_with_code`/`bad_with_code` default it to `Some(Acknowledged)` because a tagged `NO`/`BAD` is a server-acknowledged terminal response. Without this, recovery rows keyed on `Acknowledged` (e.g. `Server(Error { status: None }) + Acknowledged -> ProviderRefused`) collapse to the `Unsent` arm and misclassify provider refusals as retryable drops.
+`ServerStatus::No` and `ServerStatus::Bad` carry no attempt field. They prove
+`Acknowledged` by construction, as does `ServerStatus::Auth`. Without this, recovery rows keyed on `Acknowledged` (e.g. `Server(Error { status: None }) + Acknowledged -> ProviderRefused`) collapse to the `Unsent` arm and misclassify provider refusals as retryable drops.
 
 Partial writes attach typed records at their public owner rather than adding
 side-effect diagnostic text. Destroy records MarkedDeleted Repeatable before
@@ -1560,7 +1609,7 @@ exit lifetime.
 Connect and authentication retain their configured timeouts; OAuth token
 lookup is also bounded by the authentication command timeout.
 
-The `registry` mutex is the linearization point that protects pool registration against a completed close. `close` stores the flag before it drains; registration re-reads the flag while holding that same lock. A dial that reaches the lock first is seen by the drain; one that finishes after the drain sees the flag, is refused registration, and tears its own connection down. Both acquisition paths re-check the flag after receiving capacity. Close closes the session semaphore and clears the member waiter queue under the idle lock; registration of a waiter checks the same flag under that lock. Blocked acquisitions receive `Error::Closed`.
+The `registry` mutex is the linearization point that protects pool registration against a completed close. `close` stores the flag before it drains; registration re-reads the flag while holding that same lock. A dial that reaches the lock first is seen by the drain; one that finishes after the drain sees the flag, is refused registration, and tears its own connection down. Both acquisition paths re-check the flag after receiving capacity. Close closes the session semaphore and clears the member waiter queue under the idle lock; registration of a waiter checks the same flag under that lock. Blocked acquisitions receive `TransportFailure::Closed`.
 
 The return side takes the matching linearization under the idle lock. Returning a reusable member checks `closed` while holding that lock, before either handing to the oldest waiter or parking. A return either lands before the drain and is drained, or observes the flag and parks nothing. Cancellation removes a waiter synchronously and returns an already handed member through the same FIFO path, so dropping an acquisition cannot strand capacity.
 
@@ -1580,7 +1629,7 @@ is conservatively mapped to the full possible UID space.
 
 IMAP diverges from the `MutationSuccess::Skipped` lane other crates use for the engine's "already in this state" short-circuit: the opportunistic MODSEQ cache sends cold-cache STOREs without `UNCHANGEDSINCE`, so "already in state" cannot be observed without a full SELECT+FETCH that defeats the guard. So `STORE UNCHANGEDSINCE <modseq>` rejecting with `MODIFIED` surfaces as `ItemOutcome::Failed { kind: ConcurrencyConflict }` for the conflicting UIDs, never `Succeeded(Skipped)`.
 
-`StoreConsumer::new` takes the command's own `unchanged_since` and has no argument-less form, so how a tagged `NO` is treated is a property of the command rather than a per-call-site choice. Under `UNCHANGEDSINCE` the consumer preserves tagged `NO` as a `StoreResult` with its status, response code and human-readable text (`StoreResult` carries all three for every tagged completion, so a conditional STORE refusal keeps the server's own words), making the legal `NO [MODIFIED ...]` CONDSTORE rejection available to the mutation layer instead of discarding its per-UID conflict evidence. Without `UNCHANGEDSINCE` a tagged `NO` is a plain refusal and stays `Error::No`. Both bulk and PIM deletion use the shared STORE classifier and EXPUNGE only the subset whose STORE applied, so a guarded refusal cannot expunge a conflicting message. Tagged `BAD` is a command error on both paths. `StoreWireOutcome::from_store_result` takes the whole result rather than a `(code, tagged_ok)` pair, so the status cannot be dropped on the way to classification. `concurrency_conflict_error` / `store_failed_error` / `uidvalidity_changed_error` each take the caller's `AccountOperation` and produce `ErrorScope::Cursor(Folder(id))`, matching the folder-producer scope contract above. A STORE refusal without a more specific response code is `Server(Error)`, not the client-bug `Request(Malformed)` classification.
+`StoreConsumer::new` takes the command's own `unchanged_since` and has no argument-less form, so how a tagged `NO` is treated is a property of the command rather than a per-call-site choice. Under `UNCHANGEDSINCE` the consumer preserves tagged `NO` as a `StoreResult` with its status, response code and human-readable text (`StoreResult` carries all three for every tagged completion, so a conditional STORE refusal keeps the server's own words), making the legal `NO [MODIFIED ...]` CONDSTORE rejection available to the mutation layer instead of discarding its per-UID conflict evidence. Without `UNCHANGEDSINCE` a tagged `NO` is a plain refusal and stays `ServerStatus::No`. Both bulk and PIM deletion use the shared STORE classifier and EXPUNGE only the subset whose STORE applied, so a guarded refusal cannot expunge a conflicting message. Tagged `BAD` is a command error on both paths. `StoreWireOutcome::from_store_result` takes the whole result rather than a `(code, tagged_ok)` pair, so the status cannot be dropped on the way to classification. `concurrency_conflict_error` / `store_failed_error` / `uidvalidity_changed_error` each take the caller's `AccountOperation` and produce `ErrorScope::Cursor(Folder(id))`, matching the folder-producer scope contract above. A STORE refusal without a more specific response code is `Server(Error)`, not the client-bug `Request(Malformed)` classification.
 
 Mutation error lanes follow the primary application: recorded errors read their
 PrimaryLeg; plain leaves use Application::from_leaf. Explicit InFlight or leaf
@@ -1689,7 +1738,7 @@ crates/imap/src/
 |   `-- scopes.rs          - folder discovery, lifecycle stream
 |-- sieve.rs         - ManageSieve client, framing, transport, SASL and own Error
 |-- types/           - internal protocol types plus public Credentials / AuthPolicy
-`-- error.rs         - internal Error, ErrorCategory, Recovery
+`-- error.rs         - internal Error categories and transmission evidence
 ```
 
 ## IMAP-specific code style
@@ -1979,7 +2028,7 @@ for storage; existing wire values are unchanged.
 
 ## Typed SCRAM refusal recovery
 
-`Error::Auth` carries `Option<AuthMechanism>` and an optional typed
+`ServerStatus::Auth` carries `Option<AuthMechanism>` and an optional typed
 `ScramServerError`. The shared `refusal_class()` table in `reference/sasl.md`
 owns recovery: credential rejection requests reauthorization, policy refusal
 blocks, protocol refusal reports a contract violation, and unavailable server
@@ -2186,3 +2235,44 @@ success rather than inventing a per-UID skip from the MODSEQ cache. Missing
 folders, missing destinations and UIDVALIDITY changes retain their errors;
 none establishes subject absence. An Outlook user must still see a move refused
 because its destination disappeared.
+
+## Structured degradation warnings
+
+Composed discovery preserves a delegate's classified failure on
+`WarningKind::ScopeSkipped`, including its optional error scope, and continues
+with healthy surfaces. Strategy warnings carry `Warning::strategy_downgrade`
+(`QResyncToCondstore`, `QResyncToBasic`, `CondstoreToBasic`), so consumers can
+report the effective strategy without parsing diagnostic text. UID-count
+mismatches carry expected and actual counts. A refused NOTIFY setup retains its
+`AccountError` on `WarningKind::NotifyRefused` while the existing fallback runs.
+
+## Connection ownership and transmission evidence
+
+`connection/mod.rs` owns the connection handle, cancellation flag, event draining
+and handle liveness. `connection/config.rs` owns TLS mode and TCP keepalive;
+`types/session.rs` owns `SessionState` and `types/search.rs` owns `SearchResult`.
+`IdleEvent` belongs to the IDLE handle implementation. `NotifyFlags` remains in
+`types/notify.rs`. Driver lifetime, retained leases and their teardown-order tests
+live in `connection/driver/task.rs`; moving them preserves the rule that the driver
+future and transport are destroyed before retained session permits are released.
+
+LIST notification heuristics and ESEARCH expansion live beside their dispatch
+consumers. STORE filtering delegates to `Flag::is_writable` through dispatch.
+`dispatch/select.rs::SelectedMailboxBuilder::apply` owns SELECT response-code
+assembly, including nonzero UID admission and conservative MODSEQ denial.
+
+`ServerStatus` cannot carry optional or contradictory transmission evidence:
+NO, BAD and authentication refusals are acknowledged by construction. BYE is a
+separate fatal session-termination category whose attempt remains relative to the
+active command. A transport timeout remains nonfatal to the framing classifier;
+other transport losses retire the connection. Provider omissions after completion
+remain reusable, while malformed responses and mid-exchange internal failures do
+not. Local refusals never retire a usable connection.
+
+A failed prerequisite uses `Error::OperationNotSent` via `for_unsent_operation`.
+It preserves the helper's wire refusal and acknowledgement on its source while
+reporting Unsent relative to the enclosing APPEND, COPY or mutation. Account
+translation unwraps it and applies that enclosing-operation evidence after wire
+classification. An enterprise user expects a refused preparatory SELECT to fail
+without reconciliation for a move that was never sent. OAuth failures continue to
+retain their existing endpoint classification. No error category reparses text.

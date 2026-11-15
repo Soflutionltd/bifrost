@@ -137,7 +137,8 @@ pub(super) async fn settle(mut done: impl FnMut() -> bool) -> bool {
 
 pub(super) fn groups_empty(account: &GraphAccount) -> bool {
     account
-        .graph_subscriptions
+        .webhooks
+        .groups_for_tests()
         .try_read()
         .is_ok_and(|groups| groups.is_empty())
 }

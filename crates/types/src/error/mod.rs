@@ -33,14 +33,14 @@ pub use kind::{
     TransportErrorKind,
 };
 pub use recovery::{
-    EngineDirective, EngineDirectiveIdentity, Fatal, ReconcileAction, ReconcileAdvice,
-    ReconcileGuidance, ReconcileReason, RecoveryClass, RemediationAction, RetryAdvice,
-    RetryDisposition, RetryHint, RetryReason, StrategyDowngrade, ThrottleBudget, ThrottleKey,
-    ThrottleScope, ThrottleWork,
+    EngineDirective, EngineDirectiveIdentity, Fatal, OperatorOverrideReason, ReconcileAction,
+    ReconcileAdvice, ReconcileGuidance, ReconcileReason, RecoveryClass, RemediationAction,
+    RetryAdvice, RetryDisposition, RetryHint, RetryReason, StrategyDowngrade, ThrottleBudget,
+    ThrottleKey, ThrottleScope, ThrottleWork,
 };
 pub use scope::{AccountOperation, ErrorScope, Protocol, Provider};
 pub use stream::{ItemOutcome, MutationEffect, MutationSuccess};
-pub use warning::{Warning, WarningKind};
+pub use warning::{EngineNotice, Warning, WarningKind};
 
 pub use partial::{
     Application, Compensation, CompensationExport, CompensationOutcome, OperationPlan,

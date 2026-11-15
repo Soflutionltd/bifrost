@@ -195,15 +195,19 @@ pub fn trimmed(text: &str) -> Option<String> {
 /// distinct invalid UTF-8 octets cannot collapse to the same resource key.
 #[must_use]
 pub fn dav_href_key(href: &str) -> DavHrefKey {
-    match Url::parse(href) {
-        Ok(url) => DavHrefKey(HrefIdentity::Url {
+    href_key(Url::parse(href).ok().as_ref(), href)
+}
+
+pub(crate) fn href_key(url: Option<&Url>, href: &str) -> DavHrefKey {
+    match url {
+        Some(url) => DavHrefKey(HrefIdentity::Url {
             scheme: url.scheme().to_string(),
             host: url.host_str().map(str::to_ascii_lowercase),
             port: url.port_or_known_default(),
             segments: decoded_path_segments(url.path()),
             query: url.query().map(str::to_string),
         }),
-        Err(_) => DavHrefKey(HrefIdentity::Raw(href.trim_end_matches('/').to_string())),
+        None => DavHrefKey(HrefIdentity::Raw(href.trim_end_matches('/').to_string())),
     }
 }
 

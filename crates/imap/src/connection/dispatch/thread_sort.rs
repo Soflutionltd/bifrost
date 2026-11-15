@@ -56,7 +56,7 @@ impl Consumer for ThreadConsumer {
 #[derive(Default)]
 pub(crate) struct SortConsumer {
     /// The SORT response, if received.
-    result: Option<(Vec<u32>, Option<u64>)>,
+    result: Option<(Vec<u32>, Option<crate::types::ModSeq>)>,
     /// Non-SORT responses routed here.
     buffered: Vec<UntaggedResponse>,
 }

@@ -243,7 +243,9 @@ pub(crate) async fn run_object_readback(
                                         ReadbackTarget::Move(destination),
                                         HydratedObjectKind::Metadata(entry),
                                     ) => {
-                                        if entry.memberships.contains(destination) {
+                                        if entry.memberships.iter().any(|membership| {
+                                            membership.same_container(destination)
+                                        }) {
                                             ObjectReadback::Satisfied
                                         } else {
                                             ObjectReadback::Unsatisfied

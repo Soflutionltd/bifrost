@@ -5,15 +5,15 @@
 //! a property of an `{accountId, type}` pair). A single shared
 //! `Option<String>` cannot hold the primary account's state and a
 //! foreign (shared/delegate) account's state at once, so the cache is
-//! keyed by JMAP `accountId`. The primary account is one ordinary key
-//! (`self.mail.id_str()`); there is no primary-vs-foreign branch in the
-//! cache itself, only in *which* key a call site looks up.
+//! stored in the account slot that owns it. Each handle travels with its own
+//! cell; there is no separately supplied accountId lookup key.
 //!
 //! Unknown and unavailable observations supply no guard. StateCell owns every
 //! transition; seeds are the only observations installed before concurrency.
 
 use crate::core::id::ObjectState;
 use crate::email::Email;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -64,59 +64,42 @@ impl<O> StateCell<O> {
     }
 }
 
-/// Per-account cells for Email. Mailbox lifecycle positions have a separate
-/// owner because only delivered lifecycle pages may publish sidebar progress.
-pub(crate) type StateMap<O = Email> = Arc<Mutex<HashMap<String, StateCell<O>>>>;
+/// One slot's observations. The handle chooses the cell before a request;
+/// no request helper can pair a handle with another account's string key.
+pub(crate) struct StateCache<O = Email>(Arc<Mutex<StateCell<O>>>);
 
-pub(crate) fn seeded<O>(states: HashMap<String, Option<ObjectState<O>>>) -> StateMap<O> {
-    Arc::new(Mutex::new(
-        states
-            .into_iter()
-            .map(|(account, state)| {
-                let state = state.filter(|state| !state.as_str().is_empty());
-                (account, StateCell { state })
-            })
-            .collect(),
-    ))
+impl<O> Clone for StateCache<O> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
 }
 
-pub(crate) async fn guard<O>(map: &StateMap<O>, account_id: &str) -> Option<ObjectState<O>> {
-    map.lock().await.get(account_id).and_then(StateCell::guard)
-}
+impl<O> StateCache<O> {
+    pub(crate) fn seeded(state: Option<ObjectState<O>>) -> Self {
+        Self(Arc::new(Mutex::new(StateCell {
+            state: state.filter(|state| !state.as_str().is_empty()),
+        })))
+    }
 
-#[cfg(test)]
-pub(crate) async fn set<O>(map: &StateMap<O>, account_id: &str, state: ObjectState<O>) {
-    map.lock()
-        .await
-        .insert(account_id.to_string(), StateCell { state: Some(state) });
-}
+    pub(crate) async fn guard(&self) -> Option<ObjectState<O>> {
+        self.0.lock().await.guard()
+    }
 
-/// Return the winning observation under the publication lock. Network probes
-/// hold no lock and cannot replace a concurrent advance.
-pub(crate) async fn observe_probe<O>(
-    map: &StateMap<O>,
-    account_id: &str,
-    expected: Option<&ObjectState<O>>,
-    probed: ObjectState<O>,
-) -> ObjectState<O> {
-    map.lock()
-        .await
-        .entry(account_id.to_string())
-        .or_default()
-        .observe_probe(expected, probed)
-}
+    pub(crate) async fn observe_probe(
+        &self,
+        expected: Option<&ObjectState<O>>,
+        probed: ObjectState<O>,
+    ) -> ObjectState<O> {
+        self.0.lock().await.observe_probe(expected, probed)
+    }
 
-pub(crate) async fn observe_changes<O>(
-    map: &StateMap<O>,
-    account_id: &str,
-    since: &ObjectState<O>,
-    state: ObjectState<O>,
-) {
-    map.lock()
-        .await
-        .entry(account_id.to_string())
-        .or_default()
-        .observe_changes(since, state);
+    pub(crate) async fn observe_changes(&self, since: &ObjectState<O>, state: ObjectState<O>) {
+        self.0.lock().await.observe_changes(since, state);
+    }
+
+    pub(crate) async fn observe_set(&self, transition: Option<(ObjectState<O>, ObjectState<O>)>) {
+        self.0.lock().await.observe_set(transition);
+    }
 }
 
 /// A set response proves only its own oldState -> newState transition.
@@ -135,21 +118,64 @@ pub(crate) fn set_transition<O>(
     ))
 }
 
-/// Preserve unobserved concurrent changes for the next whole-property guard.
-/// An Outlook user expects a concurrent edit to conflict rather than have a
-/// later unrelated write silently bless it as already observed.
+// Test fixtures may prepare several accounts at once. Selecting a cell happens
+// when a fixture constructs a slot; production has no account-keyed state map.
+#[cfg(test)]
+pub(crate) type StateMap<O = Email> = Arc<std::sync::Mutex<HashMap<String, StateCache<O>>>>;
+
+#[cfg(test)]
+pub(crate) fn seeded<O>(states: HashMap<String, Option<ObjectState<O>>>) -> StateMap<O> {
+    Arc::new(std::sync::Mutex::new(
+        states
+            .into_iter()
+            .map(|(id, state)| (id, StateCache::seeded(state)))
+            .collect(),
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn cell<O>(states: &StateMap<O>, id: &str) -> StateCache<O> {
+    states
+        .lock()
+        .expect("test states")
+        .entry(id.to_owned())
+        .or_insert_with(|| StateCache::seeded(None))
+        .clone()
+}
+
+#[cfg(test)]
+pub(crate) async fn guard<O>(states: &StateMap<O>, id: &str) -> Option<ObjectState<O>> {
+    cell(states, id).guard().await
+}
+#[cfg(test)]
+pub(crate) async fn set<O>(states: &StateMap<O>, id: &str, state: ObjectState<O>) {
+    cell(states, id).0.lock().await.state = Some(state);
+}
+#[cfg(test)]
+pub(crate) async fn observe_probe<O>(
+    states: &StateMap<O>,
+    id: &str,
+    expected: Option<&ObjectState<O>>,
+    probed: ObjectState<O>,
+) -> ObjectState<O> {
+    cell(states, id).observe_probe(expected, probed).await
+}
+#[cfg(test)]
+pub(crate) async fn observe_changes<O>(
+    states: &StateMap<O>,
+    id: &str,
+    since: &ObjectState<O>,
+    state: ObjectState<O>,
+) {
+    cell(states, id).observe_changes(since, state).await;
+}
+#[cfg(test)]
 pub(crate) async fn observe_set<O>(
-    map: &StateMap<O>,
-    account_id: &str,
+    states: &StateMap<O>,
+    id: &str,
     transition: Option<(ObjectState<O>, ObjectState<O>)>,
 ) {
-    if let Some((old, new)) = transition {
-        map.lock()
-            .await
-            .entry(account_id.to_string())
-            .or_default()
-            .observe_set(Some((old, new)));
-    }
+    cell(states, id).observe_set(transition).await;
 }
 
 #[cfg(test)]
@@ -166,7 +192,7 @@ mod tests {
     }
 
     fn map() -> StateMap {
-        Arc::new(Mutex::new(HashMap::new()))
+        seeded(HashMap::new())
     }
 
     #[tokio::test]

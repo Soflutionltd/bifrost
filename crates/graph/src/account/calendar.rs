@@ -53,12 +53,13 @@ const EVENT_SEARCH_FIELDS: &[&str] = &[
 ];
 
 pub(crate) async fn calendars_list(account: GraphAccount) -> Result<Vec<Calendar>, AccountError> {
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     let mut calendars = Vec::new();
     let mut walk = crate::paging::PageWalk::new("calendars");
     let mut next = Some(
         account
-            .client
+            .mailboxes
+            .primary()
             .api_url(&format!(
                 "{prefix}/calendars?$select=id,name,canEdit,isDefaultCalendar&$top=250"
             ))
@@ -68,13 +69,15 @@ pub(crate) async fn calendars_list(account: GraphAccount) -> Result<Vec<Calendar
         walk.enter(&url)
             .map_err(|error| into_error(error, AccountOperation::CalendarsList))?;
         let page: ODataCollection<GraphCalendar> = account
-            .client
+            .mailboxes
+            .primary()
             .get(Resource::Outlook, &url)
             .await
             .map_err(|error| into_error(error, AccountOperation::CalendarsList))?;
         calendars.extend(page.value.into_iter().map(calendar_from_graph));
         next = account
-            .client
+            .mailboxes
+            .primary()
             .admit_next(page.next_link.as_ref())
             .map_err(|error| into_error(error, AccountOperation::CalendarsList))?;
     }
@@ -90,21 +93,25 @@ pub(crate) async fn events_in_range(
         return public::range(&account, folder, &range).await;
     }
     let operation = AccountOperation::EventsInRange;
-    let cursor = crate::paging::decode_link_cursor(&account.client, range.page_cursor, operation)
-        .map_err(|detail| {
+    let cursor = crate::paging::decode_link_cursor(
+        account.mailboxes.primary(),
+        range.page_cursor,
+        operation,
+    )
+    .map_err(|detail| {
         AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
     })?;
     let url = match cursor {
         Some(url) => url,
         None => {
-            let prefix = account.client.api_path_prefix();
+            let prefix = account.mailboxes.primary().api_path_prefix();
             let calendar = bifrost_net::url::encode_path_component(&range.calendar_id.0);
             account
-                .client
+                .mailboxes.primary()
                 .api_url(&format!(
                     "{prefix}/calendars/{calendar}/calendarView?startDateTime={}&endDateTime={}&$select={EVENT_SELECT}&$top={}",
-                    bifrost_net::url::encode_query_value(&range.start.value),
-                    bifrost_net::url::encode_query_value(&range.end.value),
+                    bifrost_net::url::encode_query_value(range.start.value()),
+                    bifrost_net::url::encode_query_value(range.end.value()),
                     range.limit.unwrap_or(250).clamp(1, 250)
                 ))
                 .map_err(|error| into_error(error, operation))?
@@ -112,7 +119,8 @@ pub(crate) async fn events_in_range(
     };
     let page: ODataCollection<GraphEvent> = get_event_page(&account, &url, operation).await?;
     let next_cursor = account
-        .client
+        .mailboxes
+        .primary()
         .admit_next(page.next_link.as_ref())
         .map_err(|error| into_error(error, operation))?
         .map(|next| crate::paging::encode_cursor(operation, &next.as_str()));
@@ -162,7 +170,8 @@ async fn fetch_graph_event(
 ) -> Result<GraphEvent, AccountError> {
     let path = event_url(account, calendar_id, event_id);
     account
-        .client
+        .mailboxes
+        .primary()
         .get_json_prefer::<GraphEvent>(Resource::Outlook, &path, EVENT_TIMEZONE_PREFER)
         .await
         .map_err(|error| into_error(error, operation))
@@ -182,12 +191,13 @@ pub(crate) async fn create(
     )?;
     validate_event_create_timezones(&event)?;
     let calendar_id = event.calendar_id.0.clone();
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&calendar_id);
     let path = format!("{prefix}/calendars/{encoded}/events");
     let body = graph_event_from_create(&event)?;
     let created = account
-        .client
+        .mailboxes
+        .primary()
         .post::<GraphEvent, _>(
             Resource::Outlook,
             &path,
@@ -229,7 +239,7 @@ fn reject_unwritable_status(
 }
 
 fn is_blank_time(time: &EventTime) -> bool {
-    time.value.trim().is_empty()
+    time.is_unspecified()
 }
 
 /// Write-side guard for event times, run before any request.
@@ -265,17 +275,37 @@ fn reject_unusable_write_times(
             "Graph event create needs an explicit end; an empty end cannot be written".to_string(),
         ));
     }
+    for (field, time) in [("start", start), ("end", end)] {
+        if let Some(time) = time.filter(|time| !time.is_unspecified()) {
+            time.validate().map_err(|_| {
+                graph_error::invalid_argument_account_error(
+                    operation,
+                    field,
+                    "Graph event time is malformed",
+                )
+            })?;
+        }
+    }
+    if let (Some(start), Some(end)) = (start, end.filter(|end| !end.is_unspecified())) {
+        start.validate_end(end).map_err(|_| {
+            graph_error::invalid_argument_account_error(
+                operation,
+                "end",
+                "Graph event end must follow start in the same time domain",
+            )
+        })?;
+    }
     Ok(())
 }
 
 fn validate_event_create_timezones(event: &EventCreate) -> Result<(), AccountError> {
     validate_graph_time_zone(
-        event.start.timezone.as_deref(),
+        event.start.timezone(),
         "start.timezone",
         AccountOperation::EventCreate,
     )?;
     validate_graph_time_zone(
-        event.end.timezone.as_deref(),
+        event.end.timezone(),
         "end.timezone",
         AccountOperation::EventCreate,
     )
@@ -284,14 +314,14 @@ fn validate_event_create_timezones(event: &EventCreate) -> Result<(), AccountErr
 fn validate_event_patch_timezones(patch: &EventPatch) -> Result<(), AccountError> {
     if let Some(start) = &patch.start {
         validate_graph_time_zone(
-            start.timezone.as_deref(),
+            start.timezone(),
             "start.timezone",
             AccountOperation::EventUpdate,
         )?;
     }
     if let Some(end) = &patch.end {
         validate_graph_time_zone(
-            end.timezone.as_deref(),
+            end.timezone(),
             "end.timezone",
             AccountOperation::EventUpdate,
         )?;
@@ -346,7 +376,8 @@ pub(crate) async fn update(
     let etag = etag.or(legacy_etag.as_deref());
     let result = if let Some(etag) = etag {
         account
-            .client
+            .mailboxes
+            .primary()
             .patch_if_match(
                 Resource::Outlook,
                 &path,
@@ -357,7 +388,8 @@ pub(crate) async fn update(
             .await
     } else {
         account
-            .client
+            .mailboxes
+            .primary()
             .patch(
                 Resource::Outlook,
                 &path,
@@ -414,7 +446,8 @@ pub(crate) async fn delete_if_version(
     let path = event_url(&account, &calendar_id, &event_id);
     let result = if let Some(etag) = etag.as_deref() {
         account
-            .client
+            .mailboxes
+            .primary()
             .delete_if_match(
                 Resource::Outlook,
                 &path,
@@ -424,7 +457,8 @@ pub(crate) async fn delete_if_version(
             .await
     } else {
         account
-            .client
+            .mailboxes
+            .primary()
             .delete(Resource::Outlook, &path, bifrost_net::ReplayPolicy::Never)
             .await
     };
@@ -441,7 +475,8 @@ pub(crate) async fn rsvp(
     let action = rsvp_action(status)?;
     let path = format!("{}/{action}", event_url(&account, &calendar_id, &event_id));
     account
-        .client
+        .mailboxes
+        .primary()
         .post_no_response(
             Resource::Outlook,
             &path,
@@ -504,17 +539,21 @@ async fn search_locally(
         .clone()
         .unwrap_or_else(|| CalendarId(DEFAULT_CALENDAR_ID.to_string()));
     let operation = AccountOperation::EventSearch;
-    let cursor =
-        crate::paging::decode_paged_cursor(&account.client, request.page_cursor, operation)
-            .map_err(|detail| {
-                AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
-            })?;
+    let cursor = crate::paging::decode_paged_cursor(
+        account.mailboxes.primary(),
+        request.page_cursor,
+        operation,
+    )
+    .map_err(|detail| {
+        AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
+    })?;
     let (mut url, mut skip) = match cursor {
         Some(position) => position,
         None => {
-            let prefix = account.client.api_path_prefix();
+            let prefix = account.mailboxes.primary().api_path_prefix();
             let first = account
-                .client
+                .mailboxes
+                .primary()
                 .api_url(&format!(
                     "{}?$select={EVENT_SELECT}&$top={}",
                     event_search_path(&prefix, explicit_calendar_id.as_ref()),
@@ -545,7 +584,8 @@ async fn search_locally(
         // Admitted at receipt, before it can be followed or minted into the
         // caller's cursor below.
         let next_link = account
-            .client
+            .mailboxes
+            .primary()
             .admit_next(page.next_link.as_ref())
             .map_err(|error| into_error(error, operation))?;
         let page_len = page.value.len();
@@ -616,7 +656,8 @@ async fn search_with_graph_api(
         }],
     };
     let response = account
-        .client
+        .mailboxes
+        .primary()
         .post::<GraphSearchResponse, _>(
             Resource::Outlook,
             "/search/query",
@@ -671,7 +712,7 @@ fn graph_search_api_supported(account: &GraphAccount, request: &EventSearchReque
     request.page_cursor.is_none()
         && request.calendar_id.is_none()
         && !request.query.trim().is_empty()
-        && account.client.uses_default_mailbox()
+        && account.mailboxes.primary().uses_default_mailbox()
 }
 
 async fn get_event_page<T: serde::de::DeserializeOwned>(
@@ -680,7 +721,8 @@ async fn get_event_page<T: serde::de::DeserializeOwned>(
     operation: AccountOperation,
 ) -> Result<ODataCollection<T>, AccountError> {
     account
-        .client
+        .mailboxes
+        .primary()
         .get_prefer(Resource::Outlook, url, EVENT_TIMEZONE_PREFER)
         .await
         .map_err(|error| into_error(error, operation))
@@ -732,7 +774,6 @@ fn event_from_graph(calendar_id: String, event: GraphEvent) -> CalendarEvent {
         title: event.subject,
         description: event.body.and_then(|body| body.content),
         location: event.location.and_then(|location| location.display_name),
-        is_all_day: event.is_all_day.unwrap_or(false),
         start: event
             .start
             .map(|time| event_time(time, event.is_all_day.unwrap_or(false)))
@@ -741,7 +782,7 @@ fn event_from_graph(calendar_id: String, event: GraphEvent) -> CalendarEvent {
         end: event
             .end
             .map(|time| event_time(time, event.is_all_day.unwrap_or(false)))
-            .filter(|time| !time.value.is_empty()),
+            .filter(|time| !time.value().is_empty()),
         status: if event.is_cancelled.unwrap_or(false) {
             EventStatus::Cancelled
         } else {
@@ -798,9 +839,9 @@ fn graph_event_from_create(event: &EventCreate) -> Result<GraphEventPatch, Accou
                 display_name: Some(name.clone()),
             })
         }),
-        start: Some(graph_time(&event.start, event.is_all_day)),
-        end: Some(graph_time(&event.end, event.is_all_day)),
-        is_all_day: Some(event.is_all_day),
+        start: Some(graph_time(&event.start, event.is_all_day())),
+        end: Some(graph_time(&event.end, event.is_all_day())),
+        is_all_day: Some(event.is_all_day()),
         show_as: Some(show_as(event.availability).to_string()),
         sensitivity: Some(sensitivity(event.visibility).to_string()),
         attendees: non_empty(event.attendees.iter().map(graph_attendee)),
@@ -965,8 +1006,8 @@ fn graph_event_from_patch(
         patch
             .start
             .as_ref()
-            .map(|time| is_all_day_value(&time.value))
-            .or_else(|| end.map(|time| is_all_day_value(&time.value)))
+            .map(EventTime::is_all_day)
+            .or_else(|| end.map(EventTime::is_all_day))
             .unwrap_or(false)
     });
     // Only emit `isAllDay` when the patch actually touches a time field
@@ -1019,7 +1060,7 @@ fn graph_event_from_patch(
 }
 
 fn event_url(account: &GraphAccount, calendar_id: &str, event_id: &str) -> String {
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     let event = bifrost_net::url::encode_path_component(event_id);
     if calendar_id == MAILBOX_SCOPE {
         // Graph event ids are mailbox-unique; the mailbox-scoped path
@@ -1074,25 +1115,23 @@ fn split_event_id(
 }
 
 fn event_time(time: GraphDateTime, is_all_day: bool) -> EventTime {
-    let value = time.date_time.unwrap_or_default();
-    EventTime {
-        value: if is_all_day {
-            all_day_date(&value).unwrap_or(value)
-        } else {
-            value
-        },
-        timezone: time.time_zone,
+    let time = EventTime::from_observed(time.date_time.unwrap_or_default(), time.time_zone);
+    if is_all_day {
+        time.converted(true)
+    } else {
+        time
     }
 }
 
 fn graph_time(time: &EventTime, is_all_day: bool) -> GraphDateTime {
+    let converted = time.converted(is_all_day);
     GraphDateTime {
         date_time: Some(if is_all_day {
-            graph_all_day_date_time(&time.value)
+            format!("{}T00:00:00.0000000", converted.value())
         } else {
-            time.value.clone()
+            converted.value().to_owned()
         }),
-        time_zone: Some(graph_time_zone(time.timezone.as_deref())),
+        time_zone: Some(graph_time_zone(time.timezone())),
     }
 }
 
@@ -1127,26 +1166,8 @@ fn validate_graph_time_zone(
     }
 }
 
-fn all_day_date(value: &str) -> Option<String> {
-    value.split_once('T').map(|(date, _)| date.to_string())
-}
-
-fn graph_all_day_date_time(value: &str) -> String {
-    let date = all_day_date(value).unwrap_or_else(|| value.to_string());
-    format!("{date}T00:00:00.0000000")
-}
-
-fn is_all_day_value(value: &str) -> bool {
-    value.len() == 10
-        && value.as_bytes().get(4) == Some(&b'-')
-        && value.as_bytes().get(7) == Some(&b'-')
-}
-
 fn empty_time() -> EventTime {
-    EventTime {
-        value: String::new(),
-        timezone: None,
-    }
+    EventTime::from_observed(String::new(), None)
 }
 
 fn attendee_from_graph(attendee: GraphAttendee) -> Option<EventAttendee> {
@@ -1582,15 +1603,14 @@ mod tests {
             title: Some("Planning".to_string()),
             description: Some("Full description".to_string()),
             location: None,
-            start: EventTime {
-                value: "2026-06-02T12:00:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            end: EventTime {
-                value: "2026-06-02T13:00:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            is_all_day: false,
+            start: EventTime::from_observed(
+                "2026-06-02T12:00:00".to_string(),
+                Some("UTC".to_string()),
+            ),
+            end: EventTime::from_observed(
+                "2026-06-02T13:00:00".to_string(),
+                Some("UTC".to_string()),
+            ),
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -1630,15 +1650,14 @@ mod tests {
             title: None,
             description: None,
             location: None,
-            start: EventTime {
-                value: "2026-06-02T12:00:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            end: EventTime {
-                value: "2026-06-02T13:00:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            is_all_day: false,
+            start: EventTime::from_observed(
+                "2026-06-02T12:00:00".to_string(),
+                Some("UTC".to_string()),
+            ),
+            end: EventTime::from_observed(
+                "2026-06-02T13:00:00".to_string(),
+                Some("UTC".to_string()),
+            ),
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -1812,10 +1831,10 @@ mod tests {
         // the event timed at midnight.
         let patch = graph_event_from_patch(
             &EventPatch {
-                start: Some(EventTime {
-                    value: "2026-06-02".to_string(),
-                    timezone: Some("UTC".to_string()),
-                }),
+                start: Some(EventTime::from_observed(
+                    "2026-06-02".to_string(),
+                    Some("UTC".to_string()),
+                )),
                 ..EventPatch::default()
             },
             CurrentSeries::default(),
@@ -1836,10 +1855,10 @@ mod tests {
     fn timed_start_patch_does_not_set_all_day() {
         let patch = graph_event_from_patch(
             &EventPatch {
-                start: Some(EventTime {
-                    value: "2026-06-02T09:30:00".to_string(),
-                    timezone: Some("UTC".to_string()),
-                }),
+                start: Some(EventTime::from_observed(
+                    "2026-06-02T09:30:00".to_string(),
+                    Some("UTC".to_string()),
+                )),
                 ..EventPatch::default()
             },
             CurrentSeries::default(),
@@ -1945,12 +1964,9 @@ mod tests {
             },
         );
 
-        assert!(event.is_all_day);
-        assert_eq!(event.start.value, "2026-06-02");
-        assert_eq!(
-            event.end.as_ref().map(|end| end.value.as_str()),
-            Some("2026-06-03")
-        );
+        assert!(event.is_all_day());
+        assert_eq!(event.start.value(), "2026-06-02");
+        assert_eq!(event.end.as_ref().map(EventTime::value), Some("2026-06-03"));
     }
 
     /// A delta tombstone carries no `end`, and a null `dateTime` is no end
@@ -1983,15 +1999,8 @@ mod tests {
             title: None,
             description: None,
             location: None,
-            start: EventTime {
-                value: "2026-06-02".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            end: EventTime {
-                value: "2026-06-03".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            is_all_day: true,
+            start: EventTime::from_observed("2026-06-02".to_string(), Some("UTC".to_string())),
+            end: EventTime::from_observed("2026-06-03".to_string(), Some("UTC".to_string())),
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -2068,15 +2077,14 @@ mod tests {
             title: None,
             description: None,
             location: None,
-            start: EventTime {
-                value: "2026-06-02T12:00:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            end: EventTime {
-                value: "2026-06-02T13:00:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            is_all_day: false,
+            start: EventTime::from_observed(
+                "2026-06-02T12:00:00".to_string(),
+                Some("UTC".to_string()),
+            ),
+            end: EventTime::from_observed(
+                "2026-06-02T13:00:00".to_string(),
+                Some("UTC".to_string()),
+            ),
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -2109,15 +2117,14 @@ mod tests {
             title: None,
             description: None,
             location: None,
-            start: EventTime {
-                value: "2026-06-02T12:00:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            end: EventTime {
-                value: "2026-06-02T13:00:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            is_all_day: false,
+            start: EventTime::from_observed(
+                "2026-06-02T12:00:00".to_string(),
+                Some("UTC".to_string()),
+            ),
+            end: EventTime::from_observed(
+                "2026-06-02T13:00:00".to_string(),
+                Some("UTC".to_string()),
+            ),
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -2155,10 +2162,8 @@ mod tests {
 
     fn recurrence_patch(rrule: &str, start: Option<&str>) -> EventPatch {
         EventPatch {
-            start: start.map(|value| EventTime {
-                value: value.to_string(),
-                timezone: Some("UTC".to_string()),
-            }),
+            start: start
+                .map(|value| EventTime::from_observed(value.to_string(), Some("UTC".to_string()))),
             recurrence: Some(EventRecurrence {
                 rrule: Some(rrule.to_string()),
                 ..EventRecurrence::default()
@@ -2256,10 +2261,10 @@ mod tests {
             time_zone: None,
         };
         let moved = EventPatch {
-            start: Some(EventTime {
-                value: "2026-06-09T12:00:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            }),
+            start: Some(EventTime::from_observed(
+                "2026-06-09T12:00:00".to_string(),
+                Some("UTC".to_string()),
+            )),
             ..EventPatch::default()
         };
 
@@ -2285,10 +2290,10 @@ mod tests {
         };
         for value in ["2026-06-2\u{e9}", "not a date at all"] {
             let moved = EventPatch {
-                start: Some(EventTime {
-                    value: value.to_string(),
-                    timezone: Some("UTC".to_string()),
-                }),
+                start: Some(EventTime::from_observed(
+                    value.to_string(),
+                    Some("UTC".to_string()),
+                )),
                 ..EventPatch::default()
             };
             let error = graph_event_from_patch(&moved, series)
@@ -2381,8 +2386,14 @@ mod tests {
 
         // Through create, the refusal is the operation's Unsupported.
         let mut event = recurring_create("FREQ=MONTHLY;COUNT=3");
-        event.start.value = "2026-01-31T12:00:00".to_string();
-        event.end.value = "2026-01-31T13:00:00".to_string();
+        event.start = EventTime::from_observed(
+            "2026-01-31T12:00:00".to_string(),
+            event.start.timezone().map(str::to_owned),
+        );
+        event.end = EventTime::from_observed(
+            "2026-01-31T13:00:00".to_string(),
+            event.end.timezone().map(str::to_owned),
+        );
         let error = graph_event_from_create(&event).expect_err("the 31st every month is refused");
         assert_eq!(
             error.kind(),
@@ -2477,10 +2488,7 @@ mod tests {
     }
 
     fn timed(value: &str) -> EventTime {
-        EventTime {
-            value: value.to_string(),
-            timezone: Some("UTC".to_string()),
-        }
+        EventTime::from_observed(value.to_string(), Some("UTC".to_string()))
     }
 
     fn create_with_times(start: &str, end: &str) -> EventCreate {
@@ -2784,15 +2792,14 @@ mod tests {
             title: None,
             description: None,
             location: None,
-            start: EventTime {
-                value: "2026-06-02T12:00:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            end: EventTime {
-                value: "2026-06-02T13:00:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            },
-            is_all_day: false,
+            start: EventTime::from_observed(
+                "2026-06-02T12:00:00".to_string(),
+                Some("UTC".to_string()),
+            ),
+            end: EventTime::from_observed(
+                "2026-06-02T13:00:00".to_string(),
+                Some("UTC".to_string()),
+            ),
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,

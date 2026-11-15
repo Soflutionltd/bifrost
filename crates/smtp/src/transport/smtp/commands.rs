@@ -6,7 +6,7 @@ use std::fmt::{self, Display, Formatter};
 use crate::{
     address::{Address, Envelope},
     transport::smtp::{
-        authentication::{Credentials, Mechanism},
+        authentication::Mechanism,
         error::{self, Error},
         extension::{ClientId, MailParameter, RcptParameter},
         response::Response,
@@ -286,12 +286,7 @@ impl Display for Rset {
     }
 }
 
-/// AUTH command
-//
-// No `PartialEq`/`Eq`/`serde` derives: `Credentials` carries a live
-// `Arc<dyn TokenSource>` for OAuth, which is neither comparable nor
-// serializable. The wire bytes flow through `Display` over the
-// precomputed `response`, so these derives were never load-bearing.
+/// AUTH command framing over a precomputed shared-client payload.
 #[derive(Clone)]
 pub(crate) enum Auth {
     Start(Mechanism),
@@ -323,69 +318,44 @@ impl Display for Auth {
 }
 
 impl Auth {
-    /// Creates an AUTH command (from a challenge if provided).
-    ///
-    /// `oauth_token` is the access token resolved by the connection's
-    /// auth driver from the credential's `TokenSource`; `None` for
-    /// password / SCRAM mechanisms.
+    /// Take the shared client's initial payload, leaving mechanism state with
+    /// the session. LOGIN deliberately starts without an initial response.
     pub(crate) fn new(
         mechanism: Mechanism,
-        credentials: Credentials,
-        oauth_token: Option<&str>,
-    ) -> Result<Auth, Error> {
+        client: &mut bifrost_sasl::SaslClient,
+    ) -> Result<Self, Error> {
         if mechanism.supports_initial_response() {
-            let response = mechanism.response_with_token(&credentials, None, oauth_token)?;
-            Ok(Auth::Initial {
+            let response = client
+                .initial_response()
+                .ok_or_else(|| error::internal("SASL initial response missing"))?;
+            Ok(Self::Initial {
                 mechanism,
                 response,
             })
         } else {
-            Ok(Auth::Start(mechanism))
+            Ok(Self::Start(mechanism))
         }
     }
 
-    /// Creates an AUTH command from a response that needs to be a
-    /// valid challenge (with 334 response code)
-    #[cfg(test)]
+    /// SMTP owns base64 framing; the client owns the challenge position and
+    /// OAuth error answer. Empty and binary challenges are valid SASL input.
     pub(crate) fn new_from_response(
-        mechanism: Mechanism,
-        credentials: Credentials,
+        client: &mut bifrost_sasl::SaslClient,
         response: &Response,
-        oauth_token: Option<&str>,
-    ) -> Result<Auth, Error> {
-        Self::new_from_response_at_index(mechanism, credentials, response, 0, oauth_token)
-    }
-
-    pub(crate) fn new_from_response_at_index(
-        mechanism: Mechanism,
-        credentials: Credentials,
-        response: &Response,
-        challenge_index: usize,
-        oauth_token: Option<&str>,
-    ) -> Result<Auth, Error> {
+    ) -> Result<Self, Error> {
         if !response.has_code(334) {
             return Err(error::parse("Expecting a challenge"));
         }
-
-        let encoded_challenge = response
-            .first_word()
+        let encoded = response
+            .first_line()
             .ok_or_else(|| error::parse("Could not read auth challenge"))?;
-        #[cfg(feature = "tracing")]
-        tracing::debug!("auth encoded challenge: {}", encoded_challenge);
-
-        let decoded_base64 = crate::base64::decode(encoded_challenge).map_err(error::parse)?;
-        let decoded_challenge = String::from_utf8(decoded_base64).map_err(error::parse)?;
-        #[cfg(feature = "tracing")]
-        tracing::debug!("auth decoded challenge: {}", decoded_challenge);
-
-        let response = mechanism.response_with_token_at_index(
-            &credentials,
-            Some(decoded_challenge.as_ref()),
-            challenge_index,
-            oauth_token,
-        )?;
-
-        Ok(Auth::Continuation(response))
+        let challenge = crate::base64::decode(encoded.trim()).map_err(error::parse)?;
+        match client.step(&challenge)? {
+            bifrost_sasl::Step::Reply(reply) => Ok(Self::Continuation(reply)),
+            _ => Err(error::parse(
+                "unexpected SASL completion in a challenge response",
+            )),
+        }
     }
 }
 
@@ -394,6 +364,7 @@ mod test {
     use std::str::FromStr;
 
     use super::*;
+    use crate::transport::smtp::authentication::Credentials;
     use crate::transport::smtp::extension::MailBodyParameter;
 
     #[test]
@@ -492,30 +463,41 @@ mod test {
         assert_eq!(
             format!(
                 "{}",
-                Auth::new(Mechanism::Plain, credentials.clone(), None).unwrap()
+                Auth::new(
+                    Mechanism::Plain,
+                    &mut Mechanism::Plain.password_client(&credentials).unwrap()
+                )
+                .unwrap()
             ),
             "AUTH PLAIN AHVzZXIAcGFzc3dvcmQ=\r\n"
         );
         assert_eq!(
             format!(
                 "{}",
-                Auth::new(Mechanism::Login, credentials, None).unwrap()
+                Auth::new(
+                    Mechanism::Login,
+                    &mut Mechanism::Login.password_client(&credentials).unwrap()
+                )
+                .unwrap()
             ),
             "AUTH LOGIN\r\n"
         );
-        let credentials = Credentials::oauth2("user".to_owned(), "token".to_owned());
+        let mut oauth = Mechanism::OAuthBearer
+            .oauth_client("user", "token")
+            .unwrap();
         assert_eq!(
             format!(
                 "{}",
-                Auth::new(Mechanism::Xoauth2, credentials.clone(), Some("token")).unwrap()
+                Auth::new(
+                    Mechanism::Xoauth2,
+                    &mut Mechanism::Xoauth2.oauth_client("user", "token").unwrap()
+                )
+                .unwrap()
             ),
             "AUTH XOAUTH2 dXNlcj11c2VyAWF1dGg9QmVhcmVyIHRva2VuAQE=\r\n"
         );
         assert_eq!(
-            format!(
-                "{}",
-                Auth::new(Mechanism::OAuthBearer, credentials.clone(), Some("token")).unwrap()
-            ),
+            format!("{}", Auth::new(Mechanism::OAuthBearer, &mut oauth).unwrap()),
             "AUTH OAUTHBEARER bixhPXVzZXIsAWF1dGg9QmVhcmVyIHRva2VuAQE=\r\n"
         );
         let continuation = Response::new(
@@ -529,13 +511,7 @@ mod test {
         assert_eq!(
             format!(
                 "{}",
-                Auth::new_from_response(
-                    Mechanism::OAuthBearer,
-                    credentials,
-                    &continuation,
-                    Some("token")
-                )
-                .unwrap()
+                Auth::new_from_response(&mut oauth, &continuation).unwrap()
             ),
             "AQ==\r\n"
         );
@@ -548,7 +524,8 @@ mod test {
         // acknowledgement XOAUTH2 requires (a bare CRLF line), so the server
         // emits the tagged failure reply instead of the exchange leaking
         // through as an untagged "does not expect a challenge" error.
-        let credentials = Credentials::oauth2("user".to_owned(), "token".to_owned());
+        let mut oauth = Mechanism::Xoauth2.oauth_client("user", "token").unwrap();
+        oauth.initial_response().unwrap();
         let continuation = Response::new(
             crate::transport::smtp::response::Code {
                 severity: crate::transport::smtp::response::Severity::PositiveIntermediate,
@@ -560,13 +537,7 @@ mod test {
         assert_eq!(
             format!(
                 "{}",
-                Auth::new_from_response(
-                    Mechanism::Xoauth2,
-                    credentials,
-                    &continuation,
-                    Some("token")
-                )
-                .unwrap()
+                Auth::new_from_response(&mut oauth, &continuation).unwrap()
             ),
             "\r\n"
         );
@@ -637,7 +608,11 @@ mod test {
         );
 
         assert!(
-            Auth::new_from_response(Mechanism::Plain, credentials, &not_a_challenge, None).is_err()
+            Auth::new_from_response(
+                &mut Mechanism::Plain.password_client(&credentials).unwrap(),
+                &not_a_challenge
+            )
+            .is_err()
         );
     }
 
@@ -653,16 +628,20 @@ mod test {
             vec!["!!!!".to_owned()],
         );
 
-        assert!(Auth::new_from_response(Mechanism::Plain, credentials, &challenge, None).is_err());
+        assert!(
+            Auth::new_from_response(
+                &mut Mechanism::Plain.password_client(&credentials).unwrap(),
+                &challenge
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn scram_initial_command_is_bare_auth() {
-        // SCRAM has no initial response and is driven by the SCRAM exchange,
-        // so `Auth::new(.., None)` must not invoke `Mechanism::response` (which
-        // errors for SCRAM) and must emit a bare `AUTH SCRAM-SHA-256`.
-        let credentials = Credentials::password("user".to_owned(), "password".to_owned());
-        let auth = Auth::new(Mechanism::ScramSha256, credentials, None).unwrap();
+        // SMTP starts SCRAM without an inline response; its framing adapter
+        // supplies the client's first message after the initial 334 prompt.
+        let auth = Auth::Start(Mechanism::ScramSha256);
         assert_eq!(format!("{auth}"), "AUTH SCRAM-SHA-256\r\n");
     }
 }

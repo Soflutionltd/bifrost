@@ -169,7 +169,7 @@ fn to_acct_err(op: AccountOperation) -> impl Fn(SieveError) -> AccountError {
 fn invalid(op: AccountOperation, detail: impl Into<String>) -> AccountError {
     let detail: String = detail.into();
     account_error_with(
-        Error::InvalidInput(detail.into()),
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(detail.into())),
         ImapErrorContext::operation(op),
     )
 }

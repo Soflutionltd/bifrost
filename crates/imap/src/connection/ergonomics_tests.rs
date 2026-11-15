@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::connection::test_support::{driver_pair, preauth_greeting, read_line, respond, tag_of};
-use crate::types::{FetchAttr, UidSet};
+use crate::types::{FetchAttr, UidSetExpr};
 
 fn fetch_response(seq: u32) -> FetchResponse {
     FetchResponse {
@@ -19,11 +19,17 @@ async fn early_fetch_consumer_close_discards_buffered_items_and_unblocks_the_dri
     tx.send(Ok(fetch_response(1))).await.unwrap();
     tx.send(Ok(fetch_response(2))).await.unwrap();
 
-    let error = drain_fetch_stream(rx, |_| Err(Error::InvalidInput("stop fetching".into())))
-        .await
-        .expect_err("the callback error is preserved");
+    let error = drain_fetch_stream(rx, |_| {
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput("stop fetching".into()),
+        ))
+    })
+    .await
+    .expect_err("the callback error is preserved");
 
-    assert!(matches!(error, Error::InvalidInput(message) if message == "stop fetching"));
+    assert!(
+        matches!(error, Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(message)) if message == "stop fetching")
+    );
     assert!(
         tx.send(Ok(fetch_response(3))).await.is_err(),
         "closing the receiver tells the bounded driver consumer to drain to tagged completion"
@@ -60,17 +66,21 @@ async fn uid_fetch_each_finishes_after_the_callback_stops_a_full_bounded_stream(
     });
 
     conn.select("INBOX", Duration::from_secs(5)).await.unwrap();
-    let uids = UidSet::parse("1:65").unwrap();
+    let uids = UidSetExpr::parse("1:65").unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(1),
         conn.uid_fetch_each(&uids, &[FetchAttr::Uid], Duration::from_secs(5), |_| {
-            Err(Error::InvalidInput("stop fetching".into()))
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput("stop fetching".into()),
+            ))
         }),
     )
     .await
     .expect("closing the receiver must let the driver reach the tagged completion");
 
-    assert!(matches!(result, Err(Error::InvalidInput(message)) if message == "stop fetching"));
+    assert!(
+        matches!(result, Err(Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(message))) if message == "stop fetching")
+    );
     script.await.unwrap();
 }
 
@@ -111,17 +121,21 @@ async fn uid_fetch_each_gives_up_when_the_server_stalls_after_an_early_consumer_
     });
 
     conn.select("INBOX", Duration::from_secs(5)).await.unwrap();
-    let uids = UidSet::parse("1:3").unwrap();
+    let uids = UidSetExpr::parse("1:3").unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(600),
         conn.uid_fetch_each(&uids, &[FetchAttr::Uid], Duration::from_secs(2), |_| {
-            Err(Error::InvalidInput("stop fetching".into()))
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput("stop fetching".into()),
+            ))
         }),
     )
     .await
     .expect("a stalled server must not outlive the command timeout");
 
-    assert!(matches!(result, Err(Error::InvalidInput(message)) if message == "stop fetching"));
+    assert!(
+        matches!(result, Err(Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(message))) if message == "stop fetching")
+    );
     let _ = release_tx.send(());
     script.await.unwrap();
 }
@@ -139,7 +153,7 @@ async fn limited_fetch_retires_connection_on_oversized_literal_declaration() {
             .await
             .unwrap();
     };
-    let uids = UidSet::parse("1").unwrap();
+    let uids = UidSetExpr::parse("1").unwrap();
     let attrs = [FetchAttr::BodySection {
         peek: true,
         section: None,
@@ -149,7 +163,12 @@ async fn limited_fetch_retires_connection_on_oversized_literal_declaration() {
         conn.uid_fetch_limited(&uids, &attrs, 1024, Duration::from_secs(5)),
         script,
     );
-    assert!(matches!(result, Err(Error::FetchLiteralLimit { .. })));
+    assert!(matches!(
+        result,
+        Err(Error::ResultLimit(
+            crate::error::ResultLimit::FetchLiteral { .. }
+        ))
+    ));
     assert!(!conn.is_alive());
 }
 
@@ -158,7 +177,7 @@ async fn budgeted_fetch_stream_rejects_payload_before_channel_delivery() {
     use crate::connection::test_support::select_inbox;
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
     select_inbox(&conn, &mut server).await;
-    let uids = UidSet::parse("1").unwrap();
+    let uids = UidSetExpr::parse("1").unwrap();
     let attrs = [FetchAttr::BodySection {
         peek: true,
         section: None,
@@ -181,7 +200,12 @@ async fn budgeted_fetch_stream_rejects_payload_before_channel_delivery() {
             .unwrap();
     };
     let (result, ()) = tokio::join!(fetch, script);
-    assert!(matches!(result, Err(Error::FetchLiteralLimit { .. })));
+    assert!(matches!(
+        result,
+        Err(Error::ResultLimit(
+            crate::error::ResultLimit::FetchLiteral { .. }
+        ))
+    ));
     assert!(rx.recv().await.is_none());
     assert!(!conn.is_alive());
 }

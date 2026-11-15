@@ -3,11 +3,13 @@ use super::{
     PushIngress, SinkTarget, broadcast,
     health::{PushHealth, PushLaneHealth, PushLaneState},
 };
+use crate::engine::supervisor::ReopenRequest;
 use crate::{
     backoff::{ReconnectBackoff, jitter_seed},
     cancel::{BoundaryRequest, BoundaryView},
-    multiplexer::{ChangeDelivery, ReopenRequest},
-    recovery::{self, RecoveryPlan, ThrottleBucket},
+    delivery::ChangeDelivery,
+    recovery::{self, RecoveryPlan},
+    throttle::ThrottleBucket,
 };
 use arc_swap::ArcSwap;
 use bifrost_types::{
@@ -147,10 +149,15 @@ impl PushSupervisor {
         if edge {
             broadcast(
                 &self.target(),
-                SyncEvent::Warning(Warning::user_safe(
-                    WarningKind::Other,
-                    "push transport disconnected",
-                )),
+                SyncEvent::Warning(
+                    Warning::user_safe(
+                        WarningKind::Engine(bifrost_types::EngineNotice::PushDisconnected {
+                            lane: Some(self.health.borrow().lanes[index].lane),
+                        }),
+                        "push transport disconnected",
+                    )
+                    .with_optional_error(error.clone()),
+                ),
             );
         }
         delay
@@ -269,7 +276,7 @@ impl PushSupervisor {
                 return backoff.failures();
             }
             while let Some(wait) =
-                recovery::account_throttle_wait(&self.throttles, &self.account_id)
+                crate::throttle::account_throttle_wait(&self.throttles, &self.account_id)
             {
                 if !self.wait(wait, &mut pending, &stop, &mut boundary).await {
                     return backoff.failures();
@@ -286,7 +293,8 @@ impl PushSupervisor {
                 let throttles = Arc::clone(&throttles);
                 let aid = aid.clone();
                 async move {
-                    while let Some(wait) = recovery::account_throttle_wait(&throttles, &aid) {
+                    while let Some(wait) = crate::throttle::account_throttle_wait(&throttles, &aid)
+                    {
                         tokio::time::sleep(wait).await;
                     }
                 }

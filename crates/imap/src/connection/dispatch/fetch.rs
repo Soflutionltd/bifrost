@@ -5,7 +5,7 @@ use std::pin::Pin;
 use crate::connection::NotifyFlags;
 use crate::error::Error;
 use crate::types::response::{TaggedResponse, UntaggedResponse};
-use crate::types::validated::ParsedUidSet;
+use crate::types::set::UidSet;
 use crate::types::{FetchResponse, StoreResult, UidRange};
 
 use super::{BackpressureState, Consumer, ConsumerContext, Finalized, StreamingConsumer};
@@ -110,12 +110,14 @@ impl Consumer for FetchConsumer {
             if let Some(limit) = self.hard_limit
                 && self.estimated_bytes > limit
             {
-                self.limit_exceeded.get_or_insert(Error::FetchLimit {
-                    estimated: self.estimated_bytes,
-                    limit,
-                    seq: Some(fr.seq),
-                    uid: fr.uid,
-                });
+                self.limit_exceeded.get_or_insert(Error::ResultLimit(
+                    crate::error::ResultLimit::Fetch {
+                        estimated: self.estimated_bytes,
+                        limit,
+                        seq: crate::types::Seq::new(fr.seq),
+                        uid: fr.uid.and_then(crate::types::Uid::new),
+                    },
+                ));
                 return;
             }
             if !self.warned && self.estimated_bytes > self.warn_threshold {
@@ -392,7 +394,7 @@ pub(crate) enum FetchStreamItem {
 /// Bounded streaming consumer for UID FETCH CHANGEDSINCE VANISHED.
 pub(crate) struct BoundedStreamingFetchVanishedConsumer {
     pipe: BoundedStreamingPipe<FetchStreamItem>,
-    requested_set: Option<ParsedUidSet>,
+    requested_set: Option<UidSet>,
     dropped_vanished_count: usize,
     buffered: Vec<UntaggedResponse>,
 }
@@ -400,7 +402,7 @@ pub(crate) struct BoundedStreamingFetchVanishedConsumer {
 impl BoundedStreamingFetchVanishedConsumer {
     pub(crate) fn new(
         tx: tokio::sync::mpsc::Sender<Result<FetchStreamItem, Error>>,
-        requested_set: Option<ParsedUidSet>,
+        requested_set: Option<UidSet>,
     ) -> Self {
         Self {
             pipe: BoundedStreamingPipe::new(tx),
@@ -482,7 +484,7 @@ impl StreamingConsumer for BoundedStreamingFetchVanishedConsumer {
 /// [MODIFIED ...]` is a legal, partially-successful CONDSTORE result whose
 /// per-UID conflict evidence the mutation layer needs, so it is preserved in
 /// `StoreResult::status`. Without `UNCHANGEDSINCE` a tagged `NO` is a plain
-/// refusal with nothing partial about it, and is surfaced as `Error::No` -
+/// refusal with nothing partial about it, and is surfaced as `crate::error::ServerStatus::No` -
 /// callers of the unconditional STORE APIs read `Ok` as "the server accepted
 /// this", and at least one of them (`\Deleted` + EXPUNGE) would destroy mail
 /// if that stopped being true.
@@ -499,7 +501,7 @@ pub(crate) struct StoreConsumer {
 }
 
 impl StoreConsumer {
-    pub(crate) fn new(unchanged_since: Option<u64>) -> Self {
+    pub(crate) fn new(unchanged_since: Option<crate::types::ModSeqValzer>) -> Self {
         Self {
             fetches: Vec::new(),
             buffered: Vec::new(),
@@ -607,7 +609,7 @@ pub(crate) struct FetchVanishedConsumer {
     /// Parsed requested UID set for defensive filtering of
     /// `VANISHED (EARLIER)` responses (RFC 7162 Section 3.2.6).
     /// `None` when the sequence set contains `$` (RFC 5182).
-    requested_set: Option<ParsedUidSet>,
+    requested_set: Option<UidSet>,
     /// Count of individual UIDs dropped by filtering.
     dropped_vanished_count: usize,
     /// Non-solicited responses (classified as `Either`).
@@ -625,7 +627,7 @@ impl FetchVanishedConsumer {
     /// Pass `Some(set)` to filter out-of-set UIDs per RFC 7162
     /// Section 3.2.6. Pass `None` when the sequence set contains `$`
     /// (RFC 5182 search result reference) and cannot be parsed.
-    pub(crate) fn new(requested_set: Option<ParsedUidSet>) -> Self {
+    pub(crate) fn new(requested_set: Option<UidSet>) -> Self {
         Self {
             fetches: Vec::new(),
             vanished_uids: Vec::new(),
@@ -762,10 +764,12 @@ mod store_tests {
 
     #[test]
     fn tagged_no_modified_reaches_the_store_result() {
-        let result = Box::new(StoreConsumer::new(Some(42)))
-            .finalize(tagged(StatusKind::No, modified()), &context())
-            .output
-            .expect("tagged NO is a typed STORE result");
+        let result = Box::new(StoreConsumer::new(Some(
+            crate::types::ModSeqValzer::new(42).expect("valid protocol test value"),
+        )))
+        .finalize(tagged(StatusKind::No, modified()), &context())
+        .output
+        .expect("tagged NO is a typed STORE result");
         assert_eq!(result.status, StatusKind::No);
         assert_eq!(result.text, "store rejected");
         assert!(matches!(
@@ -787,13 +791,19 @@ mod store_tests {
                 Err(err) => err,
                 Ok(_) => panic!("unconditional STORE must not report a tagged NO as success"),
             };
-            assert!(matches!(err, Error::No { .. }), "unexpected error: {err:?}");
+            assert!(
+                matches!(
+                    err,
+                    Error::ServerStatus(crate::error::ServerStatus::No { .. })
+                ),
+                "unexpected error: {err:?}"
+            );
         }
     }
 
     #[test]
     fn tagged_bad_is_an_error_on_both_paths() {
-        for unchanged_since in [None, Some(42)] {
+        for unchanged_since in [None, crate::types::ModSeqValzer::new(42)] {
             let err = match Box::new(StoreConsumer::new(unchanged_since))
                 .finalize(tagged(StatusKind::Bad, None), &context())
                 .output
@@ -802,7 +812,10 @@ mod store_tests {
                 Ok(_) => panic!("tagged BAD is always a command error"),
             };
             assert!(
-                matches!(err, Error::Bad { .. }),
+                matches!(
+                    err,
+                    Error::ServerStatus(crate::error::ServerStatus::Bad { .. })
+                ),
                 "unexpected error: {err:?}"
             );
         }
@@ -810,10 +823,12 @@ mod store_tests {
 
     #[test]
     fn conditional_store_tagged_ok_still_reports_ok() {
-        let result = Box::new(StoreConsumer::new(Some(42)))
-            .finalize(tagged(StatusKind::Ok, None), &context())
-            .output
-            .expect("tagged OK is a STORE result");
+        let result = Box::new(StoreConsumer::new(Some(
+            crate::types::ModSeqValzer::new(42).expect("valid protocol test value"),
+        )))
+        .finalize(tagged(StatusKind::Ok, None), &context())
+        .output
+        .expect("tagged OK is a STORE result");
         assert_eq!(result.status, StatusKind::Ok);
     }
 

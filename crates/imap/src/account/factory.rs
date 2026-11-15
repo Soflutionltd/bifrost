@@ -565,7 +565,10 @@ fn server_id_disables_qresync(server_id: &[(String, Option<String>)]) -> bool {
 /// trailing delimiter. All folders under a shared root collapse to this one
 /// owner (there is no per-principal segment in a shared namespace). Pure and
 /// tested.
-pub(crate) fn mailbox_owner_for(prefix: &str, delimiter: Option<char>) -> bifrost_types::MailboxId {
+pub(crate) fn mailbox_owner_for(
+    prefix: &str,
+    delimiter: Option<char>,
+) -> bifrost_types::PrincipalId {
     // The owner is the whole namespace root minus its trailing delimiter,
     // NOT just the root's final segment. Collapsing to the final segment
     // merges distinct multi-segment shared trees: `#shared/dept/` and
@@ -576,7 +579,7 @@ pub(crate) fn mailbox_owner_for(prefix: &str, delimiter: Option<char>) -> bifros
         Some(d) => prefix.strip_suffix(d).unwrap_or(prefix),
         None => prefix,
     };
-    bifrost_types::MailboxId(owner.to_owned())
+    bifrost_types::PrincipalId(owner.to_owned())
 }
 
 /// Owner identity for the *other-user* namespace: the per-principal segment
@@ -592,7 +595,7 @@ pub(crate) fn mailbox_owner_from_other_user_path(
     folder_path: &str,
     prefix: &str,
     delimiter: Option<char>,
-) -> bifrost_types::MailboxId {
+) -> bifrost_types::PrincipalId {
     // The prefix only attributes a principal when the folder genuinely
     // sits *under* it: a bare textual `strip_prefix` would mis-read
     // `OtherTeam/INBOX` as belonging to the `Other` namespace and invent
@@ -614,7 +617,7 @@ pub(crate) fn mailbox_owner_from_other_user_path(
         None => (!relative.is_empty()).then_some(relative),
     };
     match segment {
-        Some(owner) => bifrost_types::MailboxId(owner.to_owned()),
+        Some(owner) => bifrost_types::PrincipalId(owner.to_owned()),
         None => mailbox_owner_for(prefix, delimiter),
     }
 }
@@ -826,7 +829,7 @@ pub(crate) async fn list_folders(
             .await
         {
             Ok(folders) => return Ok(folders),
-            Err(crate::Error::MissingCapability(_)) => {}
+            Err(crate::Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(_))) => {}
             Err(err) => return Err(err),
         }
     }
@@ -991,7 +994,11 @@ mod tests {
                     let folder = crate::types::MailboxName::new("INBOX").unwrap();
                     let mut fetch = opened
                         .account
-                        .open_raw_rfc822(super::super::encode_object_id(&folder, 1, 1));
+                        .open_raw_rfc822(super::super::encode_object_id(
+                            &folder,
+                            crate::types::UidValidity::new(1).expect("nonzero epoch"),
+                            crate::types::Uid::new(1).expect("valid protocol test value"),
+                        ));
                     let mut body = Vec::new();
                     let mut done = false;
                     while let Some(event) = fetch.next().await {
@@ -1031,12 +1038,12 @@ mod tests {
         // (trailing-stripped) prefix is the owner.
         assert_eq!(
             mailbox_owner_for("#shared.", Some('.')),
-            bifrost_types::MailboxId("#shared".to_owned())
+            bifrost_types::PrincipalId("#shared".to_owned())
         );
         // No delimiter: prefix is the owner verbatim.
         assert_eq!(
             mailbox_owner_for("Shared", None),
-            bifrost_types::MailboxId("Shared".to_owned())
+            bifrost_types::PrincipalId("Shared".to_owned())
         );
         // Multi-segment shared root keeps its whole (trailing-stripped)
         // path as the owner so distinct trees do not collapse. A prior
@@ -1044,7 +1051,7 @@ mod tests {
         // `#shared/dept/` and `#other/dept/` into one `dept` owner.
         assert_eq!(
             mailbox_owner_for("#shared/dept/", Some('/')),
-            bifrost_types::MailboxId("#shared/dept".to_owned())
+            bifrost_types::PrincipalId("#shared/dept".to_owned())
         );
         assert_ne!(
             mailbox_owner_for("#shared/dept/", Some('/')),
@@ -1059,16 +1066,16 @@ mod tests {
         // distinct users get distinct owners - not collapsed to the root.
         assert_eq!(
             mailbox_owner_from_other_user_path("#user/alice/INBOX", "#user/", Some('/')),
-            bifrost_types::MailboxId("alice".to_owned())
+            bifrost_types::PrincipalId("alice".to_owned())
         );
         assert_eq!(
             mailbox_owner_from_other_user_path("#user/bob/Sent", "#user/", Some('/')),
-            bifrost_types::MailboxId("bob".to_owned())
+            bifrost_types::PrincipalId("bob".to_owned())
         );
         // The user-root folder itself (no segment after the principal).
         assert_eq!(
             mailbox_owner_from_other_user_path("#user/alice", "#user/", Some('/')),
-            bifrost_types::MailboxId("alice".to_owned())
+            bifrost_types::PrincipalId("alice".to_owned())
         );
         // Non-default delimiter.
         assert_eq!(
@@ -1077,13 +1084,13 @@ mod tests {
                 "Other Users.",
                 Some('.')
             ),
-            bifrost_types::MailboxId("carol".to_owned())
+            bifrost_types::PrincipalId("carol".to_owned())
         );
         // Defensive fallback: a path not under the prefix degrades to the
         // root-derived owner rather than panicking.
         assert_eq!(
             mailbox_owner_from_other_user_path("#user/", "#user/", Some('/')),
-            bifrost_types::MailboxId("#user".to_owned())
+            bifrost_types::PrincipalId("#user".to_owned())
         );
         // Delimiter-boundary guard: a prefix that matches textually but
         // not on a delimiter boundary (`Other` vs `OtherTeam/INBOX`) must
@@ -1091,13 +1098,13 @@ mod tests {
         // match; it falls back to the root-derived owner.
         assert_eq!(
             mailbox_owner_from_other_user_path("OtherTeam/INBOX", "Other", Some('/')),
-            bifrost_types::MailboxId("Other".to_owned())
+            bifrost_types::PrincipalId("Other".to_owned())
         );
         // A prefix without a trailing delimiter that DOES terminate on a
         // boundary (next char is the delimiter) still reads the principal.
         assert_eq!(
             mailbox_owner_from_other_user_path("Other/dave/INBOX", "Other", Some('/')),
-            bifrost_types::MailboxId("dave".to_owned())
+            bifrost_types::PrincipalId("dave".to_owned())
         );
     }
 
@@ -1223,9 +1230,12 @@ mod tests {
         let contact_scope = bifrost_types::ErrorScope::ContactCollection;
         let sub_skip = SkippedScope {
             scope: contact_scope.clone(),
-            error: discover_err(crate::Error::Internal(
-                "second address book is not synced".to_string(),
-            )),
+            error: discover_err(crate::Error::Internal {
+                kind: crate::error::InternalFailure::Invariant(
+                    "second address book is not synced".to_string(),
+                ),
+                mid_exchange: None,
+            }),
         };
         let opened = OpenedAccount {
             account: stub,

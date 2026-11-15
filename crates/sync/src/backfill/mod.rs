@@ -49,7 +49,16 @@ impl std::fmt::Debug for BackfillRegistry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BackfillState {
+    /// This incarnation has not started its first attempt.
     Pending,
+    /// A failed attempt is waiting on its retry ramp.
+    Retrying,
+    /// A partition is parked until a scope-local throttle hold expires.
+    Throttled,
+    /// An operator decision is needed to cross a checkpoint barrier.
+    OperatorBlocked,
+    /// A walk lost pages and must restart from its beginning.
+    RestartingAfterLoss,
     Running,
     Completed,
 }

@@ -115,7 +115,7 @@ fn saved_search_marker_is_detected_after_uid_key() {
     assert!(has("UID $", "$"));
     assert!(matches!(
         conn(vec![Capability::Imap4Rev1]).validate_search_criteria_capabilities("UID $"),
-        Err(Error::MissingCapability(capability)) if capability == "SEARCHRES"
+        Err(Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(capability))) if capability == "SEARCHRES"
     ));
 }
 
@@ -167,7 +167,9 @@ fn scanner_handles_non_ascii_operands() {
 fn modseq_criterion_requires_condstore() {
     assert!(matches!(
         conn(vec![]).validate_search_criteria_capabilities("MODSEQ 5"),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(
         conn(vec![Capability::Condstore])
@@ -182,7 +184,9 @@ fn within_criteria_require_the_within_capability() {
     for criteria in ["OLDER 60", "YOUNGER 60"] {
         assert!(matches!(
             conn(vec![Capability::Imap4Rev2]).validate_search_criteria_capabilities(criteria),
-            Err(Error::MissingCapability(_))
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::MissingCapability(_)
+            ))
         ));
         assert!(
             conn(vec![Capability::Within])
@@ -199,12 +203,16 @@ fn savedate_criteria_are_not_implied_by_rev2() {
     assert!(matches!(
         conn(vec![Capability::Imap4Rev1])
             .validate_search_criteria_capabilities("SAVEDSINCE 1-Jan-2026"),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         conn(vec![Capability::Imap4Rev2])
             .validate_search_criteria_capabilities("SAVEDBEFORE 1-Jan-2026"),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(
         conn(vec![Capability::Imap4Rev2, Capability::SaveDate])
@@ -224,11 +232,15 @@ fn savedate_criteria_are_not_implied_by_rev2() {
 fn objectid_criteria_are_not_implied_by_rev2() {
     assert!(matches!(
         conn(vec![Capability::Imap4Rev1]).validate_search_criteria_capabilities("EMAILID M1"),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         conn(vec![Capability::Imap4Rev2]).validate_search_criteria_capabilities("THREADID T1"),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(
         conn(vec![Capability::Imap4Rev2, Capability::ObjectId])
@@ -241,7 +253,9 @@ fn objectid_criteria_are_not_implied_by_rev2() {
 fn saved_result_marker_requires_searchres() {
     assert!(matches!(
         conn(vec![Capability::Imap4Rev1]).validate_search_criteria_capabilities("$"),
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(
         conn(vec![Capability::SearchRes])
@@ -311,7 +325,12 @@ async fn queued_search_uses_capabilities_received_by_preceding_command() {
     let (noop, search) = tokio::join!(conn.noop(Duration::from_secs(5)), search);
     noop.unwrap();
     assert!(
-        matches!(search, Err(Error::StateChangedBeforeSend(_))),
+        matches!(
+            search,
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::StateChangedBeforeSend(_)
+            ))
+        ),
         "{search:?}"
     );
     drop(conn);

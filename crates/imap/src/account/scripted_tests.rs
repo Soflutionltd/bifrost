@@ -121,7 +121,11 @@ async fn sent_append_receipt(reply: Option<&'static str>) -> bifrost_types::Send
 #[tokio::test]
 async fn sent_append_with_appenduid_reports_the_filed_copy() {
     let receipt = sent_append_receipt(Some("OK [APPENDUID 7 3] done")).await;
-    let filed = super::encode_object_id(&crate::types::MailboxName::new("Sent").unwrap(), 7, 3);
+    let filed = super::encode_object_id(
+        &crate::types::MailboxName::new("Sent").unwrap(),
+        crate::types::UidValidity::new(7).expect("nonzero epoch"),
+        crate::types::Uid::new(3).expect("valid protocol test value"),
+    );
     assert_eq!(receipt.id, filed);
     assert!(matches!(
         receipt.sent_copy,
@@ -358,7 +362,11 @@ async fn draft_send_scripted(
         }
         server
     });
-    let draft = super::encode_object_id(&crate::types::MailboxName::new("Drafts").unwrap(), 7, 1);
+    let draft = super::encode_object_id(
+        &crate::types::MailboxName::new("Drafts").unwrap(),
+        crate::types::UidValidity::new(7).expect("nonzero epoch"),
+        crate::types::Uid::new(1).expect("valid protocol test value"),
+    );
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
         super::pim::draft_send_with_clock(
@@ -385,7 +393,11 @@ fn assert_discard_failure(receipt: &bifrost_types::SendReceipt) -> &bifrost_type
         .draft_discard
         .as_ref()
         .expect("a failed discard rides the receipt");
-    let draft = super::encode_object_id(&crate::types::MailboxName::new("Drafts").unwrap(), 7, 1);
+    let draft = super::encode_object_id(
+        &crate::types::MailboxName::new("Drafts").unwrap(),
+        crate::types::UidValidity::new(7).expect("nonzero epoch"),
+        crate::types::Uid::new(1).expect("valid protocol test value"),
+    );
     assert_eq!(failure.draft.0, draft.0);
     assert_eq!(
         failure.error.operation(),
@@ -533,7 +545,11 @@ async fn draft_discard_on_a_bare_server_retries_a_failed_post_send_discard() {
         .await;
         server
     });
-    let draft = super::encode_object_id(&crate::types::MailboxName::new("Drafts").unwrap(), 7, 1);
+    let draft = super::encode_object_id(
+        &crate::types::MailboxName::new("Drafts").unwrap(),
+        crate::types::UidValidity::new(7).expect("nonzero epoch"),
+        crate::types::Uid::new(1).expect("valid protocol test value"),
+    );
     tokio::time::timeout(
         Duration::from_secs(5),
         super::pim::draft_discard(account, bifrost_types::DraftHandle(draft.0)),
@@ -823,7 +839,11 @@ async fn send_message_files_the_bcc_bearing_copy_and_transmits_without_it() {
         header_block(&rendered.raw)
     );
     assert_eq!(sole_first_date(&rendered.raw), sole_first_date(&appended));
-    let filed = super::encode_object_id(&crate::types::MailboxName::new("Sent").unwrap(), 7, 3);
+    let filed = super::encode_object_id(
+        &crate::types::MailboxName::new("Sent").unwrap(),
+        crate::types::UidValidity::new(7).expect("nonzero epoch"),
+        crate::types::Uid::new(3).expect("valid protocol test value"),
+    );
     assert_eq!(receipt.id, filed);
     assert!(matches!(
         receipt.sent_copy,
@@ -1063,8 +1083,16 @@ async fn folder_get_failure_does_not_relabel_published_stale_ids() {
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
     let account = scripted_account(conn, 1);
     let folder = crate::types::MailboxName::new("INBOX").unwrap();
-    let stale_id = super::encode_object_id(&folder, 4, 7);
-    let valid_id = super::encode_object_id(&folder, 5, 3);
+    let stale_id = super::encode_object_id(
+        &folder,
+        crate::types::UidValidity::new(4).expect("nonzero epoch"),
+        crate::types::Uid::new(7).expect("valid protocol test value"),
+    );
+    let valid_id = super::encode_object_id(
+        &folder,
+        crate::types::UidValidity::new(5).expect("nonzero epoch"),
+        crate::types::Uid::new(3).expect("valid protocol test value"),
+    );
 
     let script = tokio::spawn(async move {
         let select = read_line(&mut server).await;
@@ -1177,8 +1205,8 @@ async fn get_flushes_at_target_buffer_boundary_before_input_closes() {
         input_tx
             .send(super::encode_object_id(
                 &crate::types::MailboxName::new("INBOX").unwrap(),
-                5,
-                u32::try_from(uid).unwrap(),
+                crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                crate::types::Uid::new(u32::try_from(uid).unwrap()).unwrap(),
             ))
             .await
             .unwrap();
@@ -1229,8 +1257,8 @@ async fn mutation_flushes_at_target_buffer_boundary_before_input_closes() {
         input_tx
             .send(super::encode_object_id(
                 &crate::types::MailboxName::new("INBOX").unwrap(),
-                5,
-                u32::try_from(uid).unwrap(),
+                crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                crate::types::Uid::new(u32::try_from(uid).unwrap()).unwrap(),
             ))
             .await
             .unwrap();
@@ -1269,8 +1297,16 @@ async fn mutation_select_failure_reports_every_id_failed_once_as_unsent() {
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
     let account = scripted_account(conn, 1);
     let folder = crate::types::MailboxName::new("INBOX").unwrap();
-    let first_id = super::encode_object_id(&folder, 5, 3);
-    let second_id = super::encode_object_id(&folder, 5, 4);
+    let first_id = super::encode_object_id(
+        &folder,
+        crate::types::UidValidity::new(5).expect("nonzero epoch"),
+        crate::types::Uid::new(3).expect("valid protocol test value"),
+    );
+    let second_id = super::encode_object_id(
+        &folder,
+        crate::types::UidValidity::new(5).expect("nonzero epoch"),
+        crate::types::Uid::new(4).expect("valid protocol test value"),
+    );
 
     let script = tokio::spawn(async move {
         let select = read_line(&mut server).await;
@@ -1352,7 +1388,7 @@ async fn mutation_select_failure_reports_every_id_failed_once_as_unsent() {
 #[tokio::test]
 async fn shared_folder_select_denial_is_scoped_and_later_mutation_targets_continue() {
     use bifrost_types::{
-        AccountErrorKind, CursorScope, ErrorScope, FlagOp, FolderId, ItemOutcome, MailboxId,
+        AccountErrorKind, CursorScope, ErrorScope, FlagOp, FolderId, ItemOutcome, PrincipalId,
         SyncEvent, SyncStateErrorKind,
     };
     use futures::StreamExt;
@@ -1370,15 +1406,25 @@ async fn shared_folder_select_denial_is_scoped_and_later_mutation_targets_contin
                 name: shared.clone(),
                 ..Default::default()
             },
-            owner: MailboxId("alice".to_owned()),
+            owner: PrincipalId("alice".to_owned()),
             rights: None,
             namespace_prefix: "Shared/".to_owned(),
         }],
     );
     let account = scripted_sync_account(conn, 1, false, None, folders);
-    let shared_id = super::encode_object_id(&shared, 5, 3);
+    let shared_id = super::encode_object_id(
+        &shared,
+        crate::types::UidValidity::new(5).expect("nonzero epoch"),
+        crate::types::Uid::new(3).expect("valid protocol test value"),
+    );
     let personal_ids: Vec<_> = (1..=super::TARGET_BUFFER_ITEMS)
-        .map(|uid| super::encode_object_id(&personal, 5, u32::try_from(uid).unwrap()))
+        .map(|uid| {
+            super::encode_object_id(
+                &personal,
+                crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                crate::types::Uid::new(u32::try_from(uid).unwrap()).expect("nonzero test UID"),
+            )
+        })
         .collect();
     let mut submitted = vec![shared_id.clone()];
     submitted.extend(personal_ids.iter().cloned());
@@ -1563,7 +1609,13 @@ async fn invalid_move_destination_batches_its_rejections() {
     let folder = crate::types::MailboxName::new("INBOX").unwrap();
     let target_count = account.config.mutation_batch_size.max(1) * 2 + 5;
     let ids: Vec<bifrost_types::ObjectId> = (1..=target_count)
-        .map(|uid| super::encode_object_id(&folder, 5, u32::try_from(uid).unwrap()))
+        .map(|uid| {
+            super::encode_object_id(
+                &folder,
+                crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                crate::types::Uid::new(u32::try_from(uid).unwrap()).expect("nonzero test UID"),
+            )
+        })
         .collect();
     let expected: Vec<String> = ids.iter().map(|id| id.0.clone()).collect();
 
@@ -1903,7 +1955,10 @@ async fn an_incomplete_select_still_moves_the_mailbox_affinity() {
         .await
         .expect_err("a SELECT without EXISTS is incomplete");
     assert!(
-        matches!(err, crate::Error::ProtocolMissing(_)),
+        matches!(
+            err,
+            crate::Error::Provider(crate::error::ProviderFailure::Missing(_))
+        ),
         "expected the post-OK omission, got {err:?}"
     );
     assert_eq!(pooled.selected_affinity(), Some(&archive));
@@ -2106,13 +2161,13 @@ async fn deselect_target_brings_other_parked_members_off_the_target() {
 // ---------------------------------------------------------------------------
 
 use bifrost_types::{
-    Change, ChangeCursor, Checkpoint, DiagnosticText, ObjectChange, ObjectChangeKind, PageBoundary,
-    ScopeChange, ScopeChangeKind, SyncEvent, SyncStrategy, Warning, WarningKind,
+    Change, ChangeCursor, Checkpoint, ObjectChange, ObjectChangeKind, PageBoundary, ScopeChange,
+    ScopeChangeKind, SyncEvent, SyncStrategy, Warning, WarningKind,
 };
 
 use crate::types::MailboxInfo;
 
-use super::{CompactUidSet, FolderCursor};
+use super::{FolderCursor, UidSet};
 
 fn inbox() -> crate::types::MailboxName {
     crate::types::MailboxName::new("INBOX").unwrap()
@@ -2131,7 +2186,7 @@ fn inbox_registry() -> FolderRegistry {
 ///
 /// `SelectConsumer` validates FLAGS + EXISTS + RECENT before it reads a
 /// single response code, so a transcript that omits them fails the command
-/// with `Error::Protocol` and the whole changes stream terminates before
+/// with `crate::error::ProviderFailure::Protocol` and the whole changes stream terminates before
 /// any strategy work runs. Every select transcript below starts here.
 const SELECT_PREAMBLE: &str =
     "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n* 0 RECENT\r\n";
@@ -2213,12 +2268,13 @@ fn done_cursor(events: &[SyncEvent<Change>]) -> FolderCursor {
     super::decode_cursor(cursor).expect("emitted checkpoint must decode")
 }
 
-fn id(uidvalidity: u32, uid: u32) -> String {
-    super::encode_object_id(&inbox(), uidvalidity, uid).0
-}
-
-fn downgrade_detail(from: SyncStrategy, to: SyncStrategy) -> String {
-    format!("{from:?}->{to:?}")
+fn id(uidvalidity: crate::types::UidValidity, uid: u32) -> String {
+    super::encode_object_id(
+        &inbox(),
+        uidvalidity,
+        crate::types::Uid::new(uid).expect("nonzero test UID"),
+    )
+    .0
 }
 
 /// QRESYNC SELECT is the whole diff: broad VANISHED ranges intersect the
@@ -2277,9 +2333,9 @@ async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::QResync {
-            uidvalidity: 5,
-            modseq: 100,
-            baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::from_uids([
+            uidvalidity: crate::types::UidValidity::new(5).expect("nonzero epoch"),
+            modseq: crate::types::ModSeq::new(100).expect("valid protocol test value"),
+            baseline: crate::account::envelope::UidBaseline::Complete(UidSet::from_numbers([
                 1, 2, 3,
             ])),
         }),
@@ -2294,9 +2350,27 @@ async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
     assert_eq!(
         change_labels(&events),
         vec![
-            (id(5, 1), "removed"),
-            (id(5, 3), "updated"),
-            (id(5, 2), "updated"),
+            (
+                id(
+                    crate::types::UidValidity::new(5).expect("valid protocol test value"),
+                    1
+                ),
+                "removed"
+            ),
+            (
+                id(
+                    crate::types::UidValidity::new(5).expect("valid protocol test value"),
+                    3
+                ),
+                "updated"
+            ),
+            (
+                id(
+                    crate::types::UidValidity::new(5).expect("valid protocol test value"),
+                    2
+                ),
+                "updated"
+            ),
         ],
         "UID 2 was VANISHED then re-FETCHed, so it must land in one lane only, \
          and the twice-FETCHed UID 3 must be emitted once"
@@ -2308,7 +2382,7 @@ async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
             modseq,
             baseline: crate::account::envelope::UidBaseline::Complete(known_uids),
         } => {
-            assert_eq!((uidvalidity, modseq), (5, 200));
+            assert_eq!((uidvalidity.get(), modseq.get()), (5, 200));
             assert_eq!(known_uids.to_uids(), vec![2, 3]);
         }
         other => panic!("QRESYNC must checkpoint a QRESYNC cursor, got {other:?}"),
@@ -2352,9 +2426,9 @@ async fn qresync_delivery_transcript(expunge: bool, search_fails: bool) {
     enabled.unwrap();
     let account = scripted_sync_account(conn, 1, true, None, inbox_registry());
     let baseline = FolderCursor::QResync {
-        uidvalidity: 5,
-        modseq: 100,
-        baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::from_uids([1, 2])),
+        uidvalidity: crate::types::UidValidity::new(5).expect("nonzero epoch"),
+        modseq: crate::types::ModSeq::new(100).expect("valid protocol test value"),
+        baseline: crate::account::envelope::UidBaseline::Complete(UidSet::from_numbers([1, 2])),
     };
     account.folders.set_cursor(&inbox(), baseline.clone());
     let script = tokio::spawn(async move {
@@ -2400,13 +2474,34 @@ async fn qresync_delivery_transcript(expunge: bool, search_fails: bool) {
         }));
         assert!(matches!(
             account.folders.get(&inbox()).unwrap().cursor(),
-            Some(FolderCursor::QResync { modseq: 100, .. })
+            Some(FolderCursor::QResync { modseq, .. }) if modseq.get() == 100
         ));
     } else {
         let expected = if expunge {
-            vec![(id(5, 1), "removed"), (id(5, 3), "added")]
+            vec![
+                (
+                    id(
+                        crate::types::UidValidity::new(5).expect("valid protocol test value"),
+                        1,
+                    ),
+                    "removed",
+                ),
+                (
+                    id(
+                        crate::types::UidValidity::new(5).expect("valid protocol test value"),
+                        3,
+                    ),
+                    "added",
+                ),
+            ]
         } else {
-            vec![(id(5, 3), "added")]
+            vec![(
+                id(
+                    crate::types::UidValidity::new(5).expect("valid protocol test value"),
+                    3,
+                ),
+                "added",
+            )]
         };
         assert_eq!(change_labels(&events), expected);
         assert!(warnings_of(&events).is_empty());
@@ -2416,7 +2511,10 @@ async fn qresync_delivery_transcript(expunge: bool, search_fails: bool) {
                 baseline: crate::account::envelope::UidBaseline::Complete(known_uids),
                 ..
             } => {
-                assert_eq!(modseq, 200);
+                assert_eq!(
+                    modseq,
+                    crate::types::ModSeq::new(200).expect("valid protocol test value")
+                );
                 let expected_uids = if expunge { vec![2, 3] } else { vec![1, 2, 3] };
                 assert_eq!(known_uids.to_uids(), expected_uids);
             }
@@ -2443,11 +2541,9 @@ async fn incomplete_qresync_baseline_requests_inventory_restart_without_wire_io(
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::QResync {
-            uidvalidity: 5,
-            modseq: 100,
-            baseline: crate::account::envelope::UidBaseline::Legacy(CompactUidSet::from_uids([
-                1, 2,
-            ])),
+            uidvalidity: crate::types::UidValidity::new(5).expect("nonzero epoch"),
+            modseq: crate::types::ModSeq::new(100).expect("valid protocol test value"),
+            baseline: crate::account::envelope::UidBaseline::Legacy(UidSet::from_numbers([1, 2])),
         }),
     )
     .await;
@@ -2530,9 +2626,9 @@ async fn condstore_cursor_diffs_changedsince_flags_against_a_uid_search_snapshot
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::Condstore {
-            uidvalidity: 7,
-            modseq: 50,
-            known_uids: CompactUidSet::from_uids([1, 2, 3]),
+            uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            modseq: crate::types::ModSeq::new(50).expect("valid protocol test value"),
+            known_uids: UidSet::from_numbers([1, 2, 3]),
         }),
     )
     .await;
@@ -2545,9 +2641,27 @@ async fn condstore_cursor_diffs_changedsince_flags_against_a_uid_search_snapshot
     assert_eq!(
         change_labels(&events),
         vec![
-            (id(7, 2), "updated"),
-            (id(7, 4), "added"),
-            (id(7, 1), "removed"),
+            (
+                id(
+                    crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                    2
+                ),
+                "updated"
+            ),
+            (
+                id(
+                    crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                    4
+                ),
+                "added"
+            ),
+            (
+                id(
+                    crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                    1
+                ),
+                "removed"
+            ),
         ]
     );
     match done_cursor(&events) {
@@ -2556,7 +2670,7 @@ async fn condstore_cursor_diffs_changedsince_flags_against_a_uid_search_snapshot
             modseq,
             known_uids,
         } => {
-            assert_eq!((uidvalidity, modseq), (7, 60));
+            assert_eq!((uidvalidity.get(), modseq.get()), (7, 60));
             assert_eq!(known_uids.to_uids(), vec![2, 3, 4]);
         }
         other => panic!("expected a CONDSTORE checkpoint, got {other:?}"),
@@ -2608,9 +2722,9 @@ async fn condstore_changes_crossing_batch_limit_are_paged() {
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::Condstore {
-            uidvalidity: 7,
-            modseq: 50,
-            known_uids: CompactUidSet::from_uids(1..=129),
+            uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            modseq: crate::types::ModSeq::new(50).expect("valid protocol test value"),
+            known_uids: UidSet::from_numbers(1..=129),
         }),
     )
     .await;
@@ -2700,9 +2814,9 @@ async fn a_qresync_run_on_a_member_without_qresync_continues_as_condstore_on_the
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::QResync {
-            uidvalidity: 7,
-            modseq: 50,
-            baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::from_uids([
+            uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            modseq: crate::types::ModSeq::new(50).expect("valid protocol test value"),
+            baseline: crate::account::envelope::UidBaseline::Complete(UidSet::from_numbers([
                 1, 2, 3,
             ])),
         }),
@@ -2713,18 +2827,33 @@ async fn a_qresync_run_on_a_member_without_qresync_continues_as_condstore_on_the
     assert_eq!(warnings.len(), 1, "one downgrade warning: {warnings:?}");
     assert_eq!(warnings[0].kind, WarningKind::StrategyDowngraded);
     assert_eq!(
-        warnings[0]
-            .protocol_detail
-            .as_ref()
-            .map(DiagnosticText::as_str),
-        Some(downgrade_detail(SyncStrategy::QResync, SyncStrategy::Condstore).as_str())
+        warnings[0].strategy_downgrade,
+        Some(bifrost_types::StrategyDowngrade::QResyncToCondstore)
     );
     assert_eq!(
         change_labels(&events),
         vec![
-            (id(7, 2), "updated"),
-            (id(7, 4), "added"),
-            (id(7, 1), "removed"),
+            (
+                id(
+                    crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                    2
+                ),
+                "updated"
+            ),
+            (
+                id(
+                    crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                    4
+                ),
+                "added"
+            ),
+            (
+                id(
+                    crate::types::UidValidity::new(7).expect("valid protocol test value"),
+                    1
+                ),
+                "removed"
+            ),
         ]
     );
     match done_cursor(&events) {
@@ -2733,7 +2862,7 @@ async fn a_qresync_run_on_a_member_without_qresync_continues_as_condstore_on_the
             modseq,
             baseline: crate::account::envelope::UidBaseline::Complete(known_uids),
         } => {
-            assert_eq!((uidvalidity, modseq), (7, 60));
+            assert_eq!((uidvalidity.get(), modseq.get()), (7, 60));
             assert_eq!(known_uids.to_uids(), vec![2, 3, 4]);
         }
         other => panic!("expected a policy-minted QRESYNC checkpoint, got {other:?}"),
@@ -2817,9 +2946,9 @@ async fn a_qresync_run_on_a_member_that_already_selected_never_issues_enable() {
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::QResync {
-            uidvalidity: 7,
-            modseq: 50,
-            baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::from_uids([
+            uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            modseq: crate::types::ModSeq::new(50).expect("valid protocol test value"),
+            baseline: crate::account::envelope::UidBaseline::Complete(UidSet::from_numbers([
                 1, 2, 3,
             ])),
         }),
@@ -2832,7 +2961,7 @@ async fn a_qresync_run_on_a_member_that_already_selected_never_issues_enable() {
     assert!(
         matches!(
             done_cursor(&events),
-            FolderCursor::QResync { modseq: 60, .. }
+            FolderCursor::QResync { modseq, .. } if modseq.get() == 60
         ),
         "the run must checkpoint, by policy, at the SELECT's HIGHESTMODSEQ"
     );
@@ -2884,9 +3013,9 @@ async fn basic_cursor_derives_both_lanes_from_a_uid_search_diff() {
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::Basic {
-            uidvalidity: 3,
-            uidnext: 10,
-            known_uids: CompactUidSet::from_uids([1, 2]),
+            uidvalidity: crate::types::UidValidity::new(3).expect("nonzero epoch"),
+            uidnext: crate::types::Uid::new(10),
+            known_uids: UidSet::from_numbers([1, 2]),
         }),
     )
     .await;
@@ -2898,7 +3027,22 @@ async fn basic_cursor_derives_both_lanes_from_a_uid_search_diff() {
     );
     assert_eq!(
         change_labels(&events),
-        vec![(id(3, 5), "added"), (id(3, 1), "removed")]
+        vec![
+            (
+                id(
+                    crate::types::UidValidity::new(3).expect("valid protocol test value"),
+                    5
+                ),
+                "added"
+            ),
+            (
+                id(
+                    crate::types::UidValidity::new(3).expect("valid protocol test value"),
+                    1
+                ),
+                "removed"
+            )
+        ]
     );
     match done_cursor(&events) {
         FolderCursor::Basic {
@@ -2906,7 +3050,10 @@ async fn basic_cursor_derives_both_lanes_from_a_uid_search_diff() {
             uidnext,
             known_uids,
         } => {
-            assert_eq!((uidvalidity, uidnext), (3, 11));
+            assert_eq!(
+                (uidvalidity.get(), uidnext.map(crate::types::Uid::get)),
+                (3, Some(11))
+            );
             assert_eq!(known_uids.to_uids(), vec![2, 5]);
         }
         other => panic!("expected a Basic checkpoint, got {other:?}"),
@@ -2934,9 +3081,9 @@ async fn basic_unchanged_uidnext_and_count_skip_uid_search() {
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::Basic {
-            uidvalidity: 3,
-            uidnext: 10,
-            known_uids: CompactUidSet::from_uids([1, 2]),
+            uidvalidity: crate::types::UidValidity::new(3).expect("nonzero epoch"),
+            uidnext: crate::types::Uid::new(10),
+            known_uids: UidSet::from_numbers([1, 2]),
         }),
     )
     .await;
@@ -2991,9 +3138,9 @@ async fn nomodseq_mailbox_downgrades_condstore_to_basic_on_the_selected_connecti
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::Condstore {
-            uidvalidity: 9,
-            modseq: 40,
-            known_uids: CompactUidSet::from_uids([1, 2]),
+            uidvalidity: crate::types::UidValidity::new(9).expect("nonzero epoch"),
+            modseq: crate::types::ModSeq::new(40).expect("valid protocol test value"),
+            known_uids: UidSet::from_numbers([1, 2]),
         }),
     )
     .await;
@@ -3006,11 +3153,8 @@ async fn nomodseq_mailbox_downgrades_condstore_to_basic_on_the_selected_connecti
     );
     assert_eq!(warnings[0].kind, WarningKind::StrategyDowngraded);
     assert_eq!(
-        warnings[0]
-            .protocol_detail
-            .as_ref()
-            .map(DiagnosticText::as_str),
-        Some(downgrade_detail(SyncStrategy::Condstore, SyncStrategy::Basic).as_str())
+        warnings[0].strategy_downgrade,
+        Some(bifrost_types::StrategyDowngrade::CondstoreToBasic)
     );
     assert!(
         !events.iter().any(|e| matches!(e, SyncEvent::Batch(_))),
@@ -3022,7 +3166,10 @@ async fn nomodseq_mailbox_downgrades_condstore_to_basic_on_the_selected_connecti
             uidnext,
             known_uids,
         } => {
-            assert_eq!((uidvalidity, uidnext), (9, 7));
+            assert_eq!(
+                (uidvalidity.get(), uidnext.map(crate::types::Uid::get)),
+                (9, Some(7))
+            );
             assert_eq!(known_uids.to_uids(), vec![1, 2]);
         }
         other => panic!("a NOMODSEQ mailbox must checkpoint Basic, got {other:?}"),
@@ -3070,9 +3217,9 @@ async fn nomodseq_downgrade_splits_selected_fetches_between_updated_and_added() 
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::Condstore {
-            uidvalidity: 9,
-            modseq: 40,
-            known_uids: CompactUidSet::from_uids([1]),
+            uidvalidity: crate::types::UidValidity::new(9).expect("nonzero epoch"),
+            modseq: crate::types::ModSeq::new(40).expect("valid protocol test value"),
+            known_uids: UidSet::from_numbers([1]),
         }),
     )
     .await;
@@ -3085,7 +3232,22 @@ async fn nomodseq_downgrade_splits_selected_fetches_between_updated_and_added() 
     );
     assert_eq!(
         change_labels(&events),
-        vec![(id(9, 1), "updated"), (id(9, 7), "added")],
+        vec![
+            (
+                id(
+                    crate::types::UidValidity::new(9).expect("valid protocol test value"),
+                    1
+                ),
+                "updated"
+            ),
+            (
+                id(
+                    crate::types::UidValidity::new(9).expect("valid protocol test value"),
+                    7
+                ),
+                "added"
+            )
+        ],
         "the arrival belongs to the Added lane alone"
     );
     let _server = script.await.unwrap();
@@ -3121,9 +3283,9 @@ async fn uidvalidity_change_terminates_the_stream_without_publishing_a_diff() {
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::Condstore {
-            uidvalidity: 7,
-            modseq: 50,
-            known_uids: CompactUidSet::from_uids([1]),
+            uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            modseq: crate::types::ModSeq::new(50).expect("valid protocol test value"),
+            known_uids: UidSet::from_numbers([1]),
         }),
     )
     .await;
@@ -3159,19 +3321,19 @@ async fn describe_cursor_reports_the_strategy_the_run_will_actually_use() {
     use bifrost_types::CostClass;
 
     let qresync_cursor = cursor_for(&FolderCursor::QResync {
-        uidvalidity: 1,
-        modseq: 1,
-        baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::default()),
+        uidvalidity: crate::types::UidValidity::new(1).expect("nonzero epoch"),
+        modseq: crate::types::ModSeq::new(1).expect("valid protocol test value"),
+        baseline: crate::account::envelope::UidBaseline::Complete(UidSet::default()),
     });
     let condstore_cursor = cursor_for(&FolderCursor::Condstore {
-        uidvalidity: 1,
-        modseq: 1,
-        known_uids: CompactUidSet::default(),
+        uidvalidity: crate::types::UidValidity::new(1).expect("nonzero epoch"),
+        modseq: crate::types::ModSeq::new(1).expect("valid protocol test value"),
+        known_uids: UidSet::default(),
     });
     let basic_cursor = cursor_for(&FolderCursor::Basic {
-        uidvalidity: 1,
-        uidnext: 1,
-        known_uids: CompactUidSet::default(),
+        uidvalidity: crate::types::UidValidity::new(1).expect("nonzero epoch"),
+        uidnext: crate::types::Uid::new(1),
+        known_uids: UidSet::default(),
     });
 
     let (conn, _server) =
@@ -3200,9 +3362,9 @@ async fn describe_cursor_reports_the_strategy_the_run_will_actually_use() {
     assert_eq!(described.cost_class, CostClass::Expensive);
 
     let incomplete = cursor_for(&FolderCursor::QResync {
-        uidvalidity: 1,
-        modseq: 1,
-        baseline: crate::account::envelope::UidBaseline::Legacy(CompactUidSet::default()),
+        uidvalidity: crate::types::UidValidity::new(1).expect("nonzero epoch"),
+        modseq: crate::types::ModSeq::new(1).expect("valid protocol test value"),
+        baseline: crate::account::envelope::UidBaseline::Legacy(UidSet::default()),
     });
     for account in [enabled, disabled] {
         let described = super::changes::describe_cursor(&account, &incomplete);
@@ -3249,16 +3411,22 @@ async fn uid_count_disagreeing_with_exists_warns_but_still_checkpoints() {
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::Basic {
-            uidvalidity: 3,
-            uidnext: 3,
-            known_uids: CompactUidSet::from_uids([1, 2]),
+            uidvalidity: crate::types::UidValidity::new(3).expect("nonzero epoch"),
+            uidnext: crate::types::Uid::new(3),
+            known_uids: UidSet::from_numbers([1, 2]),
         }),
     )
     .await;
 
     let warnings = warnings_of(&events);
     assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert_eq!(warnings[0].kind, WarningKind::Other);
+    assert_eq!(
+        warnings[0].kind,
+        WarningKind::UidCountMismatch {
+            expected: 9,
+            actual: 2
+        }
+    );
     assert!(
         warnings[0].message.as_str().contains("SELECT EXISTS 9"),
         "the warning must carry both counts: {}",
@@ -3302,9 +3470,9 @@ async fn the_final_batch_and_done_carry_the_same_checkpoint() {
     let events = collect_changes(
         account,
         cursor_for(&FolderCursor::Basic {
-            uidvalidity: 3,
-            uidnext: 5,
-            known_uids: CompactUidSet::default(),
+            uidvalidity: crate::types::UidValidity::new(3).expect("nonzero epoch"),
+            uidnext: crate::types::Uid::new(5),
+            known_uids: UidSet::default(),
         }),
     )
     .await;
@@ -3373,7 +3541,16 @@ async fn close_is_idempotent_and_leaves_the_pool_refusing() {
     else {
         panic!("a closed account must not hand out connections");
     };
-    assert!(matches!(err, crate::Error::Closed { .. }), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            crate::Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
 }
 
 /// The two blob openers are statically unsupported (`blob_range` is
@@ -3483,7 +3660,11 @@ async fn open_raw_rfc822_emits_chunks_before_the_tagged_completion() {
         server
     });
 
-    let message = super::encode_object_id(&folder, 5, 7);
+    let message = super::encode_object_id(
+        &folder,
+        crate::types::UidValidity::new(5).expect("nonzero epoch"),
+        crate::types::Uid::new(7).expect("valid protocol test value"),
+    );
     let mut stream = super::blob::open_raw_rfc822(account, message);
 
     let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
@@ -3543,7 +3724,14 @@ async fn raw_read_events(fetch_answer: &'static str) -> Vec<SyncEvent<bytes::Byt
         .await;
         server
     });
-    let mut stream = super::blob::open_raw_rfc822(account, super::encode_object_id(&folder, 5, 7));
+    let mut stream = super::blob::open_raw_rfc822(
+        account,
+        super::encode_object_id(
+            &folder,
+            crate::types::UidValidity::new(5).expect("nonzero epoch"),
+            crate::types::Uid::new(7).expect("valid protocol test value"),
+        ),
+    );
     let mut events = Vec::new();
     while let Some(event) = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
@@ -3671,8 +3859,11 @@ where
 
 const POLL_SELECT: &str = "* 4 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 9] ok\r\n";
 
-fn nz(value: u32) -> std::num::NonZeroU32 {
-    std::num::NonZeroU32::new(value).unwrap()
+fn nz<T: TryFrom<u32>>(value: u32) -> T
+where
+    T::Error: std::fmt::Debug,
+{
+    T::try_from(value).unwrap()
 }
 
 #[tokio::test]
@@ -3909,7 +4100,7 @@ async fn a_raw_message_read_stops_at_its_byte_budget() {
         super::blob::run_fetch(
             &account,
             &folder,
-            5,
+            crate::types::UidValidity::new(5).expect("valid protocol test value"),
             7,
             bifrost_types::AccountOperation::OpenRawRfc822,
             3,
@@ -3921,9 +4112,14 @@ async fn a_raw_message_read_stops_at_its_byte_budget() {
     .expect("the budgeted read must finish");
 
     match outcome {
-        Err(super::blob::BlobError::Imap(crate::Error::FetchLimit { limit, uid, .. })) => {
+        Err(super::blob::BlobError::Imap(crate::Error::ResultLimit(
+            crate::error::ResultLimit::Fetch { limit, uid, .. },
+        ))) => {
             assert_eq!(limit, 3);
-            assert_eq!(uid, Some(7));
+            assert_eq!(
+                uid,
+                Some(crate::types::Uid::new(7).expect("valid protocol test value"))
+            );
         }
         Err(super::blob::BlobError::Imap(other)) => panic!("unexpected imap error: {other:?}"),
         Err(super::blob::BlobError::Account(err)) => panic!("unexpected account error: {err:?}"),
@@ -3971,7 +4167,7 @@ async fn a_uid_the_operand_cannot_carry_never_reaches_the_fetch() {
         super::blob::run_fetch(
             &account,
             &folder,
-            5,
+            crate::types::UidValidity::new(5).expect("valid protocol test value"),
             0,
             bifrost_types::AccountOperation::OpenRawRfc822,
             1024,
@@ -4100,7 +4296,11 @@ async fn pim_select_without_uidvalidity_is_the_providers_missing_field() {
     };
 
     let inbox = crate::types::MailboxName::new("INBOX").unwrap();
-    let id = super::encode_object_id(&inbox, 5, 3);
+    let id = super::encode_object_id(
+        &inbox,
+        crate::types::UidValidity::new(5).expect("nonzero epoch"),
+        crate::types::Uid::new(3).expect("valid protocol test value"),
+    );
     let in_inbox = || SearchRequest::filter(SearchFilter::In(ContainerId("INBOX".to_owned())));
 
     let mut cases: Vec<(AccountOperation, bifrost_types::AccountError)> = Vec::new();
@@ -4259,7 +4459,13 @@ async fn search_messages_returns_the_boundary_survivor_after_an_earlier_expunge(
     };
     let ids = |uids: &[u32]| {
         uids.iter()
-            .map(|uid| super::encode_object_id(&inbox, 7, *uid))
+            .map(|uid| {
+                super::encode_object_id(
+                    &inbox,
+                    crate::types::UidValidity::new(7).expect("nonzero epoch"),
+                    crate::types::Uid::new(*uid).expect("nonzero test UID"),
+                )
+            })
             .collect::<Vec<_>>()
     };
 
@@ -4298,7 +4504,11 @@ async fn thread_search_pages_by_lowest_member_uid() {
     .await;
     assert_eq!(
         first.items,
-        vec![super::encode_thread_id(&inbox, 7, &[101])]
+        vec![super::encode_thread_id(
+            &inbox,
+            crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            &crate::types::set::UidSet::from_numbers([101])
+        )]
     );
 
     // Thread 101 is expunged; an offset of 1 would land past thread 102.
@@ -4309,7 +4519,11 @@ async fn thread_search_pages_by_lowest_member_uid() {
     .await;
     assert_eq!(
         second.items,
-        vec![super::encode_thread_id(&inbox, 7, &[102, 105])]
+        vec![super::encode_thread_id(
+            &inbox,
+            crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            &crate::types::set::UidSet::from_numbers([102, 105])
+        )]
     );
 }
 
@@ -4364,7 +4578,11 @@ async fn hydrate_uid_3_against(
         Duration::from_secs(5),
         super::pim::message_hydrate(
             account,
-            super::encode_object_id(&inbox, 5, 3),
+            super::encode_object_id(
+                &inbox,
+                crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                crate::types::Uid::new(3).expect("valid protocol test value"),
+            ),
             bifrost_types::hydration::HydrationProjection::Headers,
         ),
     )
@@ -4388,7 +4606,11 @@ async fn message_hydrate_of_an_expunged_uid_is_not_found() {
     };
 
     let inbox = crate::types::MailboxName::new("INBOX").unwrap();
-    let wanted = super::encode_object_id(&inbox, 5, 3);
+    let wanted = super::encode_object_id(
+        &inbox,
+        crate::types::UidValidity::new(5).expect("nonzero epoch"),
+        crate::types::Uid::new(3).expect("valid protocol test value"),
+    );
 
     for (label, data) in [
         ("no FETCH data at all", ""),
@@ -4451,7 +4673,11 @@ async fn add_to_container_and_message_hydrate_honour_their_capability_flags() {
     });
     // A well-formed id, so a missing gate proceeds toward the wire rather
     // than failing id decode first.
-    let id = super::encode_object_id(&crate::types::MailboxName::new("INBOX").unwrap(), 5, 3);
+    let id = super::encode_object_id(
+        &crate::types::MailboxName::new("INBOX").unwrap(),
+        crate::types::UidValidity::new(5).expect("nonzero epoch"),
+        crate::types::Uid::new(3).expect("valid protocol test value"),
+    );
 
     let err = tokio::time::timeout(
         Duration::from_secs(5),
@@ -4502,7 +4728,11 @@ async fn thread_hydrate_answers_once_per_requested_uid() {
         ..scripted_account_parts(conn, 1)
     });
     let inbox = crate::types::MailboxName::new("INBOX").unwrap();
-    let thread = super::encode_thread_id(&inbox, 5, &[3, 4]);
+    let thread = super::encode_thread_id(
+        &inbox,
+        crate::types::UidValidity::new(5).expect("nonzero epoch"),
+        &crate::types::set::UidSet::from_numbers([3, 4]),
+    );
 
     let script = tokio::spawn(async move {
         let select = read_line(&mut server).await;
@@ -4558,8 +4788,16 @@ async fn thread_hydrate_answers_once_per_requested_uid() {
     assert_eq!(
         ids,
         vec![
-            super::encode_object_id(&inbox, 5, 3),
-            super::encode_object_id(&inbox, 5, 4),
+            super::encode_object_id(
+                &inbox,
+                crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                crate::types::Uid::new(3).expect("valid protocol test value")
+            ),
+            super::encode_object_id(
+                &inbox,
+                crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                crate::types::Uid::new(4).expect("valid protocol test value")
+            ),
         ],
         "one message per requested uid, and nothing else"
     );
@@ -4608,7 +4846,11 @@ async fn a_refused_preflight_select_leaves_the_mutation_unsent() {
         Duration::from_secs(5),
         super::pim::add_to_container(
             account,
-            MutationTarget::Message(super::encode_object_id(&inbox, 5, 3)),
+            MutationTarget::Message(super::encode_object_id(
+                &inbox,
+                crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                crate::types::Uid::new(3).expect("valid protocol test value"),
+            )),
             ContainerId("Archive".to_owned()),
         ),
     )
@@ -4656,13 +4898,19 @@ async fn mutation_select_omits_qresync_baseline_and_keeps_cached_store_guard() {
     let account = scripted_sync_account(conn, 1, true, None, inbox_registry());
     let entry = account.folders.get(&inbox()).unwrap();
     entry.set_cursor(FolderCursor::QResync {
-        uidvalidity: 5,
-        modseq: 100,
-        baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::from_ranges(
-            vec![crate::types::UidRange::range(1, 4000000000)],
-        )),
+        uidvalidity: crate::types::UidValidity::new(5).expect("nonzero epoch"),
+        modseq: crate::types::ModSeq::new(100).expect("valid protocol test value"),
+        baseline: crate::account::envelope::UidBaseline::Complete(UidSet::from_ranges(vec![
+            crate::types::UidRange::range(1, 4000000000),
+        ])),
     });
-    entry.record_modseq(5, 2, 100).unwrap();
+    entry
+        .record_modseq(
+            crate::types::UidValidity::new(5).expect("valid protocol test value"),
+            2,
+            crate::types::ModSeq::new(100).expect("positive test MODSEQ"),
+        )
+        .unwrap();
     let script = tokio::spawn(async move {
         let select = read_line(&mut server).await;
         assert!(
@@ -4691,14 +4939,20 @@ async fn mutation_select_omits_qresync_baseline_and_keeps_cached_store_guard() {
         account,
         Box::pin(futures::stream::iter([super::encode_object_id(
             &inbox(),
-            5,
-            2,
+            crate::types::UidValidity::new(5).expect("nonzero epoch"),
+            crate::types::Uid::new(2).expect("valid protocol test value"),
         )])),
         super::mutate::MutationKind::Flags(FlagOp::Add(bifrost_types::FlagSet::from([
             "$flagged".to_owned()
         ]))),
     );
-    assert_eq!(drain_mutation_batches(output).await, vec![vec![id(5, 2)]]);
+    assert_eq!(
+        drain_mutation_batches(output).await,
+        vec![vec![id(
+            crate::types::UidValidity::new(5).expect("valid protocol test value"),
+            2
+        )]]
+    );
     let _server = script.await.unwrap();
 }
 
@@ -4721,7 +4975,11 @@ async fn a_group_after_an_abandoning_timeout_settles_unsent_without_waiting() {
             .folders
             .get(&inbox())
             .unwrap()
-            .record_modseq(5, 2, 900)
+            .record_modseq(
+                crate::types::UidValidity::new(5).expect("valid protocol test value"),
+                2,
+                crate::types::ModSeq::new(900).expect("positive test MODSEQ"),
+            )
             .unwrap();
         let timeout = account.command_timeout();
         let script = tokio::spawn(async move {
@@ -4748,8 +5006,16 @@ async fn a_group_after_an_abandoning_timeout_settles_unsent_without_waiting() {
         let events = super::mutate::mutation_stream(
             account,
             Box::pin(futures::stream::iter([
-                super::encode_object_id(&inbox(), 5, 2),
-                super::encode_object_id(&inbox(), 5, 3),
+                super::encode_object_id(
+                    &inbox(),
+                    crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                    crate::types::Uid::new(2).expect("valid protocol test value"),
+                ),
+                super::encode_object_id(
+                    &inbox(),
+                    crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                    crate::types::Uid::new(3).expect("valid protocol test value"),
+                ),
             ])),
             kind,
         )
@@ -4760,7 +5026,11 @@ async fn a_group_after_an_abandoning_timeout_settles_unsent_without_waiting() {
             timeout,
             "one timeout for the stalled group, none for the next (destroy = {destroy})"
         );
-        let third = super::encode_object_id(&inbox(), 5, 3);
+        let third = super::encode_object_id(
+            &inbox(),
+            crate::types::UidValidity::new(5).expect("nonzero epoch"),
+            crate::types::Uid::new(3).expect("valid protocol test value"),
+        );
         let error = events
             .iter()
             .filter_map(|event| match event {
@@ -4808,7 +5078,11 @@ async fn caller_modseq_rejects_stale_flags_while_absent_keeps_cached_guard() {
             .folders
             .get(&inbox())
             .unwrap()
-            .record_modseq(5, 2, 900)
+            .record_modseq(
+                crate::types::UidValidity::new(5).expect("valid protocol test value"),
+                2,
+                crate::types::ModSeq::new(900).expect("positive test MODSEQ"),
+            )
             .unwrap();
         let script = tokio::spawn(async move {
             let select = read_line(&mut server).await;
@@ -4839,7 +5113,11 @@ async fn caller_modseq_rejects_stale_flags_while_absent_keeps_cached_guard() {
         let events = Arc::new(account)
             .bulk_set_flags_if_version(
                 Box::pin(futures::stream::iter([MailMutationTarget {
-                    id: super::encode_object_id(&inbox(), 5, 2),
+                    id: super::encode_object_id(
+                        &inbox(),
+                        crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                        crate::types::Uid::new(2).expect("valid protocol test value"),
+                    ),
                     expected_version: expected.map(ServerVersion::ModSeq),
                 }])),
                 FlagOp::Add(bifrost_types::FlagSet::from(["$flagged".into()])),
@@ -5175,7 +5453,13 @@ async fn flags_only_fetch_without_flags_is_a_missing_field_failure() {
     });
     let folder = crate::types::MailboxName::new("INBOX").unwrap();
     let ids = (1..=2)
-        .map(|uid| super::encode_object_id(&folder, 5, uid))
+        .map(|uid| {
+            super::encode_object_id(
+                &folder,
+                crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                crate::types::Uid::new(uid).expect("nonzero test UID"),
+            )
+        })
         .collect::<Vec<_>>();
     let mut output = super::get::get_stream(
         account,

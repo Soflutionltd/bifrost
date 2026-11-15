@@ -181,14 +181,17 @@ pub(crate) struct RecurrenceAnchor {
 
 impl RecurrenceAnchor {
     pub(crate) fn from_event_time(time: &EventTime) -> Result<Self, RecurrenceRefusal> {
-        let start = parse_start_date(&time.value).ok_or_else(|| RecurrenceRefusal::Malformed {
-            field: "start",
-            message: "Graph recurrence needs the event start to begin with a YYYY-MM-DD date"
-                .to_string(),
-        })?;
+        let start = time
+            .local_datetime()
+            .map(civil::DateTime::date)
+            .ok_or_else(|| RecurrenceRefusal::Malformed {
+                field: "start",
+                message: "Graph recurrence needs the event start to begin with a YYYY-MM-DD date"
+                    .to_string(),
+            })?;
         Ok(Self {
             start,
-            zone: resolve_time_zone(time.timezone.as_deref().unwrap_or("UTC")),
+            zone: resolve_time_zone(time.timezone().unwrap_or("UTC")),
         })
     }
 }

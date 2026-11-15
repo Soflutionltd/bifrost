@@ -13,9 +13,7 @@ use crate::webhooks::{
 };
 
 use super::common::PushEndpoint;
-use super::webhook::{
-    GraphSubscriptionGroup, GraphSubscriptionState, mark_subscription_terminated, recreated_ids,
-};
+use super::webhook::{GraphSubscriptionGroup, GraphSubscriptionState};
 
 pub(crate) const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub(super) const RENEWAL_THRESHOLD_MINUTES: i64 = 30;
@@ -28,18 +26,18 @@ pub(crate) fn renewal_session(
     use bifrost_types::{PushSessionEnd as End, PushSessionEvent as E};
     Box::pin(async_stream::stream! {
         let Some(_lease) = account.push_lease.try_claim() else { yield E::Failed(bifrost_types::push_lane_contract_error(bifrost_types::Protocol::Graph, bifrost_types::PushLane(0), "already driven")); return; };
-        let mut topology = account.graph_topology.subscribe();
+        let mut topology = account.webhooks.topology();
         let mut established = false;
         loop {
-            while let Some(scope) = pop_gap(&account) { yield E::Invalidated(gap_hint(scope)); }
+            while let Some(scope) = account.webhooks.pop_gap() { yield E::Invalidated(gap_hint(scope)); }
             topology.borrow_and_update();
-            let live = { let groups = account.graph_subscriptions.read().await; has_live_graph_subscription_group(&groups) };
+            let live = account.webhooks.has_live().await;
             if !live {
                 tokio::select! { () = stop.stopped() => break, () = account.shutdown.cancelled() => break, _ = topology.changed() => {} }
                 continue;
             }
             if !established { established = true; yield E::Established; }
-            let due = { let mut groups = account.graph_subscriptions.write().await; due_renewals(&mut groups) };
+            let due = account.webhooks.due().await;
         // Whether any row in this pass failed non-terminally. Every row is
         // attempted once regardless (a failing row must not starve its
         // siblings); the pass then ends `Incomplete` instead of `Healthy`.
@@ -56,19 +54,11 @@ pub(crate) fn renewal_session(
                 biased;
                 () = account.shutdown.cancelled() => { yield E::Ended(End::Stopped); return; },
                 () = stop.stopped() => { yield E::Ended(End::Stopped); return; },
-                result = renew_subscription(&account.client, &server_id, None) => result,
+                result = renew_subscription(account.mailboxes.primary(), &server_id, None) => result,
             };
             match renewal {
                 Ok(new_expiry) => {
-                    let mut groups = account.graph_subscriptions.write().await;
-                    if let Some(group) = groups.get_mut(&handle)
-                        && let Some(state) = group
-                            .subscriptions
-                            .iter_mut()
-                            .find(|state| state.server_id == server_id)
-                    {
-                        state.expires_at = new_expiry;
-                    }
+                    account.webhooks.renewed(&handle, &server_id, new_expiry).await;
                 }
                 Err(error) => {
                     // Graph retains no deleted subscription to PATCH, so a
@@ -154,7 +144,7 @@ pub(crate) fn renewal_session(
                         // same doomed PATCH and POST.
                         // Flagged, not removed: renewing stops, but teardown
                         // must still be able to DELETE it.
-                        mark_subscription_terminated(&account, &handle, &server_id).await;
+                        account.webhooks.terminate(&handle, &server_id).await;
 
                     }
                     had_error |= !account_error.recovery().is_terminal();
@@ -163,21 +153,14 @@ pub(crate) fn renewal_session(
             }
         }
 
-        while let Some(scope) = pop_gap(&account) { yield E::Invalidated(gap_hint(scope)); }
-        let retired = { let groups = account.graph_subscriptions.read().await; groups.values().any(|g| !g.tearing_down && g.subscriptions.iter().any(|s| s.terminated)) };
+        while let Some(scope) = account.webhooks.pop_gap() { yield E::Invalidated(gap_hint(scope)); }
+        let retired = account.webhooks.has_terminated().await;
         if had_error || retired { yield E::Ended(End::Incomplete); return; }
         yield E::Healthy;
         tokio::select! { () = stop.stopped() => break, () = account.shutdown.cancelled() => break, () = tokio::time::sleep(RENEWAL_CHECK_INTERVAL) => {} }
         }
         yield E::Ended(End::Stopped);
     })
-}
-fn pop_gap(account: &GraphAccount) -> Option<CursorScope> {
-    account
-        .pending_gaps
-        .lock()
-        .expect("push gap lock")
-        .pop_front()
 }
 /// A recreated row's coverage gap: one precise scope, so it names the Graph
 /// subscription source rather than the wide-wake-up `Coalesced`.
@@ -341,7 +324,7 @@ async fn create_and_install_replacement(
         return Ok(Replacement::AccountClosed);
     }
     let response = create_subscription(
-        &account.client,
+        account.mailboxes.primary(),
         &resource,
         &endpoint.webhook_url,
         &endpoint.client_state,
@@ -357,37 +340,10 @@ async fn create_and_install_replacement(
         terminated: false,
     };
     let created_id = replacement.server_id.clone();
-    let gap_scopes = replacement.scopes.clone();
-
-    let mut groups = account.graph_subscriptions.write().await;
-    // Checked under the write lock and paired with `retire_all_graph_
-    // subscriptions` cancelling the token BEFORE its walk, exactly like the
-    // registration in `create_and_register`: either this install lands before
-    // the cancel (and the walk, which snapshots under the same lock
-    // afterwards, sees it) or it observes the cancel and is undone. The group's
-    // `tearing_down` marker refuses the same install once the walk reaches
-    // its handle; this check keeps the rule local to the create instead of
-    // resting on the walk's ordering.
-    let installed = !account.shutdown.is_cancelled()
-        && install_replacement(&mut groups, &handle, &stale_server_id, replacement);
-    if installed {
-        account
-            .pending_gaps
-            .lock()
-            .expect("push gap lock")
-            .extend(gap_scopes);
-        // The handle string cannot name the new id, so record it where an
-        // orphan teardown on a reopened instance will look; see
-        // `RecreatedSubscriptionIds`. Under the same write lock as the
-        // install, so a teardown snapshot never sees one without the other.
-        record_recreated_id(
-            &mut recreated_ids(account),
-            &handle,
-            &stale_server_id,
-            &created_id,
-        );
-    }
-    drop(groups);
+    let installed = account
+        .webhooks
+        .install_replacement(&account.shutdown, &handle, &stale_server_id, replacement)
+        .await;
     if installed {
         return Ok(Replacement::Installed);
     }
@@ -401,7 +357,8 @@ async fn create_and_install_replacement(
     // ever tear down again. Delete the subscription we just minted instead.
     // Best effort: the caller's `push_unsubscribe` may already have
     // returned, so there may be nobody left to report a cleanup failure to.
-    if let Err(cleanup_error) = delete_subscription(&account.client, &created_id).await {
+    if let Err(cleanup_error) = delete_subscription(account.mailboxes.primary(), &created_id).await
+    {
         tracing::warn!(
             target: "bifrost_graph::webhooks",
             server_id = %created_id,

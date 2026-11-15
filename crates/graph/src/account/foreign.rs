@@ -13,7 +13,7 @@
 
 #[cfg(test)]
 use bifrost_types::CursorScope;
-use bifrost_types::{FolderId, MailboxId, MembershipScope, ObjectId, ThreadId};
+use bifrost_types::{FolderId, MembershipScope, ObjectId, PrincipalId, ThreadId};
 
 /// Reserved separator. A `FolderId` of the form `"<mailbox>\u{1f}<folder>"`
 /// is a foreign-mailbox folder; a plain id is the primary mailbox.
@@ -162,11 +162,11 @@ pub(crate) fn parse_folder(folder: &FolderId) -> ParsedFolder {
 }
 
 /// The `MembershipScope` owner tag for a foreign folder: the mailbox
-/// identity as a `MailboxId`. Emitted on discovery so the consumer maps
+/// identity as a `PrincipalId`. Emitted on discovery so the consumer maps
 /// the scope to its shared-mailbox owner. The engine's covering rule
-/// cannot form this tag (the folder-id and mailbox-id strings differ).
+/// cannot infer ownership from opaque folder identities.
 pub(crate) fn owner_tag(mailbox: &str) -> MembershipScope {
-    MembershipScope::Mailbox(MailboxId(mailbox.to_string()))
+    MembershipScope::Owner(PrincipalId(mailbox.to_string()))
 }
 
 /// A parsed Graph message/blob `ObjectId`: either a primary-mailbox item
@@ -455,7 +455,7 @@ mod tests {
         );
         assert_eq!(
             owner_tag("Shared@Contoso.com"),
-            MembershipScope::Mailbox(MailboxId("Shared@Contoso.com".into()))
+            MembershipScope::Owner(PrincipalId("Shared@Contoso.com".into()))
         );
         assert!(!same_owner(
             Some("\u{c4}@contoso.com"),
@@ -520,7 +520,7 @@ mod tests {
     fn owner_tag_is_mailbox_membership() {
         assert_eq!(
             owner_tag("shared@contoso.com"),
-            MembershipScope::Mailbox(MailboxId("shared@contoso.com".to_string()))
+            MembershipScope::Owner(PrincipalId("shared@contoso.com".to_string()))
         );
     }
 
@@ -692,12 +692,13 @@ mod tests {
             &[String::new(), "shared@contoso.com".to_string()],
         );
         assert!(matches!(
-            account.client_for_owner(Some("")),
+            account.mailboxes.client_for_owner(Some("")),
             Err(crate::error::GraphError::Configuration { .. })
         ));
         // The well-formed sibling of the same configuration still routes.
         assert_eq!(
             account
+                .mailboxes
                 .client_for_owner(Some("shared@contoso.com"))
                 .expect("configured")
                 .api_path_prefix(),

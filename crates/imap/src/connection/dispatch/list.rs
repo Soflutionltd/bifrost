@@ -2,9 +2,8 @@ use crate::connection::NotifyFlags;
 use crate::error::Error;
 use crate::types::response::{TaggedResponse, UntaggedResponse};
 use crate::types::validated::MailboxName;
-use crate::types::{MailboxInfo, StatusItem, StatusResult};
+use crate::types::{MailboxAttribute, MailboxInfo, StatusItem, StatusResult};
 
-use super::super::{is_notify_list_event, is_notify_selection_mismatch};
 use super::{Consumer, ConsumerContext, Finalized};
 
 /// Consumer for LIST (RFC 3501 Section6.3.8).
@@ -451,10 +450,10 @@ impl Consumer for StatusConsumer {
             // raised after the tagged OK leaves the connection usable. Nothing
             // solicited exists to drop, so the buffer is surrendered.
             return Finalized::failure(
-                Error::ProtocolMissing(format!(
+                Error::Provider(crate::error::ProviderFailure::Missing(format!(
                     "STATUS OK but no matching untagged STATUS response \
                      for mailbox '{target}' (RFC 3501 Sections 5.2, 6.3.10)"
-                )),
+                ))),
                 self.buffered,
             );
         };
@@ -469,7 +468,12 @@ impl Consumer for StatusConsumer {
             // exchange, so the framing is intact and `Internal` (not
             // connection-fatal) is safe.
             return Finalized::failure(
-                Error::Internal("matching predicate returned non-MailboxStatus variant".into()),
+                Error::Internal {
+                    kind: crate::error::InternalFailure::Invariant(
+                        "matching predicate returned non-MailboxStatus variant".into(),
+                    ),
+                    mid_exchange: None,
+                },
                 self.buffered,
             );
         };
@@ -500,6 +504,106 @@ impl Consumer for StatusConsumer {
             reclassified,
         )
     }
+}
+
+/// Check whether a LIST response's attributes conflict with the selection
+/// options of a LIST-EXTENDED command (RFC 5258 Section 3).
+///
+/// When NOTIFY is active, a concurrent create event may match the wildcard
+/// but lack the attributes required by the selection options (SUBSCRIBED,
+/// REMOTE, SPECIAL-USE). Returns `true` if the response does NOT satisfy
+/// the selection criteria and should be treated as a NOTIFY event.
+pub(in crate::connection) fn is_notify_selection_mismatch(
+    info: &MailboxInfo,
+    selection_options: &[crate::types::command_options::ListSelect],
+) -> bool {
+    let has_recursivematch = selection_options
+        .iter()
+        .any(|o| matches!(o, crate::types::command_options::ListSelect::RecursiveMatch));
+
+    for opt in selection_options {
+        if matches!(opt, crate::types::command_options::ListSelect::Subscribed) {
+            let has_subscribed = info
+                .attributes
+                .iter()
+                .any(|a| matches!(a, MailboxAttribute::Subscribed));
+            // RFC 5258 Section 3.5: with RECURSIVEMATCH, a mailbox can be
+            // returned without \Subscribed if it has children with matching
+            // subscriptions (indicated by non-empty CHILDINFO extended data).
+            let has_childinfo = has_recursivematch && !info.child_info.is_empty();
+            if !has_subscribed && !has_childinfo {
+                return true;
+            }
+        }
+        if matches!(opt, crate::types::command_options::ListSelect::Remote)
+            && !info
+                .attributes
+                .iter()
+                .any(|a| matches!(a, MailboxAttribute::Remote))
+        {
+            return true;
+        }
+        // RFC 6154 Section 3: SPECIAL-USE requests only mailboxes with
+        // a special-use attribute.
+        if matches!(opt, crate::types::command_options::ListSelect::SpecialUse)
+            && !info.attributes.iter().any(MailboxAttribute::is_special_use)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check whether a LIST response carries markers that identify it as a
+/// NOTIFY event rather than a solicited LIST result (RFC 5465 Section 5.4).
+///
+/// NOTIFY delivers `MailboxName` events (rename, delete, ACL change,
+/// subscription change) as LIST responses. Reliable markers:
+///
+/// - **OLDNAME** (RFC 9051 Section 6.3.9.7): present on rename events.
+///   A solicited LIST lists current mailbox state and never includes OLDNAME.
+///   Always treated as a NOTIFY marker.
+/// - **`\NonExistent`** (RFC 9051 Section 7.2.2): present on delete events.
+///   A solicited plain LIST only returns existing mailboxes so `\NonExistent`
+///   is a reliable NOTIFY marker in that context. However, LIST-EXTENDED with
+///   SUBSCRIBED can legitimately return subscribed-but-deleted mailboxes with
+///   `\NonExistent` (RFC 5258 Section 3).
+/// - **`\NoAccess`** (RFC 5465 Section 5.9): present when the logged-in
+///   user loses the `l` ACL right on a monitored mailbox. A solicited plain
+///   LIST typically does not return inaccessible mailboxes. However,
+///   LIST-EXTENDED with SUBSCRIBED may return subscribed-but-inaccessible
+///   mailboxes with `\NoAccess`.
+///
+/// Callers must set `filter_extended_markers` to `false` when
+/// `\NonExistent` / `\NoAccess` can legitimately appear on solicited
+/// results (i.e., LIST-EXTENDED with SUBSCRIBED).
+///
+/// Create events carry no distinguishing marker and are not filtered.
+// SELECT has no SUBSCRIBED selection option, so its callers always filter
+// extended markers. LIST-EXTENDED derives this policy from its own options.
+pub(in crate::connection) fn is_notify_list_event(
+    info: &MailboxInfo,
+    filter_extended_markers: bool,
+) -> bool {
+    // Rename event: OLDNAME extended data item  -  always a NOTIFY marker.
+    if info.old_name.is_some() {
+        return true;
+    }
+    // Delete (\NonExistent) and ACL-loss (\NoAccess) events. Only
+    // treated as NOTIFY markers when the caller confirms that these
+    // attributes cannot appear on solicited results (i.e., plain LIST
+    // or LIST-EXTENDED without SUBSCRIBED).
+    if filter_extended_markers
+        && info.attributes.iter().any(|a| {
+            matches!(
+                a,
+                MailboxAttribute::NonExistent | MailboxAttribute::NoAccess
+            )
+        })
+    {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]

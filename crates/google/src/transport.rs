@@ -659,7 +659,9 @@ impl GmailApi {
         let redirect_client = self.clone();
         builder = builder
             .quota_scope(surface_quota_scope(self.account_net().account(), surface))
-            .redirect_guard(move |_, target| redirect_client.surface_for_url(target) == surface);
+            .redirect_guard(move |_, target| {
+                redirect_client.surface_for_url(target.as_str()) == surface
+            });
         let project = self
             .quota_project
             .as_ref()

@@ -54,10 +54,12 @@ pub(in crate::codec::encode) fn encode_list_extended(
     utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     if patterns.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            "LIST-EXTENDED requires at least one mailbox pattern \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "LIST-EXTENDED requires at least one mailbox pattern \
              (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
-                .into(),
+                    .into(),
+            ),
         ));
     }
 
@@ -147,19 +149,23 @@ fn validate_list_extended_option_syntax(
                 )
         })
     {
-        return Err(crate::Error::InvalidInput(
-            "LIST-EXTENDED selection option RECURSIVEMATCH requires another \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "LIST-EXTENDED selection option RECURSIVEMATCH requires another \
              non-REMOTE selection option (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
-                .into(),
+                    .into(),
+            ),
         ));
     }
 
     for option in selection_options {
         if option.trim().is_empty() {
-            return Err(crate::Error::InvalidInput(
-                "LIST-EXTENDED selection options must not be empty \
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    "LIST-EXTENDED selection options must not be empty \
                  (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
-                    .into(),
+                        .into(),
+                ),
             ));
         }
     }
@@ -167,10 +173,12 @@ fn validate_list_extended_option_syntax(
     for option in return_options {
         let trimmed = option.trim();
         if trimmed.is_empty() {
-            return Err(crate::Error::InvalidInput(
-                "LIST-EXTENDED return options must not be empty \
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    "LIST-EXTENDED return options must not be empty \
                  (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
-                    .into(),
+                        .into(),
+                ),
             ));
         }
 

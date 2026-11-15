@@ -26,7 +26,7 @@ use crate::core::SetCreate;
 use crate::core::transport::HttpTransport;
 use crate::sync::page_cursor::PageKind;
 
-type ContactAccount<T> = JmapProtoAccount<T>;
+type ContactAccount<T> = JmapProtoAccount<T, crate::core::capability::Contacts>;
 
 const PAGE_LIMIT: usize = 100;
 

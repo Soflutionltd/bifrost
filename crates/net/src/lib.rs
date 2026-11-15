@@ -27,7 +27,9 @@ pub mod budget;
 pub mod concurrency;
 pub mod config;
 pub mod error;
+pub mod exchange;
 pub mod hold;
+pub mod http_status;
 mod metered_stream;
 pub mod net;
 pub mod pagination;
@@ -47,7 +49,7 @@ pub mod test_support;
 pub mod trace;
 mod upload;
 pub mod url;
-pub use url::{AdmittedUrl, TrustedOrigins};
+pub use url::{AdmittedUrl, Origin, TrustedOrigins};
 
 pub use account_error::{
     NetErrorContext, into_account_error_with_throttle_scope, token_source_account_error,
@@ -61,6 +63,9 @@ pub use auth::{
 };
 pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 pub use budget::{BandwidthBudget, BandwidthDirection, BandwidthRegistry, Reservation};
+pub use http_status::{
+    HttpErrorPolicy, StatusClass, StatusOverride, StatusPolicy, classify_status,
+};
 // Shared identity / priority / byte-range / future-alias types live
 // in bifrost-types so the engine, the protocol crates, and this
 // crate all speak the same language. Re-exported here for ergonomic
@@ -81,6 +86,7 @@ pub use config::{DEFAULT_MAX_BUFFERED_RESPONSE, NetConfig};
 pub use error::{
     Error, FinalResponse, MalformedRedirectKind, RangeFailureKind, RetryStopReason, STATUS_BODY_CAP,
 };
+pub use exchange::RequestDeadline;
 pub use hold::{Held, HoldDeadline, HoldKind, SharedHold};
 pub use http::Method;
 pub use metered_stream::MeteredStream;

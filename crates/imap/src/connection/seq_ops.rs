@@ -1,4 +1,5 @@
 #![allow(clippy::wildcard_imports)]
+use super::dispatch::filter_store_flags;
 use super::*;
 
 const DEFAULT_FETCH_STREAM_CAPACITY: usize = 64;
@@ -39,7 +40,7 @@ impl ImapConnection {
         &self,
         sequence_set: &SequenceSet,
         items: &[FetchAttr],
-        mod_seq: u64,
+        mod_seq: crate::types::ModSeq,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
         self.fetch_impl(
@@ -238,7 +239,7 @@ impl ImapConnection {
         sequence_set: &SequenceSet,
         operation: StoreOperation,
         flags: &[Flag],
-        unchanged_since: Option<u64>,
+        unchanged_since: Option<crate::types::ModSeqValzer>,
         timeout: Duration,
     ) -> Result<StoreResult, Error> {
         // RFC 3501 Section 2.3.2 / Section 9: \Recent is server-only and \*

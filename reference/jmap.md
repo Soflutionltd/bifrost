@@ -172,8 +172,8 @@ explicitly while deriving its name and property type from the object.
 Adding a new method: define a struct, use `define_get_method!` / `define_set_method!` etc. Adding a new object type adds one row to `data_types!`.
 
 `Request` takes one `SessionState` snapshot when it is constructed. Its
-`maxCallsInRequest` guard, default account id, and HTTP `apiUrl` all come from
-that snapshot, which remains attached through send. It refuses the first call
+`maxCallsInRequest` guard and HTTP `apiUrl` come from
+that snapshot; its account id comes from the selected capability handle, which remains attached through send. It refuses the first call
 that would exceed the limit, before serializing or appending that method. The
 guard covers tuple batches, explicit result-reference flows, and WebSocket
 requests through the same `call` door. HTTP request-size enforcement and
@@ -401,7 +401,7 @@ mismatch in place.
 - WebSocket remains reqwest-specific (documented).
 
 The session and everything derived from it (`apiUrl`, the upload / download /
-EventSource templates parsed into `URLPart`s, and the default account id) live
+EventSource templates parsed into `URLPart`s) live
 together in one `Arc<SessionState>` behind a single lock. RFC 8620 §2 lets any
 Session property change, so `refresh_session` republishes the whole derived set
 atomically; readers take one `session_state()` snapshot and build a whole URL
@@ -459,9 +459,27 @@ sufficient here: `+` in a query-position `{type}` would otherwise decode
 server-side as a space, turning `application/ld+json` into `application/ld json`.
 
 All convenience helpers are `impl<Tr: HttpTransport> Client<Tr>` so custom transports get the full API.
-`Client::build()` uses the lexicographically first primary capability as its
-stable generic fallback; account-scoped callers use `Account::build()` and
-therefore select their required capability explicitly. A session advertising no `primaryAccounts` has no such fallback, so the derived default account id is empty; `Request::call` inspects the serialized arguments and refuses an empty default only when the method carries an `accountId` with `Error::NoPrimaryAccount { capability }` naming the method's own capability. Accountless `PushSubscription/get` and `/set` remain legal without any primary account. The fault is local and knowable before a byte moves, so it is reported locally rather than shipped as `"accountId": ""` and answered with an opaque server error.
+`Client::primary_account::<C>()` returns `Account<Tr, C>` and
+`Account::build()` returns `Request<Tr, C>`. Their ordinary `call` doors and
+request tuple batches require methods with `Cap = C`. There is no generic
+primary-account fallback or production account-id override: selecting Mail
+cannot silently address the Calendars primary, or vice versa.
+`Client::build()` constructs an accountless Core request for Echo and
+PushSubscription. An account-bearing Core method needs an explicit account's
+`core()` view, including Blob/copy, which does not require the Blob extension.
+
+An account serving several families supports `view::<D>()`, checked against
+that exact account in the session. A matching `primaryAccounts` entry also
+proves selection when an older server omits the optional account block.
+`Request::call_as` is the explicit cross-family batch door: it checks the same
+account against the request's frozen session before appending the method.
+A failed view or cross-family call is a local `AccountCapability` refusal,
+mapped to `Unsupported(operation)`; it never switches to D's primary account.
+Shared submission therefore retains the shared mailbox's account id. Composed
+send and draft workflows also require a Mail view of the selected Submission
+account before changing Email objects. An enterprise Outlook user expects a
+draft and its eventual submission to remain in one mailbox namespace.
+
 
 A contact `update` that carries `address_book_id` moves the card, which is an add of the new membership plus a clear of the old - and the old book is knowable only from the current card. `contact_update` therefore reads the card first through the single-object read helper, correlating the requested id before projection. An explicit `notFound` fails with contact-scoped `NotFound(Contact)`; an unanswered id fails with contact-scoped, retryable `Protocol(PartialResponse)`. Both errors retain `ContactUpdate` as the operation and prevent the write. Treating the missing read as "no old book" would silently degrade the move into an add and leave the contact in both books; the unanswered-id lane is a transient, not evidence that the card has no book.
 
@@ -497,7 +515,7 @@ one - an absent `pref` is least preferred, never promoted. Reading
 outside 1-100 is not a ranking and reads as absent, so `pref: 0` cannot
 beat every legal rank.
 
-The sync request helpers likewise take `Account<Tr>` / `Client<Tr>` with
+The sync request helpers likewise take capability-scoped `Account<Tr, C>` / `Client<Tr>` with
 `Tr: HttpTransport`; the engine-facing `JmapAccount` remains the reqwest
 production specialization because WebSocket push is reqwest-specific. Factory
 tests use an armed scripted transport that records exact API JSON and derives
@@ -556,7 +574,7 @@ object's vocabulary; the two JSON-backed objects retain extension round-trip tes
 - `Field<T>` - three-state nullable: `Omitted` / `Null` / `Value(T)`. Use instead of `Option<Option<T>>`, and instead of sentinels: an empty collection, an empty string and an epoch date are real values, never a stand-in for "clear". At a setter boundary `From<Option<T>>` maps `None` to an explicit `Null`; an untouched property stays `Omitted`. Mailbox role setters and `Filter::role` take `Option<Role>`, where `None` is the explicit null role.
 - `core::patch` - the one owner of PatchObject path handling. `PatchPath::new` builds a path from literal segments with RFC 6901 escaping, so an id containing `/` or `~` cannot retarget the edit; `From<&str>` / `From<String>` accept an already-encoded path as is. `patch::insert` applies RFC 8620's no-overlap rule as latest-setter-wins: an edit removes any earlier edit on the same path, a parent of it or a child of it, while sibling paths survive. `IdSet` builds complete create-time `Id[Boolean]` sets (memberships, keywords) holding only `true` members; `IdSetPatch` edits them by per-member path (`true` to add, `null` to remove) or replaces the whole set. The generated `set_property` goes through `patch::insert`; the raw JSON-map escape hatches (`properties_mut` on `json_object_struct!` types) bypass overlap handling, and a caller writing paths through them owns RFC 8620 overlap validation.
 - `Id<T>` - phantom-typed string ID: `AccountId`, `BlobId`, `State`. Available for incremental adoption.
-- `Account<Tr>` - internal account-scoped view of `Client`. Use `account.build()` for scoped requests inside the crate.
+- `Account<Tr, C>` - internal capability-scoped account view of `Client`. Use `account.build()` for scoped requests inside the crate.
 - `Capability` trait - typed URIs with associated `Config` type.
 - `TransportError` - crate-owned, `#[non_exhaustive]`, carries response body (`Bytes`) for ProblemDetails parsing. A local failure is marked explicitly (the private `LocalFailure`, set only by the dedicated constructors) and classifies as `Internal(_)` before the net evidence or the no-evidence `Transport(Network)` fallback is consulted; an unmarked error with no net evidence (for example, an in-crate test stub) keeps the fallback. The shared transport kind vocabulary has no unknown-provenance variant, so this legacy custom-transport fallback remains; classification never parses its message. A passed-through 3xx from either default transport door carries net `Status` evidence and is classified as a terminal HTTP failure (see HTTP redirect handling below). Two marks exist. `LocalFailure::InvariantViolated` (`TransportError::invariant` / `invariant_with_source`) is a state impossible by construction, raised before anything was sent, and classifies `Internal(InvariantViolated)`. `LocalFailure::LimitExceeded` (`TransportError::limit_exceeded`) is a bound this crate imposes on a response the protocol leaves unbounded - today only the EventSource over-long block cap - and classifies `Internal(LimitExceeded)`. The central mapping never retries an `Internal` kind. Without the mark, impossible-by-construction states (an unsupported method, an invalid default header, missing credentials) were retried as network faults forever, and a tripped EventSource cap classified as a retryable network fault too.
 
@@ -712,11 +730,16 @@ RSVP pre-reads) correlate the requested id before projection. An explicit
 that omits the requested id from both `list` and `notFound` maps to retryable
 `Protocol(PartialResponse)`. Unrelated returned objects cannot satisfy the read.
 Inbound calendar durations count each week as seven days, for timed and
-all-day events alike.
+all-day events alike. Shared `EventTime` values carry parsed date, local-time
+and instant kinds; the returned event and create payload derive `is_all_day()`
+from the typed start. Writers and range filters consume that parsed state,
+including shared compatible-bound and exclusive-date-end validation. Reminder
+offsets and absolute triggers likewise use shared parsed timing types, with
+malformed provider triggers retained as `Unparsed` observations.
 
 Calendar page walks (`events_in_range`, `search`) reconcile their submitted ids the way `contacts.rs::reconcile_cards` does. Every id the `CalendarEvent/get` answer covered in neither `list` nor `notFound`, and every returned event `event_from_jmap` refuses (a modified recurrence override, multiple or excluded recurrence rules, an unknown participant role or status), rides `Page::failed_ids`; the rest of the page still returns. One unrepresentable event therefore costs its own row, not the walk - before this it failed the whole call, permanently, since the event does not go away. The single-event `get` door is unchanged: with no neighbours to protect it still returns the conversion error itself. `search`'s calendar filter is client-side, so when `EventSearchRequest.calendar_id` is set the server's `total` (which counts the unfiltered result set) is suppressed rather than reported as this walk's total; the cursor stays live, and a page whose every hit belonged to another calendar is legitimately empty with more pages behind it. `EventSearchRequest::include_cancelled` (default `false`) is the same kind of client-side post-filter (draft-26 has no status filter condition and `get_events` always hydrates `status`), so the server `total` is likewise suppressed unless `include_cancelled` is set and no calendar filter is; an absent JSCalendar `status` reads as `Confirmed` (the draft-26 default), leaving `Unknown` for unrecognized values only. Both calendar page walks (and both contact ones) page by anchor with a pinned `queryState`, not by integer position - see "PIM page cursors".
 
-`UNTIL` conversion and the start/duration write both need the event start timezone and all-day flag, which an `EventPatch` need not carry. `update` reads the current event (`CalendarEvent/get`, before hydration, so an event whose own recurrence is unrepresentable does not block the patch) for exactly the fields the patch leaves unset: a recurrence-only patch carrying `UNTIL`, or any time patch that does not restate `is_all_day`. Omitting `is_all_day` therefore means "unchanged", not "timed". RFC 5545 `UNTIL` is converted, not copied: basic DATE and DATE-TIME syntax becomes an extended JSCalendar `LocalDateTime`, a zoned event's UTC UNTIL is resolved into the event timezone, and the inbound direction restores DATE for all-day events, floating DATE-TIME for floating events, or UTC DATE-TIME for zoned events. The inclusive bound is unchanged in both directions.
+`UNTIL` conversion and the start/duration write both need the event start timezone and time kind, which an `EventPatch` need not carry. `update` reads the current event (`CalendarEvent/get`, before hydration, so an event whose own recurrence is unrepresentable does not block the patch) for missing context: a recurrence-only patch carrying `UNTIL`, or a time patch that does not restate the conversion instruction. Supplied typed bounds determine the resulting mode unless `EventPatch::is_all_day` explicitly requests a conversion. A metadata or recurrence-only patch retains the stored mode. Time patches emit the matching `showWithoutTime`, so a date cannot accidentally leave a timed event at midnight. RFC 5545 `UNTIL` is converted, not copied: basic DATE and DATE-TIME syntax becomes an extended JSCalendar `LocalDateTime`, a zoned event's UTC UNTIL is resolved into the event timezone, and the inbound direction restores DATE for all-day events, floating DATE-TIME for floating events, or UTC DATE-TIME for zoned events. The inclusive bound is unchanged in both directions.
 Event time updates: JSCalendar derives end from `start` + `duration`, so a patch must carry both `start` and `end` (recomputing `duration`); a one-bound patch is rejected Unsupported rather than dropping the change or keeping a stale duration. Empty times: the projection yields an empty `start` for "the provider did not say", and this crate's own read path produces one (a server event with no `start` projects an empty start and `CalendarEvent.end` `None`; an absent `duration` is RFC 8984's `PT0S`, so an event with a start always has an end), so a read-modify-write can echo it. An empty (or whitespace-only) `start` is refused as `Request(Malformed)` naming `start` on create and patch, before any request (JSCalendar `start` is a mandatory LocalDateTime). An empty `end` on a patch means "no duration change": JSCalendar stores the end as `duration`, so the patch drops it, still applies `start`/`timeZone`, and leaves the stored `duration` alone (an empty end with no `start` writes no time fields). Encoding it would have sent `PT0S` and silently collapsed the event to zero length. A non-empty `start` or `end` that is not a date, a zoneless date-time or an RFC 3339 (UTC or offset) date-time is refused `Request(Malformed)` naming the field, before any request (`parse_time`, used by `validate_start`, `event_duration` and the `start` writer `jmap_time_from_shared`, which has no raw fallback, so no caller can put unparsed text on the wire); an all-day event additionally refuses offset date-times. An `end` before its `start`, or a timed pair mixing a zoneless date-time with an offset one (or a date with either), is refused naming `end`. `event_duration` has no fallback duration: nothing can write a `PT0S` for a time it could not read. An empty `end` on a create is refused `Unsupported` (an absent or `PT0S` duration is a zero-length event the caller never asked for), matching bifrost-google. All-day ends follow the exclusive `EventTime` contract: inbound end is `start + duration` days and outbound `duration` is `end - start` days (a single all-day event is start D / end D+1 / `P1D`), uniform with caldav/google/graph. JSCalendar has no DATE type, so an all-day start is written as midnight on its date (`2026-06-02T00:00:00`) with `showWithoutTime` carrying the all-day sense, and an inbound all-day time is truncated back to the shared bare date. `events_in_range` bounds become the query's `after` / `before` LocalDateTimes in the default Etc/UTC: an offset date-time is normalized to UTC, a bare date is midnight, a zoneless date-time passes as itself, and an empty or unparseable bound is refused `Request(Malformed)` naming `start` or `end` before any request, as the google and caldav range reads refuse theirs.
 JSCalendar `alerts` project onto the read-only `CalendarEvent.reminders` surface (OffsetTrigger -> relative offset with `relativeTo`; AbsoluteTrigger -> absolute `when`; alert `action` carried through). Privacy maps JSCalendar `privacy` <-> visibility (`secret` -> `Confidential`); status maps `EventStatus` <-> `status`. Organizers map to/from JSCalendar owner participants (created events write the organizer as `owner`). `freeBusyStatus` standardizes `free`/`busy`, so shared Tentative/OutOfOffice serialize as busy.
 An attendee patch is a whole-map `participants` write, and JSCalendar keeps the organizer in that same map, so `update` reads the current event whenever the patch carries attendees (`event_patch_needs_current`) and merges the owner-roled participants back in under their existing keys: an attendee whose email matches an owner entry updates its name and participation status in place (keeping its owner role - the read path surfaces an owner as a `Chair` attendee, so a read-modify-write round trip stays stable), and fresh attendee keys never collide with a kept one.
@@ -770,9 +793,9 @@ crates/jmap/src/sync/
   factory.rs       - JmapAccountFactory + builder + JmapCredentials
   capabilities.rs  - AccountCapabilities builder, CoreLimits
   state.rs         - cursor envelope (V1 tag/length format)
-  state_cache.rs   - per-accountId typed Email StateCell observations
-  foreign.rs       - foreign-account codec: mailbox (encode_foreign/parse_foreign/owner_tag)
-                     and object ids (encode_object/parse_object/native_object)
+  state_cache.rs   - slot-owned typed Email StateCell observations
+  registry.rs      - account slots, optional-family selection, owner routing and push topology
+  foreign.rs       - JmapRef / Owner and the legacy consumer-id codec for all id kinds
   discover.rs      - cursor_scopes / memberships / scope_lifecycle_stream
   inventory.rs     - per-scope inventory streaming
   changes.rs       - per-scope change stream dispatch
@@ -838,7 +861,38 @@ foreign-account skip lane; see Foreign accounts below).
 
 The batch is conditional on the session's own numbers. `maxCallsInRequest` and `maxSizeRequest` are hard limits (RFC 8620 §2) the server enforces by rejecting the whole request with a request-level `limit` error, and the commonly quoted 16 calls is the minimum a server is *recommended* to support, never a floor a client may assume. So `batched_open_probes` sends the two-call batch only when the advertised call count allows it and `Request::send_methods_within` finds the encoded request inside `maxSizeRequest`; otherwise nothing is sent and the probes go out one request each. `send_methods_within` takes the size limit as a required argument (and returns `Ok(None)` without sending when the batch does not fit) precisely so a future batching call site cannot forget the question.
 
-`JmapAccount` (`pub(crate)`) owns the `Client`, the primary `Mail` `Account` handle, a `foreign_mail: Arc<HashMap<AccountId, MailAccount>>` of shared/delegate-account handles keyed by JMAP `accountId`, optional `Submission`/`VacationResponse`/`Quota`/`Sieve` handles, the built capabilities, per-scope cursor seed states, the `WsState`, a subscription registry, and a per-`accountId` Email guard cache (`StateMap`, holding `StateCell` entries in `state_cache.rs`). Cells hold typed Email object states; the primary account's id is one ordinary key. Unknown and unavailable observations both provide no guard. Each cell owns set continuity, changes continuity, and compare-and-replace probe publication. There is no general Mailbox observation cache: its only reader compared it against itself for publication, and no decision consumed it. Scope lifecycle alone owns primary Mailbox positions, typed as Mailbox object states; delta polling and local `Mailbox/set` cannot consume the lifecycle poller's window. This lifecycle position is open-time process state, not an engine change cursor, so it does not enter the cursor envelope or alter its schema/version. `set_priority`/`set_bandwidth_cap` delegate to `bifrost-net::AccountNet`. The account also holds a shared close completion: the first polled `close()` starts teardown in a spawned task, and all later callers await that same result.
+`JmapAccount` (`pub(crate)`) owns the `Client`, an `Arc<Registry>`, the built
+capabilities, the `WsState`, subscription and shutdown state, and the primary
+mailbox lifecycle topology. Its constructor takes these named components rather
+than parallel per-account maps. `Registry` owns the primary mail `Slot` and a
+lexically ordered account table keyed by typed JMAP account ids. Each slot owns
+its capability-scoped `Account<Tr, C>` handle, validated core limits, seeded
+cursor scopes, submission support and one typed Email `StateCache` / `StateCell`.
+Mail slots and each optional family's slots carry their own capability type.
+Families are installed sequentially; handles for one account share the same
+observation cell, including two optional families whose account serves no Mail.
+No Mail handle is manufactured for an optional-only account. A Submission
+account can differ from the Mail primary; send and draft workflows check a
+Mail view of that same Submission account before Email operations.
+Only successfully seeded foreign mail slots enter shared discovery, send-as
+routing and push topology. An optional-only primary account adds no shared
+scope or owner membership.
+
+Mutation, draft, submission and changes doors take the selected slot rather
+than a handle, a separate cache and a string cache key. Metering forks the
+protocol handle while retaining that slot's state cell. Unknown and unavailable
+observations supply no guard. Each cell owns set continuity, changes continuity
+and compare-and-replace probe publication. The account-keyed state-map helpers
+exist only in hermetic test fixtures, where slot construction selects the real
+cell that later assertions observe.
+
+There is no general Mailbox observation cache. Scope lifecycle alone owns the
+primary Mailbox position and announced names, separately from Email guards;
+delta polling and local `Mailbox/set` cannot consume the lifecycle poller's
+window. This is process state, not an engine change cursor, and does not alter
+the persisted cursor envelope. Priority and bandwidth caps delegate to
+`bifrost-net::AccountNet`. The first polled `close()` starts teardown in a
+spawned task behind a shared completion; later callers await that same result.
 
 `Client` carries an optional `ByteTally`; `Client::metered()` / `Account::metered()` hand back a handle over the same transport and session state that reports inbound request bytes into a fresh accumulator, which each sync stream takes at construction and each emitted batch `take`s. `Client::metered_into(&tally)` / `Account::metered_into(&tally)` report into an existing accumulator when one batch crosses differently scoped handles. The tally lives outside `ClientInner` deliberately: forking the inner would fork the session-state mutex, and two clients with independent session state is a correctness bug rather than an accounting detail.
 
@@ -907,13 +961,13 @@ Supported scopes for `inventory_stream` and `changes_stream`:
 - `CursorScope::Type(ObjectType::Thread)` and `CursorScope::Query(_)` are not discovered. A legacy cursor for either terminates unsupported: thread inventory derives from email inventory, and the v1 trait has no registered query definition to supply an `Email/queryChanges` filter/sort.
 - `CursorScope::Folder(FolderId(encode_foreign_account(account_id)))` - a foreign (shared/delegate) account, one account-level scope per share. Inventory paginates an UNFILTERED `Email/query` against the foreign account handle (one walk per share); changes use that account's `Email/changes`, which is account-wide and cannot be filtered by mailbox - which is exactly why the topology is one scope per account, never one per mailbox (a per-mailbox topology streamed the identical change set once per mailbox and fanned every foreign push out M ways). Per-mailbox membership is learned at hydration from the qualified `mailboxIds`, the same model the primary `Type(Email)` scope uses. A legacy per-mailbox `Folder` cursor still decodes and takes an `inMailbox`-filtered inventory walk, but is never seeded. See "Foreign (shared/delegate) accounts".
 
-Every change-stream batch carries a `Checkpoint::Change(ChangeCursor)` whose state string is the post-call `newState`. The loop continues until `hasMoreChanges` is false, then emits `SyncEvent::Done`. A forward-progress guard terminates the loop as a `Protocol(ContractViolation)` when a server answers `hasMoreChanges: true` with `newState == sinceState` (RFC 8620 s5.2 requires `newState` to reflect the served changes) - the guard fires before that page's batch, so nothing is lost: the state never moved and the next drive replays from it. A second guard covers the case the first cannot see: a server alternating between two states moves the state at every single step, so each step looks like progress while the walk paginates forever. Each change walk therefore remembers the states it has served and terminates the same way when one comes back. The Email, Mailbox and foreign `Folder` scopes all run ONE paginated walk, `changes::changes_walk`, generic over the `*/changes` method (`core::changes::ChangesMethod`, implemented by `define_changes_method!` so a new `*/changes` object gets it for free). Three things vary and are parameters, not copies: the method (whose `NAME` is also the guard's diagnostic), the `owner` tag - `Some(accountId)` only for a foreign scope, which both qualifies the emitted change ids into the owning account's namespace AND routes a permission denial into a per-scope quarantine, and with `None` reduces to the plain error mapping the primary walks always used - and the per-`accountId` state cache the scope advances. `ChangesWalk` and `InventoryWalk` in `sync/state_walk.rs` own their respective progress guards and error contexts; only `ChangesWalk` carries a recovery policy. Change and lifecycle walks share the guard for `hasMoreChanges: true` with an unmoved or repeated state; the lifecycle guard resets at each poll pause. Inventory does not send a prior state and accepts `queryState` churn, but `InventoryWalk` owns the anchor guard and refuses a page that re-serves the prior anchor, terminating as a `Protocol(ContractViolation)` WITHOUT a `Done` rather than recording unproved coverage. Change and lifecycle requests are marked state-based. Inventory query contexts also mark whether that specific query sent an anchor; get contexts carry only cursor scope. State expiry in durable changes restarts the scope through the engine, lifecycle reconciles a fresh mailbox snapshot locally, and an inventory anchor loss restarts its scope. `cannotCalculateChanges` or `tooManyChanges` on a stateless inventory query or get is a `Protocol(ContractViolation)`. The per-`accountId` `state_cache` maps advance compare-and-swap style (keyed by the scope's accountId) so a stale writer does not clobber a newer state.
+Every change-stream batch carries a `Checkpoint::Change(ChangeCursor)` whose state string is the post-call `newState`. The loop continues until `hasMoreChanges` is false, then emits `SyncEvent::Done`. A forward-progress guard terminates the loop as a `Protocol(ContractViolation)` when a server answers `hasMoreChanges: true` with `newState == sinceState` (RFC 8620 s5.2 requires `newState` to reflect the served changes) - the guard fires before that page's batch, so nothing is lost: the state never moved and the next drive replays from it. A second guard covers the case the first cannot see: a server alternating between two states moves the state at every single step, so each step looks like progress while the walk paginates forever. Each change walk therefore remembers the states it has served and terminates the same way when one comes back. The Email, Mailbox and foreign `Folder` scopes all run ONE paginated walk, `changes::changes_walk`, generic over the `*/changes` method (`core::changes::ChangesMethod`, implemented by `define_changes_method!` so a new `*/changes` object gets it for free). Three things vary and are parameters, not copies: the method (whose `NAME` is also the guard's diagnostic), the `owner` tag - `Some(accountId)` only for a foreign scope, which both qualifies the emitted change ids into the owning account's namespace AND routes a permission denial into a per-scope quarantine, and with `None` reduces to the plain error mapping the primary walks always used - and the selected slot's state cell the scope advances. `ChangesWalk` and `InventoryWalk` in `sync/state_walk.rs` own their respective progress guards and error contexts; only `ChangesWalk` carries a recovery policy. Change and lifecycle walks share the guard for `hasMoreChanges: true` with an unmoved or repeated state; the lifecycle guard resets at each poll pause. Inventory does not send a prior state and accepts `queryState` churn, but `InventoryWalk` owns the anchor guard and refuses a page that re-serves the prior anchor, terminating as a `Protocol(ContractViolation)` WITHOUT a `Done` rather than recording unproved coverage. Change and lifecycle requests are marked state-based. Inventory query contexts also mark whether that specific query sent an anchor; get contexts carry only cursor scope. State expiry in durable changes restarts the scope through the engine, lifecycle reconciles a fresh mailbox snapshot locally, and an inventory anchor loss restarts its scope. `cannotCalculateChanges` or `tooManyChanges` on a stateless inventory query or get is a `Protocol(ContractViolation)`. Each slot's `StateCache` advances compare-and-swap style, so a stale writer cannot clobber a newer observation.
 
 The CAS is exact: an expected state advances only an entry containing that state. It cannot initialize an absent or explicitly empty entry. Only an advance with no expected state may initialize those shapes.
 
 `changes_walk` advances the shared state cache before yielding its batch. This may put the cache ahead of the engine's durable checkpoint if the stream is dropped between those steps. That is intentional: the cache is only an observed-state hint for mutation `ifInState` calls, while the engine cursor advances from the checkpoint in the batch. Replaying from an older durable cursor still requests the same change page; a stale mutation precondition is rejected by JMAP and refreshed.
 
-`get_stream` (hydration) supports `Projection::FlagsOnly` and `Metadata` for Email; raw-MIME projections fatal-unsupported (whole-message raw is `open_raw_rfc822`: one `Email/get` for `blobId`, then streamed blob batches). Batches size at `max_objects_in_get` and partial route buffers flush after the JMAP batching policy's 100 ms maximum wait, even while the input stream remains open. Hydrated emails emit `ItemOutcome::Succeeded`; locally-invalid ids or transport-drop ambiguity flow through `Failed` / `Uncertain` rather than terminating the stream. A foreign-qualified id's `Metadata` entry is qualified exactly as the foreign inventory mints it - memberships re-encoded `Folder(encode_foreign(accountId, mailboxId))` plus the `Mailbox(accountId)` owner tag, entry and blob ids in the object namespace. This is the attribution channel for foreign changes: the account-level change stream emits only qualified ids, and hydration is where the consumer learns which shared folder a message sits in.
+`get_stream` (hydration) supports `Projection::FlagsOnly` and `Metadata` for Email; raw-MIME projections fatal-unsupported (whole-message raw is `open_raw_rfc822`: one `Email/get` for `blobId`, then streamed blob batches). Batches size at `max_objects_in_get` and partial route buffers flush after the JMAP batching policy's 100 ms maximum wait, even while the input stream remains open. Hydrated emails emit `ItemOutcome::Succeeded`; locally-invalid ids or transport-drop ambiguity flow through `Failed` / `Uncertain` rather than terminating the stream. A foreign-qualified id's `Metadata` entry is qualified exactly as the foreign inventory mints it - memberships re-encoded `Folder(encode_foreign(accountId, mailboxId))` plus the `Owner(accountId)` owner tag, entry and blob ids in the object namespace. This is the attribution channel for foreign changes: the account-level change stream emits only qualified ids, and hydration is where the consumer learns which shared folder a message sits in.
 
 Each `Email/get` answer is reconciled against the ids the batch submitted (`hydrate::reconcile_hydration`, pure and unit-pinned), so every submitted id leaves on exactly one lane. Repeated submitted ids remain repeated submissions: reconciliation drives from the submitted slice, and one correlated response object supplies one outcome for every occurrence. `notFound` alone cannot carry that: an absent `notFound` decodes as empty (see "`/get` response leniency"), and a present one can still omit an id the server also left out of `list`. Outcomes are keyed by the id the CALLER submitted - a response object whose id was not requested, was already answered, or is missing entirely is discarded rather than minted into an outcome. Ids named in `notFound` emit `Failed` with `NotFound(Message)`; ids answered in neither list emit `Failed` with `Protocol(PartialResponse)` + `Attempt(Acknowledged)`, which the shared recovery mapping retries rather than dropping (a terminal contract violation would lose the id for a condition the next `Email/get` usually clears). `contacts::get_cards` reconciles the same way, routing both classes into `Page::failed_ids` so the consumer preserves the row instead of reading absence as a deletion.
 
@@ -1463,15 +1517,14 @@ arrived) and, unless its primary cause already is one, the typed
   `Problem(unknownCapability)` -> `SyncState(CapabilityChanged)` ->
   `Engine(RestartAccount)`; `Problem(notJSON | notRequest)` ->
   `Protocol(ContractViolation)`. A problem document of any other type is
-  classified by its HTTP status (the document's own `status`, else the
-  carrying net error's): 400/422 `Request(Malformed)`, 401
-  `Authentication(ReauthorizationRequired)`, 403
-  `Authorization(PermissionDenied)`, 404 `NotFound(resource)` when the scope
-  names one and `Server(Error { 404 })` otherwise, 409
-  `ConcurrencyConflict`, 410 `SyncState(CursorInvalid)` only under a cursor
-  scope, 429 `Server(RateLimited)` with an account throttle scope, 5xx
-  `Server(Unavailable)`, any other status `Server(Error { status })`, and no
-  status at all `Protocol(Unknown)`.
+  classified by the shared `bifrost_net::classify_status` table (the document's
+  own `status`, else the carrying net error's). This is the same fallback as a
+  plain transport body: 408/502/503/504 are unavailable, 507 is quota exhausted
+  with account throttle scope, and other 5xx retain a status-bearing server
+  error. 409/412 are state conflicts and 400/413/422 are malformed requests.
+  Scope-less 404 remains `Server(Error { 404 })`; cursor-scoped 410 invalidates
+  that cursor. No status at all is `Protocol(Unknown)`. Enterprise users should
+  get the same recovery when the server changes only its error body format.
 - Which net error shape carried the problem document decides where its
   evidence lives, and the crate reads all of them. `Error::Status` is the
   *only* variant bifrost-net produces for a terminal HTTP status, and a
@@ -1563,7 +1616,7 @@ cursor-scoped error classifier instead.
 
 ### Foreign (shared/delegate) accounts
 
-JMAP auto-discovers shared/delegate accounts from the session: at `open`, `foreign_mail_account_ids` selects session accounts with `isPersonal: false` advertising `urn:ietf:params:jmap:mail`, excluding the primary; each becomes a scoped `Account::new(client, accountId)` handle in `foreign_mail`. The accounts are probed concurrently, then results are sorted by accountId before installation so open latency is bounded by the slowest independent share rather than their sum while topology and skip ordering stay deterministic. The concurrency is the server's own `maxConcurrentRequests` (RFC 8620 §2), clamped to `[1, 8]` by `api_request_concurrency`, and a session with no readable core capability probes serially. Exceeding that limit earns a request-level `limit` error, which the probe path would classify as a failure and turn a healthy share into a skipped scope. `api_request_concurrency` is the crate's single answer to how wide any fan-out may go; `filters_list` reads the same function for its blob downloads, so a second bound cannot drift from the session. `seed_foreign_account` runs the primary's two probes (`Email`/`Mailbox` state), and `apply_foreign_seed` inserts the per-accountId `state_cache` entries and seeds exactly ONE `CursorScope::Folder(encode_foreign_account(accountId))` - the account-level scope, seeded from the account's Email state - into `seed_states`. One scope per account, never one per mailbox: `Email/changes` is account-wide, so per-mailbox cursors would each replay the identical change set (the original B9 defect) and a foreign push would fan out to every one of them. A successfully seeded foreign account that also advertises Submission is included in `foreign_submission`; only that same routing set enables `pim_methods.send_as`, so a revoked share never produces an advertised but unreachable send path. A probe failure - revoked grant (terminal `NoPermission`) and exhausted transient retry (retryable) alike - skips that foreign account and records a `SkippedScope` naming its accountId, with the classified error, on `OpenedAccount::skipped_scopes` (`seed_foreign_account_or_skip`). Open itself neither fails (initial attach does not retry `factory.open`, so failing would block the user's own primary mail on a delegate outage) nor skips silently (the original G8 defect); the recovery class on the skip tells the consumer whether a reopen can heal it. Cost is O(foreign accounts) round-trips at open. Since foreign account discovery happens only here and there is no foreign scope lifecycle stream, the capabilities flag advertises that reopening can discover a newly granted share.
+JMAP auto-discovers shared/delegate accounts from the session: at `open`, `foreign_mail_account_ids` selects session accounts with `isPersonal: false` advertising `urn:ietf:params:jmap:mail`, excluding the primary; each is probed through a scoped `Account::new(client, accountId)` handle and installed as a registry slot only after successful seeding. The accounts are probed concurrently, then results are sorted by accountId before installation so open latency is bounded by the slowest independent share rather than their sum while topology and skip ordering stay deterministic. The concurrency is the server's own `maxConcurrentRequests` (RFC 8620 §2), clamped to `[1, 8]` by `api_request_concurrency`, and a session with no readable core capability probes serially. Exceeding that limit earns a request-level `limit` error, which the probe path would classify as a failure and turn a healthy share into a skipped scope. `api_request_concurrency` is the crate's single answer to how wide any fan-out may go; `filters_list` reads the same function for its blob downloads, so a second bound cannot drift from the session. `seed_foreign_account` runs the primary's two probes (`Email`/`Mailbox` state), and `foreign_seed_slot` installs the observed Email state in that slot and seeds exactly ONE `CursorScope::Folder(encode_foreign_account(accountId))` - the account-level scope, seeded from the account's Email state. One scope per account, never one per mailbox: `Email/changes` is account-wide, so per-mailbox cursors would each replay the identical change set (the original B9 defect) and a foreign push would fan out to every one of them. A successfully seeded foreign slot records its own Submission support; only that same routing set enables `pim_methods.send_as`, so a revoked share never produces an advertised but unreachable send path. A probe failure - revoked grant (terminal `NoPermission`) and exhausted transient retry (retryable) alike - skips that foreign account and records a `SkippedScope` naming its accountId, with the classified error, on `OpenedAccount::skipped_scopes` (`seed_foreign_account_or_skip`). Open itself neither fails (initial attach does not retry `factory.open`, so failing would block the user's own primary mail on a delegate outage) nor skips silently (the original G8 defect); the recovery class on the skip tells the consumer whether a reopen can heal it. Cost is O(foreign accounts) round-trips at open. Since foreign account discovery happens only here and there is no foreign scope lifecycle stream, the capabilities flag advertises that reopening can discover a newly granted share.
 
 Owner-email resolution for those accounts is a two-level RFC 9670 gate
 (`owner_email_plans`): no session `urn:ietf:params:jmap:principals`
@@ -1582,7 +1635,7 @@ On `Unavailable` the owner email is left unset, so a transport blip or an
 unimplemented `Principal/get` cannot overwrite real ownership with a
 label.
 
-The foreign accountId rides in the `Folder` scope's `FolderId` (`foreign.rs` codec, `\u{1f}` separator; the account-level scope leaves the mailbox part empty, which no real RFC 8620 id can produce); `Type(_)` scopes cannot carry an account (`Type(Email)` is identical across accounts and would collide in the engine index), so the variant-free `Folder` shape is used. `mail_for_scope` / `account_id_for_scope` / `owner_of_scope` route a `Folder` scope to its `foreign_mail` handle, state-map key, and `MailboxId(accountId)` owner tag; primary scopes route to `self.mail` and `None`. `cursor_scopes` appends the seeded account-level foreign `Folder` scopes; `discover::memberships` appends one `Mailbox(accountId)` owner tag per foreign account, and `inventory_stream` stamps that tag onto every foreign-scope item - and re-encodes each native mailbox membership as `Folder(encode_foreign(accountId, mailboxId))` - so a foreign account's native mailbox ids cannot be conflated with the primary's in the membership index. The request layer is already per-account (`Account<Tr>::build` stamps the accountId), so routing is "hand `mail_for_scope` instead of `self.mail`", not a `core/request.rs` change.
+The foreign accountId rides in the `Folder` scope's `FolderId` (`foreign.rs` codec, `\u{1f}` separator; the account-level scope leaves the mailbox part empty, which no real RFC 8620 id can produce); `Type(_)` scopes cannot carry an account (`Type(Email)` is identical across accounts and would collide in the engine index), so the variant-free `Folder` shape is used. `Registry::scope` resolves a Folder scope to its slot; the slot supplies the handle, state cell and owner tag. Primary scopes resolve to the primary slot with no foreign owner. `cursor_scopes` appends the seeded account-level foreign `Folder` scopes; `discover::memberships` appends one `Owner(accountId)` owner tag per foreign account, and `inventory_stream` stamps that tag onto every foreign-scope item - and re-encodes each native mailbox membership as `Folder(encode_foreign(accountId, mailboxId))` - so a foreign account's native mailbox ids cannot be conflated with the primary's in the membership index. The request layer is already per-account (`Account<Tr, C>::build` stamps the accountId); the registry selects its owning slot before the request is built.
 
 Foreign OBJECT ids are qualified with the same codec (`encode_object` /
 `parse_object` / `native_object`, same `\u{1f}` separator). The foreign
@@ -1592,64 +1645,44 @@ what makes hydration and blob reads self-routing: `get_stream` and
 `open_blob` receive only an id - no scope - so a bare native id would run
 `Email/get` / `/download/{accountId}/{blobId}` against the PRIMARY account
 and either 404 or resolve an unrelated same-id primary object.
-`hydrate::route_for_id` buckets ids per routing target (one `Email/get` per
-account, since the call is accountId-scoped), strips to the native id on the
-wire, and re-qualifies on the way out so an outcome id is byte-identical to
-the id the caller handed in. `blob::foreign_split` does the same selection
-for `open_blob` and both legs of `open_raw_rfc822` (the `blobId` fetch AND
-the download). An id naming an account this session cannot reach falls back
-to the primary handle deliberately, and - like the mutation pipeline's
-`wire_email_id` - stays LITERAL on that wire (`hydrate::wire_object_id`
-strips the qualification only for the routed owner), so the miss surfaces
-as a real not-found rather than either a fabricated local error or, on a
-native-id collision, an unrelated primary object hydrated under the
-foreign id.
+`foreign::JmapRef` parses the declared `Owner` (Primary or Shared) and native
+suffix once through the historical first-separator codec. Every encoder uses
+that codec. `Registry::route` returns Primary, Shared or Departed; reachability
+never changes an id's declared owner. A primary-qualified id therefore remains
+Departed, just like any qualifier this session does not register as a share.
+`Slot::wire` delegates to `JmapRef::wire`, the only stripping rule: strip on the
+matching shared slot; retain the complete consumer id on the primary or a
+different shared slot. This includes primary-qualified ids, which older PIM
+helpers stripped while hydration and bulk mutations kept literal. An enterprise
+Outlook user must never see or mutate a colliding primary object under a
+vanished share's identity.
 
-`pim::message_hydrate` (the one-id door, and the one
-`SyncEngine::message_hydrate` funnels into) routes on the SAME
-`hydrate::route_for_id` decision. It previously did not, so a foreign-encoded
-id reached the primary `Email/get` verbatim and came back as a `NotFound`
-naming the encoded string. On the way out, `qualify_foreign_message_ids`
-re-qualifies the hydrated `Message`: `id` and each attachment `BlobId` in the
-OBJECT namespace (`encode_object`, what `open_blob` decodes), each
-`ContainerId` in the FOLDER namespace (`encode_foreign`, what
-`containers_list` and the cursor scopes key on). The two namespaces are not
-interchangeable and the projection must not confuse them.
+Object, thread, raw-message and blob doors explicitly choose the literal primary
+fallback for Departed. Scope inventory and changes terminate with ScopeRevoked;
+search refuses an unreachable filter owner as Request(Malformed), because an
+empty primary search would conceal the routing failure. Cross-account operand
+checks use declared ownership regardless of registration. A message and its
+move destination must agree before a wire id is selected.
 
-Thread ids ride the same object namespace (nc-7's fix): foreign inventory
-and hydration qualify `InventoryEntry::thread_id` / `Message.thread_id`
-through the one `qualify_foreign_ids` hook, so a foreign thread id carries
-its owner everywhere the consumer sees it, and every thread-keyed door
-decodes it - `thread_hydrate` selects the owning handle, sends the bare
-native id, and re-qualifies each returned member's id/thread/containers/
-attachments; `MutationTarget::Thread` fan-outs, `move_thread`, and
-`delete_thread` route the same way, with `delete_thread` minting its
-resolved Trash id in the thread's own namespace so the cross-account guard
-and the already-in-Trash comparison see one account. The handle-selection
-boundary itself (`route_object_id` / `route_mutation_target`) is
-transport-generic and pinned over string handles, because `JmapAccount`
-hardwires `ReqwestTransport` (xc-3) and the account door cannot be driven
-scripted; the account methods are one-line delegations to keep that pin
-meaningful.
+Hydration buckets ids by registry route so one Email/get cannot mix accounts.
+Blob and raw-message reads select one slot for both the Email/get and download
+legs. Single-message and thread hydration use the same registry lookup and
+qualify returned message, thread, container and attachment ids with the owning
+account. Thread-keyed mutations also select that slot before expanding the
+thread; delete_thread qualifies its resolved Trash id in the thread's namespace
+before comparing owners or deciding to expunge.
 
-Three more decisions are lifted out for the same reason (jmap-O2), each
-pure given its inputs, each with its trait method reduced to a one-line
-delegation: `cursor_scopes_from_seeds` (discovery order - seeded `Type`
-scopes in a fixed order, then foreign `Folder` scopes SORTED, because
-`seed_states` is a `HashMap` and an unsorted lane would hand the engine a
-different scope order every run), `partitioning_for_scope` (every scope is one
-`Full` walk, because Email pages by anchor and an engine partition
-boundary would discard it), and `establishment_for_seed` (seeded ->
-`Ready`, unseeded -> `Unsupported` carrying the cursor scope). Prefer this
-pattern over threading the transport generic through the sync layer: it
-costs one function and no API surface.
-
-A thread id qualified for an account this session no longer
-holds stays LITERAL on the primary route - same rule as message ids - so
-the server reports the miss instead of a collision-prone local strip.
+Discovery reads seeded scopes and owner memberships directly from slots, with
+Email then Mailbox first when seeded, followed by shared accounts in lexical
+order. PushRouting is a view holding the same registry Arc; it has no separate
+foreign-scope map. A share added after open is absent from both until reopen.
+The transport-generic registry, including state isolation and optional-family
+selection, is exercised directly by hermetic tests. The engine-facing
+JmapAccount remains pinned to ReqwestTransport; protocol request helpers retain
+their scripted-transport seam.
 
 `containers_list` appends each foreign account's mailboxes with
-`namespace = Shared`, `owner = MailboxId(accountId)`,
+`namespace = Shared`, `owner = PrincipalId(accountId)`,
 `native_id = encode_foreign(accountId, mailboxId)` (byte-identical to the
 `MembershipScope::Folder` qualification inventory and hydration stamp on
 that account's messages - the container/membership join key; the sync
@@ -1680,7 +1713,7 @@ user's own mailbox are not consulted, so an omission there hides nothing.
 Foreign object mutations route through the same registered-account decision as
 hydration: bulk operations partition by owner, and single-message PIM
 operations select the owning `Mail` handle before stripping the qualified id
-for `Email/set`. Their state-cache key is that selected accountId. Foreign
+for `Email/set`. Their guard cell belongs to that selected slot. Foreign
 mailbox lifecycle remains out of scope: `scope_lifecycle` polls only the
 primary. Under the account-level scope this costs less than it used to: a
 foreign mailbox created after `open` needs no new cursor (the account scope
@@ -1838,9 +1871,9 @@ validation (`validated_core_limits`) and upload-size validation.
 and unusable) to account errors. `sync/capabilities.rs` invokes this boundary
 and owns the local set batch ceiling of 500 and the 100 ms batching wait.
 Capability advertisement and both bulk mutation streams use the same set-size function; hydration uses the same
-wait constant. Bare protocol Account doors read their own session through the protocol-owned
-`Session::object_limits` accessor via the capabilities helpers. Those handles do not carry the validated sync slot;
-using the primary slot for a routed foreign handle would obscure that boundary.
+wait constant. Sync helpers carry the selected slot and its validated limits. Bare protocol
+handles outside the sync registry retain the protocol-owned
+`Session::object_limits` accessor.
 
 The primary lifecycle walk stores its positions and announced mailbox names in
 one `LifecycleTopology` behind one lock. Both ordinary changes pages and expired

@@ -1,11 +1,12 @@
 //! Deterministic lane-level recovery and coverage obligations.
 use super::supervisor::PushSupervisor;
 use super::*;
+use crate::engine::supervisor::ReopenRequest;
 use crate::{
     cancel::{Boundary, BoundaryRequest},
-    multiplexer::{ChangeDelivery, ReopenRequest},
-    recovery::ThrottleBucket,
+    delivery::ChangeDelivery,
     test_common::{SessionStep as S, StubAccount},
+    throttle::ThrottleBucket,
 };
 use arc_swap::ArcSwap;
 use bifrost_types::{
@@ -27,7 +28,7 @@ struct Fixture {
     boundary: watch::Sender<BoundaryRequest>,
     health: watch::Receiver<health::PushHealth>,
     recovery: mpsc::Receiver<ReopenRequest>,
-    events: tokio::sync::broadcast::Receiver<crate::multiplexer::MultiplexerEvent>,
+    events: tokio::sync::broadcast::Receiver<crate::delivery::MultiplexerEvent>,
     throttles: Arc<ThrottleBucket>,
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<()>,
@@ -484,7 +485,7 @@ async fn a_retry_hint_longer_than_the_backoff_is_honored_and_recorded() {
     )
     .await;
     assert!(
-        crate::recovery::account_throttle_wait(
+        crate::throttle::account_throttle_wait(
             &f.throttles,
             &bifrost_types::AccountId("lanes".into())
         )

@@ -25,6 +25,7 @@ mod mutation;
 mod page_cursor;
 mod pim;
 mod push;
+mod registry;
 mod single_get;
 mod state;
 mod state_cache;

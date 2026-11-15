@@ -349,8 +349,10 @@ impl CommandWriter {
     /// encoder, so the last segment is never empty.
     pub(crate) fn finish(mut self) -> Result<WireCommand, Error> {
         if self.invalid_nul {
-            return Err(Error::InvalidInput(
-                "IMAP string data must not contain NUL (RFC 3501 Section 9)".into(),
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    "IMAP string data must not contain NUL (RFC 3501 Section 9)".into(),
+                ),
             ));
         }
         self.flush_buf();

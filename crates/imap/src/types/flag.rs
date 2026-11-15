@@ -2,12 +2,30 @@
 
 /// A parser-owned unknown flag spelling. Construction is confined to this module.
 #[derive(Debug, Clone)]
-pub struct FlagKeyword(String);
+pub struct FlagKeyword(ObservedKeyword);
+
+#[derive(Debug, Clone)]
+enum ObservedKeyword {
+    Atom(super::validated::ImapAtom),
+    Malformed(String),
+}
+
+impl FlagKeyword {
+    fn observed(value: &str) -> Self {
+        Self(match super::validated::ImapAtom::new(value) {
+            Ok(atom) => ObservedKeyword::Atom(atom),
+            Err(_) => ObservedKeyword::Malformed(value.to_owned()),
+        })
+    }
+}
 
 impl std::ops::Deref for FlagKeyword {
     type Target = str;
     fn deref(&self) -> &str {
-        &self.0
+        match &self.0 {
+            ObservedKeyword::Atom(atom) => atom.as_str(),
+            ObservedKeyword::Malformed(value) => value,
+        }
     }
 }
 
@@ -21,9 +39,14 @@ impl<'a> StoreFlag<'a> {
         if !flag.is_writable() {
             return Ok(None);
         }
-        if let Flag::Custom(keyword) = flag {
-            super::validated::validate_atom_bytes(keyword.as_bytes(), "flag keyword")
-                .map_err(|err| crate::Error::InvalidInput(err.to_string().into()))?;
+        if let Flag::Custom(FlagKeyword(ObservedKeyword::Malformed(value))) = flag {
+            super::validated::validate_atom_bytes(value.as_bytes(), "flag keyword").map_err(
+                |err| {
+                    crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
+                        err.to_string().into(),
+                    ))
+                },
+            )?;
         }
         Ok(Some(Self(flag)))
     }
@@ -115,7 +138,7 @@ impl Flag {
             "\\draft" => Self::Draft,
             "\\recent" => Self::Recent,
             "\\*" => Self::Wildcard,
-            _ => Self::Custom(FlagKeyword(s.to_owned())),
+            _ => Self::Custom(FlagKeyword::observed(s)),
         }
     }
 }

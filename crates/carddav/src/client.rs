@@ -1,20 +1,26 @@
+use crate::dialect::CardDavDialect;
+#[cfg(test)]
+use bifrost_dav_core::DavRequest;
+use bifrost_dav_core::collection::{
+    DavCollectionClient, Dialect, MultigetFetch, QUERY_HREF_PROPS, complete_failure_error,
+};
 use std::fmt;
 
 use bifrost_dav_core::{
-    CARDDAV_NAMESPACE, DavDispatch, DavProtocol, DavRequest, escape_xml, filter_unsupported,
-    normalize_http_etag, prepare_if_match, worse_recovery,
+    CARDDAV_NAMESPACE, DavDispatch, DavProtocol, escape_xml, filter_unsupported,
 };
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery, PutCondition};
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{AccountError, AccountOperation, ErrorScope};
 use reqwest::Method;
-use reqwest::header::{CONTENT_TYPE, ETAG};
+#[cfg(test)]
+use reqwest::header::ETAG;
 
 use crate::CardDavConfig;
 use crate::parse::{
     AddressBookCollection, CardDavContactListing, CardDavFetchedVCard, CardDavMultigetReport,
-    MultigetOutcome, extract_href_property_in_namespace, parse_addressbook_collections,
-    parse_multiget_report, parse_propfind_contacts, resolve_href,
+    extract_href_property_in_namespace, parse_addressbook_collections, parse_propfind_contacts,
+    resolve_href,
 };
 
 #[derive(Debug)]
@@ -23,25 +29,13 @@ pub(crate) struct AddressBookDiscovery {
     pub(crate) gateways: Vec<String>,
 }
 
-const MULTIGET_BATCH_SIZE: usize = 50;
-
-/// In-flight REPORT legs a single multiget or text search may hold open.
-///
-/// The chunk count is driven by the caller's uri list, so an unbounded
-/// `join_all` over it lets one large collection launch hundreds of
-/// simultaneous REPORTs at a server that never agreed to that. This per-call
-/// local policy bounds one input-sized fan-out. No account-wide DAV bound is
-/// needed yet, and no server advertises one; bifrost-net's `ConcurrencyLimit`
-/// is available if one is wanted. Ordered (`buffered`, not
-/// `buffer_unordered`) so the merged report and the surviving degraded error
-/// stay deterministic regardless of completion order.
-const MULTIGET_LEG_CONCURRENCY: usize = 4;
-
 /// This crate's dialect binding for the shared DAV layer.
 ///
 /// Every shared constructor takes it, so a CardDAV error can never be stamped
 /// with a CalDAV `Protocol` or name a `ResourceKind::Calendar`.
-const DAV: DavProtocol = DavProtocol::CardDav;
+const DAV: DavProtocol = CardDavDialect::DAV;
+
+bifrost_dav_core::dav_error_constructors!(CardDavDialect);
 
 #[derive(Clone)]
 pub(crate) struct CardDavClient {
@@ -144,6 +138,19 @@ impl fmt::Debug for CardDavClient {
 }
 
 impl CardDavClient {
+    #[cfg(test)]
+    pub(crate) async fn move_resource(
+        &self,
+        from: &str,
+        to: &str,
+        operation: AccountOperation,
+    ) -> Result<bool, AccountError> {
+        self.dav.move_resource(from, to, operation).await
+    }
+    pub(crate) fn collection_dispatch(&self) -> &DavDispatch {
+        &self.dav
+    }
+
     /// A client view whose buffered requests feed only this stream's tally.
     pub(crate) fn metered(&self) -> (Self, bifrost_dav_core::DavByteTally) {
         let (dav, tally) = self.dav.metered();
@@ -340,7 +347,7 @@ impl CardDavClient {
             .await?;
         let mut listing = parse_propfind_contacts(&response.text)
             .map_err(|error| parse_error(operation, format!("contact list: {error}")))?;
-        listing.resolve_hrefs(&response.url);
+        listing.resolve_hrefs_with(&response.url, CardDavDialect::resolve_href);
         if let Some(error) = listing_failure(&listing, operation) {
             return Err(error);
         }
@@ -353,115 +360,9 @@ impl CardDavClient {
         uris: &[String],
         operation: AccountOperation,
     ) -> Result<MultigetFetch, AccountError> {
-        let mut all_results = CardDavMultigetReport::default();
-        let mut degraded = None;
-        let bodies = uris
-            .chunks(MULTIGET_BATCH_SIZE)
-            .map(|chunk| {
-                let mut href_elements = String::new();
-                for uri in chunk {
-                    href_elements.push_str("  <D:href>");
-                    href_elements.push_str(&escape_xml(uri));
-                    href_elements.push_str("</D:href>\n");
-                }
-
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-<C:addressbook-multiget xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\">\n\
-  <D:prop>\n\
-    <D:resourcetype/>\n\
-    <D:getetag/>\n\
-    <C:address-data/>\n\
-  </D:prop>\n\
-{href_elements}</C:addressbook-multiget>"
-                );
-                body
-            })
-            .collect::<Vec<_>>();
-        let legs: Vec<_> = bodies
-            .iter()
-            .map(|body| {
-                self.run_leg(MultigetLeg {
-                    url: addressbook_url,
-                    depth: bifrost_dav_core::Depth::Zero,
-                    body,
-                    operation,
-                    context: "multiget",
-                })
-            })
-            .collect();
-        let mut legs =
-            futures::StreamExt::buffered(futures::stream::iter(legs), MULTIGET_LEG_CONCURRENCY);
-        while let Some((report, error)) = futures::StreamExt::next(&mut legs).await {
-            all_results.extend(report);
-            if let Some(error) = error {
-                degraded = worse_recovery(degraded, error);
-            }
-        }
-        MultigetFetch::settle(all_results, degraded)
-    }
-
-    /// Run one REPORT leg of a multi-leg fetch and fold its outcome into the
-    /// caller's accumulators.
-    ///
-    /// This is the only way a leg result enters `all_results`, and it is what
-    /// makes the partial-result contract structural rather than a habit. A leg
-    /// can fail four ways - transport, a non-2xx status, a body that will not
-    /// parse, and a 207 that describes complete failure - and all four land in
-    /// `degraded` here. Routing only some of them (the shape this replaced
-    /// classified the HTTP failure but kept `?` on the parse) meant a malformed
-    /// body on chunk 3 of 40 threw away chunks 1 and 2, which is exactly the
-    /// loss the degraded lane exists to prevent. The function returns nothing,
-    /// so a leg added later has no unrouted path available to it.
-    ///
-    /// A malformed body is account-authored data, so it is classified and
-    /// survived, never asserted on. `MultigetFetch::settle` is what turns "every
-    /// leg failed and nothing materialized anywhere" back into an `Err` carrying
-    /// the worst recovery class seen.
-    ///
-    /// The CalDAV twin of this function must stay in step with it.
-    async fn accumulate_leg(
-        &self,
-        leg: MultigetLeg<'_>,
-        all_results: &mut CardDavMultigetReport,
-        degraded: &mut Option<AccountError>,
-    ) {
-        let MultigetLeg {
-            url,
-            depth,
-            body,
-            operation,
-            context,
-        } = leg;
-        let response = match self.dav.report_raw(url, depth, body, operation).await {
-            Ok(response) => response,
-            Err(error) => {
-                *degraded = worse_recovery(degraded.take(), error);
-                return;
-            }
-        };
-        let mut parsed = match parse_multiget_report(&response.text) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                *degraded = worse_recovery(
-                    degraded.take(),
-                    parse_error(operation, format!("{context}: {error}")),
-                );
-                return;
-            }
-        };
-        parsed.resolve_hrefs(&response.url);
-        if let Some(error) = multiget_failure(&parsed, operation) {
-            *degraded = worse_recovery(degraded.take(), error);
-        }
-        all_results.extend(parsed);
-    }
-
-    async fn run_leg(&self, leg: MultigetLeg<'_>) -> (CardDavMultigetReport, Option<AccountError>) {
-        let mut report = CardDavMultigetReport::default();
-        let mut degraded = None;
-        self.accumulate_leg(leg, &mut report, &mut degraded).await;
-        (report, degraded)
+        DavCollectionClient::<CardDavDialect>::new(&self.dav)
+            .fetch(addressbook_url, uris, operation)
+            .await
     }
 
     /// The text-search lane's server-side prefilter, one REPORT per property,
@@ -485,84 +386,9 @@ impl CardDavClient {
     ) -> Result<FilteredHrefs, AccountError> {
         let bodies = ["FN", "N", "EMAIL", "TEL", "ADR", "ORG", "TITLE", "NOTE"]
             .map(|property| addressbook_text_query_body(property, query));
-        let legs: Vec<_> = bodies
-            .iter()
-            .map(|body| self.href_query_leg(addressbook_url, body, AccountOperation::ContactSearch))
-            .collect();
-        let mut legs =
-            futures::StreamExt::buffered(futures::stream::iter(legs), MULTIGET_LEG_CONCURRENCY);
-        let mut merged = HrefQuery::default();
-        let mut unsupported = false;
-        while let Some(leg) = futures::StreamExt::next(&mut legs).await {
-            match leg {
-                HrefLeg::Listing(listing) => extend_candidates(&mut merged, listing),
-                HrefLeg::FilterUnsupported => unsupported = true,
-                HrefLeg::Failed(error) => {
-                    merged.degraded = worse_recovery(merged.degraded.take(), error);
-                }
-            }
-        }
-        if unsupported {
-            return Ok(FilteredHrefs::FilterUnsupported);
-        }
-        merged.settle().map(FilteredHrefs::Matched)
-    }
-
-    /// Run one filtered `addressbook-query` leg, separating "the server will not
-    /// run this filter" from every other way the leg can fail.
-    ///
-    /// The status has to be read before it becomes an error, which is why this
-    /// goes through `report_raw_response` rather than `report_raw`: a 403 naming
-    /// `CARDDAV:supported-filter` is a degrade signal, and a 403 naming nothing
-    /// is still a permission refusal.
-    async fn href_query_leg(
-        &self,
-        addressbook_url: &str,
-        body: &str,
-        operation: AccountOperation,
-    ) -> HrefLeg {
-        let response = match self
-            .dav
-            .report_raw_response(
-                addressbook_url,
-                bifrost_dav_core::Depth::One,
-                body,
-                operation,
-            )
+        DavCollectionClient::<CardDavDialect>::new(&self.dav)
+            .query_text(addressbook_url, &bodies, AccountOperation::ContactSearch)
             .await
-        {
-            Ok(response) => response,
-            Err(error) => return HrefLeg::Failed(error),
-        };
-        if !response.status.is_success() {
-            return if filter_unsupported(response.status, &response.body) {
-                HrefLeg::FilterUnsupported
-            } else {
-                HrefLeg::Failed(status_error(
-                    &response.headers,
-                    operation,
-                    response.status,
-                    response.body,
-                ))
-            };
-        }
-        let mut listing = match parse_propfind_contacts(&response.body) {
-            Ok(listing) => listing,
-            Err(error) => {
-                return HrefLeg::Failed(parse_error(operation, format!("query: {error}")));
-            }
-        };
-        listing.resolve_hrefs(&response.url);
-        // A 207 in which EVERY response failed is a complete failure, not an
-        // empty candidate set: the candidate lane is read by the listing
-        // parser, and until its failure lane carried statuses this arm could
-        // only report the hrefs, so an all-refused query came back as an empty
-        // page and a consumer recorded a completed walk over a collection it
-        // had been refused.
-        match listing_failure(&listing, operation) {
-            Some(error) => HrefLeg::Failed(error),
-            None => HrefLeg::Listing(listing),
-        }
     }
 
     /// Directory queries never enumerate or locally narrow the server's answer.
@@ -605,7 +431,7 @@ impl CardDavClient {
     /// Fetch one vCard resource with a plain `GET`, reading the validator from
     /// the `ETag` response header.
     ///
-    /// Twin of `bifrost-caldav`'s `get_event`; keep them in step. Single-resource
+    /// Single-resource reads use the shared collection client. Their
     /// reads used to go through `addressbook-multiget` against the collection
     /// DERIVED from the resource URL, which is strictly more fragile: it depends
     /// on the derived parent actually being the collection the server believes
@@ -618,31 +444,9 @@ impl CardDavClient {
         url: &str,
         operation: AccountOperation,
     ) -> Result<CardDavFetchedVCard, AccountError> {
-        let request = self
-            .dav
-            .request(Method::GET, url)
-            .replay(bifrost_net::ReplayPolicy::Idempotent);
-        let response = self.dav.send_raw_request(request, operation).await?;
-        let status = response.status;
-        let etag = response
-            .headers
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(normalize_http_etag);
-        if status.is_success() {
-            Ok(CardDavFetchedVCard {
-                uri: url.to_string(),
-                etag,
-                data: response.body,
-            })
-        } else {
-            Err(status_error(
-                &response.headers,
-                operation,
-                status,
-                response.body,
-            ))
-        }
+        DavCollectionClient::<CardDavDialect>::new(&self.dav)
+            .get(url, operation)
+            .await
     }
 
     pub(crate) async fn put_vcard(
@@ -653,45 +457,9 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         self.refuse_directory_access(url, operation)?;
-        let mut request = self
-            .dav
-            .request(Method::PUT, url)
-            .replay(bifrost_net::ReplayPolicy::IdempotentUnlessConditional)
-            .header(CONTENT_TYPE, "text/vcard; charset=utf-8")
-            .body(body);
-        // A create-PUT replayed after its first attempt committed answers 412,
-        // which reads as a conflict and invites re-creating the card under a
-        // new UUID, so it is `Never`. An `If-Match` update replayed the same way
-        // answers 412 against the caller's own write; the
-        // `IdempotentUnlessConditional` declaration makes it unreplayable
-        // through its precondition, so a drop reconciles (read-back) even when
-        // the validator was fetched by the account itself. An unconditional
-        // PUT is an absolute write to a known URL and stays replayable.
-        // Unlike `bifrost-caldav`'s `put_event`, no scheduling side effect
-        // applies to a vCard.
-        if matches!(&condition, PutCondition::IfNoneMatch) {
-            request = request.replay(bifrost_net::ReplayPolicy::Never);
-        }
-        if let Some((name, value)) = condition.header() {
-            request = request.header(name, value);
-        }
-        self.send_status_request(request, operation).await
-    }
-
-    /// WebDAV `MOVE` of one resource into another collection.
-    ///
-    /// Twin of `bifrost-caldav`'s `move_resource`; keep them in step. See there
-    /// for why `Overwrite: F`, why the destination is credential-gated, and why
-    /// only 405/501 are fallback triggers.
-    pub(crate) async fn move_resource(
-        &self,
-        from: &str,
-        to: &str,
-        operation: AccountOperation,
-    ) -> Result<bool, AccountError> {
-        self.refuse_directory_access(from, operation)?;
-        self.refuse_directory_access(to, operation)?;
-        self.dav.move_resource(from, to, operation).await
+        DavCollectionClient::<CardDavDialect>::new(&self.dav)
+            .put(url, body, condition, operation)
+            .await
     }
 
     /// Conditional delete never silently drops a caller's validator.
@@ -702,15 +470,9 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
         self.refuse_directory_access(url, operation)?;
-        let etag = bifrost_types::ServerVersion::ETag(etag.into());
-        let etag = etag.expected_etag(bifrost_types::error::Protocol::CardDav, operation, true)?;
-        let etag = prepare_if_match(etag).expect("validated strong entity tag");
-        let request = self
-            .dav
-            .request(Method::DELETE, url)
-            .replay(bifrost_net::ReplayPolicy::Never)
-            .header("If-Match", etag);
-        self.dav.send_status_request(request, operation).await
+        DavCollectionClient::<CardDavDialect>::new(&self.dav)
+            .delete_if_match(url, etag, operation)
+            .await
     }
 
     /// `DELETE` one vCard resource. Replayable, and a target already gone is a
@@ -725,60 +487,9 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         self.refuse_directory_access(url, operation)?;
-        let request = self
-            .dav
-            .request(Method::DELETE, url)
-            .replay(bifrost_net::ReplayPolicy::IdempotentUnlessConditional);
-        let response = self.dav.send_raw_request(request, operation).await?;
-        if bifrost_dav_core::delete_target_already_gone(response.status) {
-            return Ok(None);
-        }
-        let etag = response
-            .headers
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(normalize_http_etag);
-        if response.status.is_success() {
-            Ok(etag)
-        } else {
-            Err(status_error(
-                &response.headers,
-                operation,
-                response.status,
-                response.body,
-            ))
-        }
-    }
-
-    /// A status-only request that also hands back the response ETag.
-    ///
-    /// Deliberately NOT `DavDispatch::send_status_request`, which discards the
-    /// response. This is a real divergence from `bifrost-caldav` rather than
-    /// drift: CardDAV's `put_vcard` and `delete_vcard` return the new validator
-    /// to their callers, and CalDAV's equivalents return `()`. Collapsing the
-    /// two during the dav-core extraction would have silently dropped the etag
-    /// every CardDAV write reports.
-    async fn send_status_request(
-        &self,
-        request: DavRequest,
-        operation: AccountOperation,
-    ) -> Result<Option<String>, AccountError> {
-        let response = self.dav.send_raw_request(request, operation).await?;
-        let etag = response
-            .headers
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(normalize_http_etag);
-        if response.status.is_success() {
-            Ok(etag)
-        } else {
-            Err(status_error(
-                &response.headers,
-                operation,
-                response.status,
-                response.body,
-            ))
-        }
+        DavCollectionClient::<CardDavDialect>::new(&self.dav)
+            .delete(url, operation)
+            .await
     }
 
     pub(crate) fn observe_directories(&self, urls: impl IntoIterator<Item = String>) {
@@ -837,21 +548,6 @@ fn directory_refusal(operation: AccountOperation, url: &str) -> AccountError {
         .expect("directory scope preserves Unsupported classification")
 }
 
-/// Whether a URL's scheme carries an authenticated, encrypted transport.
-///
-/// Only `https` qualifies; an unparseable URL is treated as insecure so the
-/// downgrade check fails closed.
-/// The prop skeleton the filtered query asks for.
-///
-/// Deliberately WITHOUT `address-data`: the filtered lane pages on the href and
-/// hydrates only the page, so a query that answered with bodies would put the
-/// whole matching result set on the wire once per page. Twin of the CalDAV
-/// constant of the same name.
-const QUERY_HREF_PROPS: &str = "  <D:prop>\n\
-    <D:resourcetype/>\n\
-    <D:getetag/>\n\
-  </D:prop>\n";
-
 fn addressbook_text_query_body(property: &str, query: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
@@ -868,81 +564,24 @@ fn addressbook_text_query_body(property: &str, query: &str) -> String {
     )
 }
 
-/// A multi-REPORT fetch: everything that came back usable, plus the
-/// recovery classification of any single REPORT that failed wholly.
-///
-/// Multiget is chunked and text search runs one REPORT per property, so a
-/// walk can meet a 401, 403, or 503 on one leg after other legs already
-/// returned cards. Aborting the whole call throws those cards away;
-/// folding the refusal into anonymous `failed_ids` throws the RECOVERY
-/// signal away, and the consumer can no longer tell "reauthorize" from
-/// "retry later" from "this resource is gone". So each REPORT is
-/// classified where it happens, and the worst class survives to the
-/// caller in `degraded`, which the account layer publishes as a
-/// `Page::skipped_scopes` entry: the walk did not finish this collection.
-/// One REPORT leg of a multi-leg fetch, as handed to `accumulate_leg`.
-struct MultigetLeg<'a> {
-    url: &'a str,
-    depth: bifrost_dav_core::Depth,
-    body: &'a str,
-    operation: AccountOperation,
-    /// Names the leg in a parse-failure message ("multiget", "query").
-    context: &'a str,
-}
-
-pub(crate) struct MultigetFetch {
-    pub(crate) report: CardDavMultigetReport,
-    pub(crate) degraded: Option<AccountError>,
-}
-
 /// Fold one listing's committed and refused hrefs into a candidate set.
 ///
 /// The listing lane merges one, the text lane eight, and they differ in nothing
 /// else. Twin of the CalDAV function of the same name.
-pub(crate) fn extend_candidates(query: &mut HrefQuery, listing: CardDavContactListing) {
-    let failed_hrefs = listing.failed_hrefs();
-    query.extend(
-        listing.entries.into_iter().map(|entry| entry.uri),
-        failed_hrefs,
-    );
-}
-
-/// One leg of a filtered query, before the lane decides what to do with it.
-enum HrefLeg {
-    Listing(CardDavContactListing),
-    FilterUnsupported,
-    Failed(AccountError),
-}
-
-impl MultigetFetch {
-    /// A wholly-failed fetch with nothing usable anywhere is still a failed
-    /// call: there is no partial result to preserve, so it keeps riding the
-    /// `Err` arm with its original classification. "Nothing usable" means no
-    /// observations of ANY kind - a successful leg that reported all its
-    /// resources 404 (genuine deletions in `failed`) or data-less
-    /// (`missing_data`) has still answered for those resources, and a
-    /// degraded sibling leg must not throw those verdicts away and force the
-    /// caller to re-walk them.
-    fn settle(
-        report: CardDavMultigetReport,
-        degraded: Option<AccountError>,
-    ) -> Result<Self, AccountError> {
-        let no_observations =
-            report.cards.is_empty() && report.failed.is_empty() && report.missing_data.is_empty();
-        match degraded {
-            Some(error) if no_observations => Err(error),
-            degraded => Ok(Self { report, degraded }),
-        }
-    }
+pub(crate) fn extend_candidates(
+    query: &mut HrefQuery,
+    listing: crate::parse::CardDavContactListing,
+) {
+    listing.extend_candidates(query);
 }
 
 /// Keep whichever failure demands the more drastic recovery, so a 503 on
 /// one chunk cannot hide a 401 on another.
 fn multiget_failure(
-    report: &CardDavMultigetReport,
+    report: &crate::parse::CardDavMultigetReport,
     operation: AccountOperation,
 ) -> Option<AccountError> {
-    complete_failure_error(report.classify(), report.failed.len(), operation)
+    complete_failure_error::<CardDavDialect>(report.classify(), report.failed.len(), operation)
 }
 
 /// The same ladder for a LISTING 207 - the depth-1 PROPFIND, the snapshot poll,
@@ -954,68 +593,14 @@ fn multiget_failure(
 /// reason other than the resource being gone, becomes an error. Twin of the
 /// CalDAV function of the same name.
 fn listing_failure(
-    listing: &CardDavContactListing,
+    listing: &crate::parse::CardDavContactListing,
     operation: AccountOperation,
 ) -> Option<AccountError> {
-    complete_failure_error(listing.classify(), listing.failed.len(), operation)
-}
-
-fn complete_failure_error(
-    outcome: MultigetOutcome,
-    failed: usize,
-    operation: AccountOperation,
-) -> Option<AccountError> {
-    match outcome {
-        MultigetOutcome::Usable => None,
-        MultigetOutcome::CompleteFailure { status } => {
-            // Only readable refusals can fail a complete response. Preserve
-            // their actual status rather than inventing a server failure.
-            let code = status;
-            Some(status_error(
-                &reqwest::header::HeaderMap::new(),
-                operation,
-                code,
-                format!("multi-status body reported failure for all {failed} resources"),
-            ))
-        }
-    }
-}
-
-pub(crate) fn unsupported_error(operation: AccountOperation) -> AccountError {
-    bifrost_dav_core::unsupported_error(operation, DAV)
-}
-
-pub(crate) fn local_error(operation: AccountOperation, message: impl Into<String>) -> AccountError {
-    bifrost_dav_core::local_error(operation, message, DAV)
-}
-
-pub(crate) fn parse_error(operation: AccountOperation, message: impl Into<String>) -> AccountError {
-    bifrost_dav_core::parse_error(operation, message, DAV)
-}
-
-/// Only the account layer's tests mint one directly now; production transport
-/// failures come back already classified from `DavDispatch`.
-#[cfg(test)]
-pub(crate) fn transport_error(
-    operation: AccountOperation,
-    message: impl Into<String>,
-) -> AccountError {
-    bifrost_dav_core::transport_error(operation, message, DAV)
-}
-
-pub(crate) fn status_error(
-    headers: &reqwest::header::HeaderMap,
-    operation: AccountOperation,
-    status: reqwest::StatusCode,
-    body: String,
-) -> AccountError {
-    bifrost_dav_core::status_error(headers, operation, status, body, DAV)
+    complete_failure_error::<CardDavDialect>(listing.classify(), listing.failed.len(), operation)
 }
 
 pub(crate) fn contact_scope(id: impl Into<String>) -> ErrorScope {
-    ErrorScope::Contact {
-        id: (id.into()).into(),
-    }
+    CardDavDialect::item_scope(id.into())
 }
 
 /// Scope the server's own not-found answer to the contact it names.
@@ -1153,7 +738,7 @@ mod tests {
     use bifrost_dav_core::DavResponse;
     use bifrost_dav_core::test_support::{
         dav_dropped_after_send, dav_redirect, dav_retried, dav_script, dav_script_empty,
-        dav_script_yielding, scripted_dav_net, transcripts,
+        scripted_dav_net, transcripts,
     };
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
     use bifrost_types::ReconcileAction;
@@ -1216,7 +801,8 @@ mod tests {
                     status: StatusCode::OK,
                     headers,
                     body: "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:One\r\nEND:VCARD\r\n".to_string(),
-                    url: String::new(),
+                    url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                        .expect("test DAV URL"),
                 },
                 DavResponse {
                     status: if expected.is_some() {
@@ -1226,7 +812,8 @@ mod tests {
                     },
                     headers: HeaderMap::new(),
                     body: String::new(),
-                    url: String::new(),
+                    url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                        .expect("test DAV URL"),
                 },
             ]);
             let client = Arc::new(CardDavClient::with_account_net(
@@ -1314,7 +901,8 @@ mod tests {
                 },
                 headers: HeaderMap::new(),
                 body: String::new(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             }]);
             let client = Arc::new(CardDavClient::with_account_net(
                 "https://dav.example.test",
@@ -1407,7 +995,8 @@ mod tests {
                 status,
                 headers,
                 body: String::new(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             }
         };
         for (script, requests, expected, label) in [
@@ -1539,7 +1128,8 @@ mod tests {
                 status: StatusCode::NO_CONTENT,
                 headers: HeaderMap::new(),
                 body: String::new(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             }
             .into(),
         ]);
@@ -1567,7 +1157,8 @@ mod tests {
                 status: StatusCode::NO_CONTENT,
                 headers: HeaderMap::new(),
                 body: String::new(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             }
             .into(),
         ]);
@@ -1595,7 +1186,8 @@ mod tests {
                 status: StatusCode::NO_CONTENT,
                 headers,
                 body: String::new(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             }),
         ]);
         let client =
@@ -1630,7 +1222,8 @@ mod tests {
             status: StatusCode::NO_CONTENT,
             headers: HeaderMap::new(),
             body: String::new(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let script = dav_script([deleted(), deleted()]);
         let client =
@@ -1680,7 +1273,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: body.to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         // Only two responses are scripted. A regression that re-lists the home
         // starves the script and fails loudly here rather than silently
@@ -1732,7 +1326,7 @@ mod tests {
         .expect("snapshot");
 
         // The known ctag survived into the snapshot without being refetched.
-        assert_eq!(snapshot.ctag.as_deref(), Some("ctag-7"));
+        assert_eq!(snapshot.token.as_deref(), Some("ctag-7"));
 
         let requests = transcripts(&script);
         assert_eq!(
@@ -1767,7 +1361,7 @@ mod tests {
               </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
             </D:multistatus>"#
                 .to_string(),
-            url: addressbook.to_string(),
+            url: bifrost_dav_core::DavHref::parse(addressbook).expect("test DAV URL"),
         }]);
         let client =
             CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
@@ -1880,7 +1474,8 @@ mod tests {
             status: StatusCode::OK,
             headers,
             body: "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ada Lovelace\r\nEND:VCARD\r\n".to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         }]);
         let client = Arc::new(CardDavClient::with_account_net(
             "https://dav.example.test",
@@ -1928,7 +1523,8 @@ mod tests {
             status: StatusCode::NOT_FOUND,
             headers: HeaderMap::new(),
             body: EXPLANATION.to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         }]);
         let client = Arc::new(CardDavClient::with_account_net(
             "https://dav.example.test",
@@ -1995,7 +1591,8 @@ mod tests {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             body: MALFORMED.to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let script = dav_script([malformed(), malformed()]);
         let client = Arc::new(CardDavClient::with_account_net(
@@ -2066,7 +1663,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         }]);
         let client = Arc::new(CardDavClient::with_account_net(
             "https://dav.example.test",
@@ -2164,7 +1762,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: body.to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let script = dav_script([
             response("<D:multistatus xmlns:D=\"DAV:\"/>"),
@@ -2209,7 +1808,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: body.to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let script = dav_script([
             response(
@@ -2258,19 +1858,22 @@ mod tests {
                 status: StatusCode::OK,
                 headers: HeaderMap::new(),
                 body: "<html><body><p>It works!</body></html>".to_string(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             },
             DavResponse {
                 status: StatusCode::MULTI_STATUS,
                 headers: HeaderMap::new(),
                 body: "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>".to_string(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             },
             DavResponse {
                 status: StatusCode::MULTI_STATUS,
                 headers: HeaderMap::new(),
                 body: "<C:addressbook-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:href>/books/ada/</D:href></C:addressbook-home-set>".to_string(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             },
         ]);
         let client =
@@ -2309,7 +1912,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: body.to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let script = dav_script([
             response("<D:multistatus xmlns:D=\"DAV:\"/>"),
@@ -2352,7 +1956,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body,
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         dav_script([
             response(
@@ -2417,13 +2022,15 @@ mod tests {
                 status: StatusCode::MOVED_PERMANENTLY,
                 headers: redirect_headers,
                 body: String::new(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             },
             DavResponse {
                 status: StatusCode::MULTI_STATUS,
                 headers: HeaderMap::new(),
                 body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>team/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:addressbook/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             },
         ]);
         let mut client =
@@ -2470,7 +2077,8 @@ mod tests {
             status: StatusCode::FOUND,
             headers: redirect_headers,
             body: String::new(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         }]);
         let client =
             CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
@@ -2494,14 +2102,16 @@ mod tests {
                 status: StatusCode::TEMPORARY_REDIRECT,
                 headers,
                 body: String::new(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             });
         }
         responses.push(DavResponse {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             body: "ok".to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         });
         let script = dav_script(responses);
         let client =
@@ -2537,7 +2147,8 @@ mod tests {
                 status: StatusCode::MULTI_STATUS,
                 headers: HeaderMap::new(),
                 body: "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>one.vcf</D:href><D:propstat><D:prop><D:getetag>\"e1\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             }
             .into(),
         ]);
@@ -2608,7 +2219,8 @@ mod tests {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             body: "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:One\r\nEND:VCARD\r\n".to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let contact =
             || bifrost_types::ContactId("https://dav.example.test/books/work/one.vcf".to_string());
@@ -2624,7 +2236,8 @@ mod tests {
                 status: StatusCode::CREATED,
                 headers: HeaderMap::new(),
                 body: String::new(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             },
         ]);
         let client = Arc::new(CardDavClient::with_account_net(
@@ -2670,7 +2283,8 @@ mod tests {
                 status: StatusCode::NO_CONTENT,
                 headers: HeaderMap::new(),
                 body: String::new(),
-                url: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
             },
         ]);
         let client = Arc::new(CardDavClient::with_account_net(
@@ -2703,7 +2317,8 @@ mod tests {
             status,
             headers: HeaderMap::new(),
             body: body.to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let script = dav_script(
             [
@@ -2779,7 +2394,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>/book/one.vcf</D:href><D:propstat><D:prop><C:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:One\nEND:VCARD</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         }]);
         let client =
             CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
@@ -2794,7 +2410,7 @@ mod tests {
             .expect("scripted multiget succeeds");
 
         assert_eq!(
-            fetched.report.cards[0].uri,
+            fetched.report.items[0].uri,
             "https://dav.example.test/book/one.vcf"
         );
         let requests = transcripts(&script);
@@ -2829,68 +2445,12 @@ mod tests {
     /// mark measures what the net pipeline holds open.
     #[tokio::test]
     async fn multiget_never_holds_more_legs_open_than_the_concurrency_bound() {
-        let chunks = 10;
-        let script = dav_script_yielding((0..chunks).map(|_| DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: "<D:multistatus xmlns:D=\"DAV:\"></D:multistatus>".to_string(),
-            url: String::new(),
-        }));
-        let client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-        let uris = (0..MULTIGET_BATCH_SIZE * chunks)
-            .map(|index| format!("https://dav.example.test/book/{index}.vcf"))
-            .collect::<Vec<_>>();
-
-        client
-            .fetch_vcards(
-                "https://dav.example.test/book/",
-                &uris,
-                AccountOperation::ContactsList,
-            )
-            .await
-            .expect("empty multistatus legs are usable");
-
-        assert_eq!(script.peak_in_flight(), MULTIGET_LEG_CONCURRENCY);
+        bifrost_dav_core::test_support::collection::multiget_concurrency::<CardDavDialect>().await;
     }
 
     #[tokio::test]
     async fn chunked_multiget_keeps_prior_chunk_when_later_http_leg_fails() {
-        let good = DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>/book/one.vcf</D:href><D:propstat><D:prop><C:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:One\nEND:VCARD</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
-            url: "https://dav.example.test/book/".to_string(),
-        };
-        let refused = DavResponse {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            headers: HeaderMap::new(),
-            body: String::new(),
-            url: String::new(),
-        };
-        // The refused leg burns the whole retry budget before it degrades.
-        let script = dav_script(
-            std::iter::once(Canned::from(good))
-                .chain(dav_retried(refused))
-                .collect::<Vec<_>>(),
-        );
-        let client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-        let uris = (0..=MULTIGET_BATCH_SIZE)
-            .map(|index| format!("https://dav.example.test/book/{index}.vcf"))
-            .collect::<Vec<_>>();
-
-        let fetched = client
-            .fetch_vcards(
-                "https://dav.example.test/book/",
-                &uris,
-                AccountOperation::ContactsList,
-            )
-            .await
-            .expect("the usable first chunk survives");
-
-        assert_eq!(fetched.report.cards.len(), 1);
-        assert!(fetched.degraded.is_some());
+        bifrost_dav_core::test_support::collection::partial_multiget::<CardDavDialect>(true).await;
     }
 
     /// The adjacent leg-failure path, mirroring the CalDAV twin: a later chunk
@@ -2898,63 +2458,14 @@ mod tests {
     /// 503, not discard the chunks that already materialized.
     #[tokio::test]
     async fn chunked_multiget_keeps_prior_chunk_when_later_body_is_malformed() {
-        let good = DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>/book/one.vcf</D:href><D:propstat><D:prop><C:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:One\nEND:VCARD</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
-            url: "https://dav.example.test/book/".to_string(),
-        };
-        let malformed = DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: "<D:multistatus xmlns:D=\"DAV:\"><D:response></D:multistatus>".to_string(),
-            url: "https://dav.example.test/book/".to_string(),
-        };
-        let script = dav_script([good, malformed]);
-        let client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-        let uris = (0..=MULTIGET_BATCH_SIZE)
-            .map(|index| format!("https://dav.example.test/book/{index}.vcf"))
-            .collect::<Vec<_>>();
-
-        let fetched = client
-            .fetch_vcards(
-                "https://dav.example.test/book/",
-                &uris,
-                AccountOperation::ContactsList,
-            )
-            .await
-            .expect("the usable first chunk survives a malformed later chunk");
-
-        assert_eq!(fetched.report.cards.len(), 1);
-        assert!(fetched.degraded.is_some());
+        bifrost_dav_core::test_support::collection::partial_multiget::<CardDavDialect>(false).await;
     }
 
     /// Nothing usable anywhere is still a failed call, malformed or not.
     #[tokio::test]
     async fn an_only_leg_that_will_not_parse_is_still_an_error() {
-        let malformed = DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: "<D:multistatus xmlns:D=\"DAV:\"><D:response></D:multistatus>".to_string(),
-            url: "https://dav.example.test/book/".to_string(),
-        };
-        let script = dav_script([malformed]);
-        let client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        let outcome = client
-            .fetch_vcards(
-                "https://dav.example.test/book/",
-                &["https://dav.example.test/book/one.vcf".to_string()],
-                AccountOperation::ContactsList,
-            )
-            .await
-            .map(|fetched| fetched.report.cards.len());
-        let Err(error) = outcome else {
-            panic!("no usable result anywhere must stay an error");
-        };
-        assert_eq!(error.operation(), Some(AccountOperation::ContactsList));
+        bifrost_dav_core::test_support::collection::wholly_malformed_multiget::<CardDavDialect>()
+            .await;
     }
 
     /// Shared-shape guard against the CalDAV regression: a non-2xx REPORT must
@@ -2969,7 +2480,8 @@ mod tests {
             status: StatusCode::UNAUTHORIZED,
             headers: HeaderMap::new(),
             body: "<html><body>401 Unauthorized</body></html>".to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let script = dav_script([unauthorized(), unauthorized()]);
         let client =
@@ -3039,7 +2551,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         }]);
         let client =
             CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
@@ -3061,7 +2574,7 @@ mod tests {
     #[test]
     fn complete_multiget_failure_uses_embedded_status_classification() {
         let report = CardDavMultigetReport {
-            cards: Vec::new(),
+            items: Vec::new(),
             failed: vec![crate::parse::CardDavFailedResource {
                 href: "/contacts/one.vcf".to_string(),
                 status: Some(401),
@@ -3082,7 +2595,7 @@ mod tests {
     #[test]
     fn accumulated_multiget_success_keeps_a_later_refusal_per_resource() {
         let report = CardDavMultigetReport {
-            cards: vec![crate::parse::CardDavFetchedVCard {
+            items: vec![crate::parse::CardDavFetchedVCard {
                 uri: "/contacts/one.vcf".to_string(),
                 etag: None,
                 data: "BEGIN:VCARD\nEND:VCARD".to_string(),
@@ -3099,7 +2612,7 @@ mod tests {
 
     fn usable_report() -> CardDavMultigetReport {
         CardDavMultigetReport {
-            cards: vec![crate::parse::CardDavFetchedVCard {
+            items: vec![crate::parse::CardDavFetchedVCard {
                 uri: "/contacts/one.vcf".to_string(),
                 etag: None,
                 data: "BEGIN:VCARD\nEND:VCARD".to_string(),
@@ -3121,7 +2634,7 @@ mod tests {
         let fetch = MultigetFetch::settle(usable_report(), Some(refusal))
             .expect("a partial result is not a failed call");
 
-        assert_eq!(fetch.report.cards.len(), 1);
+        assert_eq!(fetch.report.items.len(), 1);
         assert_eq!(
             fetch.degraded.expect("the refusal survives").recovery(),
             &RecoveryClass::AuthLost
@@ -3266,7 +2779,8 @@ mod directory_guard_contract_tests {
             status: StatusCode::MULTI_STATUS,
             headers: Default::default(),
             body: String::new(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         }]);
         let mut client =
             CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));

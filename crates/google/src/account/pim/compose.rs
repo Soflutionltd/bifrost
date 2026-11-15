@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn send_as_rejected_unsupported() {
         let mut request = SendRequest::default();
-        request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
+        request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::PrincipalId(
             "shared@contoso.com".to_string(),
         )));
         let err = send_as_guard(&request).expect("send_as request must be rejected");

@@ -894,7 +894,7 @@ pub(crate) struct ScriptedDials {
 /// A pool connector that serves one in-memory session per greeting, in
 /// order, with the dial's leases handed to the driver at spawn. Every call
 /// is counted. A call with no greeting left fails the way a refused TCP
-/// connect does (`Error::Io`, unsent), which is retryable: a push worker
+/// connect does (`crate::error::TransportFailure::Io`, unsent), which is retryable: a push worker
 /// whose dial is refused backs off and redials, as it would against a real
 /// unreachable host, instead of latching a terminal push error the way an
 /// `Error::Internal` (an invariant violation, `InternalFailure`) would.
@@ -913,14 +913,14 @@ pub(crate) fn scripted_connector(
         let greeting = greetings.lock().unwrap().pop_front();
         let tx = tx.clone();
         async move {
-            let greeting = greeting.ok_or_else(|| crate::Error::Io {
-                source: Arc::new(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    "scripted connector has no session to dial",
-                )),
-                attempt: Some(crate::error::ImapAttempt::new(
-                    bifrost_types::TransmissionState::Unsent,
-                )),
+            let greeting = greeting.ok_or_else(|| crate::Error::Transport {
+                kind: crate::error::TransportFailure::Io(crate::error::IoFailure(Arc::new(
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "scripted connector has no session to dial",
+                    ),
+                ))),
+                attempt: Some(bifrost_types::TransmissionState::Unsent),
             })?;
             let (conn, server) =
                 crate::connection::test_support::driver_pair_leased(&greeting, &req.leases).await;

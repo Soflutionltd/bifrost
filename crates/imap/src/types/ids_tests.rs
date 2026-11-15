@@ -11,7 +11,7 @@ fn uid_rejects_zero() {
 
 #[test]
 fn uid_set_coalesces_numbers() {
-    let set = UidSet::from_uids([
+    let set = UidSetExpr::from_uids([
         Uid::new(5).unwrap(),
         Uid::new(1).unwrap(),
         Uid::new(2).unwrap(),
@@ -25,7 +25,7 @@ fn uid_set_coalesces_numbers() {
 // without a detour through one `Uid` per message.
 #[test]
 fn uid_set_from_ranges_emits_the_wire_form_directly() {
-    let set = UidSet::from_ranges(&[
+    let set = UidSetExpr::from_ranges([
         UidRange::range(1, 3),
         UidRange::single(7),
         UidRange::range(9, 10),
@@ -33,13 +33,10 @@ fn uid_set_from_ranges_emits_the_wire_form_directly() {
     .unwrap();
     assert_eq!(set.to_string(), "1:3,7,9:10");
 
-    assert!(UidSet::from_ranges(&[]).is_none());
-    // 0 is not a legal UID. Default remains an invalid internal value, and
-    // the reachable contract is "empty in, None out".
-    assert!(UidSet::from_ranges(&[UidRange::default()]).is_none());
+    assert!(UidSetExpr::from_ranges([]).is_none());
     // A degenerate range (end == start) is a single UID, not "4:4".
     assert_eq!(
-        UidSet::from_ranges(&[UidRange::range(4, 4)])
+        UidSetExpr::from_ranges([UidRange::range(4, 4)])
             .unwrap()
             .to_string(),
         "4",
@@ -48,33 +45,33 @@ fn uid_set_from_ranges_emits_the_wire_form_directly() {
 
 #[test]
 fn uid_set_static_sets_are_valid() {
-    assert_eq!(UidSet::all().to_string(), "1:*");
-    assert_eq!(UidSet::saved_search().to_string(), "$");
-    assert_eq!(UidSet::one(Uid::new(9).unwrap()).to_string(), "9");
+    assert_eq!(UidSetExpr::all().to_string(), "1:*");
+    assert_eq!(UidSetExpr::saved_search().to_string(), "$");
+    assert_eq!(UidSetExpr::one(Uid::new(9).unwrap()).to_string(), "9");
 }
 
 #[test]
 fn uid_set_parse_round_trips_raw_sequence_set() {
-    assert_eq!(UidSet::parse("7,9:11").unwrap().to_string(), "7,9:11");
-    assert_eq!(UidSet::parse("$").unwrap().to_string(), "$");
+    assert_eq!(UidSetExpr::parse("7,9:11").unwrap().to_string(), "7,9:11");
+    assert_eq!(UidSetExpr::parse("$").unwrap().to_string(), "$");
 }
 
 #[test]
 fn seq_set_keeps_sequence_semantics_separate() {
-    let set = SeqSet::range(Seq::new(3).unwrap(), Seq::new(8).unwrap());
+    let set = SeqSetExpr::range(Seq::new(3).unwrap(), Seq::new(8).unwrap());
     assert_eq!(set.to_string(), "3:8");
 }
 
 #[test]
 fn seq_set_static_sets_are_valid() {
-    assert_eq!(SeqSet::all().to_string(), "1:*");
-    assert_eq!(SeqSet::saved_search().to_string(), "$");
-    assert_eq!(SeqSet::one(Seq::new(1).unwrap()).to_string(), "1");
+    assert_eq!(SeqSetExpr::all().to_string(), "1:*");
+    assert_eq!(SeqSetExpr::saved_search().to_string(), "$");
+    assert_eq!(SeqSetExpr::one(Seq::new(1).unwrap()).to_string(), "1");
 }
 
 #[test]
 fn seq_set_coalesces_numbers() {
-    let set = SeqSet::from_seqs([
+    let set = SeqSetExpr::from_seqs([
         Seq::new(10).unwrap(),
         Seq::new(8).unwrap(),
         Seq::new(9).unwrap(),

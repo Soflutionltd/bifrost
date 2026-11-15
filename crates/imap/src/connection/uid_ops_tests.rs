@@ -55,13 +55,18 @@ async fn uid_expunge_requires_uidplus_or_rev2() {
     let without = selected(vec![Capability::Imap4Rev1]);
     assert!(matches!(
         without.uid_expunge(&set("1:5"), T).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     // RFC 9051 Appendix E item 3: rev2 folds UIDPLUS into the base set.
     let rev2 = selected(vec![Capability::Imap4Rev2]);
     assert!(matches!(
         rev2.uid_expunge(&set("1:5"), T).await,
-        Err(Error::DriverGone { .. })
+        Err(Error::Transport {
+            kind: crate::error::TransportFailure::DriverGone,
+            ..
+        })
     ));
 }
 
@@ -71,7 +76,7 @@ async fn uid_move_without_move_or_uidplus_is_refused() {
     // messages, so the fallback is refused outright rather than guessed.
     let conn = selected(vec![Capability::Imap4Rev1]);
     match conn.uid_move_messages(&set("1:5"), "Archive", T).await {
-        Err(Error::MissingCapability(msg)) => {
+        Err(Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(msg))) => {
             assert!(msg.contains("MOVE"), "unexpected message: {msg}");
             assert!(msg.contains("UIDPLUS"), "unexpected message: {msg}");
         }
@@ -85,7 +90,9 @@ async fn move_by_sequence_requires_move_or_rev2() {
     let conn = selected(vec![Capability::Imap4Rev1, Capability::UidPlus]);
     assert!(matches!(
         conn.move_messages(&set("1:5"), "Archive", T).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }
 
@@ -94,9 +101,16 @@ async fn uid_fetch_vanished_requires_qresync_enabled() {
     // RFC 7162 Section 3.2.6: advertised is not enough, it must be ENABLEd.
     let conn = selected(vec![Capability::QResync]);
     assert!(matches!(
-        conn.uid_fetch_vanished(&set("1:5"), &[FetchAttr::Uid], 10, T)
-            .await,
-        Err(Error::InvalidState(_))
+        conn.uid_fetch_vanished(
+            &set("1:5"),
+            &[FetchAttr::Uid],
+            crate::types::ModSeq::new(10).expect("valid protocol test value"),
+            T
+        )
+        .await,
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidState(_)
+        ))
     ));
     let enabled = detached(
         SessionState::Selected,
@@ -105,9 +119,17 @@ async fn uid_fetch_vanished_requires_qresync_enabled() {
     );
     assert!(matches!(
         enabled
-            .uid_fetch_vanished(&set("1:5"), &[FetchAttr::Uid], 10, T)
+            .uid_fetch_vanished(
+                &set("1:5"),
+                &[FetchAttr::Uid],
+                crate::types::ModSeq::new(10).expect("valid protocol test value"),
+                T
+            )
             .await,
-        Err(Error::DriverGone { .. })
+        Err(Error::Transport {
+            kind: crate::error::TransportFailure::DriverGone,
+            ..
+        })
     ));
     // The ENABLED echo is kept as the server spelled it, and RFC 9051
     // Section 9 makes the extension name an atom. A server echoing
@@ -121,9 +143,17 @@ async fn uid_fetch_vanished_requires_qresync_enabled() {
     );
     assert!(matches!(
         odd_case
-            .uid_fetch_vanished(&set("1:5"), &[FetchAttr::Uid], 10, T)
+            .uid_fetch_vanished(
+                &set("1:5"),
+                &[FetchAttr::Uid],
+                crate::types::ModSeq::new(10).expect("valid protocol test value"),
+                T
+            )
             .await,
-        Err(Error::DriverGone { .. })
+        Err(Error::Transport {
+            kind: crate::error::TransportFailure::DriverGone,
+            ..
+        })
     ));
 }
 
@@ -133,20 +163,28 @@ async fn saved_search_reference_requires_searchres() {
     let conn = selected(vec![Capability::Imap4Rev1]);
     assert!(matches!(
         conn.uid_fetch(&set("$"), &[FetchAttr::Uid], T).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         conn.uid_copy(&set("$"), "Archive", T).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         conn.uid_store(&set("$"), StoreOperation::Add, &[Flag::Seen], None, T)
             .await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         conn.uid_expunge(&set("$"), T).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }
 
@@ -154,19 +192,41 @@ async fn saved_search_reference_requires_searchres() {
 async fn changed_since_requires_condstore() {
     let conn = selected(vec![Capability::Imap4Rev2]);
     assert!(matches!(
-        conn.uid_fetch_changed_since(&set("1:5"), &[FetchAttr::Uid], 5, T)
-            .await,
-        Err(Error::MissingCapability(_))
+        conn.uid_fetch_changed_since(
+            &set("1:5"),
+            &[FetchAttr::Uid],
+            crate::types::ModSeq::new(5).expect("valid protocol test value"),
+            T
+        )
+        .await,
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
-        conn.uid_store(&set("1:5"), StoreOperation::Add, &[Flag::Seen], Some(5), T)
-            .await,
-        Err(Error::MissingCapability(_))
+        conn.uid_store(
+            &set("1:5"),
+            StoreOperation::Add,
+            &[Flag::Seen],
+            Some(crate::types::ModSeqValzer::new(5).expect("valid protocol test value")),
+            T
+        )
+        .await,
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
-        conn.fetch_changed_since(&set("1:5"), &[FetchAttr::Uid], 5, T)
-            .await,
-        Err(Error::MissingCapability(_))
+        conn.fetch_changed_since(
+            &set("1:5"),
+            &[FetchAttr::Uid],
+            crate::types::ModSeq::new(5).expect("valid protocol test value"),
+            T
+        )
+        .await,
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }
 
@@ -179,16 +239,27 @@ async fn message_commands_require_a_selected_mailbox() {
     );
     assert!(matches!(
         conn.uid_fetch(&set("1:5"), &[FetchAttr::Uid], T).await,
-        Err(Error::InvalidState(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidState(_)
+        ))
     ));
-    assert!(matches!(conn.expunge(T).await, Err(Error::InvalidState(_))));
+    assert!(matches!(
+        conn.expunge(T).await,
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidState(_)
+        ))
+    ));
     assert!(matches!(
         conn.uid_search("ALL", T).await,
-        Err(Error::InvalidState(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidState(_)
+        ))
     ));
     assert!(matches!(
         conn.uid_copy(&set("1:5"), "Archive", T).await,
-        Err(Error::InvalidState(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidState(_)
+        ))
     ));
 }
 
@@ -197,12 +268,17 @@ async fn esearch_requires_the_capability_or_rev2() {
     let rev1 = selected(vec![Capability::Imap4Rev1]);
     assert!(matches!(
         rev1.uid_search_esearch("ALL", &["COUNT"], T).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     let rev2 = selected(vec![Capability::Imap4Rev2]);
     assert!(matches!(
         rev2.uid_search_esearch("ALL", &["COUNT"], T).await,
-        Err(Error::DriverGone { .. })
+        Err(Error::Transport {
+            kind: crate::error::TransportFailure::DriverGone,
+            ..
+        })
     ));
 }
 
@@ -212,7 +288,9 @@ async fn esearch_save_return_option_requires_searchres() {
     let conn = selected(vec![Capability::Imap4Rev1, Capability::Esearch]);
     assert!(matches!(
         conn.uid_search_esearch("ALL", &["SAVE"], T).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }
 
@@ -221,11 +299,15 @@ async fn search_save_requires_searchres() {
     let conn = selected(vec![Capability::Imap4Rev1, Capability::Esearch]);
     assert!(matches!(
         conn.search_save("ALL", T).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         conn.uid_search_save("ALL", T).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }
 
@@ -239,11 +321,15 @@ async fn sort_requires_the_sort_capability() {
     let conn = selected(vec![Capability::Imap4Rev2]);
     assert!(matches!(
         conn.sort("DATE", "UTF-8", "ALL", T).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
     assert!(matches!(
         conn.uid_sort("DATE", "UTF-8", "ALL", T).await,
-        Err(Error::MissingCapability(_))
+        Err(Error::LocalRefusal(
+            crate::error::LocalRefusal::MissingCapability(_)
+        ))
     ));
 }
 
@@ -256,10 +342,13 @@ async fn thread_requires_the_matching_algorithm_capability() {
     // Algorithm names are upper-cased before the capability lookup.
     assert!(matches!(
         conn.thread("references", "UTF-8", "ALL", T).await,
-        Err(Error::DriverGone { .. })
+        Err(Error::Transport {
+            kind: crate::error::TransportFailure::DriverGone,
+            ..
+        })
     ));
     match conn.uid_thread("ORDEREDSUBJECT", "UTF-8", "ALL", T).await {
-        Err(Error::MissingCapability(msg)) => {
+        Err(Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(msg))) => {
             assert_eq!(
                 msg.capability,
                 Capability::from_imap_str("THREAD=ORDEREDSUBJECT")
@@ -302,7 +391,9 @@ fn sort_and_thread_inherit_the_search_criteria_gates() {
     ] {
         assert!(matches!(
             crate::connection::admit_for_encoding(&command, &opts),
-            Err(Error::MissingCapability(_))
+            Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::MissingCapability(_)
+            ))
         ));
     }
 }

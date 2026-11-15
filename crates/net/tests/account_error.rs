@@ -617,3 +617,82 @@ fn x_ms_ags_diagnostic_is_support_only() {
     assert_eq!(err.telemetry_fields().trace_id, None);
     assert!(support_text_contains(&err, "x-ms-ags-diagnostic"));
 }
+
+#[test]
+fn shared_http_status_precondition_and_payload_refusals() {
+    for (status, expected, primary) in [
+        (
+            412,
+            AccountErrorKind::ConcurrencyConflict,
+            Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
+        ),
+        (
+            413,
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: bifrost_types::DiagnosticText::support_only("HTTP 413 malformed request"),
+            }),
+        ),
+    ] {
+        let error = convert(
+            Error::Status {
+                code: StatusCode::from_u16(status).unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+            ctx(AccountOperation::Hydrate),
+        );
+        assert_eq!(error.kind(), &expected);
+        assert_eq!(error.chain().iter().next(), Some(&primary));
+    }
+}
+
+#[test]
+fn shared_http_status_policy_survives_attempt_history() {
+    let budget = bifrost_types::ThrottleBudget::new("mailbox-budget");
+    let policy = bifrost_net::HttpErrorPolicy {
+        status: bifrost_net::StatusPolicy {
+            resource: Some(ResourceKind::Calendar),
+            overrides: &[(423, bifrost_net::StatusOverride::ConcurrencyConflict)],
+        },
+        throttle_scope: Some(ThrottleScope::Account),
+        throttle_budget: Some(budget.clone()),
+    };
+    for status in [404, 423, 429, 507] {
+        let mut ledger = bifrost_net::AttemptLedger::default();
+        ledger.record(
+            bifrost_net::AttemptOutcome::Response(StatusCode::UNAUTHORIZED),
+            true,
+        );
+        let evidence = bifrost_net::RequestEvidence::new(vec![], ledger.verdict());
+        let error = into_account_error_with_throttle_scope(
+            Error::AttemptHistory {
+                source: Box::new(Error::Status {
+                    code: StatusCode::from_u16(status).unwrap(),
+                    headers: HeaderMap::new(),
+                    body: Bytes::new(),
+                }),
+                evidence,
+            },
+            ctx(AccountOperation::Hydrate),
+            policy.clone(),
+        );
+        match status {
+            404 => assert_eq!(
+                error.kind(),
+                &AccountErrorKind::NotFound(ResourceKind::Calendar)
+            ),
+            423 => assert_eq!(error.kind(), &AccountErrorKind::ConcurrencyConflict),
+            _ => {
+                assert_eq!(
+                    error.telemetry_fields().throttle_scope,
+                    Some(ThrottleScope::Account)
+                );
+                assert_eq!(error.throttle_budgets(), std::slice::from_ref(&budget));
+            }
+        }
+        if matches!(status, 404 | 423) {
+            assert!(error.throttle_budgets().is_empty());
+        }
+    }
+}

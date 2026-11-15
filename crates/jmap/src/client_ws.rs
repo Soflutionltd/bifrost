@@ -47,14 +47,15 @@ impl WsConnection {
 const JMAP_WS_SUBPROTOCOL: &str = "jmap";
 
 #[derive(Serialize)]
-struct WebSocketRequest<'a, 'client> {
+#[serde(bound(serialize = ""))]
+struct WebSocketRequest<'a, 'client, C: crate::core::capability::Capability> {
     #[serde(rename = "@type")]
     _type: WebSocketRequestType,
     id: String,
     // Request owns the envelope schema for both HTTP and WebSocket. Flattening
     // adds only RFC 8887 metadata without a second method-call encoder.
     #[serde(flatten)]
-    request: &'a Request<'client>,
+    request: &'a Request<'client, crate::transport_reqwest::ReqwestTransport, C>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -602,7 +603,10 @@ impl Client {
     /// Put a request frame on the WebSocket and return the `requestId`
     /// it was assigned. Fire-and-forget: nothing waits for the answer.
     /// Use [`Client::send_ws_awaiting`] to get the correlated response.
-    pub(crate) async fn send_ws(&self, request: Request<'_>) -> crate::Result<String> {
+    pub(crate) async fn send_ws<C: crate::core::capability::Capability>(
+        &self,
+        request: Request<'_, crate::transport_reqwest::ReqwestTransport, C>,
+    ) -> crate::Result<String> {
         let (frame, request_id) = self.encode_ws_request(request)?;
         let mut sink = self.connection.sink.lock().await;
         sink.as_mut()
@@ -626,9 +630,9 @@ impl Client {
     /// error path and the registration goes with it.
     /// This request/response lane is part of RFC 8887 even though the sync
     /// account currently uses the WebSocket connection only for push.
-    pub(crate) async fn send_ws_awaiting(
+    pub(crate) async fn send_ws_awaiting<C: crate::core::capability::Capability>(
         &self,
-        request: Request<'_>,
+        request: Request<'_, crate::transport_reqwest::ReqwestTransport, C>,
     ) -> crate::Result<PendingResponse> {
         let (frame, request_id) = self.encode_ws_request(request)?;
         let mut sink = self.connection.sink.lock().await;
@@ -654,7 +658,10 @@ impl Client {
     /// same calls would have produced: `maxSizeRequest` bounds the
     /// request the server receives, and over WebSocket that request is
     /// the frame, envelope and `requestId` included.
-    fn encode_ws_request(&self, request: Request<'_>) -> crate::Result<(String, String)> {
+    fn encode_ws_request<C: crate::core::capability::Capability>(
+        &self,
+        request: Request<'_, crate::transport_reqwest::ReqwestTransport, C>,
+    ) -> crate::Result<(String, String)> {
         // Assign a request id. The counter is the CLIENT's, so ids do not
         // repeat across reconnects: a per-connection counter restarted at
         // 0, and a late response from the old connection then carried an
@@ -1666,7 +1673,10 @@ mod tests {
     #[test]
     fn an_oversized_websocket_frame_is_refused_before_the_wire() {
         let client = size_limited_client(400);
-        let mut request = client.build();
+        let account = client
+            .primary_account::<crate::core::capability::Mail>()
+            .unwrap();
+        let mut request = account.build();
         request
             .call(crate::mailbox::MailboxGet::new())
             .expect("call is added");
@@ -1779,8 +1789,11 @@ mod tests {
     impl Client {
         /// A request whose encoded frame comfortably exceeds a 400-byte
         /// limit, built from ordinary method calls.
-        fn build_oversized_request(&self) -> Request<'_> {
-            let mut request = self.build();
+        fn build_oversized_request(
+            &self,
+        ) -> Request<'_, crate::transport_reqwest::ReqwestTransport, crate::core::capability::Mail>
+        {
+            let mut request = Request::test_scoped(self, "A1");
             for _ in 0..16 {
                 request
                     .call(

@@ -297,7 +297,7 @@ pub trait Account: Send + Sync {
     /// implementation's errors stamp for the same work - a stamped budget no
     /// declaration names is a hold no wait site honours. `account` is the id
     /// the engine records under, passed in so an account-local key
-    /// (`ThrottleKey::Mailbox`) matches the recorded one exactly.
+    /// (`ThrottleKey::Folder`) matches the recorded one exactly.
     ///
     /// The default declares nothing: the work waits on account-wide holds
     /// only.

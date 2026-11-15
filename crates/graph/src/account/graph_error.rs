@@ -14,7 +14,7 @@ use bifrost_net::NetErrorContext;
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
-    ErrorScope, GraphSignal, InternalCause, InternalErrorKind, MailboxId, MailboxUnavailableKind,
+    ErrorScope, GraphSignal, InternalCause, InternalErrorKind, MailboxUnavailableKind, PrincipalId,
     Protocol, ProtocolErrorKind, Provider, RequestCause, ResourceKind, RetryHint, ServerCause,
     ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope, TransmissionState, WireCause,
 };
@@ -228,8 +228,8 @@ fn internal(kind: InternalErrorKind, message: String, ctx: &GraphErrorContext) -
 ///
 /// Refinement needs the body to be Graph's: either an envelope decoded, or
 /// there was no body at all and the status table is the whole answer (a
-/// bare 412 is `ConcurrencyConflict` here and a bare `Server(Error)` in
-/// bifrost-net, and a bare 400 on a cursor scope is the forward-compat
+/// bare 412 refreshes state through the shared status table, and a bare
+/// 400 on a cursor scope is the forward-compat
 /// delta-expiry restart). A NON-EMPTY body that is not an envelope is left
 /// on bifrost-net's mapping on purpose: Graph did not write it, so reading
 /// it as `Protocol(ContractViolation)` would turn an edge device's HTML 403
@@ -246,10 +246,7 @@ fn net_to_account_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> Acc
             return response_to_account_error(response, ctx);
         }
     }
-    stamp_budget(
-        apply_idempotency_override(net_transport_error(net, ctx), ctx),
-        ctx,
-    )
+    apply_idempotency_override(net_transport_error(net, ctx), ctx)
 }
 
 /// A typed hop-policy refusal is created before its operation and cursor scope
@@ -258,7 +255,7 @@ fn net_transport_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> Acco
     let error = bifrost_net::into_account_error_with_throttle_scope(
         net,
         ctx.to_net_ctx(),
-        throttle_scope_for(),
+        http_error_policy(ctx),
     );
     let builder = error
         .into_builder()
@@ -274,30 +271,16 @@ fn net_transport_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> Acco
         .expect("valid contextual transport error")
 }
 
-fn is_throttle(kind: &AccountErrorKind) -> bool {
-    matches!(
-        kind,
-        AccountErrorKind::Server(ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted)
-    )
-}
-
-/// Stamp the context's mailbox budget on an error `bifrost-net` built, when
-/// it classified as a throttle. The response path stamps it at construction;
-/// this covers a 429 whose body was not Graph's, which bifrost-net
-/// classifies itself.
-#[must_use]
-fn stamp_budget(error: AccountError, ctx: &GraphErrorContext) -> AccountError {
-    let Some(budget) = ctx.budget.as_ref() else {
-        return error;
-    };
-    if !is_throttle(error.kind()) {
-        return error;
+fn http_error_policy(ctx: &GraphErrorContext) -> bifrost_net::HttpErrorPolicy {
+    bifrost_net::HttpErrorPolicy {
+        status: bifrost_net::StatusPolicy {
+            resource: None,
+            // Unknown 400-coded Graph cursor signals follow delta expiry.
+            overrides: &[(400, bifrost_net::StatusOverride::CursorInvalid)],
+        },
+        throttle_scope: throttle_scope_for(),
+        throttle_budget: ctx.budget.clone(),
     }
-    error
-        .into_builder()
-        .throttle_budget(budget.clone())
-        .try_build()
-        .expect("valid account error classification")
 }
 
 /// Status, headers, and body of the response a `bifrost_net::Error`
@@ -493,12 +476,10 @@ fn soap_fault_to_account_error(
             }),
         ),
     };
-    let throttle = is_throttle(&kind);
-    let mut builder = base_builder(ctx, kind, cause).text(detail);
+    let class = bifrost_net::StatusClass::new(kind, cause);
+    let mut builder = base_builder(ctx, class.kind, class.cause).text(detail);
     builder = push_attempt(builder, TransmissionState::Acknowledged);
-    if throttle && let Some(scope) = throttle_scope_for() {
-        builder = builder.throttle_scope(scope);
-    }
+    builder = http_error_policy(ctx).apply_throttle(builder, class.throttles);
     finish(builder, ctx)
 }
 
@@ -616,15 +597,14 @@ fn autodiscover_error(
         Some(message) => format!("{what} error {shown}: {message}"),
         None => format!("{what} error {shown}"),
     };
-    let throttle = is_throttle(&kind);
-    let mut builder = base_builder(ctx, kind, cause).text(DiagnosticText::support_only(detail));
+    let class = bifrost_net::StatusClass::new(kind, cause);
+    let mut builder =
+        base_builder(ctx, class.kind, class.cause).text(DiagnosticText::support_only(detail));
     if !code.is_empty() {
         builder = builder.native_code(code.to_string());
     }
     builder = push_attempt(builder, TransmissionState::Acknowledged);
-    if throttle && let Some(scope) = throttle_scope_for() {
-        builder = builder.throttle_scope(scope);
-    }
+    builder = http_error_policy(ctx).apply_throttle(builder, class.throttles);
     finish(builder, ctx)
 }
 
@@ -731,8 +711,8 @@ fn response_to_account_error(
         None => classify_no_envelope(ctx, code, retry_hint, &body),
     };
 
-    let throttle = is_throttle(&kind);
-    let mut builder = base_builder(ctx, kind, cause.clone());
+    let class = bifrost_net::StatusClass::new(kind, cause.clone());
+    let mut builder = base_builder(ctx, class.kind, class.cause);
     // Attach the GraphSignal as an inner wire cause whenever the
     // primary cause is not itself a wire cause, so support tooling
     // can read the typed provider code regardless of which semantic
@@ -769,12 +749,7 @@ fn response_to_account_error(
     // The retry hint already lives structurally on `ServerCause`; no
     // builder side-channel is needed. `throttle_scope` annotation
     // applies only on rate-limit / quota paths. A plain 503 is unavailable.
-    if throttle && let Some(scope) = throttle_scope_for() {
-        builder = builder.throttle_scope(scope);
-        if let Some(budget) = ctx.budget.as_ref() {
-            builder = builder.throttle_budget(budget.clone());
-        }
-    }
+    builder = http_error_policy(ctx).apply_throttle(builder, class.throttles);
     finish(builder, ctx)
 }
 
@@ -836,21 +811,8 @@ fn classify(
             AccountErrorKind::ConcurrencyConflict,
             Cause::State(StateCause::ConcurrencyConflict),
         ),
-        GraphSignal::Gone => gone_410(ctx),
-        GraphSignal::NotFound => match ctx.scope.as_ref().and_then(ErrorScope::resource) {
-            Some(resource) => (
-                AccountErrorKind::NotFound(resource),
-                Cause::Request(RequestCause::NotFound {
-                    what: resource,
-                    id: ctx
-                        .scope
-                        .as_ref()
-                        .and_then(ErrorScope::object_id)
-                        .map(str::to_owned),
-                }),
-            ),
-            None => server_error_tuple(404),
-        },
+        GraphSignal::Gone => classify_by_status(ctx, 410, retry_hint),
+        GraphSignal::NotFound => classify_by_status(ctx, 404, retry_hint),
         GraphSignal::Unknown { .. } => classify_by_status(ctx, code, retry_hint),
         // GraphSignal is #[non_exhaustive] from bifrost-types; new
         // variants land here unhandled and fall through to status-based
@@ -894,83 +856,18 @@ fn cursor_invalid_or_protocol(ctx: &GraphErrorContext) -> (AccountErrorKind, Cau
     }
 }
 
-/// 410 Gone classification, single-sourced so the `GraphSignal::Gone`
-/// and the status-fallback `410` arms cannot drift. On a cursor scope it
-/// is the canonical `SyncState(CursorInvalid)` -> `Engine(RestartScope)`
-/// signal; outside cursor context it is a permanent server error.
-fn gone_410(ctx: &GraphErrorContext) -> (AccountErrorKind, Cause) {
-    if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) {
-        cursor_invalid_or_protocol(ctx)
-    } else {
-        server_error_tuple(410)
-    }
-}
-
 fn classify_by_status(
     ctx: &GraphErrorContext,
     code: u16,
     retry_hint: Option<RetryHint>,
 ) -> (AccountErrorKind, Cause) {
-    match code {
-        // A novel, not-yet-typed 400-coded signal on a cursor scope is
-        // almost certainly a delta-token rejection Graph added after this
-        // build (the typed `InvalidDeltaToken` / `SyncStateNotFound` codes
-        // already route here through `classify`). Treat it like the
-        // 410-coded case: route to the cursor-invalid restart rather than
-        // a terminal `Request(Malformed)`. graph.md documents delta-token
-        // expiry as reactive (410 / 400 InvalidDeltaToken -> RestartScope);
-        // forward-compat extends that to an unknown 400 in cursor context.
-        // Outside a cursor scope, a 400 stays a malformed request.
-        400 if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) => cursor_invalid_or_protocol(ctx),
-        400 | 422 => (
-            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(format!("HTTP {code}")),
-            }),
-        ),
-        401 => (
-            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-            Cause::Auth(AuthCause::ReauthorizationRequired),
-        ),
-        403 => (
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied {
-                resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
-            }),
-        ),
-        404 => match ctx.scope.as_ref().and_then(ErrorScope::resource) {
-            Some(resource) => (
-                AccountErrorKind::NotFound(resource),
-                Cause::Request(RequestCause::NotFound {
-                    what: resource,
-                    id: ctx
-                        .scope
-                        .as_ref()
-                        .and_then(ErrorScope::object_id)
-                        .map(str::to_owned),
-                }),
-            ),
-            None => server_error_tuple(code),
-        },
-        409 | 412 => (
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
-        ),
-        410 => gone_410(ctx),
-        408 | 502 | 503 | 504 => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint }),
-        ),
-        429 => (
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint }),
-        ),
-        507 => (
-            AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_hint }),
-        ),
-        _ => server_error_tuple(code),
-    }
+    let class = bifrost_net::classify_status(
+        code,
+        ctx.scope.as_ref(),
+        retry_hint,
+        http_error_policy(ctx).status,
+    );
+    (class.kind, class.cause)
 }
 
 /// `signal == None`: the body did not decode as a Graph error
@@ -1004,13 +901,6 @@ fn classify_no_envelope(
             }),
         )
     }
-}
-
-fn server_error_tuple(code: u16) -> (AccountErrorKind, Cause) {
-    (
-        AccountErrorKind::Server(ServerErrorKind::Error { status: Some(code) }),
-        Cause::Server(ServerCause::Error { status: Some(code) }),
-    )
 }
 
 fn base_builder(
@@ -1152,7 +1042,7 @@ fn throttle_scope_for() -> Option<ThrottleScope> {
 pub(crate) fn graph_shared_scope_error(
     error: GraphError,
     scope: &CursorScope,
-    owner: Option<&MailboxId>,
+    owner: Option<&PrincipalId>,
     ctx: GraphErrorContext,
 ) -> AccountError {
     into_account_error(error, ctx).revoke_foreign_scope(scope.clone(), owner)
@@ -1169,7 +1059,7 @@ pub(crate) fn graph_shared_scope_error(
 pub(crate) fn ews_shared_scope_error(
     error: EwsError,
     scope: &CursorScope,
-    owner: Option<&MailboxId>,
+    owner: Option<&PrincipalId>,
     ctx: GraphErrorContext,
 ) -> AccountError {
     ews_error_to_account_error(error, ctx).revoke_foreign_scope(scope.clone(), owner)
@@ -1667,6 +1557,45 @@ mod tests {
 
     fn graph_ctx(op: AccountOperation) -> GraphErrorContext {
         GraphErrorContext::graph(op)
+    }
+
+    #[test]
+    fn shared_http_status_envelope_and_plain_body_agree() {
+        let budget = bifrost_types::ThrottleBudget::new("mailbox-test");
+        let ctx = graph_ctx(AccountOperation::Hydrate).with_budget(budget.clone());
+        for status in [
+            413, 400, 404, 408, 409, 410, 412, 422, 429, 500, 502, 503, 504, 507, 599,
+        ] {
+            let status = StatusCode::from_u16(status).unwrap();
+            let response = classify(
+                status,
+                r#"{"error":{"code":"NewUnknownCode"}}"#,
+                ctx.clone(),
+                &[("retry-after", "17")],
+            );
+            let transport = into_account_error(
+                GraphError::Net(bifrost_net::Error::Status {
+                    code: status,
+                    headers: headers(&[("retry-after", "17")]),
+                    body: Bytes::from_static(b"plain failure"),
+                }),
+                ctx.clone(),
+            );
+            assert_eq!(response.kind(), transport.kind(), "status {status}");
+            assert_eq!(response.recovery(), transport.recovery(), "status {status}");
+            assert_eq!(
+                response.chain().iter().next(),
+                transport.chain().iter().next(),
+                "status {status}"
+            );
+            assert_eq!(response.throttle_budgets(), transport.throttle_budgets());
+            let expected = if matches!(status.as_u16(), 429 | 507) {
+                std::slice::from_ref(&budget)
+            } else {
+                &[]
+            };
+            assert_eq!(transport.throttle_budgets(), expected);
+        }
     }
 
     /// A locally-detected configuration rejection is raised PER id (a stale
@@ -2710,7 +2639,7 @@ mod tests {
     #[test]
     fn shared_mailbox_permission_loss_derives_disable_scope() {
         let scope = foreign_email_scope();
-        let owner = MailboxId("shared@contoso.com".to_string());
+        let owner = PrincipalId("shared@contoso.com".to_string());
         let err = graph_shared_scope_error(
             forbidden_response(),
             &scope,
@@ -2751,7 +2680,7 @@ mod tests {
         // EWS ErrorAccessDenied quarantines just this scope via the A5a
         // ScopeRevoked path rather than escalating account-wide.
         let scope = CursorScope::Folder(bifrost_types::FolderId("AAMkPF=".to_string()));
-        let owner = MailboxId("content@contoso.com".to_string());
+        let owner = PrincipalId("content@contoso.com".to_string());
         let err = ews_shared_scope_error(
             EwsError::SoapFault {
                 code: SoapFaultCode::ErrorAccessDenied,
@@ -2814,7 +2743,7 @@ mod tests {
             .expect_err("ResponseClass=Error must surface as an EwsError");
 
         let scope = CursorScope::Folder(bifrost_types::FolderId("AAMkPF=".to_string()));
-        let owner = MailboxId("content@contoso.com".to_string());
+        let owner = PrincipalId("content@contoso.com".to_string());
         let err = ews_shared_scope_error(
             parsed,
             &scope,

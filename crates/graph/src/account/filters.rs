@@ -20,12 +20,17 @@ const DEFAULT_RULE_NAME: &str = "Bifrost rule";
 const GRAPH_HEADER_SENTINEL: &str = "*";
 
 pub(crate) async fn list(account: GraphAccount) -> Result<Vec<ServerFilter>, AccountError> {
-    let rules = account.client.list_message_rules().await.map_err(|error| {
-        into_account_error(
-            error,
-            GraphErrorContext::graph(AccountOperation::FiltersList),
-        )
-    })?;
+    let rules = account
+        .mailboxes
+        .primary()
+        .list_message_rules()
+        .await
+        .map_err(|error| {
+            into_account_error(
+                error,
+                GraphErrorContext::graph(AccountOperation::FiltersList),
+            )
+        })?;
     rules
         .into_iter()
         .map(rule_from_graph)
@@ -42,7 +47,8 @@ pub(crate) async fn create(
     };
     let request = message_rule_from_create(rule, AccountOperation::FilterCreate)?;
     let created = account
-        .client
+        .mailboxes
+        .primary()
         .create_message_rule(&request)
         .await
         .map_err(|error| {
@@ -75,7 +81,8 @@ pub(crate) async fn update(
         return Ok(());
     }
     account
-        .client
+        .mailboxes
+        .primary()
         .update_message_rule(&filter.0, &body)
         .await
         .map_err(|error| {
@@ -92,7 +99,8 @@ pub(crate) async fn delete(
     filter: ServerFilterId,
 ) -> Result<(), AccountError> {
     account
-        .client
+        .mailboxes
+        .primary()
         .delete_message_rule(&filter.0)
         .await
         .map_err(|error| {

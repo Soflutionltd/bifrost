@@ -390,10 +390,10 @@ struct SubsumedPage {
     id: AckToken,
     /// This page's OWN delivery stamp, never the survivor's. See
     /// [`BoundaryEntry::subsumed`].
-    delivered_at: Option<crate::multiplexer::ReceiverSequence>,
+    delivered_at: Option<crate::delivery::ReceiverSequence>,
     /// Which numbered receivers have READ this page. See
     /// [`BoundaryEntry::readers`].
-    readers: Vec<crate::multiplexer::ReceiverSequence>,
+    readers: Vec<crate::delivery::ReceiverSequence>,
 }
 
 /// One outstanding boundary registration: a batch the engine has published and
@@ -464,7 +464,7 @@ struct BoundaryEntry {
     /// acknowledged is still an unanswered page, so it is still a recorded loss
     /// if its reader departs - see [`PendingCoverage::release_undelivered`],
     /// which does not consult this list.
-    readers: Vec<crate::multiplexer::ReceiverSequence>,
+    readers: Vec<crate::delivery::ReceiverSequence>,
     /// Publications this entry SUPERSEDED that the consumer has still not
     /// acknowledged.
     ///
@@ -525,7 +525,7 @@ struct BoundaryEntry {
     /// until the send has actually happened, which is what stops a receiver that
     /// subscribes between the registration and the send from being judged unable
     /// to acknowledge a batch it is in fact about to receive.
-    delivered_at: Option<crate::multiplexer::ReceiverSequence>,
+    delivered_at: Option<crate::delivery::ReceiverSequence>,
 }
 
 impl BoundaryEntry {
@@ -536,7 +536,7 @@ impl BoundaryEntry {
     /// Counted per page rather than per entry, because supersession folds a
     /// partition's history into one record and the pages inside it are read at
     /// different moments.
-    fn unread_charge(&self, live: &BTreeSet<crate::multiplexer::ReceiverSequence>) -> usize {
+    fn unread_charge(&self, live: &BTreeSet<crate::delivery::ReceiverSequence>) -> usize {
         usize::from(Self::page_unread(self.delivered_at, &self.readers, live))
             + self
                 .subsumed
@@ -561,9 +561,9 @@ impl BoundaryEntry {
     /// departed has left the ring for good and must free the producer rather than
     /// park it for the life of the attachment.
     fn page_unread(
-        delivered_at: Option<crate::multiplexer::ReceiverSequence>,
-        readers: &[crate::multiplexer::ReceiverSequence],
-        live: &BTreeSet<crate::multiplexer::ReceiverSequence>,
+        delivered_at: Option<crate::delivery::ReceiverSequence>,
+        readers: &[crate::delivery::ReceiverSequence],
+        live: &BTreeSet<crate::delivery::ReceiverSequence>,
     ) -> bool {
         // Not sent yet: it will occupy a slot, so it is charged already. Charging
         // it only at the send would let a partition register its whole history
@@ -584,13 +584,13 @@ impl BoundaryEntry {
     /// `None` when the account has no real subscriber at all. An entry that has
     /// not been sent yet is never undeliverable - the send may still be about to
     /// reach a receiver that has only just subscribed.
-    fn undeliverable(&self, min_live: Option<crate::multiplexer::ReceiverSequence>) -> bool {
+    fn undeliverable(&self, min_live: Option<crate::delivery::ReceiverSequence>) -> bool {
         Self::sent_beyond_reach(self.delivered_at, min_live)
     }
 
     fn sent_beyond_reach(
-        delivered_at: Option<crate::multiplexer::ReceiverSequence>,
-        min_live: Option<crate::multiplexer::ReceiverSequence>,
+        delivered_at: Option<crate::delivery::ReceiverSequence>,
+        min_live: Option<crate::delivery::ReceiverSequence>,
     ) -> bool {
         match delivered_at {
             None => false,
@@ -672,7 +672,7 @@ struct Ledger {
     /// The single membership set, updated under ChangeDelivery's ordering lock.
     /// Delivery queries this ledger rather than maintaining a second copy.
     /// Lock order is delivery -> coverage, never the reverse.
-    live: BTreeSet<crate::multiplexer::ReceiverSequence>,
+    live: BTreeSet<crate::delivery::ReceiverSequence>,
     /// The same fence, narrowed to the BACKFILL stream.
     ///
     /// Raised by the discard that follows a walk which lost pages: that walk's
@@ -710,7 +710,7 @@ pub(crate) const PENDING_BOUNDARY_CAP: usize = 1024;
 pub struct PendingCoverage {
     pub(crate) account: Option<bifrost_types::AccountId>,
     ledger: Mutex<Ledger>,
-    delivery_owner: Mutex<Option<std::sync::Weak<crate::multiplexer::ChangeDelivery>>>,
+    delivery_owner: Mutex<Option<std::sync::Weak<crate::delivery::ChangeDelivery>>>,
     next: AtomicU64,
     /// This instance's id segment: the high bits every id it mints carries.
     /// Lets a publication minted by a PRIOR attachment be recognised as such.
@@ -801,7 +801,7 @@ impl PendingCoverage {
     #[must_use]
     pub(crate) fn bind_delivery(
         &self,
-        delivery: &std::sync::Arc<crate::multiplexer::ChangeDelivery>,
+        delivery: &std::sync::Arc<crate::delivery::ChangeDelivery>,
     ) -> bool {
         let mut owner = self
             .delivery_owner
@@ -1270,11 +1270,7 @@ impl PendingCoverage {
     /// exactly that reason: a receiver that subscribes between the two really
     /// does receive the batch, and judging it beforehand would retire the
     /// capacity of a page that is about to be delivered.
-    pub fn mark_delivered(
-        &self,
-        id: &AckToken,
-        subscriber_seq: crate::multiplexer::ReceiverSequence,
-    ) {
+    pub fn mark_delivered(&self, id: &AckToken, subscriber_seq: crate::delivery::ReceiverSequence) {
         let mut ledger = self.guard();
         if let Some(entry) = ledger.boundaries.iter_mut().find(|entry| entry.id == *id) {
             entry.delivered_at = Some(subscriber_seq);
@@ -1299,7 +1295,7 @@ impl PendingCoverage {
     /// consumer is only now reading may already have been folded into a later
     /// publication of its partition, and the page just read is almost always
     /// either the survivor or the most recently folded element.
-    pub fn mark_received(&self, id: &AckToken, receiver_seq: crate::multiplexer::ReceiverSequence) {
+    pub fn mark_received(&self, id: &AckToken, receiver_seq: crate::delivery::ReceiverSequence) {
         let freed = {
             let mut ledger = self.guard();
             let mut freed = false;
@@ -1328,7 +1324,7 @@ impl PendingCoverage {
     }
 
     /// Lowest numbered receiver still subscribed, from the authoritative set.
-    pub(crate) fn min_live_receiver(&self) -> Option<crate::multiplexer::ReceiverSequence> {
+    pub(crate) fn min_live_receiver(&self) -> Option<crate::delivery::ReceiverSequence> {
         self.guard().live.iter().next().copied()
     }
 
@@ -1337,7 +1333,7 @@ impl PendingCoverage {
     /// It can never re-charge a page that is already out of the ring: it is
     /// numbered at or above every existing page's `delivered_at`, and only
     /// receivers numbered strictly below one hold it. So this never needs a wake.
-    pub(crate) fn receiver_joined(&self, receiver_seq: crate::multiplexer::ReceiverSequence) {
+    pub(crate) fn receiver_joined(&self, receiver_seq: crate::delivery::ReceiverSequence) {
         self.guard().live.insert(receiver_seq);
     }
 
@@ -1349,7 +1345,7 @@ impl PendingCoverage {
     /// of the attachment - the same failure the sweep in
     /// [`PendingCoverage::release_undelivered`] exists to prevent, one step
     /// earlier. Called under the delivery gate's lock, ahead of that sweep.
-    pub(crate) fn receiver_departed(&self, receiver_seq: crate::multiplexer::ReceiverSequence) {
+    pub(crate) fn receiver_departed(&self, receiver_seq: crate::delivery::ReceiverSequence) {
         let mut ledger = self.guard();
         let was_live = ledger.live.remove(&receiver_seq);
         drop(ledger);
@@ -1395,7 +1391,7 @@ impl PendingCoverage {
     /// eligible reader and contributes only its scope.
     pub(crate) fn backfill_charge_holders(
         &self,
-    ) -> (Vec<crate::multiplexer::ReceiverSequence>, Vec<CursorScope>) {
+    ) -> (Vec<crate::delivery::ReceiverSequence>, Vec<CursorScope>) {
         let ledger = self.guard();
         let mut holders = BTreeSet::new();
         let mut scopes: Vec<CursorScope> = Vec::new();
@@ -1506,7 +1502,7 @@ impl PendingCoverage {
     /// reopen it is a downstream store willing to pay for the row.
     pub fn release_undelivered(
         &self,
-        min_live: Option<crate::multiplexer::ReceiverSequence>,
+        min_live: Option<crate::delivery::ReceiverSequence>,
     ) -> usize {
         if self.tearing_down.load(Ordering::Acquire) {
             return 0;
@@ -2287,8 +2283,8 @@ impl PendingCoverage {
 /// has read this page, and an account with more than a handful of live change
 /// subscribers is not a shape this engine has.
 fn record_reader(
-    readers: &mut Vec<crate::multiplexer::ReceiverSequence>,
-    receiver_seq: crate::multiplexer::ReceiverSequence,
+    readers: &mut Vec<crate::delivery::ReceiverSequence>,
+    receiver_seq: crate::delivery::ReceiverSequence,
 ) -> bool {
     if readers.contains(&receiver_seq) {
         return false;
@@ -2318,8 +2314,8 @@ mod tests {
     fn a_ledger_cannot_share_receiver_numbers_between_delivery_gates() {
         let ledger = super::PendingCoverage::new();
         let (tx, _) = tokio::sync::broadcast::channel(1);
-        let first = std::sync::Arc::new(crate::multiplexer::ChangeDelivery::new(tx.clone()));
-        let second = std::sync::Arc::new(crate::multiplexer::ChangeDelivery::new(tx));
+        let first = std::sync::Arc::new(crate::delivery::ChangeDelivery::new(tx.clone()));
+        let second = std::sync::Arc::new(crate::delivery::ChangeDelivery::new(tx));
         assert!(ledger.bind_delivery(&first));
         assert!(ledger.bind_delivery(&first));
         assert!(!ledger.bind_delivery(&second));
@@ -2741,7 +2737,7 @@ mod tests {
             pending.claim_checkpoint(p, &cp),
             ClaimLookup::Apply(_)
         ));
-        pending.mark_delivered(&q, crate::multiplexer::ReceiverSequence::for_test(1));
+        pending.mark_delivered(&q, crate::delivery::ReceiverSequence::for_test(1));
 
         // The last receiver goes away. Q can never be acknowledged, so the sweep
         // retires it and its debt moves to the carry slot - the only place it
@@ -2781,7 +2777,7 @@ mod tests {
             cp.clone(),
             CoverageClaim::new(degraded("p"), crate::cursor::WalkGeneration::for_test(1)),
         );
-        pending.mark_delivered(&p, crate::multiplexer::ReceiverSequence::for_test(1));
+        pending.mark_delivered(&p, crate::delivery::ReceiverSequence::for_test(1));
         // B subscribes (number 1), then Q goes out. Q's report is COMPLETE, and
         // that is what gives the demotion assertion below its bite: a claim built
         // only from degraded reports has nothing to prove and satisfies "no
@@ -2793,12 +2789,12 @@ mod tests {
                 crate::cursor::WalkGeneration::for_test(2),
             ),
         );
-        pending.mark_delivered(&q, crate::multiplexer::ReceiverSequence::for_test(2));
+        pending.mark_delivered(&q, crate::delivery::ReceiverSequence::for_test(2));
         assert_eq!(pending.backfill_in_flight(), 2);
 
         // A (number 0) leaves; B (number 1) remains.
         assert_eq!(
-            pending.release_undelivered(Some(crate::multiplexer::ReceiverSequence::for_test(1))),
+            pending.release_undelivered(Some(crate::delivery::ReceiverSequence::for_test(1))),
             1,
             "exactly P is beyond every live reader; Q is not"
         );
@@ -2888,7 +2884,7 @@ mod tests {
                 crate::cursor::WalkGeneration::for_test(1),
             ),
         );
-        pending.mark_delivered(&a, crate::multiplexer::ReceiverSequence::for_test(1));
+        pending.mark_delivered(&a, crate::delivery::ReceiverSequence::for_test(1));
         assert_eq!(pending.release_undelivered(None), 1);
 
         // A publication on a DIFFERENT scope must leave it alone.
@@ -2932,7 +2928,7 @@ mod tests {
             cp,
             CoverageClaim::new(degraded("mine"), crate::cursor::WalkGeneration::for_test(1)),
         );
-        pending.mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(1));
+        pending.mark_delivered(&id, crate::delivery::ReceiverSequence::for_test(1));
         assert_eq!(pending.release_undelivered(None), 1);
 
         let other = CursorScope::Type(ObjectType::Contact);

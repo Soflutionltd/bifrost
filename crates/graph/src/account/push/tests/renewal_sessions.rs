@@ -11,13 +11,16 @@ use futures::StreamExt;
 #[tokio::test(start_paused = true)]
 async fn a_terminal_renewal_failure_names_the_scope_that_lost_coverage() {
     let account = webhook_account(&crate::client::GraphClient::new("token"));
-    account.client.script_rest([ScriptedRestResponse::json(
-        reqwest::StatusCode::FORBIDDEN,
-        serde_json::json!({"error":{"code":"ErrorAccessDenied","message":"denied"}}),
-    )]);
+    account
+        .mailboxes
+        .primary()
+        .script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::FORBIDDEN,
+            serde_json::json!({"error":{"code":"ErrorAccessDenied","message":"denied"}}),
+        )]);
     let mut row = expiring("old", "/me/mailFolders/inbox/messages");
     row.scopes = vec![email_scope("inbox")];
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         SubscriptionHandle("h".into()),
         GraphSubscriptionGroup::live(vec![row]),
     );
@@ -34,7 +37,7 @@ async fn a_terminal_renewal_failure_names_the_scope_that_lost_coverage() {
     let mut next = renewal_session(account.clone(), SessionStop::never(), PushGate::open());
     let mut event = Box::pin(next.next());
     assert!(futures::poll!(&mut event).is_pending());
-    assert_eq!(account.client.take_rest_requests().len(), 1);
+    assert_eq!(account.mailboxes.primary().take_rest_requests().len(), 1);
 }
 
 /// The recreate leg, end to end through the REST seam: a renewal PATCH that
@@ -47,7 +50,7 @@ async fn a_terminal_renewal_failure_names_the_scope_that_lost_coverage() {
 #[tokio::test(start_paused = true)]
 async fn a_vanished_subscription_is_recreated_and_reconnected_on_the_next_tick() {
     let account = webhook_account(&crate::client::GraphClient::new("token"));
-    account.client.script_rest([
+    account.mailboxes.primary().script_rest([
         ScriptedRestResponse::json(
             reqwest::StatusCode::NOT_FOUND,
             serde_json::json!({"error":{"code":"ResourceNotFound","message":"gone"}}),
@@ -58,7 +61,8 @@ async fn a_vanished_subscription_is_recreated_and_reconnected_on_the_next_tick()
     let mut row = expiring("stale", "/me/mailFolders/inbox/messages");
     row.scopes = vec![email_scope("inbox")];
     account
-        .graph_subscriptions
+        .webhooks
+        .groups_for_tests()
         .write()
         .await
         .insert(handle.clone(), GraphSubscriptionGroup::live(vec![row]));
@@ -79,9 +83,9 @@ async fn a_vanished_subscription_is_recreated_and_reconnected_on_the_next_tick()
         other => panic!("expected the gap invalidation, got {other:?}"),
     }
     assert!(matches!(session.next().await, Some(E::Healthy)));
-    assert!(account.pending_gaps.lock().unwrap().is_empty());
+    assert!(account.webhooks.gaps_for_tests().lock().unwrap().is_empty());
     {
-        let groups = account.graph_subscriptions.read().await;
+        let groups = account.webhooks.groups_for_tests().read().await;
         let group = groups.get(&handle).expect("the handle stays registered");
         assert_eq!(group.subscriptions.len(), 1, "in place, not beside");
         assert_eq!(group.subscriptions[0].server_id, "fresh");
@@ -90,7 +94,7 @@ async fn a_vanished_subscription_is_recreated_and_reconnected_on_the_next_tick()
             "/me/mailFolders/inbox/messages"
         );
     }
-    let requests = account.client.take_rest_requests();
+    let requests = account.mailboxes.primary().take_rest_requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].method, "PATCH");
     assert!(requests[0].url.ends_with("/subscriptions/stale"));
@@ -120,10 +124,13 @@ async fn a_missing_resource_on_recreate_terminates_the_subscription_row() {
             }),
         )
     };
-    account.client.script_rest([not_found(), not_found()]);
+    account
+        .mailboxes
+        .primary()
+        .script_rest([not_found(), not_found()]);
     let handle = SubscriptionHandle("h".into());
     let resource = "/me/mailFolders/deleted-folder/messages";
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         handle.clone(),
         GraphSubscriptionGroup::live(vec![expiring("stale", resource)]),
     );
@@ -139,13 +146,13 @@ async fn a_missing_resource_on_recreate_terminates_the_subscription_row() {
     ));
     assert!(session.next().await.is_none());
     {
-        let groups = account.graph_subscriptions.read().await;
+        let groups = account.webhooks.groups_for_tests().read().await;
         let group = groups.get(&handle).expect("stale row stays for teardown");
         assert_eq!(group.subscriptions.len(), 1);
         assert_eq!(group.subscriptions[0].server_id, "stale");
         assert!(group.subscriptions[0].terminated);
     }
-    let requests = account.client.take_rest_requests();
+    let requests = account.mailboxes.primary().take_rest_requests();
     assert_eq!(requests.len(), 2, "one PATCH and one failed create");
     assert_eq!(requests[0].method, "PATCH");
     assert_eq!(requests[1].method, "POST");
@@ -164,7 +171,7 @@ async fn a_missing_resource_on_recreate_terminates_the_subscription_row() {
     }
     assert!(futures::poll!(&mut event).is_pending());
     assert_eq!(
-        account.client.wire_attempts(),
+        account.mailboxes.primary().wire_attempts(),
         2,
         "terminated rows are not retried"
     );
@@ -185,16 +192,19 @@ async fn a_missing_resource_on_recreate_terminates_the_subscription_row() {
 #[tokio::test(start_paused = true)]
 async fn a_successful_renewal_updates_the_expiry_and_the_next_tick_finds_nothing_due() {
     let account = webhook_account(&crate::client::GraphClient::new("token"));
-    account.client.script_rest([ScriptedRestResponse::json(
-        reqwest::StatusCode::OK,
-        serde_json::json!({
-            "id": "sub",
-            "resource": "/me/mailFolders/inbox/messages",
-            "expirationDateTime": "2099-01-01T00:00:00Z"
-        }),
-    )]);
+    account
+        .mailboxes
+        .primary()
+        .script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            serde_json::json!({
+                "id": "sub",
+                "resource": "/me/mailFolders/inbox/messages",
+                "expirationDateTime": "2099-01-01T00:00:00Z"
+            }),
+        )]);
     let handle = SubscriptionHandle("h".into());
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         handle.clone(),
         GraphSubscriptionGroup::live(vec![expiring("sub", "/me/mailFolders/inbox/messages")]),
     );
@@ -210,7 +220,7 @@ async fn a_successful_renewal_updates_the_expiry_and_the_next_tick_finds_nothing
         );
     }
     {
-        let groups = account.graph_subscriptions.read().await;
+        let groups = account.webhooks.groups_for_tests().read().await;
         let group = groups.get(&handle).expect("the handle stays registered");
         assert_eq!(group.subscriptions.len(), 1);
         assert_eq!(group.subscriptions[0].server_id, "sub", "renewed in place");
@@ -223,7 +233,7 @@ async fn a_successful_renewal_updates_the_expiry_and_the_next_tick_finds_nothing
             crate::account::push::renewal::RENEWAL_THRESHOLD_MINUTES
         ));
     }
-    let requests = account.client.take_rest_requests();
+    let requests = account.mailboxes.primary().take_rest_requests();
     assert_eq!(requests.len(), 1, "one renewal, not one per pass");
     assert_eq!(requests[0].method, "PATCH");
     assert!(requests[0].url.ends_with("/subscriptions/sub"));
@@ -242,7 +252,7 @@ async fn a_successful_renewal_updates_the_expiry_and_the_next_tick_finds_nothing
 #[tokio::test(start_paused = true)]
 async fn a_pass_whose_only_failure_is_terminal_ends_incomplete() {
     let account = webhook_account(&crate::client::GraphClient::new("token"));
-    account.client.script_rest([
+    account.mailboxes.primary().script_rest([
         ScriptedRestResponse::json(
             reqwest::StatusCode::FORBIDDEN,
             serde_json::json!({"error":{"code":"ErrorAccessDenied","message":"denied"}}),
@@ -252,7 +262,7 @@ async fn a_pass_whose_only_failure_is_terminal_ends_incomplete() {
             serde_json::json!({"id":"healthy","expirationDateTime":"2099-01-01T00:00:00Z"}),
         ),
     ]);
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         SubscriptionHandle("h".into()),
         GraphSubscriptionGroup::live(vec![
             expiring("denied", "/me/messages"),
@@ -268,11 +278,11 @@ async fn a_pass_whose_only_failure_is_terminal_ends_incomplete() {
     ));
     assert!(session.next().await.is_none());
     assert_eq!(
-        account.client.take_rest_requests().len(),
+        account.mailboxes.primary().take_rest_requests().len(),
         2,
         "both rows attempted"
     );
-    let groups = account.graph_subscriptions.read().await;
+    let groups = account.webhooks.groups_for_tests().read().await;
     let rows = &groups[&SubscriptionHandle("h".into())].subscriptions;
     assert!(rows[0].terminated);
     assert_eq!(rows[1].expires_at, "2099-01-01T00:00:00Z");
@@ -281,7 +291,7 @@ async fn a_pass_whose_only_failure_is_terminal_ends_incomplete() {
 #[tokio::test(start_paused = true)]
 async fn a_failed_tick_disconnects_and_the_next_successful_tick_reconnects() {
     let account = webhook_account(&crate::client::GraphClient::new("token"));
-    account.client.script_rest([
+    account.mailboxes.primary().script_rest([
         ScriptedRestResponse::json(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             serde_json::json!({"error":{"code":"TooManyRequests"}}),
@@ -291,7 +301,7 @@ async fn a_failed_tick_disconnects_and_the_next_successful_tick_reconnects() {
             serde_json::json!({"id":"old","expirationDateTime":"2099-01-01T00:00:00Z"}),
         ),
     ]);
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         SubscriptionHandle("h".into()),
         GraphSubscriptionGroup::live(vec![expiring("old", "/me/events")]),
     );
@@ -306,13 +316,13 @@ async fn a_failed_tick_disconnects_and_the_next_successful_tick_reconnects() {
     let mut session = renewal_session(account.clone(), SessionStop::never(), PushGate::open());
     assert!(matches!(session.next().await, Some(E::Established)));
     assert!(matches!(session.next().await, Some(E::Healthy)));
-    assert_eq!(account.client.take_rest_requests().len(), 2);
+    assert_eq!(account.mailboxes.primary().take_rest_requests().len(), 2);
 }
 
 #[tokio::test(start_paused = true)]
 async fn one_tick_recreating_several_subscriptions_reconnects_once() {
     let account = webhook_account(&crate::client::GraphClient::new("token"));
-    account.client.script_rest((0..2).flat_map(|i| [
+    account.mailboxes.primary().script_rest((0..2).flat_map(|i| [
         ScriptedRestResponse::json(reqwest::StatusCode::NOT_FOUND, serde_json::json!({"error":{"code":"ResourceNotFound"}})),
         ScriptedRestResponse::json(reqwest::StatusCode::CREATED, serde_json::json!({"id":format!("new-{i}"),"expirationDateTime":"2099-01-01T00:00:00Z"})),
     ]));
@@ -323,7 +333,7 @@ async fn one_tick_recreating_several_subscriptions_reconnects_once() {
     for (i, row) in rows.iter_mut().enumerate() {
         row.scopes = vec![email_scope(&format!("f{i}"))];
     }
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         SubscriptionHandle("h".into()),
         GraphSubscriptionGroup::live(rows),
     );
@@ -333,14 +343,14 @@ async fn one_tick_recreating_several_subscriptions_reconnects_once() {
         assert!(matches!(session.next().await, Some(E::Invalidated(_))));
     }
     assert!(matches!(session.next().await, Some(E::Healthy)));
-    assert!(account.pending_gaps.lock().unwrap().is_empty());
-    assert_eq!(account.client.take_rest_requests().len(), 4);
+    assert!(account.webhooks.gaps_for_tests().lock().unwrap().is_empty());
+    assert_eq!(account.mailboxes.primary().take_rest_requests().len(), 4);
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_worker_cancelled_before_its_first_renewal_sends_nothing() {
     let account = webhook_account(&crate::client::GraphClient::new("token"));
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         SubscriptionHandle("h".into()),
         GraphSubscriptionGroup::live(vec![expiring("old", "/me/events")]),
     );
@@ -349,13 +359,13 @@ async fn a_worker_cancelled_before_its_first_renewal_sends_nothing() {
     let mut session = renewal_session(account.clone(), stop, PushGate::open());
     assert!(matches!(session.next().await, Some(E::Established)));
     assert!(matches!(session.next().await, Some(E::Ended(End::Stopped))));
-    assert!(account.client.take_rest_requests().is_empty());
+    assert!(account.mailboxes.primary().take_rest_requests().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_failing_row_does_not_starve_a_healthy_row_in_the_same_pass() {
     let account = webhook_account(&crate::client::GraphClient::new("token"));
-    account.client.script_rest([
+    account.mailboxes.primary().script_rest([
         ScriptedRestResponse::json(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             serde_json::json!({"error":{"code":"TooManyRequests"}}),
@@ -365,7 +375,7 @@ async fn a_failing_row_does_not_starve_a_healthy_row_in_the_same_pass() {
             serde_json::json!({"id":"second","expirationDateTime":"2099-01-01T00:00:00Z"}),
         ),
     ]);
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         SubscriptionHandle("h".into()),
         GraphSubscriptionGroup::live(vec![
             expiring("first", "/me/messages"),
@@ -379,9 +389,10 @@ async fn a_failing_row_does_not_starve_a_healthy_row_in_the_same_pass() {
         session.next().await,
         Some(E::Ended(End::Incomplete))
     ));
-    assert_eq!(account.client.take_rest_requests().len(), 2);
+    assert_eq!(account.mailboxes.primary().take_rest_requests().len(), 2);
     assert_eq!(
-        account.graph_subscriptions.read().await[&SubscriptionHandle("h".into())].subscriptions[1]
+        account.webhooks.groups_for_tests().read().await[&SubscriptionHandle("h".into())]
+            .subscriptions[1]
             .expires_at,
         "2099-01-01T00:00:00Z"
     );
@@ -389,13 +400,13 @@ async fn a_failing_row_does_not_starve_a_healthy_row_in_the_same_pass() {
 #[tokio::test(start_paused = true)]
 async fn every_row_failure_in_a_pass_is_reported() {
     let account = webhook_account(&crate::client::GraphClient::new("token"));
-    account.client.script_rest((0..2).map(|_| {
+    account.mailboxes.primary().script_rest((0..2).map(|_| {
         ScriptedRestResponse::json(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             serde_json::json!({"error":{"code":"TooManyRequests"}}),
         )
     }));
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         SubscriptionHandle("h".into()),
         GraphSubscriptionGroup::live(vec![
             expiring("first", "/me/messages"),
@@ -418,7 +429,7 @@ async fn a_pass_after_a_retired_row_stays_incomplete_until_the_handle_is_unsubsc
     let mut retired = expiring("dead", "/me/messages");
     retired.terminated = true;
     let live = super::fixtures::state("live", "/me/events");
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         SubscriptionHandle("h".into()),
         GraphSubscriptionGroup::live(vec![retired, live]),
     );
@@ -430,7 +441,8 @@ async fn a_pass_after_a_retired_row_stays_incomplete_until_the_handle_is_unsubsc
     ));
     drop(session);
     account
-        .graph_subscriptions
+        .webhooks
+        .groups_for_tests()
         .write()
         .await
         .get_mut(&SubscriptionHandle("h".into()))
@@ -440,18 +452,18 @@ async fn a_pass_after_a_retired_row_stays_incomplete_until_the_handle_is_unsubsc
     let mut session = renewal_session(account.clone(), SessionStop::never(), PushGate::open());
     assert!(matches!(session.next().await, Some(E::Established)));
     assert!(matches!(session.next().await, Some(E::Healthy)));
-    assert!(account.client.take_rest_requests().is_empty());
+    assert!(account.mailboxes.primary().take_rest_requests().is_empty());
 }
 #[tokio::test(start_paused = true)]
 async fn a_renewal_pass_waits_for_the_push_gate_before_each_row() {
     let account = webhook_account(&crate::client::GraphClient::new("token"));
-    account.client.script_rest((0..2).map(|_| {
+    account.mailboxes.primary().script_rest((0..2).map(|_| {
         ScriptedRestResponse::json(
             reqwest::StatusCode::OK,
             serde_json::json!({"id":"renewed","expirationDateTime":"2099-01-01T00:00:00Z"}),
         )
     }));
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         SubscriptionHandle("h".into()),
         GraphSubscriptionGroup::live(vec![
             expiring("first", "/me/messages"),
@@ -470,46 +482,53 @@ async fn a_renewal_pass_waits_for_the_push_gate_before_each_row() {
     assert!(matches!(session.next().await, Some(E::Established)));
     let mut next = Box::pin(session.next());
     assert!(futures::poll!(&mut next).is_pending());
-    assert!(account.client.take_rest_requests().is_empty());
+    assert!(account.mailboxes.primary().take_rest_requests().is_empty());
     permits.add_permits(1);
     for _ in 0..20 {
         assert!(futures::poll!(&mut next).is_pending());
         tokio::task::yield_now().await;
     }
-    assert_eq!(account.client.take_rest_requests().len(), 1);
+    assert_eq!(account.mailboxes.primary().take_rest_requests().len(), 1);
     permits.add_permits(1);
     assert!(matches!(next.await, Some(E::Healthy)));
-    assert_eq!(account.client.take_rest_requests().len(), 1);
+    assert_eq!(account.mailboxes.primary().take_rest_requests().len(), 1);
 }
 #[tokio::test]
 async fn a_recreate_landing_after_its_session_dropped_is_invalidated_by_the_next_session() {
     use crate::account::push::renewal::replace_gone_subscription;
     let account = webhook_account(&crate::client::GraphClient::new("token"));
     account
-        .client
+        .mailboxes
+        .primary()
         .script_rest([super::fixtures::created("new")]);
     let handle = SubscriptionHandle("h".into());
     let row = expiring("old", "/me/messages");
     let scopes = row.scopes.clone();
     account
-        .graph_subscriptions
+        .webhooks
+        .groups_for_tests()
         .write()
         .await
         .insert(handle.clone(), GraphSubscriptionGroup::live(vec![row]));
-    let held = account.graph_subscriptions.write().await;
+    let held = account.webhooks.groups_for_tests().write().await;
     let owner = account.clone();
     let endpoint = account.push_config.endpoint().cloned().unwrap();
     let task = tokio::spawn(async move {
         replace_gone_subscription(&owner, &endpoint, &handle, "old", "/me/messages", &scopes).await
     });
-    assert!(super::fixtures::settle(|| account.client.rest_requests().len() == 1).await);
+    assert!(
+        super::fixtures::settle(|| account.mailboxes.primary().rest_requests().len() == 1).await
+    );
     task.abort();
     let _ = task.await;
     drop(held);
-    assert!(super::fixtures::settle(|| !account.pending_gaps.lock().unwrap().is_empty()).await);
+    assert!(
+        super::fixtures::settle(|| !account.webhooks.gaps_for_tests().lock().unwrap().is_empty())
+            .await
+    );
     let mut session = renewal_session(account.clone(), SessionStop::never(), PushGate::open());
     assert!(matches!(session.next().await, Some(E::Invalidated(_))));
-    assert!(account.pending_gaps.lock().unwrap().is_empty());
+    assert!(account.webhooks.gaps_for_tests().lock().unwrap().is_empty());
 }
 #[tokio::test]
 async fn close_joins_the_worker_and_so_waits_for_the_recreates_undo() {
@@ -554,7 +573,7 @@ async fn the_worker_stops_on_cancellation_while_a_renewal_is_in_flight() {
     let client = crate::client::GraphClient::new("token");
     client.script_aux_pending(1);
     let account = webhook_account(&client);
-    account.graph_subscriptions.write().await.insert(
+    account.webhooks.groups_for_tests().write().await.insert(
         SubscriptionHandle("h".into()),
         GraphSubscriptionGroup::live(vec![expiring("old", "/me/events")]),
     );
@@ -570,4 +589,99 @@ async fn the_worker_stops_on_cancellation_while_a_renewal_is_in_flight() {
     stopper.stop();
     assert!(matches!(next.await, Some(E::Ended(End::Stopped))));
     assert!(session.next().await.is_none());
+}
+
+/// Exercise the registry transitions together, across the metered account
+/// boundary, rather than testing only the pure map helpers underneath them.
+#[tokio::test]
+async fn registry_replacement_commits_gap_and_teardown_identity_across_views() {
+    let account = webhook_account(&crate::client::GraphClient::new("token"));
+    let handle = SubscriptionHandle("h".into());
+    account
+        .webhooks
+        .register(
+            &account.shutdown,
+            handle.clone(),
+            GraphSubscriptionGroup::live(vec![expiring("old", "inbox")]),
+        )
+        .await
+        .unwrap();
+    let (metered, _) = account.metered();
+    assert!(
+        metered
+            .webhooks
+            .install_replacement(&metered.shutdown, &handle, "old", expiring("new", "inbox"))
+            .await
+    );
+    assert_eq!(account.webhooks.pop_gap(), Some(email_scope("inbox")));
+    assert_eq!(
+        account.webhooks.orphan_ids(&handle, Vec::new()),
+        vec!["new"]
+    );
+    assert_eq!(
+        account.webhooks.begin_teardown(&handle).await,
+        Some(vec!["new".into()])
+    );
+    assert!(
+        !metered
+            .webhooks
+            .install_replacement(&metered.shutdown, &handle, "new", expiring("late", "inbox"))
+            .await
+    );
+    assert!(account.webhooks.pop_gap().is_none());
+    // A failed DELETE forgets nothing. The same snapshot is retryable, but
+    // condemned rows no longer contribute renewal work.
+    assert_eq!(
+        metered.webhooks.begin_teardown(&handle).await,
+        Some(vec!["new".into()])
+    );
+    assert!(account.webhooks.due().await.is_empty());
+    metered.webhooks.forget_deleted(&handle, "new").await;
+    assert!(account.webhooks.begin_teardown(&handle).await.is_none());
+    assert!(account.webhooks.orphan_ids(&handle, Vec::new()).is_empty());
+}
+
+#[tokio::test]
+async fn registry_shutdown_refuses_new_rows_and_replacements_without_losing_old_rows() {
+    let account = webhook_account(&crate::client::GraphClient::new("token"));
+    let handle = SubscriptionHandle("h".into());
+    account
+        .webhooks
+        .register(
+            &account.shutdown,
+            handle.clone(),
+            GraphSubscriptionGroup::live(vec![expiring("old", "inbox")]),
+        )
+        .await
+        .unwrap();
+    let (metered, _) = account.metered();
+    account.shutdown.cancel();
+    assert!(
+        !metered
+            .webhooks
+            .install_replacement(&metered.shutdown, &handle, "old", expiring("new", "inbox"))
+            .await
+    );
+    let refused = metered
+        .webhooks
+        .register(
+            &metered.shutdown,
+            SubscriptionHandle("late".into()),
+            GraphSubscriptionGroup::live(vec![expiring("late", "inbox")]),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.subscriptions[0].server_id, "late");
+    assert_eq!(
+        account.webhooks.begin_teardown(&handle).await,
+        Some(vec!["old".into()])
+    );
+    assert_eq!(account.webhooks.handles().await, vec![handle]);
+    assert!(account.webhooks.pop_gap().is_none());
+    assert!(
+        account
+            .webhooks
+            .orphan_ids(&SubscriptionHandle("h".into()), Vec::new())
+            .is_empty()
+    );
 }

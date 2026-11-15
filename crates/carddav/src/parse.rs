@@ -3,15 +3,10 @@ pub(crate) use bifrost_dav_core::extract_href_property_in_namespace;
 pub(crate) use bifrost_dav_core::resolve_href;
 use bifrost_dav_core::{
     CALENDAR_SERVER_NAMESPACE, CARDDAV_NAMESPACE, DAV_NAMESPACE, MultiStatusSink, PropSet,
-    ResponseParts, XmlName, classify_207, commit_if_present, normalize_etag, parse_multistatus,
-    trimmed,
+    ResponseParts, XmlName, commit_if_present, normalize_etag, parse_multistatus, trimmed,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CardDavContactEntry {
-    pub(crate) uri: String,
-    pub(crate) etag: Option<String>,
-}
+pub(crate) type CardDavContactEntry = bifrost_dav_core::collection::ResourceEntry;
 
 /// Outcome of a depth-1 contact PROPFIND or an `addressbook-query`: the
 /// resources whose propstat succeeded (`entries`) plus the resources the server
@@ -23,18 +18,9 @@ pub(crate) struct CardDavContactEntry {
 /// listing runs through the same RFC 4918 s13 ladder the multiget lanes use;
 /// see the CalDAV twin for why an all-refused candidate 207 must not read as an
 /// empty page.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct CardDavContactListing {
-    pub(crate) entries: Vec<CardDavContactEntry>,
-    pub(crate) failed: Vec<CardDavFailedResource>,
-}
+pub(crate) type CardDavContactListing = bifrost_dav_core::collection::ResourceListing;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CardDavFetchedVCard {
-    pub(crate) uri: String,
-    pub(crate) etag: Option<String>,
-    pub(crate) data: String,
-}
+pub(crate) type CardDavFetchedVCard = bifrost_dav_core::collection::FetchedResource;
 
 /// One resource inside a 207 that yielded nothing usable, with the status the
 /// server gave it. Both member lanes use it - the multiget for a resource with
@@ -42,31 +28,11 @@ pub(crate) struct CardDavFetchedVCard {
 /// so both classify through the same ladder.
 pub(crate) type CardDavFailedResource = bifrost_dav_core::FailedResource;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct CardDavMultigetReport {
-    pub(crate) cards: Vec<CardDavFetchedVCard>,
-    pub(crate) failed: Vec<CardDavFailedResource>,
-    /// Resources that returned a successful response but omitted the
-    /// requested `address-data`. They are per-resource absences, not DAV
-    /// failures, so they surface through `Page::failed_ids` but cannot turn
-    /// a 207 into a synthetic server error.
-    pub(crate) missing_data: Vec<String>,
-}
+pub(crate) type CardDavMultigetReport = bifrost_dav_core::collection::MultigetReport;
 
 /// What a parsed 207 body actually represents, per RFC 4918 s13.
+#[cfg(test)]
 pub(crate) type MultigetOutcome = bifrost_dav_core::MultiStatusOutcome;
-
-impl CardDavMultigetReport {
-    pub(crate) fn extend(&mut self, other: CardDavMultigetReport) {
-        self.cards.extend(other.cards);
-        self.failed.extend(other.failed);
-        self.missing_data.extend(other.missing_data);
-    }
-
-    pub(crate) fn classify(&self) -> MultigetOutcome {
-        classify_207(!self.cards.is_empty(), &self.failed)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AddressBookCollection {
@@ -86,47 +52,6 @@ pub(crate) struct AddressBookCollection {
 impl AddressBookCollection {
     pub(crate) fn resolve_href(&mut self, request_url: &str) {
         self.href = resolve_href(request_url, &self.href);
-    }
-}
-
-impl CardDavContactListing {
-    pub(crate) fn resolve_hrefs(&mut self, request_url: &str) {
-        for entry in &mut self.entries {
-            entry.uri = resolve_href(request_url, &entry.uri);
-        }
-        for failure in &mut self.failed {
-            failure.href = resolve_href(request_url, &failure.href);
-        }
-    }
-
-    /// The refused hrefs, for the lanes that only carry ids (`Page::failed_ids`
-    /// and the snapshot-diff preservation guard).
-    pub(crate) fn failed_hrefs(&self) -> Vec<String> {
-        self.failed
-            .iter()
-            .map(|failure| failure.href.clone())
-            .collect()
-    }
-
-    /// Read this 207 through the RFC 4918 s13 ladder, the same one the multiget
-    /// lanes use. A listing with any committed entry is `Usable` however many
-    /// siblings were refused.
-    pub(crate) fn classify(&self) -> MultigetOutcome {
-        classify_207(!self.entries.is_empty(), &self.failed)
-    }
-}
-
-impl CardDavMultigetReport {
-    pub(crate) fn resolve_hrefs(&mut self, request_url: &str) {
-        for card in &mut self.cards {
-            card.uri = resolve_href(request_url, &card.uri);
-        }
-        for failed in &mut self.failed {
-            failed.href = resolve_href(request_url, &failed.href);
-        }
-        for href in &mut self.missing_data {
-            *href = resolve_href(request_url, href);
-        }
     }
 }
 
@@ -393,7 +318,7 @@ impl MultiStatusSink for MultigetSink {
             return;
         }
         if let Some((href, data)) = parts.fetched() {
-            self.report.cards.push(CardDavFetchedVCard {
+            self.report.items.push(CardDavFetchedVCard {
                 uri: href.to_string(),
                 etag: parts.props().etag.clone(),
                 data: data.to_string(),
@@ -669,8 +594,8 @@ END:VCARD</C:address-data></D:prop>
           </D:response></D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("valid XML");
-        assert_eq!(report.cards.len(), 1);
-        assert_eq!(report.cards[0].uri, "/contacts/opaque-id");
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].uri, "/contacts/opaque-id");
     }
 
     /// The CalDAV twin guards this; the two crates had drifted. A server
@@ -686,7 +611,7 @@ END:VCARD</C:address-data></D:prop>
           </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("valid XML");
-        assert!(report.cards.is_empty());
+        assert!(report.items.is_empty());
     }
 
     #[test]
@@ -727,10 +652,10 @@ END:VCARD</C:address-data>
 </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("valid XML");
-        assert_eq!(report.cards.len(), 1);
-        assert_eq!(report.cards[0].uri, "/contacts/card-1.vcf");
-        assert_eq!(report.cards[0].etag.as_deref(), Some("abc"));
-        assert!(report.cards[0].data.contains("FN:Ada Lovelace"));
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].uri, "/contacts/card-1.vcf");
+        assert_eq!(report.items[0].etag.as_deref(), Some("abc"));
+        assert!(report.items[0].data.contains("FN:Ada Lovelace"));
         assert!(report.failed.is_empty());
     }
 
@@ -753,7 +678,7 @@ END:VCARD</C:address-data>
 </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("valid XML");
-        assert!(report.cards.is_empty());
+        assert!(report.items.is_empty());
         assert_eq!(report.failed[0].status, Some(404));
     }
 
@@ -778,7 +703,7 @@ END:VCARD</C:address-data>
 </D:multistatus>"#;
 
         let report = parse_multiget_report(xml).expect("valid 207");
-        assert!(report.cards.is_empty());
+        assert!(report.items.is_empty());
         assert_eq!(report.failed.len(), 2);
         assert_eq!(
             report.classify(),
@@ -1085,7 +1010,7 @@ FN:Ada
 END:VCARD]]></C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
         )
         .expect("valid multiget");
-        assert!(report.cards[0].data.contains("FN:Ada"));
+        assert!(report.items[0].data.contains("FN:Ada"));
 
         let ctag = parse_collection_ctag(
             r#"<D:multistatus xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/"><D:response><D:propstat><D:prop><CS:getctag><![CDATA[tag-2]]></CS:getctag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,

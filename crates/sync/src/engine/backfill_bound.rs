@@ -538,10 +538,8 @@ mod tests {
     struct MarkerHarness {
         bound: Harness,
         control: SyncControl,
-        delivery: Arc<crate::multiplexer::ChangeDelivery>,
-        rx: std::sync::Mutex<
-            tokio::sync::broadcast::Receiver<crate::multiplexer::MultiplexerEvent>,
-        >,
+        delivery: Arc<crate::delivery::ChangeDelivery>,
+        rx: std::sync::Mutex<tokio::sync::broadcast::Receiver<crate::delivery::MultiplexerEvent>>,
     }
 
     fn marker_harness(capacity: usize) -> MarkerHarness {
@@ -569,7 +567,7 @@ mod tests {
                 scheduler,
             },
             control,
-            delivery: Arc::new(crate::multiplexer::ChangeDelivery::new(tx)),
+            delivery: Arc::new(crate::delivery::ChangeDelivery::new(tx)),
             rx: std::sync::Mutex::new(rx),
         }
     }
@@ -598,7 +596,7 @@ mod tests {
         h.bound.coverage.raise_scope_fence(&scope);
         let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(4);
         drop(writer_rx);
-        let publisher = crate::multiplexer::PagePublisher::new(
+        let publisher = crate::delivery::PagePublisher::new(
             Arc::clone(&h.delivery),
             h.control.clone(),
             writer_tx,
@@ -659,7 +657,7 @@ mod tests {
         ) -> MarkerOutcome {
             let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(4);
             drop(writer_rx);
-            let publisher = crate::multiplexer::PagePublisher::new(
+            let publisher = crate::delivery::PagePublisher::new(
                 Arc::clone(&self.delivery),
                 self.control.clone(),
                 writer_tx,
@@ -698,7 +696,7 @@ mod tests {
                 },
             );
             self.coverage
-                .mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(seq));
+                .mark_delivered(&id, crate::delivery::ReceiverSequence::for_test(seq));
             id
         }
     }
@@ -1030,7 +1028,7 @@ mod tests {
         // is 1, which is not below the sequence those pages were sent at.
         assert_eq!(
             h.coverage
-                .release_undelivered(Some(crate::multiplexer::ReceiverSequence::for_test(1))),
+                .release_undelivered(Some(crate::delivery::ReceiverSequence::for_test(1))),
             2
         );
         assert_eq!(h.coverage.backfill_in_flight(), 0);
@@ -1046,7 +1044,7 @@ mod tests {
         h.publish(&page(&scope_a(), "page:0:10", 1), 2);
         assert_eq!(
             h.coverage
-                .release_undelivered(Some(crate::multiplexer::ReceiverSequence::for_test(0))),
+                .release_undelivered(Some(crate::delivery::ReceiverSequence::for_test(0))),
             0
         );
         assert_eq!(h.coverage.backfill_in_flight(), 1);
@@ -1076,10 +1074,10 @@ mod tests {
         // The replacement subscribes, THEN the send happens and records the
         // sequence that includes it.
         h.coverage
-            .mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(2));
+            .mark_delivered(&id, crate::delivery::ReceiverSequence::for_test(2));
         assert_eq!(
             h.coverage
-                .release_undelivered(Some(crate::multiplexer::ReceiverSequence::for_test(1))),
+                .release_undelivered(Some(crate::delivery::ReceiverSequence::for_test(1))),
             0
         );
         assert_eq!(h.coverage.backfill_in_flight(), 1);
@@ -1232,7 +1230,7 @@ mod tests {
                 generation: crate::cursor::WalkGeneration::for_test(0),
             },
         );
-        coverage.mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(1));
+        coverage.mark_delivered(&id, crate::delivery::ReceiverSequence::for_test(1));
         let wait = producer.wait_for_capacity_holding_admission();
         tokio::pin!(wait);
         assert!(still_parked(wait.as_mut()).await, "parked at the bound");
@@ -1573,9 +1571,9 @@ mod tests {
     async fn the_charge_holders_name_the_receiver_that_has_not_read() {
         let h = harness(1);
         h.coverage
-            .receiver_joined(crate::multiplexer::ReceiverSequence::for_test(0));
+            .receiver_joined(crate::delivery::ReceiverSequence::for_test(0));
         h.coverage
-            .receiver_joined(crate::multiplexer::ReceiverSequence::for_test(1));
+            .receiver_joined(crate::delivery::ReceiverSequence::for_test(1));
         // Sent when two receivers had been handed out, so both are eligible.
         let id = h.publish(&page(&scope_a(), "page:0:10", 1), 2);
 
@@ -1583,8 +1581,8 @@ mod tests {
             h.coverage.backfill_charge_holders(),
             (
                 vec![
-                    crate::multiplexer::ReceiverSequence::for_test(0),
-                    crate::multiplexer::ReceiverSequence::for_test(1)
+                    crate::delivery::ReceiverSequence::for_test(0),
+                    crate::delivery::ReceiverSequence::for_test(1)
                 ],
                 vec![scope_a()]
             ),
@@ -1593,18 +1591,18 @@ mod tests {
         );
 
         h.coverage
-            .mark_received(&id, crate::multiplexer::ReceiverSequence::for_test(1));
+            .mark_received(&id, crate::delivery::ReceiverSequence::for_test(1));
         assert_eq!(
             h.coverage.backfill_charge_holders(),
             (
-                vec![crate::multiplexer::ReceiverSequence::for_test(0)],
+                vec![crate::delivery::ReceiverSequence::for_test(0)],
                 vec![scope_a()]
             ),
             "the fast reader drops out of the list; the slow one is the stall"
         );
 
         h.coverage
-            .mark_received(&id, crate::multiplexer::ReceiverSequence::for_test(0));
+            .mark_received(&id, crate::delivery::ReceiverSequence::for_test(0));
         assert_eq!(
             h.coverage.backfill_charge_holders(),
             (Vec::new(), Vec::new()),

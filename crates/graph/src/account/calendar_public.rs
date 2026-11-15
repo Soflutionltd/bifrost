@@ -17,8 +17,9 @@ const MAX_REQUESTS: u32 = 10_000;
 const MAX_IDS: usize = 100_000;
 
 pub(super) async fn calendars(account: &GraphAccount) -> Vec<Calendar> {
-    let routing = account.routing_map.read().await;
-    let meta = account.public_folder_meta.read().await;
+    let discovery = account.public_folders.snapshot().await;
+    let routing = &discovery.routing;
+    let meta = &discovery.metadata;
     let mut result: Vec<_> = meta
         .iter()
         .filter(|(id, meta)| {
@@ -65,19 +66,22 @@ async fn routing(
     op: AccountOperation,
 ) -> Result<ews::EwsHeaders, AccountError> {
     account
+        .public_folders
         .public_folder_routing(&FolderId(folder.into()))
         .await
         .map(|r| r.headers())
         .ok_or_else(|| {
-            account.missing_public_collection_route_error(
-                op,
-                &FolderId(folder.into()),
-                ErrorScope::Calendar {
-                    id: foreign::public_calendar(folder),
-                },
-                bifrost_types::ResourceKind::Calendar,
-                &foreign::public_calendar(folder).0,
-            )
+            account
+                .public_folders
+                .missing_public_collection_route_error(
+                    op,
+                    &FolderId(folder.into()),
+                    ErrorScope::Calendar {
+                        id: foreign::public_calendar(folder),
+                    },
+                    bifrost_types::ResourceKind::Calendar,
+                    &foreign::public_calendar(folder).0,
+                )
         })
 }
 fn context(op: AccountOperation, folder: &str) -> GraphErrorContext {
@@ -122,15 +126,11 @@ fn ticks(time: &EventTime, op: AccountOperation) -> Result<i64, AccountError> {
             "public CalendarView needs valid start/end instants and a resolvable zone",
         )
     };
-    let instant = match time.value.parse::<jiff::Timestamp>() {
-        Ok(instant) => instant,
-        Err(_) => {
-            let local = time
-                .value
-                .parse::<civil::DateTime>()
-                .map_err(|_| invalid())?;
-            let zone =
-                resolve_time_zone(time.timezone.as_deref().unwrap_or("UTC")).ok_or_else(invalid)?;
+    let instant = match time.instant() {
+        Some(instant) => instant,
+        None => {
+            let local = time.local_datetime().ok_or_else(invalid)?;
+            let zone = resolve_time_zone(time.timezone().unwrap_or("UTC")).ok_or_else(invalid)?;
             local.to_zoned(zone).map_err(|_| invalid())?.timestamp()
         }
     };
@@ -176,10 +176,10 @@ pub(super) async fn range(
             )
         })?;
         if p.public_calendar_v1 != folder
-            || p.start != query.start.value
-            || p.end != query.end.value
-            || p.start_zone != query.start.timezone
-            || p.end_zone != query.end.timezone
+            || p.start != query.start.value()
+            || p.end != query.end.value()
+            || p.start_zone.as_deref() != query.start.timezone()
+            || p.end_zone.as_deref() != query.end.timezone()
             || (p.windows.is_empty() && p.ready.is_empty())
             || p.windows
                 .iter()
@@ -195,10 +195,10 @@ pub(super) async fn range(
     } else {
         Position {
             public_calendar_v1: folder.into(),
-            start: query.start.value.clone(),
-            end: query.end.value.clone(),
-            start_zone: query.start.timezone.clone(),
-            end_zone: query.end.timezone.clone(),
+            start: query.start.value().to_owned(),
+            end: query.end.value().to_owned(),
+            start_zone: query.start.timezone().map(str::to_owned),
+            end_zone: query.end.timezone().map(str::to_owned),
             windows: vec![(start, end)],
             seen: BTreeSet::new(),
             ready: Vec::new(),
@@ -672,7 +672,7 @@ fn project(folder: &str, node: &Node) -> Result<CalendarEvent, ews::EwsError> {
                     .to_string();
             }
         }
-        Ok(EventTime { value, timezone })
+        Ok(EventTime::from_observed(value, timezone))
     };
     let mut attendees = Vec::new();
     for (field, role) in [
@@ -719,7 +719,6 @@ fn project(folder: &str, node: &Node) -> Result<CalendarEvent, ews::EwsError> {
             .value("End")
             .map(|_| time("End", "EndTimeZone"))
             .transpose()?,
-        is_all_day: all_day,
         status: if node.value("IsCancelled").as_deref() == Some("true") {
             EventStatus::Cancelled
         } else {
@@ -849,14 +848,8 @@ mod tests {
     fn query() -> EventRange {
         EventRange {
             calendar_id: foreign::public_calendar("cal"),
-            start: EventTime {
-                value: "2026-10-20T00:00:00Z".into(),
-                timezone: None,
-            },
-            end: EventTime {
-                value: "2026-10-22T00:00:00Z".into(),
-                timezone: None,
-            },
+            start: EventTime::from_observed("2026-10-20T00:00:00Z", None),
+            end: EventTime::from_observed("2026-10-22T00:00:00Z", None),
             page_cursor: None,
             limit: Some(2),
         }
@@ -910,8 +903,8 @@ mod tests {
             assert_eq!(event.title.as_deref(), Some("Design & build"));
             assert_eq!(event.description.as_deref(), Some("Full text"));
             assert_eq!(event.location.as_deref(), Some("Room"));
-            assert_eq!(event.start.timezone.as_deref(), Some("UTC"));
-            assert_eq!(event.end.as_ref().unwrap().value, "2026-10-20T12:00:00Z");
+            assert_eq!(event.start.timezone(), Some("UTC"));
+            assert_eq!(event.end.as_ref().unwrap().value(), "2026-10-20T12:00:00Z");
             assert_eq!(
                 event.recurrence.recurrence_id.as_deref(),
                 Some("2026-10-20T09:00:00Z")
@@ -970,9 +963,19 @@ mod tests {
             q.page_cursor = Some(bytes.clone());
             match changed {
                 0 => q.calendar_id = foreign::public_calendar("other"),
-                1 => q.start.value = "2026-10-19T00:00:00Z".into(),
-                2 => q.end.value = "2026-10-23T00:00:00Z".into(),
-                _ => q.start.timezone = Some("UTC".into()),
+                1 => {
+                    q.start = EventTime::from_observed(
+                        "2026-10-19T00:00:00Z",
+                        q.start.timezone().map(str::to_owned),
+                    );
+                }
+                2 => {
+                    q.end = EventTime::from_observed(
+                        "2026-10-23T00:00:00Z",
+                        q.end.timezone().map(str::to_owned),
+                    );
+                }
+                _ => q.start = q.start.clone().with_timezone(Some("UTC".into())),
             }
             seed(&account, "other", "IPF.Appointment", true).await;
             let error = super::super::events_in_range(account.clone(), q)
@@ -1053,7 +1056,10 @@ mod tests {
             seed(&account, "cal", "IPF.Appointment", true).await;
             let mut q = query();
             q.limit = Some(1);
-            q.end.value = "2026-10-20T00:00:00.0000001Z".into();
+            q.end = EventTime::from_observed(
+                "2026-10-20T00:00:00.0000001Z",
+                q.end.timezone().map(str::to_owned),
+            );
             let error = super::super::events_in_range(account, q).await.unwrap_err();
             assert_eq!(
                 error.kind(),
@@ -1127,7 +1133,6 @@ mod tests {
             location: None,
             start: query().start,
             end: query().end,
-            is_all_day: false,
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -1153,10 +1158,7 @@ mod tests {
                     EventId("personal::a".into()),
                     EventPatch {
                         calendar_id: Some(foreign::public_calendar("cal")),
-                        start: Some(EventTime {
-                            value: String::new(),
-                            timezone: None,
-                        }),
+                        start: Some(EventTime::from_observed(String::new(), None)),
                         ..Default::default()
                     },
                 )
@@ -1201,10 +1203,10 @@ mod tests {
         let result = super::super::get(a, foreign::public_event("cal", "day"))
             .await
             .unwrap();
-        assert_eq!(result.start.value, "2026-10-20");
-        assert_eq!(result.end.unwrap().value, "2026-10-21");
+        assert_eq!(result.start.value(), "2026-10-20");
+        assert_eq!(result.end.as_ref().unwrap().value(), "2026-10-21");
         assert_eq!(result.description.as_deref(), Some("Short"));
-        assert!(result.is_all_day);
+        assert!(result.is_all_day());
     }
     #[tokio::test]
     async fn nc2c_review_saved_ready_deletion_reports_native_failure_and_advances() {
@@ -1329,10 +1331,18 @@ mod tests {
         let (script, account) = account(vec![soap("", true)]);
         seed(&account, "cal", "IPF.Appointment", true).await;
         let mut q = query();
-        q.start.value = "2026-10-20T00:00:00".into();
-        q.end.value = "2026-10-22T00:00:00".into();
-        q.start.timezone = Some("W. Europe Standard Time".into());
-        q.end.timezone = q.start.timezone.clone();
+        q.start =
+            EventTime::from_observed("2026-10-20T00:00:00", q.start.timezone().map(str::to_owned));
+        q.end =
+            EventTime::from_observed("2026-10-22T00:00:00", q.end.timezone().map(str::to_owned));
+        q.start = q
+            .start
+            .clone()
+            .with_timezone(Some("W. Europe Standard Time".into()));
+        q.end = q
+            .end
+            .clone()
+            .with_timezone(q.start.timezone().map(str::to_owned));
         let result = super::super::events_in_range(account, q).await.unwrap();
         assert!(result.next_cursor.is_none());
         let body = &bodies(&script)[0];

@@ -24,6 +24,9 @@ pub(crate) mod request;
 pub(crate) mod response;
 pub(crate) mod search;
 mod secret;
+mod session;
+pub(crate) use session::SessionState;
+pub(crate) mod set;
 mod sync;
 mod uid_range;
 pub(crate) mod validated;
@@ -36,7 +39,9 @@ pub(crate) use body::BodyStructure;
 pub(crate) use envelope::{Envelope, EnvelopeAddress};
 pub(crate) use fetch::{AppendMessage, FetchAttr, FetchResponse, StoreOperation, StoreResult};
 pub(crate) use flag::Flag;
-pub(crate) use ids::{ModSeq, ModSeqValzer, SeqSet, Uid, UidSet, UidValidity};
+pub(crate) use ids::{AppendUid, GmailMessageId, GmailThreadId, Seq};
+pub(crate) use ids::{ModSeq, ModSeqValzer, SeqSetExpr, UidSetExpr};
+pub use ids::{Uid, UidValidity};
 pub(crate) use mailbox::{
     MailboxAttribute, MailboxInfo, SelectedMailbox, StatusItem, StatusResult,
 };
@@ -51,7 +56,7 @@ pub(crate) use response::{
 };
 #[cfg(test)]
 pub(crate) use response::{MetadataEntry, UntaggedStatus};
-pub(crate) use search::SearchCriteria;
+pub(crate) use search::{SearchCriteria, SearchResult};
 pub(crate) use secret::SecretString;
 pub(crate) use sync::{QresyncOutcome, SyncFetchResult, SyncSelectResult};
 pub(crate) use validated::{

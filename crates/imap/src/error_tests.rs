@@ -90,19 +90,25 @@ fn display_bye() {
 
 #[test]
 fn display_protocol() {
-    let err = Error::Protocol("missing CRLF".into());
+    let err = Error::Provider(crate::error::ProviderFailure::Protocol(
+        "missing CRLF".into(),
+    ));
     assert_eq!(err.to_string(), "protocol error: missing CRLF");
 }
 
 #[test]
 fn display_parse() {
-    let err = Error::Parse("unexpected NIL".into());
+    let err = Error::Provider(crate::error::ProviderFailure::Parse(
+        "unexpected NIL".into(),
+    ));
     assert_eq!(err.to_string(), "parse error: unexpected NIL");
 }
 
 #[test]
 fn display_invalid_input() {
-    let err = Error::InvalidInput("bad mailbox name".into());
+    let err = Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
+        "bad mailbox name".into(),
+    ));
     assert_eq!(err.to_string(), "invalid input: bad mailbox name");
 }
 
@@ -119,7 +125,7 @@ fn display_closed() {
 #[test]
 fn display_starttls_unavailable() {
     assert_eq!(
-        Error::StartTlsUnavailable.to_string(),
+        Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable).to_string(),
         "STARTTLS unavailable in current session",
     );
 }
@@ -129,7 +135,7 @@ fn starttls_unavailable_is_classified_as_a_policy_block() {
     use bifrost_types::{AccessErrorKind, AccountErrorKind, AccountOperation};
 
     let account_error = crate::account::error::into_account_error(
-        Error::StartTlsUnavailable,
+        Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable),
         crate::account::error::ImapErrorContext::operation(AccountOperation::Discover),
     );
     assert!(matches!(
@@ -140,7 +146,9 @@ fn starttls_unavailable_is_classified_as_a_policy_block() {
 
 #[test]
 fn display_missing_capability() {
-    let err = Error::MissingCapability("COMPRESS=DEFLATE".into());
+    let err = Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(
+        "COMPRESS=DEFLATE".into(),
+    ));
     assert_eq!(
         err.to_string(),
         "missing required capability: COMPRESS=DEFLATE",
@@ -149,10 +157,10 @@ fn display_missing_capability() {
 
 #[test]
 fn display_append_limit() {
-    let err = Error::AppendLimit {
+    let err = Error::LocalRefusal(crate::error::LocalRefusal::AppendLimit {
         size: 10_000,
         limit: 5_000,
-    };
+    });
     assert_eq!(
         err.to_string(),
         "message size 10000 exceeds server APPENDLIMIT of 5000",
@@ -161,7 +169,9 @@ fn display_append_limit() {
 
 #[test]
 fn display_invalid_append_date() {
-    let err = Error::InvalidAppendDate("32-Jan-2025 00:00:00 +0000".into());
+    let err = Error::LocalRefusal(crate::error::LocalRefusal::InvalidAppendDate(
+        "32-Jan-2025 00:00:00 +0000".into(),
+    ));
     assert_eq!(
         err.to_string(),
         "invalid APPEND date-time: 32-Jan-2025 00:00:00 +0000",
@@ -213,7 +223,8 @@ fn with_attempt_sets_state_on_bye() {
 
 #[test]
 fn with_attempt_noop_on_pure_local_errors() {
-    let err = Error::InvalidInput("x".into()).with_attempt(TransmissionState::Acknowledged);
+    let err = Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput("x".into()))
+        .with_attempt(TransmissionState::Acknowledged);
     assert!(err.attempt().is_none());
 }
 
@@ -233,18 +244,32 @@ fn bad_with_code_defaults_to_acknowledged_attempt() {
 }
 
 #[test]
-fn with_attempt_overrides_no_attempt() {
-    // The driver and test helpers can re-stamp the attempt state if a
-    // wire-level observation says otherwise.
-    let err = Error::no_with_code("nope".into(), None).with_attempt(TransmissionState::InFlight);
-    assert_eq!(err.attempt(), Some(TransmissionState::InFlight));
+fn with_attempt_preserves_server_acknowledgement() {
+    // A tagged refusal remains acknowledged even inside a loop with an
+    // earlier exchange phase.
+    for err in [
+        Error::no_with_code("nope".into(), None),
+        Error::bad_with_code("syntax".into(), None),
+        Error::auth_with_code("denied".into(), None),
+    ] {
+        assert_eq!(
+            err.with_attempt(TransmissionState::InFlight).attempt(),
+            Some(TransmissionState::Acknowledged)
+        );
+    }
 }
 
 #[test]
 fn from_io_error_via_into_yields_io_variant_without_attempt() {
     let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "connect");
     let err: Error = io_err.into();
-    assert!(matches!(err, Error::Io { .. }));
+    assert!(matches!(
+        err,
+        Error::Transport {
+            kind: crate::error::TransportFailure::Io(crate::error::IoFailure(_)),
+            ..
+        }
+    ));
     assert!(err.attempt().is_none());
 }
 
@@ -254,7 +279,10 @@ fn from_validation_error_maps_to_invalid_input() {
     let validation =
         crate::types::MailboxName::new("INBOX\r").expect_err("control chars should fail");
     let err: Error = validation.into();
-    assert!(matches!(err, Error::InvalidInput(_)));
+    assert!(matches!(
+        err,
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(_))
+    ));
 }
 
 // --- Response code preservation on status variants ---
@@ -286,8 +314,16 @@ fn bye_preserves_response_code() {
 #[test]
 fn non_status_variants_have_no_response_code() {
     assert!(Error::timeout().response_code().is_none());
-    assert!(Error::Protocol("x".into()).response_code().is_none());
-    assert!(Error::InvalidInput("x".into()).response_code().is_none());
+    assert!(
+        Error::Provider(crate::error::ProviderFailure::Protocol("x".into()))
+            .response_code()
+            .is_none()
+    );
+    assert!(
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput("x".into()))
+            .response_code()
+            .is_none()
+    );
 }
 
 // --- Equality ---
@@ -297,24 +333,33 @@ fn equal_unit_constructed_variants() {
     assert_eq!(Error::timeout(), Error::timeout());
     assert_eq!(Error::closed(), Error::closed());
     assert_eq!(Error::driver_gone(), Error::driver_gone());
-    assert_eq!(Error::StartTlsUnavailable, Error::StartTlsUnavailable);
+    assert_eq!(
+        Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable),
+        Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable)
+    );
 }
 
 #[test]
 fn equal_string_variants() {
-    assert_eq!(Error::Protocol("x".into()), Error::Protocol("x".into()));
-    assert_eq!(Error::Parse("y".into()), Error::Parse("y".into()));
     assert_eq!(
-        Error::InvalidInput("a".into()),
-        Error::InvalidInput("a".into()),
+        Error::Provider(crate::error::ProviderFailure::Protocol("x".into())),
+        Error::Provider(crate::error::ProviderFailure::Protocol("x".into()))
+    );
+    assert_eq!(
+        Error::Provider(crate::error::ProviderFailure::Parse("y".into())),
+        Error::Provider(crate::error::ProviderFailure::Parse("y".into()))
+    );
+    assert_eq!(
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput("a".into())),
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput("a".into())),
     );
 }
 
 #[test]
 fn equal_authpolicy() {
     assert_eq!(
-        Error::AuthPolicy(auth_policy_failure()),
-        Error::AuthPolicy(auth_policy_failure()),
+        Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(auth_policy_failure())),
+        Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(auth_policy_failure())),
     );
 }
 
@@ -336,7 +381,10 @@ fn io_not_equal_when_attempt_differs() {
 #[test]
 fn different_variants_are_not_equal() {
     assert_ne!(Error::timeout(), Error::closed());
-    assert_ne!(Error::Protocol("x".into()), Error::Parse("x".into()));
+    assert_ne!(
+        Error::Provider(crate::error::ProviderFailure::Protocol("x".into())),
+        Error::Provider(crate::error::ProviderFailure::Parse("x".into()))
+    );
 }
 
 // --- Variant discrimination ---
@@ -349,40 +397,50 @@ fn all_variants_are_distinguishable() {
         Error::no_with_code("n".into(), None),
         Error::bad_with_code("b".into(), None),
         Error::bye_with_code("y".into(), None),
-        Error::Protocol("p".into()),
-        Error::ProtocolMissing("pm".into()),
-        Error::Parse("r".into()),
-        Error::InvalidInput("i".into()),
-        Error::InvalidState("s".into()),
-        Error::StateChangedBeforeSend("m".into()),
-        Error::UnsupportedOperation("o".into()),
+        Error::Provider(crate::error::ProviderFailure::Protocol("p".into())),
+        Error::Provider(crate::error::ProviderFailure::Missing("pm".into())),
+        Error::Provider(crate::error::ProviderFailure::Parse("r".into())),
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput("i".into())),
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidState("s".into())),
+        Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(
+            "m".into(),
+        )),
+        Error::LocalRefusal(crate::error::LocalRefusal::UnsupportedOperation("o".into())),
         Error::timeout(),
         Error::closed(),
-        Error::AuthPolicy(auth_policy_failure()),
-        Error::StartTlsUnavailable,
-        Error::MissingCapability("c".into()),
-        Error::AppendLimit { size: 1, limit: 0 },
-        Error::FetchLimit {
+        Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(auth_policy_failure())),
+        Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable),
+        Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability("c".into())),
+        Error::LocalRefusal(crate::error::LocalRefusal::AppendLimit { size: 1, limit: 0 }),
+        Error::ResultLimit(crate::error::ResultLimit::Fetch {
             estimated: 2,
             limit: 1,
-            seq: Some(3),
-            uid: Some(4),
-        },
-        Error::FetchLiteralLimit {
+            seq: Some(crate::types::Seq::new(3).expect("valid protocol test value")),
+            uid: Some(crate::types::Uid::new(4).expect("valid protocol test value")),
+        }),
+        Error::ResultLimit(crate::error::ResultLimit::FetchLiteral {
             estimated: 2,
             limit: 1,
-        },
-        Error::SearchResultTruncated {
+        }),
+        Error::ResultLimit(crate::error::ResultLimit::SearchTruncated {
             returned: 1,
             omitted: Some(2),
+        }),
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidAppendDate(
+            "bad date".into(),
+        )),
+        Error::Internal {
+            kind: crate::error::InternalFailure::Invariant("internal err".into()),
+            mid_exchange: None,
         },
-        Error::InvalidAppendDate("bad date".into()),
-        Error::Internal("internal err".into()),
         Error::internal_mid_exchange("mid", TransmissionState::InFlight),
-        Error::LocalRuntime("rng".into()),
-        Error::DriverPanicked {
-            message: "p".into(),
-            attempt: None,
+        Error::Internal {
+            kind: crate::error::InternalFailure::Runtime("rng".into()),
+            mid_exchange: None,
+        },
+        Error::Internal {
+            kind: crate::error::InternalFailure::Panicked("p".into()),
+            mid_exchange: None,
         },
         Error::driver_gone(),
     ];
@@ -390,34 +448,69 @@ fn all_variants_are_distinguishable() {
     for err in &errors {
         let label = match err {
             Error::OAuthToken(_) => "oauthtoken",
+            Error::OperationNotSent(_) => "operationnotsent",
             Error::MoveFallbackIncomplete { .. } => "movefallback",
-            Error::Io { .. } => "io",
-            Error::Auth { .. } => "auth",
-            Error::No { .. } => "no",
-            Error::Bad { .. } => "bad",
+            Error::Transport {
+                kind: crate::error::TransportFailure::Io(crate::error::IoFailure(_)),
+                ..
+            } => "io",
+            Error::ServerStatus(crate::error::ServerStatus::Auth { .. }) => "auth",
+            Error::ServerStatus(crate::error::ServerStatus::No { .. }) => "no",
+            Error::ServerStatus(crate::error::ServerStatus::Bad { .. }) => "bad",
             Error::Bye { .. } => "bye",
-            Error::Protocol(_) => "protocol",
-            Error::ProtocolMissing(_) => "protocolmissing",
-            Error::Parse(_) => "parse",
-            Error::InvalidInput(_) => "invalidinput",
-            Error::InvalidState(_) => "invalidstate",
-            Error::StateChangedBeforeSend(_) => "statechangedbeforesend",
-            Error::UnsupportedOperation(_) => "unsupportedoperation",
-            Error::Timeout { .. } => "timeout",
-            Error::Closed { .. } => "closed",
-            Error::AuthPolicy(_) => "authpolicy",
-            Error::StartTlsUnavailable => "starttls",
-            Error::MissingCapability(_) => "capability",
-            Error::AppendLimit { .. } => "appendlimit",
-            Error::FetchLimit { .. } => "fetchlimit",
-            Error::FetchLiteralLimit { .. } => "fetchliterallimit",
-            Error::SearchResultTruncated { .. } => "searchresulttruncated",
-            Error::InvalidAppendDate(_) => "invalidappenddate",
-            Error::Internal(_) => "internal",
-            Error::InternalMidExchange { .. } => "internalmidexchange",
-            Error::LocalRuntime(_) => "localruntime",
-            Error::DriverPanicked { .. } => "driverpanicked",
-            Error::DriverGone { .. } => "drivergone",
+            Error::Provider(crate::error::ProviderFailure::Protocol(_)) => "protocol",
+            Error::Provider(crate::error::ProviderFailure::Missing(_)) => "protocolmissing",
+            Error::Provider(crate::error::ProviderFailure::Parse(_)) => "parse",
+            Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(_)) => "invalidinput",
+            Error::LocalRefusal(crate::error::LocalRefusal::InvalidState(_)) => "invalidstate",
+            Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(_)) => {
+                "statechangedbeforesend"
+            }
+            Error::LocalRefusal(crate::error::LocalRefusal::UnsupportedOperation(_)) => {
+                "unsupportedoperation"
+            }
+            Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
+                ..
+            } => "timeout",
+            Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            } => "closed",
+            Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(_)) => "authpolicy",
+            Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable) => "starttls",
+            Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(_)) => "capability",
+            Error::LocalRefusal(crate::error::LocalRefusal::AppendLimit { .. }) => "appendlimit",
+            Error::ResultLimit(crate::error::ResultLimit::Fetch { .. }) => "fetchlimit",
+            Error::ResultLimit(crate::error::ResultLimit::FetchLiteral { .. }) => {
+                "fetchliterallimit"
+            }
+            Error::ResultLimit(crate::error::ResultLimit::SearchTruncated { .. }) => {
+                "searchresulttruncated"
+            }
+            Error::LocalRefusal(crate::error::LocalRefusal::InvalidAppendDate(_)) => {
+                "invalidappenddate"
+            }
+            Error::Internal {
+                kind: crate::error::InternalFailure::Invariant(_),
+                mid_exchange: None,
+            } => "internal",
+            Error::Internal {
+                kind: crate::error::InternalFailure::Invariant(_),
+                ..
+            } => "internalmidexchange",
+            Error::Internal {
+                kind: crate::error::InternalFailure::Runtime(_),
+                ..
+            } => "localruntime",
+            Error::Internal {
+                kind: crate::error::InternalFailure::Panicked(_),
+                ..
+            } => "driverpanicked",
+            Error::Transport {
+                kind: crate::error::TransportFailure::DriverGone,
+                ..
+            } => "drivergone",
         };
         assert!(!label.is_empty());
     }
@@ -440,29 +533,37 @@ fn other_variants_have_no_source() {
         Error::no_with_code("no".into(), None),
         Error::bad_with_code("bad".into(), None),
         Error::bye_with_code("bye".into(), None),
-        Error::Protocol("proto".into()),
-        Error::ProtocolMissing("missing".into()),
-        Error::Parse("parse".into()),
-        Error::InvalidInput("x".into()),
-        Error::InvalidState("x".into()),
-        Error::StateChangedBeforeSend("x".into()),
-        Error::UnsupportedOperation("x".into()),
+        Error::Provider(crate::error::ProviderFailure::Protocol("proto".into())),
+        Error::Provider(crate::error::ProviderFailure::Missing("missing".into())),
+        Error::Provider(crate::error::ProviderFailure::Parse("parse".into())),
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput("x".into())),
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidState("x".into())),
+        Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(
+            "x".into(),
+        )),
+        Error::LocalRefusal(crate::error::LocalRefusal::UnsupportedOperation("x".into())),
         Error::timeout(),
         Error::closed(),
-        Error::StartTlsUnavailable,
-        Error::MissingCapability("CAP".into()),
-        Error::AppendLimit { size: 1, limit: 0 },
-        Error::SearchResultTruncated {
+        Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable),
+        Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability("CAP".into())),
+        Error::LocalRefusal(crate::error::LocalRefusal::AppendLimit { size: 1, limit: 0 }),
+        Error::ResultLimit(crate::error::ResultLimit::SearchTruncated {
             returned: 1,
             omitted: None,
+        }),
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidAppendDate("bad".into())),
+        Error::Internal {
+            kind: crate::error::InternalFailure::Invariant("test".into()),
+            mid_exchange: None,
         },
-        Error::InvalidAppendDate("bad".into()),
-        Error::Internal("test".into()),
         Error::internal_mid_exchange("mid", TransmissionState::Acknowledged),
-        Error::LocalRuntime("rng".into()),
-        Error::DriverPanicked {
-            message: "panic".into(),
-            attempt: None,
+        Error::Internal {
+            kind: crate::error::InternalFailure::Runtime("rng".into()),
+            mid_exchange: None,
+        },
+        Error::Internal {
+            kind: crate::error::InternalFailure::Panicked("panic".into()),
+            mid_exchange: None,
         },
         Error::driver_gone(),
     ];
@@ -479,8 +580,12 @@ fn other_variants_have_no_source() {
 /// server that sent something WRONG (`Protocol`) still does.
 #[test]
 fn a_missing_mandatory_response_is_not_connection_fatal() {
-    assert!(!Error::ProtocolMissing("x".into()).is_connection_fatal());
-    assert!(Error::Protocol("x".into()).is_connection_fatal());
+    assert!(
+        !Error::Provider(crate::error::ProviderFailure::Missing("x".into())).is_connection_fatal()
+    );
+    assert!(
+        Error::Provider(crate::error::ProviderFailure::Protocol("x".into())).is_connection_fatal()
+    );
 }
 
 #[test]
@@ -500,4 +605,17 @@ fn login_rejections_distinguish_sasl_from_command() {
     let rendered = failure.to_string();
     assert!(rendered.contains("AUTH=LOGIN ("));
     assert!(rendered.contains(", LOGIN ("));
+}
+
+#[test]
+fn prerequisite_refusal_retains_wire_acknowledgement_but_not_operation_transmission() {
+    let error =
+        Error::no_with_code("busy".into(), Some(ResponseCode::InUse)).for_unsent_operation();
+    assert_eq!(error.attempt(), Some(TransmissionState::Unsent));
+    assert_eq!(error.response_code(), Some(&ResponseCode::InUse));
+    assert!(!error.is_connection_fatal());
+    let Error::OperationNotSent(source) = error else {
+        panic!("expected prerequisite evidence")
+    };
+    assert_eq!(source.attempt(), Some(TransmissionState::Acknowledged));
 }

@@ -123,69 +123,57 @@ fn account_with(submission_available: bool, foreign_submission_id: Option<&str>)
     };
     let (caps, limits) = capabilities::build(&session, support).expect("capabilities build");
 
+    let mut registry =
+        super::registry::Registry::new(super::registry::Slot::from_mail(mail, limits));
+    if let Some(id) = foreign_submission_id {
+        let mut slot = super::registry::Slot::from_mail(
+            crate::account::Account::new(client.clone(), id),
+            limits,
+        );
+        slot.submission = true;
+        registry.insert_shared(slot);
+    }
+    if submission_available {
+        registry.families.submission =
+            Some(registry.install_family(crate::account::Account::<
+                _,
+                crate::core::capability::Submission,
+            >::new(client.clone(), "acct-1")));
+    }
+    let registry = Arc::new(registry);
     let shutdown = CancellationToken::new();
-    // `push_available: false` leaves the reader task unspawned, so nothing
-    // here opens a socket.
     let ws = WsState::new(
         client.clone(),
         false,
         shutdown.clone(),
         ReconnectPolicy::default(),
-        Arc::new(PushRouting::new(
-            "acct-1".to_string(),
-            std::iter::empty::<&bifrost_types::CursorScope>(),
-        )),
+        Arc::new(PushRouting::from_registry(Arc::clone(&registry))),
     );
-
-    let foreign_mail: HashMap<
-        crate::core::id::AccountId,
-        crate::account::Account<ReqwestTransport>,
-    > = foreign_submission_id
-        .map(|id| (id.into(), crate::account::Account::new(client.clone(), id)))
-        .into_iter()
-        .collect();
-    let foreign_submission: HashSet<String> = foreign_submission_id
-        .map(ToString::to_string)
-        .into_iter()
-        .collect();
-    let submission =
-        submission_available.then(|| crate::account::Account::new(client.clone(), "acct-1"));
-
     JmapAccount::new(
         client,
-        mail,
-        foreign_mail,
-        foreign_submission,
-        submission,
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
+        registry,
         Vec::new(),
         caps,
-        limits,
-        HashMap::new(),
         ws,
         shutdown,
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
+        super::discover::LifecycleTopology {
+            positions: HashMap::new(),
+            names: HashMap::new(),
+        },
     )
 }
 
 /// A send naming a foreign account this fixture cannot hold.
 ///
 /// Unknownness comes from the value being absent from the fixture's routing
-/// table, not from the string being degenerate: `MailboxId` has no syntax
+/// table, not from the string being degenerate: `PrincipalId` has no syntax
 /// validator, so an empty or malformed id would invite a future validation
 /// layer to reject it for an unrelated reason and quietly stop testing the
 /// routing lookup. `scheduled` stays `None` especially, since a scheduled
 /// foreign send is refused before the routing question is reached.
 fn send_as_request() -> SendRequest {
     let mut request = SendRequest::default();
-    request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
+    request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::PrincipalId(
         "contract-unknown-mailbox".to_string(),
     )));
     request
@@ -261,10 +249,7 @@ fn target() -> MutationTarget {
 }
 
 fn event_time() -> EventTime {
-    EventTime {
-        value: "2026-06-02T09:00:00Z".to_string(),
-        timezone: None,
-    }
+    EventTime::from_observed("2026-06-02T09:00:00Z".to_string(), None)
 }
 
 fn event_range() -> EventRange {
@@ -285,7 +270,6 @@ fn event_create() -> EventCreate {
         location: None,
         start: event_time(),
         end: event_time(),
-        is_all_day: false,
         status: EventStatus::Confirmed,
         availability: bifrost_types::EventAvailability::Busy,
         visibility: bifrost_types::EventVisibility::Default,

@@ -235,22 +235,24 @@ impl BudgetGate {
         };
         let inner = tokio::select! {
             acquired = inner_sem.acquire_owned() => acquired
-                .map_err(|e| Error::Other(format!("account semaphore closed: {e}")))?,
+                .map_err(|_| Error::Admission(crate::AdmissionFailure::AccountPoolClosed))?,
             () = pools.retired.cancelled() => {
-                return Err(Error::Other("account budget was forgotten".into()));
+                return Err(Error::Admission(crate::AdmissionFailure::AccountForgotten(account.clone())));
             }
         };
         let outer = tokio::select! {
             acquired = Arc::clone(&self.inner.global).acquire_owned() => acquired
-                .map_err(|e| Error::Other(format!("global semaphore closed: {e}")))?,
+                .map_err(|_| Error::Admission(crate::AdmissionFailure::GlobalPoolClosed))?,
             () = pools.retired.cancelled() => {
-                return Err(Error::Other("account budget was forgotten".into()));
+                return Err(Error::Admission(crate::AdmissionFailure::AccountForgotten(account.clone())));
             }
         };
         // If both semaphore acquisition and retirement became ready together,
         // do not hand a permit from the retired generation to the caller.
         if pools.retired.is_cancelled() {
-            return Err(Error::Other("account budget was forgotten".into()));
+            return Err(Error::Admission(crate::AdmissionFailure::AccountForgotten(
+                account.clone(),
+            )));
         }
         Ok(BudgetPermit {
             _outer: outer,
@@ -263,13 +265,13 @@ impl BudgetGate {
             .inner
             .accounts
             .lock()
-            .map_err(|_| Error::Other("account budget lock was poisoned".into()))?;
+            .map_err(|_| Error::Admission(crate::AdmissionFailure::BudgetPoisoned))?;
         match accounts.entry(account.clone()) {
             Entry::Occupied(entry) => match entry.get() {
                 AccountPoolsEntry::Active(pools) => Ok(Arc::clone(pools)),
-                AccountPoolsEntry::Forgotten => {
-                    Err(Error::Other("account budget was forgotten".into()))
-                }
+                AccountPoolsEntry::Forgotten => Err(Error::Admission(
+                    crate::AdmissionFailure::AccountForgotten(account.clone()),
+                )),
             },
             Entry::Vacant(entry) => {
                 let pools = AccountPools::new(self.inner.budget);
@@ -446,11 +448,13 @@ mod tests {
             "forget must cancel an acquisition waiting on the global pool"
         );
         assert!(
-            waiter.await.expect("waiter task").is_err(),
+            matches!(waiter.await.expect("waiter task"),
+                Err(Error::Admission(crate::AdmissionFailure::AccountForgotten(ref id))) if id == &account),
             "a retired account acquisition is refused"
         );
         assert!(
-            gate.acquire(&account, WorkKind::Sync).await.is_err(),
+            matches!(gate.acquire(&account, WorkKind::Sync).await,
+                Err(Error::Admission(crate::AdmissionFailure::AccountForgotten(ref id))) if id == &account),
             "a stray acquire after forget must not recreate account pools"
         );
 

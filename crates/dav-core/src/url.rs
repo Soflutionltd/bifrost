@@ -1,5 +1,73 @@
 //! DAV collection ancestry and origin-rooted service discovery.
 
+/// A native DAV href with its original spelling and parsed absolute target.
+///
+/// XML-relative hrefs must be resolved before construction. Persisted ids retain
+/// their spelling; the credential policy still has to admit the parsed origin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DavHref {
+    spelling: String,
+    url: reqwest::Url,
+}
+
+impl DavHref {
+    pub fn parse(spelling: impl Into<String>) -> Result<Self, &'static str> {
+        let spelling = spelling.into();
+        let url = reqwest::Url::parse(&spelling).map_err(|_| "DAV href is not an absolute URL")?;
+        Self::validate(&url)?;
+        Ok(Self { spelling, url })
+    }
+
+    /// Retain an already parsed effective request target.
+    pub fn from_url(url: reqwest::Url) -> Result<Self, &'static str> {
+        Self::validate(&url)?;
+        Ok(Self {
+            spelling: url.to_string(),
+            url,
+        })
+    }
+
+    fn validate(url: &reqwest::Url) -> Result<(), &'static str> {
+        if matches!(url.scheme(), "http" | "https") && url.host().is_some() {
+            Ok(())
+        } else {
+            Err("DAV href is not an absolute HTTP(S) URL")
+        }
+    }
+
+    /// Native spelling for account ids, XML and cursor serialization.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.spelling
+    }
+
+    /// A dispatchable target, without parsing the href a second time.
+    #[must_use]
+    pub fn as_url(&self) -> &reqwest::Url {
+        &self.url
+    }
+
+    /// Resource identity uses the shared DAV path-segment equivalence rule.
+    #[must_use]
+    pub fn key(&self) -> crate::DavHrefKey {
+        crate::xml::href_key(Some(&self.url), self.as_str())
+    }
+}
+
+impl std::ops::Deref for DavHref {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for DavHref {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Return the parent collection URL of an absolute resource URL.
 ///
 /// Query and fragment data are discarded before removing the final path
@@ -46,6 +114,34 @@ pub fn well_known_url(base_url: &str, service: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{parent_collection_url, well_known_url};
+
+    #[test]
+    fn native_href_keeps_spelling_separate_from_target_and_identity() {
+        let native = super::DavHref::parse("HTTPS://DAV.Example.Test:443/cal/My%20Cal/").unwrap();
+        assert_eq!(
+            native.as_str(),
+            "HTTPS://DAV.Example.Test:443/cal/My%20Cal/"
+        );
+        assert_eq!(
+            native.as_url().as_str(),
+            "https://dav.example.test/cal/My%20Cal/"
+        );
+        let key = |raw| super::DavHref::parse(raw).unwrap().key();
+        assert_eq!(native.key(), key("https://dav.example.test/cal/My Cal"));
+        assert_ne!(key("https://dav.test/a%2Fb"), key("https://dav.test/a/b"));
+        assert_ne!(key("https://dav.test/a?q=1"), key("https://dav.test/a?q=2"));
+        for raw in [
+            "/relative/one.ics",
+            "one.ics",
+            "mailto:one.ics",
+            "not a URL",
+        ] {
+            assert!(
+                super::DavHref::parse(raw).is_err(),
+                "unresolved native href is not a dispatch target: {raw}"
+            );
+        }
+    }
 
     /// The path-bearing base is the case that separates origin-rooted
     /// construction from string concatenation; a path-less base makes

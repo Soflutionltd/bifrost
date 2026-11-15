@@ -167,7 +167,6 @@ non-zero.
 - `-j, --jobs <N>` - parallel cargo compile jobs.
 - `--sweep <LABEL>` - run only one sweep (`--sweep workspace`,
   `--sweep jmap-calendars-off`) instead of all of them.
-- `--raw` - bypass output filtering, print everything cargo emits.
 - `--debug` / `--release` - force a profile. `--debug` is redundant while
   `[test] debug = true`; it matters only if that is flipped back.
   `BROKKR_TEST_BIN_DIR` points at the matching `target/` subdirectory.

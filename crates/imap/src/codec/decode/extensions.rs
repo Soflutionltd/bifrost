@@ -334,7 +334,7 @@ pub(super) fn parse_untagged_thread(input: &[u8]) -> IResult<&[u8], UntaggedResp
 pub(super) fn parse_untagged_unknown(input: &[u8]) -> IResult<&[u8], UntaggedResponse> {
     // An extension response is allowed here, but a malformed form of a
     // response we claim to understand is a server protocol violation. Let it
-    // reach WireReader as Error::Parse rather than silently routing it as an
+    // reach WireReader as crate::error::ProviderFailure::Parse rather than silently routing it as an
     // unsolicited unknown response.
     if starts_known_untagged_response(input) {
         return Err(nom::Err::Failure(nom::error::Error::new(

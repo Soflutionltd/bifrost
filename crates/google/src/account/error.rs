@@ -603,6 +603,8 @@ fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -
         let budget = (ctx.surface == crate::quota::ApiSurface::Gmail)
             .then(|| crate::quota::project_budget_from_hold(key))
             .flatten();
+        let mut policy = http_error_policy(ctx);
+        policy.throttle_budget = budget;
         let error = bifrost_net::into_account_error_with_throttle_scope(
             net_error,
             bifrost_net::NetErrorContext {
@@ -611,12 +613,9 @@ fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -
                 operation: ctx.operation,
                 scope: ctx.scope.clone(),
             },
-            ctx.throttle_scope.or(Some(ThrottleScope::Account)),
+            policy,
         );
         let mut builder = error.into_builder();
-        if let Some(budget) = budget {
-            builder = builder.throttle_budget(budget);
-        }
         if let Some(idempotent) = ctx.idempotency_override {
             builder = builder.idempotency_override(idempotent);
         }
@@ -652,11 +651,7 @@ fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -
         operation: ctx.operation,
         scope: ctx.scope.clone(),
     };
-    bifrost_net::into_account_error_with_throttle_scope(
-        net_error,
-        net_ctx,
-        ctx.throttle_scope.or(Some(ThrottleScope::Account)),
-    )
+    bifrost_net::into_account_error_with_throttle_scope(net_error, net_ctx, http_error_policy(ctx))
 }
 
 fn try_refine_net_with_final_response(
@@ -735,13 +730,13 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
         .or_else(|| {
             resp.headers
                 .retry_after
-                .filter(|_| is_retry_after_applicable(status, &signal))
                 .map(|hint| resp.headers.retry_at.map(RetryHint::At).unwrap_or(hint))
         });
 
     let (kind, cause) = classify_response(status, &signal, ctx, retry_hint);
+    let class = bifrost_net::StatusClass::new(kind, cause);
 
-    let mut builder = AccountErrorBuilder::new(kind, cause)
+    let mut builder = AccountErrorBuilder::new(class.kind, class.cause)
         .google_provider(ctx)
         .protocol(protocol_for(ctx))
         .operation(ctx.operation)
@@ -800,13 +795,9 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
         )));
     }
 
-    if let Some(project) = project {
-        builder = builder.throttle_budget(project.budget.clone());
-    }
-
-    if let Some(throttle) = throttle_scope_for(status, &signal, ctx) {
-        builder = builder.throttle_scope(throttle);
-    }
+    let mut policy = http_error_policy(ctx);
+    policy.throttle_budget = project.map(|project| project.budget.clone());
+    builder = policy.apply_throttle(builder, class.throttles);
 
     if let Some(idem) = ctx.idempotency_override {
         builder = builder.idempotency_override(idem);
@@ -974,68 +965,13 @@ fn classify_by_status(
     ctx: &GmailErrorContext,
     retry_hint: Option<RetryHint>,
 ) -> (AccountErrorKind, Cause) {
-    match status {
-        400 if ctx
-            .endpoint
-            .is_some_and(crate::client::GmailEndpoint::is_history) =>
-        {
-            (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
-            )
-        }
-        400 | 422 => malformed_kind_cause(format!("HTTP {status}")),
-        401 => (
-            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-            Cause::Auth(AuthCause::ReauthorizationRequired),
-        ),
-        403 => (
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied {
-                resource: ctx.resource.and_then(GmailResource::to_resource_kind),
-            }),
-        ),
-        404 if ctx
-            .endpoint
-            .is_some_and(crate::client::GmailEndpoint::is_history) =>
-        {
-            (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
-            )
-        }
-        404 => not_found_kind_cause(ctx),
-        410 if ctx
-            .endpoint
-            .is_some_and(crate::client::GmailEndpoint::is_history) =>
-        {
-            (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
-            )
-        }
-        412 => (
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
-        ),
-        413 => malformed_kind_cause("HTTP 413 payload too large".to_owned()),
-        429 => (
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint }),
-        ),
-        500..=599 => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint }),
-        ),
-        other => (
-            AccountErrorKind::Server(ServerErrorKind::Error {
-                status: Some(other),
-            }),
-            Cause::Server(ServerCause::Error {
-                status: Some(other),
-            }),
-        ),
-    }
+    let class = bifrost_net::classify_status(
+        status,
+        ctx.scope.as_ref(),
+        retry_hint,
+        http_error_policy(ctx).status,
+    );
+    (class.kind, class.cause)
 }
 
 /// pick the OAuth scope `needed` for an `InsufficientScope`
@@ -1126,54 +1062,39 @@ fn malformed_kind_cause(detail: String) -> (AccountErrorKind, Cause) {
 }
 
 fn not_found_kind_cause(ctx: &GmailErrorContext) -> (AccountErrorKind, Cause) {
-    // Explicit hints preserve operation-specific meanings such as a blob
-    // miss naming its parent message. Otherwise use the shared scope reader,
-    // including collection kinds without an individual object id.
-    let what = ctx
-        .resource
-        .and_then(GmailResource::to_resource_kind)
-        .or_else(|| ctx.scope.as_ref().and_then(ErrorScope::resource))
-        .unwrap_or(ResourceKind::Message);
-    let id = ctx
-        .scope
-        .as_ref()
-        .and_then(ErrorScope::object_id)
-        .map(str::to_owned);
-    (
-        AccountErrorKind::NotFound(what),
-        Cause::Request(RequestCause::NotFound { what, id }),
-    )
+    let class =
+        bifrost_net::classify_status(404, ctx.scope.as_ref(), None, http_error_policy(ctx).status);
+    (class.kind, class.cause)
 }
 
-fn is_retry_after_applicable(status: u16, signal: &GmailSignal) -> bool {
-    matches!(status, 429 | 500..=599)
-        || matches!(
-            signal,
-            GmailSignal::RateLimitExceeded
-                | GmailSignal::UserRateLimitExceeded
-                | GmailSignal::QuotaExceeded
-                | GmailSignal::DailyLimitExceeded
-                | GmailSignal::BackendError
-        )
-}
-
-fn throttle_scope_for(
-    status: u16,
-    signal: &GmailSignal,
-    ctx: &GmailErrorContext,
-) -> Option<ThrottleScope> {
-    let is_throttle_status = matches!(status, 429)
-        || matches!(
-            signal,
-            GmailSignal::RateLimitExceeded
-                | GmailSignal::UserRateLimitExceeded
-                | GmailSignal::QuotaExceeded
-                | GmailSignal::DailyLimitExceeded
-        );
-    if is_throttle_status {
-        ctx.throttle_scope.or(Some(ThrottleScope::Account))
-    } else {
-        None
+fn http_error_policy(ctx: &GmailErrorContext) -> bifrost_net::HttpErrorPolicy {
+    let history = ctx
+        .endpoint
+        .is_some_and(crate::client::GmailEndpoint::is_history);
+    bifrost_net::HttpErrorPolicy {
+        status: bifrost_net::StatusPolicy {
+            // Explicit hints preserve operation-specific meanings such as a
+            // blob miss naming its parent message. Collection scopes keep
+            // their own kind; Gmail's scope-less fallback is a message.
+            resource: ctx
+                .resource
+                .and_then(GmailResource::to_resource_kind)
+                .or_else(|| ctx.scope.as_ref().and_then(ErrorScope::resource))
+                .or(Some(ResourceKind::Message)),
+            // Only the history endpoint proves history loss. Enterprise users
+            // expect unrelated resource errors to preserve sync progress.
+            overrides: if history {
+                &[
+                    (400, bifrost_net::StatusOverride::CursorInvalid),
+                    (404, bifrost_net::StatusOverride::CursorInvalid),
+                    (410, bifrost_net::StatusOverride::CursorInvalid),
+                ]
+            } else {
+                &[]
+            },
+        },
+        throttle_scope: ctx.throttle_scope.or(Some(ThrottleScope::Account)),
+        throttle_budget: None,
     }
 }
 
@@ -1468,6 +1389,42 @@ mod tests {
         format!(
             r#"{{"error":{{"code":429,"message":"x","errors":[{{"domain":"usageLimits","reason":"{reason}"}}]}}}}"#
         )
+    }
+
+    #[test]
+    fn shared_http_status_envelope_and_plain_body_agree() {
+        for ctx in [
+            GmailErrorContext::base(AccountOperation::Hydrate),
+            GmailErrorContext::changes(),
+        ] {
+            for status in [
+                408, 400, 404, 409, 410, 412, 413, 422, 429, 500, 502, 503, 504, 507, 599,
+            ] {
+                let envelope = into_account_error(
+                    gmail_response(status, &body_with_reason("newUnknownReason")),
+                    ctx.clone(),
+                );
+                let plain = into_account_error(
+                    Error::Net(bifrost_net::Error::Status {
+                        code: reqwest::StatusCode::from_u16(status).unwrap(),
+                        headers: reqwest::header::HeaderMap::new(),
+                        body: Bytes::from_static(b"plain failure"),
+                    }),
+                    ctx.clone(),
+                );
+                assert_eq!(envelope.kind(), plain.kind(), "status {status}");
+                assert_eq!(envelope.recovery(), plain.recovery(), "status {status}");
+                assert_eq!(
+                    envelope.chain().iter().next(),
+                    plain.chain().iter().next(),
+                    "status {status}"
+                );
+                assert_eq!(
+                    envelope.telemetry_fields().throttle_scope,
+                    plain.telemetry_fields().throttle_scope
+                );
+            }
+        }
     }
 
     #[test]
@@ -1779,12 +1736,12 @@ mod tests {
     }
 
     #[test]
-    fn http_500_maps_to_server_unavailable() {
+    fn http_500_retains_status_and_retry() {
         let err = gmail_response(500, "internal server error");
         let acc = into_account_error(err, GmailErrorContext::inventory());
         assert!(matches!(
             acc.kind(),
-            AccountErrorKind::Server(ServerErrorKind::Unavailable)
+            AccountErrorKind::Server(ServerErrorKind::Error { status: Some(500) })
         ));
         let RecoveryClass::Retry(advice) = acc.recovery() else {
             panic!("expected retry");
@@ -1808,7 +1765,7 @@ mod tests {
         let acc = into_account_error(err, GmailErrorContext::inventory());
         assert!(matches!(
             acc.kind(),
-            AccountErrorKind::Server(ServerErrorKind::Unavailable)
+            AccountErrorKind::Server(ServerErrorKind::Error { status: Some(500) })
         ));
         // Support-only text retains the raw body.
         let support = acc.support_consented();

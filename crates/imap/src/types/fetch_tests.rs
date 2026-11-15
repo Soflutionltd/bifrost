@@ -95,10 +95,13 @@ fn fetch_response_with_internal_date() {
 fn fetch_response_with_mod_seq() {
     let resp = FetchResponse {
         seq: 1,
-        mod_seq: Some(99999),
+        mod_seq: Some(crate::types::ModSeqValzer::new(99999).expect("valid protocol test value")),
         ..Default::default()
     };
-    assert_eq!(resp.mod_seq, Some(99999));
+    assert_eq!(
+        resp.mod_seq.map(crate::types::ModSeqValzer::get),
+        Some(99999)
+    );
 }
 
 #[test]
@@ -279,7 +282,9 @@ fn fetch_response_with_preview_nil() {
 fn fetch_response_with_email_id() {
     let resp = FetchResponse {
         seq: 1,
-        email_id: Some("M6d99ac3275826486".into()),
+        email_id: Some(
+            crate::types::validated::ObjectId::new("M6d99ac3275826486").expect("valid objectid"),
+        ),
         ..Default::default()
     };
     assert_eq!(resp.email_id.as_deref(), Some("M6d99ac3275826486"));
@@ -289,7 +294,9 @@ fn fetch_response_with_email_id() {
 fn fetch_response_with_thread_id() {
     let resp = FetchResponse {
         seq: 1,
-        thread_id: Some("T64b478a75b7ea9fd".into()),
+        thread_id: Some(
+            crate::types::validated::ObjectId::new("T64b478a75b7ea9fd").expect("valid objectid"),
+        ),
         ..Default::default()
     };
     assert_eq!(resp.thread_id.as_deref(), Some("T64b478a75b7ea9fd"));
@@ -299,13 +306,19 @@ fn fetch_response_with_thread_id() {
 fn fetch_response_with_gmail_ids() {
     let resp = FetchResponse {
         seq: 1,
-        gmail_msg_id: Some(1_278_455_344_230_334_864),
-        gmail_thread_id: Some(1_278_455_344_230_334_865),
+        gmail_msg_id: Some(crate::types::GmailMessageId::new(1_278_455_344_230_334_864)),
+        gmail_thread_id: Some(crate::types::GmailThreadId::new(1_278_455_344_230_334_865)),
         gmail_labels: Some(vec!["\\Inbox".to_owned(), "Work".to_owned()]),
         ..Default::default()
     };
-    assert_eq!(resp.gmail_msg_id, Some(1_278_455_344_230_334_864));
-    assert_eq!(resp.gmail_thread_id, Some(1_278_455_344_230_334_865));
+    assert_eq!(
+        resp.gmail_msg_id,
+        Some(crate::types::GmailMessageId::new(1_278_455_344_230_334_864))
+    );
+    assert_eq!(
+        resp.gmail_thread_id,
+        Some(crate::types::GmailThreadId::new(1_278_455_344_230_334_865))
+    );
     assert_eq!(
         resp.gmail_labels,
         Some(vec!["\\Inbox".to_owned(), "Work".to_owned()])

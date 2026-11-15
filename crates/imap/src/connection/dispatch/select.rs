@@ -1,11 +1,11 @@
 use crate::connection::NotifyFlags;
 use crate::error::Error;
+use crate::types::SelectedMailbox;
 use crate::types::response::{
     ResponseCode, StatusKind, TaggedResponse, UntaggedResponse, UntaggedStatus,
 };
-use crate::types::{Flag, SelectedMailbox};
 
-use super::super::is_notify_list_event;
+use super::list::is_notify_list_event;
 use super::{Consumer, ConsumerContext, Finalized};
 
 /// Consumer for SELECT (RFC 3501 Section6.3.1) and EXAMINE (RFC 3501 Section6.3.2).
@@ -267,24 +267,24 @@ fn validate_select_responses(
     }
 
     if !saw_flags {
-        return Err(Error::ProtocolMissing(format!(
-            "{command_name} completed without the required FLAGS response ({section})"
+        return Err(Error::Provider(crate::error::ProviderFailure::Missing(
+            format!("{command_name} completed without the required FLAGS response ({section})"),
         )));
     }
     if !saw_exists {
-        return Err(Error::ProtocolMissing(format!(
-            "{command_name} completed without the required EXISTS response ({section})"
+        return Err(Error::Provider(crate::error::ProviderFailure::Missing(
+            format!("{command_name} completed without the required EXISTS response ({section})"),
         )));
     }
     if is_rev2 {
         if !saw_list {
-            return Err(Error::ProtocolMissing(format!(
-                "{command_name} completed without the required LIST response ({section})"
+            return Err(Error::Provider(crate::error::ProviderFailure::Missing(
+                format!("{command_name} completed without the required LIST response ({section})"),
             )));
         }
     } else if !saw_recent {
-        return Err(Error::ProtocolMissing(format!(
-            "{command_name} completed without the required RECENT response ({section})"
+        return Err(Error::Provider(crate::error::ProviderFailure::Missing(
+            format!("{command_name} completed without the required RECENT response ({section})"),
         )));
     }
 
@@ -304,8 +304,10 @@ fn validate_select_responses(
         _ => untagged_validity,
     };
     if validity.is_none_or(|value| value == 0) {
-        return Err(Error::ProtocolMissing(format!(
-            "{command_name} completed without the required nonzero UIDVALIDITY ({section})"
+        return Err(Error::Provider(crate::error::ProviderFailure::Missing(
+            format!(
+                "{command_name} completed without the required nonzero UIDVALIDITY ({section})"
+            ),
         )));
     }
 
@@ -321,93 +323,36 @@ pub(in crate::connection) fn build_selected_mailbox(
     tagged: &TaggedResponse,
     read_only: bool,
 ) -> SelectedMailbox {
-    let mut exists = 0;
-    let mut recent = 0;
-    let mut uid_validity: Option<u32> = None;
-    let mut uid_next = Option::None;
-    let mut flags = Vec::new();
-    let mut permanent_flags = Vec::new();
-    let mut modseq_support = crate::types::mailbox::ModSeqSupport::Unknown;
-    let mut unseen: Option<u32> = None;
-    // RFC 8474 Section 5.1: unique mailbox identifier from [MAILBOXID (<id>)].
-    let mut mailbox_id: Option<String> = None;
-    // RFC 4315 Section 2 / RFC 9051 Section 7.1: [UIDNOTSTICKY]  -  UIDs are not persistent.
-    let mut uid_not_sticky = false;
-    // RFC 7162 Section 3.2.5.2: QRESYNC SELECT responses include
-    // VANISHED (EARLIER) with UIDs removed since last sync, and
-    // FETCH responses with changed flags.
-    let mut vanished = Vec::new();
-    let mut changed_messages = Vec::new();
-
-    for resp in untagged {
-        match resp {
-            UntaggedResponse::Exists(n) => exists = *n,
-            UntaggedResponse::Recent(n) => recent = *n,
-            UntaggedResponse::Flags(f) => flags.clone_from(f),
+    let mut builder = SelectedMailboxBuilder(SelectedMailbox {
+        read_only,
+        ..SelectedMailbox::default()
+    });
+    for response in untagged {
+        match response {
+            UntaggedResponse::Exists(n) => builder.0.exists = *n,
+            UntaggedResponse::Recent(n) => builder.0.recent = *n,
+            UntaggedResponse::Flags(flags) => builder.0.flags.clone_from(flags),
             UntaggedResponse::Status {
                 status: UntaggedStatus::Ok,
                 code: Some(code),
                 ..
-            } => {
-                extract_selected_code(
-                    code,
-                    &mut uid_validity,
-                    &mut uid_next,
-                    &mut permanent_flags,
-                    &mut modseq_support,
-                    &mut unseen,
-                    &mut mailbox_id,
-                    &mut uid_not_sticky,
-                );
-            }
-            // RFC 7162 Section 3.2.5.2: capture VANISHED (EARLIER) responses
-            // sent during QRESYNC SELECT/EXAMINE. Only `earlier: true` responses
-            // belong to the initial sync; `earlier: false` are unsolicited and
-            // should not be included in the SelectedMailbox.
+            } => builder.apply(code),
             UntaggedResponse::Vanished {
                 earlier: true,
                 uids,
             } => {
-                vanished.extend_from_slice(uids);
+                builder.0.vanished.extend_from_slice(uids);
             }
-            // RFC 7162 Section 3.2.5.2: capture FETCH responses with
-            // updated flags sent during QRESYNC SELECT/EXAMINE.
             UntaggedResponse::Fetch(fetch) => {
-                changed_messages.push((**fetch).clone());
+                builder.0.changed_messages.push((**fetch).clone());
             }
             _ => {}
         }
     }
-
-    // Also check the tagged response code
     if let Some(code) = &tagged.code {
-        extract_selected_code(
-            code,
-            &mut uid_validity,
-            &mut uid_next,
-            &mut permanent_flags,
-            &mut modseq_support,
-            &mut unseen,
-            &mut mailbox_id,
-            &mut uid_not_sticky,
-        );
+        builder.apply(code);
     }
-
-    SelectedMailbox {
-        exists,
-        recent,
-        uid_validity,
-        uid_next,
-        flags,
-        permanent_flags,
-        modseq_support,
-        unseen,
-        mailbox_id,
-        read_only,
-        uid_not_sticky,
-        vanished,
-        changed_messages,
-    }
+    builder.0
 }
 
 /// Restrict SELECT/EXAMINE processing to responses belonging to the newly
@@ -433,57 +378,51 @@ pub(in crate::connection) fn selected_mailbox_effective_responses(
     }
 }
 
-/// Extract mailbox metadata from a response code (RFC 3501 Section 7.1).
-#[allow(clippy::too_many_arguments)]
-fn extract_selected_code(
-    code: &ResponseCode,
-    uid_validity: &mut Option<u32>,
-    uid_next: &mut Option<u32>,
-    permanent_flags: &mut Vec<Flag>,
-    modseq_support: &mut crate::types::mailbox::ModSeqSupport,
-    unseen: &mut Option<u32>,
-    mailbox_id: &mut Option<String>,
-    uid_not_sticky: &mut bool,
-) {
-    match code {
-        // Preserve raw numbers in the decoder, but never turn a zero wire
-        // sentinel into a usable mailbox identity. Users expect a broken
-        // server epoch to fail before inventory can publish unusable ids.
-        ResponseCode::UidValidity(v) => {
-            // A later invalid observation must not erase a usable epoch.
-            if let Some(value) = crate::types::UidValidity::new(*v) {
-                *uid_validity = Some(value.get());
+/// Owns SELECT metadata accumulation, including conservative contradictory-code handling.
+struct SelectedMailboxBuilder(SelectedMailbox);
+
+impl SelectedMailboxBuilder {
+    fn apply(&mut self, code: &ResponseCode) {
+        match code {
+            // Preserve raw numbers in the decoder, but never turn a zero wire
+            // sentinel into a usable mailbox identity. Users expect a broken
+            // server epoch to fail before inventory can publish unusable ids.
+            ResponseCode::UidValidity(v) => {
+                // A later invalid observation must not erase a usable epoch.
+                if let Some(value) = crate::types::UidValidity::new(*v) {
+                    self.0.uid_validity = Some(value);
+                }
             }
-        }
-        ResponseCode::UidNext(v) => {
-            if let Some(value) = std::num::NonZeroU32::new(*v) {
-                *uid_next = Some(value.get());
+            ResponseCode::UidNext(v) => {
+                if let Some(value) = crate::types::Uid::new(*v) {
+                    self.0.uid_next = Some(value);
+                }
             }
-        }
-        ResponseCode::PermanentFlags(f) => permanent_flags.clone_from(f),
-        ResponseCode::HighestModSeq(v) => {
-            // Once support is explicitly denied in this SELECT, do not
-            // enable guarded operations from a contradictory later code.
-            // Enterprise users expect conservative concurrency protection.
-            if !matches!(
-                modseq_support,
-                crate::types::mailbox::ModSeqSupport::NoModSeq
-            ) {
-                *modseq_support = crate::types::mailbox::ModSeqSupport::from_highest(*v);
+            ResponseCode::PermanentFlags(f) => self.0.permanent_flags.clone_from(f),
+            ResponseCode::HighestModSeq(v) => {
+                // Once support is explicitly denied in this SELECT, do not
+                // enable guarded operations from a contradictory later code.
+                // Enterprise users expect conservative concurrency protection.
+                if !matches!(
+                    self.0.modseq_support,
+                    crate::types::mailbox::ModSeqSupport::NoModSeq
+                ) {
+                    self.0.modseq_support = crate::types::mailbox::ModSeqSupport::from_highest(*v);
+                }
             }
+            ResponseCode::NoModSeq => {
+                self.0.modseq_support = crate::types::mailbox::ModSeqSupport::NoModSeq;
+            }
+            // RFC 3501 Section 7.1: [UNSEEN n]  -  first unseen message sequence number.
+            // Dropped in IMAP4rev2 (RFC 9051), but commonly sent by rev1 servers.
+            ResponseCode::Unseen(v) => self.0.unseen = Some(*v),
+            // RFC 8474 Section 5.1: [MAILBOXID (<id>)]  -  unique mailbox identifier.
+            ResponseCode::MailboxId(id) => self.0.mailbox_id = Some(id.clone()),
+            // RFC 4315 Section 2 / RFC 9051 Section 7.1: [UIDNOTSTICKY]  -
+            // UIDs assigned to messages in this mailbox are not persistent.
+            ResponseCode::UidNotSticky => self.0.uid_not_sticky = true,
+            _ => {}
         }
-        ResponseCode::NoModSeq => {
-            *modseq_support = crate::types::mailbox::ModSeqSupport::NoModSeq;
-        }
-        // RFC 3501 Section 7.1: [UNSEEN n]  -  first unseen message sequence number.
-        // Dropped in IMAP4rev2 (RFC 9051), but commonly sent by rev1 servers.
-        ResponseCode::Unseen(v) => *unseen = Some(*v),
-        // RFC 8474 Section 5.1: [MAILBOXID (<id>)]  -  unique mailbox identifier.
-        ResponseCode::MailboxId(id) => *mailbox_id = Some(id.clone()),
-        // RFC 4315 Section 2 / RFC 9051 Section 7.1: [UIDNOTSTICKY]  -
-        // UIDs assigned to messages in this mailbox are not persistent.
-        ResponseCode::UidNotSticky => *uid_not_sticky = true,
-        _ => {}
     }
 }
 
@@ -535,7 +474,7 @@ mod tests {
         };
         assert!(matches!(
             validate_select_responses(&inputs, &tagged, false, &default_ctx()),
-            Err(Error::ProtocolMissing(_))
+            Err(Error::Provider(crate::error::ProviderFailure::Missing(_)))
         ));
         tagged.code = Some(ResponseCode::UidValidity(1));
         assert!(validate_select_responses(&inputs, &tagged, false, &default_ctx()).is_ok());
@@ -571,8 +510,14 @@ mod tests {
             };
             assert!(validate_select_responses(&inputs, &tagged, false, &default_ctx()).is_ok());
             let selected = build_selected_mailbox(&inputs, &tagged, false);
-            assert_eq!(selected.uid_validity, Some(9));
-            assert_eq!(selected.uid_next, Some(12));
+            assert_eq!(
+                selected.uid_validity,
+                Some(crate::types::UidValidity::new(9).expect("valid protocol test value"))
+            );
+            assert_eq!(
+                selected.uid_next,
+                Some(crate::types::Uid::new(12).expect("valid protocol test value"))
+            );
         }
     }
 

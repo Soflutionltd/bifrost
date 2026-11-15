@@ -1,4 +1,12 @@
 //! Recovery pacing tests use the engine's own writer and in-process accounts.
+use super::establish::{EstablishOrigin, run_establish};
+use super::reattach::{
+    ReattachScopeStep, reattach_account_paced, reattach_scope_step, restart_account,
+};
+use super::recovery::{
+    engine_pause, establish_if_absent, handle_schema_incompatible, pacing::RepairPacing,
+    re_establish_scope_with_backoff, run_parked_schema_reset,
+};
 use super::*;
 use crate::test_common as common;
 use bifrost_types::Control;
@@ -202,7 +210,7 @@ async fn repair_429_is_recorded_for_another_lane() {
     tokio::select! { biased; () = &mut repair => panic!("repair finished"), () = turns() => {} }
     assert_eq!(calls(&account), 1);
     assert_eq!(
-        crate::recovery::throttle_wait(ctx.throttles, &AccountId("peer".into()), &[key()]),
+        crate::throttle::throttle_wait(ctx.throttles, &AccountId("peer".into()), &[key()]),
         Some(Duration::from_secs(20))
     );
 }
@@ -410,7 +418,7 @@ async fn repair_first_attempt_honours_hold_recorded_by_another_lane() {
     else {
         panic!("retry")
     };
-    crate::recovery::record_throttle(
+    crate::throttle::record_throttle(
         &fixture.slot.throttles,
         &AccountId("other-lane".into()),
         &advice,
@@ -749,7 +757,7 @@ fn subscription(handle: &str, unconfirmed: bool) -> RegisteredSubscription {
 #[tokio::test(start_paused = true)]
 async fn round1_teardown_records_every_refusal_before_next_call() {
     let bucket = Arc::new(std::sync::Mutex::new(
-        None::<Arc<crate::recovery::ThrottleBucket>>,
+        None::<Arc<crate::throttle::ThrottleBucket>>,
     ));
     let observed_bucket = Arc::clone(&bucket);
     let mut initial = account();
@@ -761,7 +769,7 @@ async fn round1_teardown_records_every_refusal_before_next_call() {
                 "third"
             };
             let bucket = observed_bucket.lock().expect("bucket handle");
-            let wait = crate::recovery::throttle_wait(
+            let wait = crate::throttle::throttle_wait(
                 bucket.as_ref().expect("installed bucket"),
                 &AccountId("peer".into()),
                 &[ThrottleKey::Budget(ThrottleBudget::new(preceding))],
@@ -846,7 +854,7 @@ async fn round1_teardown_records_unconfirmed_refusal_even_when_swap_succeeds() {
             .is_ok()
     );
     assert_eq!(
-        crate::recovery::throttle_wait(
+        crate::throttle::throttle_wait(
             ctx.throttles,
             &AccountId("peer".into()),
             &[ThrottleKey::Budget(ThrottleBudget::new("orphan"))]
@@ -879,7 +887,7 @@ async fn round1_local_deadline_keeps_longest_across_shorter_and_unthrottled_fail
 }
 
 fn peer_hold(ctx: &RecoveryContext<'_>, budget: &str) -> Option<Duration> {
-    crate::recovery::throttle_wait(
+    crate::throttle::throttle_wait(
         ctx.throttles,
         &AccountId("peer".into()),
         &[ThrottleKey::Budget(ThrottleBudget::new(budget))],
@@ -888,7 +896,7 @@ fn peer_hold(ctx: &RecoveryContext<'_>, budget: &str) -> Option<Duration> {
 
 #[tokio::test(start_paused = true)]
 async fn round2_unwind_records_every_refusal_and_preserves_original_error() {
-    type Bucket = Arc<crate::recovery::ThrottleBucket>;
+    type Bucket = Arc<crate::throttle::ThrottleBucket>;
     let bucket = Arc::new(std::sync::OnceLock::<Bucket>::new());
     let observed_bucket = Arc::clone(&bucket);
     let immediate = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -902,7 +910,7 @@ async fn round2_unwind_records_every_refusal_and_preserves_original_error() {
     next.push_label = "replacement".into();
     next.unsubscribe_error_hook = Some(Arc::new(move |handle| {
         if handle.0 == "replacement-2" {
-            let wait = crate::recovery::throttle_wait(
+            let wait = crate::throttle::throttle_wait(
                 observed_bucket.get().expect("bucket installed"),
                 &AccountId("peer".into()),
                 &[ThrottleKey::Budget(ThrottleBudget::new("cleanup-first"))],
@@ -1255,23 +1263,6 @@ async fn a_deferred_walk_recovery_is_stamped_with_the_incarnation_it_walked() {
     fixture.engine.shutdown().await.expect("shutdown");
 }
 
-#[test]
-fn a_park_claim_under_a_stale_epoch_takes_nothing() {
-    let repairs = DeferredScopeRepairs::new();
-    repairs
-        .parked
-        .lock()
-        .expect("parked")
-        .insert(SCOPE, crate::cursor::LifecycleEpoch::for_test(2));
-    repairs
-        .parked
-        .lock()
-        .expect("parked")
-        .insert(SCOPE, crate::cursor::LifecycleEpoch::for_test(3));
-    assert!(!repairs.claim(&SCOPE, crate::cursor::LifecycleEpoch::for_test(2)));
-    assert!(repairs.claim(&SCOPE, crate::cursor::LifecycleEpoch::for_test(3)));
-}
-
 #[tokio::test(start_paused = true)]
 async fn a_declined_schema_reset_keeps_the_scopes_it_owes() {
     let account = Arc::new(account());
@@ -1417,34 +1408,6 @@ fn a_superseded_scope_is_skipped_by_a_reattach_not_failed() {
     assert_eq!(
         reattach_scope_step(&Ok(EstablishOrigin::CreatedFresh)),
         ReattachScopeStep::Keep
-    );
-}
-#[test]
-fn parked_schema_resets_merge_by_greater_epoch() {
-    let mut state = ParkedReset::default();
-    DeferredSchemaReset::merge(
-        &mut state,
-        HashMap::from([(SCOPE, crate::cursor::LifecycleEpoch::for_test(2))]),
-    );
-    DeferredSchemaReset::merge(
-        &mut state,
-        HashMap::from([
-            (SCOPE, crate::cursor::LifecycleEpoch::for_test(1)),
-            (
-                CursorScope::Account,
-                crate::cursor::LifecycleEpoch::for_test(0),
-            ),
-        ]),
-    );
-    assert_eq!(
-        state.owed,
-        Some(HashMap::from([
-            (SCOPE, crate::cursor::LifecycleEpoch::for_test(2)),
-            (
-                CursorScope::Account,
-                crate::cursor::LifecycleEpoch::for_test(0)
-            )
-        ]))
     );
 }
 

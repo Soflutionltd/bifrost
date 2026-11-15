@@ -28,7 +28,7 @@ impl ImapConnection {
         date: Option<&str>,
         message: &[u8],
         timeout: Duration,
-    ) -> Result<Option<(u32, u32)>, Error> {
+    ) -> Result<Option<crate::types::AppendUid>, Error> {
         let mut msg = AppendMessage::new(bytes::Bytes::copy_from_slice(message));
         msg.flags = flags.to_vec();
         msg.date = date.map(str::to_owned);
@@ -45,7 +45,7 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         message: AppendMessage,
         timeout: Duration,
-    ) -> Result<Option<(u32, u32)>, Error> {
+    ) -> Result<Option<crate::types::AppendUid>, Error> {
         use super::dispatch::AppendConsumer;
 
         self.check_utf8_only_enforced()?;
@@ -92,7 +92,7 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         messages: &[AppendMessage],
         timeout: Duration,
-    ) -> Result<Vec<(u32, u32)>, Error> {
+    ) -> Result<Vec<crate::types::AppendUid>, Error> {
         use super::dispatch::MultiAppendConsumer;
 
         self.check_utf8_only_enforced()?;
@@ -102,8 +102,10 @@ impl ImapConnection {
         self.require_state(crate::types::CommandKind::Append)?;
 
         if messages.is_empty() {
-            return Err(Error::InvalidInput(
-                "MULTIAPPEND requires at least one message".into(),
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    "MULTIAPPEND requires at least one message".into(),
+                ),
             ));
         }
 
@@ -190,7 +192,9 @@ impl ImapConnection {
     fn check_append_limit(&self, size: usize, limit: u64) -> Result<(), Error> {
         let size = u64::try_from(size).unwrap_or(u64::MAX);
         if size > limit {
-            return Err(Error::AppendLimit { size, limit });
+            return Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::AppendLimit { size, limit },
+            ));
         }
         Ok(())
     }
@@ -221,9 +225,9 @@ pub(super) fn mailbox_append_limit(status: &StatusResult) -> Result<Option<u64>,
         }
     }
     if !saw_append_limit {
-        return Err(Error::ProtocolMissing(
+        return Err(Error::Provider(crate::error::ProviderFailure::Missing(
             "APPENDLIMIT capability but STATUS response omitted APPENDLIMIT".into(),
-        ));
+        )));
     }
     Ok(limit)
 }
@@ -235,7 +239,7 @@ pub(super) fn mailbox_append_limit(status: &StatusResult) -> Result<Option<u64>,
 /// the helper's `InFlight` / `Acknowledged` evidence would make recovery
 /// reconcile a message that was never written.
 fn unsent_preflight(error: Error) -> Error {
-    error.with_attempt(bifrost_types::TransmissionState::Unsent)
+    error.for_unsent_operation()
 }
 
 #[cfg(test)]
@@ -256,7 +260,13 @@ mod tests {
             .await;
         // The detached driver would return DriverGone if STATUS was queued.
         let error = result.expect_err("expired preflight must fail");
-        assert!(matches!(error, Error::Timeout { .. }));
+        assert!(matches!(
+            &error,
+            Error::OperationNotSent(source) if matches!(source.as_ref(), Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
+                ..
+            })
+        ));
         assert_eq!(
             error.attempt(),
             Some(bifrost_types::TransmissionState::Unsent)

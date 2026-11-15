@@ -656,12 +656,19 @@ inspection tier.
 
 `scope.rs`. `ErrorScope` (`#[non_exhaustive]`, custom `Serialize`)
 locates the failure: `Account`, `Cursor(CursorScope)`, and id-bearing
-`Mailbox` / `Message` / `Thread` / `Calendar` / `Event` / `Contact` plus the
+`Mailbox` / `Owner` / `Message` / `Thread` / `Calendar` / `Event` / `Contact` plus the
 collection variants, `Submission`, `CloudFile`, `UploadSession`, `Namespace { prefix }` for an IMAP namespace prefix that is
 not itself a selectable mailbox, plus `DirectoryGateway { url }` for a
 read-only directory endpoint that a multi-gateway lookup skipped. The id-bearing variants use the same typed ids as
-the account surface (`MailboxId`, `ObjectId`, `ThreadId`, `CalendarId`,
+the account surface (`MailboxId`, `PrincipalId`, `ObjectId`, `ThreadId`, `CalendarId`,
 `EventId`, `ContactId`) and serialize their inner strings for support exports.
+`Mailbox` names a native container; `Owner` names a principal whose shared
+surface failed. Owner scopes serialize as `kind = owner` and have no resource
+kind, so a missing principal is never mistaken for a missing mail folder.
+`AccountError::throttle_holds` preserves that distinction in `HoldTarget`:
+Owner carries PrincipalId; native Mailbox and folder or folder-type cursor
+errors carry the canonical FolderId through the explicit Mailbox-to-Folder
+conversion. Engine keys keep principals separate from containers.
 `ErrorScope::resource()` and `object_id()` centralize the exhaustive resource and borrowed-id projections: Event maps to Event; `CalendarCollection` and `ContactCollection` map to Calendar and Contact with no id, so a collection-scoped not-found or permission refusal stays typed in every crate; cursor scopes have neither; and Submission/CloudFile retain ids without a matching resource kind.
 `scope_fields` is the single source for both the declared struct field
 count and the fields written, so the count cannot drift from the body
@@ -689,14 +696,30 @@ mapper, whose acknowledged retry rule remains unchanged.
 
 ## Warning is outside the error model
 
-`warning.rs`. `Warning { kind: WarningKind, message, next_action,
-protocol_detail, retry_count }` is **deliberately not** part of the
-error model: it is advisory, never aborts a stream, carries no
-`RecoveryClass`, and never converts to `AccountError`.
-`WarningKind::{StrategyDowngraded, OperatorAttentionNeeded, Throttled,
-ClockSkew, BlobNotByteStream, ReadbackSkipped, ChangeStreamLagged,
-InventoryEndedUnannounced, Other}`. The sync engine emits warnings
-alongside (not instead of) errors; see `reference/sync.md`.
+`warning.rs`. `Warning` is advisory: it never aborts a stream or instructs
+replay of its successful parent operation. Alongside diagnostic text it carries
+optional `scope`, originating `error: AccountError`, and `strategy_downgrade`.
+The error retains its recovery class, remediation and consent-controlled
+cause chain; consumers may inspect it without reclassifying the warning as an
+operation failure. Explicit warning scope takes precedence over the error's
+optional scope.
+
+Discovery's skip lane is `WarningKind::ScopeSkipped` with this classified
+evidence, using the same scope/error vocabulary as `SkippedScope` in pages and
+factory results. A delegate outage must leave primary mail usable while still
+letting an enterprise user distinguish retryable downtime from a revoked grant.
+`StrategyDowngraded` carries `StrategyDowngrade` for IMAP transitions, including
+a direct QRESYNC-to-Basic fallback. `UidCountMismatch` carries both counts;
+`NotifyRefused` retains the classified refusal. Engine advisories use
+`WarningKind::Engine(EngineNotice)`, with bounded cases and counts for recovery
+budgets, scope disable/downgrade, operator override, barriers, incomplete coverage,
+push health and reconciliation. Scope lives on the enclosing warning.
+
+`OperatorOverrideReason` crosses `StateCause::OperatorOverrideNeeded` and
+`EngineDirective::OperatorOverrideRequired` without flattening. Known reasons
+name exhausted establishment, unsupported recovery classification and Outlook
+configuration. Custom requirements retain support-only diagnostic text in `Other`.
+
 `ChangeStreamLagged` is structural on purpose - the multiplexer's
 `ChangesReceiver` mints it (and only it) when broadcast ring overflow
 destroys batches, and a consumer's detach/reconcile recovery keys on the

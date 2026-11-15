@@ -6,7 +6,7 @@
 #[cfg(feature = "serde")]
 use std::fmt::Debug;
 
-use crate::transport::smtp::{Error, error, error::SmtpCommandPhase, response::Response};
+use crate::transport::smtp::{Error, error, error::SmtpCommandPhase};
 
 #[cfg(feature = "tokio")]
 pub(crate) use self::async_connection::AsyncSmtpConnection;
@@ -23,11 +23,15 @@ mod async_connection;
 mod async_net;
 #[cfg(all(test, feature = "tokio", feature = "account-error"))]
 pub(crate) use async_net::AsyncNetworkStream;
+#[cfg(all(test, feature = "account-error"))]
+mod conformance;
 mod connection;
 mod core;
 mod envelope;
 pub(crate) mod metering;
 mod net;
+mod reply;
+mod session;
 mod tls;
 
 pub(crate) use self::metering::WireMetering;
@@ -144,27 +148,11 @@ fn data_terminator(ends_with_crlf: bool) -> &'static [u8] {
     }
 }
 
-/// A failure at a pipelined wire boundary, carrying the boundary it happened
-/// at.
+/// A transaction failure paired with its command boundary.
 ///
-/// This exists to make the phase decoration structural rather than a
-/// convention. The pipelined drivers run inside inner functions that return
-/// this type, and it deliberately has:
-///
-/// - no `From<Error>` impl, so `?` on an undecorated `Result<_, Error>` does
-///   not compile inside those functions, and
-/// - no constructor that does not take a `SmtpCommandPhase`.
-///
-/// So the only way out of a pipelined driver is through a phase. The outer
-/// wrapper is the single place that converts back to `Error`, which is where
-/// the phase is stamped. Adding a new boundary to the pipelined path cannot
-/// silently ship undecorated: it will not build.
-///
-/// Negative replies matter here as much as transport failures. A server
-/// rejecting `MAIL FROM`, a `RCPT TO` or `DATA` is a normal outcome whose
-/// phase feeds `classify_response`, including the recipient-lane split, so an
-/// undecorated rejection makes PIPELINING classify differently from the
-/// non-pipelined path for the same wire exchange.
+/// All error exits from the shared sequencer carry this type. It has no
+/// phase-less constructor or `From<Error>` conversion: each boundary must
+/// choose a phase before a terminal projection can expose the wire error.
 pub(super) struct PhasedError {
     phase: SmtpCommandPhase,
     error: Error,
@@ -178,42 +166,6 @@ impl PhasedError {
     pub(super) fn into_error(self) -> Error {
         self.error.with_phase(self.phase)
     }
-}
-
-/// Merge RCPT-time rejections with the final statuses for accepted LMTP
-/// recipients without trusting a server-controlled count at the call site.
-///
-/// Both count mismatches return `error::internal`, and they ARE internal: the
-/// only caller (`DirectLmtp` in `core.rs`) counts an accepted recipient for
-/// every `None` it pushes and then reads exactly that many final statuses, so
-/// the two counts cannot disagree over anything the server sent - only if that
-/// bookkeeping is broken. Neither carries a `debug_assert`, deliberately: the
-/// `batch.rs` assert-plus-release-fallback idiom exists where a LANE has to
-/// resolve to something and the fallback is a guess; this is an invariant with
-/// a real error to return.
-fn merge_lmtp_statuses(
-    recipient_statuses: Vec<Option<Response>>,
-    delivery_statuses: Vec<Response>,
-) -> Result<Vec<Response>, Error> {
-    let mut delivery_statuses = delivery_statuses.into_iter();
-    let mut statuses = Vec::with_capacity(recipient_statuses.len());
-
-    for response in recipient_statuses {
-        match response {
-            Some(response) => statuses.push(response),
-            None => statuses.push(delivery_statuses.next().ok_or_else(|| {
-                error::internal("server returned fewer LMTP statuses than accepted recipients")
-            })?),
-        }
-    }
-
-    if delivery_statuses.next().is_some() {
-        return Err(error::internal(
-            "server returned more LMTP statuses than accepted recipients",
-        ));
-    }
-
-    Ok(statuses)
 }
 
 #[derive(Debug, Copy, Clone)]

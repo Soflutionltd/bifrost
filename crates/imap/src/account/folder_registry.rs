@@ -4,271 +4,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use crate::types::set::UidSet;
 use crate::types::{MailboxAttribute, MailboxInfo, MailboxName, UidRange};
 
 use super::FolderCursor;
-
-/// Compact sorted UID set used in Basic and CONDSTORE cursor payloads.
-// protocol-specific: IMAP cursors need a compact UID baseline, not a wire sequence set.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct CompactUidSet {
-    ranges: Vec<UidRange>,
-}
-
-impl CompactUidSet {
-    pub(crate) fn from_uids(uids: impl IntoIterator<Item = u32>) -> Self {
-        let mut values: Vec<u32> = uids.into_iter().filter(|uid| *uid != 0).collect();
-        values.sort_unstable();
-        values.dedup();
-
-        let mut ranges = Vec::new();
-        let mut iter = values.into_iter();
-        let Some(mut start) = iter.next() else {
-            return Self { ranges };
-        };
-        let mut end = start;
-        for uid in iter {
-            if uid == end.saturating_add(1) {
-                end = uid;
-            } else {
-                ranges.push(normalized_range(start, end));
-                start = uid;
-                end = uid;
-            }
-        }
-        ranges.push(normalized_range(start, end));
-        Self { ranges }
-    }
-
-    pub(crate) fn from_ranges(ranges: Vec<UidRange>) -> Self {
-        let mut set = Self::default();
-        for range in ranges {
-            let start = range.start;
-            let end = range.end.unwrap_or(start);
-            if start != 0 && end >= start {
-                set.insert_range(start, end);
-            }
-        }
-        set
-    }
-
-    pub(crate) fn ranges(&self) -> &[UidRange] {
-        &self.ranges
-    }
-
-    pub(crate) fn to_uids(&self) -> Vec<u32> {
-        self.ranges.iter().copied().flat_map(expand_range).collect()
-    }
-
-    /// Number of individual UIDs represented by the compact ranges.
-    pub(crate) fn uid_count(&self) -> usize {
-        self.ranges
-            .iter()
-            .map(|range| {
-                range
-                    .end
-                    .map(|end| end.saturating_sub(range.start).saturating_add(1))
-                    .unwrap_or(1)
-            })
-            .map(|count| usize::try_from(count).unwrap_or(usize::MAX))
-            .sum()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
-    }
-
-    /// Membership test over the compact ranges. `from_uids` leaves them
-    /// sorted and disjoint, so this is a binary search rather than an
-    /// expansion of the whole baseline.
-    pub(crate) fn contains(&self, uid: u32) -> bool {
-        self.ranges
-            .binary_search_by(|range| {
-                let end = range.end.unwrap_or(range.start);
-                if end < uid {
-                    std::cmp::Ordering::Less
-                } else if range.start > uid {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .is_ok()
-    }
-
-    /// Insert one UID while retaining sorted, disjoint, maximally merged ranges.
-    /// Returns whether the UID was absent before the insertion.
-    pub(crate) fn insert(&mut self, uid: u32) -> bool {
-        if uid == 0 || self.contains(uid) {
-            return false;
-        }
-        self.insert_range(uid, uid);
-        true
-    }
-
-    /// Remove one UID while retaining sorted, disjoint ranges.
-    /// Returns whether the UID was present before the removal.
-    pub(crate) fn remove(&mut self, uid: u32) -> bool {
-        let Ok(index) = self.ranges.binary_search_by(|range| {
-            let end = range.end.unwrap_or(range.start);
-            if end < uid {
-                std::cmp::Ordering::Less
-            } else if range.start > uid {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }) else {
-            return false;
-        };
-        let range = self.ranges[index];
-        let end = range.end.unwrap_or(range.start);
-        match (uid == range.start, uid == end) {
-            (true, true) => {
-                self.ranges.remove(index);
-            }
-            (true, false) => {
-                self.ranges[index] = normalized_range(uid + 1, end);
-            }
-            (false, true) => {
-                self.ranges[index] = normalized_range(range.start, uid - 1);
-            }
-            (false, false) => {
-                self.ranges[index] = normalized_range(range.start, uid - 1);
-                self.ranges
-                    .insert(index + 1, normalized_range(uid + 1, end));
-            }
-        }
-        true
-    }
-
-    /// Remove a wire range without expanding its numeric span. The returned
-    /// set is only the intersection with known membership, including when the
-    /// server coalesces holes or names UIDs never seen by this consumer.
-    pub(crate) fn remove_range(&mut self, range: UidRange) -> Self {
-        let end = range.end.unwrap_or(range.start);
-        let start = range.start.min(end).max(1);
-        let end = range.start.max(end);
-        let mut kept = Vec::new();
-        let mut removed = Vec::new();
-        for known in &self.ranges {
-            let known_end = known.end.unwrap_or(known.start);
-            let lo = known.start.max(start);
-            let hi = known_end.min(end);
-            if lo > hi {
-                kept.push(*known);
-                continue;
-            }
-            removed.push(normalized_range(lo, hi));
-            if known.start < lo {
-                kept.push(normalized_range(known.start, lo - 1));
-            }
-            if hi < known_end {
-                kept.push(normalized_range(hi + 1, known_end));
-            }
-        }
-        self.ranges = kept;
-        Self { ranges: removed }
-    }
-
-    fn insert_range(&mut self, mut start: u32, mut end: u32) {
-        let index = self
-            .ranges
-            .partition_point(|range| range.end.unwrap_or(range.start).saturating_add(1) < start);
-        while index < self.ranges.len() && self.ranges[index].start <= end.saturating_add(1) {
-            let range = self.ranges.remove(index);
-            start = start.min(range.start);
-            end = end.max(range.end.unwrap_or(range.start));
-        }
-        self.ranges.insert(index, normalized_range(start, end));
-    }
-
-    /// Ascending UIDs, produced lazily from the ranges. Callers that only
-    /// walk the set in order must use this rather than `to_uids`, which
-    /// materialises one `u32` per UID.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.ranges
-            .iter()
-            .flat_map(|range| range.start..=range.end.unwrap_or(range.start))
-    }
-
-    /// Linear subtraction of two sorted range lists. Equal spans are skipped
-    /// as ranges, so work is proportional to the number of ranges plus the
-    /// UIDs that actually changed, not the total mailbox size.
-    pub(crate) fn diff(&self, newer: &Self) -> UidSetDiff {
-        UidSetDiff {
-            added: subtract_ranges(&newer.ranges, &self.ranges),
-            removed: subtract_ranges(&self.ranges, &newer.ranges),
-        }
-    }
-}
-
-fn subtract_ranges(source: &[UidRange], cover: &[UidRange]) -> Vec<u32> {
-    let mut out = Vec::new();
-    let mut cover_index = 0;
-    for range in source {
-        let end = u64::from(range.end.unwrap_or(range.start));
-        let mut cursor = u64::from(range.start);
-        while cover_index < cover.len()
-            && u64::from(cover[cover_index].end.unwrap_or(cover[cover_index].start)) < cursor
-        {
-            cover_index += 1;
-        }
-        let mut index = cover_index;
-        while index < cover.len() && u64::from(cover[index].start) <= end {
-            let covered = cover[index];
-            let covered_start = u64::from(covered.start);
-            let covered_end = u64::from(covered.end.unwrap_or(covered.start));
-            if cursor < covered_start {
-                out.extend((cursor..covered_start.min(end + 1)).map(uid_from_wide));
-            }
-            cursor = cursor.max(covered_end + 1);
-            if cursor > end {
-                break;
-            }
-            index += 1;
-        }
-        if cursor <= end {
-            out.extend((cursor..=end).map(uid_from_wide));
-        }
-        cover_index = index;
-    }
-    out
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn uid_from_wide(uid: u64) -> u32 {
-    debug_assert!(uid <= u64::from(u32::MAX));
-    uid as u32
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct UidSetDiff {
-    pub(crate) added: Vec<u32>,
-    pub(crate) removed: Vec<u32>,
-}
-
-/// The one canonical spelling for an inclusive run of UIDs.
-///
-/// `UidRange::range(n, n)` and `UidRange::single(n)` are distinct values that
-/// both denote a single UID, and `CompactUidSet` derives `PartialEq` over its
-/// range vector. Every construction and mutation path must therefore agree on
-/// which one it emits, or two sets holding identical UIDs compare unequal and
-/// encode to different cursor payloads.
-fn normalized_range(start: u32, end: u32) -> UidRange {
-    if start == end {
-        UidRange::single(start)
-    } else {
-        UidRange::range(start, end)
-    }
-}
-
-pub(crate) fn expand_range(range: UidRange) -> Vec<u32> {
-    match range.end {
-        Some(end) => (range.start..=end).collect(),
-        None => vec![range.start],
-    }
-}
 
 pub(crate) struct FolderEntry {
     pub(crate) name: MailboxName,
@@ -281,9 +20,9 @@ pub(crate) struct FolderEntry {
     listing: RwLock<FolderListing>,
     /// `Some(owner)` for a shared/other-user folder discovered under a
     /// non-personal namespace; `None` for the account's own personal
-    /// folders. Drives `MembershipScope::Mailbox` tagging and
+    /// folders. Drives `MembershipScope::Owner` tagging and
     /// `ErrorScope::Mailbox` scoping on revocation.
-    pub(crate) shared_owner: Option<bifrost_types::MailboxId>,
+    pub(crate) shared_owner: Option<bifrost_types::PrincipalId>,
     /// The MYRIGHTS rights set observed for this folder at discovery, when
     /// the server advertises ACL and answered. `None` means "not
     /// reported" (no ACL capability, MYRIGHTS failed, or a personal folder
@@ -315,8 +54,8 @@ const MODSEQ_CACHE_TARGET: usize = 40_000;
 
 #[derive(Debug, Default, Clone)]
 struct ModSeqCache {
-    uidvalidity: Option<u32>,
-    by_uid: HashMap<u32, u64>,
+    uidvalidity: Option<crate::types::UidValidity>,
+    by_uid: HashMap<crate::types::Uid, crate::types::ModSeq>,
 }
 
 impl ModSeqCache {
@@ -331,7 +70,7 @@ impl ModSeqCache {
         if self.by_uid.len() <= MODSEQ_CACHE_CAPACITY {
             return;
         }
-        let mut uids: Vec<u32> = self.by_uid.keys().copied().collect();
+        let mut uids: Vec<crate::types::Uid> = self.by_uid.keys().copied().collect();
         let evict = uids.len() - MODSEQ_CACHE_TARGET;
         uids.select_nth_unstable(evict);
         for uid in &uids[..evict] {
@@ -364,14 +103,14 @@ impl FolderEntry {
 
     pub(crate) fn from_mailbox_with_owner(
         info: MailboxInfo,
-        shared_owner: Option<bifrost_types::MailboxId>,
+        shared_owner: Option<bifrost_types::PrincipalId>,
     ) -> Self {
         Self::from_mailbox_with_owner_rights(info, shared_owner, None)
     }
 
     pub(crate) fn from_mailbox_with_owner_rights(
         info: MailboxInfo,
-        shared_owner: Option<bifrost_types::MailboxId>,
+        shared_owner: Option<bifrost_types::PrincipalId>,
         rights: Option<crate::types::MailboxRights>,
     ) -> Self {
         let listing = listing_from_info(&info, rights.as_ref());
@@ -431,7 +170,11 @@ impl FolderEntry {
         *self.cursor.write().expect("folder cursor lock poisoned") = Some(cursor);
     }
 
-    pub(crate) fn modseq(&self, uidvalidity: u32, uid: u32) -> Option<u64> {
+    pub(crate) fn modseq(
+        &self,
+        uidvalidity: crate::types::UidValidity,
+        uid: u32,
+    ) -> Option<crate::types::ModSeq> {
         let cache = self
             .modseq_by_uid
             .read()
@@ -439,34 +182,33 @@ impl FolderEntry {
         if cache.uidvalidity != Some(uidvalidity) {
             return None;
         }
-        cache.by_uid.get(&uid).copied()
+        cache.by_uid.get(&crate::types::Uid::new(uid)?).copied()
     }
 
     pub(crate) fn record_modseq(
         &self,
-        uidvalidity: u32,
+        uidvalidity: crate::types::UidValidity,
         uid: u32,
-        modseq: u64,
+        modseq: impl Into<crate::types::ModSeqValzer>,
     ) -> Result<(), crate::Error> {
-        if uidvalidity == 0 {
-            // SELECT completion rejects zero epochs before account reads.
-            // Keep this cache boundary defensive for directly supplied values;
-            // raw decoder tolerance does not make zero a usable identity.
+        // A server's zero observation is retained through FETCH merging, but
+        // is not a concurrency guard. Users still receive mail when this
+        // optional hint is unavailable; the cache retains positive state only.
+        let (Some(uid), Some(modseq)) = (
+            crate::types::Uid::new(uid),
+            crate::types::ModSeq::new(modseq.into().get()),
+        ) else {
             return Ok(());
-        }
-        debug_assert_ne!(uid, 0, "MODSEQ cache update needs UID");
-        if modseq == 0 {
-            // The decoder tolerates MODSEQ 0 from servers as a sentinel. The
-            // cache only informs a later STORE guard, so this value has no
-            // useful protection to record and must not fail the sync walk.
-            // Enterprise users should still receive mail when this optional
-            // concurrency hint is unusable; refusing it would halt that sync.
-            return Ok(());
-        }
+        };
         let mut modseqs = self
             .modseq_by_uid
             .write()
-            .map_err(|_| crate::Error::Internal("folder modseq lock poisoned".into()))?;
+            .map_err(|_| crate::Error::Internal {
+                kind: crate::error::InternalFailure::Invariant(
+                    "folder modseq lock poisoned".into(),
+                ),
+                mid_exchange: None,
+            })?;
         if modseqs.uidvalidity != Some(uidvalidity) {
             modseqs.uidvalidity = Some(uidvalidity);
             modseqs.by_uid.clear();
@@ -476,7 +218,7 @@ impl FolderEntry {
         Ok(())
     }
 
-    pub(crate) fn clear_modseqs(&self, uidvalidity: u32, uids: &[u32]) {
+    pub(crate) fn clear_modseqs(&self, uidvalidity: crate::types::UidValidity, uids: &[u32]) {
         let mut modseqs = self
             .modseq_by_uid
             .write()
@@ -485,28 +227,26 @@ impl FolderEntry {
             return;
         }
         for uid in uids {
-            modseqs.by_uid.remove(uid);
+            if let Some(uid) = crate::types::Uid::new(*uid) {
+                modseqs.by_uid.remove(&uid);
+            }
         }
     }
 
     /// Clear only cached keys covered by the wire ranges. Work is bounded
     /// by cache size, even for a VANISHED span covering the whole UID space.
-    pub(crate) fn clear_modseq_ranges(&self, uidvalidity: u32, ranges: &[UidRange]) {
-        let removed = CompactUidSet::from_ranges(
-            ranges
-                .iter()
-                .map(|range| {
-                    let end = range.end.unwrap_or(range.start);
-                    normalized_range(range.start.min(end).max(1), range.start.max(end))
-                })
-                .collect(),
-        );
+    pub(crate) fn clear_modseq_ranges(
+        &self,
+        uidvalidity: crate::types::UidValidity,
+        ranges: &[UidRange],
+    ) {
+        let removed = UidSet::from_ranges(ranges.to_vec());
         let mut modseqs = self
             .modseq_by_uid
             .write()
             .expect("folder modseq lock poisoned");
         if modseqs.uidvalidity == Some(uidvalidity) {
-            modseqs.by_uid.retain(|uid, _| !removed.contains(*uid));
+            modseqs.by_uid.retain(|uid, _| !removed.contains(uid.get()));
         }
     }
 
@@ -533,11 +273,11 @@ pub(crate) struct SharedFolderEntry {
     pub(crate) info: MailboxInfo,
     /// The owning mailbox. For an other-user namespace (root `#user/`),
     /// this is the per-principal segment that follows the root in each
-    /// folder's own path - `#user/alice/INBOX` -> `MailboxId("alice")` -
+    /// folder's own path - `#user/alice/INBOX` -> `PrincipalId("alice")` -
     /// so distinct users get distinct owners. For a shared namespace
     /// (root `#shared.`), all folders share one owner, the root minus its
-    /// trailing delimiter -> `MailboxId("#shared")`.
-    pub(crate) owner: bifrost_types::MailboxId,
+    /// trailing delimiter -> `PrincipalId("#shared")`.
+    pub(crate) owner: bifrost_types::PrincipalId,
     /// The parsed MYRIGHTS set, or `None` when the server did not report
     /// one (no ACL capability, or MYRIGHTS failed and discovery deferred
     /// to SELECT).
@@ -852,7 +592,12 @@ impl FolderRegistry {
         }
     }
 
-    pub(crate) fn modseq(&self, folder: &MailboxName, uidvalidity: u32, uid: u32) -> Option<u64> {
+    pub(crate) fn modseq(
+        &self,
+        folder: &MailboxName,
+        uidvalidity: crate::types::UidValidity,
+        uid: u32,
+    ) -> Option<crate::types::ModSeq> {
         self.get(folder)
             .and_then(|entry| entry.modseq(uidvalidity, uid))
     }
@@ -860,9 +605,9 @@ impl FolderRegistry {
     pub(crate) fn record_modseq(
         &self,
         folder: &MailboxName,
-        uidvalidity: u32,
+        uidvalidity: crate::types::UidValidity,
         uid: u32,
-        modseq: u64,
+        modseq: impl Into<crate::types::ModSeqValzer>,
     ) -> Result<(), crate::Error> {
         if let Some(entry) = self.get(folder) {
             return entry.record_modseq(uidvalidity, uid, modseq);
@@ -870,7 +615,12 @@ impl FolderRegistry {
         Ok(())
     }
 
-    pub(crate) fn clear_modseqs(&self, folder: &MailboxName, uidvalidity: u32, uids: &[u32]) {
+    pub(crate) fn clear_modseqs(
+        &self,
+        folder: &MailboxName,
+        uidvalidity: crate::types::UidValidity,
+        uids: &[u32],
+    ) {
         if let Some(entry) = self.get(folder) {
             entry.clear_modseqs(uidvalidity, uids);
         }
@@ -879,7 +629,7 @@ impl FolderRegistry {
     pub(crate) fn clear_modseq_ranges(
         &self,
         folder: &MailboxName,
-        uidvalidity: u32,
+        uidvalidity: crate::types::UidValidity,
         ranges: &[UidRange],
     ) {
         if let Some(entry) = self.get(folder) {
@@ -929,8 +679,26 @@ mod tests {
             },
         ]);
         assert_eq!(registry.entries().len(), 2);
-        registry.get(&a).unwrap().record_modseq(1, 7, 99).unwrap();
-        assert_eq!(registry.get(&b).unwrap().modseq(1, 7), None);
+        registry
+            .get(&a)
+            .unwrap()
+            .record_modseq(
+                crate::types::UidValidity::new(1).expect("valid protocol test value"),
+                7,
+                crate::types::ModSeq::new(99).expect("positive test MODSEQ"),
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .get(&b)
+                .unwrap()
+                .modseq(
+                    crate::types::UidValidity::new(1).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
+            None
+        );
         registry.apply_mailbox_event(MailboxInfo {
             name: a.clone(),
             attributes: vec![MailboxAttribute::NonExistent],
@@ -958,224 +726,27 @@ mod tests {
                 name: name.clone(),
                 ..Default::default()
             },
-            owner: bifrost_types::MailboxId("alice".to_owned()),
+            owner: bifrost_types::PrincipalId("alice".to_owned()),
             rights: rights.map(crate::types::MailboxRights::parse),
             namespace_prefix: namespace_prefix.to_owned(),
         }
     }
 
-    #[test]
-    fn compact_uid_set_roundtrips_and_diffs() {
-        let set = CompactUidSet::from_uids([1, 2, 3, 7, 9, 10]);
-        assert_eq!(set.to_uids(), vec![1, 2, 3, 7, 9, 10]);
-        assert_eq!(
-            set.ranges(),
-            &[
-                UidRange::range(1, 3),
-                UidRange::single(7),
-                UidRange::range(9, 10)
-            ]
-        );
-
-        let newer = CompactUidSet::from_uids([2, 3, 4, 9]);
-        let diff = set.diff(&newer);
-        assert_eq!(diff.added, vec![4]);
-        assert_eq!(diff.removed, vec![1, 7, 10]);
-        assert_eq!(set.uid_count(), 6);
-    }
-
-    #[test]
-    fn compact_uid_set_mutation_splits_and_merges_ranges() {
-        let mut set = CompactUidSet::from_ranges(vec![UidRange::range(1, 500_000)]);
-        assert!(set.remove(250_000));
-        assert!(!set.contains(250_000));
-        assert_eq!(set.ranges().len(), 2);
-        assert!(!set.remove(250_000));
-
-        assert!(set.insert(250_000));
-        assert_eq!(set.ranges(), &[UidRange::range(1, 500_000)]);
-        assert!(!set.insert(250_000));
-
-        assert!(set.remove(1));
-        assert!(set.remove(500_000));
-        assert_eq!(set.ranges(), &[UidRange::range(2, 499_999)]);
-    }
-
     // `UidRange::range(n, n)` and `UidRange::single(n)` are deliberately NOT
     // equal (see `types::uid_range`), and `from_uids` / `insert_range` both
     // normalise a one-element run to `single`. `remove` must land on the same
-    // spelling: `CompactUidSet` derives `PartialEq` over the range vector, and
+    // spelling: `UidSet` derives `PartialEq` over the range vector, and
     // a mutated live set from `run_qresync` is what gets encoded into the
     // persisted CONDSTORE cursor. A `2:2` residue there would make the same
     // UID set compare unequal to - and serialise differently from - the set
     // rebuilt from the wire.
-    #[test]
-    fn compact_uid_set_remove_normalises_one_element_residue() {
-        // Trimming the low end down to a single survivor.
-        let mut set = CompactUidSet::from_uids([1, 2]);
-        assert!(set.remove(1));
-        assert_eq!(set, CompactUidSet::from_uids([2]));
-        assert_eq!(set.ranges(), &[UidRange::single(2)]);
-
-        // Trimming the high end down to a single survivor.
-        let mut set = CompactUidSet::from_uids([1, 2]);
-        assert!(set.remove(2));
-        assert_eq!(set, CompactUidSet::from_uids([1]));
-        assert_eq!(set.ranges(), &[UidRange::single(1)]);
-
-        // Splitting from the middle, leaving a single survivor on each side.
-        let mut set = CompactUidSet::from_uids([1, 2, 3]);
-        assert!(set.remove(2));
-        assert_eq!(set, CompactUidSet::from_uids([1, 3]));
-        assert_eq!(set.ranges(), &[UidRange::single(1), UidRange::single(3)]);
-
-        // Splitting with a multi-UID remainder on one side only.
-        let mut set = CompactUidSet::from_uids([1, 2, 3, 4]);
-        assert!(set.remove(2));
-        assert_eq!(set, CompactUidSet::from_uids([1, 3, 4]));
-        assert_eq!(set.ranges(), &[UidRange::single(1), UidRange::range(3, 4)]);
-    }
-
-    #[test]
-    fn compact_uid_set_mutation_handles_empty_and_single_element_sets() {
-        let mut set = CompactUidSet::default();
-        assert!(!set.remove(1), "removing from an empty set reports absent");
-        assert!(set.is_empty());
-
-        assert!(set.insert(5));
-        assert_eq!(set.ranges(), &[UidRange::single(5)]);
-        assert!(!set.insert(5), "re-inserting reports already present");
-
-        assert!(set.remove(5));
-        assert!(set.is_empty(), "removing the only UID empties the set");
-        assert_eq!(set.ranges(), &[]);
-
-        // UID 0 is not an `nz-number` and must never enter the set.
-        assert!(!set.insert(0));
-        assert!(set.is_empty());
-        assert!(!set.remove(0));
-    }
-
-    #[test]
-    fn compact_uid_set_insert_merges_across_range_boundaries() {
-        let mut set = CompactUidSet::from_uids([1, 2, 4, 5]);
-        assert_eq!(
-            set.ranges(),
-            &[UidRange::range(1, 2), UidRange::range(4, 5)]
-        );
-
-        // The gap UID bridges two neighbours into one range.
-        assert!(set.insert(3));
-        assert_eq!(set.ranges(), &[UidRange::range(1, 5)]);
-        assert_eq!(set.uid_count(), 5);
-
-        // Extending past each endpoint keeps a single merged range.
-        assert!(set.insert(6));
-        assert_eq!(set.ranges(), &[UidRange::range(1, 6)]);
-        assert!(set.insert(7));
-        assert_eq!(set.ranges(), &[UidRange::range(1, 7)]);
-
-        // A UID two past the end is disjoint, not adjacent.
-        assert!(set.insert(9));
-        assert_eq!(set.ranges(), &[UidRange::range(1, 7), UidRange::single(9)]);
-        // ...and filling the hole merges it back in.
-        assert!(set.insert(8));
-        assert_eq!(set.ranges(), &[UidRange::range(1, 9)]);
-
-        // A single UID adjacent below the first range extends it downward.
-        let mut set = CompactUidSet::from_uids([5, 6]);
-        assert!(set.insert(4));
-        assert_eq!(set.ranges(), &[UidRange::range(4, 6)]);
-        assert!(set.insert(1));
-        assert_eq!(set.ranges(), &[UidRange::single(1), UidRange::range(4, 6)]);
-    }
 
     // Every mutation path must leave the set indistinguishable from the same
     // UIDs fed through `from_uids`, since that is what membership, diffing and
     // cursor encoding all assume.
-    #[test]
-    fn compact_uid_set_mutations_agree_with_a_reference_set() {
-        let mut set = CompactUidSet::default();
-        let mut reference = std::collections::BTreeSet::new();
-
-        // A deterministic walk that hits adjacency, splitting and re-merging.
-        let script: [(bool, u32); 18] = [
-            (true, 10),
-            (true, 11),
-            (true, 12),
-            (true, 14),
-            (true, 13),
-            (false, 12),
-            (true, 1),
-            (true, 2),
-            (false, 1),
-            (false, 2),
-            (true, 20),
-            (false, 20),
-            (true, 12),
-            (false, 14),
-            (false, 10),
-            (true, 10),
-            (false, 11),
-            (false, 13),
-        ];
-        for (insert, uid) in script {
-            if insert {
-                assert_eq!(set.insert(uid), reference.insert(uid), "insert {uid}");
-            } else {
-                assert_eq!(set.remove(uid), reference.remove(&uid), "remove {uid}");
-            }
-            let expected = CompactUidSet::from_uids(reference.iter().copied());
-            assert_eq!(
-                set,
-                expected,
-                "after {}{uid}",
-                if insert { '+' } else { '-' }
-            );
-            assert_eq!(set.uid_count(), reference.len());
-            assert_eq!(set.to_uids(), reference.iter().copied().collect::<Vec<_>>());
-            for uid in 1..25 {
-                assert_eq!(
-                    set.contains(uid),
-                    reference.contains(&uid),
-                    "contains {uid}"
-                );
-            }
-        }
-    }
 
     // The merge walks both range lists in order, so the edges worth pinning
     // are the ones where one side runs out before the other.
-    #[test]
-    fn compact_uid_set_diff_handles_exhausted_sides() {
-        let empty = CompactUidSet::default();
-        let some = CompactUidSet::from_uids([4, 5, 9]);
-
-        let from_empty = empty.diff(&some);
-        assert_eq!(from_empty.added, vec![4, 5, 9]);
-        assert!(from_empty.removed.is_empty());
-
-        let to_empty = some.diff(&empty);
-        assert!(to_empty.added.is_empty());
-        assert_eq!(to_empty.removed, vec![4, 5, 9]);
-
-        assert_eq!(some.diff(&some), UidSetDiff::default());
-
-        // Disjoint sets: every UID on each side must appear exactly once,
-        // interleaved rather than concatenated.
-        let disjoint = CompactUidSet::from_uids([1, 6, 7]);
-        let diff = disjoint.diff(&some);
-        assert_eq!(diff.added, vec![4, 5, 9]);
-        assert_eq!(diff.removed, vec![1, 6, 7]);
-    }
-
-    #[test]
-    fn compact_uid_set_diff_handles_max_uid_without_false_change() {
-        let max = CompactUidSet::from_uids([u32::MAX]);
-        assert_eq!(max.diff(&max), UidSetDiff::default());
-        assert_eq!(CompactUidSet::default().diff(&max).added, vec![u32::MAX]);
-        assert_eq!(max.diff(&CompactUidSet::default()).removed, vec![u32::MAX]);
-    }
 
     /// `subtract_ranges` is hand-rolled range algebra whose whole point is to
     /// never expand an unchanged span, so a handful of examples cannot pin it:
@@ -1183,41 +754,6 @@ mod tests {
     /// ranges that straddle a source-range boundary and must stay available to
     /// the next source range. Diff every pair against the obvious
     /// expand-and-compare answer over deterministic pseudo-random membership.
-    #[test]
-    fn compact_uid_set_diff_matches_set_semantics_over_generated_pairs() {
-        fn naive(a: &CompactUidSet, b: &CompactUidSet) -> Vec<u32> {
-            let cover: std::collections::BTreeSet<u32> = b.iter().collect();
-            a.iter().filter(|uid| !cover.contains(uid)).collect()
-        }
-
-        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        for _ in 0..400 {
-            let mut left = Vec::new();
-            let mut right = Vec::new();
-            // A small universe with dense, streaky membership is what produces
-            // long equal runs and boundary-straddling covers; uniform sparse
-            // picks would almost never generate either.
-            for uid in 1..=64_u32 {
-                if next() % 3 != 0 {
-                    left.push(uid);
-                }
-                if next() % 3 != 0 {
-                    right.push(uid);
-                }
-            }
-            let a = CompactUidSet::from_uids(left);
-            let b = CompactUidSet::from_uids(right);
-            let diff = a.diff(&b);
-            assert_eq!(diff.added, naive(&b, &a), "added: {a:?} -> {b:?}");
-            assert_eq!(diff.removed, naive(&a, &b), "removed: {a:?} -> {b:?}");
-        }
-    }
 
     // The cache is opportunistic, so the bound must hold without an
     // access-order structure: a full-mailbox inventory sweep leaves the
@@ -1232,31 +768,43 @@ mod tests {
         let total = u32::try_from(MODSEQ_CACHE_CAPACITY).expect("fits") + 1;
         for uid in 1..=total {
             entry
-                .record_modseq(11, uid, u64::from(uid))
+                .record_modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    uid,
+                    crate::types::ModSeq::new(u64::from(uid)).expect("positive test MODSEQ"),
+                )
                 .expect("valid modseq");
         }
-        assert_eq!(entry.modseq(11, total), Some(u64::from(total)));
         assert_eq!(
-            entry.modseq(11, 1),
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    total
+                )
+                .map(crate::types::ModSeq::get),
+            Some(u64::from(total))
+        );
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    1
+                )
+                .map(crate::types::ModSeq::get),
             None,
             "the oldest UID is the first evicted",
         );
         let survivors = (1..=total)
-            .filter(|uid| entry.modseq(11, *uid).is_some())
+            .filter(|uid| {
+                entry
+                    .modseq(
+                        crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                        *uid,
+                    )
+                    .is_some()
+            })
             .count();
         assert_eq!(survivors, MODSEQ_CACHE_TARGET);
-    }
-
-    #[test]
-    fn compact_uid_set_contains_probes_the_ranges() {
-        let set = CompactUidSet::from_uids([1, 2, 3, 7, 9, 10]);
-        for uid in set.to_uids() {
-            assert!(set.contains(uid), "{uid} is in the set");
-        }
-        for uid in [0, 4, 5, 6, 8, 11, u32::MAX] {
-            assert!(!set.contains(uid), "{uid} is not in the set");
-        }
-        assert!(!CompactUidSet::default().contains(1));
     }
 
     #[test]
@@ -1280,21 +828,57 @@ mod tests {
         };
         let entry = FolderEntry::from_mailbox(info);
 
-        entry.record_modseq(11, 7, 99).expect("valid modseq");
         entry
-            .record_modseq(0, 8, 100)
-            .expect("zero UIDVALIDITY is not a cacheable epoch");
-        entry
-            .record_modseq(11, 8, 0)
-            .expect("zero MODSEQ is ignored by the opportunistic cache");
+            .record_modseq(
+                crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                7,
+                crate::types::ModSeq::new(99).expect("positive test MODSEQ"),
+            )
+            .expect("valid modseq");
+        assert!(crate::types::UidValidity::new(0).is_none());
+        assert!(crate::types::ModSeq::new(0).is_none());
 
-        assert_eq!(entry.modseq(11, 7), Some(99));
-        assert_eq!(entry.modseq(0, 8), None);
-        assert_eq!(entry.modseq(11, 8), None);
-        assert_eq!(entry.modseq(12, 7), None);
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
+            Some(99)
+        );
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    8
+                )
+                .map(crate::types::ModSeq::get),
+            None
+        );
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(12).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
+            None
+        );
 
-        entry.clear_modseqs(11, &[7]);
-        assert_eq!(entry.modseq(11, 7), None);
+        entry.clear_modseqs(
+            crate::types::UidValidity::new(11).expect("valid protocol test value"),
+            &[7],
+        );
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
+            None
+        );
     }
 
     #[test]
@@ -1305,11 +889,39 @@ mod tests {
         };
         let entry = FolderEntry::from_mailbox(info);
 
-        entry.record_modseq(11, 7, 99).expect("valid modseq");
-        entry.record_modseq(12, 7, 100).expect("valid modseq");
+        entry
+            .record_modseq(
+                crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                7,
+                crate::types::ModSeq::new(99).expect("positive test MODSEQ"),
+            )
+            .expect("valid modseq");
+        entry
+            .record_modseq(
+                crate::types::UidValidity::new(12).expect("valid protocol test value"),
+                7,
+                crate::types::ModSeq::new(100).expect("positive test MODSEQ"),
+            )
+            .expect("valid modseq");
 
-        assert_eq!(entry.modseq(11, 7), None);
-        assert_eq!(entry.modseq(12, 7), Some(100));
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
+            None
+        );
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(12).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
+            Some(100)
+        );
     }
 
     #[test]
@@ -1320,7 +932,13 @@ mod tests {
             ..Default::default()
         }]);
         let entry = registry.get(&folder).expect("folder entry");
-        entry.record_modseq(11, 7, 99).expect("valid modseq");
+        entry
+            .record_modseq(
+                crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                7,
+                crate::types::ModSeq::new(99).expect("positive test MODSEQ"),
+            )
+            .expect("valid modseq");
 
         registry.apply_mailbox_event(MailboxInfo {
             name: folder.clone(),
@@ -1334,7 +952,15 @@ mod tests {
             ..Default::default()
         });
         let entry = registry.get(&folder).expect("recreated folder entry");
-        assert_eq!(entry.modseq(11, 7), None);
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
+            None
+        );
         assert!(entry.cursor().is_none());
     }
 
@@ -1361,7 +987,7 @@ mod tests {
         let ingested = registry.get(&shared).expect("shared entry");
         assert_eq!(
             ingested.shared_owner,
-            Some(bifrost_types::MailboxId("alice".to_owned()))
+            Some(bifrost_types::PrincipalId("alice".to_owned()))
         );
         // The discovery-time MYRIGHTS set is retained on the entry so
         // `containers_list` can project it.
@@ -1392,7 +1018,7 @@ mod tests {
         let entry = registry.get(&path).expect("entry present");
         assert_eq!(
             entry.shared_owner,
-            Some(bifrost_types::MailboxId("alice".to_owned())),
+            Some(bifrost_types::PrincipalId("alice".to_owned())),
             "a path under a declared shared namespace must carry its owner"
         );
         assert_eq!(
@@ -1430,7 +1056,7 @@ mod tests {
             ],
         );
 
-        let alice = Some(bifrost_types::MailboxId("alice".to_owned()));
+        let alice = Some(bifrost_types::PrincipalId("alice".to_owned()));
         let w = registry.get(&writable).expect("writable entry");
         let r = registry.get(&read_only).expect("read-only entry");
         assert_eq!(w.shared_owner, alice);
@@ -1470,7 +1096,7 @@ mod tests {
         let entry = registry.get(&path).expect("entry present");
         assert_eq!(
             entry.shared_owner,
-            Some(bifrost_types::MailboxId("alice".to_owned()))
+            Some(bifrost_types::PrincipalId("alice".to_owned()))
         );
         assert_eq!(entry.rights, Some(crate::types::MailboxRights::parse("l")));
         assert!(
@@ -1575,7 +1201,7 @@ mod tests {
         let retained = registry.get(&shared).expect("shared entry retained");
         assert_eq!(
             retained.shared_owner,
-            Some(bifrost_types::MailboxId("alice".to_owned()))
+            Some(bifrost_types::PrincipalId("alice".to_owned()))
         );
         assert_eq!(
             retained.rights,
@@ -1608,11 +1234,16 @@ mod tests {
         ]);
 
         let held = registry.get(&kept).expect("entry present");
-        held.record_modseq(11, 7, 99).expect("valid modseq");
+        held.record_modseq(
+            crate::types::UidValidity::new(11).expect("valid protocol test value"),
+            7,
+            crate::types::ModSeq::new(99).expect("positive test MODSEQ"),
+        )
+        .expect("valid modseq");
         held.set_cursor(FolderCursor::Basic {
-            uidvalidity: 11,
-            uidnext: 8,
-            known_uids: CompactUidSet::from_uids([7]),
+            uidvalidity: crate::types::UidValidity::new(11).expect("nonzero epoch"),
+            uidnext: crate::types::Uid::new(8),
+            known_uids: UidSet::from_numbers([7]),
         });
 
         let created = MailboxName::new("Projects").expect("valid mailbox");
@@ -1634,7 +1265,12 @@ mod tests {
             "a surviving personal folder must keep its identity, not be rebuilt",
         );
         assert_eq!(
-            after.modseq(11, 7),
+            after
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
             Some(99),
             "the MODSEQ cache must survive a personal re-LIST",
         );
@@ -1648,8 +1284,23 @@ mod tests {
         );
         // Writes through the pre-refresh Arc must still be visible: that is
         // the lost-update hazard a rebuild reintroduces.
-        held.record_modseq(11, 8, 100).expect("valid modseq");
-        assert_eq!(registry.get(&kept).expect("entry").modseq(11, 8), Some(100));
+        held.record_modseq(
+            crate::types::UidValidity::new(11).expect("valid protocol test value"),
+            8,
+            crate::types::ModSeq::new(100).expect("positive test MODSEQ"),
+        )
+        .expect("valid modseq");
+        assert_eq!(
+            registry
+                .get(&kept)
+                .expect("entry")
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    8
+                )
+                .map(crate::types::ModSeq::get),
+            Some(100)
+        );
 
         assert!(registry.get(&created).is_some(), "a new folder is added");
         assert!(
@@ -1693,7 +1344,7 @@ mod tests {
         let renamed = registry.get(&new).expect("renamed shared entry");
         assert_eq!(
             renamed.shared_owner,
-            Some(bifrost_types::MailboxId("alice".to_owned())),
+            Some(bifrost_types::PrincipalId("alice".to_owned())),
             "a renamed shared folder must keep its owner so a later SELECT denial quarantines",
         );
         assert_eq!(
@@ -1707,7 +1358,7 @@ mod tests {
     fn range_removal_matches_membership_for_overlaps_holes_and_repeated_removals() {
         for start in 1..=10 {
             for end in 1..=10 {
-                let mut known = CompactUidSet::from_uids([1, 2, 4, 7, 8, 10]);
+                let mut known = UidSet::from_numbers([1, 2, 4, 7, 8, 10]);
                 let removed = known.remove_range(UidRange::range(start, end));
                 let (lo, hi) = (start.min(end), start.max(end));
                 let expected: Vec<_> = [1, 2, 4, 7, 8, 10]
@@ -1725,7 +1376,7 @@ mod tests {
 
     #[test]
     fn range_removal_intersects_sparse_membership_without_expanding_wire_span() {
-        let mut known = CompactUidSet::from_uids([2, 7, u32::MAX]);
+        let mut known = UidSet::from_numbers([2, 7, u32::MAX]);
         let removed = known.remove_range(UidRange::range(1, 4000000000));
         assert_eq!(removed.to_uids(), vec![2, 7]);
         assert_eq!(known.to_uids(), vec![u32::MAX]);
@@ -1743,7 +1394,7 @@ mod tests {
 
     #[test]
     fn range_removal_splits_and_normalizes_reversed_endpoints() {
-        let mut known = CompactUidSet::from_ranges(vec![UidRange::range(1, u32::MAX)]);
+        let mut known = UidSet::from_ranges(vec![UidRange::range(1, u32::MAX)]);
         let removed = known.remove_range(UidRange::range(9, 3));
         assert_eq!(removed.ranges(), &[UidRange::range(3, 9)]);
         assert_eq!(
@@ -1756,64 +1407,59 @@ mod tests {
     fn vanished_ranges_clear_only_cached_keys_in_the_same_epoch() {
         let entry = FolderEntry::from_mailbox(MailboxInfo::default());
         for uid in [2, 7, u32::MAX] {
-            entry.record_modseq(11, uid, 99).expect("valid modseq");
+            entry
+                .record_modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    uid,
+                    crate::types::ModSeq::new(99).expect("positive test MODSEQ"),
+                )
+                .expect("valid modseq");
         }
         let ranges = [UidRange::range(4000000000, 1)];
-        entry.clear_modseq_ranges(12, &ranges);
-        assert_eq!(entry.modseq(11, 2), Some(99));
-        entry.clear_modseq_ranges(11, &ranges);
-        assert_eq!(entry.modseq(11, 2), None);
-        assert_eq!(entry.modseq(11, 7), None);
-        assert_eq!(entry.modseq(11, u32::MAX), Some(99));
-    }
-
-    #[test]
-    fn compact_uid_set_drops_zero_sorts_and_dedupes() {
-        // UIDs are nz-number: a 0 is not a UID and must never reach a
-        // range. Input order and duplicates must not survive either.
-        let set = CompactUidSet::from_uids([9, 0, 2, 2, 1, 0, 3]);
-        assert_eq!(set.to_uids(), vec![1, 2, 3, 9]);
-        assert_eq!(set.ranges(), &[UidRange::range(1, 3), UidRange::single(9)]);
-        assert_eq!(set.uid_count(), 4);
-
-        assert!(CompactUidSet::from_uids([0, 0]).is_empty());
-        assert!(CompactUidSet::default().is_empty());
-        assert_eq!(CompactUidSet::default().uid_count(), 0);
-    }
-
-    #[test]
-    fn compact_uid_set_from_ranges_normalizes_overlap_and_order() {
-        // `from_ranges` is the cursor-decode entry point, so it must cope
-        // with a set that was written out of order or with overlaps and
-        // still produce one canonical merged range list.
-        let set = CompactUidSet::from_ranges(vec![
-            UidRange::range(5, 8),
-            UidRange::single(1),
-            UidRange::range(2, 6),
-        ]);
-        assert_eq!(set.ranges(), &[UidRange::range(1, 8)]);
-        assert_eq!(set.uid_count(), 8);
-    }
-
-    #[test]
-    fn compact_uid_set_diff_reports_both_directions() {
-        let old = CompactUidSet::from_uids([1, 2, 3]);
-        let new = CompactUidSet::from_uids([2, 3, 4]);
-        let forward = old.diff(&new);
-        assert_eq!(forward.added, vec![4]);
-        assert_eq!(forward.removed, vec![1]);
-        let backward = new.diff(&old);
-        assert_eq!(backward.added, vec![1]);
-        assert_eq!(backward.removed, vec![4]);
-        // A set diffed against itself reports nothing.
-        assert_eq!(old.diff(&old), UidSetDiff::default());
-    }
-
-    #[test]
-    fn expand_range_covers_single_and_inclusive_range() {
-        assert_eq!(expand_range(UidRange::single(4)), vec![4]);
-        assert_eq!(expand_range(UidRange::range(4, 7)), vec![4, 5, 6, 7]);
-        assert_eq!(expand_range(UidRange::range(4, 4)), vec![4]);
+        entry.clear_modseq_ranges(
+            crate::types::UidValidity::new(12).expect("valid protocol test value"),
+            &ranges,
+        );
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    2
+                )
+                .map(crate::types::ModSeq::get),
+            Some(99)
+        );
+        entry.clear_modseq_ranges(
+            crate::types::UidValidity::new(11).expect("valid protocol test value"),
+            &ranges,
+        );
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    2
+                )
+                .map(crate::types::ModSeq::get),
+            None
+        );
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
+            None
+        );
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    u32::MAX
+                )
+                .map(crate::types::ModSeq::get),
+            Some(99)
+        );
     }
 
     #[test]
@@ -1823,16 +1469,44 @@ mod tests {
             ..Default::default()
         };
         let entry = FolderEntry::from_mailbox(info);
-        entry.record_modseq(11, 7, 99).expect("valid modseq");
+        entry
+            .record_modseq(
+                crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                7,
+                crate::types::ModSeq::new(99).expect("positive test MODSEQ"),
+            )
+            .expect("valid modseq");
 
         // An expunge reported against a different epoch must not evict the
         // current epoch's cached MODSEQ (that would silently downgrade the
         // next STORE from UNCHANGEDSINCE-protected to unprotected).
-        entry.clear_modseqs(12, &[7]);
-        assert_eq!(entry.modseq(11, 7), Some(99));
+        entry.clear_modseqs(
+            crate::types::UidValidity::new(12).expect("valid protocol test value"),
+            &[7],
+        );
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
+            Some(99)
+        );
 
-        entry.clear_modseqs(11, &[7]);
-        assert_eq!(entry.modseq(11, 7), None);
+        entry.clear_modseqs(
+            crate::types::UidValidity::new(11).expect("valid protocol test value"),
+            &[7],
+        );
+        assert_eq!(
+            entry
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
+            None
+        );
     }
 
     #[test]
@@ -1859,7 +1533,13 @@ mod tests {
             ..Default::default()
         }]);
         let entry = registry.get(&folder).expect("folder entry");
-        entry.record_modseq(11, 7, 99).expect("valid modseq");
+        entry
+            .record_modseq(
+                crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                7,
+                crate::types::ModSeq::new(99).expect("positive test MODSEQ"),
+            )
+            .expect("valid modseq");
 
         registry.apply_mailbox_event(MailboxInfo {
             name: folder.clone(),
@@ -1869,7 +1549,12 @@ mod tests {
 
         let after = registry.get(&folder).expect("folder still registered");
         assert_eq!(
-            after.modseq(11, 7),
+            after
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
             Some(99),
             "a re-announcement must not reset the MODSEQ cache"
         );
@@ -1909,17 +1594,27 @@ mod tests {
         });
 
         // The run finishes and commits its state through the handle it has.
-        held.record_modseq(11, 7, 99).expect("valid modseq");
+        held.record_modseq(
+            crate::types::UidValidity::new(11).expect("valid protocol test value"),
+            7,
+            crate::types::ModSeq::new(99).expect("positive test MODSEQ"),
+        )
+        .expect("valid modseq");
         held.set_cursor(FolderCursor::Basic {
-            uidvalidity: 11,
-            uidnext: 8,
-            known_uids: CompactUidSet::from_uids([7]),
+            uidvalidity: crate::types::UidValidity::new(11).expect("nonzero epoch"),
+            uidnext: crate::types::Uid::new(8),
+            known_uids: UidSet::from_numbers([7]),
         });
         held.mark_seen();
 
         let after = registry.get(&folder).expect("folder still registered");
         assert_eq!(
-            after.modseq(11, 7),
+            after
+                .modseq(
+                    crate::types::UidValidity::new(11).expect("valid protocol test value"),
+                    7
+                )
+                .map(crate::types::ModSeq::get),
             Some(99),
             "a MODSEQ recorded through a pre-refresh handle must not be lost"
         );
@@ -1951,7 +1646,7 @@ mod tests {
         let recreated = registry.get(&folder).expect("recreated shared entry");
         assert_eq!(
             recreated.shared_owner,
-            Some(bifrost_types::MailboxId("alice".to_owned())),
+            Some(bifrost_types::PrincipalId("alice".to_owned())),
         );
     }
 }
@@ -1973,7 +1668,7 @@ mod role_resolution_tests {
                 attributes: vec![MailboxAttribute::Sent],
                 ..Default::default()
             },
-            owner: bifrost_types::MailboxId("alice".into()),
+            owner: bifrost_types::PrincipalId("alice".into()),
             rights: None,
             namespace_prefix: "Shared/".into(),
         };

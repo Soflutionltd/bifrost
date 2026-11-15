@@ -45,6 +45,12 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
+- **An expired CalDAV sync token fails every poll.** `cursor_invalid_error` in
+  `crates/caldav/src/client.rs` scopes the error to `CursorScope::Folder(url)`,
+  but live CalDAV cursors are `CursorScope::FolderType`, so the engine's
+  exact-match `RestartScope` misses the cursor and the stale token is replayed
+  on every poll. `reference/caldav.md` documents the wrong scope too. Scope it
+  to the live cursor's shape and pin it with a restart test.
 
 ## 2. Blocked on a live probe
 
@@ -280,6 +286,42 @@ face.
 ## 5. Low priority
 
 Narrow edge cases, audits with no known defect, and design work.
+
+- **Lateral findings from the review of the design-hunt batch, unverified.**
+  Each wants its own check and, where marked, a ruling.
+  - DAV: `reference/caldav.md` and `reference/carddav.md` call a cursor scope
+    mismatch schema-incompatible; the code treats it as `CursorInvalid`.
+    `dav-core` `http_error_policy_for_protocol` has an `unreachable!` panic
+    path. The pre-dispatch raw-URL trust check has no test.
+  - Google: the 404 `Message` fallback now also labels a scopeless 403 as
+    `NoPermission` on `Message` for filter and directory calls.
+  - net: `server_cause_from_status` returns a `Server` cause for unlisted 4xx
+    statuses.
+  - IMAP: `ImapMessageRef` equality depends on the container spelling,
+    including INBOX case, contradicting its doc. The stricter OAuth and
+    CRAM-MD5 handling and ManageSieve's OAUTHBEARER preference are not in
+    `reference/imap.md`.
+  - SASL: `AGENTS.md` still calls `bifrost-sasl` private although it is
+    published. `strip_frame_delim` in `crates/sasl/src/oauth.rs` still
+    rewrites for callers that bypass `SaslClient`.
+  - JMAP: a capability dropped mid-session yields terminal `Unsupported` where
+    `CapabilityChanged` may fit (ruling). The foreign-discovery paragraph of
+    `reference/jmap.md` names a constructor that is now test-only. An all-day
+    event with no start loses its all-day flag.
+  - SMTP: a rejected batch DATA reports per-recipient RCPT rejections. Batch
+    sends have no BDAT entry point (ruling). An LMTP final 421 marks the
+    remaining recipients uncertain without reading their finals. `Session` and
+    `Transaction` use `unreachable!` on impossible outcomes.
+  - sync: the operator-override warning moved from `user_safe` to
+    `support_only` (ruling). `plan_recovery` lost its unhandled-classification
+    detail. `ThrottleScope::Mailbox` no longer names what it means. Several
+    engine sites still hold raw `WriterRequest` senders instead of
+    `WriterHandle`. `publish_warning` stamps `Account` scope on unscoped
+    warnings. `AckOutcome` is not `#[must_use]`: adding it is clean in
+    production but about fifty test call sites discard the value.
+  - Graph: `public_folder` change events carry `Owner` memberships that only
+    `Account` cursors cover.
+  - Calendars: CalDAV and JMAP normalize floating times to UTC.
 
 - **The backfill bound docs say an acknowledgement frees capacity; the code
   frees it on receipt.** `engine/backfill_bound.rs` documents the permit as the

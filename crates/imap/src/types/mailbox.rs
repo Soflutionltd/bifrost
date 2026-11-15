@@ -456,9 +456,9 @@ pub struct SelectedMailbox {
     /// `None` when the server omits UIDVALIDITY or sends zero (a protocol
     /// violation; neither is a usable mailbox epoch).
     /// RFC 3501 Section 9 defines UIDVALIDITY as `nz-number` (> 0).
-    pub uid_validity: Option<u32>,
+    pub uid_validity: Option<super::UidValidity>,
     /// Predicted next UID (RFC 3501 Section 7.1).
-    pub uid_next: Option<u32>,
+    pub uid_next: Option<super::Uid>,
     /// Flags defined in the mailbox (RFC 3501 Section 7.2.6).
     pub flags: Vec<Flag>,
     /// Flags the client can change permanently (RFC 3501 Section 7.1).

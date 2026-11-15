@@ -170,14 +170,21 @@ async fn ews_release_is_claimed_once_and_joined_by_every_caller() {
         let count = Arc::clone(&count); let ready = Arc::clone(&ready);
         async move { count.fetch_add(1, std::sync::atomic::Ordering::SeqCst); ready.notified().await; Ok(()) }.boxed()
     });
-    account.ews_ledger.lock().unwrap().entries.insert("id".into(), EwsEntry { state: EwsEntryState::Live, releaser });
-    let first = release(&account, "id"); let second = release(&account, "id");
+    account.ews.ledger.lock().unwrap().entries.insert(
+        "id".into(),
+        EwsEntry {
+            state: EwsEntryState::Live,
+            releaser,
+        },
+    );
+    let first = account.ews.release(&account.push_tasks, "id");
+    let second = account.ews.release(&account.push_tasks, "id");
     tokio::task::yield_now().await;
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(first.clone().now_or_never().is_none());
     gate.notify_one();
     futures::future::join(first, second).await;
-    assert!(account.ews_ledger.lock().unwrap().entries.is_empty());
+    assert!(account.ews.ledger.lock().unwrap().entries.is_empty());
 }
 
 #[tokio::test]
@@ -187,12 +194,12 @@ async fn a_failed_ews_release_keeps_its_obligation_without_hiding_a_newer_subscr
     let fail: EwsReleaser = Arc::new(|_| async { Err(EwsError::Internal("failed cleanup".into())) }.boxed());
     let good: EwsReleaser = Arc::new(|_| async { Ok(()) }.boxed());
     {
-        let mut ledger = account.ews_ledger.lock().unwrap();
+        let mut ledger = account.ews.ledger.lock().unwrap();
         ledger.entries.insert("old".into(), EwsEntry { state: EwsEntryState::Live, releaser: fail });
         ledger.entries.insert("new".into(), EwsEntry { state: EwsEntryState::Live, releaser: good });
     }
-    release(&account, "old").await;
-    let ledger = account.ews_ledger.lock().unwrap();
+    account.ews.release(&account.push_tasks, "old").await;
+    let ledger = account.ews.ledger.lock().unwrap();
     assert!(matches!(ledger.entries["old"].state, EwsEntryState::Orphaned));
     assert!(matches!(ledger.entries["new"].state, EwsEntryState::Live));
 }
@@ -203,9 +210,12 @@ async fn a_forced_session_drop_leaves_the_subscription_for_close_to_release() {
     let (account, mut session, mut requests) = setup(vec![ScriptStep::Respond(subscribe_response_xml("sub-1")), ScriptStep::Respond(unsubscribe_response_xml())]).await;
     assert!(matches!(session.next().await, Some(E::Established)));
     drop(session);
-    assert!(matches!(account.ews_ledger.lock().unwrap().entries["sub-1"].state, EwsEntryState::Orphaned));
+    assert!(matches!(
+        account.ews.ledger.lock().unwrap().entries["sub-1"].state,
+        EwsEntryState::Orphaned
+    ));
     account.close().await.unwrap();
-    assert!(account.ews_ledger.lock().unwrap().entries.is_empty());
+    assert!(account.ews.ledger.lock().unwrap().entries.is_empty());
     let bodies: Vec<_> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
     assert_eq!(bodies.len(), 2);
     assert!(bodies[1].contains("Unsubscribe"));
@@ -216,13 +226,19 @@ async fn a_session_start_releases_orphaned_subscriptions() {
     use futures::FutureExt;
     let account = GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
     let releaser: EwsReleaser = Arc::new(|_| async { Ok(()) }.boxed());
-    account.ews_ledger.lock().unwrap().entries.insert("old".into(), EwsEntry { state: EwsEntryState::Orphaned, releaser });
+    account.ews.ledger.lock().unwrap().entries.insert(
+        "old".into(),
+        EwsEntry {
+            state: EwsEntryState::Orphaned,
+            releaser,
+        },
+    );
     let (transport, mut requests) = scripted(vec![]);
     let mut session = ews_session(account.clone(), Arc::new(transport), SessionStop::never());
     let mut next = Box::pin(session.next());
     assert!(futures::poll!(&mut next).is_pending());
     for _ in 0..20 { tokio::task::yield_now().await; }
-    assert!(account.ews_ledger.lock().unwrap().entries.is_empty());
+    assert!(account.ews.ledger.lock().unwrap().entries.is_empty());
     assert!(requests.try_recv().is_err());
 }
 
@@ -240,7 +256,7 @@ async fn a_subscribe_answered_after_close_is_released_not_recorded() {
     account.close().await.unwrap();
     ready.notify_one();
     assert!(matches!(next.await, Some(E::Ended(End::Stopped))));
-    assert!(account.ews_ledger.lock().unwrap().entries.is_empty());
+    assert!(account.ews.ledger.lock().unwrap().entries.is_empty());
     assert!(requests.recv().await.unwrap().contains("Unsubscribe"));
 }
 
@@ -254,4 +270,23 @@ async fn a_terminal_response_error_in_the_stream_terminates_instead_of_reconnect
     let bodies: Vec<_> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
     assert_eq!(bodies.len(), 3);
     assert!(bodies[2].contains("Unsubscribe"));
+}
+
+#[tokio::test]
+async fn closing_a_metered_view_releases_the_original_sessions_subscription() {
+    use bifrost_types::Account;
+    let (account, mut session, mut requests) = setup(vec![
+        ScriptStep::Respond(subscribe_response_xml("sub-1")),
+        ScriptStep::Respond(unsubscribe_response_xml()),
+    ])
+    .await;
+    assert!(matches!(session.next().await, Some(E::Established)));
+    let (metered, _) = account.metered();
+    drop(session);
+    metered.close().await.unwrap();
+    assert!(account.ews.ledger.lock().unwrap().entries.is_empty());
+    assert!(account.shutdown.is_cancelled());
+    let bodies: Vec<_> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies[1].contains("Unsubscribe"));
 }

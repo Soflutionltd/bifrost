@@ -1,4 +1,5 @@
 #![allow(clippy::wildcard_imports)]
+use super::lifecycle::build_default_tls_connector;
 use super::*;
 
 /// Connection configuration for [`ImapConnection`].
@@ -187,3 +188,41 @@ where
 #[cfg(test)]
 #[path = "config_tests.rs"]
 mod tests;
+
+/// TLS policy for an IMAP connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TlsMode {
+    /// Connect directly over TLS.
+    Implicit,
+    /// Connect in cleartext, then upgrade via STARTTLS.
+    StartTls,
+    /// Connect without TLS.
+    None,
+}
+
+impl TlsMode {
+    pub(super) fn uses_implicit_tls(self) -> bool {
+        matches!(self, Self::Implicit)
+    }
+
+    pub(super) fn uses_starttls(self) -> bool {
+        matches!(self, Self::StartTls)
+    }
+}
+
+/// TCP keepalive configuration for the underlying socket.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TcpKeepalive {
+    /// Time before the first keepalive probe.
+    pub(crate) time: Duration,
+    /// Interval between subsequent probes.
+    pub(crate) interval: Duration,
+}
+
+impl TcpKeepalive {
+    /// Create a TCP keepalive configuration with the given time and interval.
+    pub(crate) fn new(time: Duration, interval: Duration) -> Self {
+        Self { time, interval }
+    }
+}

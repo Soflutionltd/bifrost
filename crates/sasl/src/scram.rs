@@ -80,10 +80,8 @@ pub enum ScramChannelBinding {
 }
 
 impl ScramChannelBinding {
-    /// The GS2 header string the consumer must send in client-first (so the
-    /// consumer and the `c=` computation never disagree). A PLUS consumer MUST
-    /// build client-first from this, not from a literal, or the desync this
-    /// type prevents re-enters at the consumer boundary.
+    /// The GS2 header used by the shared SASL client and the `c=` proof.
+    /// Both derive from this binding so they cannot disagree.
     pub fn gs2_header(&self) -> &'static str {
         match self {
             Self::None => "n,,",

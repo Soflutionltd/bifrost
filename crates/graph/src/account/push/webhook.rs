@@ -38,20 +38,18 @@ use super::dispatch::{ArmOutcome, finalize_push_outcomes};
 /// An id enters when a recreate installs it and leaves only when a DELETE of
 /// it succeeds (or a whole orphan teardown does) - never when a terminal
 /// renewal failure drops its group row, since that deletes nothing. Every
-/// write and the teardown snapshot happen under the `graph_subscriptions`
+/// write and the teardown snapshot happen under the registry's registration
 /// write lock, so the two never disagree. Never held across an await.
 pub(crate) type RecreatedSubscriptionIds =
     std::sync::Arc<std::sync::Mutex<HashMap<SubscriptionHandle, Vec<String>>>>;
 
 /// Lock the recreated-id ledger, tolerating poison: every write leaves the
 /// map consistent, so a panic elsewhere does not invalidate it.
+#[cfg(test)]
 pub(super) fn recreated_ids(
     account: &GraphAccount,
 ) -> std::sync::MutexGuard<'_, HashMap<SubscriptionHandle, Vec<String>>> {
-    account
-        .recreated_subscription_ids
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    account.webhooks.recreated_for_test_edit()
 }
 
 #[derive(Debug, Clone)]
@@ -320,7 +318,7 @@ async fn create_and_register(
     let mut subscriptions = Vec::new();
     for (resource, covered) in grouped {
         match create_subscription(
-            &account.client,
+            account.mailboxes.primary(),
             &resource,
             &endpoint.webhook_url,
             &endpoint.client_state,
@@ -371,31 +369,24 @@ async fn create_and_register(
         }
     };
 
-    let mut groups = account.graph_subscriptions.write().await;
-    // Checked under the write lock, and paired with `retire_all_graph_
-    // subscriptions` cancelling the token BEFORE it walks the groups: either
-    // this insert lands before the cancel (and the walk, which needs the read
-    // lock afterwards, sees and deletes it) or it sees the cancel here and
-    // rolls back. Without the pairing a `close()` that walked the groups while
-    // this task was mid-create would leave a registered group nobody retires.
-    if account.shutdown.is_cancelled() {
-        drop(groups);
-        roll_back_created(account, &subscriptions).await;
-        return Err(account_closed_error());
-    }
-    // The handle embeds the ids just created, so a reopened instance that
-    // inherits it as an orphan can still DELETE them.
+    // Mint before registration; the handle carries the original server ids.
     let handle = graph_handle(
         &token,
         own_binding(account).as_deref(),
         subscriptions.iter().map(|state| state.server_id.as_str()),
     );
-    groups.insert(handle.clone(), GraphSubscriptionGroup::live(subscriptions));
-    drop(groups);
-    // Wake a session parked without registrations after the committed insert.
-    account
-        .graph_topology
-        .send_modify(|n| *n = n.wrapping_add(1));
+    if let Err(group) = account
+        .webhooks
+        .register(
+            &account.shutdown,
+            handle.clone(),
+            GraphSubscriptionGroup::live(subscriptions),
+        )
+        .await
+    {
+        roll_back_created(account, &group.subscriptions).await;
+        return Err(account_closed_error());
+    }
     Ok((Some(handle), outcomes))
 }
 
@@ -410,7 +401,7 @@ async fn create_and_register(
 async fn roll_back_created(account: &GraphAccount, subscriptions: &[GraphSubscriptionState]) {
     for subscription in subscriptions {
         if let Err(cleanup_error) =
-            delete_subscription(&account.client, &subscription.server_id).await
+            delete_subscription(account.mailboxes.primary(), &subscription.server_id).await
         {
             tracing::warn!(
                 target: "bifrost_graph::webhooks",
@@ -448,29 +439,16 @@ async fn roll_back_created(account: &GraphAccount, subscriptions: &[GraphSubscri
 async fn unsubscribe_orphan(
     account: &GraphAccount,
     handle: &SubscriptionHandle,
-    mut server_ids: Vec<String>,
+    server_ids: Vec<String>,
 ) -> Result<(), AccountError> {
-    if let Some(recreated) = recreated_ids(account).get(handle) {
-        server_ids.extend(recreated.iter().cloned());
-    }
-    let owned: std::collections::HashSet<String> = account
-        .graph_subscriptions
-        .read()
-        .await
-        .values()
-        .flat_map(|group| {
-            group
-                .subscriptions
-                .iter()
-                .map(|state| state.server_id.clone())
-        })
-        .collect();
+    let server_ids = account.webhooks.orphan_ids(handle, server_ids);
+    let owned = account.webhooks.owned_ids().await;
     let mut first_error = None;
     for server_id in server_ids {
         if owned.contains(&server_id) {
             continue;
         }
-        if let Err(error) = delete_subscription(&account.client, &server_id).await {
+        if let Err(error) = delete_subscription(account.mailboxes.primary(), &server_id).await {
             first_error.get_or_insert_with(|| {
                 into_account_error(
                     error,
@@ -482,7 +460,7 @@ async fn unsubscribe_orphan(
     match first_error {
         Some(error) => Err(error),
         None => {
-            recreated_ids(account).remove(handle);
+            account.webhooks.forget_orphan(handle);
             Ok(())
         }
     }
@@ -495,7 +473,8 @@ async fn unsubscribe_orphan(
 /// prove the handle is its own.
 fn own_binding(account: &GraphAccount) -> Option<String> {
     account
-        .client
+        .mailboxes
+        .primary()
         .account_net()
         .map(|net| super::common::account_binding(net.account()))
 }
@@ -504,7 +483,7 @@ pub(super) async fn unsubscribe_graph(
     account: GraphAccount,
     handle: SubscriptionHandle,
 ) -> Result<(), AccountError> {
-    let Some(server_ids) = begin_graph_teardown(&account, &handle).await else {
+    let Some(server_ids) = account.webhooks.begin_teardown(&handle).await else {
         // Unknown to this instance: an orphan from an earlier connection (or
         // a handle already torn down here). The handle itself says what to
         // delete.
@@ -530,7 +509,7 @@ pub(super) async fn unsubscribe_graph(
         };
     };
     for server_id in server_ids {
-        delete_subscription(&account.client, &server_id)
+        delete_subscription(account.mailboxes.primary(), &server_id)
             .await
             .map_err(|e| {
                 into_account_error(
@@ -538,11 +517,9 @@ pub(super) async fn unsubscribe_graph(
                     GraphErrorContext::graph(AccountOperation::PushUnsubscribe),
                 )
             })?;
-        forget_deleted_subscription(&account, &handle, &server_id).await;
+        account.webhooks.forget_deleted(&handle, &server_id).await;
     }
-    account
-        .graph_topology
-        .send_modify(|n| *n = n.wrapping_add(1));
+    account.webhooks.changed();
     Ok(())
 }
 
@@ -566,20 +543,14 @@ pub(crate) async fn retire_all_graph_subscriptions(account: &GraphAccount) {
     // precedes this cancel (and is walked below) or is refused and rolled
     // back. `close()` relies on this being its only cancel.
     account.shutdown.cancel();
-    let handles: Vec<SubscriptionHandle> = account
-        .graph_subscriptions
-        .read()
-        .await
-        .keys()
-        .cloned()
-        .collect();
+    let handles = account.webhooks.handles().await;
     for handle in handles {
-        let Some(server_ids) = begin_graph_teardown(account, &handle).await else {
+        let Some(server_ids) = account.webhooks.begin_teardown(&handle).await else {
             continue;
         };
         for server_id in server_ids {
-            match delete_subscription(&account.client, &server_id).await {
-                Ok(()) => forget_deleted_subscription(account, &handle, &server_id).await,
+            match delete_subscription(account.mailboxes.primary(), &server_id).await {
+                Ok(()) => account.webhooks.forget_deleted(&handle, &server_id).await,
                 Err(error) => {
                     let error = into_account_error(
                         error,
@@ -596,14 +567,6 @@ pub(crate) async fn retire_all_graph_subscriptions(account: &GraphAccount) {
             }
         }
     }
-}
-
-async fn begin_graph_teardown(
-    account: &GraphAccount,
-    handle: &SubscriptionHandle,
-) -> Option<Vec<String>> {
-    let mut groups = account.graph_subscriptions.write().await;
-    mark_group_tearing_down(&mut groups, handle)
 }
 
 /// Condemn one handle's group and snapshot the server ids teardown must
@@ -630,43 +593,6 @@ pub(super) fn mark_group_tearing_down(
             .map(|state| state.server_id.clone())
             .collect(),
     )
-}
-
-/// Stop renewing one subscription whose renewal failed terminally, keeping
-/// its row so teardown can still DELETE it (see
-/// `GraphSubscriptionState::terminated`).
-pub(super) async fn mark_subscription_terminated(
-    account: &GraphAccount,
-    handle: &SubscriptionHandle,
-    server_id: &str,
-) {
-    let mut groups = account.graph_subscriptions.write().await;
-    if let Some(state) = groups.get_mut(handle).and_then(|group| {
-        group
-            .subscriptions
-            .iter_mut()
-            .find(|state| state.server_id == server_id)
-    }) {
-        state.terminated = true;
-    }
-}
-
-/// Forget one server subscription whose DELETE has succeeded: its group
-/// state and its entry in the recreated-id ledger.
-///
-/// Teardown's only way of forgetting a subscription, so on that path a row is
-/// never dropped without the DELETE that makes forgetting it honest. The other
-/// exits are not teardown: a recreate swaps a vanished row (and its ledger
-/// id) for its replacement, and a fully successful orphan teardown clears the
-/// handle's ledger entry, having deleted everything in it.
-async fn forget_deleted_subscription(
-    account: &GraphAccount,
-    handle: &SubscriptionHandle,
-    server_id: &str,
-) {
-    let mut groups = account.graph_subscriptions.write().await;
-    remove_subscription_from_groups(&mut groups, handle, server_id);
-    forget_recreated_id(&mut recreated_ids(account), handle, server_id);
 }
 
 /// Drop `server_id` from `handle`'s ledger entry, and the entry once empty.

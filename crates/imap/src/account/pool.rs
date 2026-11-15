@@ -790,7 +790,10 @@ pub(crate) async fn enable_qresync(
     }
     match conn.enable(&["QRESYNC"], timeout).await {
         Ok(_) => Ok(()),
-        Err(Error::No { .. } | Error::Bad { .. }) if conn.is_reusable() => Ok(()),
+        Err(
+            Error::ServerStatus(crate::error::ServerStatus::No { .. })
+            | Error::ServerStatus(crate::error::ServerStatus::Bad { .. }),
+        ) if conn.is_reusable() => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -872,7 +875,9 @@ impl PooledConn {
                     .selected = None;
                 Ok(())
             }
-            Err(Error::MissingCapability(_)) => self.replace_selected_member().await,
+            Err(Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(_))) => {
+                self.replace_selected_member().await
+            }
             Err(error) => Err(error),
         }
     }
@@ -1073,7 +1078,13 @@ mod tests {
         assert!(futures::poll!(dial.as_mut()).is_pending());
         started_rx.await.unwrap();
         pool.close().await;
-        assert!(matches!(dial.await, Err(Error::Closed { .. })));
+        assert!(matches!(
+            dial.await,
+            Err(Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            })
+        ));
         assert!(pool.inner.registry.lock().unwrap().is_empty());
         assert_eq!(pool.available_sessions(), 2);
     }
@@ -1128,7 +1139,13 @@ mod tests {
         pool.close().await;
         assert_eq!(started.elapsed(), Duration::ZERO);
         assert!(!conn.is_alive());
-        assert!(matches!(dial.await, Err(Error::Closed { .. })));
+        assert!(matches!(
+            dial.await,
+            Err(Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            })
+        ));
         assert_eq!(pool.available_sessions(), 2);
     }
 
@@ -1240,7 +1257,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::Timeout { .. }));
+        assert!(matches!(
+            error,
+            Error::Transport {
+                kind: crate::error::TransportFailure::Timeout,
+                ..
+            }
+        ));
         assert_eq!(started.elapsed(), timeout);
         conn.terminate().await;
     }
@@ -1490,15 +1513,24 @@ mod tests {
 
         assert!(matches!(
             pool.checkout_for_folder(&folder("INBOX")).await,
-            Err(Error::Closed { .. })
+            Err(Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            })
         ));
         assert!(matches!(
             pool.checkout_any().await,
-            Err(Error::Closed { .. })
+            Err(Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            })
         ));
         assert!(matches!(
             pool.acquire_fresh(Vec::new()).await,
-            Err(Error::Closed { .. })
+            Err(Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            })
         ));
         assert_eq!(idle_len(&pool), 0, "close drains the parked members");
     }
@@ -1528,7 +1560,10 @@ mod tests {
         assert_eq!(idle_len(&pool), 0, "close drains the parked members");
         assert!(matches!(
             pool.checkout_any().await,
-            Err(Error::Closed { .. })
+            Err(Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            })
         ));
     }
 
@@ -1647,7 +1682,13 @@ mod tests {
             .expect("close must release a blocked checkout rather than strand it")
             .unwrap();
         assert!(
-            matches!(outcome, Err(Error::Closed { .. })),
+            matches!(
+                outcome,
+                Err(Error::Transport {
+                    kind: crate::error::TransportFailure::Closed,
+                    ..
+                })
+            ),
             "a checkout released by close must refuse, not mint a session: {outcome:?}",
         );
         drop(held);
@@ -2024,7 +2065,13 @@ mod tests {
         assert!(futures::poll!(&mut dial).is_pending());
         rx.await.unwrap();
         pool.close().await;
-        assert!(matches!(dial.await, Err(Error::Closed { .. })));
+        assert!(matches!(
+            dial.await,
+            Err(Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            })
+        ));
         assert_eq!(*order.lock().unwrap(), ["transport", "lease"]);
     }
 
@@ -2078,8 +2125,20 @@ mod tests {
         assert!(futures::poll!(&mut fresh).is_pending());
         drop(peer);
         pool.close().await;
-        assert!(matches!(data.await, Err(Error::Closed { .. })));
-        assert!(matches!(fresh.await, Err(Error::Closed { .. })));
+        assert!(matches!(
+            data.await,
+            Err(Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            fresh.await,
+            Err(Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            })
+        ));
         assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 

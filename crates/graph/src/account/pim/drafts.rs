@@ -27,7 +27,7 @@ pub(crate) async fn draft_create(
         return Err(unsupported_account_error(AccountOperation::DraftCreate));
     }
     let message = message_from_draft_patch(&patch, true)?;
-    create_draft_message(&account.client, message).await
+    create_draft_message(account.mailboxes.primary(), message).await
 }
 
 pub(crate) async fn draft_update(
@@ -41,11 +41,12 @@ pub(crate) async fn draft_update(
     let message = message_from_draft_patch(&patch, false)?;
     let path = format!(
         "{}/messages/{}",
-        account.client.api_path_prefix(),
+        account.mailboxes.primary().api_path_prefix(),
         bifrost_net::url::encode_path_component(&draft.0)
     );
     account
-        .client
+        .mailboxes
+        .primary()
         .patch(
             Resource::Outlook,
             &path,
@@ -66,11 +67,12 @@ pub(crate) async fn draft_discard(
 ) -> Result<(), AccountError> {
     let path = format!(
         "{}/messages/{}",
-        account.client.api_path_prefix(),
+        account.mailboxes.primary().api_path_prefix(),
         bifrost_net::url::encode_path_component(&draft.0)
     );
     account
-        .client
+        .mailboxes
+        .primary()
         .delete(Resource::Outlook, &path, bifrost_net::ReplayPolicy::Never)
         .await
         .map_err(|e| {
@@ -84,7 +86,7 @@ pub(crate) async fn draft_send(
     account: GraphAccount,
     draft: DraftHandle,
 ) -> Result<ObjectId, AccountError> {
-    send_draft_message(&account.client, &draft).await?;
+    send_draft_message(account.mailboxes.primary(), &draft).await?;
     evict_draft_etag(&account, None, &draft).await;
     Ok(ObjectId(draft.0))
 }

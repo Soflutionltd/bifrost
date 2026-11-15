@@ -136,14 +136,18 @@ impl StatusItems {
         if let Self::Raw(text) = self
             && text.contains(['\r', '\n'])
         {
-            return Err(crate::Error::InvalidInput(
-                format!("{context} must not contain CR or LF").into(),
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    format!("{context} must not contain CR or LF").into(),
+                ),
             ));
         }
         let items = self.attributes()?;
         if items.is_empty() {
-            return Err(crate::Error::InvalidInput(
-                format!("{context} must contain at least one status data item").into(),
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    format!("{context} must contain at least one status data item").into(),
+                ),
             ));
         }
         for item in &items {
@@ -181,10 +185,12 @@ impl From<Vec<StatusAttribute>> for StatusItems {
 pub(crate) fn status_item_tokens(items: &str) -> Result<Vec<&str>, crate::Error> {
     let trimmed = items.trim();
     if trimmed.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            "STATUS item list must contain at least one data item \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "STATUS item list must contain at least one data item \
                  (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                .into(),
+                    .into(),
+            ),
         ));
     }
 
@@ -193,46 +199,54 @@ pub(crate) fn status_item_tokens(items: &str) -> Result<Vec<&str>, crate::Error>
             let inner = without_open
                 .strip_suffix(')')
                 .ok_or_else(|| {
-                    crate::Error::InvalidInput(
+                    crate::Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(
                         "STATUS item list must use balanced parentheses \
                              (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
                             .into(),
-                    )
+                    ))
                 })?
                 .trim();
             if inner.is_empty() {
-                return Err(crate::Error::InvalidInput(
-                    "STATUS item list must contain at least one data item \
+                return Err(crate::Error::LocalRefusal(
+                    crate::error::LocalRefusal::InvalidInput(
+                        "STATUS item list must contain at least one data item \
                          (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                        .into(),
+                            .into(),
+                    ),
                 ));
             }
             inner
         }
         (Some(_), None) | (None, Some(_)) => {
-            return Err(crate::Error::InvalidInput(
-                "STATUS item list must use balanced parentheses \
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    "STATUS item list must use balanced parentheses \
                      (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                    .into(),
+                        .into(),
+                ),
             ));
         }
         (None, None) => trimmed,
     };
 
     if body.contains('(') || body.contains(')') {
-        return Err(crate::Error::InvalidInput(
-            "STATUS item list must be flat and must not contain nested parentheses \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "STATUS item list must be flat and must not contain nested parentheses \
                  (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                .into(),
+                    .into(),
+            ),
         ));
     }
 
     let tokens: Vec<&str> = body.split_ascii_whitespace().collect();
     if tokens.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            "STATUS item list must contain at least one data item \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "STATUS item list must contain at least one data item \
                  (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                .into(),
+                    .into(),
+            ),
         ));
     }
     Ok(tokens)
@@ -255,17 +269,21 @@ pub(crate) fn list_status_return_option_items(option: &str) -> Option<Result<&st
         if let Some(items) = suffix.strip_suffix(')') {
             Ok(items)
         } else {
-            Err(crate::Error::InvalidInput(
-                "LIST-EXTENDED STATUS return option must be STATUS (<items>) \
+            Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    "LIST-EXTENDED STATUS return option must be STATUS (<items>) \
                  per RFC 5819 Section 4 / RFC 9051 Section 7"
-                    .into(),
+                        .into(),
+                ),
             ))
         }
     } else {
-        Err(crate::Error::InvalidInput(
-            "LIST-EXTENDED STATUS return option must be STATUS (<items>) \
+        Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                "LIST-EXTENDED STATUS return option must be STATUS (<items>) \
              per RFC 5819 Section 4 / RFC 9051 Section 7"
-                .into(),
+                    .into(),
+            ),
         ))
     })
 }

@@ -144,8 +144,8 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
      and the consumer got no sync at all, primary mail included.
      Any other error still fails the attach.
 5. `discover_memberships()` -> populate `CursorRegistry`
-   membership index for push-hint routing. `scope_covers_membership`
-   in `engine/attach.rs` is the engine-policy mapping (account-wide
+   membership index for push-hint routing. `CursorScope::covers`
+   in `bifrost-types` is the shared topology mapping (account-wide
    cursors cover every membership; folder-typed cursors cover the
    matching folder; query cursors cover the matching query). A `Mailbox`
    membership only matches a type-qualified folder or type cursor for Email,
@@ -789,14 +789,14 @@ remain unpublished until discovery and establishment succeed. Deferred inventory
 captures the current coverage fence after any schema reset, since the writer's
 reset advances that fence even when no producer has started.
 
-`engine/reattach.rs::establishment` owns the common stored-versus-fresh cursor
+`engine/establish.rs::establishment` owns the common stored-versus-fresh cursor
 decision, resume-hook classification, initial establishment and fresh-envelope
 validation. Attach defers inventory until subscription; recovery and reattach
 run fusion inline under the caller's captured fence. Writer resume reads retain
 reattach attempt ownership. Only freshly created Ready cursors need a new
 durable write. An unreadable stored row resets the whole account only during attach
 preflight; a replacement preserves it because it can still abort while the live
-account acknowledges newer work. `recovery::classify_envelope` uses explicit
+account acknowledges newer work. `engine_errors::classify_envelope` uses explicit
 fresh or stored provenance: fresh invalid envelopes are scoped terminal account
 contract failures, while stored invalid envelopes retain schema recovery. An
 enterprise user must not lose healthy checkpoints to repair a faulty producer.
@@ -1392,7 +1392,7 @@ safety checks; only the resume decision rejects ambiguous legacy markers.
 The rescan retires an incarnation only on a durable conclusion: the plan
 ran to completion, or the checkpoint store already carries its
 completion marker. A partition failure or a checkpoint-store read
-failure deliberately leaves the scope `Pending`, so those incarnations
+failure leaves the scope `Retrying`, so those incarnations
 stay eligible and return on an exponential delay (5s doubling to a 5min
 ceiling) rather than being filtered out for the rest of the attachment -
 otherwise one transient request would cost that scope its whole backfill
@@ -1413,7 +1413,7 @@ completing the scope - neither asking for windows forever nor writing a
 sentinel over ground nothing proved. The same holds for every plan, not only
 `OpenPages`: `run_partition` reports a silently ended stream as
 `complete: false`, so a fixed plan (Full, time windows, UID ranges) no longer
-writes its completion sentinel over it, and the scope stays Pending. Both
+writes its completion sentinel over it, and the scope stays eligible for retry. Both
 inventory front ends surface the silent end as a typed `SyncEvent::Warning`
 of kind `WarningKind::InventoryEndedUnannounced`
 (`inventory_walk::unannounced_end_warning`); the fusion walk establishes no
@@ -1423,10 +1423,10 @@ change stream rather than in a log (ruled 2026-10-04). Producers that emit `Sync
 streams get the declaration from `lift_complete_walk`, the one place that
 still infers it (see `reference/types.md`).
 
-Resume: the `BackfillRegistry` (`BackfillState::Pending/Running/Completed`)
+Resume: the `BackfillRegistry` (`BackfillState`)
 is an engine-wide read-only projection of each account's `BackfillScan`.
 The scan owns one record per `(CursorScope, ScopeIncarnation)`, with exclusive
-fresh, running, parked, held, failed and settled phases. Retry history and loss
+fresh, running, parked, failed and settled phases. Retry history and loss
 evidence survive holds and parked partitions in that record. One retain removes
 all departed incarnations, including settled ones. Fusion's first-sighting scope
 history remains attachment-wide so re-establishment cannot skip inventory again.
@@ -1915,7 +1915,7 @@ Unvouchable` covers what is left: a marker whose receipt names some other
 partition, and the no-publication case above. Either way nothing is touched,
 since writing it would land a completion no ledger can vouch for and discarding
 on it would delete one an earlier attachment earned. All of these ride
-`AckPersistOutcome::Withheld`: the consumer's acknowledgement succeeds, and only
+`AckOutcome::Withheld(CompletionRefusal)`: the consumer's acknowledgement succeeds, and only
 the durable row is refused.
 
 The same instance segment bounds the ledger's own watermarks. `claim_checkpoint`
@@ -2762,7 +2762,7 @@ and deferred inventory fusion. Admission for a change drive happens before
 `CursorRegistry::with_drive`, so a queued task never owns a scope lease, and
 the permit is released before recovery handoff and cadence sleeps.
 
-`admit` returns `Error::Other` when its lane is at capacity - the incoming
+`admit` returns `Error::Admission(AdmissionFailure::LaneFull { .. })` when its lane is at capacity - the incoming
 request is refused rather than displacing an older waiter. Repeating work paths
 treat that as transient: the poll loop backs off one cadence step and re-enters
 rather than retiring the scope, and the push sweep skips that scope only, which
@@ -3384,7 +3384,7 @@ because a key with no open entry is never planned again. A result for a key
 re-raised as a fresh occurrence meanwhile charges the new occurrence - an
 over-charge bounded by the results in flight, which is the conservative
 direction. A `Stalled` replacement is charged through `charge_lineage` with a
-lineage `ack.rs` resolved via `open_lineage` BEFORE the swap, since the swap
+lineage the writer's repair handler (`engine/writer/repair.rs`) resolved via `open_lineage` BEFORE the swap, since the swap
 discharges the key it came from.
 Progress is judged across extent, granularity, proof gained and repair
 authority, not extent equality: turning one opaque region into three addressable
@@ -3693,8 +3693,10 @@ domains and repair targets. Its enum encoders, including nested kinds and text
 visibility, are exhaustive in the defining crate. Its decoders retain all
 historical minimum-version checks. Sync composes these with ledger-owned
 entries, barriers, proofs, policy, audit and budget sections through the shared
-`wire::Reader`; no shared enum encoder has a fallback panic. The existing bytes,
-ledger version 12 and readable window 3 through 12 are unchanged. Future shared
+`wire::Reader`; no shared enum encoder has a fallback panic. Version 13 adds
+Owner error scope tag 15 (PrincipalId), keeping tags and layouts of older rows
+readable in the window 3 through 13. Historical Mailbox tag 2 remains a container;
+ambiguous old ids are never guessed into owners. Future shared
 tag additions advance `wire::ledger::VOCABULARY_VERSION` beyond the enclosing
 ledger version; a compile-time assertion requires sync to adopt that version.
 Shared malformed-input and schema errors preserve sync's existing classifications.
@@ -3831,13 +3833,49 @@ The read-back report preserves requested ids and partial progress through a
 stream termination. The engine checks envelope and hydrated identity, then
 requires FlagsOnly for flags and Metadata for moves. The account's pure
 `flag_target` judges flag state in its own write vocabulary. Move observations
-check destination membership. Destroy treats presence as unsatisfied and
+check destination membership with `MembershipScope::same_container`, including
+the explicit Folder/Mailbox bridge and excluding Owner tags. Destroy treats
+presence as unsatisfied and
 explicit `NotFound(Message)` as satisfied: bulk destroy targets mail messages.
 A missing mailbox, account, or any other resource kind does not prove the
 message absent and remains unresolved. Missing, failed, incomplete, wrong-projection,
 and indeterminate observations remain unresolved. Equal duplicates agree;
 disagreeing duplicates remain unresolved even if later observations agree.
 Per-item engine failures are retained alongside the observations.
+
+## Structured degradation and acknowledgement outcomes
+
+An enterprise consumer must distinguish an unavailable share from lost grants,
+barrier debt from push downtime, and an accepted acknowledgement from an actual
+checkpoint advance. Human diagnostic text is not a discriminator.
+
+`SyncEngine::ack` returns `AckOutcome::Durable` or
+`AckOutcome::Withheld(CompletionRefusal::{OpenDebt, WalkNotWhole, Unvouchable})`.
+Prior-attachment backfill rows are `Unvouchable`. A checkpoint-free repair ack
+is `RepairAccepted`: it acknowledges repair delivery without promising a
+checkpoint write. Repair resolution and acknowledgement can arrive in either
+order; the writer combines them before discharging debt. Withholding preserves the existing
+retirement and ledger rules; it does not announce a durable checkpoint.
+`Error::AckRejected(AckRejection)` identifies unknown publications, routing
+mismatches and invalid envelopes before writing. `Error::AckStore` preserves the
+store's original error after a valid ack, distinct from caller rejection.
+
+Scheduler pressure is `AdmissionFailure::LaneFull { priority, capacity }`.
+Forgotten account budgets, poisoned budget locks and closed pools retain distinct
+variants through the scheduler's response channel. The wire-start gate retries
+only full lanes; permanent admission failures stop the drive. Conflicting caller
+versions retain their target id, and an inventory `Done` for the wrong scope
+retains expected and actual scopes.
+
+Engine advisories use `WarningKind::Engine(EngineNotice)` and preserve the
+originating `AccountError` where one exists. `ChangeDelivery::publish_warning`
+fills an absent warning scope from its `EventScope`, preserving a producer's
+more specific scope. IMAP strategy warnings retain `StrategyDowngrade`.
+`BackfillRegistry` distinguishes never-started `Pending`, `Retrying`,
+`Throttled`, `OperatorBlocked`, `RestartingAfterLoss`, `Running` and `Completed`.
+These are live scheduling observations; durable resume remains store-owned.
+A failed writer barrier query stops the walk as a retryable observation failure;
+it cannot claim `OperatorBlocked` without an observed operator barrier.
 
 ## Error / Terminated / Warning
 
@@ -3846,7 +3884,7 @@ Engine-side `Error` (distinct from `bifrost-types::AccountError`):
 - `AccountNotAttached(AccountId)`
 - `AccountAlreadyAttached(AccountId)`
 - `OpenFailed(#[source] bifrost_types::AccountError)`
-- `EstablishCursorFailed(String)`
+- `EstablishCursorFailed(EstablishFailure)`
 - `EstablishCursorTerminated(#[source] bifrost_types::AccountError)`
 - `CheckpointStore(String)`
 - `SchemaIncompatible`
@@ -3966,7 +4004,7 @@ a `Warning::OperatorAttentionNeeded` carrying the protocol-supplied
 reason. The reason rides on the warning's free-form fields; the
 `PauseReason` enum is bounded.
 
-`crate::recovery::ThrottleBucket` is engine-wide (one per
+`crate::throttle::ThrottleBucket` is engine-wide (one per
 `SyncEngine`, shared by every slot): deadlines keyed by
 `ThrottleKey::{Mailbox, Account, Budget}`. `Budget` is the only key that
 crosses accounts. `ThrottleScope::CurrentOperation` is a per-call hint and
@@ -3985,7 +4023,7 @@ the deferred-inventory worker for the scope, the mutation campaign for its
 unresolved targets plus a move's destination and supplied source
 (`ThrottleWork::Objects`, `ThrottleWork::Membership`), and the read-back for
 every id in `unresolved_readback_ids`. Recovery-driven establishment
-(`run_establish` in `engine/reattach.rs`, for scope recovery and replacement
+(`run_establish` in `engine/establish.rs`, for scope recovery and replacement
 accounts) honours account-wide holds and the current account's declarations
 for `ThrottleWork::Scope`. Before every attempt, including the first, it
 waits for both those holds and the previous failure's local deadline.
@@ -4010,10 +4048,10 @@ holds from replacement-subscription unwind failures, both account-close
 failure paths, and best-effort membership refresh failures; cleanup keeps the
 original result and the longest local deadline, and membership refresh stays
 best-effort. The wait is the longest pending
-deadline across the account-wide keys and the declared ones. `Mailbox` and
+deadline across the account-wide keys and the declared ones. `Owner`, `Folder` and
 `Budget` keys are never part of the account-wide wait: they hold one
 mailbox's work, and reach it only by declaration. IMAP declares its
-`ThrottleKey::Mailbox` for a folder scope, a folder's objects and a folder
+`ThrottleKey::Folder` for a folder scope, a folder's objects and a folder
 membership; Graph declares the Outlook mailbox `ThrottleKey::Budget` each
 scope, object and destination folder is routed to; every other crate
 declares nothing and waits on account-wide holds only.
@@ -4106,18 +4144,13 @@ recording the account key as well would pause every sibling mailbox the
 budget exists to keep running. A stamped budget with no hint is held for the
 same one-second fallback the observer sleeps, so a sibling declaring it is
 paced alike. An unstamped hintless error records nothing, except on a
-lifted `Mailbox` key, which is as narrow as a budget and gets the same
-fallback: IMAP's folder-scoped `[LIMIT]` carries no hint, and without it the
-per-folder hold was never recorded at all. Otherwise
-both recorders resolve the key from the
-identities the classified error actually carries
-(the error's mailbox scope). The mailbox identity is
-read in BOTH shapes it is produced in - `ErrorScope::Mailbox { id }` and
-`ErrorScope::Cursor(CursorScope::Folder(id))` - because every production folder
-producer builds the latter, via `with_folder_scope`, and IMAP's
-`mailbox_throttle` (the only production emitter of `ThrottleScope::Mailbox`)
-fires for either. Reading only the former made `ThrottleKey::Mailbox`
-unreachable in production while its test passed against the synthetic shape.
+lifted narrow key, which receives the same fallback: IMAP's folder-scoped
+`[LIMIT]` carries no hint, so it records `ThrottleKey::Folder` with the original
+FolderId. `ErrorScope::Mailbox` uses the explicit FolderId conversion and
+`ErrorScope::Owner` records a PrincipalId owner key. `AccountError::throttle_holds`
+owns this projection, and both recorder paths consume it. Principal and container key
+spaces remain distinct even for equal strings; `FolderType` errors preserve
+their FolderId just like `Folder` errors.
 A mailbox throttle carrying no mailbox identity at all remains local to the
 current operation: degrading it to the account key would widen a per-mailbox 429
 into an account-wide stall. There is no tenant- or provider-wide scope: a
@@ -4179,7 +4212,45 @@ escalate per-scope (account continues for sibling scopes);
 `Warning` is a re-export of `bifrost_types::Warning` and is
 outside the error model (advisory only, never aborts streams).
 
+## Output and writer ownership
+
+`delivery` owns the consumer output port independently of polling. Backfill,
+repair, live changes and push publish through the same gate. Its receiver
+numbering, publication stamps, departure sweeps and lag treatment retain one
+lock and one publication ledger. `multiplexer::lifecycle::LifecycleWorker`
+owns lifecycle observation; the multiplexer holds its abort-on-drop guard so
+extracting the worker does not let a blocked reopen send survive teardown.
+Membership projection lives in `cursor::membership`, beside the remembered
+creation model and deletion reach it reads.
+
+`engine::writer` owns the serial durable-state protocol and its typed
+`WriterHandle`. `Writer` loads the authoritative ledger and dispatches to one
+method per operation. `ProvisionalRows` owns reattach row marks;
+`RepairPairing` owns pending resolutions and acknowledgements. Acknowledgement,
+reset and operator handlers preserve their existing store and publication
+ordering. Unavailable-ledger replies live with `WriterRequest`, including the
+retention of offered debt and the cursor-only reads that can still proceed.
+Inventory and repair lanes ask the handle for operations rather than building
+request variants and reply channels. Handle replies preserve channel loss
+separately from a store refusal where inventory uses those answers differently.
+Worker drain deadlines and writer-last ordering live in `engine::teardown`.
+
 ## File map
+
+Recovery has two ownership layers. `recovery/plan.rs` projects provider advice
+and records stream-failure effects; `engine/recovery/` applies the resulting
+engine directives. `engine/supervisor.rs` owns `ReopenRequest` and the serial
+listener, including parked repair and provider lifecycle requests. The
+multiplexer and push lanes only produce these requests. Shared engine-authored
+account errors live in `engine_errors.rs`, including the control wait error;
+throttle deadlines and declarations live in `throttle.rs`.
+
+Replacement open and cutover live in `engine/reattach/transaction.rs`. Its guard
+owns provisional writer compensation, replacement subscriptions and outstanding
+close obligations in `engine/reattach/guard.rs`. `engine/establish.rs` is shared
+by attach, scoped recovery and replacement establishment. These module boundaries
+preserve the existing request order, reopen-lock spans, captured fences and
+construction-time cleanup ownership.
 
 ```
 crates/sync/src/
@@ -4214,8 +4285,7 @@ crates/sync/src/
                           // the only state it owns
     attach.rs             // attach / attach_inner / attach_opened,
                           // discover_scopes(_from), establish_one,
-                          // persist_cursor, scope_covers_membership,
-                          // link_discovered_memberships,
+                          // persist_cursor, link_discovered_memberships,
                           // wait_for_real_subscriber,
                           // run_deferred_inventory_establishment
     backfill.rs           // run_backfill_orchestrator + BackfillWiring;
@@ -4226,16 +4296,34 @@ crates/sync/src/
                           // open_pages_resume,
                           // backfill_complete_recorded,
                           // emit_backfill_complete
-    ack.rs                // ack_writer (the account's single durable
-                          // writer) + WriterHandle; persist_ack_request,
-                          // apply_repair_resolutions, apply_replacement;
-                          // take_ack_writer / await_worker_until
+    writer/
+      mod.rs              // Writer state owner, initial ledger load and serial dispatch
+      protocol.rs         // private WriterRequest / AckRequest / OperatorDecision;
+                          // request-owned replies when the ledger is unavailable
+      handle.rs           // typed WriterHandle; standalone spawn and lane operations
+      acknowledge.rs      // acknowledgement persistence and completion judgement
+      provisional.rs      // ProvisionalRows: reattach attempt ownership and live reads
+      repair.rs           // RepairPairing: recovered proofs paired with consumer acks
+      ledger_ops.rs       // debt, barriers, operator policy and ledger-only writes
+      reset.rs            // scope/account reset and backfill progress discard
+      tests.rs            // existing writer contract tests
+    teardown.rs           // take_ack_writer / await_worker_until / await_ack_writer_until
                           // (detach's writer-last ordering)
-    reattach.rs           // RecoveryContext + handle_account_error;
-                          // handle_engine_directive, restart/disable/
-                          // re-establish scope, reattach_account,
-                          // restart_account, run_establish,
-                          // accepted_push_scopes, log_open_skips
+    supervisor.rs         // ReopenRequest + the serial account listener;
+                          // lifecycle and parked-repair request dispatch
+    recovery/
+      mod.rs              // RecoveryContext, RecoveryFollowUp, recovery notices
+      dispatch.rs         // plan projection and engine-directive arms
+      parked.rs           // DeferredScopeRepairs, DeferredSchemaReset, ResetCount
+      pacing.rs           // RepairPacing, retry and cumulative wait budgets
+      schema.rs           // account schema reset and owed establishment
+      scoped.rs           // scope restart, establish-if-absent and disable
+    reattach/
+      mod.rs              // staged replacement module boundary
+      transaction.rs      // replacement open, cutover and account restart
+      guard.rs            // ReattachGuard, ReattachAttempt, provisional rows
+                          // and cancellation cleanup obligations
+    establish.rs          // common stored/fresh cursor decision and run_establish
     bulk.rs               // bulk_set_flags / bulk_move / bulk_move_from
                           // / bulk_destroy + run_bulk_pipeline;
                           // classify_item_outcome, MutationBucket,
@@ -4253,23 +4341,27 @@ crates/sync/src/
   types.rs                // EngineConfig, MultiplexerConfig,
                           // BackfillConfig, MutationConfig, PushConfig,
                           // SchedulerConfig, AccountSlot, WorkerTask
-  recovery.rs             // plan_recovery + RecoveryPlan dispatch;
-                          // ThrottleBucket (engine-wide, monotonic
-                          // tokio::time::Instant deadlines) +
-                          // resolve_throttle_key / record_throttle /
-                          // account_throttle_wait;
-                          // retry_delay; restart_scope_error;
-                          // cursor_decode_failure translator
+  recovery/
+    mod.rs                // shared recovery dispatch entry points
+    plan.rs               // plan_recovery + RecoveryPlan, failure effects,
+                          // retry/reconcile delay and shared timing constants
+    plan_tests.rs         // existing plan and dispatch contract tests
+  throttle.rs             // ThrottleBucket, monotonic deadlines and declarations
+  throttle_tests.rs       // existing bucket and declaration tests
+  engine_errors.rs        // every shared engine-authored AccountError constructor;
+                          // stored/fresh envelope classification, control wait end
+  engine_errors_tests.rs  // existing error and envelope classification tests
+  delivery/
+    mod.rs                // ChangeDelivery, ChangesReceiver, PagePublisher,
+                          // EventScope and MultiplexerEvent; atomic send/stamp,
+                          // subscribe/number and departure/sweep under one mutex
+    tests.rs              // receiver membership, lag and backfill delivery contracts
   multiplexer/
-    mod.rs                // Multiplexer::run; ReopenRequest;
-                          // MultiplexerEvent { scope, event, checkpoint };
-                          // lifecycle_reopen wiring; ChangeDelivery -
-                          // the change broadcast plus the numbering of
-                          // the receivers handed out on it, under one
-                          // mutex so send+stamp, subscribe+number and
-                          // unregister+sweep are each atomic
-    changes.rs            // drive_changes_stream + ChangesEvent +
-                          // AckRequest (broadcast-then-consumer-ack)
+    mod.rs                // Multiplexer::run, per-scope polling and scope tokens
+    lifecycle.rs          // LifecycleWorker, reconnect policy and ordered transitions
+    lifecycle_tests.rs    // lifecycle and topology projection contract tests
+    tests.rs              // polling, cadence and token ownership contract tests
+    changes.rs            // drive_changes_stream + ChangesEvent
     fusion.rs             // InventoryFusion::run_with_broadcast
     poll.rs               // adaptive cadence helper
   backfill/
@@ -4297,6 +4389,7 @@ crates/sync/src/
                           // through Account::flag_target
   cursor/
     mod.rs                // CursorRegistry + membership index
+    membership.rs         // membership projection through remembered cursor models
     coverage.rs           // PendingCoverage: the publication ledger -
                           // claims, boundary registrations, supersession,
                           // fences, watermarks - and, on those same
@@ -4347,8 +4440,8 @@ lanes and protocol push lanes. `BackfillBound::wake` has
 no in-engine caller - teardown pulses the slot's
 `PendingCoverage::wake_capacity` directly, having the coverage and no gate - and
 is kept as published surface rather than removed, the same standing as
-`SyncControl::record_checkpoint`. `ChangeDelivery` is public from `multiplexer`
-(`new`, `sender`, `publish_backfill`, `subscribe`, `min_live`). `PendingCoverage`
+`SyncControl::record_checkpoint`. `ChangeDelivery` is public from `delivery`
+(`new`, `observe`, `publish_backfill`, `subscribe`, `min_live`). `PendingCoverage`
 gained the following methods (receiver membership mutators are now crate-private): `mark_delivered`, `mark_received`
 (the receipt bound's permit), `receiver_joined` and `receiver_departed` (the
 live numbered set the slowest-reader rule is evaluated against),
@@ -4361,10 +4454,15 @@ guarantee. `PublicationReceipt` carries a crate-private
 `walk_watermark: Option<UndeliveredMark>`; consumers retain the opaque token through
 its codec rather than constructing receipts. Receipt-minting methods, including
 `register_walk_marker`, are crate-private. `BackfillConfig` gained `lane_capacity`, and
-`WriterRequest` a `DiscardBackfillProgress` variant. The enum is public and
-re-exported as `bifrost_sync::multiplexer::WriterRequest`; its variants are
-part of the published surface. Everything else the lane work touched is
-`pub(crate)` or narrower.
+the private writer protocol gained `DiscardBackfillProgress`.
+`engine::writer::WriterHandle` is the public opaque endpoint passed to
+`PagePublisher` and `run_repair_pass`. Standalone producers can start the same
+single writer with `WriterHandle::spawn`; engine attachments own its worker
+and hand typed endpoints to their lanes. Standalone consumers acknowledge
+through `WriterHandle::ack`, inspect authoritative debt through `get_ledger`,
+and preserve debt on direct backfill writes through `persist_backfill`.
+The raw request protocol is
+crate-private, including acknowledgement and operator messages.
 
 ## Caller versions on PIM mutations
 
@@ -4579,7 +4677,7 @@ a lifecycle epoch and an account generation cannot be substituted at a call.
 | `types::AccountGeneration` | `Incarnation` supplies initial and replacement identities. Recovery requests, push health, lifecycle watches and reconciler holds retain the installed connection's identity. |
 | `engine::ReattachAttempt` | `ReattachGuard` issues process-wide provisional-row ownership ids; writer claims, commit and abort carry them unchanged. |
 | `engine::ResetCount` | `DeferredSchemaReset` counts committed clears and snapshots that count when parking an owed reset. |
-| `multiplexer::ReceiverSequence` | `ChangeDelivery` numbers admitted subscribers. Coverage records delivery and readership against those numbers without issuing them. |
+| `delivery::ReceiverSequence` | `ChangeDelivery` numbers admitted subscribers. Coverage records delivery and readership against those numbers without issuing them. |
 | `backfill::scope_walk::WalkTotal` | `ScopeWalkDriver` folds observed partition counts; the total supplies completion progress with the established one-past-count marker convention and exposes `count` for reporting. |
 
 Internal `ScopeTokenGeneration`, `PushTopologyGeneration` and

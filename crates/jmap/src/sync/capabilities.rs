@@ -18,10 +18,6 @@ pub(super) fn max_objects_in_get(session: &Session) -> usize {
     session.object_limits().max_objects_in_get
 }
 
-pub(super) fn max_objects_in_set(session: &Session) -> usize {
-    set_batch_size(session.object_limits().max_objects_in_set)
-}
-
 /// RFC 8620 section 2 requires maxSizeUpload. Zero permits only empty files;
 /// the suggested minimum is not a mandatory lower bound.
 pub(crate) fn upload_size_limit(session: &Session) -> Result<usize, AccountError> {

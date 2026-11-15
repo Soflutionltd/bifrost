@@ -10,7 +10,7 @@
 //! protocol.
 
 use crate::cursor::ProtocolKind;
-use crate::ids::{MailboxId, ObjectId};
+use crate::ids::{ObjectId, PrincipalId};
 use crate::page::SkippedScope;
 
 /// Which namespace a container lives in.
@@ -281,7 +281,7 @@ pub struct Container {
     /// the IMAP other-user / shared-namespace owner. `None` for
     /// `Personal` and `Public` containers (a public folder has no owning
     /// principal).
-    pub owner: Option<MailboxId>,
+    pub owner: Option<PrincipalId>,
     /// The container's native id inside the OWNER's own namespace, never
     /// the foreign-encoded form `native_id` carries. Graph: the bare
     /// mail-folder id. JMAP: the bare mailbox id. IMAP: the full mailbox
@@ -393,7 +393,7 @@ impl Container {
 
     /// Set the owning mailbox / principal for a shared container.
     #[must_use]
-    pub fn with_owner(mut self, owner: Option<MailboxId>) -> Self {
+    pub fn with_owner(mut self, owner: Option<PrincipalId>) -> Self {
         self.owner = owner;
         self
     }
@@ -617,11 +617,11 @@ mod tests {
             None,
         )
         .with_namespace(ContainerNamespace::Shared)
-        .with_owner(Some(MailboxId("shared@contoso.com".to_string())))
+        .with_owner(Some(PrincipalId("shared@contoso.com".to_string())))
         .with_owner_local_id(Some("AAMk".to_string()))
         .with_content_class(Some(ContainerContentClass::Mail));
         assert_eq!(c.namespace, ContainerNamespace::Shared);
-        assert_eq!(c.owner, Some(MailboxId("shared@contoso.com".to_string())));
+        assert_eq!(c.owner, Some(PrincipalId("shared@contoso.com".to_string())));
         // `owner_local_id` is the bare owner-namespace id, never the
         // foreign-encoded `native_id`.
         assert_eq!(c.owner_local_id.as_deref(), Some("AAMk"));

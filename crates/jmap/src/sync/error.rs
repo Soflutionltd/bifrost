@@ -337,6 +337,21 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         // re-authorize, which cannot add an account to the session. Not
         // `CapabilityChanged -> RestartAccount` either: that reopen loop
         // would re-run discovery against the same session forever.
+        crate::Error::AccountCapability {
+            account_id,
+            capability,
+        } => build(
+            AccountErrorKind::Unsupported(ctx.operation),
+            Cause::Request(RequestCause::Unsupported {
+                operation: ctx.operation,
+            }),
+            &ctx,
+        )
+        .text(DiagnosticText::support_only(format!(
+            "account {account_id} does not serve capability {capability}"
+        )))
+        .try_build()
+        .expect("valid account error classification"),
         crate::Error::NoPrimaryAccount { capability } => build(
             AccountErrorKind::Unsupported(ctx.operation),
             Cause::Request(RequestCause::Unsupported {
@@ -579,7 +594,7 @@ pub(crate) fn search_result_set_superseded(operation: AccountOperation) -> Accou
 /// foreign-account routing table. Consumers receive these ids from foreign
 /// membership ownership, so an unknown id is a malformed request.
 #[must_use]
-pub(crate) fn send_as_unknown_account(mailbox: &bifrost_types::MailboxId) -> AccountError {
+pub(crate) fn send_as_unknown_account(mailbox: &bifrost_types::PrincipalId) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
         Cause::Request(RequestCause::InvalidArgument {
@@ -969,7 +984,7 @@ pub(crate) fn unregistered_foreign_scope(
 pub(crate) fn shared_scope_error(
     err: crate::Error,
     scope: &CursorScope,
-    owner: Option<&bifrost_types::MailboxId>,
+    owner: Option<&bifrost_types::PrincipalId>,
     ctx: JmapErrorContext,
 ) -> AccountError {
     into_account_error(err, ctx).revoke_foreign_scope(scope.clone(), owner)
@@ -1513,91 +1528,23 @@ fn convert_problem(
                 detail: Some(DiagnosticText::support_only(details.to_string())),
             }),
         ),
-        (ProblemType::Other(_), Some(400 | 422)) => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(details.to_string()),
-            }),
-        ),
-        (ProblemType::Other(_), Some(401)) => (
-            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-            Cause::Auth(AuthCause::ReauthorizationRequired),
-        ),
-        (ProblemType::Other(_), Some(403)) => (
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied {
-                resource: ctx.scope().as_ref().and_then(ErrorScope::resource),
-            }),
-        ),
-        (ProblemType::Other(_), Some(404)) => {
-            if let Some(resource) = ctx.scope().as_ref().and_then(ErrorScope::resource) {
-                let id = ctx
-                    .scope()
-                    .as_ref()
-                    .and_then(ErrorScope::object_id)
-                    .map(str::to_owned);
-                (
-                    AccountErrorKind::NotFound(resource),
-                    Cause::Request(RequestCause::NotFound { what: resource, id }),
-                )
-            } else {
-                // Scope-less HTTP 404. The three scope-less not-found
-                // shapes in this crate are deliberately distinct by wire
-                // source, not unified, because each preserves a different
-                // diagnostic signal while all three resolve terminal:
-                //   - a bare HTTP 404 (here) is a transport-level
-                //     resource refusal -> `Server(Error{404})` ->
-                //     `ProviderRefused`;
-                //   - a JMAP `notFound` SetError without a resource scope
-                //     -> `Protocol(Unknown)` -> `UnknownPermanent`
-                //     (`set_error_to_account_error`);
-                //   - a local "id absent from response" shape error ->
-                //     `Protocol(MissingField)` ->
-                //     `ProviderContractViolation` (`convert_id_not_found`).
-                // The message keys differ so support exports can tell the
-                // three apart; recovery is terminal in every case, so the
-                // engine behaves identically.
-                (
-                    AccountErrorKind::Server(ServerErrorKind::Error { status: Some(404) }),
-                    Cause::Server(ServerCause::Error { status: Some(404) }),
-                )
-            }
+        (ProblemType::Other(_), Some(status)) => {
+            let class = bifrost_net::classify_status(
+                status,
+                ctx.scope().as_ref(),
+                retry_hint,
+                bifrost_net::StatusPolicy::default(),
+            );
+            (class.kind, class.cause)
         }
-        (ProblemType::Other(_), Some(409)) => (
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
-        ),
-        (ProblemType::Other(_), Some(410))
-            if matches!(ctx.scope(), Some(ErrorScope::Cursor(_))) =>
-        {
-            (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
-            )
-        }
-        (ProblemType::Other(_), Some(429)) => (
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint }),
-        ),
-        (ProblemType::Other(_), Some(status)) if (500..=599).contains(&status) => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint }),
-        ),
-        (ProblemType::Other(_), Some(status)) => (
-            AccountErrorKind::Server(ServerErrorKind::Error {
-                status: Some(status),
-            }),
-            Cause::Server(ServerCause::Error {
-                status: Some(status),
-            }),
-        ),
         (ProblemType::Other(code), None) => (
             AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
             Cause::Wire(WireCause::Jmap(JmapMethod::Unknown { code: code.clone() })),
         ),
     };
 
-    let mut builder = build_with(&ctx, kind, primary)
+    let class = bifrost_net::StatusClass::new(kind, primary);
+    let mut builder = build_with(&ctx, class.kind, class.cause)
         .push_cause(Cause::Attempt(AttemptCause::new(
             TransmissionState::Acknowledged,
         )))
@@ -1617,12 +1564,8 @@ fn convert_problem(
     if let Some(limit) = details.limit() {
         builder = builder.text(DiagnosticText::support_only(format!("limit: {limit}")));
     }
-    if matches!(details.error(), ProblemType::JMAP(JMAPError::Limit)) {
-        builder = builder.throttle_scope(ThrottleScope::Account);
-    }
-    if matches!(details.error(), ProblemType::Other(_)) && matches!(status_u16, Some(429)) {
-        builder = builder.throttle_scope(ThrottleScope::Account);
-    }
+    builder = bifrost_net::HttpErrorPolicy::from(Some(ThrottleScope::Account))
+        .apply_throttle(builder, class.throttles);
     builder
         .try_build()
         .expect("valid account error classification")
@@ -2273,6 +2216,39 @@ mod tests {
     }
 
     #[test]
+    fn shared_http_status_problem_and_plain_body_agree() {
+        for status in [
+            408, 400, 404, 409, 410, 412, 413, 422, 429, 500, 502, 503, 504, 507, 599,
+        ] {
+            let translate = |body| {
+                into_account_error(
+                    from_net(bifrost_net::Error::Status {
+                        code: reqwest::StatusCode::from_u16(status).unwrap(),
+                        headers: retry_after_headers("17"),
+                        body: bytes::Bytes::from_static(body),
+                    }),
+                    JmapErrorContext::new(AccountOperation::SyncChanges),
+                )
+            };
+            let problem = translate(br#"{"type":"about:blank"}"#);
+            let plain = translate(b"plain failure");
+            assert_eq!(problem.kind(), plain.kind(), "status {status}");
+            assert_eq!(problem.recovery(), plain.recovery(), "status {status}");
+            assert_eq!(
+                problem.chain().iter().next(),
+                plain.chain().iter().next(),
+                "status {status}"
+            );
+            assert_eq!(
+                problem.telemetry_fields().throttle_scope,
+                plain.telemetry_fields().throttle_scope
+            );
+            assert!(problem.chain().iter().any(|cause| matches!(cause,
+                Cause::Wire(WireCause::Jmap(JmapMethod::Unknown { code })) if code == "about:blank")));
+        }
+    }
+
+    #[test]
     fn oversized_upload_is_a_local_malformed_request() {
         let error = into_account_error(
             crate::Error::UploadSizeLimit { max: 3, size: 4 },
@@ -2525,7 +2501,7 @@ mod tests {
 
     #[test]
     fn send_as_unknown_account_is_malformed() {
-        let err = send_as_unknown_account(&bifrost_types::MailboxId("foreign-id".to_string()));
+        let err = send_as_unknown_account(&bifrost_types::PrincipalId("foreign-id".to_string()));
         assert_eq!(
             err.kind(),
             &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
@@ -2648,9 +2624,9 @@ mod tests {
 
     #[test]
     fn shared_account_permission_loss_derives_disable_scope() {
-        use bifrost_types::{EngineDirective, MailboxId};
+        use bifrost_types::{EngineDirective, PrincipalId};
         let scope = CursorScope::Folder(super::super::foreign::encode_foreign("acct-9", "mbx-3"));
-        let owner = MailboxId("acct-9".to_string());
+        let owner = PrincipalId("acct-9".to_string());
         let err = shared_scope_error(
             method_error("forbidden"),
             &scope,

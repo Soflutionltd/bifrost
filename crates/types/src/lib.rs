@@ -69,9 +69,9 @@ pub use capabilities::{
 pub use calendar::{
     AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, EventAttendee,
     EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
-    EventRecurrence, EventReminder, EventSearchRequest, EventStatus, EventTime, EventVisibility,
-    RecurrenceDay, RecurrenceRule, RecurrenceRuleError, RecurrenceUntil, ReminderRelativeTo,
-    ReminderTrigger, RsvpStatus,
+    EventRecurrence, EventReminder, EventSearchRequest, EventStatus, EventTime, EventTimeError,
+    EventTimeKind, EventVisibility, RecurrenceDay, RecurrenceRule, RecurrenceRuleError,
+    RecurrenceUntil, ReminderOffset, ReminderRelativeTo, ReminderTrigger, RsvpStatus,
 };
 
 // Cloud-storage attachment hosting.
@@ -124,7 +124,8 @@ pub use cursor::{
     CHANGE_CURSOR_ENVELOPE_VERSION, ChangeCursor, ChangeCursorEnvelopeMismatch, CostClass,
     CursorDecodeFault, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
     ObjectType, OpaqueChangeState, OpaqueProgressBytes, PayloadVersion, ProtocolKind,
-    ScopeLifecycle, ScopeLifecycleEvent, SyncStrategy, TraitEnvelopeVersion,
+    RemovalProjection, ScopeLifecycle, ScopeLifecycleEvent, ScopeShapes, SyncStrategy,
+    TraitEnvelopeVersion,
 };
 
 pub use error::partial::{
@@ -141,16 +142,17 @@ pub use error::{
     BatchFailure, BatchInputInvalidItem, BatchInputInvalidReason, BatchInvariantError, BatchItem,
     BatchItemId, BatchItemOutcome, BatchOutcome, BatchOutcomeBuilder, BatchSuccess, BatchUncertain,
     Cause, CauseChain, DetailVisibility, DiagnosticInfo, DiagnosticText, EngineDirective,
-    EngineDirectiveIdentity, EnhancedStatusCode, ErrorScope, Fatal, GmailSignal, GraphSignal,
-    HINTLESS_HOLD_WAIT, HoldTarget, ImapResponseCode, InternalCause, InternalErrorKind,
-    ItemOutcome, JmapMethod, MailboxUnavailableKind, MutationEffect, MutationSuccess, Protocol,
-    ProtocolErrorKind, Provider, ReconcileAction, ReconcileAdvice, ReconcileGuidance,
-    ReconcileReason, RecoveryClass, RemediationAction, RequestCause, RequestErrorKind,
-    ResourceKind, RetryAdvice, RetryDisposition, RetryHint, RetryReason, ServerCause,
-    ServerErrorKind, StateCause, StrategyDowngrade, SupportExportConsented, SupportExportInternal,
-    SupportExportMinimal, SyncStateErrorKind, TelemetryToken, TelemetryView, ThrottleBudget,
-    ThrottleKey, ThrottleScope, ThrottleWork, TransmissionState, TransportCause,
-    TransportErrorKind, TransportKind, Warning, WarningKind, WireCause, validate_batch_input,
+    EngineDirectiveIdentity, EngineNotice, EnhancedStatusCode, ErrorScope, Fatal, GmailSignal,
+    GraphSignal, HINTLESS_HOLD_WAIT, HoldTarget, ImapResponseCode, InternalCause,
+    InternalErrorKind, ItemOutcome, JmapMethod, MailboxUnavailableKind, MutationEffect,
+    MutationSuccess, OperatorOverrideReason, Protocol, ProtocolErrorKind, Provider,
+    ReconcileAction, ReconcileAdvice, ReconcileGuidance, ReconcileReason, RecoveryClass,
+    RemediationAction, RequestCause, RequestErrorKind, ResourceKind, RetryAdvice, RetryDisposition,
+    RetryHint, RetryReason, ServerCause, ServerErrorKind, StateCause, StrategyDowngrade,
+    SupportExportConsented, SupportExportInternal, SupportExportMinimal, SyncStateErrorKind,
+    TelemetryToken, TelemetryView, ThrottleBudget, ThrottleKey, ThrottleScope, ThrottleWork,
+    TransmissionState, TransportCause, TransportErrorKind, TransportKind, Warning, WarningKind,
+    WireCause, validate_batch_input,
 };
 
 // Stream-event types.
@@ -185,8 +187,8 @@ pub use hydration::{
 
 // Newtype ids.
 pub use ids::{
-    AccountId, BlobId, FolderId, LabelId, MailboxId, ObjectId, QueryId, RunId, SubscriptionHandle,
-    ThreadId,
+    AccountId, BlobId, FolderId, LabelId, MailboxId, ObjectId, PrincipalId, QueryId, RunId,
+    SubscriptionHandle, ThreadId,
 };
 
 // Mutation + projection + hydration types.

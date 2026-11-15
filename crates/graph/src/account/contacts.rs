@@ -24,7 +24,7 @@ const CONTACT_READ_SELECT: &str = "id,displayName,emailAddresses,businessPhones,
 pub(crate) async fn address_books_list(
     account: GraphAccount,
 ) -> Result<Vec<AddressBook>, AccountError> {
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     let mut books = vec![AddressBook {
         id: AddressBookId(DEFAULT_CONTACTS_ID.to_string()),
         native_id: DEFAULT_CONTACTS_ID.to_string(),
@@ -44,7 +44,8 @@ pub(crate) async fn address_books_list(
     let mut walk = crate::paging::PageWalk::new("contactFolders");
     let mut next = Some(
         account
-            .client
+            .mailboxes
+            .primary()
             .api_url(&format!(
                 "{prefix}/contactFolders?$select=id,displayName,parentFolderId&$top=250"
             ))
@@ -92,7 +93,8 @@ async fn contact_page(
     let url = match decode_link_cursor(&account, page_cursor, operation)? {
         Some(url) => url,
         None => account
-            .client
+            .mailboxes
+            .primary()
             .api_url(&contacts_url(&account, address_book.as_ref(), top))
             .map_err(|error| into_error(error, operation))?,
     };
@@ -122,11 +124,12 @@ pub(crate) async fn get(
         })?;
         return public::get(&account, folder, item).await;
     }
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
     let path = format!("{prefix}/contacts/{encoded}?$select={CONTACT_READ_SELECT}");
     let contact = account
-        .client
+        .mailboxes
+        .primary()
         .get_json::<GraphContact>(Resource::Outlook, &path)
         .await
         .map_err(|error| into_error(error, AccountOperation::ContactGet))?;
@@ -148,7 +151,8 @@ pub(crate) async fn create(
     }
     let path = create_url(&account, contact.address_book_id.as_ref());
     let created = account
-        .client
+        .mailboxes
+        .primary()
         .post::<GraphContact, _>(
             Resource::Outlook,
             &path,
@@ -217,13 +221,14 @@ pub(crate) async fn update(
             .etag
             .map(bifrost_types::EntityTag::into_string)
     };
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
     let path = format!("{prefix}/contacts/{encoded}");
     let body = graph_contact_from_patch(&patch);
     let result = if let Some(etag) = etag.as_deref() {
         account
-            .client
+            .mailboxes
+            .primary()
             .patch_if_match(
                 Resource::Outlook,
                 &path,
@@ -234,7 +239,8 @@ pub(crate) async fn update(
             .await
     } else {
         account
-            .client
+            .mailboxes
+            .primary()
             .patch(
                 Resource::Outlook,
                 &path,
@@ -276,12 +282,13 @@ pub(crate) async fn delete_if_version(
             .etag
             .map(bifrost_types::EntityTag::into_string)
     };
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
     let path = format!("{prefix}/contacts/{encoded}");
     let result = if let Some(etag) = etag.as_deref() {
         account
-            .client
+            .mailboxes
+            .primary()
             .delete_if_match(
                 Resource::Outlook,
                 &path,
@@ -291,7 +298,8 @@ pub(crate) async fn delete_if_version(
             .await
     } else {
         account
-            .client
+            .mailboxes
+            .primary()
             .delete(Resource::Outlook, &path, bifrost_net::ReplayPolicy::Never)
             .await
     };
@@ -319,7 +327,8 @@ pub(crate) async fn search(
         Some(position) => position,
         None => {
             let first = account
-                .client
+                .mailboxes
+                .primary()
                 .api_url(&contact_search_url(
                     &account,
                     request.address_book_id.as_ref(),
@@ -413,11 +422,10 @@ pub(crate) async fn directory_search(
     let resumed = page_cursor.is_some();
     let top = top_for_limit(limit, 999);
     let (mut url, mut skip, mut mode) =
-        match crate::paging::decode_directory_cursor(&account.client, page_cursor).map_err(
-            |detail| {
+        match crate::paging::decode_directory_cursor(account.mailboxes.primary(), page_cursor)
+            .map_err(|detail| {
                 AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
-            },
-        )? {
+            })? {
             Some(position) => position,
             None => {
                 let mode = if query.trim().is_empty() {
@@ -426,7 +434,8 @@ pub(crate) async fn directory_search(
                     DirectoryMode::Search
                 };
                 let first = account
-                    .client
+                    .mailboxes
+                    .primary()
                     .api_url(&directory_search_path(&query, top, mode))
                     .map_err(|error| into_error(error, operation))?;
                 (first, 0, mode)
@@ -462,7 +471,8 @@ pub(crate) async fn directory_search(
                 );
                 mode = DirectoryMode::Filter;
                 url = account
-                    .client
+                    .mailboxes
+                    .primary()
                     .api_url(&directory_search_path(&query, top, mode))
                     .map_err(|error| into_error(error, operation))?;
                 walk = crate::paging::PageWalk::new("directory search");
@@ -786,7 +796,11 @@ async fn get_page_with_consistency<T: serde::de::DeserializeOwned>(
     url: &AdmittedUrl,
     eventual: bool,
 ) -> Result<ODataCollection<T>, crate::error::GraphError> {
-    account.client.get_eventual(resource, url, eventual).await
+    account
+        .mailboxes
+        .primary()
+        .get_eventual(resource, url, eventual)
+        .await
 }
 
 /// Admit a page's `@odata.nextLink` at receipt, before it is followed or
@@ -797,7 +811,8 @@ pub(crate) fn admit_next<T>(
     operation: AccountOperation,
 ) -> Result<Option<AdmittedUrl>, AccountError> {
     account
-        .client
+        .mailboxes
+        .primary()
         .admit_next(page.next_link.as_ref())
         .map_err(|error| into_error(error, operation))
 }
@@ -817,9 +832,11 @@ pub(crate) fn decode_link_cursor(
     page_cursor: Option<bifrost_types::PageCursor>,
     operation: AccountOperation,
 ) -> Result<Option<AdmittedUrl>, AccountError> {
-    crate::paging::decode_link_cursor(&account.client, page_cursor, operation).map_err(|detail| {
-        AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
-    })
+    crate::paging::decode_link_cursor(account.mailboxes.primary(), page_cursor, operation).map_err(
+        |detail| {
+            AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
+        },
+    )
 }
 
 fn decode_paged_cursor(
@@ -827,13 +844,15 @@ fn decode_paged_cursor(
     page_cursor: Option<bifrost_types::PageCursor>,
     operation: AccountOperation,
 ) -> Result<Option<(AdmittedUrl, usize)>, AccountError> {
-    crate::paging::decode_paged_cursor(&account.client, page_cursor, operation).map_err(|detail| {
-        AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
-    })
+    crate::paging::decode_paged_cursor(account.mailboxes.primary(), page_cursor, operation).map_err(
+        |detail| {
+            AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
+        },
+    )
 }
 
 fn contacts_url(account: &GraphAccount, address_book: Option<&AddressBookId>, top: u32) -> String {
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     contacts_path(&prefix, address_book, top)
 }
 
@@ -843,7 +862,7 @@ fn contact_search_url(
     query: &str,
     top: u32,
 ) -> String {
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     contact_search_path(&prefix, address_book, query, top)
 }
 
@@ -893,7 +912,7 @@ fn top_for_limit(limit: Option<u32>, ceiling: u32) -> u32 {
 }
 
 fn create_url(account: &GraphAccount, address_book: Option<&AddressBookId>) -> String {
-    let prefix = account.client.api_path_prefix();
+    let prefix = account.mailboxes.primary().api_path_prefix();
     match address_book.map(|id| id.0.as_str()) {
         Some(DEFAULT_CONTACTS_ID) | None => format!("{prefix}/contacts"),
         Some(folder) => {
@@ -1717,14 +1736,14 @@ mod tests {
                 account,
                 bifrost_types::EventRange {
                     calendar_id: bifrost_types::CalendarId("calendar".to_string()),
-                    start: bifrost_types::EventTime {
-                        value: "2026-01-01T00:00:00Z".to_string(),
-                        timezone: None,
-                    },
-                    end: bifrost_types::EventTime {
-                        value: "2026-02-01T00:00:00Z".to_string(),
-                        timezone: None,
-                    },
+                    start: bifrost_types::EventTime::from_observed(
+                        "2026-01-01T00:00:00Z".to_string(),
+                        None,
+                    ),
+                    end: bifrost_types::EventTime::from_observed(
+                        "2026-02-01T00:00:00Z".to_string(),
+                        None,
+                    ),
                     page_cursor: Some(foreign),
                     limit: None,
                 },

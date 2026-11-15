@@ -54,7 +54,13 @@ async fn an_own_tag_ok_before_the_continuation_is_non_fatal_and_the_connection_s
         .list_rights("INBOX", LITERAL_IDENTIFIER, Duration::from_secs(5))
         .await
         .expect_err("an OK without a continuation cannot carry the answer");
-    assert!(matches!(err, Error::ProtocolMissing(_)), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::Provider(crate::error::ProviderFailure::Missing(_))
+        ),
+        "got {err:?}"
+    );
     assert!(!err.is_connection_fatal());
     assert!(
         conn.is_alive(),
@@ -93,7 +99,13 @@ async fn an_own_tag_ok_before_a_login_literal_does_not_authenticate() {
         .login("user", "pa\u{7f}ss", Duration::from_secs(5))
         .await
         .expect_err("an OK without a continuation cannot authenticate");
-    assert!(matches!(err, Error::ProtocolMissing(_)), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::Provider(crate::error::ProviderFailure::Missing(_))
+        ),
+        "got {err:?}"
+    );
     assert_eq!(
         conn.state_rx.borrow().session_state,
         crate::connection::SessionState::NotAuthenticated,
@@ -126,7 +138,13 @@ async fn a_foreign_tag_before_the_continuation_is_fatal() {
         .list_rights("INBOX", LITERAL_IDENTIFIER, Duration::from_secs(5))
         .await
         .expect_err("a foreign tag is a desynchronization");
-    assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::Provider(crate::error::ProviderFailure::Protocol(_))
+        ),
+        "got {err:?}"
+    );
     assert!(err.is_connection_fatal());
     assert!(
         !conn.is_alive(),
@@ -183,7 +201,13 @@ async fn a_later_multiappend_message_refused_at_its_marker_leaves_the_wire_in_sy
         .multi_append("INBOX", &messages, Duration::from_secs(5))
         .await
         .expect_err("the second message was refused");
-    assert!(matches!(err, Error::No { .. }), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::ServerStatus(crate::error::ServerStatus::No { .. })
+        ),
+        "got {err:?}"
+    );
     assert!(!err.is_connection_fatal());
     assert!(
         conn.is_alive(),
@@ -260,7 +284,13 @@ async fn refused_second_metadata_literal_leaves_the_wire_in_sync(caps: &str, len
         )
         .await
         .expect_err("the second literal was refused");
-    assert!(matches!(err, Error::No { .. }), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::ServerStatus(crate::error::ServerStatus::No { .. })
+        ),
+        "got {err:?}"
+    );
     assert!(!err.is_connection_fatal());
     assert!(
         conn.is_alive(),

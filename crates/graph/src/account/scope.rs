@@ -78,7 +78,7 @@ impl GraphScope {
         &self,
         account: &'a GraphAccount,
     ) -> Result<&'a crate::client::GraphClient, crate::error::GraphError> {
-        account.client_for_owner(self.owner())
+        account.mailboxes.client_for_owner(self.owner())
     }
 
     pub(crate) fn kind(&self) -> Result<GraphCursorKind, CursorError> {

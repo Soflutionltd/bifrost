@@ -204,14 +204,19 @@ pub(super) async fn message_values_for_thread(
     select: &str,
 ) -> Result<Vec<Value>, AccountError> {
     let parsed = crate::account::foreign::parse_thread_id(thread);
-    let client = account.client_for_owner(parsed.owner()).map_err(|error| {
-        into_account_error(
-            error,
-            GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(ErrorScope::Thread {
-                id: (thread.0.clone()).into(),
-            }),
-        )
-    })?;
+    let client = account
+        .mailboxes
+        .client_for_owner(parsed.owner())
+        .map_err(|error| {
+            into_account_error(
+                error,
+                GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(
+                    ErrorScope::Thread {
+                        id: (thread.0.clone()).into(),
+                    },
+                ),
+            )
+        })?;
     let filter = format!("conversationId eq {}", odata_quoted(parsed.native_id()));
     let path = format!(
         "{}/messages?{}&$filter={}&$top=50",

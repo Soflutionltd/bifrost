@@ -8,7 +8,7 @@
 //! attached, checkpoint store rejected the write, shutdown in
 //! progress).
 
-use bifrost_types::{AccountError, AccountId};
+use bifrost_types::{AccountError, AccountId, CursorScope, ObjectId, Priority};
 
 /// Engine-side failure type.
 ///
@@ -34,7 +34,7 @@ pub enum Error {
     OpenFailed(#[source] AccountError),
     /// `establish_initial_cursor` returned an error.
     #[error("failed to establish initial cursor: {0}")]
-    EstablishCursorFailed(String),
+    EstablishCursorFailed(EstablishFailure),
     /// Cursor-establishing inventory ended in a terminal account
     /// error. The full `AccountError` is preserved so callers can
     /// inspect recovery, scope, operation, provider, and diagnostics.
@@ -47,6 +47,26 @@ pub enum Error {
     /// Checkpoint persistence failed.
     #[error("checkpoint store rejected the write: {0}")]
     CheckpointStore(String),
+    /// A caller's acknowledgement was rejected before a store write.
+    #[error("acknowledgement rejected: {0}")]
+    AckRejected(AckRejection),
+    /// A valid acknowledgement reached the store, which failed. Preserve its
+    /// original error without confusing it with a rejected publication token.
+    #[error("acknowledgement persistence failed: {0}")]
+    AckStore(#[source] Box<Error>),
+    #[error("scheduler admission failed: {0}")]
+    Admission(#[from] AdmissionFailure),
+    #[error("mutation target {0:?} has conflicting caller versions")]
+    ConflictingCallerVersions(ObjectId),
+    #[error("inventory Done cursor has scope {actual:?}; expected {expected:?}")]
+    InventoryScopeMismatch {
+        expected: CursorScope,
+        actual: CursorScope,
+    },
+    #[error("inventory fusion carried an unsupported checkpoint")]
+    InventoryCheckpointUnsupported,
+    #[error("inventory Done carried no checkpoint for establishment")]
+    InventoryCheckpointMissing,
     /// Cursor envelope on disk uses a schema this engine cannot read.
     /// Local-only: when this would cross into recovery dispatch, the
     /// engine converts it into an `AccountError` with
@@ -78,6 +98,63 @@ pub enum Error {
     /// counterpart (config validation, malformed checkpoint type, etc.).
     #[error("{0}")]
     Other(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EstablishFailure {
+    #[error("unknown CursorEstablishment variant")]
+    UnsupportedVariant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum AdmissionFailure {
+    #[error("lane {priority:?} is full (capacity {capacity})")]
+    LaneFull { priority: Priority, capacity: usize },
+    #[error("account {0:?} budget was forgotten")]
+    AccountForgotten(AccountId),
+    #[error("account budget lock was poisoned")]
+    BudgetPoisoned,
+    #[error("account semaphore closed")]
+    AccountPoolClosed,
+    #[error("global semaphore closed")]
+    GlobalPoolClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum AckRejection {
+    #[error("unknown publication")]
+    UnknownPublication,
+    #[error("scope does not match checkpoint")]
+    ScopeMismatch,
+    #[error("unsupported checkpoint")]
+    UnsupportedCheckpoint,
+    #[error("invalid checkpoint envelope")]
+    InvalidEnvelope,
+}
+
+/// Successful acknowledgement does not necessarily advance a checkpoint.
+/// Enterprise consumers need the distinction before claiming sync is durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AckOutcome {
+    /// Checkpoint-free repair delivery accepted; no checkpoint was offered.
+    RepairAccepted,
+    Durable,
+    Withheld(CompletionRefusal),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompletionRefusal {
+    /// Repair or waive the scope's outstanding obligations before completion.
+    OpenDebt,
+    /// Some pages were lost; restart the inventory walk.
+    WalkNotWhole,
+    /// This attachment cannot vouch for the offered publication.
+    Unvouchable,
 }
 
 /// Re-export of `bifrost_types::Warning`. Engine callers continue to

@@ -16,7 +16,7 @@ use crate::{
 
 /// Latest ledger version that introduced a shared vocabulary tag.
 /// Advance beyond the current sync ledger version when adding new tags.
-pub const VOCABULARY_VERSION: u32 = 11;
+pub const VOCABULARY_VERSION: u32 = 13;
 
 /// Append a coverage domain, including its scope and snapshot identity.
 pub fn encode_domain(out: &mut Vec<u8>, domain: &CoverageDomain) {
@@ -419,6 +419,10 @@ pub fn encode_error_scope(out: &mut Vec<u8>, scope: &ErrorScope) {
             out.push(1);
             write_bytes(out, &encode_scope(cursor));
         }
+        ErrorScope::Owner { id } => {
+            out.push(15);
+            write_string(out, &id.0);
+        }
         ErrorScope::Mailbox { id } => {
             out.push(2);
             write_string(out, &id.0);
@@ -489,6 +493,9 @@ pub fn decode_error_scope(reader: &mut Reader<'_>) -> Result<ErrorScope, Error> 
         13 if reader.version >= 7 => ErrorScope::UploadSession,
         14 if reader.version >= 11 => ErrorScope::Namespace {
             prefix: reader.string()?,
+        },
+        15 if reader.version >= 13 => ErrorScope::Owner {
+            id: crate::PrincipalId(reader.string()?),
         },
         other => return Err(unknown_tag("error scope", other)),
     })
@@ -774,6 +781,32 @@ fn read_opt_string(reader: &mut Reader<'_>) -> Result<Option<String>, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_scope_wire_identity_is_distinct_and_versioned() {
+        let owner = crate::ErrorScope::Owner {
+            id: crate::PrincipalId("a".into()),
+        };
+        let mailbox = crate::ErrorScope::Mailbox {
+            id: crate::MailboxId("a".into()),
+        };
+        let mut bytes = Vec::new();
+        super::encode_error_scope(&mut bytes, &owner);
+        assert_eq!(
+            super::decode_error_scope(&mut super::Reader::new(&bytes, 13)).unwrap(),
+            owner
+        );
+        assert!(super::decode_error_scope(&mut super::Reader::new(&bytes, 12)).is_err());
+        let mut native = Vec::new();
+        super::encode_error_scope(&mut native, &mailbox);
+        assert_ne!(bytes, native);
+        assert_eq!(
+            super::decode_error_scope(&mut super::Reader::new(&native, 12)).unwrap(),
+            mailbox
+        );
+        assert_eq!(serde_json::to_value(&owner).unwrap()["kind"], "owner");
+        assert_eq!(owner.resource(), None);
+    }
+
     /// Every operation tag must survive the table round trip. A transposed pair
     /// in the table would relabel an operation in a durable record without ever
     /// failing to compile.

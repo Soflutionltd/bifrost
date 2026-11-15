@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,46 +10,21 @@ use bifrost_types::{
 
 use crate::blob::BlobRef;
 use crate::blob::download::{BlobStream, BlobTransport, DEFAULT_MAX_BLOB_SIZE};
-use crate::client::{ByteTally, Client};
-use crate::core::id::{AccountId, BlobId};
+use crate::client::ByteTally;
+use crate::core::id::BlobId;
 use crate::email::{EmailGet, EmailId, Property};
 
-type MailAccount<T> = crate::account::Account<T>;
-
-/// Resolve the JMAP `accountId` a foreign-qualified id belongs to.
-///
-/// Blob download is accountId-scoped (`/download/{accountId}/{blobId}`), so
-/// a foreign (shared/delegate) blob must be requested under its OWNING
-/// account - the primary account's download URL would 404 on a blob it does
-/// not own. `Some((accountId, native))` when the id was qualified by the
-/// foreign inventory projection AND that account is still reachable;
-/// `None` for a primary id (or an id naming an account that vanished, which
-/// falls back to the primary account so the miss surfaces as a real 404
-/// rather than a fabricated local error). Pure so the selection is
-/// unit-pinnable without a live session.
-pub(crate) fn foreign_split<F>(id: &str, is_registered: F) -> Option<(&str, &str)>
-where
-    F: Fn(&str) -> bool,
-{
-    super::foreign::parse_object(id).filter(|(account, _)| is_registered(account))
-}
-
 pub(crate) fn open<T: BlobTransport>(
-    client: Client<T>,
-    account_id: AccountId,
-    foreign_accounts: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
+    foreign_accounts: Arc<super::registry::Registry<T>>,
     handle: BlobHandle,
 ) -> AccountStream<SyncEvent<bytes::Bytes>> {
     Box::pin(async_stream::stream! {
         let started = Instant::now();
         // A foreign-qualified blob id names its owning account; download
         // under that account, with the native blobId on the wire.
-        let (account_id, native_blob) =
-            match foreign_split(&handle.id.0, |account| foreign_accounts.contains_key(account)) {
-                Some((account, native)) => (AccountId::new(account), native.to_string()),
-                None => (account_id, handle.id.0.clone()),
-            };
-        let mut blob = BlobRef::new(account_id, BlobId::new(native_blob));
+        let slot = foreign_accounts.object(&handle.id.0);
+        let client = slot.client().clone();
+        let mut blob = BlobRef::new(slot.id().clone(), BlobId::new(slot.wire(&handle.id.0)));
         if let Some(content_type) = handle.content_type {
             blob = blob.with_content_type(content_type);
         }
@@ -86,10 +60,7 @@ pub(crate) fn open<T: BlobTransport>(
 /// untouched: hydration's raw projection is A1's concern; this is the
 /// dedicated raw read.
 pub(crate) fn open_raw_rfc822<T: BlobTransport>(
-    client: Client<T>,
-    account_id: AccountId,
-    mail: MailAccount<T>,
-    foreign_accounts: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
+    foreign_accounts: Arc<super::registry::Registry<T>>,
     message: ObjectId,
 ) -> AccountStream<SyncEvent<bytes::Bytes>> {
     Box::pin(async_stream::stream! {
@@ -98,18 +69,10 @@ pub(crate) fn open_raw_rfc822<T: BlobTransport>(
         // for the whole-message blobId and the blob download) to the owning
         // account. Routing only one of them would fetch a blobId from one
         // account and download it from another.
-        let (account_id, mail, native_message) =
-            match foreign_split(&message.0, |account| foreign_accounts.contains_key(account)) {
-                Some((account, native)) => (
-                    AccountId::new(account),
-                    foreign_accounts
-                        .get(account)
-                        .cloned()
-                        .expect("foreign_split only returns a registered account"),
-                    native.to_string(),
-                ),
-                None => (account_id, mail, message.0.clone()),
-            };
+        let mail = foreign_accounts.object(&message.0).clone();
+        let account_id = mail.id().clone();
+        let client = mail.client().clone();
+        let native_message = mail.wire(&message.0).to_owned();
         // Both legs report into one accumulator: the `Email/get` that
         // resolves the whole-message blobId and the streamed download are
         // traffic this read caused. The API response count is attached to
@@ -290,12 +253,11 @@ pub(crate) fn open_range(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
-    use super::foreign_split;
     use bifrost_types::{PageBoundary, SyncEvent};
     use futures::StreamExt as _;
 
@@ -495,9 +457,16 @@ mod tests {
             },
         };
         let events = super::open(
-            metered_client(),
-            crate::core::id::AccountId::new("primary"),
-            std::sync::Arc::new(std::collections::HashMap::new()),
+            std::sync::Arc::new(crate::sync::registry::Registry::from_test(
+                crate::sync::registry::Slot::new(
+                    metered_client(),
+                    crate::core::id::AccountId::new("primary"),
+                ),
+                std::sync::Arc::new(std::collections::HashMap::<
+                    crate::core::id::AccountId,
+                    crate::sync::registry::Slot<_>,
+                >::new()),
+            )),
             handle,
         )
         .collect::<Vec<_>>()
@@ -531,12 +500,15 @@ mod tests {
     #[tokio::test]
     async fn a_raw_read_accounts_for_the_api_leg_once_across_chunk_batches() {
         let client = metered_client();
-        let mail = crate::account::Account::new(client.clone(), "primary");
+        let mail = crate::sync::registry::Slot::new(client.clone(), "primary");
         let events = super::open_raw_rfc822(
-            client,
-            crate::core::id::AccountId::new("primary"),
-            mail,
-            std::sync::Arc::new(std::collections::HashMap::new()),
+            std::sync::Arc::new(crate::sync::registry::Registry::from_test(
+                mail,
+                std::sync::Arc::new(std::collections::HashMap::<
+                    crate::core::id::AccountId,
+                    crate::sync::registry::Slot<_>,
+                >::new()),
+            )),
             bifrost_types::ObjectId("M1".to_string()),
         )
         .collect::<Vec<_>>()
@@ -674,26 +646,5 @@ mod tests {
                 SyncEvent::Terminated(_)
             ]
         ));
-    }
-
-    #[test]
-    fn foreign_blob_id_selects_the_owning_account() {
-        let registered: HashSet<String> = ["acct-9".to_string()].into_iter().collect();
-        let is_registered = |account: &str| registered.contains(account);
-
-        let foreign = super::super::foreign::encode_object("acct-9", "B1");
-        // The download runs under the FOREIGN accountId with the native
-        // blobId on the wire.
-        assert_eq!(
-            foreign_split(&foreign, is_registered),
-            Some(("acct-9", "B1"))
-        );
-
-        // A bare (primary) id keeps the primary account.
-        assert_eq!(foreign_split("B1", is_registered), None);
-        // An id naming an unreachable account falls back to primary, so the
-        // miss surfaces as a real download 404.
-        let gone = super::super::foreign::encode_object("acct-gone", "B1");
-        assert_eq!(foreign_split(&gone, is_registered), None);
     }
 }

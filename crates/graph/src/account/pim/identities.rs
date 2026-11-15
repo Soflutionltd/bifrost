@@ -12,12 +12,17 @@ use std::time::SystemTime;
 use super::common::*;
 
 pub(crate) async fn identities_list(account: GraphAccount) -> Result<Vec<Identity>, AccountError> {
-    let profile = account.client.get_profile().await.map_err(|e| {
-        into_account_error(
-            e,
-            GraphErrorContext::graph(AccountOperation::IdentitiesList),
-        )
-    })?;
+    let profile = account
+        .mailboxes
+        .primary()
+        .get_profile()
+        .await
+        .map_err(|e| {
+            into_account_error(
+                e,
+                GraphErrorContext::graph(AccountOperation::IdentitiesList),
+            )
+        })?;
     let address = profile.mail.or(profile.user_principal_name);
     let Some(address) = address else {
         return Ok(Vec::new());
@@ -38,10 +43,11 @@ pub(crate) async fn vacation_get(
 ) -> Result<Option<VacationConfig>, AccountError> {
     let path = format!(
         "{}/mailboxSettings?$select=automaticRepliesSetting",
-        account.client.api_path_prefix()
+        account.mailboxes.primary().api_path_prefix()
     );
     let settings: MailboxSettings = account
-        .client
+        .mailboxes
+        .primary()
         .get_json(Resource::Outlook, &path)
         .await
         .map_err(|e| {
@@ -78,9 +84,13 @@ pub(crate) async fn vacation_set(
             "scheduledEndDateTime": graph_datetime_or_default(config.ends_at)
         }
     });
-    let path = format!("{}/mailboxSettings", account.client.api_path_prefix());
+    let path = format!(
+        "{}/mailboxSettings",
+        account.mailboxes.primary().api_path_prefix()
+    );
     account
-        .client
+        .mailboxes
+        .primary()
         .patch(
             Resource::Outlook,
             &path,

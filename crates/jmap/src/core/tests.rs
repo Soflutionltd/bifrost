@@ -626,6 +626,10 @@ mod envelope {
     }
 
     impl Stub {
+        fn build(&self) -> crate::core::request::Request<'_, StubTransport> {
+            crate::core::request::Request::test_scoped(&self.client, "A1")
+        }
+
         /// The `n`th request body the client POSTed.
         fn request(&self, n: usize) -> Value {
             self.sent.lock().expect("stub sent lock")[n].clone()
@@ -675,7 +679,7 @@ mod envelope {
     fn unanswered_set_retains_the_serialized_request_guard() {
         let stub = stub(mail_primary(), []);
         for guarded in [false, true] {
-            let mut request = stub.client.build();
+            let mut request = stub.build();
             let mut set = ReplayTestSet::new();
             if guarded {
                 set = set.if_in_state("s0");
@@ -702,7 +706,7 @@ mod envelope {
         use crate::core::id::BlobId;
         let stub = stub(mail_primary(), []);
         for refused in [false, true] {
-            let mut request = stub.client.build();
+            let mut request = stub.build();
             let handle = request
                 .call(CopyBlobRequest::new("source").blob_id("blob"))
                 .unwrap();
@@ -733,7 +737,7 @@ mod envelope {
     #[test]
     fn request_replay_policy_is_idempotent_only_when_every_call_is_replay_safe() {
         let stub = stub(mail_primary(), []);
-        let mut request = stub.client.build();
+        let mut request = stub.build();
         assert_eq!(
             request.replay_policy(),
             bifrost_net::ReplayPolicy::Idempotent
@@ -748,9 +752,9 @@ mod envelope {
         assert_eq!(request.replay_policy(), bifrost_net::ReplayPolicy::Never);
         #[cfg(feature = "mail")]
         {
-            let mut request = stub.client.build();
+            let mut request = stub.build();
             request
-                .call(crate::email::import::EmailImportRequest::new())
+                .call_as(crate::email::import::EmailImportRequest::new())
                 .unwrap();
             assert_eq!(request.replay_policy(), bifrost_net::ReplayPolicy::Never);
         }
@@ -768,10 +772,12 @@ mod envelope {
             "https://example.test/.well-known/jmap",
         )
         .unwrap();
-        let mut request = client.build();
+        let mut request =
+            crate::core::request::Request::<_, capability::Core>::test_scoped(&client, "A1");
         request.call(TestGet::new()).unwrap();
         assert!(client.send_request(&request).await.is_err());
-        let mut request = client.build();
+        let mut request =
+            crate::core::request::Request::<_, capability::Core>::test_scoped(&client, "A1");
         request
             .call(ReplayTestSet::new().if_in_state("caller-old"))
             .unwrap();
@@ -909,7 +915,7 @@ mod envelope {
     async fn request_serializes_using_method_calls_and_injected_account_id() {
         let stub = stub(mail_primary(), [reply("session-1", vec![get_result("s0")])]);
 
-        let mut request = stub.client.build();
+        let mut request = stub.build();
         let handle = request
             .call(TestGet::new().ids([TestObjId::new("t1")]))
             .expect("method encodes");
@@ -946,9 +952,9 @@ mod envelope {
             )],
         );
 
-        let mut request = stub.client.build();
+        let mut request = stub.build();
         let _core_a = request.call(TestGet::new()).expect("encodes");
-        let _mail = request.call(TestMailGet::new()).expect("encodes");
+        let _mail = request.call_as(TestMailGet::new()).expect("encodes");
         let _core_b = request.call(TestGet::new()).expect("encodes");
         request.send().await.expect("stub replies");
 
@@ -982,14 +988,18 @@ mod envelope {
             .client
             .primary_account::<capability::Mail>()
             .expect("session lists a mail primary");
-        mail.call(TestGet::new()).await.expect("stub replies");
+        mail.core()
+            .call(TestGet::new())
+            .await
+            .expect("stub replies");
         assert_eq!(
             stub.request(0)["methodCalls"][0][1]["accountId"],
             json!("A1")
         );
 
         // An explicit override wins over the client default.
-        let mut request = stub.client.build().account_id("B2");
+        let mut request =
+            crate::core::request::Request::<_, capability::Core>::test_scoped(&stub.client, "B2");
         let _ = request.call(TestGet::new()).expect("encodes");
         request.send().await.expect("stub replies");
         assert_eq!(
@@ -1009,7 +1019,6 @@ mod envelope {
         );
 
         let (get, query) = stub
-            .client
             .build()
             .send_methods_within((TestGet::new(), TestQuery::new()), usize::MAX)
             .await
@@ -1042,7 +1051,6 @@ mod envelope {
         );
 
         let (get, query) = stub
-            .client
             .build()
             .send_methods_within((TestGet::new(), TestQuery::new()), usize::MAX)
             .await
@@ -1067,7 +1075,6 @@ mod envelope {
         );
 
         let sent = stub
-            .client
             .build()
             .send_methods_within((TestGet::new(), TestQuery::new()), 8)
             .await
@@ -1080,7 +1087,7 @@ mod envelope {
     #[test]
     fn request_construction_refuses_the_advertised_call_limit() {
         let stub = stub_with_max_calls(mail_primary(), 1, []);
-        let mut request = stub.client.build();
+        let mut request = stub.build();
         request.call(TestGet::new()).expect("first call fits");
 
         let error = match request.call(TestQuery::new()) {
@@ -1089,11 +1096,7 @@ mod envelope {
         };
 
         assert!(matches!(error, crate::Error::RequestCallLimit { max: 1 }));
-        assert_eq!(
-            request.method_calls.len(),
-            1,
-            "the rejected call is not added"
-        );
+        assert_eq!(request.call_count(), 1, "the rejected call is not added");
         assert_eq!(
             stub.request_count(),
             0,
@@ -1111,7 +1114,7 @@ mod envelope {
             )],
         );
 
-        let mut request = stub.client.build();
+        let mut request = stub.build();
         let query = request.call(TestQuery::new()).expect("encodes");
         let _get = request
             .call(TestGet::new().ids_ref(query.result_reference("/ids")))
@@ -1140,14 +1143,14 @@ mod envelope {
         assert!(stub.client.is_session_updated());
 
         // A reply echoing the session's own state leaves it fresh.
-        let mut request = stub.client.build();
+        let mut request = stub.build();
         let _ = request.call(TestGet::new()).expect("encodes");
         request.send().await.expect("stub replies");
         assert!(stub.client.is_session_updated());
 
         // A reply carrying a newer sessionState marks it stale so the
         // caller knows to re-read the session resource.
-        let mut request = stub.client.build();
+        let mut request = stub.build();
         let _ = request.call(TestGet::new()).expect("encodes");
         request.send().await.expect("stub replies");
         assert!(!stub.client.is_session_updated());
@@ -1158,7 +1161,7 @@ mod envelope {
         // No queued reply: the stub answers the way a dropped connection
         // does, and the error must not be laundered into a decode error.
         let stub = stub(mail_primary(), Vec::<String>::new());
-        let mut request = stub.client.build();
+        let mut request = stub.build();
         let _ = request.call(TestGet::new()).expect("encodes");
         let err = request.send().await.expect_err("transport failed");
         assert!(matches!(err, crate::Error::Transport(_)), "got {err:?}");
@@ -1167,13 +1170,121 @@ mod envelope {
     #[tokio::test]
     async fn an_unparseable_response_body_is_a_response_decode_error() {
         let stub = stub(mail_primary(), ["not json at all".to_string()]);
-        let mut request = stub.client.build();
+        let mut request = stub.build();
         let _ = request.call(TestGet::new()).expect("encodes");
         let err = request.send().await.expect_err("body is not JSON");
         assert!(
             matches!(err, crate::Error::EnvelopeDecode(_)),
             "got {err:?}"
         );
+    }
+    #[cfg(feature = "calendars")]
+    #[test]
+    fn capability_accounts_keep_distinct_primaries_and_reject_crossed_views() {
+        let stub = stub(
+            json!({
+                "urn:ietf:params:jmap:mail": "mail-account",
+                "urn:ietf:params:jmap:calendars": "calendar-account"
+            }),
+            [],
+        );
+        let mail: crate::account::Account<_, capability::Mail> =
+            stub.client.primary_account::<capability::Mail>().unwrap();
+        let calendar: crate::account::Account<_, capability::Calendars> = stub
+            .client
+            .primary_account::<capability::Calendars>()
+            .unwrap();
+        let mut mail_request = mail.build();
+        mail_request.call(TestMailGet::new()).unwrap();
+        let mut calendar_request = calendar.build();
+        calendar_request
+            .call(crate::calendar::CalendarGet::new())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&mail_request).unwrap()["methodCalls"][0][1]["accountId"],
+            "mail-account"
+        );
+        assert_eq!(
+            serde_json::to_value(&calendar_request).unwrap()["methodCalls"][0][1]["accountId"],
+            "calendar-account"
+        );
+        assert!(matches!(mail.view::<capability::Calendars>(),
+            Err(crate::Error::AccountCapability { account_id, capability })
+                if account_id.as_str() == "mail-account" && capability == "urn:ietf:params:jmap:calendars"));
+        assert!(matches!(
+            mail_request.call_as(crate::calendar::CalendarGet::new()),
+            Err(crate::Error::AccountCapability { .. })
+        ));
+        assert_eq!(mail_request.call_count(), 1);
+        assert_eq!(stub.request_count(), 0);
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn shared_submission_view_keeps_the_selected_account_and_checks_its_capability() {
+        let mut session = serde_json::to_value(session(json!({
+            "urn:ietf:params:jmap:mail": "primary",
+            "urn:ietf:params:jmap:submission": "submission-primary"
+        })))
+        .unwrap();
+        session["accounts"] = json!({
+            "shared": { "name": "Shared", "isPersonal": false, "isReadOnly": false,
+                "accountCapabilities": {"urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": {"maxDelayedSend": 0}} },
+            "read-only-share": { "name": "Share", "isPersonal": false, "isReadOnly": false,
+                "accountCapabilities": {"urn:ietf:params:jmap:mail": {}} }
+        });
+        let source = stub(mail_primary(), []);
+        let client = Client::with_transport(
+            StubTransport {
+                sent: Arc::clone(&source.sent),
+                policies: Arc::new(Mutex::new(Vec::new())),
+                replies: Arc::new(Mutex::new(VecDeque::new())),
+            },
+            serde_json::from_value(session).unwrap(),
+            "https://example.test/session",
+        )
+        .unwrap();
+        let shared = client.account::<capability::Mail>("shared").unwrap();
+        let submission: crate::account::Account<_, capability::Submission> = shared.view().unwrap();
+        assert_eq!(submission.id_str(), "shared");
+        let mut request = shared.build();
+        request.call(TestMailGet::new()).unwrap();
+        request
+            .call_as(crate::identity::IdentityGet::new())
+            .unwrap();
+        for call in serde_json::to_value(&request).unwrap()["methodCalls"]
+            .as_array()
+            .unwrap()
+        {
+            assert_eq!(call[1]["accountId"], "shared");
+        }
+        assert!(
+            client
+                .account::<capability::Mail>("read-only-share")
+                .unwrap()
+                .view::<capability::Submission>()
+                .is_err()
+        );
+        assert!(
+            client
+                .account::<capability::Submission>("departed")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn core_blob_copy_uses_the_explicit_account_without_a_blob_extension() {
+        let stub = stub(mail_primary(), []);
+        let mail = stub.client.primary_account::<capability::Mail>().unwrap();
+        let core = mail.core();
+        let mut request = core.build();
+        request
+            .call(crate::blob::copy::CopyBlobRequest::new("source").blob_id("b1"))
+            .unwrap();
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(wire["methodCalls"][0][1]["accountId"], "A1");
+        assert_eq!(wire["methodCalls"][0][1]["fromAccountId"], "source");
+        assert_eq!(wire["using"], json!(["urn:ietf:params:jmap:core"]));
     }
 }
 

@@ -138,7 +138,7 @@ async fn fetch_ews_outcomes(
     let mut outcomes = Vec::new();
     for (id, folder) in ids {
         let batch_id = BatchItemId(id.0.clone());
-        let Some(routing) = account.public_folder_routing(folder).await else {
+        let Some(routing) = account.public_folders.public_folder_routing(folder).await else {
             // The routing map starts empty on every reopen and is filled by
             // public-folder discovery, which can skip a folder after a
             // per-folder failure, so a legitimately minted id can miss here.
@@ -149,7 +149,11 @@ async fn fetch_ews_outcomes(
             // folder, that retry would never end, so the item is reported
             // NotFound instead (ruling recorded on
             // `graph_error::unroutable_public_resource_error`).
-            let error = account.missing_public_route_error(AccountOperation::Hydrate, id, folder);
+            let error = account.public_folders.missing_public_route_error(
+                AccountOperation::Hydrate,
+                id,
+                folder,
+            );
             outcomes.push(ItemOutcome::Failed(BatchFailure::new(batch_id, error)));
             continue;
         };
@@ -174,7 +178,7 @@ async fn fetch_ews_outcomes(
         // Class-conditional property shape: a contact / calendar item in a
         // mixed public folder answers a message-shaped GetItem with
         // `ErrorInvalidPropertyRequest`.
-        let shape = account.public_item_shape(id, folder).await;
+        let shape = account.public_folders.public_item_shape(id, folder).await;
         match ews.get_item(&native, shape, &routing.headers()).await {
             Ok(item) if !item.is_mail() => outcomes.push(ItemOutcome::Failed(BatchFailure::new(
                 batch_id,
@@ -347,8 +351,8 @@ async fn fetch_batch(
         .collect();
     let request = BatchRequest { requests };
     let response: BatchResponse = super::batch::submit(
-        &account.client,
-        account.batch_resource(&rest_ids)?,
+        account.mailboxes.primary(),
+        account.mailboxes.batch_resource(&rest_ids)?,
         &request,
     )
     .await?;
@@ -357,7 +361,7 @@ async fn fetch_batch(
         response.responses,
         projection,
         &mut outcomes,
-        &|id| account.budget_for_object(id),
+        &|id| account.mailboxes.budget_for_object(id),
         &replayable,
     );
 
@@ -571,7 +575,7 @@ fn metadata_or_flags(id: &ObjectId, value: &Value) -> HydratedObjectKind {
             if let Some(owner) = parsed_id.owner() {
                 entry
                     .memberships
-                    .push(MembershipScope::Mailbox(bifrost_types::MailboxId(
+                    .push(MembershipScope::Owner(bifrost_types::PrincipalId(
                         owner.to_string(),
                     )));
             }
@@ -644,7 +648,10 @@ fn hydrate_url_for_id(
     select: &str,
 ) -> Result<String, crate::error::GraphError> {
     let parsed = super::foreign::parse_message_id(id);
-    let prefix = account.client_for_owner(parsed.owner())?.api_path_prefix();
+    let prefix = account
+        .mailboxes
+        .client_for_owner(parsed.owner())?
+        .api_path_prefix();
     let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
     Ok(format!("{prefix}/messages/{enc_id}?$select={select}"))
 }
@@ -1054,8 +1061,8 @@ mod tests {
                             .memberships
                             .contains(&MembershipScope::Folder(folder.clone()))
                     );
-                    assert!(entry.memberships.contains(&MembershipScope::Mailbox(
-                        bifrost_types::MailboxId("content@contoso.com".to_string())
+                    assert!(entry.memberships.contains(&MembershipScope::Owner(
+                        bifrost_types::PrincipalId("content@contoso.com".to_string())
                     )));
                 }
                 other => panic!("expected Metadata for {projection:?}, got {other:?}"),
@@ -1181,7 +1188,7 @@ mod tests {
                             "shared@contoso.com",
                             "inbox"
                         )),
-                        MembershipScope::Mailbox(bifrost_types::MailboxId(
+                        MembershipScope::Owner(bifrost_types::PrincipalId(
                             "shared@contoso.com".to_string()
                         )),
                     ]
@@ -1270,7 +1277,7 @@ mod tests {
             Some(FolderId("inbox".to_string()))
         );
         assert_eq!(
-            folder_destination(MembershipScope::Mailbox(bifrost_types::MailboxId(
+            folder_destination(MembershipScope::Owner(bifrost_types::PrincipalId(
                 "shared@contoso.com".to_string()
             ))),
             None
@@ -1352,9 +1359,7 @@ mod tests {
 
         // After a complete discovery pass that did not restore the route,
         // the item stops retrying and is reported gone.
-        account
-            .public_folder_discovery_complete
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        account.public_folders.set_discovery_complete(true);
         let outcomes = fetch_ews_outcomes(&account, &ews, Projection::FlagsOnly).await;
         let [ItemOutcome::Failed(failure)] = outcomes.as_slice() else {
             panic!("missing routing must fail per item: {outcomes:?}");
@@ -1451,6 +1456,7 @@ mod tests {
         if let Some(item) = known_item {
             // Exactly what the inventory / poll walk records.
             account
+                .public_folders
                 .record_public_item_classes(&folder, std::slice::from_ref(&item))
                 .await;
         }

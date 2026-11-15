@@ -67,14 +67,14 @@ fn account_with_shared_mailbox() -> GraphAccount {
 /// A send naming a shared mailbox this account cannot hold.
 ///
 /// Unknownness comes from the value being absent from the fixture's routing
-/// table, not from the string being degenerate: `MailboxId` has no syntax
+/// table, not from the string being degenerate: `PrincipalId` has no syntax
 /// validator, so an empty or malformed id would invite a future validation
 /// layer to reject it for an unrelated reason and quietly stop testing the
 /// routing lookup. Everything else stays default - `scheduled: None`
 /// especially, since a scheduled send is refused before the routing question.
 fn send_as_request() -> SendRequest {
     let mut request = SendRequest::default();
-    request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
+    request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::PrincipalId(
         "contract-unknown-mailbox".to_string(),
     )));
     request
@@ -149,10 +149,7 @@ fn target() -> MutationTarget {
 }
 
 fn event_time() -> EventTime {
-    EventTime {
-        value: "2026-06-02T09:00:00Z".to_string(),
-        timezone: None,
-    }
+    EventTime::from_observed("2026-06-02T09:00:00Z".to_string(), None)
 }
 
 fn event_range() -> EventRange {
@@ -173,7 +170,6 @@ fn event_create() -> EventCreate {
         location: None,
         start: event_time(),
         end: event_time(),
-        is_all_day: false,
         status: EventStatus::Confirmed,
         availability: bifrost_types::EventAvailability::Busy,
         visibility: bifrost_types::EventVisibility::Default,

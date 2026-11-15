@@ -480,6 +480,7 @@ pub(crate) fn message_batch_url(
     // per-item URL builder for four `$batch` surfaces, and the id it could
     // not route is the only thing that makes the failure actionable.
     let prefix = account
+        .mailboxes
         .client_for_owner(parsed.owner())
         .map_err(|error| {
             into_account_error(
@@ -717,6 +718,7 @@ pub(super) async fn submit_write_batch_with_targets(
     operation: AccountOperation,
 ) -> Result<BatchProgress, AccountError> {
     let resource = account
+        .mailboxes
         .batch_resource(targets)
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?;
     submit_write_batch_resource(account, resource, requests, targets, absent, operation).await
@@ -751,10 +753,13 @@ async fn submit_write_batch_resource(
     let expected_ids: Vec<String> = requests.iter().map(|r| r.id.clone()).collect();
     let mut seen_ids = std::collections::HashSet::new();
     let mut progress = BatchProgress::default();
-    let response: BatchResponse =
-        super::super::batch::submit(&account.client, resource, &BatchRequest { requests })
-            .await
-            .map_err(|e| into_account_error(e, ctx.clone()))?;
+    let response: BatchResponse = super::super::batch::submit(
+        account.mailboxes.primary(),
+        resource,
+        &BatchRequest { requests },
+    )
+    .await
+    .map_err(|e| into_account_error(e, ctx.clone()))?;
     // The loop DRAINS every subresponse rather than stopping at the first bad
     // item. `$batch` response order is Graph's, not the caller's: stopping
     // early once left the etag of a message that demonstrably WAS destroyed
@@ -825,7 +830,9 @@ async fn submit_write_batch_resource(
             bifrost_types::BatchItemId(item.id.clone()),
             operation,
             scope,
-            target.as_ref().and_then(|id| account.budget_for_object(id)),
+            target
+                .as_ref()
+                .and_then(|id| account.mailboxes.budget_for_object(id)),
         );
         match outcome {
             bifrost_types::ItemOutcome::Succeeded(success) => {

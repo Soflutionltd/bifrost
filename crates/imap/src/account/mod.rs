@@ -73,11 +73,12 @@ pub use submission::{SmtpSubmissionConfig, SubmissionCredentials, SubmissionTls}
 
 pub(crate) use submission::SubmissionTransport;
 
+pub(crate) use crate::types::set::UidSet;
 pub(crate) use envelope::{
     DecodedObjectId, FolderCursor, decode_cursor, decode_object_id, decode_thread_id,
     encode_cursor, encode_object_id, encode_thread_id,
 };
-pub(crate) use folder_registry::{CompactUidSet, FolderRegistry};
+pub(crate) use folder_registry::FolderRegistry;
 pub(crate) use pool::{Pool, PooledConn};
 
 const STREAM_CAPACITY: usize = 64;
@@ -311,17 +312,15 @@ impl ImapAccount {
                 modseq,
                 baseline: envelope::UidBaseline::Complete(known_uids),
             }) = cursor
-            && let Some(validity) = UidValidity::new(*uidvalidity)
-            && let Some(modseq) = crate::types::ModSeq::new(*modseq)
         {
             // Straight from the compact ranges: the baseline is already
             // sorted and coalesced, and on a large mailbox expanding it into
             // individual UIDs only to re-coalesce them is the entire cost of
             // building the QRESYNC operand.
-            let known_uids = crate::types::UidSet::from_ranges(known_uids.ranges());
+            let known_uids = crate::types::UidSetExpr::from_ranges(known_uids.ranges());
             // Cached state must fail through the operation boundary if the
             // wire operand validator refuses it, rather than panic at runtime.
-            options = options.with_qresync(validity, modseq, known_uids)?;
+            options = options.with_qresync(*uidvalidity, *modseq, known_uids)?;
         }
         Ok(options)
     }
@@ -329,12 +328,12 @@ impl ImapAccount {
     pub(crate) fn cursor_from_select(
         &self,
         selected: &crate::types::SelectedMailbox,
-        known_uids: Option<CompactUidSet>,
+        known_uids: Option<UidSet>,
     ) -> Result<FolderCursor, Error> {
         let uidvalidity = selected_uidvalidity(selected)?;
         let known_uids = known_uids.unwrap_or_default();
         if self.qresync_enabled()
-            && let Some(modseq) = selected.modseq().map(crate::types::ModSeq::get)
+            && let Some(modseq) = selected.modseq()
         {
             return Ok(FolderCursor::QResync {
                 uidvalidity,
@@ -342,7 +341,7 @@ impl ImapAccount {
                 baseline: envelope::UidBaseline::Complete(known_uids),
             });
         }
-        if let Some(modseq) = selected.modseq().map(crate::types::ModSeq::get) {
+        if let Some(modseq) = selected.modseq() {
             return Ok(FolderCursor::Condstore {
                 uidvalidity,
                 modseq,
@@ -351,7 +350,7 @@ impl ImapAccount {
         }
         Ok(FolderCursor::Basic {
             uidvalidity,
-            uidnext: selected.uid_next.unwrap_or_default(),
+            uidnext: selected.uid_next,
             known_uids,
         })
     }
@@ -438,7 +437,7 @@ impl Account for ImapAccount {
     //
     // IMAP's only narrower-than-account throttle is the per-mailbox one
     // `mailbox_throttle` raises for a folder-scoped `[LIMIT]`, which the
-    // engine records as `ThrottleKey::Mailbox { account, mailbox }` keyed on
+    // engine records as `ThrottleKey::Folder { account, folder }` keyed on
     // the folder's name. Every arm below builds that exact key from the same
     // `MailboxName::account_id()` the error producer scopes with, so a recorded
     // hold and the work it should hold meet. Routing follows `route_scope`:
@@ -450,9 +449,9 @@ impl Account for ImapAccount {
         work: bifrost_types::ThrottleWork<'_>,
     ) -> Vec<bifrost_types::ThrottleKey> {
         use bifrost_types::{ThrottleKey, ThrottleWork};
-        let key = |mailbox: &str| ThrottleKey::Mailbox {
+        let key = |mailbox: &str| ThrottleKey::Folder {
             account: account.clone(),
-            mailbox: bifrost_types::MailboxId(mailbox.to_owned()),
+            folder: bifrost_types::FolderId(mailbox.to_owned()),
         };
         match work {
             ThrottleWork::Scope(scope) => {
@@ -1160,15 +1159,18 @@ fn unsupported_stream<T: Send + 'static>(
 /// omission is judged. Zero is also unusable, even for a locally constructed
 /// selection that bypasses the SELECT consumer's completion validation.
 /// It is the SERVER's omission, so it is
-/// `Error::ProtocolMissing` (`Protocol(MissingField)`,
+/// `crate::error::ProviderFailure::Missing` (`Protocol(MissingField)`,
 /// `ProviderContractViolation`) at every account-layer read, never a
 /// caller-blaming `Request(Malformed)`: the one place the classification
 /// lives, so the sync lanes and the PIM primitives cannot drift apart again.
-pub(crate) fn selected_uidvalidity(selected: &crate::types::SelectedMailbox) -> Result<u32, Error> {
-    selected
-        .uid_validity
-        .filter(|value| *value != 0)
-        .ok_or_else(|| Error::ProtocolMissing("SELECT missing or zero UIDVALIDITY".into()))
+pub(crate) fn selected_uidvalidity(
+    selected: &crate::types::SelectedMailbox,
+) -> Result<UidValidity, Error> {
+    selected.uid_validity.ok_or_else(|| {
+        Error::Provider(crate::error::ProviderFailure::Missing(
+            "SELECT missing or zero UIDVALIDITY".into(),
+        ))
+    })
 }
 
 /// Convert a crate-private `crate::Error` into a public `AccountError`
@@ -1507,7 +1509,7 @@ mod scope_router {
         bifrost_types::SkippedScope {
             scope: scope.clone(),
             error: account_error_with(
-                Error::InvalidInput(detail.into()),
+                Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(detail.into())),
                 error::ImapErrorContext::operation(AccountOperation::Discover).with_scope(scope),
             ),
         }
@@ -1636,8 +1638,7 @@ pub(crate) fn membership_scope(folder: &MailboxName) -> MembershipScope {
 #[cfg(test)]
 mod throttle_key_tests {
     use bifrost_types::{
-        Account, AccountId, CursorScope, FolderId, MailboxId, MembershipScope, ThrottleKey,
-        ThrottleWork,
+        Account, AccountId, CursorScope, FolderId, MembershipScope, ThrottleKey, ThrottleWork,
     };
 
     use super::test_support::{StubAccount, scripted_account_parts, stub_arc};
@@ -1646,7 +1647,7 @@ mod throttle_key_tests {
     use crate::types::MailboxName;
 
     /// Every shape of work on one folder declares the SAME key, and it is
-    /// the key a folder-scoped `[LIMIT]` records: `ThrottleKey::Mailbox`
+    /// the key a folder-scoped `[LIMIT]` records: `ThrottleKey::Folder`
     /// over the folder's name, under the account id the engine passes in.
     /// A composed DAV collection is never mistaken for an IMAP mailbox.
     #[tokio::test]
@@ -1665,9 +1666,9 @@ mod throttle_key_tests {
             ..scripted_account_parts(conn, 1)
         });
         let id = AccountId("imap".into());
-        let inbox = vec![ThrottleKey::Mailbox {
+        let inbox = vec![ThrottleKey::Folder {
             account: id.clone(),
-            mailbox: MailboxId("INBOX".into()),
+            folder: FolderId("INBOX".into()),
         }];
 
         let scope = CursorScope::Folder(FolderId("INBOX".into()));
@@ -1677,8 +1678,8 @@ mod throttle_key_tests {
         );
         let object = super::envelope::encode_object_id(
             &MailboxName::new("INBOX").expect("valid mailbox"),
-            7,
-            42,
+            crate::types::UidValidity::new(7).expect("nonzero epoch"),
+            crate::types::Uid::new(42).expect("valid protocol test value"),
         );
         assert_eq!(
             account.throttle_keys(&id, ThrottleWork::Objects(&[object])),

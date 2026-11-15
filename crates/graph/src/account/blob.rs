@@ -163,9 +163,9 @@ async fn fetch_ews_attachment(
         return Err(EwsAttachmentError::NotPublic);
     };
     let folder = bifrost_types::FolderId(folder.to_string());
-    let Some(routing) = account.public_folder_routing(&folder).await else {
+    let Some(routing) = account.public_folders.public_folder_routing(&folder).await else {
         return Err(EwsAttachmentError::MissingRoute(Box::new(
-            account.missing_public_route_error(
+            account.public_folders.missing_public_route_error(
                 AccountOperation::OpenBlob,
                 &ObjectId(locator.message_id.clone()),
                 &folder,
@@ -407,7 +407,10 @@ async fn fetch_raw_stream(
     // fetch routes to `/users/{owner}/messages/{native}/$value`; a primary
     // id keeps `/me`.
     let parsed = super::foreign::parse_message_id(message);
-    let client = account.client_for_owner(parsed.owner()).map_err(Box::new)?;
+    let client = account
+        .mailboxes
+        .client_for_owner(parsed.owner())
+        .map_err(Box::new)?;
     let prefix = client.api_path_prefix();
     let enc_message_id = bifrost_net::url::encode_path_component(parsed.native_id());
     let url = client
@@ -431,6 +434,7 @@ async fn fetch_blob_stream(
     // own - it rides on the message).
     let parsed = super::foreign::parse_message_id(&ObjectId(locator.message_id.clone()));
     let client = account
+        .mailboxes
         .client_for_owner(parsed.owner())
         .map_err(|error| BlobFetchError::Failed(Box::new(error)))?;
     let prefix = client.api_path_prefix();
@@ -501,9 +505,7 @@ mod tests {
             kind: GraphBlobKind::Ews,
         };
         for complete in [false, true] {
-            account
-                .public_folder_discovery_complete
-                .store(complete, std::sync::atomic::Ordering::SeqCst);
+            account.public_folders.set_discovery_complete(complete);
             let mut stream = open_ews_blob_stream(account.clone(), locator.clone());
             let event = futures::StreamExt::next(&mut stream).await.unwrap();
             let SyncEvent::Terminated(error) = event else {
@@ -569,6 +571,7 @@ mod tests {
         // exactly these two pieces: the owner's prefix + the native id.
         assert_eq!(
             account
+                .mailboxes
                 .client_for_owner(parsed.owner())
                 .expect("configured")
                 .api_path_prefix(),
@@ -581,6 +584,7 @@ mod tests {
         let parsed_primary = super::super::foreign::parse_message_id(&primary);
         assert_eq!(
             account
+                .mailboxes
                 .client_for_owner(parsed_primary.owner())
                 .expect("primary")
                 .api_path_prefix(),

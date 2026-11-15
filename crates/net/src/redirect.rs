@@ -254,7 +254,7 @@ pub struct RedirectStep {
     /// if RFC 7231 §6.4 rewriting applied.
     pub next_method: Method,
     /// Resolved absolute URL of the next hop.
-    pub next_url: String,
+    pub next_url: reqwest::Url,
     /// Whether the body should be preserved on the next hop.
     /// `false` means the body is dropped; the HTTP method change to
     /// GET on 301/302/303 forces this.
@@ -373,7 +373,7 @@ pub(crate) fn classify_redirect_with_mode(
 
     Ok(RedirectAction::Follow(RedirectStep {
         next_method,
-        next_url: next_url.into(),
+        next_url,
         preserve_body,
         keep_auth: !cross_host,
     }))
@@ -393,13 +393,8 @@ fn location_to_str(value: &HeaderValue) -> Result<String, Error> {
 /// Canonical scheme/host/effective-port identity for credential admission.
 /// Paths, userinfo and fragments confer no authority.
 #[must_use]
-pub fn origin_key(url: &reqwest::Url) -> Option<String> {
-    Some(format!(
-        "{}://{}:{}",
-        url.scheme(),
-        url.host_str()?.to_ascii_lowercase(),
-        url.port_or_known_default()?
-    ))
+pub fn origin_key(url: &reqwest::Url) -> Option<crate::Origin> {
+    crate::Origin::from_url(url)
 }
 
 /// Same-origin test for the redirect hop's `keep_auth` decision.

@@ -32,11 +32,8 @@ pub struct FolderId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LabelId(pub String);
 
-/// A mailbox identifier. Either a JMAP mailbox id, or - post-A5a, on the
-/// Graph crate - the shared/delegate-mailbox routing key (an SMTP address /
-/// `/users/{id}` path segment) that selects a foreign-mailbox client. On the
-/// public send surface this is the `SendAs` mailbox identity that the Graph
-/// backend routes a draft-create-and-send through.
+/// A native mail container identifier, such as a JMAP mailbox id.
+/// This never names the principal that owns a shared mailbox.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MailboxId(pub String);
 
@@ -47,6 +44,31 @@ impl From<String> for MailboxId {
 }
 
 impl From<&str> for MailboxId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+/// Native mailboxes and folders share container identity at cursor boundaries.
+/// PrincipalId deliberately has no such conversion.
+impl From<&MailboxId> for FolderId {
+    fn from(value: &MailboxId) -> Self {
+        Self(value.0.clone())
+    }
+}
+
+/// Provider-native principal routing identity (a JMAP accountId, Graph user
+/// address/id, or IMAP shared namespace owner). Distinct from a mail container.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PrincipalId(pub String);
+
+impl From<String> for PrincipalId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for PrincipalId {
     fn from(value: &str) -> Self {
         Self(value.to_owned())
     }

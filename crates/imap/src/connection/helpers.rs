@@ -283,7 +283,7 @@ impl ImapConnection {
     ///
     /// **`IMAP4rev1` only.** RFC 9051 removed the CHECK command from
     /// `IMAP4rev2`. On a pure rev2 connection, use [`noop`](Self::noop)
-    /// instead  -  this method returns [`Error::MissingCapability`].
+    /// instead  -  this method returns [`crate::error::LocalRefusal::MissingCapability`].
     pub async fn check(&self, timeout: Duration) -> Result<(), Error> {
         self.require_state(crate::types::CommandKind::Check)?;
         // RFC 9051 removed CHECK; reject when rev2 behavior is active.
@@ -337,13 +337,15 @@ pub(super) fn state_refusal(state: SessionState, allowed: &[SessionState]) -> Op
     if state == SessionState::Logout {
         return Some(Error::closed().with_attempt(bifrost_types::TransmissionState::Unsent));
     }
-    Some(Error::InvalidState(crate::error::LocalFailure::state(
-        crate::error::StateRequirement::LegalStates {
-            actual: state,
-            allowed: allowed.to_vec(),
-        },
-        format!("command not valid in {state:?} state (expected one of {allowed:?})"),
-    )))
+    Some(Error::LocalRefusal(
+        crate::error::LocalRefusal::InvalidState(crate::error::LocalFailure::state(
+            crate::error::StateRequirement::LegalStates {
+                actual: state,
+                allowed: allowed.to_vec(),
+            },
+            format!("command not valid in {state:?} state (expected one of {allowed:?})"),
+        )),
+    ))
 }
 
 #[cfg(test)]

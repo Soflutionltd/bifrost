@@ -199,7 +199,9 @@ impl NotifyEventGroup {
 
     pub(crate) fn validate(&self) -> Result<(), crate::Error> {
         match &self.validation_error {
-            Some(error) => Err(crate::Error::InvalidInput(error.message().into())),
+            Some(error) => Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(error.message().into()),
+            )),
             None => Ok(()),
         }
     }

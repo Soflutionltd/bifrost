@@ -5,6 +5,7 @@
 //! cursor for each affected scope. Output flows to the multiplexer's
 //! broadcast so consumers see a single unified `Change` stream.
 
+use crate::engine::supervisor::ReopenRequest;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -17,8 +18,9 @@ use arc_swap::ArcSwap;
 use crate::cancel::BoundaryView;
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
+use crate::delivery::ChangeDelivery;
 use crate::error::Error;
-use crate::multiplexer::{ChangeDelivery, ChangesEvent, ReopenRequest, drive_changes_stream};
+use crate::multiplexer::{ChangesEvent, drive_changes_stream};
 
 pub struct Reconciler {
     pub account_id: AccountId,
@@ -35,7 +37,7 @@ pub struct Reconciler {
     /// Engine-wide throttle bucket. The reconciler honors account-wide
     /// deadlines before driving a hinted scope and records deadlines
     /// its own Retry outcomes carry.
-    pub throttles: Arc<crate::recovery::ThrottleBucket>,
+    pub throttles: Arc<crate::throttle::ThrottleBucket>,
     pub scheduler: crate::scheduler::Scheduler,
     /// The multiplexer's per-scope poll tokens, shared rather than copied.
     ///
@@ -119,7 +121,7 @@ impl Reconciler {
             let ready: Vec<_> = deferred
                 .iter()
                 .filter(|scope| {
-                    crate::recovery::throttle_wait(
+                    crate::throttle::throttle_wait(
                         &self.throttles,
                         &self.account_id,
                         &self.scope_keys(scope),
@@ -171,7 +173,7 @@ impl Reconciler {
 
     /// Declared throttle keys for one scope's drive.
     fn scope_keys(&self, scope: &CursorScope) -> Vec<bifrost_types::ThrottleKey> {
-        crate::recovery::declared_keys(
+        crate::throttle::declared_keys(
             self.account.load_full().as_ref().as_ref(),
             &self.account_id,
             bifrost_types::ThrottleWork::Scope(scope),
@@ -185,7 +187,7 @@ impl Reconciler {
             .iter()
             .map(|scope| {
                 let keys = self.scope_keys(scope);
-                crate::recovery::throttle_wait(&self.throttles, &self.account_id, &keys)
+                crate::throttle::throttle_wait(&self.throttles, &self.account_id, &keys)
                     .unwrap_or_default()
             })
             .min()
@@ -269,7 +271,7 @@ impl Reconciler {
                         }
                         let account_swap = &admitted.incarnation;
                         let account: &dyn Account = account_swap.as_ref().as_ref();
-                        let final_keys = crate::recovery::declared_keys(
+                        let final_keys = crate::throttle::declared_keys(
                             account, &account_id, bifrost_types::ThrottleWork::Scope(&scope),
                         );
                         let outcome = drive_changes_stream(
@@ -462,7 +464,7 @@ impl Reconciler {
         keys: &[bifrost_types::ThrottleKey],
         deferred: &mut HashSet<CursorScope>,
     ) {
-        if crate::recovery::throttle_wait(&self.throttles, &self.account_id, keys).is_some() {
+        if crate::throttle::throttle_wait(&self.throttles, &self.account_id, keys).is_some() {
             deferred.insert(scope.clone());
         }
     }
@@ -564,7 +566,7 @@ mod tests {
                 shutdown: shutdown.clone(),
                 control,
                 reopen_tx,
-                throttles: Arc::new(crate::recovery::ThrottleBucket::new()),
+                throttles: Arc::new(crate::throttle::ThrottleBucket::new()),
                 scheduler,
                 scope_tokens: tokens,
                 account_generation: tokio::sync::watch::channel(

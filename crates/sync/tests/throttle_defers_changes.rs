@@ -1,6 +1,6 @@
 //! A recorded throttle deadline actually defers `changes_stream`.
 //!
-//! The throttle bucket's mechanics are unit-pinned in `recovery.rs` - key
+//! The throttle bucket's mechanics are unit-pinned in `throttle.rs` - key
 //! resolution, max-of-overlapping records, expiry. None of that
 //! proves the engine OBSERVES a deadline: the recorder and the reader could
 //! both be correct and still never meet, because the reader ran on a

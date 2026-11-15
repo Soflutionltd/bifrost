@@ -111,19 +111,11 @@ pub(super) fn uid_range(input: &[u8]) -> IResult<&[u8], UidRange> {
     } else {
         (input, None)
     };
-    // Postel's law (RFC 1122 Section 1.2.2): normalize reversed ranges
-    // where start > end. Some non-conformant servers emit descending ranges
-    // (e.g., `100:1`). Swap the endpoints so start <= end, consistent with
-    // the expected UID ordering (RFC 3501 Section 9).
-    let (start, end) = match second {
-        Some(end) if first > end => (end, Some(first)),
-        other => (first, other),
-    };
     Ok((
         input,
-        match end {
-            Some(end) => UidRange::range(start, end),
-            None => UidRange::single(start),
+        match second {
+            Some(end) => UidRange::range(first, end),
+            None => UidRange::single(first),
         },
     ))
 }

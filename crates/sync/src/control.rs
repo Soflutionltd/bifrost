@@ -10,13 +10,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, Cause, Checkpoint, Control,
-    CursorScope, DurableCheckpointSet, Partition, Priority, StateCause,
+    AccountError, AccountId, Checkpoint, Control, CursorScope, DurableCheckpointSet, Partition,
+    Priority,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::cancel::{Boundary, BoundaryRequest};
+use crate::engine_errors::control_wait_ended;
+#[cfg(test)]
+use bifrost_types::{AccountErrorKind, Cause, StateCause};
 
 /// Retained account run state, including the reason for a pause.
 #[derive(Debug, Clone)]
@@ -671,19 +674,6 @@ impl SyncControl {
             }
         }
     }
-}
-
-/// The error a `pause` / `checkpoint_now` waiter returns when the account
-/// can no longer reach the boundary it asked for.
-fn control_wait_ended(detail: &'static str) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::ControlWaitEnded,
-        Cause::State(StateCause::ControlWaitEnded {
-            detail: bifrost_types::DiagnosticText::support_only(detail),
-        }),
-    )
-    .try_build()
-    .expect("valid account error classification")
 }
 
 /// Restores the boundary request `checkpoint_now` displaced, whichever

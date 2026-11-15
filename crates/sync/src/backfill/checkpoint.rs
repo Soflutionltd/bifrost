@@ -7,12 +7,10 @@
 
 use std::sync::Arc;
 
-use bifrost_types::{AccountId, BackfillCheckpoint, Checkpoint};
-use tokio::sync::{mpsc, oneshot};
-
 use crate::cursor::store::{CheckpointTransition, DynCheckpointStore};
+use crate::engine::writer::WriterHandle;
 use crate::error::Error;
-use crate::multiplexer::WriterRequest;
+use bifrost_types::{AccountId, BackfillCheckpoint, Checkpoint};
 
 /// Where a `BackfillCheckpointWriter` sends its durable writes.
 ///
@@ -31,13 +29,13 @@ pub struct BackfillCheckpointTarget {
 
 #[derive(Clone)]
 enum TargetRoute {
-    Writer(mpsc::Sender<WriterRequest>),
+    Writer(WriterHandle),
     Store(Arc<DynCheckpointStore>),
 }
 
 impl BackfillCheckpointTarget {
     /// Route writes through the account's single durable writer.
-    pub(crate) fn attached(tx: mpsc::Sender<WriterRequest>) -> Self {
+    pub(crate) fn attached(tx: WriterHandle) -> Self {
         Self {
             inner: TargetRoute::Writer(tx),
         }
@@ -89,13 +87,7 @@ impl BackfillCheckpointWriter {
     /// ledger, because a spurious `Complete` discharges debt nothing re-read.
     pub async fn persist(&self, checkpoint: BackfillCheckpoint) -> Result<(), Error> {
         match &self.store.inner {
-            TargetRoute::Writer(tx) => {
-                let (done, wait) = oneshot::channel();
-                tx.send(WriterRequest::PersistBackfill { checkpoint, done })
-                    .await
-                    .map_err(|_| Error::ShuttingDown)?;
-                wait.await.map_err(|_| Error::ShuttingDown)?
-            }
+            TargetRoute::Writer(writer) => writer.persist_backfill(checkpoint).await,
             TargetRoute::Store(store) => {
                 let ledger = store.get_ledger(&self.account_id).await?;
                 store

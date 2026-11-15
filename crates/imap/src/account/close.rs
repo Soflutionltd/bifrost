@@ -76,7 +76,10 @@ pub(crate) fn close(account: ImapAccount) -> AccountFuture<Result<(), AccountErr
 
 fn teardown_error(detail: &str) -> AccountError {
     super::account_error_with(
-        crate::Error::LocalRuntime(detail.to_string()),
+        crate::Error::Internal {
+            kind: crate::error::InternalFailure::Runtime(detail.to_string()),
+            mid_exchange: None,
+        },
         super::error::ImapErrorContext::operation(bifrost_types::AccountOperation::Close),
     )
 }

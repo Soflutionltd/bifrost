@@ -128,6 +128,12 @@ fresh wire request: governor debit + outbound metering + body send
 (`send_streaming`) share `send_streaming_inner`; the buffered path
 drains the body through the same metering reader.
 
+URL text is parsed at request construction; a malformed URL is a deferred
+`InvalidRequest` raised before admission or credential lookup. `AccountNet::request`
+also accepts an owned `reqwest::Url`. Exchange hops, redirect steps and redirect
+guards carry parsed URLs through credential admission, quota resolution and wire
+request construction, without serializing and reparsing targets between hops.
+
 `AccountNet::session_request(method, &SessionUrl)` is the shared constructor for
 provider-admitted pre-authenticated session URLs. It suppresses account bearer
 authentication, redacts transport-generated URL error text and disables redirects
@@ -147,6 +153,51 @@ enterprise users expect the upload credential and payload to remain on the
 provider-admitted destination.
 Graph's anonymous auxiliary requests and both Drive session sends use this door;
 Outlook audience selection and provider upload sequencing remain provider-owned.
+
+### Exchange core and statuses as data
+
+The public exchange surface is `RequestBuilder` with `HopPolicy`,
+`RequestDeadline` and the buffered/streaming response types. Internally,
+`exchange::Hop` owns the changing method, URL, payload, credential flags,
+replay declaration and resolved rate key. Its follow operation applies method
+and body rewriting, protocol header admission, credential stripping and quota
+re-resolution together. The walker owns independent retry/auth/redirect budgets
+and one attempt ledger. Every pass-through uses one response constructor;
+metering, deadlines and concurrency claims remain attached until body completion
+or drop.
+
+`RequestDeadline::from_timeout(Some(duration))` starts an absolute deadline.
+Pass the same value to `RequestBuilder::deadline` across several protocol legs.
+`None` is unbounded. Its wait helpers distinguish pre-dispatch, in-flight and
+acknowledged-body expiry. A later timeout/deadline setter replaces the earlier
+choice. Session request builders expose the same deadline and status selection
+without widening their locked destination policy.
+
+`RequestBuilder::statuses_as_data(statuses)` replaces the request's selection.
+A selected status returns immediately through the normal response-body path,
+before diagnostic draining, error observation, 401 refresh, status retries or
+redirect following. This includes explicitly selected 401 and 3xx statuses.
+Unselected statuses keep the existing transport policy. Enterprise consumers
+need complete precondition and fallback responses without pretending a response
+was a transport failure. Selected bodies therefore use the buffered response
+ceiling, inactivity timeout, bandwidth admission and absolute deadline, rather
+than the smaller diagnostic cap. Streaming leaves body ownership with the caller.
+
+`Response::evidence()` exposes the ordered exchange ledger and diagnostics,
+including terminal status metadata. `StreamingResponse::ledger` exposes the
+same wire outcomes; its body retains diagnostic history for any later failure.
+Credential-URL response history is redacted before exposure. Selecting a status
+does not erase an earlier possible commit.
+
+If the provider rejects a buffered response, `Response::into_status_error()`
+keeps its ledger and earlier diagnostic history and caps the terminal body.
+Pass that error to `into_account_error_with_throttle_scope` with the provider's
+`HttpErrorPolicy` to use the shared HTTP classification. An ambiguous 5xx on
+a non-replayable write still requires reconciliation, even when no earlier
+attempt exists; a direct 412 remains a state conflict. Protocol-specific status
+interpretation remains the caller's decision, guided by the retained evidence.
+DAV's existing status reconstruction remains a consumer of the default error
+mode until its dispatch explicitly selects statuses as data.
 
 ### Shared provider holds and error observation
 
@@ -245,7 +296,7 @@ success or pass-through streaming responses. Protocol crates can keep a
 request's gate, observer, cost and concurrency attribution on one API surface.
 
 `RequestBuilder::observe_errors(callback)` observes responses with status
->= 400 before authentication recovery or retry decisions. It receives a
+>= 400 that remain transport errors, before authentication recovery or retry\ndecisions. Selected statuses-as-data bypass this observer. It receives a
 `FinalResponse` containing the existing capped diagnostic prefix, including
 any truncation or read-failure marker, rather than an unlimited body. The same
 read supplies the eventual error evidence; the body is not drained twice.
@@ -316,7 +367,7 @@ error, never as a clean end-of-stream, or `send()` would hand back a prefix of
 the payload as though it were the whole response.
 
 Because `read_timeout` is the only inactivity bound and it is per-account, every
-body drain must apply it. Terminal statuses go through
+body drain must apply it. Unselected error statuses go through
 `read_capped_response_body(response, account, deadline)`, never
 `reqwest::Response::bytes()`: a server that sends 4xx headers and then stalls
 mid-body would otherwise block forever, and the google and graph accounts set no
@@ -397,10 +448,10 @@ reach.
 Two contract facts a consumer scripting statuses must know, both
 pinned in `tests/test_support_seam.rs`:
 
-- The retry loop turns every 4xx and 5xx into `Err` before a response
-  surfaces. Only a 2xx and a passed-through 3xx reach a caller as
-  `Ok(Response)`. A branch that matches a 4xx off an `Ok` is dead on
-  the production path.
+- By default the retry loop turns every 4xx and 5xx into `Err`.
+  A 2xx or passed-through 3xx reaches a caller as `Ok(Response)`.
+  `statuses_as_data` explicitly selects additional statuses for that
+  response path; scripting an error response alone does not select it.
 - An exhausted script panics rather than falling through to the
   network, so an under-scripted test fails loudly instead of dialing
   a real socket.
@@ -1310,7 +1361,7 @@ the complete request before dispatch. The ordinary redirect guard and trust
 allowlist still apply. DAV's stricter complete-origin gate is an additional
 requirement, never an exception to transport admission.
 
-`origin_key` supplies canonical scheme/host/effective-port identity to both net's
+`origin_key` returns an `Origin`, the canonical scheme/host/effective-port identity used by net's
 `same_origin` comparison and DAV's credential gate. Explicit default ports and
 host case compare equal; a different port or scheme cannot inherit credentials.
 The shared `DEFAULT_MAX_HOPS` is ten: sufficient for enterprise discovery and
@@ -1514,7 +1565,7 @@ pub struct NetErrorContext {
 pub fn into_account_error_with_throttle_scope(
     error: Error,
     ctx: NetErrorContext,
-    throttle_scope: Option<ThrottleScope>,
+    policy: impl Into<HttpErrorPolicy>,
 ) -> AccountError;
 ```
 
@@ -1524,11 +1575,44 @@ conversion attaches `Cause::Attempt` when target-attempt evidence
 exists, preserves request / trace ids and capped body text from
 `Status`, `RateLimited`, and status-backed `RetryBudgetExhausted`,
 and leaves provider JSON interpretation to JMAP, Gmail, and Graph. The
-throttle-scope argument carries the caller's policy through net's generic
-status and local-hold mappings. Graph, Google, JMAP and DAV funnels pass their
+policy argument carries status overrides, resource hints, throttle scope and
+an optional throttle budget through net's generic status, attempt-history and
+local-hold mappings. `Option<ThrottleScope>` is accepted for callers needing
+only the common status table. Graph, Google, JMAP and DAV funnels pass their
 documented scope explicitly. `None` leaves throttle scope unset; net does not
 infer policy from the provider or protocol. `parse_retry_after_hint` is the
 shared parser for both transport waits and structured error evidence.
+
+### Shared HTTP status classification
+
+`http_status::classify_status(code, scope, retry_hint, StatusPolicy)` owns the
+HTTP table for net, DAV, Graph, Google and JMAP problem details. It returns a
+`StatusClass { kind, cause, throttles }`. Typed provider body signals take
+precedence; provider fallback policies declare only exceptions and resource
+hints. An enterprise user expects the same refusal to recover the same way
+whether it arrives as JSON, problem details or a proxy's plain body.
+
+The common table maps 400/413/422 to `Request(Malformed)` with a malformed
+request cause, 401 to reauthorization, 403 to permission denied, 404 to
+`NotFound` when context names a resource (otherwise a status-bearing server
+error), 409/412 to a state conflict, and 410 to cursor invalid only on a cursor
+scope. 408/502/503/504 are unavailable, 429 is rate limited, and 507 is quota
+exhausted. Other statuses, including 500 and unknown 5xx, retain net's
+`Server(Error { status })` classification; shared recovery still retries HTTP
+5xx server errors. Failed preconditions refresh state;
+payload refusals identify malformed requests. Neither decision depends on the
+body format. Provider-typed transient failures still override the fallback.
+
+DAV declares 423 as a conflict and supplies its dialect's resource. Graph
+declares cursor-context 400 as cursor invalid. Google declares history-endpoint
+400/404/410 as cursor invalid and supplies its resource hint. Cursor overrides
+require a cursor scope. JMAP overrides only its typed problem types.
+
+`HttpErrorPolicy::apply_throttle` stamps the provider scope and optional budget
+once when `StatusClass::throttles` is true, including classifications refined
+by typed provider signals. DAV dispatch does not restamp net errors; Graph
+passes its mailbox budget into net instead of rebuilding the returned error
+to add that budget. Non-throttle classifications carry neither annotation.
 
 ## Status-line helpers
 
@@ -1591,7 +1675,7 @@ crates/net/src/
   config.rs       // process-wide NetConfig + with_root_cert
   net.rs          // Net + AccountNet; shared_default; attach/detach;
                   // download_stream
-  request.rs      // RequestBuilder + Response/StreamingResponse;
+  exchange.rs     // Hop transitions + public absolute RequestDeadline\n  request.rs      // RequestBuilder + Response/StreamingResponse;
                   // Dispatch seam, retry loop, redirect walk
   redirect.rs     // FollowRedirects + RedirectPolicy + classify_redirect
                   // (RFC 7231 section 6.4 method rewriting, trusted-host
@@ -1754,11 +1838,15 @@ when an in-flight future is dropped.
 
 ## Credential destination admission
 
-`TrustedOrigins` owns exact HTTP(S) origin membership and mints `AdmittedUrl`
+`TrustedOrigins` stores `Origin` values, not resource URLs, and mints `AdmittedUrl`
 proofs. It rejects userinfo, including empty userinfo discarded by URL parsing.
 Cloning copies the set, so DAV discovery cannot widen a sibling protocol leg.
 `AccountNet::admitted_request` sends the proof's canonical URL; a proof does
 not grant authority over another account's configured origins.
+`admit_url` accepts an already parsed target; raw input goes through `admit` so
+lexical userinfo is checked before parsing erases it. `AdmittedUrl::as_url`
+exposes the admitted parsed target, and `Origin` contains no path, query,
+fragment or credential text.
 
 `AccountSpec::trusted_origins` optionally restricts automatic account bearer
 injection and caller-supplied Authorization headers. A configured empty set refuses all destinations. The shared request

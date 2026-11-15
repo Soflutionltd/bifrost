@@ -103,6 +103,7 @@ pub(super) async fn search_message_rows(
     let mut skipped_scopes: Vec<SkippedScope> = Vec::new();
     let (client, page) = loop {
         let client = account
+            .mailboxes
             .client_for_owner(owner.as_deref())
             .map_err(|error| into_account_error(error, GraphErrorContext::graph(operation)))?;
         let ctx = GraphErrorContext::graph(operation);
@@ -146,7 +147,7 @@ pub(super) async fn search_message_rows(
                 let Some(mailbox) = owner.as_deref() else {
                     return Err(into_account_error(error, ctx));
                 };
-                let scope = ErrorScope::Mailbox {
+                let scope = ErrorScope::Owner {
                     id: (mailbox.to_string()).into(),
                 };
                 let error = into_account_error(error, ctx.with_scope(scope.clone()));
@@ -280,7 +281,7 @@ pub(super) fn encode_search_cursor(
 /// order it visits them. Sorted, so the walk order does not ride on
 /// `HashMap` iteration order and two runs of the same account agree.
 pub(super) fn search_mailboxes(account: &GraphAccount) -> Vec<String> {
-    let mut mailboxes: Vec<String> = account.shared_clients.keys().cloned().collect();
+    let mut mailboxes: Vec<String> = account.mailboxes.shared().keys().cloned().collect();
     mailboxes.sort_unstable();
     mailboxes
 }

@@ -1,28 +1,36 @@
+use crate::dialect::CalDavDialect;
+use bifrost_dav_core::append_path;
+use bifrost_dav_core::collection::{COLLECTION_PAGE_SIZE, Dialect};
+use bifrost_dav_core::collection_account::{
+    CollectionSnapshot, DavCollectionAccount, IdleLifecycle, RelocateFailure,
+};
+#[cfg(test)]
+use bifrost_dav_core::{encode_watermark_cursor, slice_after_watermark, sorted_candidate_hrefs};
+#[cfg(test)]
+use std::collections::HashSet;
+type Kernel = DavCollectionAccount<CalDavDialect>;
 use bifrost_dav_core::{
-    DavHrefKey, DavProtocol, SnapshotEntry, append_path, dav_href_key, decode_snapshot,
-    decode_watermark_cursor, diff_snapshots, encode_snapshot, encode_watermark_cursor,
-    inventory_entry as inventory_entry_from_snapshot, object_change, preserve_unobserved_entries,
-    same_dav_url, slice_after_watermark, sorted_candidate_hrefs, worse_recovery,
+    DavHrefKey, SnapshotEntry, dav_href_key, object_change, preserve_unobserved_entries,
+    same_dav_url,
 };
 use bifrost_types::{
     Application, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets, TargetRef,
     TargetRole,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Instant;
 
 use bifrost_types::*;
 use bytes::Bytes;
-use futures::{FutureExt, StreamExt, stream};
+#[cfg(test)]
+use futures::StreamExt;
+use jiff::civil;
 use jiff::tz::Offset;
-use jiff::{Timestamp, civil};
-use reqwest::Url;
 
 use crate::capabilities::{caldav_capabilities, scheduling_available};
 use crate::client::{
     CalDavClient, FilteredHrefs, HrefQuery, PutCondition, event_scope, extend_candidates,
-    local_error, missing_event_error, unsupported_error,
+    missing_event_error, unsupported_error,
 };
 use crate::ical::{
     EventProjectionError, PatchError, ReplyError, WriteError, create_to_ical, event_from_ical,
@@ -31,17 +39,6 @@ use crate::ical::{
 use crate::parse::CalendarCollection;
 use crate::{CalDavConfig, CalDavCredentials};
 
-// Version 2 changes snapshot ids from base-URL-relative to request-URI-relative.
-//
-// Accepted cost of that bump, recorded so it is not rediscovered as a bug: a
-// v1 cursor is REFUSED by `decode_cursor_snapshot` rather than migrated - a v1
-// payload is byte-identical in shape to a v2 one, so the ids cannot be
-// distinguished and rewritten, only re-derived - so every consumer holding a
-// pre-bump cursor pays one full re-sync per DAV account, once. That is a
-// one-time cost against ids that were silently wrong, which was worth paying.
-// Pinned by `event_cursor_rejects_the_base_relative_id_version`.
-const CURSOR_ENVELOPE_VERSION: u32 = 2;
-const CURSOR_MAGIC: &[u8] = b"CALDAVET1";
 /// How many `sync-collection` REPORTs one poll may spend draining an RFC 6578
 /// truncated result. A bound rather than an unbounded loop: a server that keeps
 /// reporting truncation must not hold one poll on the wire forever, and what is
@@ -57,38 +54,7 @@ const SYNC_TRUNCATION_ROUNDS: usize = 16;
 /// `CONTACT_PAGE_SIZE`. An explicit `limit` is honoured as given, however large,
 /// and continuation rides `page_cursor`. Changing this value changes what a
 /// published method returns.
-const EVENT_PAGE_SIZE: usize = 250;
-
-/// No dynamic scope events are available, but exhaustion would make the
-/// consumer reconnect. Keep every subscription alive until account shutdown.
-#[derive(Debug)]
-struct IdleLifecycle {
-    sender: std::sync::Mutex<Option<futures::channel::oneshot::Sender<()>>>,
-    shutdown: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
-}
-
-impl Default for IdleLifecycle {
-    fn default() -> Self {
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        Self {
-            sender: std::sync::Mutex::new(Some(sender)),
-            shutdown: receiver.shared(),
-        }
-    }
-}
-
-impl IdleLifecycle {
-    fn stream(&self) -> AccountStream<bifrost_types::ScopeLifecycleEvent> {
-        Box::pin(stream::pending().take_until(self.shutdown.clone()))
-    }
-
-    fn close(&self) {
-        let sender = self.sender.lock().expect("lifecycle lock poisoned").take();
-        if let Some(sender) = sender {
-            let _ = sender.send(());
-        }
-    }
-}
+const EVENT_PAGE_SIZE: usize = COLLECTION_PAGE_SIZE;
 
 #[derive(Debug)]
 pub(crate) struct CalDavAccount {
@@ -99,8 +65,8 @@ pub(crate) struct CalDavAccount {
     /// The collection a call that names no calendar routes to, and `None` when
     /// the home enumerated no collections.
     ///
-    /// Deliberately not the calendar home in that case. See
-    /// `no_default_calendar`.
+    /// Deliberately not the calendar home in that case. See the shared kernel
+    /// default-collection policy.
     pub(crate) default_calendar_url: Option<String>,
     pub(crate) calendar_urls: Vec<String>,
     rsvp_email: Option<String>,
@@ -216,7 +182,7 @@ impl CalDavAccount {
         }
         default_calendar_url
             .map(str::to_string)
-            .ok_or_else(|| no_default_calendar(operation))
+            .ok_or_else(|| Kernel::no_default(operation))
     }
 
     fn map_calendar(collection: CalendarCollection) -> Calendar {
@@ -261,49 +227,16 @@ impl CalDavAccount {
         body: String,
         content_changed: bool,
     ) -> Result<(), RelocateFailure> {
-        let destination = append_path(target_calendar, &resource_file_name(source_url));
-        if client
-            .move_resource(source_url, &destination, AccountOperation::EventUpdate)
-            .await
-            .map_err(RelocateFailure::Before)?
-        {
-            if !content_changed {
-                return Ok(());
-            }
-            // The move is done and the id has changed. A failure here is a
-            // half-applied request, not a failed one.
-            return client
-                .put_event(
-                    &destination,
-                    body,
-                    PutCondition::None,
-                    AccountOperation::EventUpdate,
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| RelocateFailure::MovedThenPut { destination, error });
-        }
-        // No MOVE support: copy first, then remove the original. Ordered this
-        // way round because a failed copy leaves the event exactly where it
-        // was, while a failed delete leaves it readable in two places - the
-        // recoverable direction of a non-atomic pair.
-        client
-            .put_event(
-                &destination,
-                body,
-                PutCondition::IfNoneMatch,
-                AccountOperation::EventUpdate,
-            )
-            .await
-            .map_err(RelocateFailure::Before)?;
-        client
-            .delete_event(source_url, AccountOperation::EventUpdate)
-            .await
-            .map_err(|error| RelocateFailure::CopiedThenDelete {
-                destination,
-                source: source_url.to_owned(),
-                error,
-            })
+        Kernel::relocate(
+            client.collection_dispatch(),
+            source_url,
+            target_calendar,
+            body,
+            content_changed,
+            AccountOperation::EventUpdate,
+            || format!("{}.{}", new_uid(), CalDavDialect::FILE_EXTENSION),
+        )
+        .await
     }
 
     async fn fetch_event_from_url(
@@ -324,7 +257,7 @@ impl CalDavAccount {
             Some(calendar) => client.resolve_url(&calendar.0),
             None => event_calendar_url(&url)
                 .or(default_calendar_url)
-                .ok_or_else(|| no_default_calendar(operation))?,
+                .ok_or_else(|| Kernel::no_default(operation))?,
         };
         let fetched = client.get_event(&url, operation).await.map_err(|error| {
             error
@@ -392,53 +325,13 @@ impl CalDavAccount {
         let listing = client
             .list_event_hrefs_filtered(calendar, operation)
             .await?;
-        // COMPLETE inventory coverage cannot discharge a refused member. Fail
-        // before emitting either items or a checkpoint, retaining its status.
-        if operation == AccountOperation::SyncInventory
-            && let Some(failure) = listing.failed.first()
-        {
-            return Err(
-                match failure
-                    .status
-                    .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
-                {
-                    Some(status) => bifrost_dav_core::status_error(
-                        &reqwest::header::HeaderMap::new(),
-                        operation,
-                        status,
-                        format!("inventory member refused: {}", failure.href),
-                        DavProtocol::CalDav,
-                    ),
-                    None => bifrost_dav_core::parse_error(
-                        operation,
-                        "inventory member omitted usable properties",
-                        DavProtocol::CalDav,
-                    ),
-                },
-            );
-        }
-        let failed_hrefs = listing.failed_hrefs();
-        let mut entries = listing
-            .entries
-            .into_iter()
-            .map(|entry| EventSnapshotEntry {
-                uri: entry.uri,
-                etag: entry.etag.map(Into::into),
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.uri.cmp(&right.uri));
-        let observation = preserve_unobserved_entries(&[], &mut entries, &failed_hrefs);
-        let sync_token = observation.advance_token(None, sync_token);
-        Ok(EventSnapshot {
-            calendar_url: calendar.to_string(),
-            sync_token,
-            entries,
-            failed_hrefs,
-        })
+        Kernel::snapshot_from_listing(calendar, sync_token, listing, operation)
     }
 }
 
 impl Account for CalDavAccount {
+    bifrost_dav_core::dav_unsupported_account_methods!(CalDavDialect);
+
     fn protocol(&self) -> bifrost_types::Protocol {
         bifrost_types::Protocol::CalDav
     }
@@ -464,29 +357,7 @@ impl Account for CalDavAccount {
     }
 
     fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>> {
-        let scopes = self
-            .calendar_urls
-            .iter()
-            .cloned()
-            .map(|url| CursorScope::FolderType {
-                folder: bifrost_types::FolderId(url),
-                ty: ObjectType::CalendarEvent,
-            })
-            .collect();
-        Box::pin(stream::iter([
-            SyncEvent::Batch(Batch {
-                items: scopes,
-                page_boundary: PageBoundary::Final,
-                server_latency: Default::default(),
-                bytes_in: 0,
-                checkpoint: None,
-            }),
-            SyncEvent::Done(None),
-        ]))
-    }
-
-    fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>> {
-        unsupported_stream(AccountOperation::DiscoverMemberships)
+        Kernel::discover_scopes(self.calendar_urls.iter().cloned())
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
@@ -498,85 +369,26 @@ impl Account for CalDavAccount {
         scope: CursorScope,
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
         let client = Arc::clone(&self.client);
-        let default_calendar = self.default_calendar_url.clone();
-        let calendar_urls = self.calendar_urls.clone();
-        Box::pin(async move {
-            validate_event_scope(&scope, AccountOperation::EstablishCursor)?;
-            let calendar = collection_url_for_scope(
-                &scope,
-                default_calendar.as_deref(),
-                &calendar_urls,
-                AccountOperation::EstablishCursor,
-            )?;
-            let snapshot =
-                Self::event_snapshot(&client, &calendar, AccountOperation::EstablishCursor).await?;
-            Ok(CursorEstablishment::Ready(cursor_from_snapshot(
-                scope, &snapshot,
-            )))
-        })
+        Kernel::establish(
+            scope,
+            self.default_calendar_url.clone(),
+            self.calendar_urls.clone(),
+            move |collection| async move {
+                Self::event_snapshot(&client, &collection, AccountOperation::EstablishCursor).await
+            },
+        )
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         let (client, tally) = self.client.metered();
-        let default_calendar = self.default_calendar_url.clone();
-        let calendar_urls = self.calendar_urls.clone();
-        let coverage_scope = scope.clone();
-        let coverage_domain = collection_coverage_domain(
-            coverage_scope,
-            scope_collection_url(&scope, default_calendar.as_deref()),
-        );
-        // COMPLETE coverage is an accurate claim here: this walk terminates
-        // wholesale on any failure, so it never advances a checkpoint across a
-        // gap. A version that starts absorbing per-item failures must build
-        // `InventoryBatch` directly rather than converting.
-        Box::pin(
-            stream::once(async move {
-                let mut events = Vec::new();
-                if let Err(error) = validate_event_scope(&scope, AccountOperation::SyncInventory) {
-                    events.push(SyncEvent::Terminated(error));
-                    return events;
-                }
-                let calendar = match collection_url_for_scope(
-                    &scope,
-                    default_calendar.as_deref(),
-                    &calendar_urls,
-                    AccountOperation::SyncInventory,
-                ) {
-                    Ok(calendar) => calendar,
-                    Err(error) => {
-                        events.push(SyncEvent::Terminated(error));
-                        return events;
-                    }
-                };
-                let started = Instant::now();
-                let snapshot =
-                    match Self::event_snapshot(&client, &calendar, AccountOperation::SyncInventory)
-                        .await
-                    {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            events.push(SyncEvent::Terminated(error));
-                            return events;
-                        }
-                    };
-                let checkpoint = cursor_from_snapshot(scope, &snapshot);
-                let items = snapshot
-                    .entries
-                    .iter()
-                    .map(inventory_entry_from_snapshot)
-                    .collect();
-                events.push(SyncEvent::Batch(Batch {
-                    items,
-                    page_boundary: PageBoundary::Final,
-                    server_latency: started.elapsed(),
-                    bytes_in: tally.take(),
-                    checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
-                }));
-                events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
-                events
-            })
-            .flat_map(stream::iter)
-            .map(bifrost_types::lift_complete_walk(coverage_domain)),
+        Kernel::inventory(
+            scope,
+            self.default_calendar_url.clone(),
+            self.calendar_urls.clone(),
+            tally,
+            move |collection| async move {
+                Self::event_snapshot(&client, &collection, AccountOperation::SyncInventory).await
+            },
         )
     }
 
@@ -599,61 +411,11 @@ impl Account for CalDavAccount {
         }
     }
 
-    fn get_stream(
-        &self,
-        _ids: AccountStream<ObjectId>,
-        _projection: Projection,
-    ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
-        unsupported_stream(AccountOperation::Hydrate)
-    }
-
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
         let (client, tally) = self.client.metered();
-        Box::pin(
-            stream::once(async move {
-                let mut events = Vec::new();
-                let previous = match decode_cursor_snapshot(&cursor) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        events.push(SyncEvent::Terminated(error));
-                        return events;
-                    }
-                };
-                let started = Instant::now();
-                let (current, changes) = match changes_from_cursor(&client, &previous).await {
-                    Ok(result) => result,
-                    Err(error) => {
-                        events.push(SyncEvent::Terminated(error));
-                        return events;
-                    }
-                };
-                let checkpoint = cursor_from_snapshot(cursor.scope, &current);
-                events.push(SyncEvent::Batch(Batch {
-                    items: changes,
-                    page_boundary: PageBoundary::Final,
-                    server_latency: started.elapsed(),
-                    bytes_in: tally.take(),
-                    checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
-                }));
-                events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
-                events
-            })
-            .flat_map(stream::iter),
-        )
-    }
-
-    fn push_subscribe(
-        &self,
-        _scopes: &[CursorScope],
-    ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
-        unsupported_future(AccountOperation::PushSubscribe)
-    }
-
-    fn push_unsubscribe(
-        &self,
-        _handle: SubscriptionHandle,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::PushUnsubscribe)
+        Kernel::changes(cursor, tally, move |previous| async move {
+            changes_from_cursor(&client, &previous).await
+        })
     }
 
     fn push_stream(
@@ -671,281 +433,8 @@ impl Account for CalDavAccount {
         ]))
     }
 
-    fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {
-        unsupported_stream(AccountOperation::OpenBlob)
-    }
-
-    fn open_blob_range(
-        &self,
-        _handle: BlobHandle,
-        _range: ByteRange,
-    ) -> AccountStream<SyncEvent<Bytes>> {
-        unsupported_stream(AccountOperation::OpenBlobRange)
-    }
-
-    fn open_raw_rfc822(&self, _message: ObjectId) -> AccountStream<SyncEvent<Bytes>> {
-        unsupported_stream(AccountOperation::OpenRawRfc822)
-    }
-
-    fn bulk_set_flags(
-        &self,
-        _targets: AccountStream<ObjectId>,
-        op: FlagOp,
-        _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        match op.validate_for_account(Protocol::CalDav) {
-            Ok(()) => unsupported_stream(AccountOperation::UpdateFlags),
-            Err(error) => Box::pin(futures::stream::once(async move {
-                SyncEvent::Terminated(error)
-            })),
-        }
-    }
-
-    fn bulk_move(
-        &self,
-        _targets: AccountStream<ObjectId>,
-        _destination: MembershipScope,
-        _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        unsupported_stream(AccountOperation::BulkMove)
-    }
-
-    fn bulk_destroy(
-        &self,
-        _targets: AccountStream<ObjectId>,
-        _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        unsupported_stream(AccountOperation::BulkDestroy)
-    }
-
-    fn add_to_container(
-        &self,
-        _target: MutationTarget,
-        _container: ContainerId,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::AddToContainer)
-    }
-
-    fn remove_from_container(
-        &self,
-        _target: MutationTarget,
-        _container: ContainerId,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::RemoveFromContainer)
-    }
-
-    fn set_keyword(
-        &self,
-        _target: MutationTarget,
-        _keyword: bifrost_types::Flag,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetKeyword)
-    }
-
-    fn set_label_membership(
-        &self,
-        _target: MutationTarget,
-        _label: ContainerId,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetLabelMembership)
-    }
-
-    fn set_category(
-        &self,
-        _target: MutationTarget,
-        _category: String,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetCategory)
-    }
-
-    fn set_extended_property(
-        &self,
-        _target: MutationTarget,
-        _property: String,
-        _value: Option<String>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetExtendedProperty)
-    }
-
-    fn set_is_read(
-        &self,
-        _target: MutationTarget,
-        _is_read: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetIsRead)
-    }
-
-    fn set_importance(
-        &self,
-        _target: MutationTarget,
-        _level: Importance,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::SetImportance)
-    }
-
-    fn send_message(
-        &self,
-        _request: SendRequest,
-    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
-        unsupported_future(AccountOperation::Send)
-    }
-
-    fn attachment_upload(
-        &self,
-        _bytes: AccountStream<Result<Bytes, AccountError>>,
-        _mime: String,
-    ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-        unsupported_future(AccountOperation::AttachmentUpload)
-    }
-
-    fn host_attachment(
-        &self,
-        _bytes: Bytes,
-        _meta: CloudUploadMeta,
-    ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
-        unsupported_future(AccountOperation::HostAttachment)
-    }
-
-    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
-        unsupported_future(AccountOperation::DraftCreate)
-    }
-
-    fn draft_update(
-        &self,
-        _draft: DraftHandle,
-        _patch: DraftPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::DraftUpdate)
-    }
-
-    fn draft_discard(&self, _draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::DraftDiscard)
-    }
-
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
-        unsupported_future(AccountOperation::DraftSend)
-    }
-
-    fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::CancelScheduledSend)
-    }
-
-    fn reschedule_send(
-        &self,
-        _handle: ObjectId,
-        _scheduled: std::time::SystemTime,
-    ) -> AccountFuture<Result<ObjectId, AccountError>> {
-        unsupported_future(AccountOperation::RescheduleSend)
-    }
-
-    fn search(
-        &self,
-        _request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
-        unsupported_future(AccountOperation::Search)
-    }
-
-    fn search_messages(
-        &self,
-        _request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
-        unsupported_future(AccountOperation::SearchMessages)
-    }
-
-    fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>> {
-        unsupported_future(AccountOperation::ContainersList)
-    }
-
-    fn container_create(
-        &self,
-        _kind: ContainerKind,
-        _name: String,
-        _parent: Option<ContainerId>,
-        _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
-        unsupported_future(AccountOperation::ContainerCreate)
-    }
-
-    fn container_rename(
-        &self,
-        _container: ContainerId,
-        _name: String,
-        _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::ContainerRename)
-    }
-
-    fn container_move(
-        &self,
-        _container: ContainerId,
-        _new_parent: Option<ContainerId>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::ContainerMove)
-    }
-
-    fn container_delete(&self, _container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::ContainerDelete)
-    }
-
-    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
-        unsupported_future(AccountOperation::IdentitiesList)
-    }
-
-    fn identity_update(
-        &self,
-        _identity: IdentityId,
-        _patch: IdentityPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::IdentityUpdate)
-    }
-
-    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
-        unsupported_future(AccountOperation::VacationGet)
-    }
-
-    fn vacation_set(&self, _config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::VacationSet)
-    }
-
-    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
-        unsupported_future(AccountOperation::QuotaGet)
-    }
-
-    fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
-        unsupported_future(AccountOperation::FiltersList)
-    }
-
-    fn filter_create(
-        &self,
-        _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
-        unsupported_future(AccountOperation::FilterCreate)
-    }
-
-    fn filter_update(
-        &self,
-        _filter: ServerFilterId,
-        _patch: ServerFilterPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::FilterUpdate)
-    }
-
-    fn filter_delete(&self, _filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::FilterDelete)
-    }
-
-    fn filter_validate(
-        &self,
-        _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<FilterValidation, AccountError>> {
-        unsupported_future(AccountOperation::FilterValidate)
-    }
-
     fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
-        unsupported_future(AccountOperation::AddressBooksList)
+        Kernel::unsupported_future(AccountOperation::AddressBooksList)
     }
 
     fn contacts_list(
@@ -953,18 +442,18 @@ impl Account for CalDavAccount {
         _address_book: Option<AddressBookId>,
         _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        unsupported_future(AccountOperation::ContactsList)
+        Kernel::unsupported_future(AccountOperation::ContactsList)
     }
 
     fn contact_get(&self, _contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
-        unsupported_future(AccountOperation::ContactGet)
+        Kernel::unsupported_future(AccountOperation::ContactGet)
     }
 
     fn contact_create(
         &self,
         _contact: ContactCreate,
     ) -> AccountFuture<Result<ContactId, AccountError>> {
-        unsupported_future(AccountOperation::ContactCreate)
+        Kernel::unsupported_future(AccountOperation::ContactCreate)
     }
 
     fn contact_update(
@@ -972,18 +461,18 @@ impl Account for CalDavAccount {
         _contact: ContactId,
         _patch: ContactPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::ContactUpdate)
+        Kernel::unsupported_future(AccountOperation::ContactUpdate)
     }
 
     fn contact_delete(&self, _contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::ContactDelete)
+        Kernel::unsupported_future(AccountOperation::ContactDelete)
     }
 
     fn contact_search(
         &self,
         _request: ContactSearchRequest,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        unsupported_future(AccountOperation::ContactSearch)
+        Kernel::unsupported_future(AccountOperation::ContactSearch)
     }
 
     fn directory_search(
@@ -992,22 +481,7 @@ impl Account for CalDavAccount {
         _limit: Option<u32>,
         _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
-        unsupported_future(AccountOperation::DirectorySearch)
-    }
-
-    fn directory_groups_list(
-        &self,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
-        unsupported_future(AccountOperation::DirectoryGroupsList)
-    }
-
-    fn directory_group_expand(
-        &self,
-        _group: DirectoryGroupId,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
-        unsupported_future(AccountOperation::DirectoryGroupExpand)
+        Kernel::unsupported_future(AccountOperation::DirectorySearch)
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
@@ -1049,7 +523,7 @@ impl Account for CalDavAccount {
     ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
         let client = Arc::clone(&self.client);
         Box::pin(async move {
-            let watermark = decode_event_page_cursor(
+            let watermark = Kernel::decode_page_cursor(
                 range.page_cursor.clone(),
                 AccountOperation::EventsInRange,
             )?;
@@ -1225,7 +699,7 @@ impl Account for CalDavAccount {
             let content_changed = patch_changes_content(&patch);
             Self::relocate_event(&client, &url, &target_calendar, body, content_changed)
                 .await
-                .map_err(|failure| relocation_error(failure, &url))
+                .map_err(|failure| Kernel::relocation_error(failure, &url))
         })
     }
 
@@ -1367,7 +841,7 @@ impl Account for CalDavAccount {
         let client = Arc::clone(&self.client);
         let default_calendar_url = self.default_calendar_url.clone();
         Box::pin(async move {
-            let watermark = decode_event_page_cursor(
+            let watermark = Kernel::decode_page_cursor(
                 request.page_cursor.clone(),
                 AccountOperation::EventSearch,
             )?;
@@ -1425,21 +899,6 @@ impl Account for CalDavAccount {
         })
     }
 
-    fn thread_hydrate(
-        &self,
-        _thread: ThreadId,
-    ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
-        unsupported_future(AccountOperation::HydrateThread)
-    }
-
-    fn message_hydrate(
-        &self,
-        _message: ObjectId,
-        _projection: HydrationProjection,
-    ) -> AccountFuture<Result<Message, AccountError>> {
-        unsupported_future(AccountOperation::HydrateMessage)
-    }
-
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
         self.lifecycle.close();
         Box::pin(async { Ok(()) })
@@ -1453,13 +912,6 @@ fn rsvp_email_from_config(config: &CalDavConfig) -> Option<String> {
         }
         _ => None,
     }
-}
-
-fn decode_event_page_cursor(
-    cursor: Option<bifrost_types::PageCursor>,
-    operation: AccountOperation,
-) -> Result<Option<String>, AccountError> {
-    decode_watermark_cursor(cursor, operation, DavProtocol::CalDav)
 }
 
 /// The whole collection as candidate hrefs, from the depth-1 PROPFIND.
@@ -1523,65 +975,26 @@ async fn hydrated_event_page<K: Fn(&CalendarEvent) -> bool>(
     operation: AccountOperation,
     keep: K,
 ) -> Result<Page<CalendarEvent>, AccountError> {
-    let HrefQuery {
-        hrefs,
-        failed_hrefs,
-        degraded,
-    } = candidates;
-    let hrefs = sorted_candidate_hrefs(hrefs);
-    let total = u64::try_from(hrefs.len()).unwrap_or(u64::MAX);
-    let slice = slice_after_watermark(hrefs, watermark, page_size, String::as_str);
-    let fetched = client
-        .fetch_events(calendar_url, &slice.items, operation)
-        .await?;
-    let skipped_scopes = skipped_calendar_scope(
-        calendar_url,
-        worse_recovery_option(degraded, fetched.degraded),
-    );
-    let fetched = fetched.report;
-    let mut failed = fetched.failed_hrefs();
-    failed.extend(failed_hrefs);
-    let mut events = Vec::new();
-    let mut materialized = HashSet::new();
-    for event in fetched.events {
-        let uri = event.uri;
-        match events_from_ical(
-            uri.clone(),
-            CalendarId(calendar_url.to_string()),
-            event.etag,
-            &event.data,
-        ) {
-            Ok(projected) => {
-                materialized.insert(uri);
-                events.extend(projected.into_iter().filter(|event| keep(event)));
-            }
-            Err(_) => failed.push(uri),
-        }
-    }
-    one_outcome_per_id(&mut failed, &materialized);
-    // Served in the same key order the page was sliced in; a multiget answers
-    // in whatever order it likes.
-    events.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-    Ok(Page {
-        truncated: false,
-        items: events,
-        next_cursor: slice.next_watermark.as_deref().map(encode_watermark_cursor),
-        estimated_total: Some(total),
-        failed_ids: failed,
-        skipped_scopes,
-    })
-}
-
-/// Keep the worse of two optional failures, so a refused query leg is not
-/// buried under a milder multiget failure or dropped entirely.
-fn worse_recovery_option(
-    current: Option<AccountError>,
-    candidate: Option<AccountError>,
-) -> Option<AccountError> {
-    match candidate {
-        Some(candidate) => worse_recovery(current, candidate),
-        None => current,
-    }
+    Kernel::hydrated_page(
+        bifrost_dav_core::collection_account::PageRequest {
+            collection: calendar_url,
+            candidates,
+            watermark,
+            page_size,
+        },
+        |hrefs| async move { client.fetch_events(calendar_url, &hrefs, operation).await },
+        |event| {
+            events_from_ical(
+                event.uri,
+                CalendarId(calendar_url.to_owned()),
+                event.etag,
+                &event.data,
+            )
+        },
+        keep,
+        |event| event.id.0.as_str(),
+    )
+    .await
 }
 
 /// Classify a patch that could not be spliced, by what stopped it.
@@ -1686,105 +1099,6 @@ fn patch_changes_content(patch: &EventPatch) -> bool {
     content != EventPatch::default()
 }
 
-enum RelocateFailure {
-    Before(AccountError),
-    MovedThenPut {
-        destination: String,
-        error: AccountError,
-    },
-    CopiedThenDelete {
-        destination: String,
-        source: String,
-        error: AccountError,
-    },
-}
-fn relocation_error(failure: RelocateFailure, original: &str) -> AccountError {
-    let (error, source, destination, committed, effect, subject) = match failure {
-        RelocateFailure::Before(error) => return error,
-        RelocateFailure::MovedThenPut { destination, error } => {
-            let subject = destination.clone();
-            (
-                error,
-                original.to_owned(),
-                destination,
-                StepEffect::Moved,
-                StepEffect::Updated,
-                subject,
-            )
-        }
-        RelocateFailure::CopiedThenDelete {
-            destination,
-            source,
-            error,
-        } => {
-            let subject = source.clone();
-            (
-                error,
-                source,
-                destination,
-                StepEffect::Copied,
-                StepEffect::Deleted,
-                subject,
-            )
-        }
-    };
-    let scope = |id: &str| ErrorScope::Event {
-        id: EventId(id.to_owned()),
-    };
-    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
-        effect,
-        StepTargets::complete(vec![TargetRef::new(TargetRole::Subject, scope(&subject))]),
-        StepReplay::Repeatable,
-        Application::from_leaf(&error),
-    ));
-    record.committed(
-        committed,
-        StepTargets::complete(vec![
-            TargetRef::new(TargetRole::Source, scope(&source)),
-            TargetRef::new(TargetRole::Destination, scope(&destination)),
-        ]),
-        StepReplay::Blocking,
-    );
-    error
-        .into_builder()
-        .scope(scope(&subject))
-        .partial_commit(record)
-        .try_build()
-        .expect("valid relocation record")
-}
-
-/// The last path segment of a resource URL - the name the resource keeps when
-/// it moves into another collection.
-///
-/// Falls back to a fresh UID-backed name when the URL has no usable final
-/// segment, so a move never targets the destination collection itself.
-fn resource_file_name(url: &str) -> String {
-    Url::parse(url)
-        .ok()
-        .and_then(|parsed| {
-            parsed
-                .path_segments()
-                .and_then(|mut segments| segments.next_back().filter(|name| !name.is_empty()))
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| format!("{}.ics", new_uid()))
-}
-
-fn unsupported_future<T: Send + 'static>(
-    operation: AccountOperation,
-) -> AccountFuture<Result<T, AccountError>> {
-    Box::pin(async move { Err(unsupported_error(operation)) })
-}
-
-fn unsupported_stream<T: Send + 'static>(
-    operation: AccountOperation,
-) -> AccountStream<SyncEvent<T>> {
-    Box::pin(stream::iter([
-        SyncEvent::Terminated(unsupported_error(operation)),
-        SyncEvent::Done(None),
-    ]))
-}
-
 /// Derive the parent collection URL of an event resource URL.
 ///
 /// This must go through a real URL parse. A final-slash search over the whole
@@ -1806,16 +1120,13 @@ fn event_calendar_url(event_url: &str) -> Option<String> {
 /// can display as lost. The sort and dedup finish the job for ids that
 /// failed in more than one REPORT.
 ///
-/// `bifrost-carddav` has a function of the same name and shape, and the two
-/// were deliberately NOT collapsed into `bifrost-dav-core` when the propstat
-/// machine and the snapshot layer were: this one filters against a
-/// materialized href set, the CardDAV twin against the `native_id` of the
-/// parsed cards, so they share only their outline and a shared version
-/// would need a projection each side supplies anyway.
+/// The shared helper accepts the materialized href projection explicitly.
+#[cfg(test)]
 fn one_outcome_per_id(failed: &mut Vec<String>, materialized: &HashSet<String>) {
-    failed.retain(|href| !materialized.contains(href));
-    failed.sort_unstable();
-    failed.dedup();
+    bifrost_dav_core::collection_account::one_outcome_per_id(
+        failed,
+        materialized.iter().map(String::as_str),
+    );
 }
 
 /// Publish a partially-refused walk as a skipped scope.
@@ -1826,16 +1137,9 @@ fn one_outcome_per_id(failed: &mut Vec<String>, materialized: &HashSet<String>) 
 /// know whether to reauthorize, retry, or stop. `failed_ids` cannot carry
 /// that: it is a bare list of resource ids with no recovery class, and the
 /// refused leg often does not even name the resources it lost.
+#[cfg(test)]
 fn skipped_calendar_scope(calendar_url: &str, degraded: Option<AccountError>) -> Vec<SkippedScope> {
-    degraded
-        .map(|error| SkippedScope {
-            scope: ErrorScope::Calendar {
-                id: calendar_url.to_string().into(),
-            },
-            error,
-        })
-        .into_iter()
-        .collect()
+    Kernel::skipped_scope(calendar_url, degraded)
 }
 
 /// Resource identity for a consumer-restated calendar id against a URL this
@@ -1847,17 +1151,7 @@ fn same_url(left: &str, right: &str) -> bool {
     same_dav_url(left, right)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct EventSnapshot {
-    calendar_url: String,
-    sync_token: Option<String>,
-    entries: Vec<EventSnapshotEntry>,
-    /// Hrefs the server reported *failed* within the 207 of the poll
-    /// that built this snapshot. Not persisted in the cursor (a
-    /// per-poll observation); the diff preserves these `previous`
-    /// entries rather than destroying them (brick 7).
-    failed_hrefs: Vec<String>,
-}
+type EventSnapshot = CollectionSnapshot;
 
 /// One polled calendar member. The shape, the cursor codec, the diff and the
 /// page slicer are all shared with `bifrost-carddav` through
@@ -1899,28 +1193,6 @@ fn reject_recurrence_instance_id(
     Ok(())
 }
 
-fn validate_event_scope(
-    scope: &CursorScope,
-    operation: AccountOperation,
-) -> Result<(), AccountError> {
-    if matches!(
-        scope,
-        CursorScope::Type(ObjectType::CalendarEvent)
-            | CursorScope::Folder(_)
-            | CursorScope::FolderType {
-                ty: ObjectType::CalendarEvent,
-                ..
-            }
-    ) {
-        Ok(())
-    } else {
-        Err(crate::client::local_error(
-            operation,
-            "CalDAV only supports calendar-event cursor scopes",
-        ))
-    }
-}
-
 /// The cursor-scope collection set: one entry per DISCOVERED calendar, and
 /// NOTHING when the home holds none.
 ///
@@ -1932,26 +1204,10 @@ fn validate_event_scope(
 /// commonly terminate with 404. It would also contradict the empty-home
 /// contract the listing APIs are pinned to.
 fn discovered_collection_urls(collections: &[crate::parse::CalendarCollection]) -> Vec<String> {
-    collections
-        .iter()
-        .map(|collection| collection.href.clone())
-        .collect()
-}
-
-/// A call that names no calendar cannot be routed, because the calendar home
-/// enumerated no collections.
-///
-/// The alternative - falling back to the calendar home URL - is what this
-/// replaces. The home is not itself a collection in that case (`list_calendars`
-/// already returns the home when it genuinely is one, so an empty result means
-/// an empty backend), so every such request went to a resource a spec-correct
-/// server 404s, and reported it as a remote failure rather than as the local
-/// routing failure it is. It also contradicted the empty-home contract
-/// `calendars_list` is pinned to.
-fn no_default_calendar(operation: AccountOperation) -> AccountError {
-    local_error(
-        operation,
-        "CalDAV account has no calendar collection to route a call that names none",
+    Kernel::discovered_collections(
+        collections
+            .iter()
+            .map(|collection| collection.href.as_str()),
     )
 }
 
@@ -1960,146 +1216,13 @@ fn no_default_calendar(operation: AccountOperation) -> AccountError {
 ///
 /// Deliberately has no access to the calendar home, so the fallback this
 /// replaced cannot be reintroduced here without also changing the signature.
-/// See `no_default_calendar` for why the home is the wrong answer.
+/// The shared kernel deliberately has no home URL to substitute.
 fn default_collection_url(collections: &[crate::parse::CalendarCollection]) -> Option<String> {
-    collections
-        .first()
-        .map(|collection| collection.href.clone())
-}
-
-fn collection_url_for_scope(
-    scope: &CursorScope,
-    default_url: Option<&str>,
-    collection_urls: &[String],
-    operation: AccountOperation,
-) -> Result<String, AccountError> {
-    match scope {
-        CursorScope::Type(ObjectType::CalendarEvent) => default_url
-            .map(str::to_string)
-            .ok_or_else(|| no_default_calendar(operation)),
-        CursorScope::Folder(folder)
-        | CursorScope::FolderType {
-            folder,
-            ty: ObjectType::CalendarEvent,
-        } if collection_urls.contains(&folder.0) => Ok(folder.0.clone()),
-        _ => Err(local_error(
-            operation,
-            "CalDAV cursor scope does not name a discovered calendar",
-        )),
-    }
-}
-
-fn scope_collection_url<'a>(
-    scope: &'a CursorScope,
-    default_url: Option<&'a str>,
-) -> Option<&'a str> {
-    match scope {
-        CursorScope::Folder(folder)
-        | CursorScope::FolderType {
-            folder,
-            ty: ObjectType::CalendarEvent,
-        } => Some(&folder.0),
-        _ => default_url,
-    }
-}
-
-fn collection_coverage_domain(scope: CursorScope, collection_url: Option<&str>) -> CoverageDomain {
-    match scope {
-        CursorScope::Folder(_)
-        | CursorScope::FolderType {
-            ty: ObjectType::CalendarEvent,
-            ..
-        } => CoverageDomain::full(scope),
-        // An unroutable legacy scope still needs a domain to carry the
-        // terminating stream; the walk fails before the region is read.
-        _ => CoverageDomain {
-            scope,
-            coordinate: CoverageCoordinate::ProviderRegion {
-                namespace: "caldav".to_string(),
-                region: collection_url.unwrap_or_default().as_bytes().to_vec(),
-            },
-            snapshot: SnapshotIdentity::unstable(),
-        },
-    }
-}
-
-fn cursor_from_snapshot(scope: CursorScope, snapshot: &EventSnapshot) -> ChangeCursor {
-    ChangeCursor {
-        scope,
-        server_state: OpaqueChangeState {
-            protocol: ProtocolKind::CalDav,
-            envelope_version: bifrost_types::PayloadVersion::new(CURSOR_ENVELOPE_VERSION),
-            bytes: encode_cursor_snapshot(snapshot),
-        },
-        advanced_through: None,
-        envelope_version: bifrost_types::TraitEnvelopeVersion::new(
-            bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
-        ),
-    }
-}
-
-fn encode_cursor_snapshot(snapshot: &EventSnapshot) -> Vec<u8> {
-    encode_snapshot(
-        CURSOR_MAGIC,
-        &snapshot.calendar_url,
-        snapshot.sync_token.as_deref(),
-        &snapshot.entries,
+    Kernel::default_collection(
+        collections
+            .iter()
+            .map(|collection| collection.href.as_str()),
     )
-}
-
-// Keep the persisted dialect magic stable: its suffix is not a second schema
-// version. The envelope alone rejects the old native-id namespace. The payload
-// collection is also necessary for accepted legacy Type scopes, which carry no
-// URL; Folder scopes cross-check it to prevent polling a different collection.
-// Sharing the token's storage does not share its semantics: only this dialect
-// decides whether it is a sync-token or a ctag.
-fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<EventSnapshot, AccountError> {
-    validate_event_scope(&cursor.scope, AccountOperation::SyncChanges)?;
-    let bytes = cursor
-        .server_state
-        .open(
-            ProtocolKind::CalDav,
-            bifrost_types::PayloadVersion::new(CURSOR_ENVELOPE_VERSION),
-        )
-        .map_err(|fault| {
-            fault
-                .builder(Protocol::CalDav, AccountOperation::SyncChanges)
-                .scope(ErrorScope::Cursor(cursor.scope.clone()))
-                .try_build()
-                .expect("valid account error classification")
-        })?;
-    let decoded =
-        decode_snapshot(CURSOR_MAGIC, DavProtocol::CalDav.label(), bytes).map_err(|error| {
-            cursor_error(error)
-                .into_builder()
-                .scope(ErrorScope::Cursor(cursor.scope.clone()))
-                .try_build()
-                .expect("valid account error classification")
-        })?;
-    // Fixed, valid classification: try_build cannot fail.
-    #[allow(clippy::unwrap_in_result)]
-    if let CursorScope::Folder(folder)
-    | CursorScope::FolderType {
-        folder,
-        ty: ObjectType::CalendarEvent,
-    } = &cursor.scope
-        && !same_dav_url(&folder.0, &decoded.collection_url)
-    {
-        return Err(bifrost_types::CursorDecodeFault::ScopeMismatch
-            .builder(Protocol::CalDav, AccountOperation::SyncChanges)
-            .scope(ErrorScope::Cursor(cursor.scope.clone()))
-            .text(DiagnosticText::support_only(
-                "cursor collection does not match its folder scope",
-            ))
-            .try_build()
-            .expect("valid account error classification"));
-    }
-    Ok(EventSnapshot {
-        calendar_url: decoded.collection_url,
-        sync_token: decoded.token,
-        entries: decoded.entries,
-        failed_hrefs: Vec::new(),
-    })
 }
 
 /// Poll for changes, preferring the RFC 6578 `sync-collection` REPORT and
@@ -2118,7 +1241,7 @@ async fn changes_from_cursor(
     client: &CalDavClient,
     previous: &EventSnapshot,
 ) -> Result<(EventSnapshot, Vec<Change>), AccountError> {
-    if let Some(sync_token) = previous.sync_token.as_deref() {
+    if let Some(sync_token) = previous.token.as_deref() {
         let mut current = previous.clone();
         current.failed_hrefs.clear();
         let mut changes = Vec::new();
@@ -2131,22 +1254,22 @@ async fn changes_from_cursor(
         // that latency; the round cap and same-token stop remain safe because
         // either leaves the last valid token available for the next poll.
         for _ in 0..SYNC_TRUNCATION_ROUNDS {
-            let report = client.sync_events(&previous.calendar_url, &token).await?;
+            let report = client.sync_events(&previous.collection_url, &token).await?;
             let truncated = report.truncated;
             let next_token = report.sync_token;
             changes.extend(apply_sync_report(&mut current, report.entries));
             let Some(next_token) = next_token else {
                 tracing::warn!(
                     target: "bifrost_caldav::sync",
-                    calendar = %previous.calendar_url,
+                    calendar = %previous.collection_url,
                     "sync-collection response omitted the required sync-token; retaining the previous token"
                 );
                 break;
             };
             let observation =
                 preserve_unobserved_entries(&[], &mut current.entries, &current.failed_hrefs);
-            current.sync_token =
-                observation.advance_token(current.sync_token.take(), Some(next_token.clone()));
+            current.token =
+                observation.advance_token(current.token.take(), Some(next_token.clone()));
             if !observation.complete {
                 break;
             }
@@ -2159,7 +1282,7 @@ async fn changes_from_cursor(
             if next_token == token {
                 tracing::warn!(
                     target: "bifrost_caldav::sync",
-                    calendar = %previous.calendar_url,
+                    calendar = %previous.collection_url,
                     "truncated sync-collection response returned the same sync-token; stopping the drain"
                 );
                 break;
@@ -2170,23 +1293,13 @@ async fn changes_from_cursor(
     }
     let mut current = CalDavAccount::event_snapshot(
         client,
-        &previous.calendar_url,
+        &previous.collection_url,
         AccountOperation::SyncChanges,
     )
     .await?;
-    preserve_unobserved_event_entries(previous, &mut current);
-    let changes = diff_event_snapshots(previous, &current);
+    current.preserve_unobserved(previous);
+    let changes = current.changes_from(previous);
     Ok((current, changes))
-}
-
-fn preserve_unobserved_event_entries(previous: &EventSnapshot, current: &mut EventSnapshot) {
-    let observation = preserve_unobserved_entries(
-        &previous.entries,
-        &mut current.entries,
-        &current.failed_hrefs,
-    );
-    current.sync_token =
-        observation.advance_token(previous.sync_token.clone(), current.sync_token.take());
 }
 
 fn apply_sync_report(
@@ -2292,29 +1405,13 @@ fn apply_sync_report_with_key(
     changes
 }
 
-/// Diff two event snapshots. The rule, the transient-empty-207 suppression
-/// and the failed-href preservation all live in `bifrost-dav-core`, which
-/// `bifrost-carddav` reads through the same door.
-fn diff_event_snapshots(previous: &EventSnapshot, current: &EventSnapshot) -> Vec<Change> {
-    diff_snapshots(&previous.entries, &current.entries, &current.failed_hrefs)
-}
-
-fn cursor_error(message: impl Into<String>) -> AccountError {
-    bifrost_types::CursorDecodeFault::Malformed
-        .builder(Protocol::CalDav, AccountOperation::SyncChanges)
-        .text(DiagnosticText::support_only(message))
-        .try_build()
-        .expect("valid account error classification")
-}
-
 fn caldav_query_time(time: &EventTime) -> Option<String> {
-    let instant = if time.value.len() == 10 {
-        let date = civil::Date::strptime("%Y-%m-%d", &time.value).ok()?;
+    let instant = if let bifrost_types::EventTimeKind::Date(date) = time.kind() {
         Offset::UTC
             .to_timestamp(date.to_datetime(civil::Time::MIN))
             .ok()?
     } else {
-        time.value.parse::<Timestamp>().ok()?
+        time.instant()?
     };
     Some(
         Offset::UTC
@@ -2331,13 +1428,13 @@ fn caldav_query_range(
     let start = caldav_query_time(start).ok_or_else(|| {
         crate::client::local_error(
             AccountOperation::EventsInRange,
-            format!("invalid event range start: {}", start.value),
+            format!("invalid event range start: {}", start.value()),
         )
     })?;
     let end = caldav_query_time(end).ok_or_else(|| {
         crate::client::local_error(
             AccountOperation::EventsInRange,
-            format!("invalid event range end: {}", end.value),
+            format!("invalid event range end: {}", end.value()),
         )
     })?;
     Ok((start, end))
@@ -2499,7 +1596,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: body.to_string(),
-            url: "https://dav.example.test/cal/".to_string(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/cal/")
+                .expect("test DAV URL"),
         };
         let event = |name: &str| {
             format!(
@@ -2591,7 +1689,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body,
-            url: "https://dav.example.test/cal/".to_string(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/cal/")
+                .expect("test DAV URL"),
         };
         let listing = "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\
 <D:response><D:href>/cal/a.ics</D:href><D:propstat><D:prop><D:getetag>\"a\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
@@ -2645,7 +1744,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body,
-            url: "https://dav.example.test/cal/".to_string(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/cal/")
+                .expect("test DAV URL"),
         }
     }
 
@@ -2707,7 +1807,7 @@ mod tests {
     }
 
     fn cursor_entry_uris(cursor: &ChangeCursor) -> Vec<String> {
-        decode_cursor_snapshot(cursor)
+        Kernel::decode_snapshot(cursor)
             .expect("the cursor this account just minted decodes")
             .entries
             .into_iter()
@@ -2792,7 +1892,8 @@ mod tests {
             status: StatusCode::METHOD_NOT_ALLOWED,
             headers: HeaderMap::new(),
             body: String::new(),
-            url: "https://dav.example.test/cal/".to_string(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/cal/")
+                .expect("test DAV URL"),
         };
         let listing = wrap(&[queried("a"), queried("b")]);
         let script = dav_script([home_listing(), refusal, cal_multistatus(listing)]);
@@ -3074,7 +2175,8 @@ mod tests {
             body: format!(
                 "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">{body}</D:multistatus>"
             ),
-            url: "https://dav.example.test/cal/".to_string(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/cal/")
+                .expect("test DAV URL"),
         };
         let script = dav_script([
             envelope(format!("{}{}{}", listed("a"), listed("b"), listed("c"))),
@@ -3123,7 +2225,8 @@ mod tests {
             status: StatusCode::FORBIDDEN,
             headers: HeaderMap::new(),
             body: "<D:error xmlns:D=\"DAV:\"><C:supported-filter/></D:error>".to_string(),
-            url: "https://dav.example.test/cal/".to_string(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/cal/")
+                .expect("test DAV URL"),
         };
         let listing = wrap(&[queried("a"), queried("b"), queried("c")]);
         let page = wrap(&[hydrated("a"), hydrated("b")]);
@@ -3307,7 +2410,8 @@ mod tests {
             status: StatusCode::BAD_REQUEST,
             headers: HeaderMap::new(),
             body: String::new(),
-            url: "https://dav.example.test/cal/".to_string(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/cal/")
+                .expect("test DAV URL"),
         };
         let script = dav_script([
             refusal,
@@ -3479,13 +2583,11 @@ mod tests {
     }
 
     fn time(value: &str) -> EventTime {
-        EventTime {
-            value: value.to_string(),
-            timezone: None,
-        }
+        EventTime::from_observed(value.to_string(), None)
     }
 
-    fn event(start: &str, end: &str, is_all_day: bool) -> CalendarEvent {
+    fn event(start: &str, end: &str, expected_all_day: bool) -> CalendarEvent {
+        assert_eq!(time(start).is_all_day(), expected_all_day);
         CalendarEvent {
             id: EventId("/cal/one.ics".to_string()),
             calendar_id: CalendarId("/cal/".to_string()),
@@ -3501,8 +2603,7 @@ mod tests {
             description: None,
             location: None,
             start: time(start),
-            end: Some(time(end)).filter(|end| !end.value.is_empty()),
-            is_all_day,
+            end: Some(time(end)).filter(|end| !end.value().is_empty()),
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -3528,7 +2629,7 @@ mod tests {
         // the leg returns `Unsupported(HostAttachment)`.
         assert!(!caldav_capabilities(true).pim_methods.host_attachment);
 
-        let err = unsupported_future::<HostedAttachment>(AccountOperation::HostAttachment)
+        let err = Kernel::unsupported_future::<HostedAttachment>(AccountOperation::HostAttachment)
             .await
             .expect_err("caldav host_attachment is unsupported");
         assert_eq!(
@@ -3543,7 +2644,7 @@ mod tests {
         // stream's first item terminates `Unsupported(OpenRawRfc822)`.
         assert!(!caldav_capabilities(true).pim_methods.open_raw_rfc822);
 
-        let mut stream = unsupported_stream::<Bytes>(AccountOperation::OpenRawRfc822);
+        let mut stream = Kernel::unsupported_stream::<Bytes>(AccountOperation::OpenRawRfc822);
         let first = stream.next().await.expect("first event");
         match first {
             SyncEvent::Terminated(err) => assert_eq!(
@@ -3848,38 +2949,38 @@ mod tests {
     #[test]
     fn a_cursor_collection_must_match_its_folder_scope() {
         let snapshot = EventSnapshot {
-            calendar_url: "https://dav.example.test/c/a%40b/".to_string(),
+            collection_url: "https://dav.example.test/c/a%40b/".to_string(),
             ..EventSnapshot::default()
         };
-        let equivalent = cursor_from_snapshot(
+        let equivalent = Kernel::cursor_from_snapshot(
             CursorScope::Folder(FolderId("https://dav.example.test/c/a@b/".to_string())),
             &snapshot,
         );
-        assert!(decode_cursor_snapshot(&equivalent).is_ok());
-        let mismatched = cursor_from_snapshot(
+        assert!(Kernel::decode_snapshot(&equivalent).is_ok());
+        let mismatched = Kernel::cursor_from_snapshot(
             CursorScope::Folder(FolderId("https://dav.example.test/c/other/".to_string())),
             &snapshot,
         );
-        assert!(decode_cursor_snapshot(&mismatched).is_err());
+        assert!(Kernel::decode_snapshot(&mismatched).is_err());
     }
 
     #[test]
     fn a_failed_poll_keeps_the_token_needed_to_retry_the_member() {
         let mut previous = event_snapshot_with(&["a", "b"]);
-        previous.sync_token = Some("old".to_string());
+        previous.token = Some("old".to_string());
         let mut current = event_snapshot_with(&["a"]);
-        current.sync_token = Some("new".to_string());
+        current.token = Some("new".to_string());
         current.failed_hrefs = vec!["b".to_string()];
-        preserve_unobserved_event_entries(&previous, &mut current);
-        assert_eq!(current.sync_token, previous.sync_token);
+        current.preserve_unobserved(&previous);
+        assert_eq!(current.token, previous.token);
         assert_eq!(current.entries, previous.entries);
     }
 
     #[test]
     fn event_cursor_snapshot_round_trips() {
         let snapshot = EventSnapshot {
-            calendar_url: "https://dav.example.test/cal/".to_string(),
-            sync_token: Some("token-1".to_string()),
+            collection_url: "https://dav.example.test/cal/".to_string(),
+            token: Some("token-1".to_string()),
             entries: vec![
                 EventSnapshotEntry {
                     uri: "https://dav.example.test/cal/a.ics".to_string(),
@@ -3892,9 +2993,10 @@ mod tests {
             ],
             failed_hrefs: Vec::new(),
         };
-        let cursor = cursor_from_snapshot(CursorScope::Type(ObjectType::CalendarEvent), &snapshot);
+        let cursor =
+            Kernel::cursor_from_snapshot(CursorScope::Type(ObjectType::CalendarEvent), &snapshot);
 
-        let decoded = decode_cursor_snapshot(&cursor).expect("cursor should decode");
+        let decoded = Kernel::decode_snapshot(&cursor).expect("cursor should decode");
 
         assert_eq!(decoded, snapshot);
     }
@@ -3910,10 +3012,10 @@ mod tests {
     fn event_cursor_rejects_the_base_relative_id_version() {
         let snapshot = EventSnapshot::default();
         let mut cursor =
-            cursor_from_snapshot(CursorScope::Type(ObjectType::CalendarEvent), &snapshot);
+            Kernel::cursor_from_snapshot(CursorScope::Type(ObjectType::CalendarEvent), &snapshot);
         cursor.server_state.envelope_version = bifrost_types::PayloadVersion::new(1);
 
-        let error = decode_cursor_snapshot(&cursor).expect_err("v1 cursors are disowned");
+        let error = Kernel::decode_snapshot(&cursor).expect_err("v1 cursors are disowned");
         assert!(matches!(
             error.kind(),
             AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
@@ -3927,24 +3029,24 @@ mod tests {
     #[test]
     fn event_cursor_rejects_impossible_count_before_allocating() {
         let snapshot = EventSnapshot {
-            calendar_url: "https://dav.example.test/cal/".to_string(),
-            sync_token: None,
+            collection_url: "https://dav.example.test/cal/".to_string(),
+            token: None,
             entries: Vec::new(),
             failed_hrefs: Vec::new(),
         };
         let mut cursor =
-            cursor_from_snapshot(CursorScope::Type(ObjectType::CalendarEvent), &snapshot);
+            Kernel::cursor_from_snapshot(CursorScope::Type(ObjectType::CalendarEvent), &snapshot);
         let count_offset = cursor.server_state.bytes.len() - 4;
         cursor.server_state.bytes[count_offset..].copy_from_slice(&u32::MAX.to_be_bytes());
 
-        assert!(decode_cursor_snapshot(&cursor).is_err());
+        assert!(Kernel::decode_snapshot(&cursor).is_err());
     }
 
     #[test]
     fn event_snapshot_diff_classifies_object_changes() {
         let previous = EventSnapshot {
-            calendar_url: "cal".to_string(),
-            sync_token: None,
+            collection_url: "cal".to_string(),
+            token: None,
             entries: vec![
                 EventSnapshotEntry {
                     uri: "a.ics".to_string(),
@@ -3962,8 +3064,8 @@ mod tests {
             failed_hrefs: Vec::new(),
         };
         let current = EventSnapshot {
-            calendar_url: "cal".to_string(),
-            sync_token: None,
+            collection_url: "cal".to_string(),
+            token: None,
             entries: vec![
                 EventSnapshotEntry {
                     uri: "a.ics".to_string(),
@@ -3981,7 +3083,7 @@ mod tests {
             failed_hrefs: Vec::new(),
         };
 
-        let changes = diff_event_snapshots(&previous, &current);
+        let changes = current.changes_from(&previous);
         let kinds = changes
             .into_iter()
             .map(|change| match change {
@@ -4002,8 +3104,8 @@ mod tests {
 
     fn event_snapshot_with(entries: &[&str]) -> EventSnapshot {
         EventSnapshot {
-            calendar_url: "cal".to_string(),
-            sync_token: None,
+            collection_url: "cal".to_string(),
+            token: None,
             entries: entries
                 .iter()
                 .map(|uri| EventSnapshotEntry {
@@ -4021,26 +3123,26 @@ mod tests {
         // yields zero changes (no Destroyed).
         let previous = event_snapshot_with(&["a.ics", "b.ics"]);
         let empty = event_snapshot_with(&[]);
-        assert!(diff_event_snapshots(&previous, &empty).is_empty());
-        assert!(diff_event_snapshots(&previous, &previous).is_empty());
-        assert!(diff_event_snapshots(&empty, &empty).is_empty());
+        assert!(empty.changes_from(&previous).is_empty());
+        assert!(previous.changes_from(&previous).is_empty());
+        assert!(empty.changes_from(&empty).is_empty());
     }
 
     #[test]
     fn empty_poll_checkpoint_preserves_snapshot_for_the_recovery_poll() {
         let previous = event_snapshot_with(&["a.ics", "b.ics"]);
         let mut empty = event_snapshot_with(&[]);
-        empty.sync_token = Some("refreshed".to_string());
+        empty.token = Some("refreshed".to_string());
 
-        preserve_unobserved_event_entries(&previous, &mut empty);
+        empty.preserve_unobserved(&previous);
         assert_eq!(empty.entries.len(), 2);
         assert_eq!(
-            empty.sync_token, None,
+            empty.token, None,
             "an empty observation must retry the listing"
         );
 
         let recovered = event_snapshot_with(&["a.ics", "b.ics"]);
-        assert!(diff_event_snapshots(&empty, &recovered).is_empty());
+        assert!(recovered.changes_from(&empty).is_empty());
     }
 
     /// Moved down one level with the lane itself: every paging lane now slices
@@ -4064,13 +3166,13 @@ mod tests {
         let slice = href_page(&["a", "b", "c"], None, 2);
         let cursor = encode_watermark_cursor(&slice.next_watermark.expect("page one truncates"));
         assert_eq!(
-            decode_event_page_cursor(Some(cursor), AccountOperation::EventsInRange)
+            Kernel::decode_page_cursor(Some(cursor), AccountOperation::EventsInRange)
                 .expect("valid cursor")
                 .as_deref(),
             Some("b")
         );
         assert!(
-            decode_event_page_cursor(Some(Vec::new().into()), AccountOperation::EventsInRange)
+            Kernel::decode_page_cursor(Some(Vec::new().into()), AccountOperation::EventsInRange)
                 .is_err(),
             "an empty cursor is corrupt, not a restart from the first event"
         );
@@ -4151,13 +3253,13 @@ mod tests {
         let mut current = event_snapshot_with(&["a.ics"]);
         current.failed_hrefs = vec!["b.ics".to_string()];
         assert!(
-            diff_event_snapshots(&previous, &current).is_empty(),
+            current.changes_from(&previous).is_empty(),
             "a transiently-failed resource must not be destroyed"
         );
 
         // Without the failed-href, b.ics's absence IS a destroy.
         let current_no_failed = event_snapshot_with(&["a.ics"]);
-        let changes = diff_event_snapshots(&previous, &current_no_failed);
+        let changes = current_no_failed.changes_from(&previous);
         assert_eq!(changes.len(), 1);
         assert!(matches!(
             changes[0],
@@ -4177,13 +3279,13 @@ mod tests {
         let client =
             CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
         let mut previous = event_snapshot_with(&["https://dav.example.test/cal/a.ics"]);
-        previous.calendar_url = "https://dav.example.test/cal/".to_string();
-        previous.sync_token = Some("old".to_string());
+        previous.collection_url = "https://dav.example.test/cal/".to_string();
+        previous.token = Some("old".to_string());
         let (current, changes) = changes_from_cursor(&client, &previous)
             .await
             .expect("partial report");
         assert!(changes.is_empty());
-        assert_eq!(current.sync_token, previous.sync_token);
+        assert_eq!(current.token, previous.token);
         assert_eq!(current.entries, previous.entries);
     }
 
@@ -4360,7 +3462,7 @@ mod tests {
         )
         .await
         .expect("partial snapshot");
-        assert!(snapshot.sync_token.is_none());
+        assert!(snapshot.token.is_none());
         assert_eq!(snapshot.failed_hrefs.len(), 1);
         let requests = transcripts(&script);
         assert_eq!(requests.len(), 2);
@@ -4393,7 +3495,8 @@ mod tests {
             status: reqwest::StatusCode::METHOD_NOT_ALLOWED,
             headers: reqwest::header::HeaderMap::new(),
             body: "x".repeat(5000),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let refusal_bytes = refusal.body.len() as u64;
         let script = dav_script([token_response, refusal, listing_response]);
@@ -4414,8 +3517,8 @@ mod tests {
     #[test]
     fn sync_report_updates_snapshot_and_classifies_changes() {
         let mut snapshot = EventSnapshot {
-            calendar_url: "https://dav.example.test/cal/".to_string(),
-            sync_token: Some("token-1".to_string()),
+            collection_url: "https://dav.example.test/cal/".to_string(),
+            token: Some("token-1".to_string()),
             entries: vec![
                 EventSnapshotEntry {
                     uri: "https://dav.example.test/cal/one.ics".to_string(),
@@ -4486,8 +3589,8 @@ mod tests {
     #[test]
     fn a_refused_sync_member_is_preserved_rather_than_upserted() {
         let mut snapshot = EventSnapshot {
-            calendar_url: "https://dav.example.test/cal/".to_string(),
-            sync_token: Some("token-1".to_string()),
+            collection_url: "https://dav.example.test/cal/".to_string(),
+            token: Some("token-1".to_string()),
             entries: vec![EventSnapshotEntry {
                 uri: "https://dav.example.test/cal/one.ics".to_string(),
                 etag: Some("kept".into()),
@@ -4532,7 +3635,8 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: body.to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let script = dav_script([
             multistatus(
@@ -4545,8 +3649,8 @@ mod tests {
         let client =
             CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
         let previous = EventSnapshot {
-            calendar_url: "https://dav.example.test/cal/".to_string(),
-            sync_token: Some("start".to_string()),
+            collection_url: "https://dav.example.test/cal/".to_string(),
+            token: Some("start".to_string()),
             entries: Vec::new(),
             failed_hrefs: Vec::new(),
         };
@@ -4581,7 +3685,7 @@ mod tests {
             "the collection self-response leaked into the snapshot: {:?}",
             current.entries
         );
-        assert_eq!(current.sync_token.as_deref(), Some("complete"));
+        assert_eq!(current.token.as_deref(), Some("complete"));
         let requests = transcripts(&script);
         assert_eq!(requests.len(), 2, "the drain must re-issue the REPORT");
         assert!(requests[1].body.contains("partial"));
@@ -4600,18 +3704,19 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: body.to_string(),
-            url: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
         };
         let expected_bytes = (first_body.len() + second_body.len()) as u64;
         let script = dav_script([multistatus(first_body), multistatus(second_body)]);
         let client =
             CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
         let previous = EventSnapshot {
-            calendar_url: "https://dav.example.test/cal/".to_string(),
-            sync_token: Some("start".to_string()),
+            collection_url: "https://dav.example.test/cal/".to_string(),
+            token: Some("start".to_string()),
             ..EventSnapshot::default()
         };
-        let cursor = cursor_from_snapshot(folder_scope(), &previous);
+        let cursor = Kernel::cursor_from_snapshot(folder_scope(), &previous);
         let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
         let events = account.changes_stream(cursor).collect::<Vec<_>>().await;
 
@@ -4641,8 +3746,8 @@ mod tests {
     #[test]
     fn sync_report_404_for_unknown_href_emits_no_destroyed() {
         let mut snapshot = EventSnapshot {
-            calendar_url: "https://dav.example.test/cal/".to_string(),
-            sync_token: Some("token-1".to_string()),
+            collection_url: "https://dav.example.test/cal/".to_string(),
+            token: Some("token-1".to_string()),
             entries: vec![EventSnapshotEntry {
                 uri: "https://dav.example.test/cal/one.ics".to_string(),
                 etag: Some("e".into()),
@@ -4674,8 +3779,8 @@ mod tests {
     #[test]
     fn a_declared_task_is_dropped_from_the_sync_snapshot() {
         let mut snapshot = EventSnapshot {
-            calendar_url: "https://dav.example.test/cal/".to_string(),
-            sync_token: Some("token-1".to_string()),
+            collection_url: "https://dav.example.test/cal/".to_string(),
+            token: Some("token-1".to_string()),
             entries: vec![EventSnapshotEntry {
                 uri: "https://dav.example.test/cal/phantom.ics".to_string(),
                 etag: Some("leaked".into()),
@@ -4755,7 +3860,7 @@ mod partial_commit_tests {
     #[test]
     fn partial_commit_moved_then_put_refused() {
         let leaf = unsupported_error(AccountOperation::EventUpdate);
-        let error = relocation_error(
+        let error = Kernel::relocation_error(
             RelocateFailure::MovedThenPut {
                 destination: "destination".into(),
                 error: leaf.clone(),
@@ -4776,7 +3881,7 @@ mod partial_commit_tests {
     fn partial_commit_copied_then_delete_throttled() {
         let leaf = throttled();
         let expected = leaf.recovery().clone();
-        let error = relocation_error(
+        let error = Kernel::relocation_error(
             RelocateFailure::CopiedThenDelete {
                 destination: "destination".into(),
                 source: "source".into(),

@@ -160,22 +160,13 @@ pub(super) async fn subscribe_ews(
     // newer instance has nothing left to delete (`unsubscribe_ews` on an
     // unknown handle is the correct no-op).
     let handle = ews_handle(&new_handle_token()?);
-    let mut registrations = account.ews_subscriptions.write().await;
-    // Re-checked under the write lock for a `close()` that began while the
-    // translation was in flight. Nothing server-side exists yet, so there is
-    // nothing to undo.
-    if account.shutdown.is_cancelled() {
+    if !account
+        .ews
+        .register(&account.shutdown, handle.clone(), scopes)
+        .await
+    {
         return Err(account_closed_error());
     }
-    registrations.insert(handle.clone(), EwsSubscriptionState { scopes });
-    // Registration is the final effect; there is no await after this commit.
-    drop(registrations);
-    // Bump the topology generation AFTER the map write: a session only
-    // re-reads the map after observing a generation it has not seen, so the
-    // read this bump provokes is guaranteed to include the new registration.
-    account
-        .ews_topology
-        .send_modify(|generation| *generation = generation.wrapping_add(1));
     Ok((Some(handle), outcomes))
 }
 
@@ -214,7 +205,8 @@ pub(super) async fn translate_ews_scopes(
             target_id_type: "ewsId",
         };
         match account
-            .client
+            .mailboxes
+            .primary()
             .post::<TranslateExchangeIdsResponse, _>(
                 Resource::Outlook,
                 "/me/translateExchangeIds",
@@ -380,20 +372,7 @@ pub(super) async fn unsubscribe_ews(
     account: GraphAccount,
     handle: SubscriptionHandle,
 ) -> Result<(), AccountError> {
-    let removed = account
-        .ews_subscriptions
-        .write()
-        .await
-        .remove(&handle)
-        .is_some();
-    // Only a registration that actually existed changes the scope union;
-    // bumping on an idempotent re-unsubscribe would churn the live stream
-    // through a pointless resubscribe.
-    if removed {
-        account
-            .ews_topology
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
-    }
+    account.ews.remove(&handle).await;
     Ok(())
 }
 

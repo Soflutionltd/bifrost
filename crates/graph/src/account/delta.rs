@@ -54,7 +54,7 @@ pub(super) fn walk(
         };
         let ctx = GraphErrorContext::graph(operation)
             .with_scope(ErrorScope::Cursor(scope.clone()));
-        let owner = parsed.owner().map(|owner| bifrost_types::MailboxId(owner.to_string()));
+        let owner = parsed.owner().map(|owner| bifrost_types::PrincipalId(owner.to_string()));
         let kind = match parsed.kind() {
             Ok(kind) => kind,
             Err(error) => {
@@ -152,7 +152,7 @@ pub(super) fn walk(
                         let mut entry = inventory_entry_from_parsed(&parsed, &value)
                             .expect("delta identity already admitted");
                         if let Some(owner) = &owner {
-                            entry.memberships.push(bifrost_types::MembershipScope::Mailbox(owner.clone()));
+                            entry.memberships.push(bifrost_types::MembershipScope::Owner(owner.clone()));
                         }
                         entries.push(entry);
                     }

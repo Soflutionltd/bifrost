@@ -25,13 +25,15 @@ pub(in crate::codec::encode) fn encode_id(
     // RFC 2971 Section 3.3: "Implementations MUST NOT send more than 30
     // field-value pairs."
     if params.len() > 30 {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "ID command has {} field-value pairs, but RFC 2971 Section 3.3 \
+        return Err(crate::Error::LocalRefusal(
+            crate::error::LocalRefusal::InvalidInput(
+                format!(
+                    "ID command has {} field-value pairs, but RFC 2971 Section 3.3 \
              allows at most 30",
-                params.len()
-            )
-            .into(),
+                    params.len()
+                )
+                .into(),
+            ),
         ));
     }
 
@@ -39,13 +41,15 @@ pub(in crate::codec::encode) fn encode_id(
         // RFC 2971 Section 3.3: "Field strings MUST NOT be longer than
         // 30 octets."
         if key.len() > 30 {
-            return Err(crate::Error::InvalidInput(
-                format!(
-                    "ID field name is {} octets, but RFC 2971 Section 3.3 \
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    format!(
+                        "ID field name is {} octets, but RFC 2971 Section 3.3 \
                  allows at most 30",
-                    key.len()
-                )
-                .into(),
+                        key.len()
+                    )
+                    .into(),
+                ),
             ));
         }
         // RFC 2971 Section 3.3: "Value strings MUST NOT be longer than
@@ -53,13 +57,15 @@ pub(in crate::codec::encode) fn encode_id(
         if let Some(v) = value
             && v.len() > 1024
         {
-            return Err(crate::Error::InvalidInput(
-                format!(
-                    "ID value is {} octets, but RFC 2971 Section 3.3 \
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    format!(
+                        "ID value is {} octets, but RFC 2971 Section 3.3 \
                  allows at most 1024",
-                    v.len()
-                )
-                .into(),
+                        v.len()
+                    )
+                    .into(),
+                ),
             ));
         }
     }
@@ -70,12 +76,14 @@ pub(in crate::codec::encode) fn encode_id(
     for (key, _) in params {
         let normalized = key.to_ascii_lowercase();
         if !seen_keys.insert(normalized) {
-            return Err(crate::Error::InvalidInput(
-                format!(
-                    "ID command repeats the same field name more than once: {key} \
+            return Err(crate::Error::LocalRefusal(
+                crate::error::LocalRefusal::InvalidInput(
+                    format!(
+                        "ID command repeats the same field name more than once: {key} \
                  (RFC 2971 Section 3.3)"
-                )
-                .into(),
+                    )
+                    .into(),
+                ),
             ));
         }
     }

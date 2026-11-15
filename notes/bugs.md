@@ -143,56 +143,6 @@ already acted on the session unvalidated; they belong in `core/session.rs` as
 `SessionState::derive -> ValidatedSession`, with `sync/capabilities.rs` keeping
 only the mapping.
 
-## BUG-072 - HTTP status -> error kind is decided by five ladders that already disagree
-
-**Reported by:** jmap-account (live, P3), net-dav (live).
-
-The net-dav hunter widened this to every HTTP crate. Sites: bifrost-net
-`account_error.rs::status_kind_cause` (and, inside the same file,
-`server_cause_from_status` answering a sub-question a second time: 408/502/503/504,
-429, 507, 5xx); dav-core `error.rs::status_error` (two parallel if-chains, one for
-the kind and one for the cause, held in step inside one function); Graph
-`graph_error.rs::classify_by_status` (a near-copy of net's, down to the `(kind,
-cause, bool)` tuple); Google `account/error.rs::classify_by_status`; JMAP
-`sync/error.rs::convert_problem` (below).
-
-| status | net | DAV | Graph | Google |
-|---|---|---|---|---|
-| 409 | ConcurrencyConflict | ConcurrencyConflict | ConcurrencyConflict | Server(Error 409) |
-| 412 | Server(Error 412) | ConcurrencyConflict | ConcurrencyConflict | ConcurrencyConflict |
-| 423 | Server(Error) | ConcurrencyConflict | Server(Error) | Server(Error) |
-| 500 | Server(Error 500) | Server(Error 500) | Server(Error 500) | Server(Unavailable) |
-| 507 | QuotaExhausted | QuotaExhausted | QuotaExhausted | Server(Unavailable) |
-| 413 | Server(Error) | Server(Error) | Server(Error) | Request(Malformed) |
-| 404, no scope | Server(Error 404) | NotFound(dialect resource) | Server(Error 404) | resource-dependent |
-| 400/422 cause | `RequestCause::Malformed` | `RequestCause::InvalidArgument` | `Malformed` | `Malformed` |
-
-Graph's own comment states the 412 split ("a bare 412 is `ConcurrencyConflict` here
-and a bare `Server(Error)` in bifrost-net"). Every consumer falling through to net's
-funnel - DAV's unreplayable histories and Graph's non-envelope bodies included -
-gets net's table, so the same 412 is a conflict on one path and an unknown server
-error on another inside one account. Owner: one classification function exported
-by bifrost-net (or bifrost-types if IMAP-side callers want it), roughly
-`classify_status(status, &StatusContext) -> StatusClass { kind, cause, throttles:
-bool }`, with provider refinements passed in as a declared override set
-(cursor-context 400/410, Gmail's history endpoint, DAV's 412/423, Graph's envelope
-codes, JMAP's problem types) rather than copied tables. The scope projection beside
-it is CON-044; throttle stamping is CON-061.
-
-The jmap-account hunter's original account follows.
-
-`error::convert_problem` classifies the HTTP status of a problem-details response
-itself; `bifrost-net`'s `status_kind_cause` classifies the same statuses for every
-other HTTP failure. 5xx: JMAP maps every 500-599 to `Server(Unavailable)`
-(retryable), net maps only 502/503/504 to `Unavailable` and the rest to
-`Server(Error{status})`. 507: net maps to `QuotaExhausted` with a throttle scope,
-JMAP to `Unavailable` with none. 408: net maps to `Unavailable`, JMAP to
-`Server(Error{408})`. An identical 500 from the same server is retried or not
-depending on whether it carried an `application/problem+json` body. The
-status-line precedent applies: net exports the status classification, and JMAP
-overrides only the JMAP-typed problem types (`limit`, `unknownCapability`,
-`notJSON`, `notRequest`).
-
 ## BUG-176 - Open rulings and design residue from the wave 10 to 16 lateral findings
 
 **Reported by:** wave 10 to 16 fixers (lateral); everything fixable in those

@@ -30,42 +30,54 @@ pub(crate) struct SubscribeState {
     pub(crate) closed: Arc<AtomicBool>,
 }
 
-/// Routing snapshot for push notifications: which JMAP `accountId` is the
+/// Registry view for push notifications: which JMAP `accountId` is the
 /// primary, and which seeded account-level `Folder` cursor scope each
 /// foreign (shared/delegate) account's state changes drive.
 ///
 /// RFC 8620 s7.1 keys `StateChange.changed` by `accountId`, so a
 /// notification names the account whose state moved. Each foreign account
 /// seeds exactly ONE cursor scope (JMAP state is per `(accountId, type)`),
-/// so one foreign push is one hint - the map value is a single scope by
+/// so one foreign push is one hint - each slot owns a single scope by
 /// construction, never a fanout list. The engine's cursor topology is
-/// derived from the same seed snapshot at attach, so the two views cannot
+/// read from the same registry at attach, so the two views cannot
 /// drift within a session; a share granted after open is invisible to
 /// both until reopen (the documented foreign-lifecycle limit).
+trait RoutingView: Send + Sync {
+    fn primary_id(&self) -> &str;
+    fn foreign_scope(&self, account: &str) -> Option<&CursorScope>;
+}
+
+impl<T: crate::core::transport::HttpTransport> RoutingView for super::registry::Registry<T> {
+    fn primary_id(&self) -> &str {
+        self.primary.mail.id_str()
+    }
+    fn foreign_scope(&self, account: &str) -> Option<&CursorScope> {
+        self.push_scope(account)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PushRouting {
-    primary_account_id: String,
-    /// Foreign JMAP `accountId` -> its one seeded `Folder` scope.
-    foreign_scopes: HashMap<String, CursorScope>,
+    registry: Arc<dyn RoutingView>,
 }
 
 impl PushRouting {
+    pub(crate) fn from_registry<T: crate::core::transport::HttpTransport>(
+        registry: Arc<super::registry::Registry<T>>,
+    ) -> Self {
+        Self { registry }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new<'a>(
         primary_account_id: String,
         seed_scopes: impl Iterator<Item = &'a CursorScope>,
     ) -> Self {
-        let mut foreign_scopes: HashMap<String, CursorScope> = HashMap::new();
-        for scope in seed_scopes {
-            if let CursorScope::Folder(folder) = scope
-                && let Some(parsed) = super::foreign::parse_foreign(folder)
-            {
-                foreign_scopes.insert(parsed.account_id, scope.clone());
-            }
-        }
-        Self {
-            primary_account_id,
-            foreign_scopes,
-        }
+        let scopes: Vec<_> = seed_scopes.cloned().collect();
+        Self::from_registry(Arc::new(super::registry::test_registry(
+            &primary_account_id,
+            &scopes,
+        )))
     }
 }
 
@@ -698,7 +710,7 @@ fn collect_state_change(
     tx: &mut Vec<InvalidationHint>,
     routing: &PushRouting,
 ) {
-    if account_id == routing.primary_account_id {
+    if account_id == routing.registry.primary_id() {
         if let Some(scope) = scope_for_data_type(data_type) {
             tx.push(session_hint(HintPayload::SpecificCursorScope(scope)));
         } else if !matches!(data_type, DataType::Thread) {
@@ -711,7 +723,7 @@ fn collect_state_change(
         }
         return;
     }
-    let Some(scope) = routing.foreign_scopes.get(account_id) else {
+    let Some(scope) = routing.registry.foreign_scope(account_id) else {
         // An accountId this session never seeded: a probe-skipped share
         // or one granted after open. JMAP state is per-(accountId, type),
         // so no registered cursor's state can have moved - there is
@@ -1126,9 +1138,16 @@ mod tests {
             foreign_scope("acct-b"),
         ];
         let routing = PushRouting::new("acct-primary".to_string(), seeds.iter());
-        assert_eq!(routing.foreign_scopes.len(), 2);
-        assert_eq!(routing.foreign_scopes["acct-a"], foreign_scope("acct-a"));
-        assert_eq!(routing.foreign_scopes["acct-b"], foreign_scope("acct-b"));
+        assert!(routing.registry.foreign_scope("acct-a").is_some());
+        assert!(routing.registry.foreign_scope("acct-b").is_some());
+        assert_eq!(
+            *routing.registry.foreign_scope("acct-a").unwrap(),
+            foreign_scope("acct-a")
+        );
+        assert_eq!(
+            *routing.registry.foreign_scope("acct-b").unwrap(),
+            foreign_scope("acct-b")
+        );
     }
 
     #[test]

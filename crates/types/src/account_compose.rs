@@ -3,7 +3,7 @@
 //! This layer stays protocol-neutral because all three decisions depend on
 //! Account contracts, not IMAP sessions. Keeping capability projection beside
 //! routing gives composition one owner instead of a second IMAP-only table.
-//! Discovery failures retain the existing warning contract; factory attach
+//! Discovery failures retain classified evidence on the warning skip lane; factory attach
 //! failures use OpenedAccount's typed skipped-scopes lane at the caller.
 //!
 //! The exhaustive PIM projection below requires every new field to choose an
@@ -134,17 +134,10 @@ async fn drain_sub_discovery<T>(
             SyncEvent::Batch(batch) => items.extend(batch.items),
             SyncEvent::Warning(warning) => warnings.push(warning),
             SyncEvent::Terminated(error) => {
-                warnings.push(
-                    Warning::support_only(
-                        crate::error::WarningKind::Other,
-                        format!(
-                            "composed sub-account discovery failed ({}); \
-                             retried on next reopen",
-                            error.message_key()
-                        ),
-                    )
-                    .with_protocol_detail(crate::error::DiagnosticText::support_only("compose")),
-                );
+                // Enterprise users keep primary mail while a delegate is down,
+                // and need its classified failure to distinguish grant repair
+                // from a transient outage.
+                warnings.push(Warning::skipped(None, error));
                 break;
             }
             SyncEvent::Done(_) => break,

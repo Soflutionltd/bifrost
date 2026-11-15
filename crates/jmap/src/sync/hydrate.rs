@@ -11,10 +11,9 @@ use futures::StreamExt;
 use crate::core::transport::HttpTransport;
 use crate::email::{EmailGet, EmailId, Property};
 
-use super::capabilities::CoreLimits;
 use super::inventory::{email_to_inventory, inventory_properties};
 
-type MailAccount<T> = crate::account::Account<T>;
+type MailAccount<T> = super::registry::Slot<T>;
 
 use super::capabilities::BATCH_MAX_WAIT;
 
@@ -102,27 +101,28 @@ fn flush_order(route: &HydrationRoute) -> (u8, &str) {
     }
 }
 
-/// Route one hydration id. Pure over the registration predicate so the
-/// selection is unit-pinnable without a live session.
-pub(crate) fn route_for_id<F>(id: &ObjectId, is_registered: F) -> HydrationRoute
-where
-    F: Fn(&str) -> bool,
-{
-    match super::foreign::parse_object(&id.0) {
-        Some((account, _)) if is_registered(account) => {
-            HydrationRoute::Foreign(account.to_string())
+/// Hydration keeps departed ids literal on the primary route. Scope and search
+/// doors choose refusal instead; the registry never conflates those cases.
+pub(crate) fn route_for_id<T: HttpTransport>(
+    id: &ObjectId,
+    registry: &super::registry::Registry<T>,
+) -> HydrationRoute {
+    match registry.route(super::foreign::JmapRef::parse(&id.0)) {
+        super::registry::Route::Shared(slot) => HydrationRoute::Foreign(slot.id_str().to_owned()),
+        super::registry::Route::Primary(_) | super::registry::Route::Departed => {
+            HydrationRoute::Primary
         }
-        _ => HydrationRoute::Primary,
     }
 }
 
 pub(crate) fn stream<T: HttpTransport>(
-    mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
-    limits: CoreLimits,
+    foreign_mail: Arc<super::registry::Registry<T>>,
     mut ids: AccountStream<ObjectId>,
     projection: Projection,
 ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
+    let mail = foreign_mail.primary.clone();
+    let limits = mail.limits;
+
     Box::pin(async_stream::stream! {
         if !matches!(projection, Projection::FlagsOnly | Projection::Metadata) {
             yield super::error::terminated_unsupported(
@@ -164,7 +164,7 @@ pub(crate) fn stream<T: HttpTransport>(
                     false,
                 ),
                 Some(Some(id)) => {
-                    let route = route_for_id(&id, |account| foreign_mail.contains_key(account));
+                    let route = route_for_id(&id, &foreign_mail);
                     buffers
                         .entry(route)
                         .or_insert_with(|| PendingHydration::new(now))
@@ -181,7 +181,7 @@ pub(crate) fn stream<T: HttpTransport>(
             };
 
             for (route, mut batch) in ready {
-                match fetch_route(&mail, &foreign_mail, &route, projection, &mut batch).await {
+                match fetch_route(&foreign_mail, &route, projection, &mut batch).await {
                     Ok(Some(batch)) => yield SyncEvent::Batch(batch),
                     Ok(None) => {}
                     Err(err) => {
@@ -208,16 +208,15 @@ pub(crate) fn stream<T: HttpTransport>(
 /// handle rather than dropping the ids silently (the primary `Email/get`
 /// then reports them as not found).
 async fn fetch_route<T: HttpTransport>(
-    mail: &MailAccount<T>,
-    foreign_mail: &HashMap<crate::core::id::AccountId, MailAccount<T>>,
+    foreign_mail: &super::registry::Registry<T>,
     route: &HydrationRoute,
     projection: Projection,
     batch: &mut Vec<ObjectId>,
 ) -> crate::Result<Option<Batch<ItemOutcome<HydratedObject>>>> {
-    let (handle, owner) = match route {
-        HydrationRoute::Primary => (mail, None),
-        HydrationRoute::Foreign(account) => match foreign_mail.get(account.as_str()) {
-            Some(handle) => (handle, Some(account.as_str())),
+    let handle = match route {
+        HydrationRoute::Primary => &foreign_mail.primary,
+        HydrationRoute::Foreign(account) => match foreign_mail.shared_slot(account.as_str()) {
+            Some(handle) => handle,
             None => {
                 // A route minted while the handle existed, drained after
                 // it vanished (the map is fixed per account instance, so
@@ -233,11 +232,11 @@ async fn fetch_route<T: HttpTransport>(
                     "foreign hydration route has no handle; ids run on \
                      the primary route in literal form"
                 );
-                (mail, None)
+                &foreign_mail.primary
             }
         },
     };
-    fetch_batch(handle, projection, batch, owner).await
+    fetch_batch(handle, projection, batch).await
 }
 
 /// The wire form of a routed hydration id: the native id when the batch
@@ -246,7 +245,7 @@ async fn fetch_route<T: HttpTransport>(
 ///
 /// The literal fallback is what keeps the unregistered-foreign case
 /// honest, and it must match what the mutation pipeline
-/// (`mutation::wire_email_id`, `pim::wire_id_for_mail`) does: an id
+/// (`Slot::wire`) does: an id
 /// qualified for an account this session has no handle for runs on the
 /// primary route, and stripping it there would send the bare native id
 /// to the PRIMARY `Email/get` - which, on an id collision, resolves an
@@ -255,10 +254,10 @@ async fn fetch_route<T: HttpTransport>(
 /// never occurs in an RFC 8620 id), so the server answers `notFound` -
 /// the honest result for an id we can no longer reach.
 pub(crate) fn wire_object_id<'a>(id: &'a ObjectId, owner: Option<&str>) -> &'a str {
-    match (owner, super::foreign::parse_object(&id.0)) {
-        (Some(owner), Some((account, native))) if account == owner => native,
-        _ => &id.0,
-    }
+    super::foreign::JmapRef::parse(&id.0).wire(owner.map_or(
+        super::foreign::Owner::Primary,
+        super::foreign::Owner::Shared,
+    ))
 }
 
 /// Fetch one route's buffered ids and reconcile the answer against them.
@@ -270,8 +269,8 @@ async fn fetch_batch<T: HttpTransport>(
     mail: &MailAccount<T>,
     projection: Projection,
     batch: &mut Vec<ObjectId>,
-    owner: Option<&str>,
 ) -> crate::Result<Option<Batch<ItemOutcome<HydratedObject>>>> {
+    let owner = mail.owner().shared();
     let started = Instant::now();
     let requested: Vec<ObjectId> = std::mem::take(batch);
     if requested.is_empty() {
@@ -291,7 +290,7 @@ async fn fetch_batch<T: HttpTransport>(
     // correlated object back out to each matching occurrence.
     let ids = requested
         .iter()
-        .map(|id| EmailId::new(wire_object_id(id, owner).to_string()))
+        .map(|id| EmailId::new(mail.wire(&id.0)))
         .collect::<Vec<_>>();
     let properties = properties_for_projection(projection);
     let response = mail
@@ -446,7 +445,7 @@ fn reconcile_hydration(
                 // with its literal wire form, and qualifying its entry
                 // under the dead account would double-encode the ids.
                 if let Some(owner) = owner {
-                    let owner = bifrost_types::MailboxId(owner.to_string());
+                    let owner = bifrost_types::PrincipalId(owner.to_string());
                     super::inventory::qualify_foreign_memberships(&mut entry.memberships, &owner);
                     super::inventory::qualify_foreign_ids(&mut entry, &owner);
                 }
@@ -476,6 +475,7 @@ fn properties_for_projection(projection: Projection) -> Vec<Property> {
 
 #[cfg(test)]
 mod tests {
+    use crate::sync::capabilities::CoreLimits;
     use std::sync::Mutex;
 
     use bytes::Bytes;
@@ -587,12 +587,14 @@ mod tests {
 
     #[test]
     fn foreign_id_routes_to_the_foreign_account_and_strips_to_native() {
-        let registered: HashSet<String> = ["acct-9".to_string()].into_iter().collect();
-        let is_registered = |account: &str| registered.contains(account);
+        let scope = bifrost_types::CursorScope::Folder(
+            super::super::foreign::encode_foreign_account("acct-9"),
+        );
+        let registry = crate::sync::registry::test_registry("primary", &[scope]);
 
         let foreign = ObjectId(super::super::foreign::encode_object("acct-9", "M1"));
         assert_eq!(
-            route_for_id(&foreign, is_registered),
+            route_for_id(&foreign, &registry),
             HydrationRoute::Foreign("acct-9".to_string()),
         );
         // The `Email/get` call carries the bare native id; the accountId
@@ -601,13 +603,13 @@ mod tests {
 
         // A bare id is primary.
         assert_eq!(
-            route_for_id(&ObjectId("M1".to_string()), is_registered),
+            route_for_id(&ObjectId("M1".to_string()), &registry),
             HydrationRoute::Primary,
         );
         // An id naming an account this session cannot reach falls back to
         // primary rather than fabricating a handle.
         let gone = ObjectId(super::super::foreign::encode_object("acct-gone", "M1"));
-        assert_eq!(route_for_id(&gone, is_registered), HydrationRoute::Primary);
+        assert_eq!(route_for_id(&gone, &registry), HydrationRoute::Primary);
     }
 
     #[test]
@@ -670,10 +672,10 @@ mod tests {
             "https://example.test/.well-known/jmap",
         )
         .expect("client builds");
-        let mail = crate::account::Account::new(client.clone(), "primary");
+        let mail = crate::sync::registry::Slot::new(client.clone(), "primary");
         let foreign_mail = Arc::new(HashMap::from([(
             "shared".into(),
-            crate::account::Account::new(client, "shared"),
+            crate::sync::registry::Slot::new(client, "shared"),
         )]));
         let foreign_id = ObjectId(super::super::foreign::encode_object("shared", "M1"));
         let yielded_id = foreign_id.clone();
@@ -681,12 +683,14 @@ mod tests {
             futures::stream::once(async move { yielded_id }).chain(futures::stream::pending()),
         );
         let mut events = stream(
-            mail,
-            foreign_mail,
-            CoreLimits {
-                max_objects_in_get: 2,
-                max_objects_in_set: 2,
-            },
+            std::sync::Arc::new(
+                crate::sync::registry::Registry::from_test(mail, foreign_mail).with_limits(
+                    CoreLimits {
+                        max_objects_in_get: 2,
+                        max_objects_in_set: 2,
+                    },
+                ),
+            ),
             input,
             Projection::FlagsOnly,
         );
@@ -923,8 +927,8 @@ mod tests {
         assert!(
             entry
                 .memberships
-                .contains(&bifrost_types::MembershipScope::Mailbox(
-                    bifrost_types::MailboxId("acct-9".to_string())
+                .contains(&bifrost_types::MembershipScope::Owner(
+                    bifrost_types::PrincipalId("acct-9".to_string())
                 )),
             "the owner tag identifies the share"
         );

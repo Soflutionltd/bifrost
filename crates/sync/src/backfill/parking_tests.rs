@@ -12,7 +12,7 @@ struct Harness {
     registry: Arc<BackfillRegistry>,
     walked: Arc<Mutex<Vec<(CursorScope, InventoryPartition)>>>,
     task: tokio::task::JoinHandle<()>,
-    receiver: Option<crate::multiplexer::ChangesReceiver>,
+    receiver: Option<crate::delivery::ChangesReceiver>,
 }
 
 fn scope() -> CursorScope {
@@ -28,7 +28,7 @@ async fn drain() {
 impl Harness {
     async fn new() -> Self {
         let account_id = AccountId("parking".into());
-        let throttles = Arc::new(crate::recovery::ThrottleBucket::new());
+        let throttles = Arc::new(crate::throttle::ThrottleBucket::new());
         let held = ThrottleKey::Budget(bifrost_types::ThrottleBudget::new("parking-budget"));
         let bucket = Arc::clone(&throttles);
         let key = held.clone();
@@ -110,7 +110,7 @@ impl Harness {
                         let _ = done.send(Ok(None));
                     }
                     WriterRequest::ScopeBarrierBlocked { done, .. } => {
-                        let _ = done.send(false);
+                        let _ = done.send(Ok(false));
                     }
                     WriterRequest::DiscardBackfillProgress { done, .. } => {
                         let _ = done.send(Ok(()));
@@ -215,7 +215,7 @@ async fn parking_later_partition_allows_another_scope() {
 #[tokio::test(start_paused = true)]
 async fn parking_fixed_plan_retries_the_pending_partition() {
     let h = Harness::new().await;
-    assert_eq!(h.state(), Some(BackfillState::Pending));
+    assert_eq!(h.state(), Some(BackfillState::Throttled));
     h.advance(60).await;
     assert_eq!(
         h.partitions(),
@@ -247,7 +247,7 @@ async fn parking_page_loss_restarts_without_completion() {
     ));
     h.advance(60).await;
     assert_eq!(h.partitions().len(), 1, "the holed walk must be abandoned");
-    assert_eq!(h.state(), Some(BackfillState::Pending));
+    assert_eq!(h.state(), Some(BackfillState::RestartingAfterLoss));
     h.advance(5).await;
     assert_eq!(
         h.partitions()[1],
@@ -276,7 +276,7 @@ async fn parking_resume_preserves_the_original_fence() {
     let h = Harness::new().await;
     assert_eq!(
         h.state(),
-        Some(BackfillState::Pending),
+        Some(BackfillState::Throttled),
         "the walk must park before the reset"
     );
     h.ctx.coverage.invalidate_scope(&scope());
@@ -286,7 +286,7 @@ async fn parking_resume_preserves_the_original_fence() {
         1,
         "reset must reject the pending partition before its provider call"
     );
-    assert_eq!(h.state(), Some(BackfillState::Pending));
+    assert_eq!(h.state(), Some(BackfillState::Retrying));
     h.stop().await;
 }
 
@@ -299,7 +299,7 @@ async fn parking_resume_rechecks_a_longer_hold() {
     );
     h.advance(60).await;
     assert_eq!(h.partitions().len(), 1);
-    assert_eq!(h.state(), Some(BackfillState::Pending));
+    assert_eq!(h.state(), Some(BackfillState::Throttled));
     h.advance(60).await;
     assert_eq!(h.partitions().len(), 3);
     assert_eq!(h.state(), Some(BackfillState::Completed));

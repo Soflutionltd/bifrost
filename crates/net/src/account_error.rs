@@ -7,13 +7,14 @@
 //! future auditor knows where that sweep's coverage stopped.
 
 #[cfg(test)]
+use bifrost_types::ThrottleScope;
+#[cfg(test)]
 use std::time::{Duration, SystemTime};
 
 use bifrost_types::{
-    AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, DiagnosticText, ErrorScope,
-    Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind, RetryHint, ServerCause,
-    ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope, TransmissionState,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause, AuthCause,
+    AuthErrorKind, Cause, DiagnosticText, ErrorScope, Protocol, ProtocolErrorKind, Provider,
+    RequestCause, RequestErrorKind, RetryHint, ServerCause, ServerErrorKind, TransmissionState,
     TransportCause, TransportErrorKind, TransportKind, WireCause,
 };
 use bytes::Bytes;
@@ -24,6 +25,7 @@ use reqwest::{
 
 use crate::error::{Error, FinalResponse, RangeFailureKind};
 use crate::request::parse_retry_after_hint;
+use crate::{HttpErrorPolicy, StatusPolicy, classify_status};
 
 #[derive(Clone, Debug)]
 pub struct NetErrorContext {
@@ -65,12 +67,18 @@ pub fn token_source_account_error(
 /// Provider crates know whether a server's throttle should pause an account,
 /// mailbox, or only the current operation. This entry point lets them carry
 /// that decision through net's generic status and local-hold translation.
+/// Pass `HttpErrorPolicy` for provider status overrides and a throttle budget;
+/// an `Option<ThrottleScope>` selects the common HTTP table without a budget.
 #[must_use]
 pub fn into_account_error_with_throttle_scope(
     error: Error,
     ctx: NetErrorContext,
-    throttle_scope: Option<ThrottleScope>,
+    policy: impl Into<HttpErrorPolicy>,
 ) -> AccountError {
+    translate(error, ctx, &policy.into())
+}
+
+fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> AccountError {
     match error {
         Error::HopPolicy(error) => *error,
         Error::AttemptHistory { source, evidence } => {
@@ -83,13 +91,10 @@ pub fn into_account_error_with_throttle_scope(
                     Error::Network { .. } | Error::Timeout { .. } | Error::Tls { .. }
                 );
             let typed_hop_refusal = matches!(source.as_ref(), Error::HopPolicy(_));
-            let terminal =
-                into_account_error_with_throttle_scope(*source, ctx.clone(), throttle_scope);
+            let terminal = translate(*source, ctx.clone(), policy);
             let previous: Vec<_> = attempts
                 .into_iter()
-                .map(|error| {
-                    into_account_error_with_throttle_scope(error, ctx.clone(), throttle_scope)
-                })
+                .map(|error| translate(error, ctx.clone(), policy))
                 .collect();
             let reclassified =
                 !lone_transport && ledger.verdict() == crate::CommitEvidence::MayHaveCommitted;
@@ -160,9 +165,7 @@ pub fn into_account_error_with_throttle_scope(
             let diagnostics = format!("prior attempts: {attempts:?}");
             let evidence: Vec<_> = attempts
                 .into_iter()
-                .map(|attempt| {
-                    into_account_error_with_throttle_scope(attempt, ctx.clone(), throttle_scope)
-                })
+                .map(|attempt| translate(attempt, ctx.clone(), policy))
                 .collect();
             let state = ledger.transmission_state();
             let mut builder = push_attempt(
@@ -178,9 +181,7 @@ pub fn into_account_error_with_throttle_scope(
                 builder = builder.idempotency_override(false);
             }
             builder = builder.text(DiagnosticText::support_only(diagnostics));
-            if let Some(scope) = throttle_scope {
-                builder = builder.throttle_scope(scope);
-            }
+            builder = policy.apply_throttle(builder, true);
             finish(builder, &ctx)
         }
         Error::Network {
@@ -224,7 +225,7 @@ pub fn into_account_error_with_throttle_scope(
             &headers,
             &body,
             parse_retry_after_hint(headers.get(RETRY_AFTER)),
-            throttle_scope,
+            policy,
         ),
         Error::RetryBudgetExhausted {
             final_response,
@@ -237,7 +238,7 @@ pub fn into_account_error_with_throttle_scope(
                 &response.headers,
                 &response.body,
                 parse_retry_after_hint(response.headers.get(RETRY_AFTER)),
-                throttle_scope,
+                policy,
             ),
             // DEFENSIVE ARM, unreachable from the retry loop. `request.rs`
             // mints `RetryBudgetExhausted` only from the status branch, always
@@ -271,7 +272,7 @@ pub fn into_account_error_with_throttle_scope(
         Error::RateLimited {
             retry_after,
             final_response,
-        } => rate_limited(&ctx, retry_after, &final_response, throttle_scope),
+        } => rate_limited(&ctx, retry_after, &final_response, policy),
         // Cancellation has no dispatch evidence. Google Drive upload shutdown
         // returns this directly, including after a request may have left.
         // Keep InFlight conservatively: a non-idempotent operation must read
@@ -483,7 +484,7 @@ fn rate_limited(
     ctx: &NetErrorContext,
     retry_after: Option<RetryHint>,
     final_response: &FinalResponse,
-    throttle_scope: Option<ThrottleScope>,
+    policy: &HttpErrorPolicy,
 ) -> AccountError {
     let retry_hint = retry_after;
     let mut builder = base_builder(
@@ -498,9 +499,7 @@ fn rate_limited(
         &final_response.headers,
         &final_response.body,
     );
-    if let Some(scope) = throttle_scope {
-        builder = builder.throttle_scope(scope);
-    }
+    builder = policy.apply_throttle(builder, true);
     finish(builder, ctx)
 }
 
@@ -510,99 +509,19 @@ fn status_error(
     headers: &HeaderMap,
     body: &Bytes,
     retry_hint_param: Option<RetryHint>,
-    throttle_scope: Option<ThrottleScope>,
+    policy: &HttpErrorPolicy,
 ) -> AccountError {
-    let code = status.as_u16();
-    let retry_hint = retry_hint_param;
-    let (kind, cause, throttle) = status_kind_cause(ctx, code, body, retry_hint);
-    let mut builder = base_builder(ctx, kind, cause);
+    let class = classify_status(
+        status.as_u16(),
+        ctx.scope.as_ref(),
+        retry_hint_param,
+        policy.status,
+    );
+    let mut builder = base_builder(ctx, class.kind, class.cause);
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     builder = response_diagnostics(builder, status, headers, body);
-    if throttle && let Some(scope) = throttle_scope {
-        builder = builder.throttle_scope(scope);
-    }
+    builder = policy.apply_throttle(builder, class.throttles);
     finish(builder, ctx)
-}
-
-fn status_kind_cause(
-    ctx: &NetErrorContext,
-    code: u16,
-    body: &Bytes,
-    retry_hint: Option<RetryHint>,
-) -> (AccountErrorKind, Cause, bool) {
-    match code {
-        400 | 422 => {
-            let detail = status_detail(code, body);
-            (
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed { detail }),
-                false,
-            )
-        }
-        401 => (
-            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-            Cause::Auth(AuthCause::ReauthorizationRequired),
-            false,
-        ),
-        403 => (
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied {
-                resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
-            }),
-            false,
-        ),
-        404 => match ctx.scope.as_ref().and_then(ErrorScope::resource) {
-            Some(resource) => (
-                AccountErrorKind::NotFound(resource),
-                Cause::Request(RequestCause::NotFound {
-                    what: resource,
-                    id: ctx
-                        .scope
-                        .as_ref()
-                        .and_then(ErrorScope::object_id)
-                        .map(str::to_owned),
-                }),
-                false,
-            ),
-            None => server_error(code),
-        },
-        409 => (
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
-            false,
-        ),
-        410 if matches!(ctx.scope.as_ref(), Some(ErrorScope::Cursor(_))) => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-            false,
-        ),
-        410 => server_error(code),
-        408 | 502 | 503 | 504 => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint }),
-            false,
-        ),
-        429 => (
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint }),
-            true,
-        ),
-        507 => (
-            AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_hint }),
-            true,
-        ),
-        500..=599 => server_error(code),
-        _ => server_error(code),
-    }
-}
-
-fn server_error(code: u16) -> (AccountErrorKind, Cause, bool) {
-    (
-        AccountErrorKind::Server(ServerErrorKind::Error { status: Some(code) }),
-        Cause::Server(ServerCause::Error { status: Some(code) }),
-        false,
-    )
 }
 
 fn invalid_argument(ctx: &NetErrorContext, field: &'static str, detail: String) -> AccountError {
@@ -814,14 +733,6 @@ fn body_diagnostic(body: &Bytes) -> Option<DiagnosticText> {
     )))
 }
 
-/// The detail is deliberately synthetic: the response body is not
-/// summarized into `RequestCause::Malformed.detail`. The body reaches
-/// support-text via `response_diagnostics` at the call site, and that
-/// is the accepted home for it - do not re-raise.
-fn status_detail(code: u16, _body: &Bytes) -> DiagnosticText {
-    DiagnosticText::support_only(format!("HTTP {code} malformed request"))
-}
-
 fn maybe_support_text(value: String) -> Option<DiagnosticText> {
     if value.trim().is_empty() {
         None
@@ -902,13 +813,9 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
     }
 }
 
-fn server_cause_from_status(code: u16, retry_hint_param: Option<RetryHint>) -> Option<Cause> {
-    let retry_hint = retry_hint_param;
-    match code {
-        408 | 502 | 503 | 504 => Some(Cause::Server(ServerCause::Unavailable { retry_hint })),
-        429 => Some(Cause::Server(ServerCause::RateLimited { retry_hint })),
-        507 => Some(Cause::Server(ServerCause::QuotaExhausted { retry_hint })),
-        500..=599 => Some(Cause::Server(ServerCause::Error { status: Some(code) })),
+fn server_cause_from_status(code: u16, retry_hint: Option<RetryHint>) -> Option<Cause> {
+    match classify_status(code, None, retry_hint, StatusPolicy::default()).cause {
+        cause @ Cause::Server(_) => Some(cause),
         _ => None,
     }
 }

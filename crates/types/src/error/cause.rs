@@ -8,7 +8,7 @@ use crate::capabilities::CapabilityDelta;
 use super::batch::BatchItemId;
 use super::diagnostic::DiagnosticText;
 use super::kind::{InternalErrorKind, MailboxUnavailableKind, ResourceKind, TransportErrorKind};
-use super::recovery::{RetryHint, StrategyDowngrade};
+use super::recovery::{OperatorOverrideReason, RetryHint, StrategyDowngrade};
 use super::scope::{AccountOperation, Protocol};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -466,7 +466,7 @@ pub enum StateCause {
         delta: Option<CapabilityDelta>,
     },
     OperatorOverrideNeeded {
-        reason: String,
+        reason: OperatorOverrideReason,
     },
     ConcurrencyConflict,
     /// Access to one cursor scope was revoked mid-sync. Pairs with
@@ -478,7 +478,7 @@ impl StateCause {
     fn detail(&self) -> Option<&str> {
         match self {
             Self::ControlWaitEnded { detail } => Some(detail.as_str()),
-            Self::OperatorOverrideNeeded { reason } => Some(reason.as_str()),
+            Self::OperatorOverrideNeeded { reason } => Some(reason.detail()),
             Self::AccountClosed
             | Self::CursorInvalid
             | Self::StrategyFailure { .. }

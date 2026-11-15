@@ -23,7 +23,7 @@ use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AttendeeRole, Calendar, CalendarEvent,
     CalendarId, CalendarProvenance, EventAttendee, EventAvailability, EventCreate, EventId,
     EventOrganizer, EventPatch, EventRange, EventRecurrence, EventReminder, EventSearchRequest,
-    EventStatus, EventTime, EventVisibility, Page, ProtocolKind, ReminderRelativeTo,
+    EventStatus, EventTime, EventTimeKind, EventVisibility, Page, ProtocolKind, ReminderRelativeTo,
     ReminderTrigger, RsvpStatus,
 };
 use jiff::tz::{Offset, TimeZone};
@@ -44,7 +44,7 @@ use crate::core::query::Filter as QueryFilter;
 use crate::core::transport::HttpTransport;
 use crate::sync::page_cursor::PageKind;
 
-type CalendarAccount<T> = JmapProtoAccount<T>;
+type CalendarAccount<T> = JmapProtoAccount<T, crate::core::capability::Calendars>;
 
 const PAGE_LIMIT: usize = 250;
 
@@ -174,7 +174,7 @@ pub(crate) fn create<T: HttpTransport>(
         validate_shared_recurrence(
             &event.recurrence,
             Some(&event.start),
-            event.is_all_day,
+            event.is_all_day(),
             AccountOperation::EventCreate,
         )?;
         validate_shared_attendees(&event.attendees, AccountOperation::EventCreate)?;
@@ -583,17 +583,17 @@ fn event_from_jmap(
             ))
         })?;
     let timezone = event.time_zone().as_value().map(ToString::to_string);
-    let start = EventTime {
-        value: shared_time_from_jmap(raw_start, is_all_day),
-        timezone: timezone.clone(),
-    };
+    let start = EventTime::from_observed(
+        shared_time_from_jmap(raw_start, is_all_day),
+        timezone.clone(),
+    );
     // An absent `duration` is RFC 8984's `PT0S`, a real zero-length end; only
     // an event with no `start` to measure from has no end at all.
-    let end = Some(EventTime {
-        value: shared_time_from_jmap(&raw_end, is_all_day),
-        timezone: timezone.clone(),
-    })
-    .filter(|end| !end.value.is_empty());
+    let end = Some(EventTime::from_observed(
+        shared_time_from_jmap(&raw_end, is_all_day),
+        timezone.clone(),
+    ))
+    .filter(|end| !end.value().is_empty());
     let (rdate, mut exdate) = recurrence_dates_from_overrides(event.recurrence_overrides())
         .map_err(|message| unsupported(operation, message))?;
     if let Some(dates) = event.excluded_dates() {
@@ -621,7 +621,6 @@ fn event_from_jmap(
         location: first_location(event.locations()),
         start,
         end,
-        is_all_day,
         status: event_status(event.status()),
         availability: availability(event.free_busy_status()),
         visibility: visibility(event.privacy()),
@@ -709,9 +708,8 @@ fn rrule_has_until(patch: &EventPatch) -> bool {
 }
 
 /// True when the patch cannot supply the conversion context itself. `UNTIL`
-/// needs the start's timezone; any start/end or `UNTIL` write needs to know
-/// whether the event is all-day, and a patch that does not restate
-/// `is_all_day` is not asserting that the event became timed.
+/// needs the start's timezone. The pre-read also supplies stored context when
+/// no explicit conversion is requested; supplied typed bounds override its mode.
 fn event_patch_needs_context(patch: &EventPatch) -> bool {
     let until = rrule_has_until(patch);
     (until && patch.start.is_none())
@@ -732,12 +730,28 @@ fn event_context_from_patch(
 ) -> EventContext {
     let is_all_day = patch
         .is_all_day
+        .or_else(|| {
+            patch
+                .start
+                .as_ref()
+                .filter(|time| !time.is_unspecified())
+                .map(EventTime::is_all_day)
+        })
+        .or_else(|| {
+            patch
+                .end
+                .as_ref()
+                .filter(|time| !time.is_unspecified())
+                .map(EventTime::is_all_day)
+        })
         .or_else(|| current.map(|event| event.show_without_time().unwrap_or(false)))
         .unwrap_or(false);
     let start = patch.start.clone().or_else(|| {
-        current.map(|event| EventTime {
-            value: shared_time_from_jmap(event.start().unwrap_or_default(), is_all_day),
-            timezone: event.time_zone().as_value().map(ToString::to_string),
+        current.map(|event| {
+            EventTime::from_observed(
+                shared_time_from_jmap(event.start().unwrap_or_default(), is_all_day),
+                event.time_zone().as_value().map(ToString::to_string),
+            )
         })
     });
     let owner_participants = current
@@ -824,12 +838,12 @@ fn jmap_patch_from_event_patch(
             let all_day = context.is_all_day;
             let value = event_duration(start, end, all_day, operation)?;
             out.start(jmap_time_from_shared(start, all_day, operation)?);
-            out.time_zone(start.timezone.clone());
+            out.time_zone(start.timezone().map(str::to_owned));
             out.duration(value);
         }
         (Some(start), None) if end_is_blank => {
             out.start(jmap_time_from_shared(start, context.is_all_day, operation)?);
-            out.time_zone(start.timezone.clone());
+            out.time_zone(start.timezone().map(str::to_owned));
         }
         (Some(_), None) | (None, Some(_)) => {
             return Err(unsupported(
@@ -839,8 +853,8 @@ fn jmap_patch_from_event_patch(
         }
         (None, None) => {}
     }
-    if let Some(is_all_day) = patch.is_all_day {
-        out.show_without_time(is_all_day);
+    if patch.is_all_day.is_some() || patch.start.is_some() || end.is_some() {
+        out.show_without_time(context.is_all_day);
     }
     if let Some(status) = patch.status {
         out.status(jmap_event_status(status));
@@ -1039,7 +1053,7 @@ fn write_event_create(
     // absent `duration` to `PT0S`, so either way the server would store a
     // zero-length event the caller never asked for. The caller must supply the
     // end it wants (`Unsupported`, matching bifrost-google's create).
-    validate_start(Some(&event.start), event.is_all_day, operation)?;
+    validate_start(Some(&event.start), event.is_all_day(), operation)?;
     if is_blank_time(&event.end) {
         return Err(unsupported(
             operation,
@@ -1048,17 +1062,17 @@ fn write_event_create(
     }
     target.start(jmap_time_from_shared(
         &event.start,
-        event.is_all_day,
+        event.is_all_day(),
         operation,
     )?);
-    target.time_zone(event.start.timezone.clone());
+    target.time_zone(event.start.timezone().map(str::to_owned));
     target.duration(event_duration(
         &event.start,
         &event.end,
-        event.is_all_day,
+        event.is_all_day(),
         operation,
     )?);
-    target.show_without_time(event.is_all_day);
+    target.show_without_time(event.is_all_day());
     target.status(jmap_event_status(event.status));
     target.free_busy_status(jmap_availability(event.availability));
     target.set_property("privacy", json!(jmap_visibility(event.visibility)));
@@ -1078,13 +1092,13 @@ fn write_event_create(
         )
     })?;
     if let Some(rrule) = event.recurrence.rrule.as_deref() {
-        let rule = jmap_recurrence_rule_from_rrule(rrule, Some(&event.start), event.is_all_day)
+        let rule = jmap_recurrence_rule_from_rrule(rrule, Some(&event.start), event.is_all_day())
             .ok_or_else(|| {
-                unsupported(
-                    operation,
-                    "JMAP shared recurrence contains RRULE fields unsupported by the JSCalendar mapper",
-                )
-            })?;
+            unsupported(
+                operation,
+                "JMAP shared recurrence contains RRULE fields unsupported by the JSCalendar mapper",
+            )
+        })?;
         target.recurrence_rules(vec![rule]);
     }
     let overrides = recurrence_overrides_from_shared(&event.recurrence);
@@ -1331,11 +1345,11 @@ fn jmap_until_from_ical(
             .ok()?;
             let datetime = date.to_datetime(time);
             if utc {
-                let timezone = TimeZone::get(start?.timezone.as_deref()?).ok()?;
+                let timezone = TimeZone::get(start?.timezone()?).ok()?;
                 let instant = Offset::UTC.to_timestamp(datetime).ok()?;
                 Some(timezone.to_datetime(instant).to_string())
             } else {
-                start.filter(|start| start.timezone.is_none())?;
+                start.filter(|start| start.timezone().is_none())?;
                 Some(datetime.to_string())
             }
         }
@@ -1356,7 +1370,7 @@ fn ical_until_from_jmap(
     if until.subsec_nanosecond() != 0 {
         return Err("an RFC 5545 UNTIL cannot express fractional seconds");
     }
-    if is_all_day || start.len() == 10 {
+    if is_all_day || EventTime::from_observed(start, None).is_all_day() {
         if until.time() != civil::Time::MIN {
             return Err("an all-day JMAP recurrence until must be midnight");
         }
@@ -1627,19 +1641,16 @@ fn reminder_from_alert(value: &Value) -> Option<EventReminder> {
         .map(str::to_ascii_uppercase);
     let trigger = match trigger.get("@type").and_then(Value::as_str) {
         Some("AbsoluteTrigger") => {
-            ReminderTrigger::Absolute(trigger.get("when").and_then(Value::as_str)?.to_string())
+            ReminderTrigger::absolute(trigger.get("when").and_then(Value::as_str)?)
         }
         // OffsetTrigger is the default when @type is absent.
         _ => {
-            let offset = trigger.get("offset").and_then(Value::as_str)?.to_string();
+            let offset = trigger.get("offset").and_then(Value::as_str)?;
             let relative_to = match trigger.get("relativeTo").and_then(Value::as_str) {
                 Some("end") => ReminderRelativeTo::End,
                 _ => ReminderRelativeTo::Start,
             };
-            ReminderTrigger::Relative {
-                offset,
-                relative_to,
-            }
+            ReminderTrigger::relative(offset, relative_to)
         }
     };
     Some(EventReminder { trigger, action })
@@ -1664,7 +1675,7 @@ fn single_location(value: &str) -> Map<String, Value> {
 }
 
 fn is_blank_time(time: &EventTime) -> bool {
-    time.value.trim().is_empty()
+    time.is_unspecified()
 }
 
 /// The shapes of event time this crate maps onto JSCalendar.
@@ -1688,16 +1699,13 @@ impl Moment {
     }
 }
 
-fn classify_time(value: &str) -> Option<Moment> {
-    if value.len() == 10 {
-        return civil::Date::strptime("%Y-%m-%d", value)
-            .ok()
-            .map(Moment::Date);
+fn moment(time: &EventTime) -> Option<Moment> {
+    match time.kind() {
+        EventTimeKind::Date(date) => Some(Moment::Date(date)),
+        EventTimeKind::Floating(local) | EventTimeKind::Zoned(local) => Some(Moment::Local(local)),
+        EventTimeKind::Offset(instant) => Some(Moment::Instant(instant)),
+        _ => None,
     }
-    if let Ok(instant) = value.parse::<Timestamp>() {
-        return Some(Moment::Instant(instant));
-    }
-    value.parse::<civil::DateTime>().ok().map(Moment::Local)
 }
 
 /// Parse one event bound, refusing anything this crate cannot map. An empty
@@ -1720,7 +1728,7 @@ fn parse_time(
             format!("JMAP calendar event `{field}` must not be empty"),
         ));
     }
-    match classify_time(&time.value) {
+    match moment(time) {
         Some(Moment::Instant(_)) if is_all_day => Err(malformed_time(
             operation,
             field,
@@ -1762,8 +1770,20 @@ fn event_duration(
     is_all_day: bool,
     operation: AccountOperation,
 ) -> Result<CalendarDuration, AccountError> {
+    let effective_start = start.converted(is_all_day);
+    let effective_end = end.converted(is_all_day);
+    let validate_pair = !is_all_day || start.instant().is_none() && end.instant().is_none();
     let start = parse_time(start, "start", is_all_day, operation)?;
     let end = parse_time(end, "end", is_all_day, operation)?;
+    if validate_pair {
+        effective_start.validate_end(&effective_end).map_err(|_| {
+            malformed_time(
+                operation,
+                "end",
+                "JMAP calendar event end must follow start in the same time domain".to_string(),
+            )
+        })?;
+    }
     let before_start = || {
         malformed_time(
             operation,
@@ -1823,20 +1843,16 @@ fn event_duration(
 }
 
 fn shared_time_from_jmap(value: &str, is_all_day: bool) -> String {
+    let time = EventTime::from_observed(value, None);
     if is_all_day {
-        // The shared all-day contract is a bare date; JSCalendar carries
-        // midnight on that date. Keep only the date half so a server that
-        // stores the conformant LocalDateTime reads back correctly.
-        return value.split('T').next().unwrap_or(value).to_string();
+        return time.converted(true).value().to_owned();
     }
-    if value.len() == 10 {
-        return value.to_string();
-    }
-    if value.parse::<Timestamp>().is_ok() {
-        return value.to_string();
-    }
-    if let Some(time) = local_datetime(value) {
-        return shared_rfc3339(time);
+    // Preserve the existing projection's UTC anchoring for wire-local values.
+    // EventTime itself does not implicitly anchor floating caller input.
+    if let EventTimeKind::Floating(local) = time.kind()
+        && let Ok(at) = Offset::UTC.to_timestamp(local)
+    {
+        return shared_rfc3339(at);
     }
     value.to_string()
 }
@@ -1866,10 +1882,7 @@ fn jmap_time_from_shared(
         // A numeric offset yields the wall clock directly. A `Z` suffix is
         // rejected by the civil parser (Temporal reads it as an unknown
         // offset), so route that through the instant and read it back at UTC.
-        Moment::Instant(instant) => time
-            .value
-            .parse::<civil::DateTime>()
-            .unwrap_or_else(|_| Offset::UTC.to_datetime(instant)),
+        Moment::Instant(_) => time.local_datetime().expect("parsed offset wall clock"),
     };
     LocalDateTime::from_civil(wall)
         .map_err(|error| malformed_time(operation, "start", error.into()))
@@ -1903,50 +1916,33 @@ fn shared_rfc3339(at: Timestamp) -> String {
     format!("{}+00:00", Offset::UTC.to_datetime(at))
 }
 
-/// A zoneless JSCalendar LocalDateTime, anchored at UTC so two of them
-/// compare against each other and against offset-bearing values on one
-/// consistent scale.
-fn local_datetime(value: &str) -> Option<Timestamp> {
-    let naive = value.parse::<LocalDateTime>().ok()?.civil();
-    Offset::UTC.to_timestamp(naive).ok()
-}
-
 fn end_from_start_duration(start: &str, duration: &str, is_all_day: bool) -> Option<String> {
     let offset = duration.parse::<CalendarDuration>().ok()?.signed()?;
-    // Validate the whole start before an all-day projection discards its time.
-    if !start.is_empty() {
-        classify_time(start)?;
+    if start.is_empty() {
+        return Some(String::new());
     }
+    let start = EventTime::from_observed(start, None);
+    start.validate().ok()?;
     // Overflow must reject this event, not fabricate a zero-length appointment.
-    if (is_all_day || start.len() == 10)
-        && let Ok(date) =
-            civil::Date::strptime("%Y-%m-%d", start.split('T').next().unwrap_or(start))
-    {
+    if is_all_day || start.is_all_day() {
+        let date = start.local_datetime()?.date();
         // All-day ends are exclusive and round partial days upward.
         let nanos = offset.as_nanos();
         let nanos_per_day = 86_400_i128 * 1_000_000_000;
         let days = nanos / nanos_per_day + i128::from(nanos % nanos_per_day != 0);
         let span = Span::new().try_days(i64::try_from(days).ok()?).ok()?;
-        return Some(
-            date.checked_add(span)
-                .ok()?
-                .strftime("%Y-%m-%d")
-                .to_string(),
-        );
+        return Some(date.checked_add(span).ok()?.to_string());
     }
-    if let Ok(start) = start.parse::<Timestamp>() {
-        return Some(shared_rfc3339(start.checked_add(offset).ok()?));
+    if let Some(at) = start.instant() {
+        return Some(shared_rfc3339(at.checked_add(offset).ok()?));
     }
-    if let Some(start) = local_datetime(start) {
-        return Some(
-            Offset::UTC
-                .to_datetime(start.checked_add(offset).ok()?)
-                .to_string(),
-        );
-    }
-    // Missing start is the shared unknown-time sentinel. Invalid nonempty
-    // starts must fail hydration rather than fabricate an appointment end.
-    start.is_empty().then(String::new)
+    Some(
+        start
+            .local_datetime()?
+            .checked_add(offset)
+            .ok()?
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -2125,10 +2121,7 @@ mod tests {
     use super::*;
 
     fn time(value: &str) -> EventTime {
-        EventTime {
-            value: value.to_string(),
-            timezone: None,
-        }
+        EventTime::from_observed(value.to_string(), None)
     }
 
     /// Answers `CalendarEvent/query` with a fixed id list and total, and
@@ -2547,7 +2540,8 @@ mod tests {
         jmap_patch_from_event_patch(patch, &event_context_from_patch(patch, None), operation)
     }
 
-    fn event(start: &str, end: &str, is_all_day: bool) -> CalendarEvent {
+    fn event(start: &str, end: &str, expected_all_day: bool) -> CalendarEvent {
+        assert_eq!(time(start).is_all_day(), expected_all_day);
         CalendarEvent {
             id: EventId("e1".to_string()),
             calendar_id: CalendarId("c1".to_string()),
@@ -2563,8 +2557,7 @@ mod tests {
             description: None,
             location: None,
             start: time(start),
-            end: Some(time(end)).filter(|end| !end.value.is_empty()),
-            is_all_day,
+            end: Some(time(end)).filter(|end| !end.value().is_empty()),
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -2728,7 +2721,7 @@ mod tests {
             };
             let projected =
                 event_from_jmap(event, AccountOperation::EventGet).expect("supported event");
-            assert_eq!(projected.end.expect("event end").value, expected);
+            assert_eq!(projected.end.expect("event end").value(), expected);
         }
         assert_eq!(parse_duration_seconds("P2W"), Some(1_209_600));
         assert_eq!(parse_duration_seconds("P18446744073709551615W"), None);
@@ -2751,7 +2744,7 @@ mod tests {
     #[test]
     fn end_from_duration_rejects_invalid_start_but_preserves_absence() {
         for all_day in [false, true] {
-            for start in ["not a time", "2026-99-99", "2026-06-02T99:99:99"] {
+            for start in ["not a time", " ", "2026-99-99", "2026-06-02T99:99:99"] {
                 assert_eq!(end_from_start_duration(start, "PT90M", all_day), None);
             }
             assert_eq!(
@@ -2774,10 +2767,10 @@ mod tests {
     fn shared_rfc3339_writes_as_jmap_local_datetime() {
         assert_eq!(
             jmap_time_from_shared(
-                &EventTime {
-                    value: "2026-06-02T12:00:00+02:00".to_string(),
-                    timezone: Some("Europe/Oslo".to_string()),
-                },
+                &EventTime::from_observed(
+                    "2026-06-02T12:00:00+02:00".to_string(),
+                    Some("Europe/Oslo".to_string())
+                ),
                 false,
                 AccountOperation::EventCreate,
             )
@@ -2807,10 +2800,10 @@ mod tests {
     fn filter_time_normalizes_offset_to_bare_utc_local_datetime() {
         assert_eq!(
             jmap_utc_filter_time(
-                &EventTime {
-                    value: "2026-06-02T12:00:00+02:00".to_string(),
-                    timezone: Some("Europe/Oslo".to_string()),
-                },
+                &EventTime::from_observed(
+                    "2026-06-02T12:00:00+02:00".to_string(),
+                    Some("Europe/Oslo".to_string())
+                ),
                 "start",
             )
             .expect("parseable"),
@@ -3361,7 +3354,6 @@ mod tests {
             location: Some("Room".to_string()),
             start: time("2026-06-02T12:00:00Z"),
             end: time("2026-06-02T13:00:00Z"),
-            is_all_day: false,
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -3429,7 +3421,6 @@ mod tests {
             location: None,
             start: time(start),
             end: time(end),
-            is_all_day: false,
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -3452,7 +3443,7 @@ mod tests {
         }))
         .expect("event parses");
         let event = event_from_jmap(raw, AccountOperation::EventGet).expect("projects");
-        assert!(event.start.value.is_empty());
+        assert!(event.start.value().is_empty());
         assert_eq!(event.end, None);
     }
 
@@ -3568,10 +3559,10 @@ mod tests {
 
     #[test]
     fn recurrence_rule_normalizes_until_to_event_local_datetime() {
-        let zoned_start = EventTime {
-            value: "2025-01-01T09:00:00+01:00".to_string(),
-            timezone: Some("Europe/Oslo".to_string()),
-        };
+        let zoned_start = EventTime::from_observed(
+            "2025-01-01T09:00:00+01:00".to_string(),
+            Some("Europe/Oslo".to_string()),
+        );
         let utc = jmap_recurrence_rule_from_rrule(
             "FREQ=DAILY;UNTIL=20260601T070000Z",
             Some(&zoned_start),
@@ -3580,10 +3571,8 @@ mod tests {
         .expect("UTC until");
         assert_eq!(utc["until"].as_str(), Some("2026-06-01T09:00:00"));
 
-        let floating_start = EventTime {
-            value: "2025-01-01T09:00:00+00:00".to_string(),
-            timezone: None,
-        };
+        let floating_start =
+            EventTime::from_observed("2025-01-01T09:00:00+00:00".to_string(), None);
         let floating = jmap_recurrence_rule_from_rrule(
             "FREQ=DAILY;UNTIL=20260101T000000",
             Some(&floating_start),
@@ -3822,10 +3811,7 @@ mod tests {
         };
         let context = event_context_from_patch(&patch, Some(&current));
         assert_eq!(
-            context
-                .start
-                .as_ref()
-                .and_then(|start| start.timezone.as_deref()),
+            context.start.as_ref().and_then(|start| start.timezone()),
             Some("Europe/Oslo")
         );
         assert!(!context.is_all_day);
@@ -3840,31 +3826,45 @@ mod tests {
     }
 
     #[test]
-    fn an_all_day_event_keeps_its_date_start_when_a_patch_omits_is_all_day() {
-        let current = JmapCalendarEvent {
-            properties: serde_json::from_value(json!({
-                "id": "e1",
-                "start": "2026-06-01T00:00:00",
-                "showWithoutTime": true
-            }))
-            .expect("event"),
-        };
-        let patch = EventPatch {
-            start: Some(time("2026-06-02")),
-            end: Some(time("2026-06-03")),
-            ..EventPatch::default()
-        };
-        assert!(event_patch_needs_context(&patch));
-        let context = event_context_from_patch(&patch, Some(&current));
-        assert!(context.is_all_day);
-
-        let built = jmap_patch_from_event_patch(&patch, &context, AccountOperation::EventUpdate)
-            .expect("patch");
-        assert_eq!(
-            built.properties["start"].as_str(),
-            Some("2026-06-02T00:00:00")
-        );
-        assert_eq!(built.properties["duration"].as_str(), Some("P1D"));
+    fn typed_time_patches_own_the_wire_mode_without_a_sibling_flag() {
+        for (start, end, all_day, wire_start, duration) in [
+            (
+                "2026-06-02",
+                "2026-06-03",
+                true,
+                "2026-06-02T00:00:00",
+                "P1D",
+            ),
+            (
+                "2026-06-02T12:00:00",
+                "2026-06-02T13:00:00",
+                false,
+                "2026-06-02T12:00:00",
+                "PT3600S",
+            ),
+        ] {
+            for stored_mode in [true, false] {
+                let current = JmapCalendarEvent {
+                    properties: serde_json::from_value(json!({
+                        "id": "e1", "start": "2026-06-01T00:00:00",
+                        "showWithoutTime": stored_mode
+                    }))
+                    .expect("event"),
+                };
+                let patch = EventPatch {
+                    start: Some(time(start)),
+                    end: Some(time(end)),
+                    ..EventPatch::default()
+                };
+                let context = event_context_from_patch(&patch, Some(&current));
+                let built =
+                    jmap_patch_from_event_patch(&patch, &context, AccountOperation::EventUpdate)
+                        .expect("patch");
+                assert_eq!(built.properties["showWithoutTime"], json!(all_day));
+                assert_eq!(built.properties["start"].as_str(), Some(wire_start));
+                assert_eq!(built.properties["duration"].as_str(), Some(duration));
+            }
+        }
     }
 
     #[test]
@@ -4061,7 +4061,6 @@ mod tests {
                 location: None,
                 start: time("2026-06-02T12:00:00Z"),
                 end: time("2026-06-02T13:00:00Z"),
-                is_all_day: false,
                 status: EventStatus::Confirmed,
                 availability: EventAvailability::Busy,
                 visibility: EventVisibility::Default,
@@ -4287,18 +4286,18 @@ mod tests {
         assert_eq!(reminders.len(), 3);
         assert!(reminders.iter().any(|reminder| reminder.trigger
             == ReminderTrigger::Relative {
-                offset: "-PT15M".to_string(),
+                offset: "-PT15M".parse().unwrap(),
                 relative_to: ReminderRelativeTo::Start,
             }
             && reminder.action.as_deref() == Some("DISPLAY")));
         assert!(reminders.iter().any(|reminder| reminder.trigger
             == ReminderTrigger::Relative {
-                offset: "PT5M".to_string(),
+                offset: "PT5M".parse().unwrap(),
                 relative_to: ReminderRelativeTo::End,
             }
             && reminder.action.as_deref() == Some("EMAIL")));
         assert!(reminders.iter().any(|reminder| reminder.trigger
-            == ReminderTrigger::Absolute("2026-06-02T11:00:00Z".to_string())
+            == ReminderTrigger::Absolute("2026-06-02T11:00:00Z".parse().unwrap())
             && reminder.action.is_none()));
     }
 
@@ -4385,7 +4384,6 @@ mod tests {
             location: None,
             start: time("2026-06-02T12:00:00Z"),
             end: time("2026-06-02T13:00:00Z"),
-            is_all_day: false,
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -4501,7 +4499,6 @@ mod tests {
             location: None,
             start: time("2026-06-02T12:00:00Z"),
             end: time("2026-06-02T13:00:00Z"),
-            is_all_day: false,
             status: EventStatus::Tentative,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,
@@ -4544,7 +4541,6 @@ mod tests {
             location: None,
             start: time("2026-06-02T12:00:00Z"),
             end: time("2026-06-02T13:00:00Z"),
-            is_all_day: false,
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Confidential,
@@ -4565,7 +4561,6 @@ mod tests {
             location: None,
             start: time("2026-06-02T12:00:00Z"),
             end: time("2026-06-02T13:00:00Z"),
-            is_all_day: false,
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
             visibility: EventVisibility::Default,

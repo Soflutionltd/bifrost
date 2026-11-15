@@ -1,6 +1,6 @@
 [package]
 name = "bifrost-sasl"
-description = "Private shared SASL/SCRAM layer for the bifrost IMAP and SMTP clients"
+description = "Shared SASL clients and policy for the bifrost protocol clients"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

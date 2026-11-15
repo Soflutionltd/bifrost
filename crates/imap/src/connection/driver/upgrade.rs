@@ -122,11 +122,11 @@ async fn starttls_upgrade(
         *wire_reader =
             super::super::wire::WireReader::with_metering(ImapStream::Poisoned, metering);
         state.apply_infrastructure_failure();
-        return Err(Error::Protocol(
+        return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
             "STARTTLS: unexpected bytes in buffer at upgrade boundary \
              (possible MITM; RFC 3501 Section 6.2.1)"
                 .into(),
-        ));
+        )));
     }
 
     // Step 3: Atomic swap. Replace the reader with one on a Poisoned
@@ -405,7 +405,7 @@ mod bandwidth_review_tests {
     use crate::connection::{
         state::ProtocolState, stream::Tracked, tag::TagGenerator, wire::WireReader,
     };
-    use crate::error::ImapAttempt;
+
     use bifrost_net::{BandwidthBudget, BandwidthDirection, MeterSink, MeterSinkHandle};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::AsyncWriteExt;
@@ -414,26 +414,27 @@ mod bandwidth_review_tests {
     #[test]
     fn nonfatal_required_refresh_refusal_retires_the_connection() {
         let mut state = ProtocolState::new();
-        let error = Error::No {
+        let error = Error::ServerStatus(crate::error::ServerStatus::No {
             text: "CAPABILITY refused".into(),
             code: None,
-            attempt: Some(ImapAttempt::new(
-                bifrost_types::TransmissionState::Acknowledged,
-            )),
-        };
+        });
 
         let error = retire_after_failed_refresh(&mut state, error);
-        assert!(matches!(error, Error::No { text, .. } if text == "CAPABILITY refused"));
+        assert!(
+            matches!(error, Error::ServerStatus(crate::error::ServerStatus::No { text, .. }) if text == "CAPABILITY refused")
+        );
         assert_eq!(state.session_state(), SessionState::Logout);
     }
 
     #[test]
     fn fatal_required_refresh_error_keeps_its_original_class() {
         let mut state = ProtocolState::new();
-        let error = Error::Protocol("malformed post-upgrade response".into());
+        let error = Error::Provider(crate::error::ProviderFailure::Protocol(
+            "malformed post-upgrade response".into(),
+        ));
         let result = retire_after_failed_refresh(&mut state, error);
         assert!(
-            matches!(result, Error::Protocol(message) if message == "malformed post-upgrade response")
+            matches!(result, Error::Provider(crate::error::ProviderFailure::Protocol(message)) if message == "malformed post-upgrade response")
         );
         assert_eq!(state.session_state(), SessionState::Logout);
     }

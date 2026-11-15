@@ -184,7 +184,7 @@ fn framing_unreachable_literal_size_is_a_parse_error_not_a_stall() {
         assert!(
             matches!(
                 super::buffer_may_contain_complete_response(marker),
-                Err(Error::Parse(_))
+                Err(Error::Provider(crate::error::ProviderFailure::Parse(_)))
             ),
             "expected a fatal framing error for {}",
             String::from_utf8_lossy(marker)
@@ -282,7 +282,13 @@ async fn read_one_fails_fast_on_an_undeliverable_literal_count() {
     .await
     .expect("read_one must not wait for octets that cannot exist")
     .expect_err("an unreachable literal count is fatal");
-    assert!(matches!(err, Error::Parse(_)), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::Provider(crate::error::ProviderFailure::Parse(_))
+        ),
+        "got {err:?}"
+    );
     let _server = server;
 }
 
@@ -469,7 +475,10 @@ async fn read_one_reports_eof_as_closed() {
         .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
         .await
     {
-        Err(Error::Closed { .. }) => {}
+        Err(Error::Transport {
+            kind: crate::error::TransportFailure::Closed,
+            ..
+        }) => {}
         other => panic!("expected Closed on EOF, got {other:?}"),
     }
 }
@@ -485,7 +494,9 @@ async fn read_one_reports_a_hard_parse_error() {
         .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
         .await
     {
-        Err(Error::Parse(msg)) => assert!(msg.contains("parse error"), "unexpected text: {msg}"),
+        Err(Error::Provider(crate::error::ProviderFailure::Parse(msg))) => {
+            assert!(msg.contains("parse error"), "unexpected text: {msg}");
+        }
         other => panic!("expected Parse, got {other:?}"),
     }
 }
@@ -503,7 +514,7 @@ async fn read_one_rejects_a_malformed_recognized_fetch_attribute() {
             reader
                 .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
                 .await,
-            Err(Error::Parse(_))
+            Err(Error::Provider(crate::error::ProviderFailure::Parse(_)))
         ));
     }
 }
@@ -611,7 +622,10 @@ async fn bandwidth_peer_timeout_starts_after_admission() {
     assert_eq!(start.elapsed(), Duration::from_secs(1));
     assert!(matches!(
         reader.read_admitted().await,
-        Err(Error::Timeout { .. })
+        Err(Error::Transport {
+            kind: crate::error::TransportFailure::Timeout,
+            ..
+        })
     ));
     assert_eq!(start.elapsed(), Duration::from_millis(2010));
 }
@@ -656,7 +670,13 @@ async fn setup_peer_budget_keeps_elapsed_wait_when_the_reader_is_rebuilt() {
         std::future::pending::<std::io::Result<()>>(),
     )
     .await;
-    assert!(matches!(result, Err(Error::Timeout { .. })));
+    assert!(matches!(
+        result,
+        Err(Error::Transport {
+            kind: crate::error::TransportFailure::Timeout,
+            ..
+        })
+    ));
     assert_eq!(
         start.elapsed(),
         Duration::from_millis(40),
@@ -818,13 +838,22 @@ async fn bandwidth_cancelled_peer_io_keeps_its_spent_time() {
         reader.read_one(crate::codec::utf7::WireMode::ModifiedUtf7),
     )
     .await;
-    assert!(matches!(result, Err(Error::Timeout { .. })));
+    assert!(matches!(
+        result,
+        Err(Error::Transport {
+            kind: crate::error::TransportFailure::Timeout,
+            ..
+        })
+    ));
     assert_eq!(start.elapsed(), Duration::from_millis(30));
     assert!(matches!(
         reader
             .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
             .await,
-        Err(Error::Timeout { .. })
+        Err(Error::Transport {
+            kind: crate::error::TransportFailure::Timeout,
+            ..
+        })
     ));
     assert_eq!(start.elapsed(), Duration::from_millis(100));
 }
@@ -842,10 +871,12 @@ async fn literal_budget_refuses_a_marker_without_reading_its_payload() {
         reader
             .read_one_limited(crate::codec::utf7::WireMode::ModifiedUtf7, Some(1024))
             .await,
-        Err(Error::FetchLiteralLimit {
-            estimated: 1025,
-            limit: 1024
-        })
+        Err(Error::ResultLimit(
+            crate::error::ResultLimit::FetchLiteral {
+                estimated: 1025,
+                limit: 1024
+            }
+        ))
     ));
 }
 
@@ -860,10 +891,12 @@ async fn literal_budget_counts_sections_together_and_skips_payload_syntax() {
         reader
             .read_one_limited(crate::codec::utf7::WireMode::ModifiedUtf7, Some(8))
             .await,
-        Err(Error::FetchLiteralLimit {
-            estimated: 9,
-            limit: 8
-        })
+        Err(Error::ResultLimit(
+            crate::error::ResultLimit::FetchLiteral {
+                estimated: 9,
+                limit: 8
+            }
+        ))
     ));
 }
 

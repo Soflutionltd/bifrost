@@ -236,9 +236,9 @@ pub(super) fn route_pipeline_response(
 
     match resp {
         crate::types::Response::Continuation(_) => Ok(Routed::Continuation),
-        crate::types::Response::Greeting(_) => {
-            Err(Error::Protocol("unexpected greeting mid-pipeline".into()))
-        }
+        crate::types::Response::Greeting(_) => Err(Error::Provider(
+            crate::error::ProviderFailure::Protocol("unexpected greeting mid-pipeline".into()),
+        )),
         crate::types::Response::Tagged(t) => {
             let Some(&idx) = routing.tag_to_idx.get(&t.tag) else {
                 unreachable!("ReadLoop admitted only this pipeline's tags");
@@ -507,10 +507,13 @@ pub(super) async fn run_pipeline(
     // checked every command at execution, so reaching here means the session
     // moved while the batch was queued.
     if let Some(cmd) = commands.iter().find(|cmd| !cmd.kind().pipelinable()) {
-        return PipelineEnd::Refused(Error::Internal(format!(
-            "{:?} cannot be pipelined (CommandKind::pipelinable)",
-            cmd.kind()
-        )));
+        return PipelineEnd::Refused(Error::Internal {
+            kind: crate::error::InternalFailure::Invariant(format!(
+                "{:?} cannot be pipelined (CommandKind::pipelinable)",
+                cmd.kind()
+            )),
+            mid_exchange: None,
+        });
     }
     for cmd in &commands {
         if let Err(refusal) = super::admit_live(state, cmd) {
@@ -626,7 +629,16 @@ pub(super) async fn run_pipeline(
     PipelineEnd::Ran {
         results: all_results
             .into_iter()
-            .map(|r| r.unwrap_or_else(|| Err(Error::Internal("missing pipeline result".into()))))
+            .map(|r| {
+                r.unwrap_or_else(|| {
+                    Err(Error::Internal {
+                        kind: crate::error::InternalFailure::Invariant(
+                            "missing pipeline result".into(),
+                        ),
+                        mid_exchange: None,
+                    })
+                })
+            })
             .collect(),
         failure,
     }
@@ -849,8 +861,10 @@ async fn run_pipeline_batch(
                 // Pipelinable commands do not take continuations
                 // (`CommandKind::pipelinable`, checked in `run_pipeline`).
                 // An unexpected + is a protocol error (RFC 3501 Section7.5).
-                return Err(fail(Error::Protocol(
-                    "unexpected continuation in pipeline response loop".into(),
+                return Err(fail(Error::Provider(
+                    crate::error::ProviderFailure::Protocol(
+                        "unexpected continuation in pipeline response loop".into(),
+                    ),
                 )));
             }
             // Unreachable with `sending: None`: no tag is the own tag.

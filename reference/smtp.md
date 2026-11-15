@@ -84,12 +84,12 @@ does not hold for a library crate, whose consumers are outside this workspace by
 definition; "nothing calls it" established by grepping here is a fact about the
 workspace, not about who uses `SmtpTransport`.
 
-The two halves no longer mirror a protocol state machine each: the send paths
-share one sans-I/O core and differ only in how they move bytes. See "Protocol
-core and I/O adapters". What still exists twice - connect, greeting, EHLO/LHLO,
-the AUTH ladder, STARTTLS, reply reading, deadlines - is I/O-shaped, and the
-paired tests over it remain intentional while the published sync and async
-transports remain separate. There are two deliberate behavioural differences:
+The two halves share session sequencing, transaction sequencing and reply
+framing. See "Protocol core and I/O adapters". Dialing, token resolution, TLS
+handshakes, byte I/O, bandwidth admission and deadlines remain adapter-owned.
+The session conformance suite defines each transcript once and runs it through
+both adapters; adapter-specific timeout and cancellation tests stay separate.
+There are two deliberate behavioural differences:
 the `abort()` timeout (see "Connection lifecycle") and what the configured
 timeout covers during SETUP, immediately below. (Outbound throttling used to be
 a third: the blocking half slept outbound debt after a write, on the thread
@@ -223,25 +223,52 @@ for its next `Op`; the adapter performs it and feeds back an `OpOutcome`
 `Reply`, never a `Failed`: telling a routine rejection apart from a transport
 failure is exactly the decision the core exists to make in one place.
 
-Four machines cover the send surface, and each is what one driver method used
-to be:
+One `Transaction<P>` covers the send surface. Its `Dialect` selects one SMTP
+final reply or one LMTP final status per accepted recipient. `RecipientPolicy`
+is explicit: `FailFast` stops direct SMTP before the body on any recipient
+refusal; `PerRecipient` retains refusals while sending to accepted recipients.
+`DirectSmtp` and `DirectLmtp` are projection aliases, not separate machines.
+`BatchTransaction` uses the same sequencer for either dialect. Each transaction
+records one `TransactionProgress`, including original recipient indexes and a
+single phase (`Envelope`, `DataIssued`, `BodyStarted`, `BodySent`, or
+`FinalReply`). Direct `Response`, ordered LMTP responses, and account-aware
+`SendProgress` are terminal projections of that record. Direct progress exists
+with `account-error` disabled too.
 
-| Machine | Drives |
-|---|---|
-| `DirectSmtp` | `send_with_options` / `send_bdat_with_options`, pipelined or not |
-| `DirectLmtp` | `send_lmtp_with_options` / `send_lmtp_bdat_with_options` |
-| `BatchSmtp` | `send_smtp_batch`, pipelined or not |
-| `BatchLmtp` | `send_lmtp_batch` |
+The op vocabulary covers commands, body framing and session effects:
+`Write(String)`, `WriteSecret(Secret)`, `WriteBody`, `WriteBdat`,
+`OpenReplyGroup`, `ReadGrouped`, `ReadSingle`, `CloseReplyGroup`,
+`CloseLmtpDrain { restore_ok }`, `UpgradeTls(TlsParameters)`,
+`ResolveToken(Credentials)`, and `Abort`. `WriteSecret` and token outcomes redact
+Debug output and wipe storage on drop. `OpenReplyGroup` / `CloseReplyGroup`
+hold the stream `Broken` until the complete expected group drains.
+`ReadGrouped` defers surplus checking to the close; `ReadSingle` checks itself.
+Command write failures reach the same stage as the command's reply, so both
+carry the same boundary's phase.
 
-The op vocabulary is small and every variant maps to a primitive both drivers
-already had: `Write(String)`, `WriteBody`, `WriteBdat`, `OpenReplyGroup`,
-`ReadGrouped`, `ReadSingle`, `CloseReplyGroup`, `CloseLmtpDrain { restore_ok }`,
-`Abort`. `OpenReplyGroup` / `CloseReplyGroup` are the reply-group bracket: the
-stream is held `Broken` from the group's first read until its last has drained,
-so a connection abandoned mid-drain can never be recycled. `ReadGrouped` defers
-the surplus check to the close; `ReadSingle` applies it itself. A command write
-is followed by the reply read for it, and a write failure is handed to the same
-stage that would have handled the reply, so both carry that boundary's phase.
+`session.rs` owns greeting, EHLO/LHLO, STARTTLS and the AUTH ladder. Its entry
+points share one hello continuation and one authentication walk. Greeting and
+STARTTLS require 220, hello requires 2yz completion, and authentication requires
+235 to finish. SCRAM accepts either a 334 server-final followed by an empty
+client acknowledgement and 235, or the server-final folded into 235, including
+an enhanced status prefix. PLAIN, LOGIN, XOAUTH2 and OAUTHBEARER run on
+`bifrost_sasl::SaslClient`, which owns the challenge budget: PLAIN answers no
+challenge, LOGIN answers exactly two (username, then password, by position),
+and an OAuth mechanism answers one error challenge; any further `334`, or a
+`235` before the mechanism completed, is a parse-class refusal that aborts the
+connection. STARTTLS upgrades precede a fresh hello;
+post-TLS and post-AUTH capabilities replace the old set. Token resolution is
+one adapter effect per OAuth exchange: async calls `current()`, blocking uses
+`snapshot()` without creating or polling an async token future. The transport's
+dial policy still determines whether to request STARTTLS and configure AUTH.
+
+`reply.rs` owns `ReplyAssembler`: bounded byte-chunk assembly, per-line and
+total caps, UTF-8 validation, parser incomplete handling, and the shared
+surplus-byte refusal, including the STARTTLS plaintext boundary. EOF, including
+mid-line EOF, is `Network` with an `UnexpectedEof` source. The transaction
+stamps `Unsent` before body admission or `InFlight` after it. An enterprise send
+queue must retry a disconnected, unsent message without classifying a normal
+connection loss as a provider contract violation.
 
 The `Epilogue` type holds the two terminal sequences every machine shares. It
 carries the value the machine will finish with, so a boundary cannot start an
@@ -249,11 +276,11 @@ abort or a reset and forget to return. RSET-and-keep is expressed there as ops -
 write `RSET`, read the reply, keep the connection on a positive
 acknowledgement and abort otherwise - so no adapter knows the rule.
 
-Each adapter is a `drive` loop plus a `perform` match, roughly thirty lines.
-What stays adapter-side is what is genuinely I/O: dialling, the greeting and
-EHLO/LHLO exchange, the AUTH ladder, the STARTTLS upgrade, reply-line reading
-and parsing with its size caps, read and write deadlines, bandwidth throttling,
-and the socket shutdown `Op::Abort` performs. The local validation that runs
+Each adapter has a `drive` loop and an effect match. What stays adapter-side
+is I/O: dialing, buffer fills, byte writes, TLS handshakes, token-source calls,
+read/write deadlines, bandwidth admission and shutdown. Async session startup
+uses the same shared setup deadline across the greeting and hello effects.
+The local validation that runs
 before `MAIL FROM` lives in the sans-I/O sibling `client/envelope.rs`.
 `EnvelopeBuilder` takes `ServerInfo` and the connection's encryption state;
 both adapters delegate `build_envelope` and `build_batch` to it. Direct and
@@ -350,7 +377,7 @@ the pool, and hand the next send a half-open transaction. Building first keeps
 every address rejection on the clean side of `MAIL FROM`, where no abort is
 needed and the connection stays reusable.
 
-`DirectSmtp` also enforces "no `DATA` before `MAIL FROM`" itself rather than
+`Transaction` also enforces "no `DATA` before `MAIL FROM`" itself rather than
 inheriting it from its callers. `Envelope::new` rejects an empty recipient list,
 so an empty envelope is unreachable from the public API, but the pipelined
 branch used to call `start_window(0)`, find nothing to write, fall through to
@@ -358,9 +385,9 @@ branch used to call `start_window(0)`, find nothing to write, fall through to
 authority on its own command sequence and cannot see the type that forbids the
 input, so the empty case is routed through the sequential branch, which writes
 `MAIL FROM` before it looks at the list. Pinned by
-`a_pipelined_send_with_no_recipients_still_opens_with_mail_from`. `BatchSmtp`
-has the same shape one degree milder - a pipelined empty batch writes `RSET`
-with no transaction open, which is legal SMTP - and is deliberately left alone.
+`a_pipelined_send_with_no_recipients_still_opens_with_mail_from`. Empty batch
+and LMTP inputs now use that same MAIL-first branch before resetting an
+empty transaction.
 
 ## Async setup deadline
 
@@ -450,7 +477,7 @@ only by the size caps.
   remaining duration. A setup deadline remains absolute and includes admission.
 - The blocking stream keeps the same cumulative remaining peer time, re-arming
   `SO_RCVTIMEO` before each syscall after admission. It spends only syscall time,
-  so multiple fills within `read_until` cannot reset the reply budget. The
+  so multiple `fill_buf` calls cannot reset the reply budget. The
   configured socket timeout is restored when the reply ends. Zero remaining time
   fails rather than setting a zero socket timeout, which would block forever.
 
@@ -464,20 +491,23 @@ historical names while exercising reservation waits rather than post-read debt.
 
 ## PIPELINING
 
-When the server advertises PIPELINING, `MAIL FROM` and `RCPT TO` commands are written in bounded recipient windows, with every reply in one window drained before the next is written. `DATA` is issued only after all recipient windows complete; the body is never in the pipelined batch. On RCPT failure mid-pipeline the transaction is reset before the body. The shared window bound respects the peer TCP window while preserving the original recipient indexes in `SendProgress`.
+When the server advertises PIPELINING, `MAIL FROM` and `RCPT TO` commands use
+bounded recipient windows with every reply drained before the next window.
+Both dialects and both DATA and BDAT use this envelope sequence. Body admission
+comes only after the envelope completes; body bytes are never pipelined.
+`FailFast` resets before the body on a recipient refusal; `PerRecipient`
+continues for accepted recipients and resets only when none were accepted.
+Original recipient indexes survive every window.
 
 The window bracket is `Op::OpenReplyGroup` / `Op::CloseReplyGroup`, so both
 drivers hold the stream `Broken` from a successful window write until the
 complete reply group has drained, by construction rather than by mirroring.
 
-Every direct-SMTP boundary is decorated with its `SmtpCommandPhase`, and that is
-enforced by the type rather than by remembering it at each call site.
-`DirectSmtp` builds its error exits only through the free `phased` helper,
-whose return type is `PhasedError` - no `From<Error>` conversion and no
-phase-less constructor - and the single `Step::Finish` that converts back to
-`Error` is where the phase is stamped. A boundary added later cannot ship
-undecorated; it will not build. Since the machine covers the pipelined and
-non-pipelined paths alike, the guarantee now spans both.
+Every transaction error exit carries `PhasedError`, which has no phase-less
+constructor. The shared `TransactionStage` handles the write and reply for
+each boundary; terminal projections stamp the phase when converting to the
+wire `Error`. This covers direct SMTP, direct LMTP and batch errors alike,
+with or without pipelining or BDAT.
 
 Batch error translation also has one phase authority. `SmtpErrorContext` cannot
 carry a command phase, so a batch site converting a low-level `Error` must use
@@ -525,13 +555,17 @@ and abort the stream. Reporting the drain's own error instead handed the caller
 a retryable `RcptTo` network error for an envelope the server had permanently
 refused, with the reply text that said why thrown away (2026-09-07).
 `MailRejectedClosing` is the identical defect one stage later and was fixed with
-it. Pinned by `a_failed_window_drain_still_reports_the_mail_from_rejection`.
+it. A 421 among the drained RCPT replies also aborts immediately while
+preserving the MAIL refusal, rather than waiting for replies after the peer
+announces closure. Pinned by
+`a_failed_window_drain_still_reports_the_mail_from_rejection` and
+`a_closing_reply_while_draining_rejected_mail_keeps_the_mail_refusal`.
 
 A negative reply to the DATA end-of-data terminator follows the same rule from
 the other end. The peer read the whole message and refused it, so the
 transaction is complete (RFC 5321 4.1.1.4), there is nothing to reset, and the
 connection stays reusable: `DirectSmtp` finishes with the status error and no
-abort, and `BatchSmtp` (which is DATA-only) records the reply through
+abort, and the batch projection (whose public send APIs use DATA) records the reply through
 `set_data_response` after recording body completion at the write boundary and finishes `Ok(progress)`, so
 `resolve` fans it out as `DataFinal` `failed` lanes carrying `Acknowledged`.
 Routing it through the transport-failure arm instead put every accepted
@@ -553,26 +587,26 @@ open, and the next checkout's `MAIL FROM` drew `503 bad sequence`.
 `a_rejected_bdat_last_resets_the_transaction_before_the_connection_is_reused`
 pins it in both halves.
 
-One reply overrides all of that, at EVERY boundary in ALL FOUR machines: `421`
+One reply overrides all of that at every transaction boundary: `421`
 means "closing transmission channel" (RFC 5321 4.2.3), and `core::closing_channel`
 is asked ahead of every reset-or-keep decision a negative reply reaches. The
 reset-or-keep rules reason about the transaction; a 421 is about the
 connection, so whatever the boundary - `MAIL FROM`, `RCPT TO`, `DATA`, the
 end-of-data terminator, `BDAT ... LAST` - it goes through `Epilogue::abort`
-carrying the same value the arm would otherwise have produced. `DirectSmtp` and
-`DirectLmtp` carry the status error; a pipelined `MAIL FROM` answered 421 aborts
-without draining the window, since the RCPT replies may never come. `BatchSmtp`
-and `BatchLmtp` still record the answer first, so their lanes resolve from it:
+carrying the same value the arm would otherwise have produced. The direct projections carry the status error; a pipelined `MAIL FROM`
+answered 421 aborts without draining the window, since the RCPT replies may
+never come. The batch projection still records the answer first, so its lanes
+resolve from it:
 at `RCPT TO` the answered recipient is rejected with the 421 and every other
 unanswered or accepted recipient is `Unsent`, because `DATA` was never issued
-(`closing_during_envelope`); at `DATA` the accepted recipients fail with it; at
+(the envelope phase); at `DATA` the accepted recipients fail with it; at
 the end-of-data terminator the lanes resolve `DataFinal` `failed` /
 `Acknowledged` exactly as any other rejection does. Only the connection is
 retired. In a pipelined RCPT window the direct path keeps only the FIRST
 refusal as the reported error, but asks `closing_channel` of EVERY reply in the
-window (`DirectSmtpStage::RcptWindowReply` carries a `closing` flag beside the
+window (`TransactionStage::RcptWindowReply` carries a `closing` flag beside the
 retained failure), so a 550 followed by a 421 reports the 550 and aborts with no
-RSET, as `BatchSmtp` does; pinned by
+RSET, as `BatchTransaction` does; pinned by
 `a_421_later_in_an_rcpt_window_aborts_and_reports_the_first_refusal`. Parking a connection the peer just said it is closing hands the next
 checkout a dead socket - and on the batch path, which is the account-level
 `send_smtp_batch`, that dead connection is pooled, so under
@@ -585,7 +619,7 @@ and, at the end-of-data boundary,
 `a_421_data_final_reply_aborts_the_batch_connection_too`, both in both halves.
 
 The direct path tags a rejected DATA end-of-data reply `DataFinal`, matching
-what `BatchSmtp` already produced; a transport FAILURE at the same boundary
+what `BatchTransaction` already produced; a transport FAILURE at the same boundary
 keeps `body_phase()` (`DataBody` / `BdatBody`), because that is an upload
 failure rather than an answer. BDAT has no distinct final phase, so a rejected
 `BDAT ... LAST` stays `BdatBody`.
@@ -598,25 +632,22 @@ two today, so this changes the reported phase and the diagnostics that carry it,
 not the recovery classification. Pinned by
 `a_failed_direct_lmtp_bdat_chunk_carries_the_bdat_phase`.
 
-A rejected `MAIL FROM` deliberately sends no `RSET`: it opened no transaction,
-so there is nothing to reset and the connection stays reusable as it is. The
-rejection paths that follow an accepted `MAIL FROM` go through
-`reset_transaction`, which keeps the connection when the peer positively
-acknowledges the reset and aborts it otherwise. LMTP (RFC 2033) inherits both
-rules unchanged, and the direct LMTP machine now applies them: a rejected
-`MAIL FROM` finishes with no RSET and no abort, and a rejected `DATA` is
-RSET-and-keep, exactly as `DirectSmtp` and `BatchLmtp` do. It used to abort at
-both boundaries, costing one reconnect per rejected envelope on a
-local-delivery socket and leaving the direct LMTP path differing from its
-batch twin in more than the `restore_ok` drain (smtp-CR1, 2026-09-07). Pinned
-by `a_rejected_lmtp_envelope_follows_the_smtp_reset_or_keep_rules`.
+A rejected `MAIL FROM` deliberately sends no `RSET`: it opened no transaction.
+Direct reporting keeps the connection reusable; batch reporting preserves its
+conservative abort policy while returning the acknowledged batch-level error.
+After an accepted `MAIL FROM`, recipient or DATA refusal uses
+`Epilogue::reset`, keeping the connection only after a completion reply.
+Direct LMTP inherits those direct SMTP rules: a rejected MAIL keeps the stream,
+and a rejected DATA resets it. Both previously aborted unnecessarily; the
+regression is pinned by
+`a_rejected_lmtp_envelope_follows_the_smtp_reset_or_keep_rules`.
 
 This is not a PIPELINING-only rule. The direct sends (`send_with_options` and
 `send_bdat_with_options`) take the same shape when the server advertises no
 PIPELINING: `MAIL FROM`, `RCPT TO` and `DATA` replies reach the core as
 `OpOutcome::Reply`, so a routine 4xx/5xx is classified by the core instead of
 arriving as a transport-shaped failure that would abort. Only genuine I/O or
-parse failures abort. Both halves run one `DirectSmtp` machine for the
+parse failures abort. Both adapters drive the `DirectSmtp` projection of `Transaction` for the
 `MAIL FROM` + `RCPT TO` sequence, pipelined or not, and are pinned by
 `unpipelined_server_rejections_keep_the_connection_reusable`, which asserts the
 exact RSET traffic and that the connection is still unbroken afterwards. A
@@ -676,21 +707,37 @@ A consequence: `Message::formatted()` is byte-identical to the delivered data se
 
 `Credentials` is enum: `Password { username, password: Zeroizing<String> }` and `OAuth2 { identity, token_source: Arc<dyn TokenSource> }` (bifrost-net's trait). The OAuth token is read live from the shared source at each connect, so a token rotated on the source is presented on reconnect without rebuilding the transport. `Credentials` is `Clone` only - no `PartialEq`/`Eq`/serde derives (a live token source is neither comparable nor serializable; rotation material is the consumer's to persist). The `AUTH` command struct (`Auth`) likewise dropped those derives. The async transport reads the token via `oauth2_token().await`, so token sources may lock, join an in-flight refresh, or perform network refresh work without a polling shortcut; the blocking transport reads it via `oauth2_token_blocking()`, using only the synchronous, non-refreshing `TokenSource::snapshot()`. Static sources and fresh refresher caches resolve without a runtime. Cache-lock contention returns a typed transient refresh error so callers can retry; refresh-required snapshots reject with an instruction to use the async SMTP transport. The safe trait default also requires async resolution, so custom sources must implement snapshot support to serve blocking SMTP. No async token future is created or polled, and an empty or stale refresher is left unchanged. With `account-error`, token-source errors retain bifrost-net's typed account-error projection, including terminal auth loss versus transient refresh failure. Without it, the original net error remains in the low-level connection error's source chain. Cache contention likewise remains a retryable connection failure without the account feature.
 
-Mechanisms (`Mechanism`, `#[non_exhaustive]`): PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, SCRAM-SHA-1, SCRAM-SHA-256, SCRAM-SHA-1-PLUS, SCRAM-SHA-256-PLUS. SCRAM computation is consumed from `bifrost-sasl` (the `-PLUS` suffix and token spelling have a single authority there); SMTP owns only the wire sequencing. `ScramExchange` keeps its client-first and client-final lines in `Secret` values through the continuation write. The client-first is base64-framed once with a zeroizing encoder; `scram_client_final` already returns a base64 client-final, which SMTP writes unchanged.
+Mechanisms (`Mechanism`, `#[non_exhaustive]`): PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, SCRAM-SHA-1, SCRAM-SHA-256, SCRAM-SHA-1-PLUS, SCRAM-SHA-256-PLUS. SCRAM computation is consumed from `bifrost-sasl` (the `-PLUS` suffix and token spelling have a single authority there); SMTP owns only the wire sequencing. `ScramExchange` keeps its client-first and client-final lines in `Secret` values through the continuation write. The client-first is base64-framed once with a zeroizing encoder; the shared `SaslClient` returns raw replies, which this adapter base64-frames once.
 
-Password selection (`password_mechanism` in `authentication.rs`) adapts SASL-owned `negotiate` to choose one mechanism from the advertised and allowed sets in the fixed order `SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > LOGIN`. A 535 is final and never walks a retry ladder, because descending from a bound mechanism to an unbound mechanism or PLAIN would be a silent security downgrade. RFC 5802 Section 6 downgrade protection drops the unbound `SCRAM-SHA-N` candidate when `SCRAM-SHA-N-PLUS` is advertised. A PLUS candidate is skipped only when no TLS peer certificate exists. If a certificate is present but its channel binding cannot be computed, the typed parse error propagates and authentication cannot silently fall through to PLAIN. The SASL-owned `binding_from_peer_certificate` resolver computes opaque `ChannelBindingData` at most once per authentication. Selection returns a `PasswordSelection` containing the actual `ScramRung`; both connection drivers pass its GS2 input directly into the exchange with no eligibility re-selection or fake empty binding. SCRAM runs as a no-IR `334` challenge exchange driven by `ScramExchange`; `Mechanism::response` is never called for SCRAM. A server-final folded onto `235` may follow a leading enhanced status code, which the decoder skips before base64 decoding.
+Password selection (`password_mechanism` in `authentication.rs`) adapts SASL-owned `negotiate` to choose one mechanism from the advertised and allowed sets in the fixed order `SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > LOGIN`. A 535 is final and never walks a retry ladder, because descending from a bound mechanism to an unbound mechanism or PLAIN would be a silent security downgrade. RFC 5802 Section 6 downgrade protection drops the unbound `SCRAM-SHA-N` candidate when `SCRAM-SHA-N-PLUS` is advertised. A PLUS candidate is skipped only when no TLS peer certificate exists. If a certificate is present but its channel binding cannot be computed, the typed parse error propagates and authentication cannot silently fall through to PLAIN. The SASL-owned `binding_from_peer_certificate` resolver computes opaque `ChannelBindingData` at most once per authentication. Selection returns a `PasswordSelection` containing the actual `ScramRung`; the session machine passes its GS2 input directly into the exchange with no eligibility re-selection or fake empty binding. SCRAM runs as a no-IR `334` challenge exchange driven by `ScramExchange`, the SMTP base64 framing adapter over the shared `SaslClient`; `Mechanism::password_client` refuses SCRAM so a SCRAM exchange cannot be built without its binding-aware constructor. A server-final folded onto `235` may follow a leading enhanced status code, which the decoder skips before base64 decoding.
 
-OAuth credentials never use SCRAM: they pick the first allowed, advertised rung in shared OAUTHBEARER-before-XOAUTH2 order (`oauth_mechanism`) and run the stateless encoder. The connection's auth driver resolves the access token from the source once, up front, and threads it into `Auth::new` / `Mechanism::response_with_token`. The XOAUTH2 / OAUTHBEARER payload bytes are built by `bifrost-sasl` (`xoauth2_payload` / `oauthbearer_payload`, including the OAUTHBEARER GS2 identity escape); `response_with_token` also uses the shared `OAuthMechanism::error_ack()` for error continuations: empty for XOAUTH2, SOH (`AQ==` after base64 framing) for OAUTHBEARER. OAUTHBEARER before XOAUTH2 by default.
+OAuth credentials never use SCRAM: `oauth_mechanism` picks the first allowed,
+advertised rung in shared OAUTHBEARER-before-XOAUTH2 order. The session requests
+one token-resolution effect from its adapter, then constructs `SaslClient` with
+the identity and required resolved token. Its pending-token state is distinct
+from an active client; there is no optional token in payload encoding.
 
-PLAIN uses SASL-owned `plain_payload` for NUL validation and zeroizing assembly,
-as do IMAP and ManageSieve.
+PLAIN, LOGIN, XOAUTH2 and OAUTHBEARER use one retained `SaslClient` per attempt.
+`Auth` only frames raw initial responses and challenge replies as base64. The
+shared client owns LOGIN's username/password position, OAuth's mechanism-specific
+error acknowledgement, and the validity of terminal success. SMTP validates
+`235` through `finish()` before refreshing EHLO/LHLO. An early LOGIN success,
+success after an OAuth error answer, or an extra mechanism challenge is a parse
+fault and retires the connection. Enterprise users expect a completed, verified
+exchange rather than a server's unsupported claim of success.
 
-Stateless AUTH payloads and SCRAM client lines remain `bifrost_sasl::Secret`
-values through the command boundary. Stateless payload base64 framing returns
-a `Zeroizing<String>`; SCRAM client-final is already base64-framed by
-`bifrost-sasl` and is not encoded again. Both sync and async connections use
-zeroizing command buffers that are wiped before
-reuse, immediately after each write attempt, and on drop. The wipe covers the
+OAuth SOH, NUL, CR and LF in either identity or token are refused locally before
+AUTH is written. A credential-preparation or token-resolution failure leaves the
+connection usable, so the caller can repair credentials or retry without an
+unnecessary disconnect. PLAIN's NUL validation also runs before AUTH.
+
+AUTH payloads and SCRAM client lines remain `bifrost_sasl::Secret` values through
+the command boundary. Initial and continuation base64 framing returns a
+`Zeroizing<String>`; SCRAM client-final is base64-framed once by its SMTP adapter.
+The session serializes each AUTH command into a zeroizing, redacted
+`WriteSecret` op, which is wiped after the adapter's write attempt or when a
+cancelled future drops it. Generic command buffers are also zeroizing and wiped
+before reuse and after each write attempt. The wipe covers the
 buffer the command was serialized into; it cannot cover an allocation the
 serializing `write!` outgrew and replaced, so a longer-than-usual AUTH line can
 still leave one stale heap copy behind. The `Auth`
@@ -706,9 +753,10 @@ Plaintext AUTH is refused by default for all mechanisms through SASL-owned `auth
 
 AUTH continuation formatting treats challenge responses as continuation lines even for mechanisms supporting initial response. Required for OAUTHBEARER failed-auth dummy-cancel exchange (`AQ==` on the wire).
 
-The legacy continuation budget is ten answers. Reaching zero after the tenth
-answer is accepted when that answer received a final response; a further
-`334` is a challenge-limit error.
+Challenge limits follow the shared mechanism state: PLAIN has no challenge
+after its initial response, LOGIN has two replies, and OAuth acknowledges one
+error challenge before terminal refusal. There is no driver-maintained LOGIN
+index or generic ten-answer loop.
 
 `SaslError` maps at the `From<SaslError> for Error` boundary. Typed
 `ScramServerError::refusal_class()` in `reference/sasl.md` owns the table:
@@ -716,7 +764,7 @@ Credential becomes Authentication, Policy becomes Policy, Protocol becomes
 Parse, and Unavailable becomes ServerUnavailable (shared Server Unavailable,
 retryable). LocalRuntime stays local runtime; InvalidCredential remains
 InvalidInput. `ScramExchange::new` prepares both credentials before AUTH.
-`ScramExchange` derives its typed Mechanism from hash and binding rather than
+`ScramExchange` obtains its typed Mechanism from the shared client rather than
 storing a second wire-name string. Mechanism stamps retain the enum until
 support diagnostic rendering.
 
@@ -730,6 +778,12 @@ source.
 `LHLO` instead of EHLO. Default TCP port 24 (Postfix/Dovecot convention, not RFC-assigned).
 
 Per-recipient response model: vector length equals envelope recipient count. RCPT-time rejection responses are preserved at the original recipient index; accepted recipients receive the post-DATA delivery response in original order.
+
+A final 421 ends the drain immediately and aborts the connection. Batch
+reporting preserves earlier final answers and the recipient answered by the
+421; later accepted recipients remain uncertain with in-flight evidence.
+Waiting for further replies after the peer announces closure would replace a
+definitive refusal with a later transport failure.
 
 Direct LMTP sends expose only that ordered response vector. Use the account-oriented batch send API when the caller needs each recipient's RCPT-versus-final-status phase and recovery classification.
 
@@ -930,7 +984,7 @@ Display text remains support diagnostics rather than a local auth discriminator.
 Internal pipeline errors carry value-side classification data:
 
 - `SmtpTransmissionState` (`Unsent` / `InFlight` / `Acknowledged`), attached via `with_attempt`.
-- `SmtpCommandPhase`, attached via `with_phase`. The 16 variants cover every wire boundary the driver crosses: `Connect`, `Greeting`, `Hello`, `StartTls`, `Auth`, `MailFrom`, `RcptTo`, `DataCommand`, `DataBody`, `DataFinal`, `BdatBody`, `LmtpFinalStatus`, `Noop`, `Vrfy`, `Expn`, `Rset`. `Auth` alone carries a payload, `Auth { mechanism: Option<Mechanism> }`: the name sits on the variant rather than on `Error` so that stamping the auth phase forces a decision about which rung was in play, the same argument that puts `phase` on the value rather than on `SmtpErrorContext`. `Some` comes from the four driver functions (`auth_scram` and `auth_legacy` on both adapters), which bind the selected `Mechanism` once per exchange, so a `-PLUS` rung cannot desync from the AUTH line that framed it. `None` is for the genuinely pre-rung refusals: declining to pick a mechanism, refusing plaintext AUTH, an OAuth token-source failure, nonce generation. `or_phase` is set-if-absent with exactly one exception - an unnamed `Auth` stamp accepts the mechanism from a named one, because otherwise the inner `From<SaslError>` stamp would outrank the driver's named outer stamp and the SCRAM `e=` path would lose the name it had. `DataCommand` covers the `DATA` command write/read; `DataBody` covers body upload; `DataFinal` covers the final reply after the dot terminator. Phase lives on `Error::Inner`, and every send-driver wire boundary attaches it before returning - transport failures and server rejections alike. On the pipelined path that is a compile-time property of `PhasedError` rather than a convention (see "PIPELINING"). Paired transcript tests assert the value directly on both I/O halves for the `MailFrom`, `RcptTo`, `DataCommand` and `DataBody` boundaries, so the default PIPELINING path cannot silently lose the classifier input.
+- `SmtpCommandPhase`, attached via `with_phase`. The 16 variants cover every wire boundary the driver crosses: `Connect`, `Greeting`, `Hello`, `StartTls`, `Auth`, `MailFrom`, `RcptTo`, `DataCommand`, `DataBody`, `DataFinal`, `BdatBody`, `LmtpFinalStatus`, `Noop`, `Vrfy`, `Expn`, `Rset`. `Auth` alone carries a payload, `Auth { mechanism: Option<Mechanism> }`: the name sits on the variant rather than on `Error` so that stamping the auth phase forces a decision about which rung was in play, the same argument that puts `phase` on the value rather than on `SmtpErrorContext`. `Some` comes from the session machine's selected authentication, which binds the `Mechanism` once per exchange, so a `-PLUS` rung cannot desync from the AUTH line that framed it. `None` is for the genuinely pre-rung refusals: declining to pick a mechanism, refusing plaintext AUTH, an OAuth token-source failure, nonce generation. `or_phase` is set-if-absent with exactly one exception - an unnamed `Auth` stamp accepts the mechanism from a named one, because otherwise the inner `From<SaslError>` stamp would outrank the driver's named outer stamp and the SCRAM `e=` path would lose the name it had. `DataCommand` covers the `DATA` command write/read; `DataBody` covers body upload; `DataFinal` covers the final reply after the dot terminator. Phase lives on `Error::Inner`, and every send-driver wire boundary attaches it before returning - transport failures and server rejections alike. On the pipelined path that is a compile-time property of `PhasedError` rather than a convention (see "PIPELINING"). Paired transcript tests assert the value directly on both I/O halves for the `MailFrom`, `RcptTo`, `DataCommand` and `DataBody` boundaries, so the default PIPELINING path cannot silently lose the classifier input.
 
 With `account-error`, OAuth token-source failures also carry bifrost-net's already-built `AccountError` projection through the low-level SMTP error. The SMTP translation boundary reapplies its actual SMTP or LMTP protocol and fixed send operation and idempotency context while preserving the source kind and cause chain. The token-source conversion passes no throttle scope because it has no SMTP transaction scope to name. SMTP reply classifications of `RateLimited` or `QuotaExhausted` explicitly carry `ThrottleScope::Account`. This keeps `AuthLost` and `RefreshTransient` distinct.
 
@@ -942,7 +996,7 @@ The dividing line for batch sends is whether the body has left. A batch-level
 `Err((error, progress))` means "nothing was transmitted, resend the whole
 request"; once `set_body_started` / `set_body_finished` has run, that claim is
 false and the machine must finish `Ok(progress)` with per-recipient lanes even
-when the failure is a transport one. `BatchLmtp`'s `GroupOpened` used to finish
+when the failure is a transport one. `BatchTransaction`'s `GroupOpened` used to finish
 `Err` on a failed reply-group open, one stage after `BodyWritten` terminated the
 body, so an engine reading it would have resent a non-idempotent message that
 may well have been delivered. It now marks the accepted recipients `uncertain`
@@ -952,7 +1006,7 @@ failure comes from the stream's own `verify()`, so the stream is already
 unusable. Pinned by
 `a_failed_lmtp_group_open_leaves_the_recipients_uncertain_not_the_batch_unsent`.
 
-`BatchSmtp`'s `WindowOpened` and `WindowClosing` sit on the other side of that
+`BatchTransaction`'s `WindowOpened` and `WindowClosing` sit on the other side of that
 line and deliberately keep the batch-level `Err`: every recipient window is
 before `DATA`, so nothing was transmitted and the whole request genuinely is
 retryable. The cost is accepted and worth knowing before writing retry logic
@@ -966,7 +1020,7 @@ the peer, which is a worse lie than the lost diagnostics. Both arms carry a
 comment saying so.
 
 `batch.rs` `SendProgress::resolve` is the per-recipient lane resolver. LMTP `DATA`-command negative replies route through `mark_accepted_rejected_with_response` so accepted recipients become per-recipient `Failed` lanes - never a batch-level `Err` (the previous shape let the engine resend the entire non-idempotent `Send` after the server rejected it). DATA-final-negative replies tag `SmtpCommandPhase::DataFinal`,
-and that arm is live rather than latent: `BatchSmtp` records a negative
+and that arm is live rather than latent: `BatchTransaction` records a negative
 end-of-data reply through `set_data_response` exactly as it records a positive
 one (see "PIPELINING"), so `DataFinal` is a phase a driver actually produces.
 Those lanes derive as a PERMANENT refusal: an SMTP 5xx is RFC 5321's permanent
@@ -979,15 +1033,19 @@ from the `Cause::Wire(WireCause::Smtp(_))` every classified reply carries, so a
 ## Connection test harness
 
 Two layers, and both still bite. The core-level tests in
-`client/core/core_tests.rs` drive each machine with a scripted list of outcomes
+`client/core/core_tests.rs` drive the transaction machine with a scripted list of outcomes
 and record its op stream, so window reply accounting, coalesced-reply handling,
 RSET-and-keep, abort-on-I/O-failure, LMTP per-recipient final status and BDAT
 sequencing are each pinned once, in the place the rule now lives, with no I/O
 at all. Every one of them was confirmed to bite by reintroducing the bug it
-describes. Below them, both drivers' transcript suites drive the full wire
-exchange through their own adapter, which is what proves the adapters perform
-the ops faithfully; the core tests cannot see a socket and so can never replace
-them.
+describes. `client/session.rs` also tests successful TLS-effect ordering without a
+handshake, and `client/reply.rs` tests chunk splits, caps, UTF-8 and EOF.
+`client/conformance.rs` defines the session transcripts once and runs each
+through both adapters when `tokio` is enabled (blocking only otherwise).
+It covers both SCRAM server-final shapes, token resolution, STARTTLS refusal
+and injection, capability refresh, pipelined DATA/BDAT for both dialects and
+EOF evidence. Remaining driver-specific transcripts retain their I/O, stream
+state, timeout and cancellation coverage.
 
 A scripted outcome list alone cannot reach every boundary. Writes and group
 boundaries consume the next scripted failure whichever one it is, so a failure
@@ -1066,8 +1124,8 @@ greeting plus an ordered list of
   then hangs up. The bytes may be a truncated reply line, so this is the
   close-mid-response case: reads report EOF once the scripted bytes are gone
   and any later client write fails the way a write to a closed socket does.
-  A truncated reply must surface as an `incomplete response` parse error,
-  never a hang. The `MAX_RESPONSE_LINE_BYTES` cap is pinned the same way, by
+  A truncated reply must surface as an `incomplete SMTP response` network error,
+  never a hang or a provider contract violation. The `MAX_RESPONSE_LINE_BYTES` cap is pinned the same way, by
   `an_oversized_greeting_line_is_a_parse_error_not_a_hang` in both halves. Note
   that the greeting it scripts is well-formed and merely over-long: a line of
   garbage fails to parse whether or not the cap is enforced, so it pins nothing
@@ -1116,7 +1174,7 @@ crates/smtp/src/
 ├── message/             - builder, headers, MIME parts, address parsers
 ├── transport/
 │   └── smtp/
-│       ├── client/      - core (sans-I/O protocol machines), connection and
+│       ├── client/      - core (transaction), session, reply, connection and
 │       │                  async_connection (the two I/O adapters), net,
 │       │                  async_net, metering, tls
 │       ├── transport.rs / async_transport.rs - public sync + async transports

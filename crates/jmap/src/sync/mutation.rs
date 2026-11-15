@@ -13,17 +13,12 @@ use crate::core::transport::HttpTransport;
 use crate::email::{EmailId, EmailPatch, EmailSet};
 use crate::mailbox::MailboxId;
 
-use super::capabilities::CoreLimits;
 use super::mail_set::classify_set_response;
-use super::state_cache::StateMap;
 
-type MailAccount<T> = crate::account::Account<T>;
+type MailAccount<T> = super::registry::Slot<T>;
 
 pub(crate) fn set_flags<T: HttpTransport>(
-    mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
-    limits: CoreLimits,
-    email_states: StateMap,
+    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
     targets: AccountStream<ObjectId>,
     op: FlagOp,
     _key: IdempotencyKey,
@@ -38,14 +33,7 @@ pub(crate) fn set_flags<T: HttpTransport>(
     // mutation reaches the routing match below.
     match &op {
         FlagOp::Add(_) | FlagOp::Remove(_) | FlagOp::Set(_) | FlagOp::Patch { .. } => {
-            mutation_stream(
-                mail,
-                foreign_mail,
-                limits,
-                email_states,
-                targets,
-                MutationKind::Flags(op),
-            )
+            mutation_stream(foreign_mail, targets, MutationKind::Flags(op))
         }
         _ => Box::pin(async_stream::stream! {
             yield super::error::terminated_unsupported(
@@ -58,10 +46,7 @@ pub(crate) fn set_flags<T: HttpTransport>(
 }
 
 pub(crate) fn move_to<T: HttpTransport>(
-    mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
-    limits: CoreLimits,
-    email_states: StateMap,
+    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
     _key: IdempotencyKey,
@@ -78,25 +63,15 @@ pub(crate) fn move_to<T: HttpTransport>(
             });
         }
     };
-    mutation_stream(mail, foreign_mail, limits, email_states, targets, kind)
+    mutation_stream(foreign_mail, targets, kind)
 }
 
 pub(crate) fn destroy<T: HttpTransport>(
-    mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
-    limits: CoreLimits,
-    email_states: StateMap,
+    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
     targets: AccountStream<ObjectId>,
     _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    mutation_stream(
-        mail,
-        foreign_mail,
-        limits,
-        email_states,
-        targets,
-        MutationKind::Destroy,
-    )
+    mutation_stream(foreign_mail, targets, MutationKind::Destroy)
 }
 
 // RFC 8620 Section 5.3 requires a mismatching ifInState to reject the
@@ -121,13 +96,13 @@ pub(super) fn caller_state(
 }
 
 pub(super) fn versioned_stream<T: HttpTransport>(
-    mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
-    limits: CoreLimits,
-    email_states: StateMap,
+    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
     targets: AccountStream<bifrost_types::MailMutationTarget>,
     kind: MutationKind,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    let mail = foreign_mail.primary.clone();
+    let limits = mail.limits;
+
     Box::pin(async_stream::stream! {
         // RFC 8620 Section 5.3 guards the entire Email/set. Submitting each
         // target separately would let the first success invalidate siblings
@@ -162,7 +137,7 @@ pub(super) fn versioned_stream<T: HttpTransport>(
                     rejected.push(outcome);
                     continue;
                 }
-                let owner = account_id_for_target(&target.id, mail.id_str(), &foreign_mail);
+                let owner = foreign_mail.object(&target.id.0).id_str().to_owned();
                 if let Some((_, _, ids)) = groups.iter_mut().find(|(account, state, _)| {
                     account == &owner && state == &expected
                 }) {
@@ -181,11 +156,8 @@ pub(super) fn versioned_stream<T: HttpTransport>(
                 });
             }
             for (account_id, expected, mut ids) in groups {
-                let owner = mail_for_account(&mail, &foreign_mail, &account_id);
-                match apply_batch_with_version(
-                    owner, &email_states, &account_id, account_id != mail.id_str(),
-                    &kind, &mut ids, expected.as_deref(),
-                ).await {
+                let owner = foreign_mail.slot_by_id(&crate::core::id::AccountId::new(&account_id)).expect("buffered account is registered");
+                match apply_batch_with_version(owner, &kind, &mut ids, expected.as_deref()).await {
                     Ok(Some(batch)) => yield SyncEvent::Batch(batch),
                     Ok(None) => {},
                     Err(error) => {
@@ -361,23 +333,22 @@ impl RouteBuffers {
 }
 
 fn mutation_stream<T: HttpTransport>(
-    mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
-    limits: CoreLimits,
-    email_states: StateMap,
+    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
     mut targets: AccountStream<ObjectId>,
     kind: MutationKind,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    let mail = foreign_mail.primary.clone();
+    let limits = mail.limits;
+
     Box::pin(async_stream::stream! {
         let batch_size = super::capabilities::set_batch_size(limits.max_objects_in_set);
-        let primary_account_id = mail.id_str().to_string();
         let mut buffers = RouteBuffers::new(batch_size);
 
         loop {
             let (due, at_end) = match targets.next().await {
                 Some(target) => {
                     let account_id =
-                        account_id_for_target(&target, &primary_account_id, &foreign_mail);
+                        foreign_mail.object(&target.0).id_str().to_owned();
                     let rejection = destination_rejection(&kind, &target);
                     (buffers.push(account_id, target, rejection), false)
                 }
@@ -388,17 +359,9 @@ fn mutation_stream<T: HttpTransport>(
                 let Some((mut batch, rejected)) = buffers.drain(&account_id) else {
                     continue;
                 };
-                let routed_mail = mail_for_account(&mail, &foreign_mail, &account_id);
-                let foreign_account = account_id != primary_account_id;
+                let routed_mail = foreign_mail.slot_by_id(&crate::core::id::AccountId::new(&account_id)).expect("buffered account is registered");
                 let started = Instant::now();
-                match apply_batch(
-                    routed_mail,
-                    &email_states,
-                    &account_id,
-                    foreign_account,
-                    &kind,
-                    &mut batch,
-                )
+                match apply_batch(routed_mail, &kind, &mut batch)
                 .await
                 {
                     Ok(Some(mut out)) => {
@@ -468,7 +431,9 @@ fn destination_rejection(
     };
     let target_owner = super::foreign::owner_of(&target.0);
     let destination_owner = super::foreign::owner_of(destination.as_str());
-    if target_owner == destination_owner {
+    if super::foreign::JmapRef::parse(&target.0)
+        .same_owner(super::foreign::JmapRef::parse(destination.as_str()))
+    {
         return None;
     }
     Some(ItemOutcome::Failed(BatchFailure::new(
@@ -483,56 +448,16 @@ fn destination_rejection(
     )))
 }
 
-/// Select the account that owns a bulk target. An object qualified for an
-/// account no longer available in this session deliberately keeps the primary
-/// route, so the server returns its normal not-found result rather than the
-/// client fabricating a local routing error.
-fn account_id_for_target<T: HttpTransport>(
-    target: &ObjectId,
-    primary_account_id: &str,
-    foreign_mail: &HashMap<crate::core::id::AccountId, MailAccount<T>>,
-) -> String {
-    super::foreign::parse_object(&target.0)
-        .filter(|(account_id, _)| foreign_mail.contains_key(*account_id))
-        .map_or_else(
-            || primary_account_id.to_string(),
-            |(account_id, _)| account_id.to_string(),
-        )
-}
-
-fn mail_for_account<'a, T: HttpTransport>(
-    primary: &'a MailAccount<T>,
-    foreign_mail: &'a HashMap<crate::core::id::AccountId, MailAccount<T>>,
-    account_id: &str,
-) -> &'a MailAccount<T> {
-    foreign_mail.get(account_id).unwrap_or(primary)
-}
-
 async fn apply_batch<T: HttpTransport>(
     mail: &MailAccount<T>,
-    email_states: &StateMap,
-    account_id: &str,
-    foreign_account: bool,
     kind: &MutationKind,
     batch: &mut Vec<ObjectId>,
 ) -> crate::Result<Option<Batch<ItemOutcome<MutationSuccess>>>> {
-    apply_batch_with_version(
-        mail,
-        email_states,
-        account_id,
-        foreign_account,
-        kind,
-        batch,
-        None,
-    )
-    .await
+    apply_batch_with_version(mail, kind, batch, None).await
 }
 
 async fn apply_batch_with_version<T: HttpTransport>(
     mail: &MailAccount<T>,
-    email_states: &StateMap,
-    account_id: &str,
-    foreign_account: bool,
     kind: &MutationKind,
     batch: &mut Vec<ObjectId>,
     expected: Option<&str>,
@@ -557,8 +482,8 @@ async fn apply_batch_with_version<T: HttpTransport>(
         None => super::mail_set::Guard::Unconditional,
     };
     let guarded = guard.is_guarded();
-    let mut response = match super::mail_set::execute(mail, email_states, account_id, guard, || {
-        build_email_set(None, &ids, kind, account_id, foreign_account)
+    let mut response = match super::mail_set::execute(mail, guard, || {
+        build_email_set(None, &ids, kind, mail.owner())
     })
     .await
     {
@@ -578,7 +503,7 @@ async fn apply_batch_with_version<T: HttpTransport>(
     let operation = operation_for_kind(kind);
     let mut results = Vec::with_capacity(ids.len());
     for id in ids {
-        let email_id = wire_email_id(&id, account_id, foreign_account);
+        let email_id = EmailId::new(mail.wire(&id.0));
         let raw = match kind {
             MutationKind::Destroy => response.destroyed(&email_id),
             MutationKind::Flags(_) | MutationKind::Move(_) => {
@@ -653,8 +578,7 @@ fn build_email_set(
     state: Option<&str>,
     ids: &[ObjectId],
     kind: &MutationKind,
-    account_id: &str,
-    foreign_account: bool,
+    owner: crate::sync::foreign::Owner<'_>,
 ) -> crate::Result<EmailSet> {
     let mut set = EmailSet::new();
     if let Some(state) = state {
@@ -663,23 +587,17 @@ fn build_email_set(
 
     match kind {
         MutationKind::Destroy => {
-            set = set.destroy(
-                ids.iter()
-                    .map(|id| wire_email_id(id, account_id, foreign_account)),
-            );
+            set = set.destroy(ids.iter().map(|id| wire_email_id(id, owner)));
         }
         MutationKind::Flags(op) => {
             for id in ids {
-                apply_flags(
-                    set.update(wire_email_id(id, account_id, foreign_account)),
-                    op,
-                )?;
+                apply_flags(set.update(wire_email_id(id, owner)), op)?;
             }
         }
         MutationKind::Move(mailbox_id) => {
             for id in ids {
-                set.update(wire_email_id(id, account_id, foreign_account))
-                    .mailbox_ids([wire_mailbox_id(mailbox_id, account_id, foreign_account)]);
+                set.update(wire_email_id(id, owner))
+                    .mailbox_ids([wire_mailbox_id(mailbox_id, owner)]);
             }
         }
     }
@@ -699,22 +617,16 @@ fn uses_if_in_state(kind: &MutationKind) -> bool {
 /// Convert a routed foreign object back to the native id JMAP accepts on the
 /// selected account. Keep an id for an unregistered foreign account intact on
 /// the primary route, preserving the real server-side not-found behavior.
-fn wire_email_id(id: &ObjectId, account_id: &str, foreign_account: bool) -> EmailId {
-    match super::foreign::parse_object(&id.0) {
-        Some((owner, native)) if foreign_account && owner == account_id => EmailId::new(native),
-        _ => EmailId::new(id.0.clone()),
-    }
+fn wire_email_id(id: &ObjectId, owner: crate::sync::foreign::Owner<'_>) -> EmailId {
+    EmailId::new(super::foreign::JmapRef::parse(&id.0).wire(owner))
 }
 
 /// The native form of the move destination for the routed account.
 /// `destination_rejection` has already established that the destination and
 /// every target in this batch name the same owner, so the only work left is
 /// stripping the qualification the foreign account does not use.
-fn wire_mailbox_id(id: &MailboxId, account_id: &str, foreign_account: bool) -> MailboxId {
-    match super::foreign::parse_object(id.as_str()) {
-        Some((owner, native)) if foreign_account && owner == account_id => MailboxId::new(native),
-        _ => id.clone(),
-    }
+fn wire_mailbox_id(id: &MailboxId, owner: crate::sync::foreign::Owner<'_>) -> MailboxId {
+    MailboxId::new(super::foreign::JmapRef::parse(id.as_str()).wire(owner))
 }
 
 fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) -> crate::Result<()> {
@@ -760,6 +672,7 @@ fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::capabilities::CoreLimits;
     use bifrost_types::{AccountErrorKind, RecoveryClass, RetryDisposition};
     use futures::StreamExt;
     use std::sync::Mutex as StdMutex;
@@ -772,7 +685,7 @@ mod tests {
             .map(|id| ObjectId((*id).to_string()))
             .collect::<Vec<_>>();
         serde_json::to_value(
-            build_email_set(state, &ids, kind, "primary", false)
+            build_email_set(state, &ids, kind, crate::sync::foreign::Owner::Primary)
                 .expect("supported mutation builds an Email/set"),
         )
         .expect("Email/set serializes")
@@ -944,8 +857,8 @@ mod tests {
             "https://example.test/.well-known/jmap",
         )
         .expect("client builds");
-        let primary = crate::account::Account::new(client.clone(), "primary");
-        let shared = crate::account::Account::new(client, "shared");
+        let primary = crate::sync::registry::Slot::new(client.clone(), "primary");
+        let shared = crate::sync::registry::Slot::new(client, "shared");
         (
             primary,
             Arc::new(HashMap::from([("shared".into(), shared)])),
@@ -1063,13 +976,15 @@ mod tests {
                     requests: Arc::clone(&requests),
                 });
                 let events = versioned_stream(
-                    primary,
-                    foreign,
-                    CoreLimits {
-                        max_objects_in_get: 256,
-                        max_objects_in_set: 10,
-                    },
-                    Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                    std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
+                        primary,
+                        foreign,
+                        CoreLimits {
+                            max_objects_in_get: 256,
+                            max_objects_in_set: 10,
+                        },
+                        crate::sync::state_cache::seeded(std::collections::HashMap::new()),
+                    )),
                     Box::pin(futures::stream::iter(["m1", "m2"].map(|id| {
                         bifrost_types::MailMutationTarget {
                             id: ObjectId(id.into()),
@@ -1133,13 +1048,15 @@ mod tests {
                 Some("cache-new".into()),
             )]));
             let events = versioned_stream(
-                primary,
-                foreign,
-                CoreLimits {
-                    max_objects_in_get: 256,
-                    max_objects_in_set: 10,
-                },
-                states,
+                std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
+                    primary,
+                    foreign,
+                    CoreLimits {
+                        max_objects_in_get: 256,
+                        max_objects_in_set: 10,
+                    },
+                    states,
+                )),
                 Box::pin(futures::stream::iter([bifrost_types::MailMutationTarget {
                     id: ObjectId("m1".into()),
                     expected_version: Some(bifrost_types::ServerVersion::StateAt(
@@ -1182,13 +1099,15 @@ mod tests {
             Box::pin(futures::stream::iter(vec![ObjectId("m1".to_string())]));
 
         let events = mutation_stream(
-            primary,
-            foreign,
-            CoreLimits {
-                max_objects_in_get: 256,
-                max_objects_in_set: 10,
-            },
-            states,
+            std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
+                primary,
+                foreign,
+                CoreLimits {
+                    max_objects_in_get: 256,
+                    max_objects_in_set: 10,
+                },
+                states,
+            )),
             input,
             MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
         )
@@ -1218,13 +1137,15 @@ mod tests {
             requests: Arc::clone(&requests),
         });
         let events = versioned_stream(
-            primary,
-            foreign,
-            CoreLimits {
-                max_objects_in_get: 256,
-                max_objects_in_set: 10,
-            },
-            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
+                primary,
+                foreign,
+                CoreLimits {
+                    max_objects_in_get: 256,
+                    max_objects_in_set: 10,
+                },
+                crate::sync::state_cache::seeded(std::collections::HashMap::new()),
+            )),
             Box::pin(futures::stream::iter([bifrost_types::MailMutationTarget {
                 id: ObjectId("m1".into()),
                 expected_version: None,
@@ -1488,13 +1409,15 @@ mod tests {
         ]));
 
         let events = mutation_stream(
-            primary,
-            foreign,
-            CoreLimits {
-                max_objects_in_get: 256,
-                max_objects_in_set: 3,
-            },
-            states,
+            std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
+                primary,
+                foreign,
+                CoreLimits {
+                    max_objects_in_get: 256,
+                    max_objects_in_set: 3,
+                },
+                states,
+            )),
             input,
             MutationKind::Move(MailboxId::new("primary-inbox")),
         )
@@ -1653,12 +1576,8 @@ mod tests {
             replies.push(canned(reqwest::StatusCode::OK, br#"{"sessionState":"session-1","methodResponses":[["error",{"type":"stateMismatch"},"s0"]]}"#));
             let (transport, script) = replay_transport(replies);
             let (mail, _) = mutation_accounts(transport);
-            let states = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let result = apply_batch_with_version(
                 &mail,
-                &states,
-                "primary",
-                false,
                 &MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
                 &mut vec![ObjectId("m1".into())],
                 Some("caller-old"),
@@ -1695,12 +1614,8 @@ mod tests {
     async fn a_guarded_flag_write_with_an_omitted_id_reconciles() {
         let (transport, script) = replay_transport(vec![bifrost_net::test_support::canned(reqwest::StatusCode::OK, br#"{"sessionState":"session-1","methodResponses":[["Email/set",{"accountId":"primary","oldState":"caller-old","newState":"new"},"s0"]]}"#)]);
         let (mail, _) = mutation_accounts(transport);
-        let states = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let batch = apply_batch_with_version(
             &mail,
-            &states,
-            "primary",
-            false,
             &MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
             &mut vec![ObjectId("m1".into())],
             Some("caller-old"),

@@ -29,7 +29,7 @@ use super::{
 /// but a guard on the batch as a whole: it exists so a corrupt or
 /// adversarial server cannot make us buffer an unbounded literal, not to
 /// second-guess a legitimate batch of large mail. Crossing it surfaces as
-/// `Error::FetchLimit` after the tagged completion, with the IMAP stream
+/// `crate::error::ResultLimit::Fetch` after the tagged completion, with the IMAP stream
 /// still synchronized.
 const HYDRATION_FETCH_BUDGET: usize = 256 * 1024 * 1024;
 
@@ -284,14 +284,11 @@ async fn run_folder_get(
         .drain(..)
         .partition(|id| id.uidvalidity == uidvalidity);
     // One owner for "requested ids -> wire operand -> outcome attribution".
-    // The excluded lane is published with the stale failures: like them it
-    // is known truth before any wire work, and unlike them it must never be
-    // able to reach the FETCH path and be reported as hydrated.
+    // Typed identities all reach the operand; every target gets a permit.
     let target_batch = TargetBatch::new(valid);
     let uid_set = target_batch.uid_set().cloned();
     let requested_uids = target_batch.uids().to_vec();
-    let (valid, excluded_outcomes) =
-        target_batch.settle_streaming(bifrost_types::AccountOperation::Hydrate, folder);
+    let valid = target_batch.settle_streaming();
     // The permits are the only way to answer for these ids; `pending` keeps
     // a plain copy so an early return leaves them in the unresolved set.
     let pending_ids: Vec<DecodedObjectId> =
@@ -301,15 +298,7 @@ async fn run_folder_get(
     // per-item truth if that FETCH fails and the folder falls back to the
     // uncertain lane.
     emit_stale_failures(tx, stale, folder, conn.connection(), &mut previous_bytes_in).await?;
-    if !excluded_outcomes.is_empty() {
-        let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
-        tx.send(batch(excluded_outcomes, PageBoundary::Page, None, bytes_in))
-            .await
-            .map_err(|_| GetError::ChannelDropped)?;
-    }
-    // The stale and excluded failures are on the channel: from here on only
-    // the valid ids remain unresolved should the FETCH (or MODSEQ
-    // recording) fail.
+    // Only the valid ids remain unresolved if FETCH or MODSEQ recording fails.
     *pending = pending_ids;
     let mut out: Vec<ItemOutcome<HydratedObject>> = Vec::with_capacity(BATCH_ITEMS);
     let Some(uid_set) = uid_set else {
@@ -508,19 +497,27 @@ fn answer_as(mut object: HydratedObject, id: &bifrost_types::ObjectId) -> Hydrat
 
 fn hydrate_planned(
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     mut fetch: FetchResponse,
     kind: HydrationKind,
-    shared_owner: Option<&bifrost_types::MailboxId>,
+    shared_owner: Option<&bifrost_types::PrincipalId>,
 ) -> Result<HydratedObject, crate::Error> {
     let uid = fetch.uid.filter(|uid| *uid != 0).ok_or_else(|| {
-        crate::Error::ProtocolMissing("FETCH response lacked a nonzero UID".into())
+        crate::Error::Provider(crate::error::ProviderFailure::Missing(
+            "FETCH response lacked a nonzero UID".into(),
+        ))
     })?;
-    let id = super::encode_object_id(folder, uidvalidity, uid);
+    let id = super::encode_object_id(
+        folder,
+        uidvalidity,
+        crate::types::Uid::new(uid).expect("wire UID is nonzero"),
+    );
     let kind = match kind {
         HydrationKind::Flags => {
             let flags = fetch.flags.as_deref().ok_or_else(|| {
-                crate::Error::ProtocolMissing("FETCH response lacked FLAGS".into())
+                crate::Error::Provider(crate::error::ProviderFailure::Missing(
+                    "FETCH response lacked FLAGS".into(),
+                ))
             })?;
             HydratedObjectKind::FlagsOnly(flags_set(flags))
         }
@@ -532,7 +529,9 @@ fn hydrate_planned(
         )?),
         HydrationKind::Mime(selection) => {
             let body = decode_selected_body(&mut fetch, selection).ok_or_else(|| {
-                crate::Error::ProtocolMissing("FETCH response lacked the requested body".into())
+                crate::Error::Provider(crate::error::ProviderFailure::Missing(
+                    "FETCH response lacked the requested body".into(),
+                ))
             })?;
             HydratedObjectKind::RawMime(body)
         }
@@ -547,10 +546,10 @@ fn hydrate_planned(
 #[cfg(test)]
 fn fetch_to_hydrated(
     folder: &MailboxName,
-    uidvalidity: u32,
+    uidvalidity: crate::types::UidValidity,
     fetch: FetchResponse,
     projection: Projection,
-    shared_owner: Option<&bifrost_types::MailboxId>,
+    shared_owner: Option<&bifrost_types::PrincipalId>,
 ) -> Option<HydratedObject> {
     let (_, kind) = projection_plan(projection, false)?;
     hydrate_planned(folder, uidvalidity, fetch, kind, shared_owner).ok()
@@ -785,7 +784,14 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            fetch_to_hydrated(&folder(), 9, no_uid, Projection::FlagsOnly, None).is_none(),
+            fetch_to_hydrated(
+                &folder(),
+                crate::types::UidValidity::new(9).expect("valid protocol test value"),
+                no_uid,
+                Projection::FlagsOnly,
+                None
+            )
+            .is_none(),
             "a FETCH without UID cannot be addressed and must be dropped",
         );
     }
@@ -800,21 +806,33 @@ mod tests {
         let mut observed = Vec::new();
         let merged = merge_requested_fetches(
             vec![
-                response(None, Some(1)),
-                response(Some(99), Some(2)),
-                response(Some(3), Some(7)),
-                response(Some(3), Some(0)),
+                response(
+                    None,
+                    Some(crate::types::ModSeqValzer::new(1).expect("valid protocol test value")),
+                ),
+                response(
+                    Some(99),
+                    Some(crate::types::ModSeqValzer::new(2).expect("valid protocol test value")),
+                ),
+                response(
+                    Some(3),
+                    Some(crate::types::ModSeqValzer::new(7).expect("valid protocol test value")),
+                ),
+                response(Some(3), Some(crate::types::ModSeqValzer::new(0).unwrap())),
             ],
             &[3],
             |uid, fetch| {
-                observed.push((uid, fetch.mod_seq));
+                observed.push((uid, fetch.mod_seq.map(crate::types::ModSeqValzer::get)));
                 Ok::<(), ()>(())
             },
         )
         .unwrap();
         assert_eq!(observed, vec![(3, Some(7)), (3, Some(0))]);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[&3].mod_seq, Some(0));
+        assert_eq!(
+            merged[&3].mod_seq.map(crate::types::ModSeqValzer::get),
+            Some(0)
+        );
     }
 
     #[test]
@@ -826,15 +844,32 @@ mod tests {
                 ..Default::default()
             };
             assert!(matches!(
-                hydrate_planned(&folder(), 9, missing, kind, None),
-                Err(crate::Error::ProtocolMissing(_))
+                hydrate_planned(
+                    &folder(),
+                    crate::types::UidValidity::new(9).expect("valid protocol test value"),
+                    missing,
+                    kind,
+                    None
+                ),
+                Err(crate::Error::Provider(
+                    crate::error::ProviderFailure::Missing(_)
+                ))
             ));
             let empty = FetchResponse {
                 uid: Some(3),
                 flags: Some(Vec::new()),
                 ..Default::default()
             };
-            assert!(hydrate_planned(&folder(), 9, empty, kind, None).is_ok());
+            assert!(
+                hydrate_planned(
+                    &folder(),
+                    crate::types::UidValidity::new(9).expect("valid protocol test value"),
+                    empty,
+                    kind,
+                    None
+                )
+                .is_ok()
+            );
         }
     }
 
@@ -847,12 +882,14 @@ mod tests {
         assert!(matches!(
             hydrate_planned(
                 &folder(),
-                9,
+                crate::types::UidValidity::new(9).expect("valid protocol test value"),
                 fetch,
                 HydrationKind::Mime(BodySelection::Whole),
                 None
             ),
-            Err(crate::Error::ProtocolMissing(_))
+            Err(crate::Error::Provider(
+                crate::error::ProviderFailure::Missing(_)
+            ))
         ));
     }
 
@@ -866,9 +903,22 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let object = fetch_to_hydrated(&folder(), 9, fetch, Projection::FlagsOnly, None)
-            .expect("uid present");
-        assert_eq!(object.id, super::super::encode_object_id(&folder(), 9, 3));
+        let object = fetch_to_hydrated(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            fetch,
+            Projection::FlagsOnly,
+            None,
+        )
+        .expect("uid present");
+        assert_eq!(
+            object.id,
+            super::super::encode_object_id(
+                &folder(),
+                crate::types::UidValidity::new(9).expect("nonzero epoch"),
+                crate::types::Uid::new(3).expect("valid protocol test value")
+            )
+        );
         assert!(object.blobs.is_empty());
         match object.kind {
             HydratedObjectKind::FlagsOnly(flags) => {
@@ -887,8 +937,14 @@ mod tests {
             rfc822_size: Some(77),
             ..Default::default()
         };
-        let object = fetch_to_hydrated(&folder(), 9, fetch, Projection::Metadata, None)
-            .expect("uid present");
+        let object = fetch_to_hydrated(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            fetch,
+            Projection::Metadata,
+            None,
+        )
+        .expect("uid present");
         let legacy = bifrost_types::ObjectId("imap1:5:INBOX:9:3".to_owned());
         let object = answer_as(object, &legacy);
         assert_eq!(object.id, legacy);
@@ -906,16 +962,22 @@ mod tests {
             rfc822_size: Some(77),
             ..Default::default()
         };
-        let owner = bifrost_types::MailboxId("alice".to_owned());
-        let object = fetch_to_hydrated(&folder(), 9, fetch, Projection::Metadata, Some(&owner))
-            .expect("uid present");
+        let owner = bifrost_types::PrincipalId("alice".to_owned());
+        let object = fetch_to_hydrated(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            fetch,
+            Projection::Metadata,
+            Some(&owner),
+        )
+        .expect("uid present");
         match object.kind {
             HydratedObjectKind::Metadata(entry) => {
                 assert_eq!(entry.fingerprint.size, Some(77));
                 assert!(
                     entry
                         .memberships
-                        .contains(&bifrost_types::MembershipScope::Mailbox(owner)),
+                        .contains(&bifrost_types::MembershipScope::Owner(owner)),
                     "the shared-mailbox membership must survive hydration",
                 );
             }
@@ -932,7 +994,16 @@ mod tests {
             uid: Some(3),
             ..Default::default()
         };
-        assert!(fetch_to_hydrated(&folder(), 9, fetch, Projection::Full, None).is_none());
+        assert!(
+            fetch_to_hydrated(
+                &folder(),
+                crate::types::UidValidity::new(9).expect("valid protocol test value"),
+                fetch,
+                Projection::Full,
+                None
+            )
+            .is_none()
+        );
     }
 
     // A preview is a prefix of the whole message, so what comes back is a
@@ -948,8 +1019,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        let object = fetch_to_hydrated(&folder(), 9, fetch, Projection::Preview(16), None)
-            .expect("uid present");
+        let object = fetch_to_hydrated(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            fetch,
+            Projection::Preview(16),
+            None,
+        )
+        .expect("uid present");
         match object.kind {
             HydratedObjectKind::RawMime(bytes) => {
                 assert_eq!(bytes.as_ref(), &b"Subject: hi\r\n\r\npreview body"[..]);
@@ -1009,7 +1086,11 @@ mod tests {
 
     #[test]
     fn unreturned_and_stale_hydration_ids_are_failed() {
-        let stale = DecodedObjectId::canonical(folder(), 8, 2);
+        let stale = DecodedObjectId::canonical(
+            folder(),
+            crate::types::UidValidity::new(8).expect("nonzero epoch"),
+            crate::types::Uid::new(2).expect("valid protocol test value"),
+        );
         let stale = failed_hydration(vec![stale], uidvalidity_changed_error(&folder()));
         assert!(
             matches!(stale.as_slice(), [ItemOutcome::Failed(failure)] if matches!(
@@ -1018,7 +1099,11 @@ mod tests {
             ))
         );
 
-        let missing = DecodedObjectId::canonical(folder(), 9, 3);
+        let missing = DecodedObjectId::canonical(
+            folder(),
+            crate::types::UidValidity::new(9).expect("nonzero epoch"),
+            crate::types::Uid::new(3).expect("valid protocol test value"),
+        );
         let error = message_not_found_error(&missing);
         assert!(matches!(
             error.kind(),
@@ -1102,11 +1187,14 @@ mod tests {
         let trailing = FetchResponse {
             uid: Some(7),
             flags: Some(vec![crate::types::Flag::Seen]),
-            mod_seq: Some(42),
+            mod_seq: Some(crate::types::ModSeqValzer::new(42).expect("valid protocol test value")),
             ..Default::default()
         };
         merge_fetch_response(&mut complete, trailing);
-        assert_eq!(complete.mod_seq, Some(42));
+        assert_eq!(
+            complete.mod_seq.map(crate::types::ModSeqValzer::get),
+            Some(42)
+        );
         assert_eq!(complete.rfc822_size, Some(120));
         assert!(
             complete
@@ -1115,8 +1203,14 @@ mod tests {
                 .is_some_and(|flags| flags.contains(&crate::types::Flag::Seen)),
             "the later FLAGS update must be adopted",
         );
-        let object =
-            fetch_to_hydrated(&folder(), 9, complete, Projection::Full, None).expect("uid present");
+        let object = fetch_to_hydrated(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            complete,
+            Projection::Full,
+            None,
+        )
+        .expect("uid present");
         match object.kind {
             HydratedObjectKind::RawMime(bytes) => assert_eq!(
                 bytes.as_ref(),
@@ -1144,9 +1238,15 @@ mod tests {
             &mut first,
             FetchResponse {
                 uid: Some(7),
-                thread_id: Some("T1".to_owned()),
-                email_id: Some("E1".to_owned()),
-                gmail_thread_id: Some(42),
+                thread_id: Some(
+                    crate::types::validated::ObjectId::new("T1".to_owned())
+                        .expect("valid objectid"),
+                ),
+                email_id: Some(
+                    crate::types::validated::ObjectId::new("E1".to_owned())
+                        .expect("valid objectid"),
+                ),
+                gmail_thread_id: Some(crate::types::GmailThreadId::new(42)),
                 preview: Some("hi".to_owned()),
                 binary_sizes: vec![(vec![1], 99), (vec![2], 20)],
                 gmail_labels: Some(vec!["new".to_owned()]),
@@ -1155,7 +1255,10 @@ mod tests {
         );
         assert_eq!(first.thread_id.as_deref(), Some("T1"));
         assert_eq!(first.email_id.as_deref(), Some("E1"));
-        assert_eq!(first.gmail_thread_id, Some(42));
+        assert_eq!(
+            first.gmail_thread_id,
+            Some(crate::types::GmailThreadId::new(42))
+        );
         assert_eq!(first.preview.as_deref(), Some("hi"));
         assert_eq!(first.binary_sizes, vec![(vec![1], 10), (vec![2], 20)]);
         assert_eq!(first.gmail_labels, Some(vec!["new".to_owned()]));
@@ -1188,8 +1291,14 @@ mod tests {
         );
         // These sections carry no partial origin, so they answer a whole-message
         // request; a preview projection now takes only the origin-0 section.
-        let object =
-            fetch_to_hydrated(&folder(), 9, first, Projection::Full, None).expect("uid present");
+        let object = fetch_to_hydrated(
+            &folder(),
+            crate::types::UidValidity::new(9).expect("valid protocol test value"),
+            first,
+            Projection::Full,
+            None,
+        )
+        .expect("uid present");
         match object.kind {
             HydratedObjectKind::RawMime(bytes) => {
                 assert_eq!(bytes.as_ref(), &b"Subject: hi\r\n\r\npreview body"[..]);
@@ -1204,7 +1313,11 @@ mod tests {
     #[tokio::test]
     async fn stale_failures_reach_the_consumer_before_the_fetch_can_fail() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let stale = vec![DecodedObjectId::canonical(folder(), 8, 2)];
+        let stale = vec![DecodedObjectId::canonical(
+            folder(),
+            crate::types::UidValidity::new(8).expect("nonzero epoch"),
+            crate::types::Uid::new(2).expect("valid protocol test value"),
+        )];
         let (connection, _server) =
             crate::connection::test_support::driver_pair(b"* PREAUTH ready\r\n").await;
         let mut previous_bytes_in = connection.bytes_in();
