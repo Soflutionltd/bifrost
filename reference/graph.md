@@ -48,6 +48,39 @@ message ids qualified for the later batch write, and resolves any folder it
 needs (`delete_thread`'s Trash) in that same mailbox. The tag on thread ids
 arrived with cursor envelope v2, which forces a reseed.
 
+## Sync scope admission
+
+`account/scope.rs` owns `GraphScope`: mail with a parsed primary/shared
+mailbox route, primary events, primary contacts, and a public-folder candidate.
+The Account inventory and changes doors parse each incoming `CursorScope` once;
+inventory resume retains the parsed scope from cursor classification, and push
+parses once per submitted scope before dispatching either transport arm. Walks
+retain that interpretation for client selection, delta paths, cursor kinds,
+object and thread ids, memberships, page preferences and mail etag caching.
+`Event` and `CalendarEvent` normalize to the same collection kind while the
+original scope remains on outcomes and checkpoints. Existing cursor envelope v6
+and durable id spellings are unchanged.
+
+Primary mail, calendars and contacts support REST sync and both push arms.
+Shared mail supports REST sync and webhook push, preserving the configured
+case-insensitive mailbox lookup and the stored owner spelling in ids. EWS
+streaming remains primary-only: its translation and Subscribe session cannot
+route to a shared mailbox, so it refuses those scopes and polling remains the
+coverage. Shared calendar/contact scopes are refused consistently at cursor
+establishment, inventory, changes and push admission, because their typed reads
+currently use the primary client. An enterprise Outlook user expects a push
+notification to cover a collection the same account can actually read, with
+no false coverage or reads sent to a different mailbox. Unsupported object
+types are refused before either push transport, including EWS.
+
+A bare folder is only a public-folder candidate. Establishment and inventory
+still require an entry in the account's routing map; a bare non-public folder
+remains unsupported. Public folders are poll-only and have no REST delta or
+push resource. A resumed public-folder changes cursor retains its embedded
+routing and must match the parsed scope's folder; it does not depend on a
+fresh discovery cache. The scope type does not turn every bare folder into a
+readable public folder.
+
 ## Module layout
 
 `crates/graph/src/account/`:
@@ -56,7 +89,8 @@ arrived with cursor envelope v2, which forces a reseed.
   the `impl Account` surface.
 - `capabilities.rs` - `build_capabilities` per `PushConfig`.
 - `cursor.rs` - `GraphCursorKind`, `GraphCursorPayload`,
-  `GraphPageMarker`, envelope encode/decode, scope/kind mapping.
+  `GraphPageMarker`, envelope encode/decode and collection kinds.
+- `scope.rs` - `GraphScope`, the single scope admission and collection interpretation.
 - `scopes.rs` - `discover_cursor_scope_events`,
   `discover_membership_events`, `scope_lifecycle_events`,
   `CursorIndex`, `FolderTree`.
@@ -101,7 +135,7 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
     `Unsupported(PushSubscribe)` refusals (whole-request and scope-correlated),
     the shared `account_closed_error`, and the handle codec
     (`graph_handle` / `ews_handle` / `decode_handle`, `new_handle_token`).
-  - `push/webhook.rs` - the Graph `/subscriptions` arm: `resource_for_scope`,
+  - `push/webhook.rs` - the Graph `/subscriptions` arm: resources from `GraphScope`,
     `subscribe_graph` with its create rollback, the per-handle
     `GraphSubscriptionGroup` / `GraphSubscriptionState`, and teardown -
     `unsubscribe_graph`, `close()`'s `retire_all_graph_subscriptions`, and the
@@ -109,7 +143,7 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
     makes it race-free against renewal.
   - `push/renewal.rs` - due-row maintenance sessions, account-owned recreate
     install-or-undo tasks, committed gap obligations and terminal row retirement.
-  - `push/ews.rs` - the EWS streaming arm: `ews_subscribable_folder_id`, the
+  - `push/ews.rs` - the EWS streaming arm: native folder ids from `GraphScope`, the
     `restId` -> `ewsId` translation (`translation_input_chunks` /
     `reconcile_translated_ews_scopes`), and the `EwsSubscriptionState`
     registration plus topology bump the session reads. Like the webhook arm it
@@ -308,7 +342,7 @@ primary's. That sharing silently weakens any test written past it: a derived
 client answers from the primary's queue and records into the primary's log,
 so the seam alone cannot say WHICH client issued a request. Asserting the URL
 does not recover it either on the delta paths - `initial_delta_url` builds
-its `/users/{mailbox}` prefix off `client_for_scope` independently of which
+its `/users/{mailbox}` prefix off `GraphScope::client` independently of which
 client then sends it, and a `nextLink` / `deltaLink` is whatever Graph
 minted - so a walk that fell back to the primary would produce byte-identical
 requests. (The per-message write paths do not have that problem: there the

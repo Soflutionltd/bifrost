@@ -41,7 +41,7 @@ use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::error::Error;
 
-use super::{ChangeDelivery, MultiplexerEvent};
+use super::{ChangeDelivery, EventScope, MultiplexerEvent};
 
 /// Per-batch driver outcome. Workers consult this between batches to
 /// decide whether to keep pulling.
@@ -217,7 +217,7 @@ pub async fn drive_changes_stream(
             None
         };
         let mut me = MultiplexerEvent {
-            scope: scope.clone(),
+            scope: EventScope::Cursor(scope.clone()),
             event: Arc::new(event),
             checkpoint: checkpoint.clone(),
             publication: None,
@@ -399,7 +399,7 @@ fn publish_contract_termination(
 ) -> bool {
     let publish = || {
         let _ = delivery.sender().send(MultiplexerEvent {
-            scope: scope.clone(),
+            scope: EventScope::Cursor(scope.clone()),
             event: Arc::new(SyncEvent::Terminated(error.clone())),
             checkpoint: None,
             publication: None,

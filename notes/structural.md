@@ -538,20 +538,6 @@ per partition under the receipt bound (the whole scope for `Full` plans) and
 each retained id holds a full receipt and claim, the ledger's main memory
 hazard.
 
-## STR-024 - `MultiplexerEvent.scope` doubles as "account-wide / unscoped"
-
-**Reported by:** sync-engine.
-
-Engine-synthesized account-wide events use `CursorScope::Account` as a
-sentinel: `reattach.rs::broadcast_warning`, `broadcast_terminated` at
-`RestartAccount` exhaustion, the lifecycle reader's `Terminate` arm,
-`push/mod.rs::broadcast`, `passthrough.rs::announce_page_loss`, both campaign
-warning sites in `bulk.rs`. But `CursorScope::Account` is Gmail's real cursor
-scope, so a Gmail consumer cannot tell "the Gmail account cursor terminated"
-from "the engine gave up restarting the whole account and paused it". Proposal:
-`EventScope::{Cursor(CursorScope), Account}`, forcing every producer to say
-which it means.
-
 ## STR-025 - About ten distinct engine counters travel as bare `u64`s
 
 **Reported by:** sync-engine.
@@ -1474,25 +1460,6 @@ response family), which also makes the CON-032 tables testable per row. The
 `capability_matrix` oracle is a test copy of production logic and should go once
 production is exhaustive.
 
-## STR-065 - IMAP pending session effects are six loose flags, not one tagged effect
-
-**Reported by:** imap-connection.
-
-`ProtocolState` (`state.rs`) holds `in_logout: bool`, `in_auth: bool`,
-`in_select: Option<MailboxName>`, `in_close: bool`, `in_notify_set:
-Option<NotifyFlags>`, `in_unauthenticate: bool`, with
-`#[allow(clippy::struct_excessive_bools)]` justified as "each bool is an
-independent in-flight command flag". They are not independent: at most one
-command arms one effect per exchange, and `apply_tagged` applies whichever is
-armed to whatever tagged response arrives, without comparing tags. Target: `enum
-PendingEffect { Logout, Authenticate, Select(MailboxName), Close,
-Unauthenticate, Notify(NotifyFlags) }` and `struct Armed { tag: Tag, effect }`;
-`ProtocolState` holds `Option<Armed>` (or a small map for the pipeline), and
-`apply_tagged` applies the effect only when the tag matches and always consumes
-it, on OK, NO and BAD alike. That makes BUG-034 unrepresentable, folds
-`disarm_pending_effects` into "drop the armed entry", and gives the pipeline the
-same mechanism instead of its own pre-effect hook (BUG-035).
-
 ## STR-066 - IMAP modseq support is `Option<u64>` plus a contradicting `bool`
 
 **Reported by:** imap-connection.
@@ -1632,20 +1599,6 @@ caller errors. `RequestErrorKind` has only `Malformed` and `BatchInputInvalid`, 
 protocol crates have nowhere else to put these. Proposal: `PayloadTooLarge`,
 `PreconditionFailed` (or reuse `ConcurrencyConflict` for the not-empty/active
 cases), so a UI can say something true.
-
-## STR-075 - IMAP QRESYNC negotiation is three loose fields and a ticket
-
-**Reported by:** imap-account.
-
-`QresyncNegotiation { enabled: bool, warning: Option<String> }` (factory) becomes
-`ImapAccountInner::{qresync_negotiation_warning: Option<String>,
-qresync_negotiation_warning_sent: AtomicBool}` plus the pool's `qresync_policy`
-bool, plus `QresyncWarningTicket` to un-spend the one-shot. `enabled == true` with
-a warning, or a warning that is not a downgrade reason, are representable; the
-reason strings are restated in `negotiate_qresync`, `run_changes` and
-`run_qresync`. Proposal: one enum (`NotRequested | Enabled | Refused { reason:
-QresyncRefusal }`) with a typed reason (`KnownBrokenServer`, `EnableNotConfirmed`,
-`SessionDowngraded`) that `describe_cursor` and `run_changes` both read (BUG-049).
 
 ## STR-076 - IMAP boolean parameters that name modes
 
@@ -1809,6 +1762,11 @@ product decision about generic requests. Proposal: `Account<C, Tr>` (or
 methods any account serves (`Blob/copy`, core); with every request built from a
 capability-scoped account, the generic default-account fallback has no caller and
 the open question dissolves.
+
+A partial migration was refused (it would break sync or leave the untyped door
+open): completing this needs capability-typed sync fields, factory and helper
+signatures, and checked cross-capability views for foreign submission and core
+methods. A wave of one owning both halves of `crates/jmap`.
 
 ## STR-089 - Smaller JMAP axes travelling as primitives
 
@@ -1978,6 +1936,11 @@ can tell apart only by reading text. The kind is mostly right; a typed refusal
 reason (or at least distinct message keys) would let a consumer tell "this account
 never sends" from "not scheduled, not for shares". Related: STR-010, STR-074.
 
+Blocked on bifrost-types: `RequestCause::Unsupported` carries only the
+operation and message keys are derived from the kind, so a typed refusal reason
+(with builder and accessor support) must land in bifrost-types first; the JMAP
+sites are commented to say so.
+
 ## STR-104 - JMAP `pim.rs` does ten unrelated jobs, and `calendar_ops.rs` mixes doors with a conversion library
 
 **Reported by:** jmap-account.
@@ -1998,27 +1961,6 @@ duration parsing (BUG-060) and time classification; the conversion half is a pur
 mapping module, and the parts restating shared-vocabulary rules (window overlap,
 recurrence validation) belong in `bifrost-types` (BUG-001). Same question for IMAP:
 STR-079.
-
-## STR-106 - Graph scope to collection is decided by eight matches on `CursorScope`
-
-**Reported by:** graph.
-
-Each of these matches `CursorScope::FolderType { folder, ty }` to decide what the
-scope means: `inventory::initial_delta_request` (delta path),
-`webhook::resource_for_scope` (subscription resource),
-`push::ews::ews_subscribable_folder_id`, `inventory::sync_object_id` (object id
-minting), `inventory::sync_scope_readable` (shared non-mail refusal),
-`cursor::kind_for_scope`, `inventory::delta_prefer`, `inventory::is_mail_scope`
-(etag caching). They have drifted before (`resource_for_scope`'s comment records
-the events arm subscribing to the default calendar for every calendar scope), and
-differ on foreign scopes today: webhook accepts them, EWS rejects them,
-`sync_scope_readable` rejects shared non-mail. Proposal: one parse at each
-`Account` entry, `enum GraphScope { Mail { mailbox: MailboxRoute, folder:
-NativeFolderId }, Events { calendar }, Contacts { folder }, PublicFolder(FolderId)
-}`, with `delta_path()`, `subscription_resource()`, `ews_folder_id()`,
-`mint_object_id()`, `client()` and `etag_cached()`; a scope that cannot parse is
-refused once. Its `PublicFolder` variant also owns "is this a public folder"
-(BUG-079). The JMAP twin is STR-098.
 
 ## STR-108 - One Graph `$batch` engine with typed legs and answers
 

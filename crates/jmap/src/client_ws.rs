@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::PushStateChange as WebSocketStateChange;
 use bytes::Bytes;
 use futures::{SinkExt, Stream, StreamExt, stream::SplitSink};
 use http::{HeaderValue, Uri, header};
@@ -148,6 +149,11 @@ enum WebSocketMessage_ {
     #[cfg(feature = "calendars")]
     CalendarAlert(crate::CalendarAlert),
     RequestError(WebSocketError),
+    /// An `EmailPush` or `Group` push object. Both deserialize directly as
+    /// a [`PushObject`] from the frame, whose `@type` is the object's own
+    /// tag. Ignoring them would drop new-mail push and every state change a
+    /// server batches into a group.
+    Push(PushObject),
     /// A known push message whose fields could not be decoded. The
     /// connection stays usable, but consumers must reconcile broadly because
     /// the malformed frame may have contained a state change.
@@ -161,13 +167,6 @@ enum WebSocketMessage_ {
 struct FrameType {
     #[serde(rename = "@type")]
     ty: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WebSocketStateChange {
-    changed: HashMap<String, HashMap<DataType, String>>,
-    #[serde(rename = "pushState", default)]
-    push_state: Option<String>,
 }
 
 /// Decode one RFC 8887 frame: read the `@type` discriminator, then
@@ -190,6 +189,15 @@ fn decode_frame(payload: &[u8]) -> Result<WebSocketMessage_, serde_json::Error> 
             Err(_) => WebSocketMessage_::MalformedPush,
         },
         "RequestError" => WebSocketMessage_::RequestError(serde_json::from_slice(payload)?),
+        #[cfg(feature = "mail")]
+        "EmailPush" => match serde_json::from_slice(payload) {
+            Ok(message) => WebSocketMessage_::Push(message),
+            Err(_) => WebSocketMessage_::MalformedPush,
+        },
+        "Group" => match serde_json::from_slice(payload) {
+            Ok(message) => WebSocketMessage_::Push(message),
+            Err(_) => WebSocketMessage_::MalformedPush,
+        },
         _ => WebSocketMessage_::Ignored,
     })
 }
@@ -825,6 +833,9 @@ where
                             #[cfg(feature = "calendars")]
                             WebSocketMessage_::CalendarAlert(alert) => {
                                 yield Ok(WebSocketMessage::PushNotification(PushObject::CalendarAlert(alert)))
+                            }
+                            WebSocketMessage_::Push(push) => {
+                                yield Ok(WebSocketMessage::PushNotification(push))
                             }
                             WebSocketMessage_::RequestError(err) => {
                                 // A request-level error naming a requestId is

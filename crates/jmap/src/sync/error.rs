@@ -428,6 +428,12 @@ pub(crate) fn terminated_from_jmap<T>(err: crate::Error, ctx: JmapErrorContext) 
 /// stream call sites emit a Terminated event without constructing
 /// `RecoveryClass` directly.
 #[must_use]
+// The shared error contract derives message_key from AccountErrorKind and
+// RequestCause::Unsupported carries only the operation. A sync-local reason
+// enum would be erased at this AccountError boundary. Do not encode local
+// refusal reasons as native_code: that field records provider wire codes.
+// Caller-visible distinctions require a shared UnsupportedReason field and
+// builder/accessor in bifrost-types, then explicit reasons at these call sites.
 pub(crate) fn unsupported_error(
     operation: AccountOperation,
     scope: Option<ErrorScope>,

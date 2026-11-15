@@ -230,6 +230,8 @@ pub struct StubAccount {
     pub caps: AccountCapabilities,
     /// Optional failure returned by the caller-version flag door.
     pub versioned_flags_error: Option<AccountError>,
+    /// Optional one-shot provider transcript for an ordinary flag campaign.
+    pub bulk_flags_script: Mutex<Option<Vec<SyncEvent<ItemOutcome<MutationSuccess>>>>>,
     /// Targets delivered to that door, including their original tokens.
     pub versioned_flags_seen: Arc<Mutex<Vec<bifrost_types::MailMutationTarget>>>,
     /// Scopes yielded by `discover_cursor_scopes`.
@@ -505,6 +507,7 @@ impl StubAccount {
             establishment: |scope| CursorEstablishment::Ready(cursor_for(scope, b"stub-ready")),
             partitioning: InventoryPartitioning::Full,
             versioned_flags_error: None,
+            bulk_flags_script: Mutex::new(None),
             versioned_flags_seen: Arc::new(Mutex::new(Vec::new())),
             partition_hook: None,
             inventory_hook: None,
@@ -985,7 +988,13 @@ impl Account for StubAccount {
         _op: FlagOp,
         _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        Box::pin(stream::empty())
+        Box::pin(stream::iter(
+            self.bulk_flags_script
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_default(),
+        ))
     }
 
     fn bulk_set_flags_if_version(

@@ -1805,6 +1805,11 @@ where
 /// This cannot refuse a request that previously routed: anything that reached
 /// `Ok(())` had its id in `foreign_submission`, which makes that set non-empty,
 /// which is exactly the condition that makes `feature_available` true.
+// Preserve the precedence below: an Outlook user must first learn whether
+// send-as exists at all, then whether scheduling is supported, then whether
+// their chosen mailbox is valid and can submit. These are distinct refusal
+// reasons, but AccountError has no shared reason field for local unsupported
+// operations; do not make callers parse the diagnostic text as an API.
 fn route_send_as(
     send_as: &SendAs,
     feature_available: bool,

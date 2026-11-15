@@ -219,10 +219,11 @@ impl AdmissionState {
     ) -> Option<AdmissionRequest> {
         let (order, floor_hit) = self.visit_order(floor);
         for lane in order {
-            let Some(position) = self.lanes[lane]
-                .iter()
-                .position(|request| request.account == *account && request.kind == kind)
-            else {
+            // Skip waiters whose `admit` future was dropped: handing them the
+            // permit would waste the grant while a live waiter keeps waiting.
+            let Some(position) = self.lanes[lane].iter().position(|request| {
+                request.account == *account && request.kind == kind && !request.tx.is_closed()
+            }) else {
                 continue;
             };
             if let Some(request) = self.lanes[lane].remove(position) {
@@ -388,6 +389,12 @@ impl Scheduler {
         {
             let mut admission = self.inner.admission.lock().expect("poisoned");
             let lane = lane_index(priority);
+            // A dropped `admit` future closes its channel but notifies
+            // nobody, and the dispatcher only prunes when it wakes. Without
+            // this prune a cancelled waiter (a caller that stopped waiting
+            // on a pause or shutdown) kept its lane slot until some later
+            // wake, refusing live requests as "lane full" meanwhile.
+            admission.lanes[lane].retain(|request| !request.tx.is_closed());
             if admission.lanes[lane].len() >= self.inner.lane_capacity {
                 tracing::warn!(
                     target: "bifrost.sync.scheduler",

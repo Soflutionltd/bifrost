@@ -70,9 +70,9 @@ async fn an_own_tag_ok_before_the_continuation_is_non_fatal_and_the_connection_s
 /// the `+` did not execute: the server never received the password. The
 /// session must stay NotAuthenticated, not move to Authenticated on that OK.
 ///
-/// Removing the `disarm_pending_effects` call from `wait_for_continuation`
-/// fails the session-state assertion: `in_auth` is armed before the send, and
-/// `apply_side_effects` completes it on any tagged OK.
+/// Removing the `disarm_effect` call from `wait_for_continuation`
+/// fails the session-state assertion: the authentication effect is armed
+/// before the send, and `apply_side_effects` completes it on its tagged OK.
 #[tokio::test]
 async fn an_own_tag_ok_before_a_login_literal_does_not_authenticate() {
     let (conn, mut server) = driver_pair(b"* OK [CAPABILITY IMAP4rev1] ready\r\n").await;

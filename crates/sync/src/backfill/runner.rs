@@ -57,7 +57,7 @@ use tokio::sync::broadcast;
 use crate::control::SyncControl;
 use crate::error::Error;
 use crate::inventory_walk::{InventoryWalk, WalkDecision, cross_waived_barriers, record_barriers};
-use crate::multiplexer::MultiplexerEvent;
+use crate::multiplexer::{EventScope, MultiplexerEvent};
 
 use super::partitioner::partition_key;
 
@@ -437,7 +437,7 @@ impl BackfillRunner {
                         );
                         if let Some(tx) = &changes_tx {
                             let _ = tx.send(MultiplexerEvent::unacked(
-                                scope.clone(),
+                                EventScope::Cursor(scope.clone()),
                                 Arc::new(SyncEvent::Terminated(error.clone())),
                             ));
                         }
@@ -457,7 +457,7 @@ impl BackfillRunner {
                             Err(error) => {
                                 if let Some(tx) = &changes_tx {
                                     let _ = tx.send(MultiplexerEvent::unacked(
-                                        scope.clone(),
+                                        EventScope::Cursor(scope.clone()),
                                         Arc::new(SyncEvent::Terminated(error.clone())),
                                     ));
                                 }
@@ -506,7 +506,7 @@ impl BackfillRunner {
                                 checkpoint: None,
                             };
                             let _ = tx.send(MultiplexerEvent::unacked(
-                                scope.clone(),
+                                EventScope::Cursor(scope.clone()),
                                 Arc::new(SyncEvent::Batch(synthetic)),
                             ));
                             warn_barrier(tx, &scope, &batch.coverage);
@@ -636,7 +636,7 @@ impl BackfillRunner {
                             None
                         };
                         let me = MultiplexerEvent {
-                            scope: scope.clone(),
+                            scope: EventScope::Cursor(scope.clone()),
                             event: Arc::new(SyncEvent::Batch(synthetic)),
                             checkpoint: Some(expected.clone()),
                             publication: publication.clone(),
@@ -689,7 +689,7 @@ impl BackfillRunner {
                         );
                         if let Some(tx) = &changes_tx {
                             let _ = tx.send(MultiplexerEvent::unacked(
-                                scope.clone(),
+                                EventScope::Cursor(scope.clone()),
                                 Arc::new(SyncEvent::Terminated(error.clone())),
                             ));
                         }
@@ -753,7 +753,7 @@ impl BackfillRunner {
                 bifrost_types::InventoryEvent::Terminated(err) => {
                     if let Some(tx) = &changes_tx {
                         let me = MultiplexerEvent {
-                            scope: scope.clone(),
+                            scope: EventScope::Cursor(scope.clone()),
                             event: Arc::new(SyncEvent::Terminated(err.clone())),
                             checkpoint: None,
                             publication: None,
@@ -771,7 +771,7 @@ impl BackfillRunner {
                 bifrost_types::InventoryEvent::Warning(warning) => {
                     if let Some(tx) = &changes_tx {
                         let me = MultiplexerEvent {
-                            scope: scope.clone(),
+                            scope: EventScope::Cursor(scope.clone()),
                             event: Arc::new(SyncEvent::Warning(warning)),
                             checkpoint: None,
                             publication: None,
@@ -793,7 +793,7 @@ impl BackfillRunner {
             complete = false;
             if let Some(tx) = &changes_tx {
                 let _ = tx.send(MultiplexerEvent::unacked(
-                    scope.clone(),
+                    EventScope::Cursor(scope.clone()),
                     Arc::new(SyncEvent::Warning(
                         crate::inventory_walk::unannounced_end_warning(),
                     )),
@@ -832,7 +832,7 @@ fn warn_incomplete(
         ),
     );
     let _ = tx.send(MultiplexerEvent::unacked(
-        scope.clone(),
+        EventScope::Cursor(scope.clone()),
         Arc::new(SyncEvent::Warning(warning)),
     ));
 }
@@ -855,7 +855,7 @@ fn warn_barrier(
         ),
     );
     let _ = tx.send(MultiplexerEvent::unacked(
-        scope.clone(),
+        EventScope::Cursor(scope.clone()),
         Arc::new(SyncEvent::Warning(warning)),
     ));
 }

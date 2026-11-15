@@ -1101,8 +1101,8 @@ async fn store_flags(
 // Guarded STORE preserves tagged NO as a result for MODIFIED handling.
 // Do not flatten an access refusal into the generic Failed outcome: that
 // would bypass shared-folder quarantine and discard its wire evidence.
-// StoreResult has already lost the response text; retain its code and the
-// acknowledged attempt here rather than inventing replacement server text.
+// The error carries the server's own text and code plus the acknowledged
+// attempt.
 // `operation` is the caller's own: STORE serves both flag updates and the
 // `\Deleted` leg of a destroy, and the check classifies under that caller.
 fn store_permission_error(
@@ -1112,7 +1112,7 @@ fn store_permission_error(
     if matches!(result.status, crate::types::response::StatusKind::Ok) {
         return None;
     }
-    let error = crate::Error::no_with_code(String::new(), result.code.clone())
+    let error = crate::Error::no_with_code(result.text.clone(), result.code.clone())
         .with_attempt(bifrost_types::TransmissionState::Acknowledged);
     super::error::permission_denied(
         &error,
@@ -1581,6 +1581,7 @@ mod tests {
         let result = |status, code: Option<ResponseCode>| crate::types::StoreResult {
             fetches: Vec::new(),
             status,
+            text: String::new(),
             code,
         };
         assert_eq!(
@@ -1894,6 +1895,7 @@ mod tests {
         let result = crate::types::StoreResult {
             fetches: Vec::new(),
             status: crate::types::response::StatusKind::Ok,
+            text: String::new(),
             code: Some(ResponseCode::Modified(vec![UidRange::range(4000000000, 1)])),
         };
         let outcome = StoreWireOutcome::from_store_result(&result);
@@ -2303,6 +2305,7 @@ mod tests {
         let result = crate::types::StoreResult {
             fetches: Vec::new(),
             status: crate::types::response::StatusKind::No,
+            text: String::new(),
             code: Some(ResponseCode::NoPerm),
         };
         let error = store_permission_error(&result, AccountOperation::BulkDestroy)

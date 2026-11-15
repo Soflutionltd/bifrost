@@ -1136,7 +1136,7 @@ async fn re_establish_scope_with_backoff(
     if let Some(err) = last_account_error {
         broadcast_terminated(
             ctx.changes_tx,
-            scope.clone(),
+            EventScope::Cursor(scope.clone()),
             crate::recovery::recovery_exhaustion_error(
                 err,
                 scope.clone(),
@@ -2320,7 +2320,7 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
     if let Some(err) = last_error {
         broadcast_terminated(
             ctx.changes_tx,
-            CursorScope::Account,
+            EventScope::Account,
             crate::recovery::recovery_exhaustion_error(
                 err,
                 CursorScope::Account,
@@ -2363,7 +2363,7 @@ pub(super) fn log_open_skips(account_id: &AccountId, skips: &[SkippedScope], pha
 
 fn broadcast_terminated(
     changes_tx: &broadcast::Sender<MultiplexerEvent>,
-    scope: CursorScope,
+    scope: EventScope,
     error: AccountError,
 ) {
     let me = MultiplexerEvent {
@@ -2378,16 +2378,16 @@ fn broadcast_terminated(
 /// Broadcast a `Warning` on the per-account changes channel. The
 /// `scope` argument is the directive's target scope when available;
 /// the caller passes `None` only for warnings that are genuinely
-/// account-wide. The fallback is `CursorScope::Account` because the
-/// `MultiplexerEvent::scope` field is `CursorScope`, not
-/// `Option<CursorScope>`. (sync-N4)
+/// account-wide. Attachment failure must not look like termination of a real
+/// account cursor: an enterprise user needs to distinguish a stopped account
+/// from one cursor's failure.
 fn broadcast_warning(
     changes_tx: &broadcast::Sender<MultiplexerEvent>,
     scope: Option<CursorScope>,
     warning: bifrost_types::Warning,
 ) {
     let me = MultiplexerEvent {
-        scope: scope.unwrap_or(CursorScope::Account),
+        scope: scope.map_or(EventScope::Account, EventScope::Cursor),
         event: Arc::new(SyncEvent::Warning(warning)),
         checkpoint: None,
         publication: None,

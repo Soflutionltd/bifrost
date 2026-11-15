@@ -47,8 +47,8 @@ pub(crate) use profile::ServerProfile;
 pub(crate) use response::{
     AclEntry, Capability, CopyResult, EsearchResponse, ExpungeResult, ListRightsResponse,
     ListStatusEntry, MetadataEntry, MetadataResult, MoveResult, NamespaceResponse, QresyncParams,
-    QuotaResource, QuotaRootResponse, Response, ResponseCode, SelectOptions, SeqBound,
-    ThreadNode, UidRange, UntaggedResponse, UntaggedStatus,
+    QuotaResource, QuotaRootResponse, Response, ResponseCode, SelectOptions, SeqBound, ThreadNode,
+    UidRange, UntaggedResponse, UntaggedStatus,
 };
 pub(crate) use search::SearchCriteria;
 pub(crate) use secret::SecretString;

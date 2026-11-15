@@ -89,7 +89,7 @@ impl ImapConnection {
 
         let cmd = Command::NotifySet(params);
         let consumer = super::dispatch::NotifySetConsumer::default();
-        // Driver sets in_notify_set before sending; apply_tagged updates
+        // Driver arms NOTIFY SET before sending; apply_tagged updates
         // notify flags on tagged OK. NOTIFICATIONOVERFLOW clears them.
         // NO/BAD arrive as the ordinary `Err` of this call: they ride
         // `Finalized::output`, so the consumer's `reclassified_as_events` is
@@ -129,7 +129,7 @@ impl ImapConnection {
         self.require_notify()?;
 
         let cmd = Command::NotifyNone;
-        // Driver sets in_notify_set(default) before sending;
+        // Driver arms NOTIFY NONE before sending;
         // apply_tagged resets notify flags on tagged OK.
         self.submit_regular(
             cmd,

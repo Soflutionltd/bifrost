@@ -294,11 +294,14 @@ async fn run_inventory(
         }
         Err(err) => return Err(err.into()),
     };
-    // A UIDNOTSTICKY folder is deliberately NOT refused here or in the change
-    // lanes. Refusing would hide the folder's mail from an enterprise user
-    // entirely - removing a capability, which needs an owner ruling. Its UIDs
-    // do not persist, so its cursor is re-established on UIDVALIDITY change;
-    // a cursor-free sync mode for such folders is filed separately.
+    // UIDNOTSTICKY must keep exposing mail: enterprise users expect the
+    // folder to remain visible. A cursor-free walk cannot be enabled just
+    // here: CursorEstablishment has only Ready and EstablishViaInventory,
+    // and the engine's FusionOutcome::NoCursor does not schedule another
+    // inventory poll. Done(None) would therefore stop ongoing sync rather
+    // than fix it. The shared contract needs a recurring inventory mode,
+    // with authoritative replacement on each poll and generation-scoped
+    // object handles, before this site can stop minting UID cursors safely.
     let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
     let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
     let mut attrs = inventory_attrs(include_modseq);
@@ -670,7 +673,9 @@ mod tests {
         async fn account() -> (ImapAccount, tokio::io::DuplexStream) {
             let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
             let account = ImapAccount::new(ImapAccountParts {
-                qresync_negotiation_warning: Some("QRESYNC refused by the server".to_string()),
+                qresync: super::super::super::QresyncNegotiation::Refused(
+                    super::super::super::QresyncRefusal::EnableNotConfirmed,
+                ),
                 ..scripted_account_parts(conn, 1)
             });
             (account, server)

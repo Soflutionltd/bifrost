@@ -20,10 +20,10 @@ pub mod reconciler;
 pub mod subscription;
 
 use crate::cancel::{BoundaryRequest, BoundaryView};
-use crate::multiplexer::{ChangeDelivery, MultiplexerEvent, ReopenRequest};
+use crate::multiplexer::{ChangeDelivery, EventScope, MultiplexerEvent, ReopenRequest};
 use crate::recovery::{RecoveryPlan, ThrottleBucket, plan_recovery};
 use bifrost_types::{
-    AccountId, CursorScope, InvalidationSink, SinkPush, SyncEvent, Warning, WarningKind, WatchEvent,
+    AccountId, InvalidationSink, SinkPush, SyncEvent, Warning, WarningKind, WatchEvent,
 };
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -109,7 +109,7 @@ impl InvalidationSink for InvalidationSinkInner {
 
 pub(crate) fn broadcast(target: &SinkTarget, event: SyncEvent<bifrost_types::Change>) {
     let _ = target.delivery.sender().send(MultiplexerEvent {
-        scope: CursorScope::Account,
+        scope: EventScope::Account,
         event: Arc::new(event),
         checkpoint: None,
         publication: None,
@@ -206,7 +206,8 @@ mod tests {
     use super::*;
     use crate::cancel::Boundary;
     use bifrost_types::{
-        AccountError, AccountErrorBuilder, AccountErrorKind, Cause, StateCause, SyncStateErrorKind,
+        AccountError, AccountErrorBuilder, AccountErrorKind, Cause, CursorScope, StateCause,
+        SyncStateErrorKind,
     };
     fn setup() -> (
         InvalidationSinkInner,
@@ -329,7 +330,7 @@ mod tests {
             SinkPush::Accepted
         ));
         let event = rx.try_recv().expect("immediate broadcast");
-        assert_eq!(event.scope, CursorScope::Account);
+        assert_eq!(event.scope, EventScope::Account);
         assert!(matches!(event.event.as_ref(), SyncEvent::Terminated(_)));
     }
     #[test]

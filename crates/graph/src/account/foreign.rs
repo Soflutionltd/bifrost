@@ -11,7 +11,9 @@
 //! carries an `accountId` where Graph carries a `/users/{id}` routing
 //! key, so a shared `bifrost-types` type would be a false generalization.
 
-use bifrost_types::{CursorScope, FolderId, MailboxId, MembershipScope, ObjectId, ThreadId};
+#[cfg(test)]
+use bifrost_types::CursorScope;
+use bifrost_types::{FolderId, MailboxId, MembershipScope, ObjectId, ThreadId};
 
 /// Reserved separator. A `FolderId` of the form `"<mailbox>\u{1f}<folder>"`
 /// is a foreign-mailbox folder; a plain id is the primary mailbox.
@@ -169,6 +171,7 @@ pub(crate) fn encode_public_item_id(folder: &FolderId, item: &str) -> ObjectId {
 /// out of the inventory / changes projection. When the scope is a foreign
 /// (shared/delegate) folder, the owning mailbox is prefixed so later reads
 /// route to `/users/{mailbox}`; a primary scope yields a bare native id.
+#[cfg(test)]
 pub(crate) fn encode_message_id(scope: &CursorScope, native: &str) -> ObjectId {
     match scope {
         CursorScope::FolderType { folder, .. } | CursorScope::Folder(folder) => {
@@ -241,6 +244,7 @@ pub(crate) fn folder_owner(folder: &FolderId) -> Option<String> {
 
 /// Encode a Graph conversation id with the same mailbox qualification as its
 /// messages. Primary-mailbox thread ids deliberately remain bare.
+#[cfg(test)]
 pub(crate) fn encode_thread_id(scope: &CursorScope, native: &str) -> ThreadId {
     match scope {
         CursorScope::FolderType { folder, .. } | CursorScope::Folder(folder) => {

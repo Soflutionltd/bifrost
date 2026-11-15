@@ -159,7 +159,7 @@ struct PoolInner {
     /// The account's QRESYNC policy (`ImapAccount::qresync_enabled`). Lives
     /// here because `dial` reads it: a member dialed while it is set is
     /// brought to QRESYNC before it is handed out.
-    qresync_policy: std::sync::atomic::AtomicBool,
+    qresync: Mutex<(super::QresyncNegotiation, bool)>,
     /// Every registered session minted by this pool, including checked-out and
     /// push sessions. The weak connection reference does not extend the
     /// command handle's lifetime; the shared driver owner does keep its join
@@ -216,7 +216,7 @@ impl Pool {
                 meter,
                 bandwidth_budget,
                 closed: std::sync::atomic::AtomicBool::new(false),
-                qresync_policy: std::sync::atomic::AtomicBool::new(false),
+                qresync: Mutex::new((super::QresyncNegotiation::NotRequested, false)),
                 registry: Mutex::new(vec![SessionRegistration {
                     connection: primed_weak,
                     driver: primed_driver,
@@ -231,14 +231,58 @@ impl Pool {
     /// The account's QRESYNC policy. See `ImapAccount::qresync_enabled`.
     pub(crate) fn qresync_policy(&self) -> bool {
         self.inner
-            .qresync_policy
-            .load(std::sync::atomic::Ordering::Acquire)
+            .qresync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+            == super::QresyncNegotiation::Enabled
     }
 
-    pub(crate) fn set_qresync_policy(&self, enabled: bool) {
+    pub(crate) fn set_qresync_negotiation(&self, negotiation: super::QresyncNegotiation) {
+        // Keep delivery state across a runtime downgrade: inventory warnings
+        // are account-wide, while changes reports its own strategy transition.
         self.inner
-            .qresync_policy
-            .store(enabled, std::sync::atomic::Ordering::Release);
+            .qresync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0 = negotiation;
+    }
+
+    pub(crate) fn qresync_reason(&self) -> Option<&'static str> {
+        match self
+            .inner
+            .qresync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+        {
+            super::QresyncNegotiation::Refused(reason) => Some(reason.reason()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn take_qresync_warning(&self) -> Option<String> {
+        let mut state = self
+            .inner
+            .qresync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.1 {
+            return None;
+        }
+        let super::QresyncNegotiation::Refused(reason) = state.0 else {
+            return None;
+        };
+        state.1 = true;
+        Some(reason.reason().to_owned())
+    }
+
+    pub(crate) fn restore_qresync_warning(&self) {
+        self.inner
+            .qresync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1 = false;
     }
 
     pub(crate) async fn checkout_for_folder(
@@ -686,10 +730,13 @@ impl PoolInner {
             self.config.imap.command_timeout,
         )
         .await?;
-        if self
-            .qresync_policy
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        let qresync_enabled = self
+            .qresync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+            == super::QresyncNegotiation::Enabled;
+        if qresync_enabled {
             enable_qresync(&conn, self.config.imap.command_timeout).await?;
         }
         Ok(conn)

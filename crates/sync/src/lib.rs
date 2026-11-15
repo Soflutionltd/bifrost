@@ -101,6 +101,6 @@ pub use mutation::{
 
 // Multiplexer types consumers want to pattern-match against (the
 // per-account broadcast yields `MultiplexerEvent`).
-pub use multiplexer::{ChangesReceiver, MultiplexerEvent, ReopenRequest};
+pub use multiplexer::{ChangesReceiver, EventScope, MultiplexerEvent, ReopenRequest};
 
 pub use push::health::{PushHealth, PushLaneHealth, PushLaneState};

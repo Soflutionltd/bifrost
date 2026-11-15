@@ -246,6 +246,11 @@ impl SyncEngine {
         let mut cohorts = Vec::new();
         let mut seen = HashSet::new();
         let account = slot.current.load_full();
+        // Ruling (wave 7): a user who selected one message twice expects it
+        // changed once, not an error. Duplicates are dropped here, first
+        // occurrence wins, so each distinct ObjectId is submitted and answered
+        // once per round; that is what lets the per-round answer check below
+        // treat a repeated answer as a provider contract violation.
         for id in targets.into_iter().filter(|id| seen.insert(id.clone())) {
             route_target(
                 &mut cohorts,
@@ -699,7 +704,10 @@ impl SyncEngine {
             // admission; see `forward_campaign_directives`.
             let mut directives = Vec::new();
 
-            loop {
+            let submitted: HashSet<_> = remaining.iter().cloned().collect();
+            let mut answered = HashSet::new();
+            let mut terminated = false;
+            'submission: loop {
                 let event = tokio::select! {
                     () = slot.shutdown.cancelled() => { first_error.get_or_insert(Error::ShuttingDown); break; },
                     event = stream.next() => event,
@@ -710,6 +718,21 @@ impl SyncEngine {
                 match event {
                     bifrost_types::SyncEvent::Batch(batch) => {
                         for item in batch.items {
+                            let id = match &item {
+                                ItemOutcome::Succeeded(value) => &value.item,
+                                ItemOutcome::Failed(value) => &value.item,
+                                ItemOutcome::Uncertain(value) => &value.item,
+                            };
+                            // Validate before side effects, conflicts, throttles or accounting.
+                            // A mail user must never see an unrelated message counted, or a
+                            // repeated answer overwrite a result already reported this round.
+                            let id = bifrost_types::ObjectId(id.0.clone());
+                            if !submitted.contains(&id) || !answered.insert(id) {
+                                first_error.get_or_insert(Error::Account(
+                                    mutation_outcome_contract_failure(),
+                                ));
+                                break 'submission;
+                            }
                             let observed = match &item {
                                 ItemOutcome::Failed(f) => Some((&f.item, &f.error)),
                                 ItemOutcome::Uncertain(u) => Some((&u.item, &u.error)),
@@ -822,6 +845,7 @@ impl SyncEngine {
                         }
                     }
                     bifrost_types::SyncEvent::Terminated(err) => {
+                        terminated = true;
                         let original = err.clone();
                         if original.partial_commit().is_some() {
                             partial_commit_observations.push(
@@ -923,7 +947,7 @@ impl SyncEngine {
                                         "reconcile requested dedupe-by-client-id; consumer must dedupe",
                                     );
                                     let me = MultiplexerEvent {
-                                        scope: CursorScope::Account,
+                                        scope: EventScope::Account,
                                         event: Arc::new(SyncEvent::Warning(warning)),
                                         checkpoint: None,
                                         publication: None,
@@ -971,7 +995,7 @@ impl SyncEngine {
                     // deliberately wrote to should not dead-end in the engine.
                     bifrost_types::SyncEvent::Warning(warning) => {
                         let me = MultiplexerEvent {
-                            scope: CursorScope::Account,
+                            scope: EventScope::Account,
                             event: Arc::new(SyncEvent::Warning(warning)),
                             checkpoint: None,
                             publication: None,
@@ -983,6 +1007,9 @@ impl SyncEngine {
                 }
             }
 
+            if !terminated && answered.len() != submitted.len() {
+                first_error.get_or_insert(Error::Account(mutation_outcome_contract_failure()));
+            }
             cohort.reconcile_at = reconcile_at;
             cohort.attempt = cohort.attempt.saturating_add(1);
             // Every submitted target must occupy a lane, even when a stream
@@ -1260,7 +1287,7 @@ fn campaign_keys(
 
 /// Record the throttle hold any retryable or reconcilable error carries,
 /// whatever lane observed it.
-fn record_error_throttle(
+pub(super) fn record_error_throttle(
     throttles: &std::sync::Mutex<crate::recovery::ThrottleBucket>,
     account_id: &AccountId,
     error: &AccountError,
@@ -1594,6 +1621,22 @@ pub(super) fn classify_item_outcome(
     }
 }
 
+/// Invalid answers stop this round; unanswered submitted writes remain uncertain.
+fn mutation_outcome_contract_failure() -> AccountError {
+    let kind = bifrost_types::InternalErrorKind::AccountContract;
+    bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::Internal(kind),
+        bifrost_types::Cause::Internal(bifrost_types::InternalCause::new(
+            kind,
+            Some(bifrost_types::DiagnosticText::support_only(
+                "mutation outcomes contain unknown, duplicate or missing targets",
+            )),
+        )),
+    )
+    .try_build()
+    .expect("valid mutation outcome contract failure")
+}
+
 /// Deliver one action's engine directives to the reopen listener. Returns
 /// `false` if shutdown interrupted delivery.
 ///
@@ -1677,6 +1720,113 @@ fn retry_available(attempts: u64, max_retries: u32) -> bool {
 mod campaign_tests {
     use super::*;
     use bifrost_types::{BatchItemId, BatchSuccess, MutationEffect, ObjectId};
+
+    #[tokio::test]
+    async fn campaign_rejects_unknown_duplicate_and_missing_answers() {
+        for (answers, applied) in [
+            (vec!["unrequested"], 0),
+            (vec!["requested", "requested"], 1),
+            (vec![], 0),
+        ] {
+            let engine = SyncEngine::builder().build().expect("engine");
+            let id = AccountId("outcome-contract".into());
+            let stub = crate::test_common::StubAccount::new(Vec::new());
+            let mut script = answers
+                .into_iter()
+                .map(|answer| {
+                    // Separate pages ensure duplicate detection spans the stream.
+                    SyncEvent::Batch(Batch {
+                        items: vec![ItemOutcome::Succeeded(BatchSuccess::new(
+                            BatchItemId(answer.into()),
+                            MutationSuccess::Applied,
+                        ))],
+                        page_boundary: PageBoundary::Final,
+                        server_latency: Duration::ZERO,
+                        bytes_in: 0,
+                        checkpoint: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            script.push(SyncEvent::Done(None));
+            *stub.bulk_flags_script.lock().unwrap() = Some(script);
+            engine
+                .attach(
+                    id.clone(),
+                    Arc::new(crate::test_common::StubFactory::queue(vec![Arc::new(stub)])),
+                )
+                .await
+                .expect("attach");
+            let vendor = crate::mutation::IdempotencyVendor::with_run_id(
+                bifrost_types::RunId("contract".into()),
+                Box::new(|_| bifrost_types::ProtocolSalt::Imap),
+            );
+            let counters = engine
+                .bulk_set_flags(
+                    &id,
+                    vec![ObjectId("requested".into())],
+                    bifrost_types::FlagOp::Add(HashSet::from(["$seen".into()])),
+                    &vendor,
+                    bifrost_types::ProtocolKind::Imap,
+                )
+                .await
+                .expect("partial campaign accounting");
+            assert!(
+                matches!(counters.error.as_deref(), Some(Error::Account(error))
+                if matches!(error.kind(), bifrost_types::AccountErrorKind::Internal(
+                    bifrost_types::InternalErrorKind::AccountContract
+                )))
+            );
+            assert_eq!(counters.applied, applied);
+            assert_eq!(counters.pending_retry, 1 - applied);
+            engine.detach(&id).await.expect("detach");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_target_selected_twice_is_submitted_and_answered_once() {
+        let engine = SyncEngine::builder().build().expect("engine");
+        let id = AccountId("duplicate-input".into());
+        let stub = crate::test_common::StubAccount::new(Vec::new());
+        // One answer only: if the duplicate reached the provider, the round
+        // would end with a target unanswered and raise a contract error.
+        *stub.bulk_flags_script.lock().unwrap() = Some(vec![
+            SyncEvent::Batch(Batch {
+                items: vec![ItemOutcome::Succeeded(BatchSuccess::new(
+                    BatchItemId("twice".into()),
+                    MutationSuccess::Applied,
+                ))],
+                page_boundary: PageBoundary::Final,
+                server_latency: Duration::ZERO,
+                bytes_in: 0,
+                checkpoint: None,
+            }),
+            SyncEvent::Done(None),
+        ]);
+        engine
+            .attach(
+                id.clone(),
+                Arc::new(crate::test_common::StubFactory::queue(vec![Arc::new(stub)])),
+            )
+            .await
+            .expect("attach");
+        let vendor = crate::mutation::IdempotencyVendor::with_run_id(
+            bifrost_types::RunId("duplicate".into()),
+            Box::new(|_| bifrost_types::ProtocolSalt::Imap),
+        );
+        let counters = engine
+            .bulk_set_flags(
+                &id,
+                vec![ObjectId("twice".into()), ObjectId("twice".into())],
+                bifrost_types::FlagOp::Add(HashSet::from(["$seen".into()])),
+                &vendor,
+                bifrost_types::ProtocolKind::Imap,
+            )
+            .await
+            .expect("campaign");
+        assert!(counters.error.is_none(), "{:?}", counters.error);
+        assert_eq!(counters.applied, 1);
+        engine.detach(&id).await.expect("detach");
+    }
 
     #[test]
     fn retry_candidates_skip_engine_blocked_ids() {

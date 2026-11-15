@@ -296,7 +296,11 @@ pub(crate) fn update(
             .await;
         let result = match response {
             Ok(response) => {
-                crate::client::parse_json_response::<GoogleEvent>(response, "Calendar API").await
+                crate::client::parse_json_response::<GoogleEvent>(
+                    response,
+                    crate::quota::ApiSurface::Calendar,
+                )
+                .await
             }
             Err(error) => Err(error),
         };
@@ -351,7 +355,7 @@ pub(crate) fn delete_if_version(
             )
             .await
             .map_err(|error| event_error(error, AccountOperation::EventDelete, event.0.clone()))?;
-        crate::client::check_response_status(response, "Calendar API")
+        crate::client::check_response_status(response, crate::quota::ApiSurface::Calendar)
             .await
             .map_err(|error| event_error(error, AccountOperation::EventDelete, event.0))
     })
@@ -407,9 +411,12 @@ pub(crate) fn rsvp_if_version(
             )
             .await
             .map_err(|error| event_error(error, AccountOperation::EventRsvp, event.0.clone()))?;
-        let _: GoogleEvent = crate::client::parse_json_response(response, "Calendar API")
-            .await
-            .map_err(|error| event_error(error, AccountOperation::EventRsvp, event.0.clone()))?;
+        let _: GoogleEvent =
+            crate::client::parse_json_response(response, crate::quota::ApiSurface::Calendar)
+                .await
+                .map_err(|error| {
+                    event_error(error, AccountOperation::EventRsvp, event.0.clone())
+                })?;
         Ok(())
     })
 }
@@ -2515,8 +2522,10 @@ mod tests {
         let telemetry = error.telemetry_fields();
         assert_eq!(telemetry.status, Some(403));
         assert_eq!(telemetry.request_id, Some("req-77"));
-        assert_eq!(telemetry.provider, Some(bifrost_types::Provider::Gmail));
-        assert_eq!(telemetry.protocol, Some(Protocol::Gmail));
+        // A Calendar failure must not claim Gmail as provider or wire: the
+        // user would be sent to grant mail permissions for a calendar fault.
+        assert_eq!(telemetry.provider, None);
+        assert_eq!(telemetry.protocol, Some(Protocol::Unknown));
         assert!(telemetry.native_code.is_some());
         assert!(
             error
@@ -2532,7 +2541,7 @@ mod tests {
         );
 
         assert!(
-            error
+            !error
                 .chain()
                 .iter()
                 .any(|cause| matches!(cause, Cause::Wire(WireCause::Gmail(_))))

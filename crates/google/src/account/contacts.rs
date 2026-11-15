@@ -1813,7 +1813,9 @@ mod tests {
         let telemetry = error.telemetry_fields();
         assert_eq!(telemetry.status, Some(403));
         assert_eq!(telemetry.request_id, Some("people-req-9"));
-        assert!(error.chain().iter().any(|cause| matches!(
+        // A People failure carries no Gmail wire signal: it is not a Gmail
+        // fault and must not send the user to grant mail permissions.
+        assert!(!error.chain().iter().any(|cause| matches!(
             cause,
             bifrost_types::Cause::Wire(bifrost_types::WireCause::Gmail(_))
         )));
@@ -2452,7 +2454,7 @@ mod tests {
             r#"{{"error":{{"code":403,"message":"x","errors":[{{"domain":"global","reason":"{reason}"}}]}}}}"#
         );
         let error = crate::error::Error::response_from_parts(
-            crate::error::GmailService::GmailApi,
+            crate::error::GmailService::PeopleApi,
             403,
             crate::error::GmailResponseHeaders::default(),
             bytes::Bytes::copy_from_slice(body.as_bytes()),
@@ -2605,7 +2607,7 @@ mod tests {
         // (warmup) or propagates (paginated query) rather than swallowing.
         let body = r#"{"error":{"code":429,"message":"x","errors":[{"domain":"usageLimits","reason":"rateLimitExceeded"}]}}"#;
         let error = crate::error::Error::response_from_parts(
-            crate::error::GmailService::GmailApi,
+            crate::error::GmailService::PeopleApi,
             429,
             crate::error::GmailResponseHeaders::default(),
             bytes::Bytes::copy_from_slice(body.as_bytes()),

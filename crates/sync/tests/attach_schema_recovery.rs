@@ -2750,7 +2750,7 @@ async fn three_failed_reopens_terminate_and_pause_the_account() {
             match changes.recv().await {
                 Ok(event) => {
                     if let SyncEvent::Terminated(err) = event.event.as_ref() {
-                        break (event.scope.clone(), err.clone());
+                        break (event.scope, err.clone());
                     }
                 }
                 Err(RecvError::Closed) => panic!("the change stream closed before Terminated"),
@@ -2764,8 +2764,8 @@ async fn three_failed_reopens_terminate_and_pause_the_account() {
 
     assert_eq!(
         scope,
-        CursorScope::Account,
-        "an exhausted account-wide budget terminates the account scope"
+        bifrost_sync::EventScope::Account,
+        "an exhausted account-wide budget terminates the attachment"
     );
     let expected = unsupported(bifrost_types::AccountOperation::Discover);
     assert_eq!(
@@ -3126,7 +3126,7 @@ async fn a_deferred_inventory_that_raises_schema_incompatible_is_established_aft
                 engine
                     .ack_checkpoint(
                         &id,
-                        event.scope.clone(),
+                        event.scope.cursor().expect("cursor event").clone(),
                         checkpoint,
                         event.publication.clone(),
                     )

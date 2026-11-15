@@ -13,7 +13,6 @@ use crate::{
     },
 };
 use futures::{Stream, StreamExt};
-use std::collections::HashMap;
 
 /// Flattens one decoded state-lane payload into the notifications it
 /// actually carries.
@@ -69,19 +68,13 @@ use std::collections::HashMap;
 /// "no changed type" rather than "reconcile everything". Like an alert it is
 /// token-free, so it is emitted BEFORE the merged state change.
 fn flatten_push_object(object: PushObject, id: Option<&str>) -> Vec<PushNotification> {
+    let block = object.decompose();
     let mut notifications = Vec::new();
-    let mut merged: HashMap<String, HashMap<DataType, String>> = HashMap::new();
-    let mut saw_state_change = false;
-    let mut pending = vec![object];
-
-    while let Some(object) = pending.pop() {
+    // With neither `mail` nor `calendars` enabled no token-free object exists,
+    // so the loop body only holds the unreachable arm.
+    #[allow(clippy::never_loop)]
+    for object in block.notifications {
         match object {
-            PushObject::StateChange { changed, .. } => {
-                saw_state_change = true;
-                for (account_id, types) in changed {
-                    merged.entry(account_id).or_default().extend(types);
-                }
-            }
             #[cfg(feature = "calendars")]
             PushObject::CalendarAlert(alert) => {
                 notifications.push(PushNotification::CalendarAlert(alert));
@@ -90,23 +83,14 @@ fn flatten_push_object(object: PushObject, id: Option<&str>) -> Vec<PushNotifica
             PushObject::EmailPush { account_id, email } => {
                 notifications.push(PushNotification::EmailPush { account_id, email });
             }
-            PushObject::Group { entries } => pending.extend(entries.into_iter().rev()),
-            // Nothing is dropped here. With both `mail` and `calendars` on,
-            // every `PushObject` variant already has a real arm above and this
-            // one is genuinely unreachable, hence the lint allowance. It exists
-            // only for feature-off builds, where the cfg'd arms above vanish and
-            // the corresponding variants vanish with them, leaving the match
-            // non-exhaustive without a catch-all. Deleting it breaks those
-            // builds; reading it as silent loss is a misreading.
-            #[allow(unreachable_patterns)]
-            _ => {}
+            // decompose removes groups and state changes from this lane.
+            _ => unreachable!("state and groups are decomposed separately"),
         }
     }
-
-    if saw_state_change {
+    if let Some(state) = block.state {
         notifications.push(PushNotification::StateChange(Changes::new(
             id.map(str::to_owned),
-            merged,
+            state.changed,
         )));
     }
 

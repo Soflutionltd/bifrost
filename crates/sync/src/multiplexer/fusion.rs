@@ -28,7 +28,7 @@ use crate::cursor::CursorRegistry;
 use crate::error::Error;
 use crate::inventory_walk::{InventoryWalk, WalkDecision};
 
-use super::{ChangeDelivery, MultiplexerEvent};
+use super::{ChangeDelivery, EventScope, MultiplexerEvent};
 
 /// Outcome of an inventory fusion pass.
 #[derive(Debug, Clone)]
@@ -224,7 +224,7 @@ impl InventoryFusion {
                         );
                         if let Some(tx) = &changes_tx {
                             let _ = tx.sender().send(MultiplexerEvent {
-                                scope: scope.clone(),
+                                scope: EventScope::Cursor(scope.clone()),
                                 event: Arc::new(SyncEvent::Terminated(error.clone())),
                                 checkpoint: None,
                                 publication: None,
@@ -304,7 +304,7 @@ impl InventoryFusion {
                             None
                         };
                         let me = MultiplexerEvent {
-                            scope: scope.clone(),
+                            scope: EventScope::Cursor(scope.clone()),
                             event: Arc::new(SyncEvent::Done(Some(cp.clone()))),
                             checkpoint: Some(cp.clone()),
                             publication: publication.clone(),
@@ -328,7 +328,7 @@ impl InventoryFusion {
                 bifrost_types::InventoryEvent::Terminated(err) => {
                     if let Some(tx) = &changes_tx {
                         let me = MultiplexerEvent {
-                            scope: scope.clone(),
+                            scope: EventScope::Cursor(scope.clone()),
                             event: Arc::new(SyncEvent::Terminated(err.clone())),
                             checkpoint: None,
                             publication: None,
@@ -352,7 +352,7 @@ impl InventoryFusion {
                         );
                         if let Some(tx) = &changes_tx {
                             let _ = tx.sender().send(MultiplexerEvent {
-                                scope: scope.clone(),
+                                scope: EventScope::Cursor(scope.clone()),
                                 event: Arc::new(SyncEvent::Terminated(error.clone())),
                                 checkpoint: None,
                                 publication: None,
@@ -421,7 +421,7 @@ impl InventoryFusion {
                 bifrost_types::InventoryEvent::Warning(warning) => {
                     if let Some(tx) = &changes_tx {
                         let me = MultiplexerEvent {
-                            scope: scope.clone(),
+                            scope: EventScope::Cursor(scope.clone()),
                             event: Arc::new(SyncEvent::Warning(warning)),
                             checkpoint: None,
                             publication: None,
@@ -438,7 +438,7 @@ impl InventoryFusion {
         // surfaced, the same way the backfill runner surfaces it.
         if let Some(tx) = &changes_tx {
             let _ = tx.sender().send(MultiplexerEvent {
-                scope: scope.clone(),
+                scope: EventScope::Cursor(scope.clone()),
                 event: Arc::new(SyncEvent::Warning(
                     crate::inventory_walk::unannounced_end_warning(),
                 )),
@@ -452,7 +452,7 @@ impl InventoryFusion {
     fn warn_invalidated(scope: &CursorScope, delivery: &Option<Arc<ChangeDelivery>>) {
         if let Some(tx) = delivery {
             let _ = tx.sender().send(MultiplexerEvent {
-                scope: scope.clone(),
+                scope: EventScope::Cursor(scope.clone()),
                 event: Arc::new(SyncEvent::Warning(bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::Other,
                     "inventory walk superseded by a reset or deletion of its scope",
@@ -577,7 +577,7 @@ impl InventoryFusion {
             },
         );
         let _ = tx.sender().send(MultiplexerEvent {
-            scope: scope.clone(),
+            scope: EventScope::Cursor(scope.clone()),
             event: Arc::new(SyncEvent::Warning(warning)),
             checkpoint: None,
             publication: None,
@@ -617,7 +617,7 @@ impl InventoryFusion {
             Ok(removals) => removals,
             Err(error) => {
                 let _ = tx.sender().send(MultiplexerEvent {
-                    scope: scope.clone(),
+                    scope: EventScope::Cursor(scope.clone()),
                     event: Arc::new(SyncEvent::Terminated(error.clone())),
                     checkpoint: None,
                     publication: None,
@@ -662,7 +662,7 @@ impl InventoryFusion {
             _ => None,
         };
         let me = MultiplexerEvent {
-            scope: scope.clone(),
+            scope: EventScope::Cursor(scope.clone()),
             event: Arc::new(SyncEvent::Batch(synthetic)),
             checkpoint,
             publication: publication.clone(),
@@ -747,7 +747,7 @@ fn forward_resume_contract_failure(
 ) -> FusionOutcome {
     if let Some(tx) = delivery {
         let _ = tx.sender().send(MultiplexerEvent {
-            scope: scope.clone(),
+            scope: EventScope::Cursor(scope.clone()),
             event: Arc::new(SyncEvent::Terminated(error.clone())),
             checkpoint: None,
             publication: None,
@@ -992,7 +992,7 @@ mod tests {
             FusionOutcome::Invalidated
         ));
         let event = rx.try_recv().expect("warning");
-        assert_eq!(event.scope, CursorScope::Account);
+        assert_eq!(event.scope, EventScope::Cursor(CursorScope::Account));
         assert!(matches!(event.event.as_ref(), SyncEvent::Warning(_)));
         assert!(rx.try_recv().is_err());
     }
@@ -1185,7 +1185,7 @@ mod tests {
             Some(&bifrost_types::ErrorScope::Cursor(scope.clone()))
         );
         let event = receiver.try_recv().expect("termination forwarded");
-        assert_eq!(event.scope, scope.clone());
+        assert_eq!(event.scope, EventScope::Cursor(scope.clone()));
         let SyncEvent::Terminated(forwarded) = event.event.as_ref() else {
             panic!("the forwarded event must be terminal")
         };

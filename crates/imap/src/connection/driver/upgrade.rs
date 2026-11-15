@@ -364,6 +364,7 @@ pub(super) async fn logout_best_effort(
     let tag = tag_gen.next();
     // LOGOUT is a trivial command with no literals; write raw bytes.
     let logout_line = format!("{tag} LOGOUT\r\n");
+    state.arm_effect(&Command::Logout, &tag);
     wire_reader.write_all(logout_line.as_bytes()).await?;
 
     // Read responses until the tagged OK or an error. Apply side

@@ -7,9 +7,7 @@
 
 use std::collections::HashMap;
 
-use bifrost_types::{
-    AccountError, AccountOperation, CursorScope, ErrorScope, ObjectType, SubscriptionHandle,
-};
+use bifrost_types::{AccountError, AccountOperation, CursorScope, ErrorScope, SubscriptionHandle};
 
 use crate::account::GraphAccount;
 use crate::account::graph_error::{GraphErrorContext, into_account_error};
@@ -137,7 +135,11 @@ pub(crate) struct GraphSubscriptionState {
 /// `run_subscribe`.
 pub(super) async fn subscribe_graph(
     account: GraphAccount,
-    eligible: Vec<(bifrost_types::BatchItemId, CursorScope)>,
+    eligible: Vec<(
+        bifrost_types::BatchItemId,
+        CursorScope,
+        crate::account::scope::GraphScope,
+    )>,
     mut outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
     expected: &[bifrost_types::BatchItemId],
 ) -> Result<ArmOutcome, AccountError> {
@@ -151,8 +153,8 @@ pub(super) async fn subscribe_graph(
     // live subscription.
     let mut grouped: HashMap<String, Vec<(bifrost_types::BatchItemId, CursorScope)>> =
         HashMap::new();
-    for (item, scope) in eligible {
-        match resource_for_scope(&account, &scope) {
+    for (item, scope, parsed) in eligible {
+        match parsed.subscription_resource(&account) {
             Ok(Some(resource)) => {
                 grouped.entry(resource).or_default().push((item, scope));
             }
@@ -705,50 +707,13 @@ pub(super) fn remove_subscription_from_groups(
     remove_group
 }
 
+#[cfg(test)]
 pub(super) fn resource_for_scope(
     account: &GraphAccount,
     scope: &CursorScope,
 ) -> Result<Option<String>, crate::error::GraphError> {
-    // Route the resource through the scope's owning client (primary `/me`
-    // or a shared mailbox's `/users/{owner}`) and use the *native* folder
-    // id in the path. A foreign scope carries the owning mailbox inside the
-    // `FolderId`; percent-encoding that raw foreign id into the URL (the
-    // old behavior) produced a `/me/mailFolders/{owner%1Ffolder}/...`
-    // resource Graph cannot resolve.
-    let prefix = account.client_for_scope(scope)?.api_path_prefix();
-    match scope {
-        CursorScope::FolderType { folder, ty } => match ty {
-            ObjectType::Email => {
-                let native = crate::account::foreign::parse_folder(folder)
-                    .native_id()
-                    .to_string();
-                let encoded = bifrost_net::url::encode_path_component(&native);
-                Ok(Some(format!("{prefix}/mailFolders/{encoded}/messages")))
-            }
-            ObjectType::Event | ObjectType::CalendarEvent => {
-                // The scope's folder is the calendar id - the same id
-                // `inventory.rs` builds `/calendars/{id}/calendarView/delta`
-                // from. Discarding it and subscribing to `{prefix}/events`
-                // subscribes to the *default* calendar for every calendar
-                // scope: secondary calendars would never see a notification
-                // while the engine believed them push-covered, and the
-                // grouping in `subscribe_graph` (keyed on this string) would
-                // collapse every calendar scope into one entry.
-                let native = crate::account::foreign::parse_folder(folder)
-                    .native_id()
-                    .to_string();
-                let encoded = bifrost_net::url::encode_path_component(&native);
-                Ok(Some(format!("{prefix}/calendars/{encoded}/events")))
-            }
-            ObjectType::Contact => {
-                let native = crate::account::foreign::parse_folder(folder)
-                    .native_id()
-                    .to_string();
-                let encoded = bifrost_net::url::encode_path_component(&native);
-                Ok(Some(format!("{prefix}/contactFolders/{encoded}/contacts")))
-            }
-            _ => Ok(None),
-        },
-        _ => Ok(None),
+    match crate::account::scope::GraphScope::parse(scope) {
+        Ok(parsed) => parsed.subscription_resource(account),
+        Err(_) => Ok(None),
     }
 }

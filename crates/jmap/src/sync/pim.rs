@@ -118,9 +118,10 @@ pub(crate) fn set_keyword<T: HttpTransport>(
     value: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let owner = target_owner(&target);
         let ids = resolve_target(&mail, target, AccountOperation::SetKeyword).await?;
         let batch_size = super::capabilities::max_objects_in_set(&mail.client().session());
-        let mut progress = SetProgress::default();
+        let mut progress = SetProgress::default().with_owner(owner);
         for chunk in ids.chunks(batch_size) {
             let keyword_for_set = keyword.clone();
             let ids_for_set = chunk.to_vec();
@@ -222,8 +223,18 @@ fn resolve_foreign_headers(
     }
 }
 
+fn target_owner(target: &MutationTarget) -> Option<String> {
+    let id = match target {
+        MutationTarget::Message(id) => &id.0,
+        MutationTarget::Thread(id) => &id.0,
+        _ => return None,
+    };
+    super::foreign::owner_of(id).map(str::to_owned)
+}
+
 #[derive(Default)]
 struct SetProgress {
+    owner: Option<String>,
     committed: Vec<EmailId>,
     failed: Vec<FailedSet>,
     after_chunk: Option<AccountError>,
@@ -234,6 +245,10 @@ struct FailedSet {
     error: AccountError,
 }
 impl SetProgress {
+    fn with_owner(mut self, owner: Option<String>) -> Self {
+        self.owner = owner;
+        self
+    }
     fn is_failed(&self) -> bool {
         !self.failed.is_empty() || self.after_chunk.is_some()
     }
@@ -260,25 +275,51 @@ impl SetProgress {
         op: AccountOperation,
         guarded: bool,
     ) {
-        match result {
-            Ok(_) => self.committed.push(id.clone()),
-            Err(error) => {
-                let missing = matches!(error, crate::Error::SetIdUnanswered(_));
-                let error = super::error::set_answer_error(op, "Email/set", guarded)(error);
+        let missing = matches!(&result, Err(crate::Error::SetIdUnanswered(_)));
+        let outcome = super::mail_set::classify_set_response(
+            result.map(|_| ()),
+            ObjectId(self.owner.as_deref().map_or_else(
+                || id.as_str().to_owned(),
+                |owner| super::foreign::encode_object(owner, id.as_str()),
+            )),
+            op,
+            guarded,
+        );
+        match outcome {
+            bifrost_types::ItemOutcome::Succeeded(success) => {
+                if matches!(success.output, bifrost_types::MutationSuccess::Applied) {
+                    self.committed.push(id.clone());
+                }
+            }
+            bifrost_types::ItemOutcome::Failed(failure) => {
                 let application = if missing {
                     Application::Uncertain
                 } else {
-                    Application::from_leaf(&error)
+                    Application::from_leaf(&failure.error)
                 };
                 self.failed.push(FailedSet {
                     ids: vec![id.clone()],
                     application,
-                    error,
+                    error: failure.error,
+                });
+            }
+            // `classify_set_response` / `classify_set_item` never produce
+            // this lane today. Should they start to, the honest record is
+            // an uncertain application, never a panic in a user's write.
+            bifrost_types::ItemOutcome::Uncertain(uncertain) => {
+                self.failed.push(FailedSet {
+                    ids: vec![id.clone()],
+                    application: Application::Uncertain,
+                    error: uncertain.error,
                 });
             }
         }
     }
+
     fn finish(mut self, effect: StepEffect) -> Result<(), AccountError> {
+        // Progress is collected in wire ids, but an Outlook shared-mailbox user
+        // can correlate only the owner-qualified identities returned by reads.
+        let owner = self.owner.as_deref();
         let targets = |ids: &[EmailId]| {
             StepTargets::complete(
                 ids.iter()
@@ -286,7 +327,10 @@ impl SetProgress {
                         TargetRef::new(
                             TargetRole::Subject,
                             ErrorScope::Message {
-                                id: ObjectId(id.as_str().to_owned()),
+                                id: ObjectId(owner.map_or_else(
+                                    || id.as_str().to_owned(),
+                                    |owner| super::foreign::encode_object(owner, id.as_str()),
+                                )),
                             },
                         )
                     })
@@ -315,7 +359,7 @@ impl SetProgress {
         };
         let mut record = PartialCommitBuilder::new(primary);
         for id in self.committed {
-            record.committed(effect, email_targets(Some(&id)), StepReplay::Repeatable);
+            record.committed(effect, targets(&[id]), StepReplay::Repeatable);
         }
         for failure in self.failed {
             record.failed_sibling(
@@ -1309,7 +1353,7 @@ pub(crate) fn draft_send<T: HttpTransport>(
         );
         if implicit_state.is_some() {
             state_cache::observe_set(&email_states, &account_id, implicit_state).await;
-        } else if let Ok(fresh) = super::mutation::probe_email_state(&mail).await {
+        } else if let Ok(fresh) = super::mail_set::probe_email_state(&mail).await {
             state_cache::advance(&email_states, &account_id, prior_state.as_deref(), fresh).await;
         }
         let id = ObjectId(draft_id.into_string());
@@ -2376,6 +2420,7 @@ pub(crate) fn delete_thread<T: HttpTransport>(
     current: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let owner = super::foreign::owner_of(&thread.0).map(str::to_owned);
         let trash_mailbox =
             role_mailbox(&mail, FolderRole::Trash, AccountOperation::BulkDestroy).await?;
         // `role_mailbox` ran against the account the thread id routed to,
@@ -2429,6 +2474,7 @@ pub(crate) fn delete_thread<T: HttpTransport>(
                 &mail,
                 &email_states,
                 &account_id,
+                owner,
                 ids,
                 read_state,
                 AccountOperation::BulkDestroy,
@@ -2549,12 +2595,13 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
     mail: &MailAccount<T>,
     email_states: &StateMap,
     account_id: &str,
+    owner: Option<String>,
     ids: Vec<EmailId>,
     read_state: Option<String>,
     op: AccountOperation,
 ) -> Result<SetProgress, AccountError> {
     if ids.is_empty() {
-        return Ok(SetProgress::default());
+        return Ok(SetProgress::default().with_owner(owner));
     }
     let read_state = read_state.ok_or_else(|| {
         to_acct_err(op)(crate::Error::NotParsable(
@@ -2563,12 +2610,21 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
     })?;
     let batch_size = super::capabilities::max_objects_in_set(&mail.client().session());
     let mut if_in_state = read_state;
-    let mut progress = SetProgress::default();
+    // The owner must be known before the first item is classified: each
+    // failed id's own error scope is minted in `item`, not at `finish`.
+    let mut progress = SetProgress::default().with_owner(owner);
     for (index, chunk) in ids.chunks(batch_size).enumerate() {
-        let set = EmailSet::new()
-            .if_in_state(if_in_state.clone())
-            .destroy(chunk.iter().cloned());
-        let mut response = match mail.call(set).await {
+        let set = EmailSet::new().destroy(chunk.iter().cloned());
+        let mut set = Some(set);
+        let mut response = match super::mail_set::execute(
+            mail,
+            email_states,
+            account_id,
+            super::mail_set::Guard::Exact(&if_in_state),
+            || Ok(set.take().expect("exact guarded set is sent once")),
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
                 progress.call_failure(chunk, to_acct_err(op)(error));
@@ -2579,12 +2635,6 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
             .new_state()
             .filter(|state| !state.is_empty())
             .map(str::to_string);
-        state_cache::observe_set(
-            email_states,
-            account_id,
-            state_cache::set_transition(response.old_state(), response.new_state()),
-        )
-        .await;
         for id in chunk {
             progress.item(id, response.destroyed(id), op, true);
         }
@@ -2652,7 +2702,8 @@ async fn patch_mailbox_membership_of<T: HttpTransport>(
     // qualification the selected account does not use.
     let mailbox = MailboxId::new(wire_id_for_mail(&container.0, mail.id_str()));
     let batch_size = super::capabilities::max_objects_in_set(&mail.client().session());
-    let mut progress = SetProgress::default();
+    let mut progress = SetProgress::default()
+        .with_owner(super::foreign::owner_of(&container.0).map(str::to_owned));
     for chunk in ids.chunks(batch_size) {
         let ids_for_set = chunk.to_vec();
         let mailbox_for_set = mailbox.clone();
@@ -2805,9 +2856,17 @@ async fn destroy_emails<T: HttpTransport>(
     })
     .await?;
     for id in &ids_vec {
-        response
-            .destroyed(id)
-            .map_err(super::error::set_answer_error(op, "Email/set", false))?;
+        match super::mail_set::classify_set_response(
+            response.destroyed(id),
+            ObjectId(id.as_str().to_owned()),
+            op,
+            false,
+        ) {
+            bifrost_types::ItemOutcome::Succeeded(_) => {}
+            bifrost_types::ItemOutcome::Failed(failure) => return Err(failure.error),
+            // Not produced today; never report an uncertain destroy as done.
+            bifrost_types::ItemOutcome::Uncertain(uncertain) => return Err(uncertain.error),
+        }
     }
     Ok(())
 }
@@ -2822,18 +2881,16 @@ async fn send_email_set<T: HttpTransport, F>(
 where
     F: FnOnce() -> EmailSet,
 {
-    // These writes are narrow field/path patches or destroys by explicit id.
-    // An account-wide `ifInState` rejects them after an unrelated Email
-    // change, while a patch preserves fields it does not name. Keep the cache
-    // advance compare-and-swap guarded without probing before the write.
-    let response = mail.call(make_set()).await.map_err(to_acct_err(op))?;
-    state_cache::observe_set(
+    let mut set = Some(make_set());
+    super::mail_set::execute(
+        mail,
         email_states,
         account_id,
-        state_cache::set_transition(response.old_state(), response.new_state()),
+        super::mail_set::Guard::Unconditional,
+        || Ok(set.take().expect("unconditional set is sent once")),
     )
-    .await;
-    Ok(response)
+    .await
+    .map_err(to_acct_err(op))
 }
 
 async fn role_mailbox<T: HttpTransport>(
@@ -8862,6 +8919,56 @@ mod tests {
             matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.reason == bifrost_types::ReconcileReason::PartialCommit && a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget, bifrost_types::ReconcileAction::ObserveOnly])
         );
     }
+    #[test]
+    fn shared_set_progress_qualifies_primary_committed_and_failed_targets() {
+        let mut progress = SetProgress::default().with_owner(Some("shared".to_string()));
+        progress.item(
+            &EmailId::new("applied"),
+            Ok(()),
+            AccountOperation::SetKeyword,
+            false,
+        );
+        for id in ["missing-one", "missing-two"] {
+            progress.item(
+                &EmailId::new(id),
+                Err::<(), _>(crate::Error::SetIdUnanswered(id.to_owned())),
+                AccountOperation::SetKeyword,
+                false,
+            );
+        }
+        let error = progress.finish(StepEffect::Updated).unwrap_err();
+        let record = error.partial_commit().unwrap();
+        let target = |id| ErrorScope::Message {
+            id: ObjectId(super::super::foreign::encode_object("shared", id)),
+        };
+        assert_eq!(
+            record.primary().targets.refs[0].scope,
+            target("missing-one")
+        );
+        assert_eq!(record.steps().len(), 2);
+        assert_eq!(record.steps()[0].targets().refs[0].scope, target("applied"));
+        assert_eq!(
+            record.steps()[1].targets().refs[0].scope,
+            target("missing-two")
+        );
+    }
+
+    #[test]
+    fn absent_keyword_target_is_skipped_without_committed_write_evidence() {
+        let mut progress = SetProgress::default();
+        progress.item(
+            &EmailId::new("gone"),
+            Err::<(), _>(crate::Error::Set(
+                serde_json::from_str(r#"{"type":"notFound"}"#).unwrap(),
+            )),
+            AccountOperation::SetKeyword,
+            false,
+        );
+        assert!(!progress.is_failed());
+        assert!(progress.committed.is_empty());
+        assert!(progress.finish(StepEffect::Updated).is_ok());
+    }
+
     #[tokio::test]
     async fn partial_commit_missing_new_state_after_destroy_is_terminal() {
         let mut transport = DeleteThreadTransport::new();
@@ -8880,6 +8987,7 @@ mod tests {
             &mail,
             &send_state_map(),
             "primary",
+            None,
             vec![
                 EmailId::new("one"),
                 EmailId::new("two"),
@@ -8943,6 +9051,7 @@ mod tests {
             &mail,
             &send_state_map(),
             "primary",
+            None,
             vec![EmailId::new("a")],
             Some("state".into()),
             AccountOperation::BulkDestroy,
@@ -8966,6 +9075,7 @@ mod tests {
             &mail,
             &send_state_map(),
             "primary",
+            None,
             vec![EmailId::new("a"), EmailId::new("b"), EmailId::new("c")],
             Some("state".into()),
             AccountOperation::BulkDestroy,

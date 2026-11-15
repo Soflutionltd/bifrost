@@ -275,15 +275,14 @@ pub(super) async fn wait_for_continuation(
         }
 
         // Our own tagged OK before the `+`: the command did not execute, so
-        // the effects armed for it (`in_auth`, `in_select`, the NOTIFY
-        // registration) must not complete on this OK. The pipeline router
-        // withholds them the same way; a NO/BAD keeps them.
+        // its armed effect must not complete on this OK. The pipeline router
+        // withholds it the same way; a NO/BAD keeps it.
         if matches!(
             resp,
             crate::types::Response::Tagged(ref t)
                 if t.tag == own_tag && t.status == StatusKind::Ok
         ) {
-            state.disarm_pending_effects();
+            state.disarm_effect(own_tag);
         }
         let digest = state.apply_side_effects(&resp);
         match resp {

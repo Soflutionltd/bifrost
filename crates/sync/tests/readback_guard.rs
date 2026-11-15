@@ -3724,7 +3724,11 @@ async fn a_reasserted_omission_is_read_back_again() {
         &["a"],
         vec![
             round(&["a"], ItemScript::Uncertain(retryable_transport())),
-            RoundScript::default(),
+            // A normally-ended stream that leaves a target unanswered is now
+            // an AccountContract violation, so the reasserted round answers
+            // the target with an uncertain outcome: the write stays unknown
+            // and must be read back again, which is what this test pins.
+            round(&["a"], ItemScript::Uncertain(retryable_transport())),
             round(&["a"], ItemScript::Applied),
         ],
     );

@@ -229,7 +229,7 @@ pub(super) fn route_pipeline_response(
     );
 
     if early_own_ok && let crate::types::Response::Tagged(ref t) = resp {
-        state.disarm_notify(&t.tag);
+        state.disarm_effect(&t.tag);
     }
 
     let digest = state.apply_side_effects(&resp);
@@ -762,7 +762,7 @@ async fn run_pipeline_batch(
         // flushed once. Which commands a partial write carried is unknown,
         // so any socket progress counts every command as possibly sent.
         for (command, tag) in commands.iter().zip(&tags) {
-            state.arm_notify(command, tag);
+            state.arm_effect(command, tag);
         }
         let start = wire_reader.written();
         let chunks: Vec<&bytes::Bytes> = wires
@@ -786,7 +786,7 @@ async fn run_pipeline_batch(
         // the batch's routing so earlier commands' responses read during a
         // continuation wait reach their own consumers.
         for (i, wire) in wires.iter().enumerate() {
-            state.arm_notify(&commands[i], &tags[i]);
+            state.arm_effect(&commands[i], &tags[i]);
             let start = wire_reader.written();
             let mut routing = PipelineRouting {
                 sending: Some(i),

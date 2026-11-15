@@ -244,7 +244,9 @@ fn unauthenticate_ok_transitions_to_not_authenticated() {
     assert_eq!(state.enabled().len(), 1);
 
     // Mark UNAUTHENTICATE in flight.
-    state.set_in_unauthenticate(true);
+    state
+        .pending
+        .insert("A1".into(), PendingEffect::Unauthenticate);
 
     // Tagged OK -> NotAuthenticated, all per-user state cleared.
     let tagged_ok = Response::Tagged(TaggedResponse {
@@ -283,7 +285,10 @@ fn unauthenticate_ok_from_selected_clears_mailbox() {
     state.apply_greeting(&greeting).unwrap();
 
     // Simulate SELECT -> Selected state.
-    state.set_in_select(Some(MailboxName::new("INBOX").unwrap()));
+    state.pending.insert(
+        "A1".into(),
+        PendingEffect::Select(MailboxName::new("INBOX").unwrap()),
+    );
     let select_ok = Response::Tagged(TaggedResponse {
         tag: "A1".into(),
         status: StatusKind::Ok,
@@ -294,7 +299,9 @@ fn unauthenticate_ok_from_selected_clears_mailbox() {
     assert_eq!(state.session_state(), SessionState::Selected);
 
     // Mark UNAUTHENTICATE in flight.
-    state.set_in_unauthenticate(true);
+    state
+        .pending
+        .insert("A2".into(), PendingEffect::Unauthenticate);
 
     // Tagged OK -> NotAuthenticated, selected mailbox cleared.
     let tagged_ok = Response::Tagged(TaggedResponse {
@@ -346,7 +353,10 @@ fn enable_is_refused_once_a_mailbox_has_been_selected_in_the_session() {
         .unwrap();
     assert!(live_state_refusal(&state, CommandKind::Enable).is_none());
 
-    state.set_in_select(Some(MailboxName::new("Missing").unwrap()));
+    state.pending.insert(
+        "A1".into(),
+        PendingEffect::Select(MailboxName::new("Missing").unwrap()),
+    );
     let _ = state.apply_side_effects(&tagged("A1", StatusKind::No));
     assert!(
         !state.mailbox_selected(),
@@ -354,9 +364,12 @@ fn enable_is_refused_once_a_mailbox_has_been_selected_in_the_session() {
     );
     assert!(live_state_refusal(&state, CommandKind::Enable).is_none());
 
-    state.set_in_select(Some(MailboxName::new("INBOX").unwrap()));
+    state.pending.insert(
+        "A2".into(),
+        PendingEffect::Select(MailboxName::new("INBOX").unwrap()),
+    );
     let _ = state.apply_side_effects(&tagged("A2", StatusKind::Ok));
-    state.set_in_close(true);
+    state.pending.insert("A3".into(), PendingEffect::Close);
     let _ = state.apply_side_effects(&tagged("A3", StatusKind::Ok));
     assert_eq!(state.session_state(), SessionState::Authenticated);
     assert!(
@@ -371,7 +384,9 @@ fn enable_is_refused_once_a_mailbox_has_been_selected_in_the_session() {
         "the history gates ENABLE only"
     );
 
-    state.set_in_unauthenticate(true);
+    state
+        .pending
+        .insert("A4".into(), PendingEffect::Unauthenticate);
     let _ = state.apply_side_effects(&tagged("A4", StatusKind::Ok));
     assert!(
         !state.mailbox_selected(),
@@ -395,7 +410,9 @@ fn unauthenticate_no_preserves_state() {
     state.apply_greeting(&greeting).unwrap();
     assert_eq!(state.session_state(), SessionState::Authenticated);
 
-    state.set_in_unauthenticate(true);
+    state
+        .pending
+        .insert("A1".into(), PendingEffect::Unauthenticate);
 
     let tagged_no = Response::Tagged(TaggedResponse {
         tag: "A1".into(),
@@ -424,7 +441,9 @@ fn unauthenticate_bad_preserves_state() {
     state.apply_greeting(&greeting).unwrap();
     assert_eq!(state.session_state(), SessionState::Authenticated);
 
-    state.set_in_unauthenticate(true);
+    state
+        .pending
+        .insert("A1".into(), PendingEffect::Unauthenticate);
 
     let tagged_bad = Response::Tagged(TaggedResponse {
         tag: "A1".into(),
@@ -448,7 +467,7 @@ fn refused_logout_does_not_complete_on_a_later_commands_ok() {
                 text: "ready".into(),
             })
             .unwrap();
-        state.set_in_logout("A1".into());
+        state.pending.insert("A1".into(), PendingEffect::Logout);
         let _ = state.apply_side_effects(&Response::Tagged(TaggedResponse {
             tag: "A1".into(),
             status: refusal,
@@ -462,7 +481,12 @@ fn refused_logout_does_not_complete_on_a_later_commands_ok() {
             text: "NOOP completed".into(),
         }));
         assert_eq!(state.session_state(), SessionState::Authenticated);
-        assert!(state.in_logout.is_none());
+        assert!(
+            !state
+                .pending
+                .values()
+                .any(|effect| matches!(effect, PendingEffect::Logout))
+        );
     }
 }
 
@@ -514,28 +538,40 @@ fn snapshot_tracks_selected_mailbox_identity() {
             text: "done".into(),
         })
     };
-    state.set_in_select(Some(inbox.clone()));
+    state
+        .pending
+        .insert("A1".into(), PendingEffect::Select(inbox.clone()));
     let _ = state.apply_side_effects(&reply(StatusKind::Ok));
     assert_eq!(state.snapshot().selected, Some(inbox.clone()));
 
-    state.set_in_select(Some(archive.clone()));
+    state
+        .pending
+        .insert("A1".into(), PendingEffect::Select(archive.clone()));
     let _ = state.apply_side_effects(&reply(StatusKind::Bad));
     assert_eq!(state.snapshot().selected, Some(inbox));
 
-    state.set_in_select(Some(archive.clone()));
+    state
+        .pending
+        .insert("A1".into(), PendingEffect::Select(archive.clone()));
     let _ = state.apply_side_effects(&reply(StatusKind::No));
     assert_eq!(state.snapshot().selected, None);
 
-    state.set_in_select(Some(archive.clone()));
+    state
+        .pending
+        .insert("A1".into(), PendingEffect::Select(archive.clone()));
     let _ = state.apply_side_effects(&reply(StatusKind::Ok));
     assert_eq!(state.snapshot().selected, Some(archive.clone()));
-    state.set_in_close(true);
+    state.pending.insert("A1".into(), PendingEffect::Close);
     let _ = state.apply_side_effects(&reply(StatusKind::Ok));
     assert_eq!(state.snapshot().selected, None);
 
-    state.set_in_select(Some(archive));
+    state
+        .pending
+        .insert("A1".into(), PendingEffect::Select(archive));
     let _ = state.apply_side_effects(&reply(StatusKind::Ok));
-    state.set_in_unauthenticate(true);
+    state
+        .pending
+        .insert("A1".into(), PendingEffect::Unauthenticate);
     let _ = state.apply_side_effects(&reply(StatusKind::Ok));
     assert_eq!(state.snapshot().selected, None);
 }
@@ -551,7 +587,7 @@ fn foreign_tagged_responses_do_not_complete_or_disarm_logout() {
                 text: "ready".into(),
             })
             .unwrap();
-        state.set_in_logout("logout".into());
+        state.pending.insert("logout".into(), PendingEffect::Logout);
         let _ = state.apply_side_effects(&Response::Tagged(TaggedResponse {
             tag: "foreign".into(),
             status,
@@ -559,7 +595,10 @@ fn foreign_tagged_responses_do_not_complete_or_disarm_logout() {
             text: "unrelated completion".into(),
         }));
         assert_eq!(state.session_state(), SessionState::Authenticated);
-        assert_eq!(state.in_logout.as_deref(), Some("logout"));
+        assert!(matches!(
+            state.pending.get("logout"),
+            Some(PendingEffect::Logout)
+        ));
         let _ = state.apply_side_effects(&Response::Tagged(TaggedResponse {
             tag: "logout".into(),
             status: StatusKind::Ok,
@@ -567,7 +606,12 @@ fn foreign_tagged_responses_do_not_complete_or_disarm_logout() {
             text: "logout complete".into(),
         }));
         assert_eq!(state.session_state(), SessionState::Logout);
-        assert!(state.in_logout.is_none());
+        assert!(
+            !state
+                .pending
+                .values()
+                .any(|effect| matches!(effect, PendingEffect::Logout))
+        );
     }
 }
 
@@ -583,8 +627,8 @@ fn notify_pending_effects_belong_to_their_own_tags() {
         false,
     ));
     let mut state = ProtocolState::new();
-    state.arm_notify(&command, "N1");
-    state.arm_notify(&Command::NotifyNone, "N2");
+    state.arm_effect(&command, "N1");
+    state.arm_effect(&Command::NotifyNone, "N2");
     // A foreign refusal must not consume either pending registration.
     state.apply_tagged(&TaggedResponse {
         tag: "other".into(),
@@ -601,4 +645,91 @@ fn notify_pending_effects_belong_to_their_own_tags() {
         });
         assert_eq!(state.notify().list, expected);
     }
+}
+
+#[test]
+fn every_pending_effect_survives_foreign_tags_and_is_consumed_by_own_refusals() {
+    use crate::types::Command;
+    for foreign in [StatusKind::Ok, StatusKind::No, StatusKind::Bad] {
+        for refusal in [StatusKind::No, StatusKind::Bad] {
+            for command in [
+                Command::Logout,
+                Command::Authenticate {
+                    mechanism: "PLAIN".into(),
+                    initial_response: None,
+                },
+                Command::Select {
+                    mailbox: MailboxName::new("INBOX").unwrap(),
+                    condstore: false,
+                    qresync: None,
+                },
+                Command::Close,
+                Command::Unauthenticate,
+                Command::NotifyNone,
+            ] {
+                let mut state = ProtocolState::new();
+                state.arm_effect(&command, "own");
+                let mut reply = TaggedResponse {
+                    tag: "foreign".into(),
+                    status: foreign,
+                    code: None,
+                    text: String::new(),
+                };
+                state.apply_tagged(&reply);
+                assert_eq!(state.pending.len(), 1);
+                assert_eq!(state.session_state(), SessionState::NotAuthenticated);
+                reply.tag = "own".into();
+                reply.status = refusal;
+                state.apply_tagged(&reply);
+                assert!(state.pending.is_empty());
+                let state_after_refusal = state.session_state();
+                reply.status = StatusKind::Ok;
+                state.apply_tagged(&reply);
+                assert_eq!(state.session_state(), state_after_refusal);
+            }
+        }
+    }
+}
+
+#[test]
+fn disarming_one_literal_command_preserves_other_armed_effects() {
+    use crate::types::Command;
+
+    let mut state = ProtocolState::new();
+    state.arm_effect(&Command::Close, "first");
+    state.arm_effect(&Command::NotifyNone, "literal");
+    state.disarm_effect("literal");
+    assert!(matches!(
+        state.pending.get("first"),
+        Some(PendingEffect::Close)
+    ));
+    assert!(!state.pending.contains_key("literal"));
+    state.apply_tagged(&TaggedResponse {
+        tag: "first".into(),
+        status: StatusKind::Ok,
+        code: Some(ResponseCode::NotificationOverflow(None)),
+        text: String::new(),
+    });
+    assert_eq!(state.session_state(), SessionState::Authenticated);
+    assert!(state.pending.is_empty());
+}
+
+#[test]
+fn notification_overflow_cancels_only_pending_registrations() {
+    use crate::types::Command;
+
+    let mut state = ProtocolState::new();
+    state.arm_effect(&Command::Close, "close");
+    state.arm_effect(&Command::NotifyNone, "notify");
+    state.apply_tagged(&TaggedResponse {
+        tag: "foreign".into(),
+        status: StatusKind::Ok,
+        code: Some(ResponseCode::NotificationOverflow(None)),
+        text: String::new(),
+    });
+    assert!(matches!(
+        state.pending.get("close"),
+        Some(PendingEffect::Close)
+    ));
+    assert!(!state.pending.contains_key("notify"));
 }

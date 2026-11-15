@@ -579,6 +579,7 @@ impl Consumer for StoreConsumer {
             StoreResult {
                 fetches: self.fetches,
                 status: tagged.status,
+                text: tagged.text,
                 code: tagged.code,
             },
             self.buffered,
@@ -767,6 +768,7 @@ mod store_tests {
             .output
             .expect("tagged NO is a typed STORE result");
         assert_eq!(result.status, StatusKind::No);
+        assert_eq!(result.text, "store rejected");
         assert!(matches!(
             result.code,
             Some(crate::types::ResponseCode::Modified(_))

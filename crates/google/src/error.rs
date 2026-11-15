@@ -31,14 +31,32 @@ impl Display for Base64Encoding {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
+#[allow(clippy::enum_variant_names)] // each variant names the Google API it denotes
 pub(crate) enum GmailService {
     GmailApi,
+    CalendarApi,
+    PeopleApi,
+    DriveApi,
+}
+
+impl From<crate::quota::ApiSurface> for GmailService {
+    fn from(surface: crate::quota::ApiSurface) -> Self {
+        match surface {
+            crate::quota::ApiSurface::Gmail => Self::GmailApi,
+            crate::quota::ApiSurface::Calendar => Self::CalendarApi,
+            crate::quota::ApiSurface::People => Self::PeopleApi,
+            crate::quota::ApiSurface::Drive => Self::DriveApi,
+        }
+    }
 }
 
 impl Display for GmailService {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::GmailApi => f.write_str("Gmail API"),
+            Self::CalendarApi => f.write_str("Calendar API"),
+            Self::PeopleApi => f.write_str("People API"),
+            Self::DriveApi => f.write_str("Drive API"),
         }
     }
 }

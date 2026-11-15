@@ -73,7 +73,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::cursor::DebtLedger;
 use crate::error::Error;
-use crate::multiplexer::{ChangeDelivery, MultiplexerEvent, WriterRequest};
+use crate::multiplexer::{ChangeDelivery, EventScope, MultiplexerEvent, WriterRequest};
 
 /// How many completed attempts a lineage gets before it stops being retried
 /// automatically.
@@ -125,6 +125,31 @@ pub async fn run_repair_pass(
     coverage: &Arc<crate::cursor::PendingCoverage>,
     max_requests: usize,
 ) -> Result<usize, Error> {
+    run_repair_pass_observed(
+        account,
+        account_id,
+        ledger,
+        delivery,
+        writer_tx,
+        coverage,
+        max_requests,
+        None,
+    )
+    .await
+}
+
+/// Engine-managed repairs observe every provider hold before the next pass.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_repair_pass_observed(
+    account: &dyn Account,
+    account_id: &AccountId,
+    ledger: &DebtLedger,
+    delivery: Option<&ChangeDelivery>,
+    writer_tx: &mpsc::Sender<WriterRequest>,
+    coverage: &Arc<crate::cursor::PendingCoverage>,
+    max_requests: usize,
+    observe: Option<&(dyn Fn(&bifrost_types::AccountError) + Sync)>,
+) -> Result<usize, Error> {
     let planned = plan_requests(ledger, coverage, max_requests);
     if planned.is_empty() {
         return Ok(0);
@@ -147,6 +172,9 @@ pub async fn run_repair_pass(
             // requests still outstanding - those fall through to the local
             // deferral below.
             InventoryRepairEvent::Terminated(error) => {
+                if let Some(observe) = observe {
+                    observe(&error);
+                }
                 tracing::warn!(
                     target: "bifrost.sync.repair",
                     account = ?account_id,
@@ -172,6 +200,11 @@ pub async fn run_repair_pass(
             continue;
         };
 
+        if let InventoryRepairOutcome::Deferred { error, .. } = &outcome
+            && let Some(observe) = observe
+        {
+            observe(error);
+        }
         match outcome {
             InventoryRepairOutcome::ObjectRecovered { entry, .. } => {
                 match validate_object_recovery(&planned, &entry) {
@@ -431,7 +464,7 @@ fn publish_recovered(
         checkpoint: None,
     };
     let event = MultiplexerEvent {
-        scope,
+        scope: EventScope::Cursor(scope),
         event: Arc::new(SyncEvent::Batch(batch)),
         checkpoint: None,
         publication: Some(publication.clone()),

@@ -209,6 +209,10 @@ impl Credentials {
 /// particular, `OAuthRefresher` distinguishes terminal credential loss from a
 /// transient refresh failure. Without account integration the original net
 /// error remains available through the low-level error source chain.
+/// Both builds use the direct `Connection` class: an enterprise Outlook user
+/// expects a token endpoint outage to retry, not to blame caller input or ask
+/// for a replacement password. The typed projection still distinguishes actual
+/// credential loss from a transient outage for account-aware recovery.
 pub(super) fn oauth_token_error(error: bifrost_net::Error) -> Error {
     #[cfg(feature = "account-error")]
     let message = format!("failed to read OAuth access token: {error}");
@@ -225,7 +229,7 @@ pub(super) fn oauth_token_error(error: bifrost_net::Error) -> Error {
         None,
     );
     #[cfg(feature = "account-error")]
-    let error = error::invalid_input(message).with_preclassified_account_error(account_error);
+    let error = error::connection(message).with_preclassified_account_error(account_error);
     #[cfg(not(feature = "account-error"))]
     let error = error::connection(error);
     error.with_phase(SmtpCommandPhase::Auth { mechanism: None })
@@ -237,5 +241,25 @@ impl Debug for Credentials {
             Credentials::Password { .. } => f.debug_struct("Credentials::Password").finish(),
             Credentials::OAuth2 { .. } => f.debug_struct("Credentials::OAuth2").finish(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn token_source_failure_has_a_connection_class_in_every_feature_build() {
+        let error = super::oauth_token_error(bifrost_net::Error::RefreshFailed {
+            retry_after: None,
+            source: std::sync::Arc::new(bifrost_net::Error::Cancelled),
+        });
+
+        assert_eq!(
+            error.kind(),
+            &crate::transport::smtp::error::ErrorKind::Connection
+        );
+        assert_eq!(
+            error.phase(),
+            Some(super::SmtpCommandPhase::Auth { mechanism: None })
+        );
     }
 }

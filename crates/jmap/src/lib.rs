@@ -279,6 +279,60 @@ pub(crate) enum PushObject {
     },
 }
 
+/// The untagged state payload shared by WebSocket decoding and push blocks.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct PushStateChange {
+    pub(crate) changed: HashMap<String, HashMap<DataType, String>>,
+    #[serde(rename = "pushState", default)]
+    pub(crate) push_state: Option<String>,
+}
+
+/// One wire block: token-free notifications precede its merged state.
+#[derive(Debug)]
+pub(crate) struct PushBlock {
+    pub(crate) notifications: Vec<PushObject>,
+    pub(crate) state: Option<PushStateChange>,
+}
+
+impl PushObject {
+    pub(crate) fn decompose(self) -> PushBlock {
+        let mut notifications = Vec::new();
+        let mut state: Option<PushStateChange> = None;
+        let mut pending = vec![self];
+        while let Some(object) = pending.pop() {
+            match object {
+                PushObject::StateChange {
+                    changed,
+                    push_state,
+                } => {
+                    let merged = state.get_or_insert_with(|| PushStateChange {
+                        changed: HashMap::new(),
+                        push_state: None,
+                    });
+                    for (account, types) in changed {
+                        merged.changed.entry(account).or_default().extend(types);
+                    }
+                    if push_state.is_some() {
+                        merged.push_state = push_state;
+                    }
+                }
+                PushObject::Group { entries } => pending.extend(entries.into_iter().rev()),
+                // Unreachable when neither `mail` nor `calendars` is enabled:
+                // the enum then has only the two variants matched above.
+                #[allow(unreachable_patterns)]
+                notification => notifications.push(notification),
+            }
+        }
+        // An enterprise user must not lose an alert when processing stops at
+        // a checkpoint. Deliver token-free objects before committing state;
+        // replaying an alert after interruption is preferable to losing it.
+        PushBlock {
+            notifications,
+            state,
+        }
+    }
+}
+
 #[cfg(feature = "calendars")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]

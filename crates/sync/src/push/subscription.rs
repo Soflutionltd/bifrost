@@ -190,17 +190,17 @@ impl SubscriptionRegistry {
         }
     }
 
-    /// The handles of the account's pure orphans: records nobody wants any
-    /// more whose server-side teardown is still unconfirmed.
+    /// The account's pure orphan records, retaining scopes for throttle admission:
+    /// nobody wants them and their server-side teardown is still unconfirmed.
     #[must_use]
-    pub(crate) fn orphans(&self, account: &AccountId) -> Vec<SubscriptionHandle> {
+    pub(crate) fn orphans(&self, account: &AccountId) -> Vec<RegisteredSubscription> {
         self.inner
             .get(account)
             .map(|records| {
                 records
                     .iter()
                     .filter(|record| !record.desired() && record.teardown_unconfirmed())
-                    .map(|record| record.handle.clone())
+                    .cloned()
                     .collect()
             })
             .unwrap_or_default()

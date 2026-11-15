@@ -7,10 +7,7 @@ use serde_json::Value;
 use super::GraphAccount;
 use super::cursor::{CursorError, decode_cursor, encode_cursor};
 use super::graph_error::{GraphErrorContext, cursor_error_to_account_error};
-use super::inventory::{
-    batch, fetch_delta_page, graph_etag, is_removed, membership_from_value, page_marker,
-    removed_id, scope_matches_payload,
-};
+use super::inventory::{batch, fetch_delta_page, graph_etag, is_removed, page_marker, removed_id};
 
 /// Refresh a calendarView delta link before its fixed horizon gets close.
 /// Keeping a ninety-day lead preserves the original 365-day forward view
@@ -26,17 +23,30 @@ fn calendar_window_needs_reseed(payload: &super::cursor::GraphCursorPayload, now
         .is_none_or(|end| now >= end.saturating_sub(CALENDAR_WINDOW_RESEED_LEAD_SECS))
 }
 
+#[cfg(test)]
 pub(crate) fn changes_stream(
     account: GraphAccount,
     cursor: ChangeCursor,
 ) -> AccountStream<SyncEvent<Change>> {
+    let parsed = super::scope::GraphScope::parse(&cursor.scope);
+    changes_stream_admitted(account, cursor, parsed)
+}
+
+pub(crate) fn changes_stream_admitted(
+    account: GraphAccount,
+    cursor: ChangeCursor,
+    parsed: Result<super::scope::GraphScope, CursorError>,
+) -> AccountStream<SyncEvent<Change>> {
     Box::pin(async_stream::stream! {
-        if !super::inventory::sync_scope_readable(&cursor.scope) {
-            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
-            yield SyncEvent::Terminated(cursor_error_to_account_error(CursorError::Unsupported, ctx));
-            return;
-        }
+        let parsed = match parsed.and_then(|parsed| parsed.kind().map(|_| parsed)) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                    .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
+                yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
+                return;
+            }
+        };
         let mut payload = match decode_cursor(&cursor) {
             Ok(payload) => payload,
             Err(error) => {
@@ -47,7 +57,7 @@ pub(crate) fn changes_stream(
                 return;
             }
         };
-        if !scope_matches_payload(&cursor.scope, &payload) {
+        if !parsed.matches_payload(&payload) {
             let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
                 .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
             yield SyncEvent::Terminated(cursor_error_to_account_error(
@@ -95,7 +105,7 @@ pub(crate) fn changes_stream(
         // client here, so the engine disables an unconfigured scope and a
         // configured foreign scope keeps its own transport for the complete
         // delta-link walk.
-        let client = match account.client_for_scope(&cursor.scope) {
+        let client = match parsed.client(&account) {
             Ok(client) => client.clone(),
             Err(error) => {
                 let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
@@ -135,21 +145,21 @@ pub(crate) fn changes_stream(
             if let Err(error) = walk.enter(&current_url) {
                 let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
                     .with_scope(ErrorScope::Cursor(scope.clone()));
-                let owner = account.owner_of_scope(&scope);
+                let owner = parsed.owner().map(|owner| bifrost_types::MailboxId(owner.to_string()));
                 yield SyncEvent::Terminated(super::graph_error::graph_shared_scope_error(
                     error, &scope, owner.as_ref(), ctx,
                 ));
                 yield SyncEvent::Done(None);
                 return;
             }
-            let page = match fetch_delta_page(&client, &current_url, &scope).await {
+            let page = match fetch_delta_page(&client, &current_url, &parsed).await {
                 Ok(page) => page,
                 Err(error) => {
                     let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
                         .with_scope(ErrorScope::Cursor(scope.clone()));
                     // Foreign-scope permission denial quarantines just
                     // this scope; primary-scope denial stays terminal.
-                    let owner = account.owner_of_scope(&scope);
+                    let owner = parsed.owner().map(|owner| bifrost_types::MailboxId(owner.to_string()));
                     yield SyncEvent::Terminated(super::graph_error::graph_shared_scope_error(
                         error,
                         &scope,
@@ -172,7 +182,7 @@ pub(crate) fn changes_stream(
             let mut idless_value = false;
             for value in page.value {
                 if let Some(id) = value.get("id").and_then(Value::as_str) {
-                    last_seen_id = Some(super::inventory::sync_object_id(&scope, id).0);
+                    last_seen_id = Some(parsed.mint_object_id(id).0);
                 }
                 if is_removed(&value) {
                     if let Some(id) = removed_id(&value) {
@@ -180,13 +190,13 @@ pub(crate) fn changes_stream(
                         // Updated ids are encoded, so a foreign item's
                         // remove carries the same bytes its add did
                         // (ratatoskr equality-joins on this id).
-                        let id = super::inventory::sync_object_id(&scope, &id.0);
-                        if super::inventory::is_mail_scope(&scope) {
+                        let id = parsed.mint_object_id(&id.0);
+                        if parsed.etag_cached() {
                             removed_etag_ids.push(id.0.clone());
                         }
                         changes.push(Change::ScopeChange(ScopeChange {
                             id,
-                            membership: membership_from_value(&scope, &value),
+                            membership: parsed.membership(value.get("parentFolderId").and_then(Value::as_str)),
                             kind: ScopeChangeKind::Removed,
                         }));
                     } else {
@@ -198,9 +208,9 @@ pub(crate) fn changes_stream(
                     idless_value = true;
                 }
                 if let Some(id) = value.get("id").and_then(Value::as_str) {
-                    let object_id = super::inventory::sync_object_id(&scope, id);
+                    let object_id = parsed.mint_object_id(id);
                     // Only mail mutations consume this bounded cache.
-                    if super::inventory::is_mail_scope(&scope)
+                    if parsed.etag_cached()
                         && let Some(etag) = graph_etag(&value) {
                         etags.push((object_id.0.clone(), etag));
                     }
@@ -218,7 +228,7 @@ pub(crate) fn changes_stream(
                     }));
                     changes.push(Change::ScopeChange(ScopeChange {
                         id: object_id,
-                        membership: membership_from_value(&scope, &value),
+                        membership: parsed.membership(value.get("parentFolderId").and_then(Value::as_str)),
                         kind: ScopeChangeKind::Added,
                     }));
                 }
@@ -267,7 +277,7 @@ pub(crate) fn changes_stream(
                 Err(error) => {
                     let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
                         .with_scope(ErrorScope::Cursor(scope.clone()));
-                    let owner = account.owner_of_scope(&scope);
+                    let owner = parsed.owner().map(|owner| bifrost_types::MailboxId(owner.to_string()));
                     if !changes.is_empty() {
                         yield batch(changes, PageBoundary::Page, None, tally.take());
                     }
@@ -632,7 +642,7 @@ mod tests {
         // The hostile / stale case that matters: a cursor whose scope says
         // "inbox messages" but whose delta link belongs to the contacts
         // collection. Walking it would file contact rows as messages, so
-        // `scope_matches_payload` must terminate the stream.
+        // The parsed scope must terminate a mismatched payload.
         let contact_scope = CursorScope::FolderType {
             folder: FolderId("inbox".to_string()),
             ty: ObjectType::Contact,

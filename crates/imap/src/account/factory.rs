@@ -330,8 +330,7 @@ impl ImapAccountFactory {
                 capabilities: caps,
                 pool,
                 folders: registry,
-                qresync_enabled: qresync.enabled,
-                qresync_negotiation_warning: qresync.warning,
+                qresync,
                 supports_notify: profile.supports_notify(),
                 bandwidth_budget,
                 contacts,
@@ -576,31 +575,19 @@ fn meter_handle(
         .map(|sink| bifrost_net::MeterSinkHandle::new(Arc::clone(sink), account_id))
 }
 
-struct QresyncNegotiation {
-    enabled: bool,
-    warning: Option<String>,
-}
-
 async fn negotiate_qresync(
     conn: &crate::ImapConnection,
     cfg: &ImapAccountConfig,
     profile: &ServerProfile,
     server_id: &[(String, Option<String>)],
-) -> Result<QresyncNegotiation, crate::Error> {
+) -> Result<super::QresyncNegotiation, crate::Error> {
     if !cfg.enable_qresync || !profile.supports_qresync() {
-        return Ok(QresyncNegotiation {
-            enabled: false,
-            warning: None,
-        });
+        return Ok(super::QresyncNegotiation::NotRequested);
     }
     if server_id_disables_qresync(server_id) {
-        return Ok(QresyncNegotiation {
-            enabled: false,
-            warning: Some(
-                "server ID matches a known broken QRESYNC implementation; continuing with CONDSTORE"
-                    .to_owned(),
-            ),
-        });
+        return Ok(super::QresyncNegotiation::Refused(
+            super::QresyncRefusal::KnownBrokenServer,
+        ));
     }
     // The same initialization every pool dial runs, so the primed member and
     // the dialed ones follow one rule. The account policy is seeded from this
@@ -609,12 +596,10 @@ async fn negotiate_qresync(
     // first connection is reported once below and left on CONDSTORE.
     super::pool::enable_qresync(conn, cfg.imap.command_timeout).await?;
     let confirmed = conn.server_profile().enabled("QRESYNC");
-    Ok(QresyncNegotiation {
-        enabled: confirmed,
-        warning: (!confirmed).then(|| {
-            "server advertised QRESYNC but ENABLE did not confirm it; continuing with CONDSTORE"
-                .to_owned()
-        }),
+    Ok(if confirmed {
+        super::QresyncNegotiation::Enabled
+    } else {
+        super::QresyncNegotiation::Refused(super::QresyncRefusal::EnableNotConfirmed)
     })
 }
 

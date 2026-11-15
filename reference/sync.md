@@ -486,7 +486,16 @@ engine forgets is an orphan that keeps delivering until the provider
 expires it; an orphan is therefore never recreated against a replacement,
 is carried across swaps, and is retried by the next reopen,
 `unsubscribe_push`, or the account's orphan-teardown timer
-(`PushConfig::orphan_teardown_retry_interval`).
+(`PushConfig::orphan_teardown_retry_interval`). Each timer-driven teardown uses
+sync scheduler admission and checks the current incarnation's declared throttle
+keys for the orphan's retained scopes plus account holds. It releases admission
+while waiting on a hold, and rechecks after admission. An activity guard covers
+the provider attempt, including its timeout, so pause and checkpoint quiescence
+cannot report completion while cleanup is in flight. New cleanup is refused
+under Pause, CheckpointNow or Stop; failed teardown records every throttle
+observation before the next attempt. The next timer pass retries after resume.
+Enterprise users expect a pause to include background cleanup and repair.
+
 `SubscriptionState` represents four states: `Live`, `LiveTeardownFailed`,
 `TornDownAwaitingRecreate`, and `Orphan`. The `desired()`,
 `teardown_unconfirmed()` and `torn_down()` predicates below derive from that
@@ -971,8 +980,9 @@ under the same write lock.
    `MultiplexerEvent { scope, event, checkpoint }`.
 2. Consumer atomically persists `(items, checkpoint)` in their
    own store.
-3. Consumer calls `SyncEngine::ack_checkpoint(account, scope,
-   checkpoint, publication)`. The supplied scope must equal the checkpoint's
+3. For a checkpoint event, extract the cursor with `event.scope.cursor()` and
+   call `SyncEngine::ack_checkpoint(account, scope, checkpoint, publication)`.
+   The supplied cursor scope must equal the checkpoint's
    scope. Both the entry point and writer reject a mismatch before changing
    provisional ownership or persisting any checkpoint.
 4. The per-account writer task (one per slot, fed by an
@@ -3082,7 +3092,21 @@ account to re-read what it could not represent, publishes what came back, and
 discharges only what the consumer acknowledged. Caller-driven rather than
 scheduled, because repair is remote work against an account that may be
 throttled or degraded and the consumer knows better than the engine when to
-spend that budget.
+spend that budget. Caller-driven repair still uses the account's sync scheduler
+admission, checks provider-declared scope throttle keys and account holds after
+admission, and retains an activity guard through the pass. Under a Pause or
+CheckpointNow boundary it waits for `Run`, exactly as a bulk mutation campaign
+does (`SyncControl::wait_until_running`), then re-reads the ledger before
+planning: an enterprise user who asked for a repair expects it to run once the
+barrier lifts, not a transient `Error::Paused`. `Stop` refuses with
+`Error::Paused`; shutdown cancels the wait and the pass. The orphan-teardown
+timer uses the same gate in refusing mode and retries on its next tick.
+A dropped queued admission frees its scheduler lane slot at once: `admit`
+prunes cancelled waiters before its capacity check, and the dispatcher never
+hands a permit to a cancelled waiter.
+Provider deferrals and stream termination record all throttle observations.
+The public low-level `repair::run_repair_pass` remains available for callers
+that own their own admission; `SyncEngine::repair_debt` supplies these gates.
 
 `Account::repair_inventory` takes a stream of `InventoryRepairRequest` and
 yields correlated outcomes. Not `get_stream`, which hydrates known ids at a
@@ -3130,8 +3154,8 @@ and drops the rest.
 **One publication, and one writer request, PER SCOPE.** A pass plans across
 every repairable obligation in the ledger, which can span scopes, so the
 recovered ids are grouped by the scope they were recovered from and each group
-is broadcast as its own `MultiplexerEvent`. `MultiplexerEvent::scope` is the
-routing key a consumer files or filters on, so one batch stamped with whichever
+is broadcast as its own `MultiplexerEvent` with `EventScope::Cursor(scope)`.
+`MultiplexerEvent::scope` is the routing key a consumer files or filters on, so one batch stamped with whichever
 scope happened to be recovered first delivers scope B's ids as scope A's, or
 drops them. The RESOLUTIONS are grouped the same way, which is what keeps
 discharge honest after the split: an obligation discharges only on an
@@ -4262,3 +4286,34 @@ Recovery wait allowance exhaustion returns `Error::WaitBudgetExhausted` through
 the result instead of a pacing side flag. The pacing `observed` flag remains
 independent evidence about recording the returned failure, separate from cleanup
 holds and the cumulative wait allowance.
+
+## Event scope and mutation answer validation
+
+`MultiplexerEvent::scope` and `MultiplexerEvent::unacked` use the published
+`EventScope::{Account, Cursor(CursorScope)}`, also re-exported at the crate root.
+`Account` means attachment-wide status: lifecycle termination, account restart
+exhaustion, campaign and passthrough diagnostics, push status, receiver lag and
+retirement. `Cursor(scope)` names an actual cursor for changes, inventory,
+backfill, repair and scoped recovery. In particular,
+`Cursor(CursorScope::Account)` is a real account cursor and is distinct from
+`Account`. A mail user must be able to distinguish a stopped account from a
+single cursor's failure. Checkpoint acknowledgement still accepts `CursorScope`;
+`EventScope::cursor` extracts it and returns `None` for attachment-wide events.
+
+Every mutation submission round validates answers against its submitted target
+set and accepts each target once across all batches, before processing conflicts,
+effects, throttle evidence or counters. An unknown, out-of-round or duplicate ID
+stops the round and retains an `Internal(AccountContract)` campaign error; a
+normal completion or stream end with unanswered targets does the same. A provider
+termination may leave targets unanswered without inventing another contract
+failure. Valid prior answers remain counted; unanswered writes retain uncertainty
+and the existing read-back policy. Retries create a fresh answered set, since a
+new submission legitimately answers the same target again. Enterprise users must
+never see unrelated messages counted or repeated answers overwrite a prior result.
+
+The answer id is the submitted `ObjectId` string, byte for byte: every provider
+echoes the id it was handed rather than re-minting it (IMAP carries the
+submitted spelling in `DecodedObjectId::id`, Graph, Google and JMAP key outcomes
+on the input id). Duplicate caller targets are dropped at campaign intake, first
+occurrence wins, so a message selected twice is changed once and answered once;
+a provider that still answers one target twice is the contract violation above.

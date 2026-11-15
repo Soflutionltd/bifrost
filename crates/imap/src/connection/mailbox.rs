@@ -225,8 +225,8 @@ impl ImapConnection {
     /// extension-specific capability checks (CONDSTORE, QRESYNC), command
     /// construction, and dispatch via [`SelectConsumer`].
     ///
-    /// State transitions are handled by the driver task via the `in_select`
-    /// flag in `ProtocolState::apply_tagged`:
+    /// State transitions are handled by the driver task via the tagged SELECT
+    /// effect in `ProtocolState::apply_tagged`:
     /// - Tagged OK -> `Selected` (RFC 3501 Section6.3.1)
     /// - Tagged NO -> `Authenticated` (deselects, RFC 3501 Section6.3.1)
     /// - Tagged BAD -> no change (RFC 3501 Section6)
@@ -271,7 +271,7 @@ impl ImapConnection {
         // unwrap a second, inner `Result` to see the failure.
         //
         // State transitions (Selected on OK, Authenticated on NO) are
-        // handled by the driver's apply_tagged via the in_select flag.
+        // handled by the driver's apply_tagged via the tagged SELECT effect.
         self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
             .await
     }
@@ -556,7 +556,7 @@ impl ImapConnection {
     /// without expunging.
     ///
     /// State transition to `Authenticated` is handled by the driver task
-    /// via the `in_close` flag in `ProtocolState::apply_tagged`.
+    /// via the tagged CLOSE effect in `ProtocolState::apply_tagged`.
     pub async fn close(&self, timeout: Duration) -> Result<(), Error> {
         use super::dispatch::TaggedOkConsumer;
 
@@ -581,7 +581,7 @@ impl ImapConnection {
     /// (RFC 9051 folds UNSELECT into the base protocol).
     ///
     /// State transition to `Authenticated` is handled by the driver task
-    /// via the `in_close` flag in `ProtocolState::apply_tagged`.
+    /// via the tagged CLOSE effect in `ProtocolState::apply_tagged`.
     ///
     /// # Snapshot timing
     ///

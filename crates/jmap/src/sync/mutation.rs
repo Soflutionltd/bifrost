@@ -3,18 +3,19 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess, ErrorScope,
-    FlagOp, IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, ObjectId, PageBoundary,
+    AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, ErrorScope, FlagOp,
+    IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, ObjectId, PageBoundary,
     SyncEvent,
 };
 use futures::StreamExt;
 
 use crate::core::transport::HttpTransport;
-use crate::email::{EmailGet, EmailId, EmailPatch, EmailSet};
+use crate::email::{EmailId, EmailPatch, EmailSet};
 use crate::mailbox::MailboxId;
 
 use super::capabilities::CoreLimits;
-use super::state_cache::{self, StateMap};
+use super::mail_set::classify_set_response;
+use super::state_cache::StateMap;
 
 type MailAccount<T> = crate::account::Account<T>;
 
@@ -552,68 +553,29 @@ async fn apply_batch_with_version<T: HttpTransport>(
     // path report its real cost instead of only the last call's.
     let (mail, tally) = mail.metered();
     let mail = &mail;
-    let guarded = expected.is_some() || uses_if_in_state(kind);
-    let mut state = if let Some(expected) = expected {
-        Some(expected.to_owned())
-    } else if guarded {
-        Some(current_or_probe_state(mail, email_states, account_id).await?)
-    } else {
-        state_cache::get(email_states, account_id).await
+    let guard = match expected {
+        Some(state) => super::mail_set::Guard::Exact(state),
+        None if uses_if_in_state(kind) => super::mail_set::Guard::Replacement,
+        None => super::mail_set::Guard::Unconditional,
     };
-
-    let if_in_state = if guarded { state.as_deref() } else { None };
-    let mut response = match send_set(mail, if_in_state, &ids, kind, foreign_account).await {
+    let guarded = guard.is_guarded();
+    let mut response = match super::mail_set::execute(mail, email_states, account_id, guard, || {
+        build_email_set(None, &ids, kind, account_id, foreign_account)
+    })
+    .await
+    {
         Ok(response) => response,
-        Err(err) => {
-            if expected.is_some() && super::error::is_state_mismatch(&err) {
-                return Ok(Some(state_mismatch_failed_batch(
-                    err,
-                    kind,
-                    ids,
-                    started,
-                    tally.take(),
-                )));
-            }
-            if !guarded || !super::error::is_state_mismatch(&err) {
-                return Err(err);
-            }
-            let fresh = probe_email_state(mail).await?;
-            state_cache::set(email_states, account_id, fresh.clone()).await;
-            state = Some(fresh);
-            match send_set(mail, state.as_deref(), &ids, kind, foreign_account).await {
-                Ok(response) => response,
-                Err(err) if super::error::is_state_mismatch(&err) => {
-                    // A second method-level `stateMismatch` after a
-                    // state refresh is a genuine concurrency conflict,
-                    // not a stream-fatal condition. Propagating it as
-                    // `Err` would both terminate the whole bulk stream
-                    // (instead of the documented per-item
-                    // `Failed(ConcurrencyConflict)`) and falsely assert
-                    // "nothing was transmitted" - the retried
-                    // `Email/set` did cross the wire. Convert the
-                    // method error into a per-item `Failed` lane so the
-                    // engine drives `Retry::AfterStateRefresh` per id.
-                    return Ok(Some(state_mismatch_failed_batch(
-                        err,
-                        kind,
-                        ids,
-                        started,
-                        tally.take(),
-                    )));
-                }
-                Err(err) => return Err(err),
-            }
+        Err(error) if guarded && super::error::is_state_mismatch(&error) => {
+            return Ok(Some(state_mismatch_failed_batch(
+                error,
+                kind,
+                ids,
+                started,
+                tally.take(),
+            )));
         }
+        Err(error) => return Err(error),
     };
-
-    // Absent (non-conforming) and empty both mean "no state to record".
-    // Only a real state string advances the cache.
-    state_cache::observe_set(
-        email_states,
-        account_id,
-        state_cache::set_transition(response.old_state(), response.new_state()),
-    )
-    .await;
 
     let operation = operation_for_kind(kind);
     let mut results = Vec::with_capacity(ids.len());
@@ -635,50 +597,6 @@ async fn apply_batch_with_version<T: HttpTransport>(
         bytes_in: tally.take(),
         checkpoint: None,
     }))
-}
-
-/// Turn the answer for one submitted `Email/set` id into exactly one
-/// per-item outcome. The response method has already arrived, so any
-/// protocol-level omission must retain acknowledged transmission evidence.
-fn classify_set_response(
-    raw: crate::Result<()>,
-    id: ObjectId,
-    operation: AccountOperation,
-    guarded: bool,
-) -> ItemOutcome<MutationSuccess> {
-    match raw {
-        Ok(()) => ItemOutcome::Succeeded(BatchSuccess::new(
-            BatchItemId(id.0.clone()),
-            MutationSuccess::Applied,
-        )),
-        Err(crate::Error::Set(set_error)) => {
-            let ctx = super::error::JmapErrorContext::new(operation);
-            let item_scope = Some(ErrorScope::Message {
-                id: (id.0.clone()).into(),
-            });
-            super::error::classify_set_item(set_error, ctx, BatchItemId(id.0.clone()), item_scope)
-        }
-        Err(crate::Error::SetIdUnanswered(_)) => ItemOutcome::Failed(BatchFailure::new(
-            BatchItemId(id.0.clone()),
-            super::error::set_id_unanswered(
-                "Email/set",
-                &id.0,
-                super::error::JmapErrorContext::new(operation).with_scope(ErrorScope::Message {
-                    id: (id.0.clone()).into(),
-                }),
-                guarded,
-            ),
-        )),
-        Err(err) => ItemOutcome::Failed(BatchFailure::new(
-            BatchItemId(id.0.clone()),
-            super::error::into_account_error(
-                err,
-                super::error::JmapErrorContext::new(operation).with_scope(ErrorScope::Message {
-                    id: (id.0.clone()).into(),
-                }),
-            ),
-        )),
-    }
 }
 
 /// Build a per-item `Failed(ConcurrencyConflict)` batch for every id in
@@ -731,23 +649,6 @@ fn state_mismatch_failed_batch(
 fn state_mismatch_method_error() -> crate::core::error::MethodError {
     serde_json::from_str(r#"{"type":"stateMismatch"}"#)
         .expect("stateMismatch is a valid MethodError shape")
-}
-
-async fn send_set<T: HttpTransport>(
-    mail: &MailAccount<T>,
-    state: Option<&str>,
-    ids: &[ObjectId],
-    kind: &MutationKind,
-    foreign_account: bool,
-) -> crate::Result<crate::core::set::SetResponse<crate::email::Email>> {
-    mail.call(build_email_set(
-        state,
-        ids,
-        kind,
-        mail.id_str(),
-        foreign_account,
-    )?)
-    .await
 }
 
 fn build_email_set(
@@ -853,32 +754,6 @@ fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) -> crate::Result<()> {
     Ok(())
 }
 
-async fn current_or_probe_state<T: HttpTransport>(
-    mail: &MailAccount<T>,
-    email_states: &StateMap,
-    account_id: &str,
-) -> crate::Result<String> {
-    if let Some(state) = state_cache::get(email_states, account_id).await {
-        return Ok(state);
-    }
-    let state = probe_email_state(mail).await?;
-    // Re-check under the lock: another task may have probed concurrently.
-    if let Some(existing) = state_cache::get(email_states, account_id).await {
-        return Ok(existing);
-    }
-    state_cache::set(email_states, account_id, state.clone()).await;
-    Ok(state)
-}
-
-pub(crate) async fn probe_email_state<T: HttpTransport>(
-    mail: &MailAccount<T>,
-) -> crate::Result<String> {
-    Ok(mail
-        .call(EmailGet::new().ids(Vec::<EmailId>::new()))
-        .await?
-        .into_state())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,7 +761,7 @@ mod tests {
     use futures::StreamExt;
     use std::sync::Mutex as StdMutex;
 
-    /// Serialize the exact builder used by `send_set`, so a request-shape
+    /// Serialize the exact builder used by the shared executor, so a request-shape
     /// regression cannot pass against a parallel test-only implementation.
     fn set_body(kind: &MutationKind, ids: &[&str], state: Option<&str>) -> serde_json::Value {
         let ids = ids

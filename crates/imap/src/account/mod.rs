@@ -93,6 +93,44 @@ pub(crate) enum SelectPurpose<'a> {
     Mutate,
 }
 
+/// Account policy, distinct from each connection's committed ENABLE profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QresyncNegotiation {
+    NotRequested,
+    Enabled,
+    Refused(QresyncRefusal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QresyncRefusal {
+    KnownBrokenServer,
+    EnableNotConfirmed,
+    SessionDowngraded,
+    /// A QRESYNC SELECT response failed to parse. Kept distinct from the
+    /// generic downgrade so support can see the server sent a QRESYNC
+    /// response this crate could not read, not that QRESYNC was unavailable.
+    SelectParseFailed,
+}
+
+impl QresyncRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::SelectParseFailed => {
+                "QRESYNC SELECT failed during response parsing; continuing with CONDSTORE"
+            }
+            Self::KnownBrokenServer => {
+                "server ID matches a known broken QRESYNC implementation; continuing with CONDSTORE"
+            }
+            Self::EnableNotConfirmed => {
+                "server advertised QRESYNC but ENABLE did not confirm it; continuing with CONDSTORE"
+            }
+            Self::SessionDowngraded => {
+                "QRESYNC failed for this account session; continuing with CONDSTORE"
+            }
+        }
+    }
+}
+
 /// Open IMAP account handle. The handle owns the connection pool.
 #[derive(Clone)]
 pub(crate) struct ImapAccount {
@@ -104,8 +142,6 @@ pub(crate) struct ImapAccountInner {
     pub(crate) capabilities: bifrost_types::AccountCapabilities,
     pub(crate) pool: Arc<Pool>,
     pub(crate) folders: Arc<FolderRegistry>,
-    pub(crate) qresync_negotiation_warning: Option<String>,
-    pub(crate) qresync_negotiation_warning_sent: AtomicBool,
     pub(crate) shutdown: CancellationToken,
     pub(crate) closed: AtomicBool,
     pub(crate) close_completion: std::sync::OnceLock<close::Completion>,
@@ -132,8 +168,7 @@ pub(crate) struct ImapAccountParts {
     pub(crate) capabilities: bifrost_types::AccountCapabilities,
     pub(crate) pool: Arc<Pool>,
     pub(crate) folders: Arc<FolderRegistry>,
-    pub(crate) qresync_enabled: bool,
-    pub(crate) qresync_negotiation_warning: Option<String>,
+    pub(crate) qresync: QresyncNegotiation,
     pub(crate) supports_notify: bool,
     pub(crate) bandwidth_budget: bifrost_net::BandwidthBudget,
     pub(crate) contacts: Option<Arc<dyn Account>>,
@@ -160,15 +195,13 @@ impl ImapAccount {
         // to bring a new member to the account's QRESYNC state. The pool
         // dials nothing before the account exists, so seeding it here is
         // seen by every dial.
-        parts.pool.set_qresync_policy(parts.qresync_enabled);
+        parts.pool.set_qresync_negotiation(parts.qresync);
         Self {
             inner: Arc::new(ImapAccountInner {
                 config: parts.config,
                 capabilities: parts.capabilities,
                 pool: parts.pool,
                 folders: parts.folders,
-                qresync_negotiation_warning: parts.qresync_negotiation_warning,
-                qresync_negotiation_warning_sent: AtomicBool::new(false),
                 shutdown: CancellationToken::new(),
                 closed: AtomicBool::new(false),
                 close_completion: std::sync::OnceLock::new(),
@@ -382,7 +415,7 @@ impl ImapAccount {
         self.pool.qresync_policy()
     }
 
-    pub(crate) fn disable_qresync_for_session(&self) {
+    pub(crate) fn disable_qresync_for_session(&self, refusal: QresyncRefusal) {
         // Other folder syncs may already have passed their QRESYNC gate
         // on this account. They are allowed to finish or independently
         // downgrade; this one-way flag only prevents new QRESYNC work. It
@@ -390,18 +423,12 @@ impl ImapAccount {
         // Section 3.2.3 gives no way back short of closing the connection,
         // and every consumer reads the form a removal arrived in rather
         // than this policy.
-        self.pool.set_qresync_policy(false);
+        self.pool
+            .set_qresync_negotiation(QresyncNegotiation::Refused(refusal));
     }
 
     pub(crate) fn take_qresync_negotiation_warning(&self) -> Option<String> {
-        let warning = self.qresync_negotiation_warning.as_ref()?;
-        if self
-            .qresync_negotiation_warning_sent
-            .swap(true, Ordering::Release)
-        {
-            return None;
-        }
-        Some(warning.clone())
+        self.pool.take_qresync_warning()
     }
 
     /// Un-spend the QRESYNC negotiation one-shot.
@@ -411,8 +438,7 @@ impl ImapAccount {
     /// burn it with nobody informed. The taker holds a ticket that calls
     /// this if its output channel turns out to be gone.
     pub(crate) fn restore_qresync_negotiation_warning(&self) {
-        self.qresync_negotiation_warning_sent
-            .store(false, Ordering::Release);
+        self.pool.restore_qresync_warning();
     }
 
     /// Non-consuming read of the QRESYNC negotiation reason. Unlike
@@ -422,7 +448,7 @@ impl ImapAccount {
     /// specific session-level reason as its downgrade reason string rather
     /// than falling back to a generic message once the one-shot is spent.
     pub(crate) fn qresync_negotiation_reason(&self) -> Option<String> {
-        self.qresync_negotiation_warning.clone()
+        self.pool.qresync_reason().map(str::to_owned)
     }
 }
 

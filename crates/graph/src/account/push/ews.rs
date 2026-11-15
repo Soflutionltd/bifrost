@@ -102,15 +102,11 @@ pub(super) const TRANSLATE_EXCHANGE_IDS_MAX_INPUTS: usize = 1_000;
 /// the translation request, the reconciliation, and the retained state all
 /// read the one string this produced, so no later phase can re-derive it
 /// differently or have to assert a shape the predicate already guaranteed.
+#[cfg(test)]
 pub(super) fn ews_subscribable_folder_id(scope: &CursorScope) -> Option<String> {
-    let CursorScope::FolderType { folder, .. } = scope else {
-        return None;
-    };
-    let parsed = crate::account::foreign::parse_folder(folder);
-    if parsed.foreign().is_some() {
-        return None;
-    }
-    Some(parsed.native_id().to_string())
+    crate::account::scope::GraphScope::parse(scope)
+        .ok()?
+        .ews_folder_id()
 }
 
 /// The EWS arm of `push_subscribe`: translate, close the ledger, and only
@@ -124,16 +120,20 @@ pub(super) fn ews_subscribable_folder_id(scope: &CursorScope) -> Option<String> 
 /// with nothing to undo.
 pub(super) async fn subscribe_ews(
     account: GraphAccount,
-    eligible: Vec<(bifrost_types::BatchItemId, CursorScope)>,
+    eligible: Vec<(
+        bifrost_types::BatchItemId,
+        CursorScope,
+        crate::account::scope::GraphScope,
+    )>,
     mut outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
     expected: &[bifrost_types::BatchItemId],
 ) -> Result<ArmOutcome, AccountError> {
     let mut pending = Vec::with_capacity(eligible.len());
-    for (item, scope) in eligible {
+    for (item, scope, parsed) in eligible {
         // An unsubscribable shape (non-`FolderType`, or a foreign mailbox
         // this Subscribe cannot route to) is that scope's refusal, not the
         // request's: its valid siblings still get a live subscription.
-        let Some(source_id) = ews_subscribable_folder_id(&scope) else {
+        let Some(source_id) = parsed.ews_folder_id() else {
             outcomes.push_failed(item, unsupported_push_scope_error(scope));
             continue;
         };

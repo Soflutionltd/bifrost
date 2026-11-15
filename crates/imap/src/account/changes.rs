@@ -230,8 +230,7 @@ async fn run_changes(
                 // teardown, that take could burn the account-level warning without
                 // anyone ever receiving it.
                 let reason = account.qresync_negotiation_reason().unwrap_or_else(|| {
-                    "QRESYNC is disabled for this account session; continuing with CONDSTORE"
-                        .to_string()
+                    super::QresyncRefusal::SessionDowngraded.reason().to_owned()
                 });
                 send_strategy_downgrade(
                     &tx,
@@ -286,12 +285,19 @@ async fn run_qresync(
             if should_discard_conn_after_qresync_error(&err) {
                 conn.discard();
             }
-            account.disable_qresync_for_session();
+            // A parse failure keeps its precise diagnostic; a missing
+            // QRESYNC / ENABLE capability is the generic session downgrade.
+            let refusal = if matches!(err, crate::Error::Parse(_)) {
+                super::QresyncRefusal::SelectParseFailed
+            } else {
+                super::QresyncRefusal::SessionDowngraded
+            };
+            account.disable_qresync_for_session(refusal);
             send_strategy_downgrade(
                 &tx,
                 SyncStrategy::QResync,
                 SyncStrategy::Condstore,
-                "QRESYNC SELECT failed during response parsing; continuing with CONDSTORE",
+                refusal.reason(),
             )
             .await?;
             // Release the checkout before the retry:
@@ -347,9 +353,9 @@ async fn run_qresync(
     let reason = match selected.qresync {
         crate::types::QresyncOutcome::Used => None,
         crate::types::QresyncOutcome::NotRequested => {
-            Some("QRESYNC is disabled for this account session; continuing with CONDSTORE")
+            Some(super::QresyncRefusal::SessionDowngraded.reason())
         }
-        _ => Some("this connection does not have QRESYNC enabled; continuing with CONDSTORE"),
+        _ => Some(super::QresyncRefusal::EnableNotConfirmed.reason()),
     };
     if let Some(reason) = reason {
         send_strategy_downgrade(&tx, SyncStrategy::QResync, SyncStrategy::Condstore, reason)

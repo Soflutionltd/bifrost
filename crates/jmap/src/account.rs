@@ -25,6 +25,14 @@ use crate::{
 /// §2). Use [`Client::primary_account`] with a capability marker to
 /// pick the correct one rather than assuming
 /// [`Client::default_account_id`] applies to every capability.
+// Capability selection below currently erases C. Fixing this requires typed
+// handles throughout the sync account's mail/submission/vacation/quota/sieve/
+// contacts/calendars fields and its foreign-account helpers, not just a new
+// generic here. A method-equality bound alone would also reject legitimate
+// cross-capability calls on accounts advertising both capabilities, including
+// foreign mail submission and core Blob/copy. Those need an explicit checked
+// capability view. Retaining an untyped default to avoid migrating the callers
+// would preserve the very wrong-account call path the type is meant to close.
 pub(crate) struct Account<Tr: HttpTransport> {
     client: Client<Tr>,
     account_id: AccountId,

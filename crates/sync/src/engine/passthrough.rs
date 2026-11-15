@@ -93,7 +93,7 @@ impl SyncEngine {
              skipped scope are missing, not absent",
         ));
         let event = MultiplexerEvent {
-            scope: CursorScope::Account,
+            scope: EventScope::Account,
             event: Arc::new(SyncEvent::Warning(warning)),
             checkpoint: None,
             publication: None,

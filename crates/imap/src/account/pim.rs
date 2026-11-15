@@ -2837,7 +2837,9 @@ fn first_selectable_folder(
 ) -> Option<MailboxName> {
     entries
         .into_iter()
-        .filter(|entry| entry.selectable())
+        // Account quota must not silently report a colleague's shared mailbox
+        // usage when the user's personal namespace has no INBOX.
+        .filter(|entry| entry.selectable() && entry.shared_owner.is_none())
         // `entries()` comes from a HashMap, and distinct mailbox identities
         // can share a display name. Keep the fallback stable across rebuilds.
         .min_by(|left, right| left.name.cmp_account_order(&right.name))
@@ -3840,8 +3842,13 @@ body text\r\n";
         );
         assert_eq!(
             folder_role(&[], "INBOX/Sent", None),
+            None,
+            "a NIL delimiter is a flat namespace: no guessed slash hierarchy",
+        );
+        assert_eq!(
+            folder_role(&[], "Sent", None),
             Some(FolderRole::Sent),
-            "unknown delimiter preserves the slash fallback",
+            "a flat name that is itself a role name still resolves",
         );
     }
 
@@ -3897,6 +3904,23 @@ body text\r\n";
                 .as_ref()
                 .map(MailboxName::as_str),
             Some("Archive"),
+        );
+    }
+
+    #[test]
+    fn quota_fallback_uses_only_personal_selectable_folders() {
+        let mut shared = role_entry("A-shared", Some('/'), Vec::new());
+        std::sync::Arc::get_mut(&mut shared).unwrap().shared_owner =
+            Some(bifrost_types::MailboxId("colleague".into()));
+        assert!(first_selectable_folder(vec![std::sync::Arc::clone(&shared)]).is_none());
+        assert_eq!(
+            first_selectable_folder(vec![
+                shared,
+                role_entry("Z-personal", Some('/'), Vec::new()),
+            ])
+            .unwrap()
+            .as_str(),
+            "Z-personal",
         );
     }
 

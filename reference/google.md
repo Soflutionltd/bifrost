@@ -1614,7 +1614,7 @@ Mapping highlights:
 - Authorization failures (HTTP 403 outside the quota path) ->
   `Authorization(PermissionDenied)` -> `NoPermission`. The
   `InsufficientScope::needed` carrier is selected per `AccountOperation` via
-  `gmail_scope_for` (`gmail.send`/`compose`/`labels`/`modify`/`readonly`/
+  the API surface and `gmail_scope_for` for Gmail (`gmail.send`/`compose`/`labels`/`modify`/`readonly`/
   `metadata`/`settings.basic`, and `directory.readonly` for `DirectorySearch`).
 - Transport network failures (DNS, TLS, timeout) ->
   `Transport(_)` with an `AttemptCause` whose
@@ -1635,9 +1635,10 @@ Mapping highlights:
   other endpoints it falls through to HTTP status classification. Users expect
   unrelated resource failures to preserve sync progress.
 - `failedPrecondition` from the history endpoint ->
-  `SyncState(CursorInvalid)`. `failedPrecondition` elsewhere ->
+  `SyncState(CursorInvalid)`. `failedPrecondition` on Gmail, Calendar or People elsewhere ->
   `ConcurrencyConflict` (etag / version mismatch semantics),
-  routed through `Retry::AfterStateRefresh`.
+  routed through `Retry::AfterStateRefresh`. Drive retains HTTP status classification
+  for this reason because it does not establish an etag conflict.
 - Deleted or expired Pub/Sub registrations map to `Server(Unavailable)` with
   retry advice, including during watch renewal. Losing push does not invalidate
   the history cursor. Users retain sync progress while push retries and existing
@@ -1923,3 +1924,31 @@ what a user typing a search expects. Only bounds Gmail cannot represent at all
 (pre-epoch, or past signed Unix seconds) are refused, as malformed caller
 input, before the request they would shape is sent. Both surfaces use the
 same encoder.
+
+## API attribution and organization sharing validation
+
+Response and decode errors retain a typed Gmail, Calendar, People or Drive
+service. Raw builder dispatch also takes that enum rather than a string with a
+Drive fallback. Error translation preserves Gmail provider/protocol/wire signals
+only for Gmail. The shared error enums cannot identify the other Google APIs:
+those errors currently omit provider, use Protocol::Unknown, retain native
+reason/status and HTTP evidence, and name their API in response diagnostics.
+They never fabricate a Gmail wire cause. Accurate Google provider and API
+protocol/wire variants require a shared-types change. The account's primary
+protocol remains Gmail; this does not split the account into per-API handles.
+
+Insufficient-permission scopes follow the API surface: Calendar calendar-list
+reads use calendar.calendarlist.readonly, event reads calendar.events.readonly,
+and event writes calendar.events; People reads use contacts.readonly, writes
+contacts, and directory search directory.readonly; Drive hosting uses drive.file.
+Gmail retains its operation-specific scopes. Users should be asked for access
+to the failing service, rather than unrelated mail access.
+
+Organization sharing validates the profile address separately from mailbox
+identity comparison. It requires a nonempty dot-atom local part and DNS-shaped
+domain labels, rejecting repeated at-signs, whitespace, empty labels and invalid
+label characters. Unsupported address syntax is refused conservatively as an
+unusable provider value before creating an upload session. Enterprise users
+expect a malformed mailbox value to prevent sharing, rather than select a
+possibly unrelated organization. Identity matching remains ASCII-insensitive
+and does not reinterpret aliases.

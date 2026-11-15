@@ -531,7 +531,11 @@ mod tests {
             .post("https://gmail.test/messages/batchModify");
         assert!(
             client
-                .execute_builder(raw, "Gmail API", bifrost_net::ReplayPolicy::Never)
+                .execute_builder(
+                    raw,
+                    crate::quota::ApiSurface::Gmail,
+                    bifrost_net::ReplayPolicy::Never
+                )
                 .await
                 .is_err()
         );

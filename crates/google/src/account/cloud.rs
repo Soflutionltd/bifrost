@@ -442,7 +442,7 @@ async fn cancel_upload_session(
     let outcome = client
         .execute_builder(
             request,
-            "Drive API",
+            crate::quota::ApiSurface::Drive,
             bifrost_net::ReplayPolicy::IdempotentUnlessConditional,
         )
         .await;
@@ -489,7 +489,11 @@ async fn create_upload_session(
         .header("X-Upload-Content-Length", &meta.size.to_string())
         .json(&metadata);
     let response = client
-        .execute_builder(request, "Drive API", bifrost_net::ReplayPolicy::Never)
+        .execute_builder(
+            request,
+            crate::quota::ApiSurface::Drive,
+            bifrost_net::ReplayPolicy::Never,
+        )
         .await?;
 
     let status = response.status();
@@ -630,7 +634,11 @@ async fn upload_file_chunked_progress(
             .header("Content-Range", &content_range)
             .body(chunk);
         let response = client
-            .execute_builder(request, "Drive API", bifrost_net::ReplayPolicy::Idempotent)
+            .execute_builder(
+                request,
+                crate::quota::ApiSurface::Drive,
+                bifrost_net::ReplayPolicy::Idempotent,
+            )
             .await?;
 
         let status = response.status().as_u16();
@@ -641,7 +649,7 @@ async fn upload_file_chunked_progress(
             200 | 201 => {
                 let file: GDriveFileResponse = serde_json::from_slice(response.body.as_ref())
                     .map_err(|source| Error::JsonDecode {
-                        service: GmailService::GmailApi,
+                        service: GmailService::DriveApi,
                         source,
                     })?;
                 return Ok(file.id);
@@ -782,14 +790,14 @@ fn account_domain(account_email: &str) -> Result<String, Error> {
         .ok_or_else(|| {
             Error::provider_value_unusable(
                 ProviderFault::ParseFailed,
-                "the profile's account email has no domain for Organization-scoped sharing",
+                "the profile's account email is malformed for Organization-scoped sharing",
             )
         })
 }
 
 fn response_error(headers: &reqwest::header::HeaderMap, status: u16, body: Bytes) -> Error {
     let parsed = GmailResponseHeaders::from_headers(headers);
-    Error::response_from_parts(GmailService::GmailApi, status, parsed, body)
+    Error::response_from_parts(GmailService::DriveApi, status, parsed, body)
 }
 
 #[cfg(test)]

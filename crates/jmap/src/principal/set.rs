@@ -119,6 +119,12 @@ impl PrincipalPatch {
         }
     }
 
+    // These are server-admin dialect operations, not RFC 9670 set fields:
+    // aliases and members are arrays in the read/create/whole-patch model,
+    // and RFC 9670 defines neither property. RFC 8620 object-set removal
+    // rules do not establish this dialect's per-member operation contract.
+    // Keep the existing boolean wire operation until that contract is known;
+    // changing false to null alone would leave the array/path mismatch intact.
     pub(crate) fn alias(&mut self, alias: &str, set: bool) -> &mut Self {
         // Latest setter wins: an enterprise administrator expects an alias
         // edit to supersede an earlier replacement, never an invalid overlap.

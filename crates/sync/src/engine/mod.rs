@@ -61,8 +61,8 @@ use crate::cursor::{ClaimLookup, PendingCoverage};
 use crate::error::Error;
 use crate::multiplexer::changes::OperatorDecision;
 use crate::multiplexer::{
-    AckRequest, ChangeDelivery, Multiplexer, MultiplexerEvent, MultiplexerHandle, ReopenRequest,
-    WriterRequest,
+    AckRequest, ChangeDelivery, EventScope, Multiplexer, MultiplexerEvent, MultiplexerHandle,
+    ReopenRequest, WriterRequest,
 };
 use crate::push::{InvalidationSinkInner, RegisteredSubscription, SubscriptionRegistry};
 use crate::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
@@ -74,6 +74,7 @@ mod backfill;
 mod bulk;
 mod context;
 pub mod lane;
+mod maintenance;
 mod orphan_teardown;
 mod passthrough;
 mod reattach;
@@ -419,9 +420,10 @@ impl SyncEngine {
     /// consumer is better placed than the engine to decide when to spend that
     /// budget. The cost: a consumer that never calls this keeps its debt
     /// forever. Ruled 2026-10-03 to stay caller-driven until a consumer wires
-    /// it. A scheduled lane would need the throttle-deadline and pause checks
-    /// the backfill partition runner does, and must respect `OperatorBlocked`
-    /// without re-arming it on a timer.
+    /// it. This door still respects pause/checkpoint boundaries (it waits for
+    /// them to lift, as a bulk campaign does, refusing only on `Stop` or
+    /// shutdown), scheduler admission and provider throttle holds. A scheduled lane must also respect
+    /// `OperatorBlocked` without re-arming it on a timer.
     pub async fn repair_debt(
         &self,
         account_id: &AccountId,
@@ -430,30 +432,53 @@ impl SyncEngine {
         let slot = self
             .accounts
             .get(account_id)
+            .map(|slot| Arc::clone(slot.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let account = slot.current.load_full();
-        let delivery = Arc::clone(&slot.delivery);
-        let coverage = Arc::clone(&slot.coverage);
         let writer_tx = self
             .ack_senders
             .get(account_id)
             .map(|r| r.value().clone())
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        drop(slot);
-
         let ledger = ack::WriterHandle::new(writer_tx.clone())
             .get_ledger()
             .await?;
-        crate::repair::run_repair_pass(
-            account.as_ref().as_ref(),
+        if max_requests == 0 || ledger.repairable().next().is_none() {
+            return Ok(0);
+        }
+        let scopes = ledger
+            .repairable()
+            .take(max_requests)
+            .map(|entry| entry.domain.scope.clone())
+            .collect::<Vec<_>>();
+        let gate = maintenance::MaintenanceGate {
+            control: &slot.control,
+            scheduler: &slot.scheduler,
+            current: &slot.current,
+            throttles: &slot.throttles,
             account_id,
-            &ledger,
-            Some(&delivery),
-            &writer_tx,
-            &coverage,
-            max_requests,
-        )
-        .await
+            shutdown: &slot.shutdown,
+            boundary_tx: &slot.boundary_tx,
+            // Caller-driven: wait out a pause or checkpoint barrier.
+            wait_for_run: true,
+        };
+        let (account, _activity, _admission) = gate.acquire(&scopes).await?;
+        // The gate may have waited out a pause or checkpoint; the ledger read
+        // before it can be stale, so plan the pass from a fresh one.
+        let ledger = ack::WriterHandle::new(writer_tx.clone())
+            .get_ledger()
+            .await?;
+        let observe = |error: &AccountError| {
+            bulk::record_error_throttle(&slot.throttles, account_id, error);
+        };
+        tokio::select! {
+            biased;
+            () = slot.shutdown.cancelled() => Err(Error::ShuttingDown),
+            result = crate::repair::run_repair_pass_observed(
+                account.as_ref().as_ref(), account_id, &ledger,
+                Some(&slot.delivery), &writer_tx, &slot.coverage, max_requests,
+                Some(&observe),
+            ) => result,
+        }
     }
 
     /// Accept the loss at `key`, permanently and on the record.

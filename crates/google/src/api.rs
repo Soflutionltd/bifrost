@@ -230,7 +230,8 @@ impl GmailClient {
             )
             .await?;
         let transferred_size = u64::try_from(response.body.len()).unwrap_or(u64::MAX);
-        let attachment = super::client::parse_json_response(response, "Gmail API").await?;
+        let attachment =
+            super::client::parse_json_response(response, crate::quota::ApiSurface::Gmail).await?;
         Ok((attachment, transferred_size))
     }
 

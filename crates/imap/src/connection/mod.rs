@@ -18,8 +18,7 @@ use crate::types::{
     MailboxInfo, MailboxName, MetadataEntry, MetadataResult, MoveResult, NamespaceResponse,
     NotifySetParams, QresyncParams, QuotaResource, QuotaRootResponse, Response, ResponseCode,
     SelectOptions, SelectedMailbox, SequenceSet, StatusItem, StatusResult, StoreOperation,
-    StoreResult, ThreadNode, UidRange, UntaggedResponse, UntaggedStatus,
-    format_fetch_attrs,
+    StoreResult, ThreadNode, UidRange, UntaggedResponse, UntaggedStatus, format_fetch_attrs,
 };
 
 pub(crate) const LOGOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);

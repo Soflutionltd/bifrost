@@ -508,6 +508,7 @@ fn store_result_provides_access_to_fetches() {
             },
         ],
         status: crate::types::response::StatusKind::Ok,
+        text: String::new(),
         code: None,
     };
     // Access via .fetches field.
@@ -525,6 +526,7 @@ fn store_result_empty() {
     let result = StoreResult {
         fetches: vec![],
         status: crate::types::response::StatusKind::Ok,
+        text: String::new(),
         code: None,
     };
     assert!(result.fetches.is_empty());

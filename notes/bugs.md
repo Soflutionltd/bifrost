@@ -88,32 +88,6 @@ it. Owner: one function taking the cursor's origin,
 `classify_envelope(cursor, Origin::Fresh | Origin::Stored)`, called by every
 site. The two establishment paths that host two of these sites are CON-017.
 
-## BUG-007 - Mutation campaigns trust the account's item ids with no exactly-once check
-
-**Reported by:** sync-engine (P3).
-
-`run_bulk_pipeline` inserts every `ItemOutcome` it receives into `outcomes`
-keyed by `ObjectId(item.0)`, whether or not that id was submitted this round or
-exists in the campaign at all. An outcome for an unrequested id becomes a new
-counted entry; a duplicate is last-write-wins. `BatchOutcomeBuilder::finalize`
-enforces exactly-once only for providers that use it; the streaming bulk path is
-a `SyncEvent<ItemOutcome>` stream the engine does not validate, unlike inventory
-batches (`validate_boundary`, terminating as `AccountContract`). Mutation
-streams deserve the same guard. Structural fix: STR-005.
-
-## BUG-009 - The orphan-teardown retrier and `repair_debt` skip most of the wire-work gate
-
-**Reported by:** sync-engine (P3).
-
-`engine/orphan_teardown.rs` peeks the raw boundary and skips on `Pause` or
-`Stop`, but not `CheckpointNow`; it takes no `begin_activity` (so a pause can
-report quiescence while a `push_unsubscribe` is in flight), no scheduler
-admission, does not consult the throttle bucket, and records no hold when a
-teardown fails. Its comment says "a paused account makes no provider calls on
-the engine's own initiative", which the code does not keep. `repair_debt`
-likewise does wire work with no activity guard, admission or throttle wait. The
-gate itself is CON-014.
-
 ## BUG-015 - Proof generations restart at zero every attachment while ledger generations are durable
 
 **Reported by:** sync-lanes (live, by reading).
@@ -575,40 +549,14 @@ ObjectType)` owning `observe_set(old, new)`, `observe_changes(since, new)`,
 
 **Reported by:** jmap-account (live, P2).
 
-`error::classify_set_item` turns a JMAP `notFound` / `blobNotFound` into
-`Succeeded(Skipped)` for `UpdateFlags`, `BulkMove`, `BulkDestroy`, `SetKeyword`,
-`SetIsRead`, `AddToContainer`, `RemoveFromContainer`. Graph absorbs a 404 as
-`Skipped` only for destroy. So a flag update or a move of a vanished message is a
-success on JMAP and `Failed(NotFound)` on Graph; a move that moved nothing
-reported as success is questionable on its face. Inside JMAP the list is half
-dead: only `mutation.rs` calls `classify_set_item`, with the three bulk
-operations; `pim.rs`'s single doors route the same `notFound` through
-`SetProgress::item -> set_answer_error -> into_account_error` with no item scope,
-landing on `Protocol(Unknown)` (`UnknownPermanent`). Same wire answer, same
-keyword patch: success via `bulk_set_flags`, terminal unknown error via
-`set_keyword`. Owner: a per-`AccountOperation` "absent target" policy in
+The JMAP-internal split is gone: `sync/mail_set.rs` is one executor for the bulk
+and single-target doors, and a vanished target is `Skipped` on both. Residue,
+cross-provider: JMAP answers a flag update or a move of a vanished message as
+`Skipped`, while Graph absorbs a 404 as `Skipped` only for destroy and reports
+`Failed(NotFound)` otherwise, so the same user action reads differently by
+provider. Owner: a per-`AccountOperation` "absent target" policy in
 `bifrost-types`, applied by every provider. The read-back side of "is it gone" is
 BUG-021.
-
-## BUG-071 - JMAP partial-commit records name shared-account targets by native wire id; two `Email/set` pipelines
-
-**Reported by:** jmap-account (live, P3).
-
-`mutation.rs` (bulk doors) and `pim.rs` (single-target doors, threads, drafts,
-send) both build and send `Email/set` for the same patches (keywords,
-`mailboxIds`, destroy) and answer three questions differently. Guard:
-`mutation::uses_if_in_state` guards `FlagOp::Set` and moves with the cached state
-and retries once on `stateMismatch`; `pim::send_email_set` never guards (its
-comment argues patches need no guard); `destroy_thread_emails_if_unchanged`
-guards with a read state. Absent target: BUG-070. Outcome vocabulary: per-item
-`ItemOutcome` lanes vs a `PartialCommit` record built by `SetProgress`.
-`SetProgress::finish` names its targets with the WIRE id (`ErrorScope::Message {
-id: EmailId::as_str() }`), which for a shared account is the native, unqualified
-id, so a partial-commit record from `set_keyword` / `move_thread` /
-`delete_thread` on a shared message names ids the consumer never saw and cannot
-correlate - and the record is the only place the consumer learns which targets
-committed. Proposal: one `mail_set.rs` executor shared by both (STR-104), and the
-same question asked for IMAP in STR-080.
 
 ## BUG-072 - HTTP status -> error kind is decided by five ladders that already disagree
 
@@ -732,29 +680,12 @@ requests with the Outlook audience. Related: STR-113 (cloud-aware origins).
 
 **Reported by:** google (live; its headline), net-dav (independently flagged `execute_builder`'s string service with its `_ => ApiSurface::Drive` default, and asked that it take `ApiSurface`).
 
-The crate is four Google API clients (Gmail, People, Calendar, Drive) sharing one
-handle named after one of them, `GmailClient`, and nothing in the type system says
-which API a request belongs to. The crate rebuilds that fact three times from three
-inputs: `client.rs::surface_for_url` (longest-prefix match over three bases, with
-`Drive` the catch-all for anything matching none); `client.rs::execute_builder`,
-mapping a `&str` service name (`"Gmail API" | "People API" | "Calendar API" | _`)
-and sending anything unrecognized to `Drive`, so a typo in `"Gmail API"` silently
-drops the concurrency limit and the project hold; and
-`account/error.rs::GmailErrorContext.surface`, defaulting to `Gmail` in `base()`,
-overridden in the `calendar_*` and `contact*` constructors, set by hand in
-`cloud.rs::ctx()`. `quota.rs::ApiSurface` is the right enum, but nothing carries it
-on a request. The error model then forgets it: `parse_json_response` and
-`check_response_status` take a `_service: &str` and ignore it, and `GmailService`
-has one variant, `GmailApi`, so Calendar, People and Drive errors go out as
-`Provider::Gmail` / `Protocol::Gmail` / `WireCause::Gmail(..)`. `classify_response`
-treats every envelope as Gmail's (`FailedPrecondition` outside the history endpoint
-maps to `ConcurrencyConflict`; `PubSubSubscriptionDeleted` is matched on
-`operation == PushSubscribe`), though People reports `google.rpc` statuses and
-Calendar uses its own reason set. Graph distinguishes `Protocol::Graph` from
-`Protocol::Ews`; Google stamps one protocol for four. And `gmail_scope_for` is keyed
-on `AccountOperation` with a `_ => "gmail.modify"` catch-all, so an
-`insufficientPermissions` from Calendar or People tells the consumer to request
-`gmail.modify`.
+The mis-stamping is fixed: requests carry a typed service identity, non-Gmail
+errors no longer claim Gmail, and each API names its own OAuth scope. Residue:
+bifrost-types has no Google provider or per-API protocol and wire variants, so a
+Calendar, People or Drive error now goes out as `Protocol::Unknown` with no
+provider and no wire cause, which is honest but uninformative. Add the
+variants in bifrost-types and stamp them here.
 
 Whether a response may stamp the Gmail project budget is decided twice - at
 observation time keyed on the URL's surface (`send_recorded`), and at translation
@@ -868,7 +799,11 @@ voids, so the scope cycles CursorInvalid -> re-inventory. Refusing the folder
 vanish from the user's view, which removes a capability. The remaining fix is a
 cursor-free sync mode for such folders (re-inventory on each poll, no durable
 UID cursor, no CursorInvalid loop); the inventory site and `reference/imap.md`
-say so.
+say so. It cannot be built inside IMAP alone: it needs a shared
+`CursorEstablishment` variant in bifrost-types and engine scheduling of
+repeated authoritative inventory (today `NoCursor` schedules no further poll),
+plus safe hydration and mutation semantics for UID handles that do not survive
+a re-SELECT. A wave of one owning types, sync and imap.
 
 ## BUG-116 - The HTTP bandwidth meter cannot be handed to the engine or IMAP
 
@@ -891,47 +826,56 @@ factory, and behind it an `AccountRegistration` value owning every per-account
 entry, so detach and retag are one operation each. The string-keyed registries are
 STR-145.
 
-## BUG-156 - Google sharing-domain extraction accepts malformed addresses
+## BUG-164 - `MaintenanceGate::acquire` can re-loop without waiting
 
-**Reported by:** wave 6 fixer (google, lateral).
+**Reported by:** wave 7 green pass (lateral).
 
-`MailboxAddress` now owns Google mailbox identity, but the sharing-domain split
-still accepts an address with a repeated `@` or other malformed shape as long
-as the suffix is nonempty, so a bad address yields a wrong sharing domain
-rather than a refusal.
+With `wait_for_run` set, if `begin_activity()` returns `None` while the
+boundary reads `Run`, `acquire` drops the admission and `continue`s at once, a
+potential busy loop. The wave review believed the boundary and the control's
+running state are the same channel, which would make it unreachable, but that
+was not verified. Waiting on the control's running state before `continue`
+removes the possibility.
 
-## BUG-157 - An SMTP token-source failure has two classes depending on a feature
+## BUG-165 - The Google cross-calendar search cursor error is still stamped as Gmail
 
-**Reported by:** wave 6 fixer (smtp, lateral).
+**Reported by:** wave 7 green pass (lateral).
 
-`authentication/credentials.rs` reports a token-source failure as
-`InvalidInput` when `account-error` is on and as `Connection` when it is off,
-so one failure is a caller error in one build and a transport error in the
-other.
+`account/calendar.rs` builds the cross-calendar search cursor error with
+`Provider::Gmail` and `Protocol::Gmail`, against the rule the rest of the crate
+now follows that only the Gmail surface carries Gmail attribution.
 
-## BUG-158 - IMAP guarded STORE drops the server's response text
+## BUG-160 - Google contacts hides a first-page authorization failure as an empty directory
 
-**Reported by:** wave 6 fixer (imap-account, lateral).
+**Reported by:** wave 7 fixer (google, lateral).
 
-`StoreResult` from a guarded `UID STORE UNCHANGEDSINCE` carries no response
-text, so a refusal reaches the account without the server's explanation.
-Preserving it needs `types` and `connection` changes.
+`account/contacts.rs` absorbs a permission or insufficient-scope failure on the
+first directory page as an empty result, so a user whose directory access was
+withdrawn sees an empty directory instead of being told access is missing.
 
-## BUG-159 - JMAP Principal membership removal sends `false` instead of `null`
+## BUG-161 - JMAP `delete_thread` compares opaque mailbox ids case-insensitively
 
-**Reported by:** wave 6 review (lateral, pre-existing).
+**Reported by:** wave 7 fixer (jmap-account, lateral).
 
-`PrincipalPatch::alias(.., false)` and `member(.., false)` emit
-`"aliases/x": false`. For a `String[Boolean]` / `Id[Boolean]` set, RFC 8620
-PatchObject removal is `null`; a strict server will reject `false` or store it
-as a member with value false. A test currently pins `false`. The other id-set
-patches (`IdSetPatch`) should be checked for the same shape.
+JMAP ids are case-sensitive opaque strings, but `delete_thread` compares mailbox
+ids case-insensitively when deciding whether to destroy in place, so two
+distinct mailboxes whose ids differ only in case can select expunge for the
+wrong one.
 
-## BUG-152 - IMAP leaf matching and the quota fallback edge cases
+## BUG-162 - The JMAP state probe reads and writes the cache under separate locks
 
-**Reported by:** wave 5 fixer (imap-account, lateral).
+**Reported by:** wave 7 fixer (jmap-account, lateral).
 
-A `NIL` hierarchy delimiter still triggers slash-based leaf matching in role
-resolution, and the quota probe's fallback can still pick a shared folder when
-the account has no personal INBOX.
+The state-probe path reads the Email state cache and later writes it under two
+separate lock acquisitions, so a concurrent advance between them can be
+overwritten with an older state, defeating the continuity rule the cache now
+enforces for set responses.
+
+## BUG-163 - `run_repair_pass` counts deferrals as resolutions
+
+**Reported by:** wave 7 fixer (sync, lateral).
+
+`repair.rs::run_repair_pass` promises to report terminal resolutions but its
+return value also counts deferred obligations, so a caller reading it as
+progress over-reports what the pass settled.
 

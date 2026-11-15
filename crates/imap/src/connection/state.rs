@@ -10,7 +10,7 @@
 //! - [`ProtocolState::apply_side_effects`]  -  ongoing response processing
 //!   (the primary mutator during the driver loop).
 //!
-//! Scoped setters (`set_in_auth`, `set_in_select`, etc.) signal in-flight
+//! Tag-keyed armed effects signal in-flight
 //! command context so that `apply_side_effects` can interpret state
 //! transitions correctly. They do not mutate session state or capabilities
 //! directly.
@@ -37,7 +37,6 @@ use crate::types::validated::MailboxName;
 /// [`apply_capability_fetch`](Self::apply_capability_fetch), and
 /// [`apply_side_effects`](Self::apply_side_effects).
 #[derive(Debug)]
-#[allow(clippy::struct_excessive_bools)] // Each bool is an independent in-flight command flag.
 pub(crate) struct ProtocolState {
     /// Current session state (RFC 3501 Section3).
     state: SessionState,
@@ -55,37 +54,23 @@ pub(crate) struct ProtocolState {
     mailbox_selected: bool,
     /// Successfully `ENABLE`d extensions (RFC 5161 Section3.2).
     enabled: Vec<String>,
-    /// The tag of an in-flight LOGOUT command. Consulted by
-    /// `apply_tagged` to transition to `Logout` on tagged OK.
-    in_logout: Option<String>,
-    /// `true` while a LOGIN or AUTHENTICATE command is in flight.
-    /// Consulted by `apply_tagged` to transition to `Authenticated`
-    /// on tagged OK (RFC 3501 Section6.2.2, Section6.2.3).
-    in_auth: bool,
-    /// Set to `Some(mailbox)` while a SELECT or EXAMINE command is
-    /// in flight. Consulted by `apply_tagged` to transition to
-    /// `Selected` on tagged OK, or back to `Authenticated` on tagged
-    /// NO (RFC 3501 Section6.3.1-Section6.3.2).
-    in_select: Option<MailboxName>,
-    /// `true` while a CLOSE or UNSELECT command is in flight.
-    /// Consulted by `apply_tagged` to transition to `Authenticated`
-    /// on tagged OK (RFC 3501 Section6.4.2, RFC 9051 Section6.4.2).
-    in_close: bool,
-    /// Tag-keyed flags for NOTIFY SET or NOTIFY NONE commands in flight.
-    /// Consulted by `apply_tagged` to update
-    /// `self.notify` on tagged OK (RFC 5465 Section3). Cleared by both
-    /// `apply_tagged` (on completion) and `apply_untagged` (on
-    /// NOTIFICATIONOVERFLOW, which takes precedence over the pending
-    /// registration).
-    in_notify_set: std::collections::HashMap<String, NotifyFlags>,
-    /// `true` while an UNAUTHENTICATE command is in flight.
-    /// Consulted by `apply_tagged` to transition to `NotAuthenticated`
-    /// on tagged OK (RFC 8437 Section2).
-    in_unauthenticate: bool,
+    /// One effect per command tag, shared by regular and pipeline dispatch.
+    pending: std::collections::HashMap<String, PendingEffect>,
     /// Set when a tagged OK completed a LOGIN / AUTHENTICATE or
     /// UNAUTHENTICATE transition; taken by the driver, which owes that
     /// transition its capability refresh before it answers.
     transition: Option<SessionTransition>,
+}
+
+/// Foreign completions cannot consume these; every own completion consumes one.
+#[derive(Debug)]
+enum PendingEffect {
+    Logout,
+    Authenticate,
+    Select(MailboxName),
+    Close,
+    Unauthenticate,
+    Notify(NotifyFlags),
 }
 
 /// A session transition that a tagged OK just completed.
@@ -109,12 +94,7 @@ impl ProtocolState {
             selected: None,
             mailbox_selected: false,
             enabled: Vec::new(),
-            in_logout: None,
-            in_auth: false,
-            in_select: None,
-            in_close: false,
-            in_notify_set: std::collections::HashMap::new(),
-            in_unauthenticate: false,
+            pending: std::collections::HashMap::new(),
             transition: None,
         }
     }
@@ -224,6 +204,7 @@ impl ProtocolState {
     /// violations where the connection is irrecoverably dead.
     pub(in crate::connection) fn apply_infrastructure_failure(&mut self) {
         self.state = SessionState::Logout;
+        self.pending.clear();
     }
 
     /// Replace the cached capability set (RFC 3501 Section7.2.1).
@@ -234,89 +215,35 @@ impl ProtocolState {
         self.capabilities = caps;
     }
 
-    // -- Scoped setters --
-    //
-    // Used by the driver task to signal in-flight command context so
-    // that `apply_side_effects` can interpret state transitions
-    // correctly. These do NOT mutate session state or capabilities
-    // directly  -  they set flags that `apply_side_effects` reads.
-
-    /// Mark a LOGOUT command as in-flight.
-    pub(crate) fn set_in_logout(&mut self, tag: String) {
-        self.in_logout = Some(tag);
-    }
-
-    /// Mark a LOGIN or AUTHENTICATE command as in-flight.
-    ///
-    /// Consulted by `apply_tagged` to transition to `Authenticated` on
-    /// tagged OK (RFC 3501 Section6.2.2, Section6.2.3).
-    pub(crate) fn set_in_auth(&mut self, val: bool) {
-        self.in_auth = val;
-    }
-
-    /// Mark a SELECT or EXAMINE command as in-flight with the target
-    /// mailbox.
-    ///
-    /// Consulted by `apply_tagged` to transition to `Selected` on
-    /// tagged OK, or back to `Authenticated` on tagged NO
-    /// (RFC 3501 Section6.3.1-Section6.3.2).
-    pub(crate) fn set_in_select(&mut self, mailbox: Option<MailboxName>) {
-        self.in_select = mailbox;
-    }
-
-    /// Mark a CLOSE or UNSELECT command as in-flight.
-    ///
-    /// Consulted by `apply_tagged` to transition to `Authenticated`
-    /// on tagged OK (RFC 3501 Section6.4.2, RFC 9051 Section6.4.2).
-    pub(crate) fn set_in_close(&mut self, val: bool) {
-        self.in_close = val;
-    }
-
-    /// Arm a NOTIFY effect before sending, on either dispatch path.
-    /// Only its own completion may consume it. An overflow cancels all
-    /// registrations already in flight: an enterprise client must resume
-    /// polling rather than assume push survived a server-reported loss.
-    pub(crate) fn arm_notify(&mut self, command: &crate::types::Command, tag: &str) {
-        let flags = match command {
-            crate::types::Command::NotifySet(params) => NotifyFlags::from(params),
-            crate::types::Command::NotifyNone => NotifyFlags::default(),
+    /// Arm this command's effect after preparation and caller commitment.
+    pub(crate) fn arm_effect(&mut self, command: &crate::types::Command, tag: &str) {
+        use crate::types::Command;
+        let effect = match command {
+            Command::Logout => PendingEffect::Logout,
+            Command::Login { .. } | Command::Authenticate { .. } => PendingEffect::Authenticate,
+            Command::Select { mailbox, .. } | Command::Examine { mailbox, .. } => {
+                PendingEffect::Select(mailbox.clone())
+            }
+            Command::Close | Command::Unselect => PendingEffect::Close,
+            Command::Unauthenticate => PendingEffect::Unauthenticate,
+            Command::NotifySet(params) => PendingEffect::Notify(NotifyFlags::from(params)),
+            Command::NotifyNone => PendingEffect::Notify(NotifyFlags::default()),
             _ => return,
         };
-        self.in_notify_set.insert(tag.to_owned(), flags);
+        self.pending.insert(tag.to_owned(), effect);
     }
 
-    /// A command completed before receiving its literal, so it never ran.
-    pub(in crate::connection) fn disarm_notify(&mut self, tag: &str) {
-        self.in_notify_set.remove(tag);
+    /// Own OK before a required literal grant means this command never ran.
+    /// Remove only its effect: earlier pipelined commands still owe completions.
+    /// NO/BAD must retain SELECT's legitimate deselection behavior.
+    pub(in crate::connection) fn disarm_effect(&mut self, tag: &str) {
+        self.pending.remove(tag);
     }
 
-    /// Mark an UNAUTHENTICATE command as in-flight.
-    ///
-    /// Consulted by `apply_tagged` to transition to `NotAuthenticated`
-    /// on tagged OK (RFC 8437 Section2).
-    pub(crate) fn set_in_unauthenticate(&mut self, val: bool) {
-        self.in_unauthenticate = val;
-    }
-
-    /// Disarm every pending command effect armed by the setters above.
-    ///
-    /// For a command the server completed WITHOUT executing it: its own
-    /// tagged `OK` arrived before the `+` its synchronizing literal was owed
-    /// (RFC 3501 Section 4.3), so the literal - a LOGIN credential, a SELECT
-    /// or NOTIFY mailbox name - never reached the server. Applying that `OK`
-    /// with the effects still armed would authenticate, select or register a
-    /// command that never ran. Called BEFORE `apply_side_effects` on that
-    /// response, so the response's own codes (CAPABILITY,
-    /// NOTIFICATIONOVERFLOW) still apply; only the command's transitions are
-    /// withheld. A `NO`/`BAD` must not take this path: a refused SELECT
-    /// legitimately deselects (RFC 3501 Section 6.3.1).
-    pub(in crate::connection) fn disarm_pending_effects(&mut self) {
-        self.in_logout = None;
-        self.in_auth = false;
-        self.in_select = None;
-        self.in_close = false;
-        self.in_notify_set.clear();
-        self.in_unauthenticate = false;
+    /// Overflow cancels registrations, never unrelated session transitions.
+    fn cancel_pending_notify(&mut self) {
+        self.pending
+            .retain(|_, effect| !matches!(effect, PendingEffect::Notify(_)));
     }
 
     /// The SINGLE mutator. Called exclusively from the wire-reading
@@ -390,7 +317,7 @@ impl ProtocolState {
                 self.notify = NotifyFlags::default();
                 // Cancel any pending NOTIFY SET  -  overflow takes precedence
                 // over the new registration (RFC 5465 Section5.8).
-                self.in_notify_set.clear();
+                self.cancel_pending_notify();
             }
             // RFC 5161 Section3.2: `* ENABLED <ext1> <ext2> ...` updates the
             // set of active extensions. Accumulates across multiple ENABLE
@@ -413,7 +340,7 @@ impl ProtocolState {
     /// Handle side effects from tagged response codes.
     ///
     /// RFC 3501 Section7.1: tagged OK/NO/BAD may carry response codes.
-    /// Also handles the LOGOUT state transition when `in_logout` is set.
+    /// Also consumes the pending effect belonging to this exact tag.
     fn apply_tagged(&mut self, t: &TaggedResponse) {
         match &t.code {
             // RFC 3501 Section7.1 / Section7.2.1: "[CAPABILITY ...]" updates the
@@ -431,100 +358,54 @@ impl ProtocolState {
                 self.notify = NotifyFlags::default();
                 // Cancel any pending NOTIFY SET  -  overflow takes precedence
                 // over the new registration (RFC 5465 Section5.8).
-                self.in_notify_set.clear();
+                self.cancel_pending_notify();
             }
             _ => {}
         }
 
-        // RFC 3501 Section6.1.3: tagged OK for LOGOUT confirms the session
-        // has ended. Transition to Logout state. (BYE already did this
-        // via apply_untagged; this is a belt-and-suspenders confirmation.)
-        // LOGOUT is not pipelinable and the driver drains earlier batches
-        // before sending it. Still correlate here: a stray foreign completion
-        // must not consume the effect of a different command.
-        // Only this command's completion may consume its pending effect. A
-        // foreign tagged refusal must not prevent LOGOUT's own OK from closing
-        // the session, nor may a foreign OK close it prematurely.
-        if self.in_logout.as_deref() == Some(t.tag.as_str()) {
-            if t.status == crate::types::response::StatusKind::Ok {
-                self.state = SessionState::Logout;
-            }
-            // A refusal completes this attempt too; a later command's OK
-            // must not complete a LOGOUT that the server already rejected.
-            self.in_logout = None;
-        }
-
-        // RFC 3501 Section6.2.2, Section6.2.3: tagged OK for LOGIN or AUTHENTICATE
-        // confirms authentication succeeded. Transition to Authenticated.
+        // Consume on OK, NO and BAD alike. Foreign tags change no command
+        // effect, although their advertised response codes still apply.
+        let Some(effect) = self.pending.remove(&t.tag) else {
+            return;
+        };
+        let ok = t.status == crate::types::response::StatusKind::Ok;
         let capabilities_supplied = matches!(t.code, Some(ResponseCode::Capability(_)));
-        if self.in_auth && t.status == crate::types::response::StatusKind::Ok {
-            self.state = SessionState::Authenticated;
-            self.in_auth = false;
-            self.transition = Some(SessionTransition {
-                capabilities_supplied,
-            });
-        } else if self.in_auth {
-            // Auth failed (NO/BAD)  -  clear the flag without transitioning.
-            self.in_auth = false;
-        }
-
-        // RFC 3501 Section6.3.1-Section6.3.2: SELECT/EXAMINE state transitions.
-        if let Some(mailbox) = self.in_select.take() {
-            if t.status == crate::types::response::StatusKind::Ok {
-                // Success -> Selected state with the target mailbox.
-                self.state = SessionState::Selected;
-                self.selected = Some(mailbox);
-                self.mailbox_selected = true;
-            } else if t.status == crate::types::response::StatusKind::No {
-                // RFC 3501 Section6.3.1: NO response deselects any currently
-                // selected mailbox.
+        match effect {
+            PendingEffect::Logout if ok => self.state = SessionState::Logout,
+            PendingEffect::Authenticate if ok => {
+                self.state = SessionState::Authenticated;
+                self.transition = Some(SessionTransition {
+                    capabilities_supplied,
+                });
+            }
+            PendingEffect::Select(mailbox) => {
+                if ok {
+                    self.state = SessionState::Selected;
+                    self.selected = Some(mailbox);
+                    self.mailbox_selected = true;
+                } else if t.status == crate::types::response::StatusKind::No {
+                    // RFC 3501 Section 6.3.1: NO deselects, BAD does not.
+                    self.state = SessionState::Authenticated;
+                    self.selected = None;
+                }
+            }
+            PendingEffect::Close if ok => {
                 self.state = SessionState::Authenticated;
                 self.selected = None;
             }
-            // BAD -> no state change (RFC 3501 Section6).
-        }
-
-        // RFC 3501 Section6.4.2, RFC 9051 Section6.4.2: CLOSE/UNSELECT transitions
-        // back to Authenticated on tagged OK.
-        if self.in_close && t.status == crate::types::response::StatusKind::Ok {
-            self.state = SessionState::Authenticated;
-            self.selected = None;
-            self.in_close = false;
-        } else if self.in_close {
-            // NO/BAD  -  clear flag, no state change.
-            self.in_close = false;
-        }
-
-        // RFC 8437 Section2: UNAUTHENTICATE resets the session to Not Authenticated.
-        // All per-user state is cleared. Does NOT expunge deleted messages
-        // (UNSELECT semantics, not CLOSE semantics).
-        if self.in_unauthenticate && t.status == crate::types::response::StatusKind::Ok {
-            self.state = SessionState::NotAuthenticated;
-            self.selected = None;
-            self.mailbox_selected = false;
-            self.notify = NotifyFlags::default();
-            self.enabled.clear();
-            // Prevent the pending NOTIFY SET block below from applying
-            // stale flags after the session has been reset.
-            self.in_notify_set.clear();
-            self.in_unauthenticate = false;
-            self.transition = Some(SessionTransition {
-                capabilities_supplied,
-            });
-        } else if self.in_unauthenticate {
-            // NO/BAD  -  clear flag, no state change.
-            self.in_unauthenticate = false;
-        }
-
-        // RFC 5465 Section3: NOTIFY SET/NONE updates the per-type registration
-        // flags on tagged OK. NOTIFICATIONOVERFLOW in the tagged response
-        // code was already handled above (clears self.notify AND
-        // self.in_notify_set), so the removal below returns None in that
-        // case  -  no double-write.
-        if let Some(pending_flags) = self.in_notify_set.remove(&t.tag)
-            && t.status == crate::types::response::StatusKind::Ok
-        {
-            self.notify = pending_flags;
+            PendingEffect::Unauthenticate if ok => {
+                self.state = SessionState::NotAuthenticated;
+                self.selected = None;
+                self.mailbox_selected = false;
+                self.notify = NotifyFlags::default();
+                self.enabled.clear();
+                self.pending.clear();
+                self.transition = Some(SessionTransition {
+                    capabilities_supplied,
+                });
+            }
+            PendingEffect::Notify(flags) if ok => self.notify = flags,
+            _ => {}
         }
     }
 }

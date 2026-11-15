@@ -110,8 +110,8 @@ use bifrost_types::{
 
 use super::GraphAccount;
 use super::cursor::{
-    FULL_SCAN_INTERVAL_SECS, GraphCursorPayload, PUBLIC_FOLDER_LIVE_IDS_CAP,
-    PublicFolderCursor, PublicFolderRouting, cap_live_ids, decode_cursor, encode_cursor,
+    FULL_SCAN_INTERVAL_SECS, GraphCursorPayload, PUBLIC_FOLDER_LIVE_IDS_CAP, PublicFolderCursor,
+    PublicFolderRouting, cap_live_ids, decode_cursor, encode_cursor,
 };
 use super::graph_error::{
     GraphErrorContext, cursor_error_to_account_error, ews_shared_scope_error,
@@ -1096,21 +1096,25 @@ async fn resolve_content_routing(
 
 // ── Streams ─────────────────────────────────────────────────
 
-pub(crate) fn public_folder_inventory_stream(
+#[cfg(test)]
+fn public_folder_inventory_stream(
     account: GraphAccount,
     scope: CursorScope,
 ) -> AccountStream<bifrost_types::InventoryEvent> {
-    Box::pin(async_stream::stream! {
-        let CursorScope::Folder(folder) = scope.clone() else {
-            // Routed here only for `CursorScope::Folder` in the routing
-            // map; any other shape is a wiring bug.
-            let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
-                .with_scope(ErrorScope::Cursor(scope.clone()));
-            yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
-                super::cursor::CursorError::Unsupported, ctx));
-            return;
-        };
+    let super::scope::GraphScope::PublicFolder(folder) =
+        super::scope::GraphScope::parse(&scope).expect("public scope")
+    else {
+        panic!("public scope")
+    };
+    public_folder_inventory_stream_admitted(account, scope, folder)
+}
 
+pub(crate) fn public_folder_inventory_stream_admitted(
+    account: GraphAccount,
+    scope: CursorScope,
+    folder: FolderId,
+) -> AccountStream<bifrost_types::InventoryEvent> {
+    Box::pin(async_stream::stream! {
         let Some(routing) = account.public_folder_routing(&folder).await else {
             yield bifrost_types::InventoryEvent::Terminated(
                 account.missing_public_collection_route_error(
@@ -1445,6 +1449,7 @@ fn destroyed_ids(changes: &[Change]) -> Vec<ObjectId> {
 pub(crate) fn public_folder_changes_stream(
     account: GraphAccount,
     cursor: ChangeCursor,
+    parsed: Result<super::scope::GraphScope, super::cursor::CursorError>,
 ) -> AccountStream<SyncEvent<Change>> {
     Box::pin(async_stream::stream! {
         let scope = cursor.scope.clone();
@@ -1461,9 +1466,9 @@ pub(crate) fn public_folder_changes_stream(
         // Guard that the cursor's scope names the folder the payload polls,
         // mirroring the delta `changes_stream` (changes.rs). Without it a
         // mismatched cursor would poll the payload's folder while
-        // checkpointing under the request's scope. `scope_for_kind` maps a
-        // `PublicFolder` payload back to its `CursorScope::Folder`.
-        if !super::inventory::scope_matches_payload(&scope, &payload) {
+        // checkpointing under the request's scope. The parsed public-folder
+        // candidate must name the same folder as the persisted poll route.
+        if !parsed.is_ok_and(|parsed| parsed.matches_payload(&payload)) {
             let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
             yield SyncEvent::Terminated(cursor_error_to_account_error(

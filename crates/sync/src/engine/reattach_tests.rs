@@ -335,7 +335,7 @@ async fn account_restart_exhaustion_reclassifies_retryable_last_error() {
 
     assert_eq!(factory.opens.load(Ordering::SeqCst), 4);
     let event = changes.try_recv().expect("account exhaustion event");
-    assert_eq!(event.scope, CursorScope::Account);
+    assert_eq!(event.scope, EventScope::Account);
     let SyncEvent::Terminated(error) = event.event.as_ref() else {
         panic!("exhaustion publishes a termination")
     };

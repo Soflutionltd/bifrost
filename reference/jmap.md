@@ -191,6 +191,16 @@ clear any pending whole-list replacement of that property; `aliases(..)` /
 administrator's last edit therefore supersedes the earlier one rather than the
 patch carrying an overlapping, invalid pair.
 
+What the per-member path operation means on the wire is an unresolved
+admin-dialect question. `aliases` and `members` are server-admin dialect
+properties, not RFC 9670 fields (RFC 9670 defines neither), and the dialect
+models them as arrays on read, create and whole-list patch, while the
+per-member setters write object-set style `<property>/<token>: true|false`
+paths. RFC 8620's object-set removal rules do not establish this dialect's
+contract for those paths, so the existing boolean operation is kept until it
+is known; switching `false` to `null` alone would leave the array-versus-path
+mismatch in place.
+
 ## Internal transport abstraction
 
 `Client<T: HttpTransport = ReqwestTransport>` is generic over transport.
@@ -239,7 +249,9 @@ patch carrying an overlapping, invalid pair.
   the same block from `lastEventId` trips it again, so it is not a network
   fault to retry either.
 
-  Flattening a push block emits the token-free notifications (`CalendarAlert`,
+  Flattening is `PushObject::decompose` (`crate::PushBlock`: notifications
+  plus one merged `PushStateChange`, the payload type the WebSocket decoder
+  also reads), shared with the WebSocket sync lane. Flattening a push block emits the token-free notifications (`CalendarAlert`,
   `EmailPush`) first, in wire order, and the merged `StateChange` last, because
   only the state change carries the block id a consumer checkpoints. Interrupted
   processing can therefore only replay, never skip. The accepted consequence is
@@ -862,6 +874,19 @@ account shutdown ends `Stopped`. The engine owns the 1s to 60s backoff from
 `ReconnectPolicy`; only actual messages yield `Healthy` and reset it. The
 keepalive probes silent links after 120s, bounding the pong by the 30s setup
 timeout. Connection sessions ignore the maintenance gate.
+
+Each push frame is flattened once by `PushObject::decompose`, the same
+decomposition the EventSource lane uses (see the transport section above):
+groups are unwrapped in wire order, every `StateChange` merges into one
+per-account, per-type change set, the last present `pushState` wins and is
+the one remembered for reconnect, and token-free notifications are routed
+before the merged state. An `EmailPush` is new mail in one account and routes
+exactly as that account's Email state change would, collapsing into a
+same-block Email or EmailDelivery entry for the account rather than emitting a
+second hint. A `CalendarAlert` reports a reminder, not a data change, so it
+emits no hint: an enterprise user expects the reminder, not a full account
+repoll. The WebSocket frame decoder forwards `EmailPush` and `Group` frames as
+push objects; an undecodable one is a malformed push and invalidates broadly.
 
 Push routing uses the open-time `PushRouting` snapshot. Primary Email and
 EmailDelivery changes share the Email cursor; Mailbox maps to Mailbox;
@@ -1710,3 +1735,38 @@ validate them, so such ids may already have been minted and persisted. Rejecting
 these shapes only at this reader could orphan persisted containers. The empty
 mailbox suffix also remains the intentional account-level scope encoding. A
 stricter codec requires versioning and continued legacy decoding.
+
+
+### Shared mail-set execution and progress
+
+`sync/mail_set.rs` executes the Email/set mutations used by bulk mail writes,
+keyword and membership patches, explicit destroys, and guarded Trash-thread
+expunges. It owns state probing, one stateMismatch refresh for internally guarded
+whole-property replacements, and oldState/newState cache continuity. Narrow
+patches and unconditional destroys do not probe or guard: an enterprise Outlook
+user expects an unrelated message arrival not to block a flag edit. Whole-map
+keyword replacements and bulk moves use the replacement guard. Explicit caller
+states and the state from a Trash-membership read are exact guards, never
+refreshed after refusal; replacing those tokens could overwrite a caller's
+concurrent edit or destroy a message that left Trash. Guarded destroy chunks
+still advance only from the preceding set's returned newState.
+
+Bulk outcomes and the single-operation progress adapter use one per-id
+classifier. A notFound covered by the shared absent-target policy is Skipped,
+never Applied: the vanished message should disappear without an error or a
+false claim that this operation moved it. Single-operation progress omits such
+skips from committed steps. An unanswered id remains an uncertain application,
+with the guarded or unguarded recovery advice preserved. Partial-commit primary,
+committed and failed-sibling targets retain the consumer's namespace, including
+the owner qualification for shared mail. Thread member ids use the same owner
+namespace as the thread and its hydrated messages. Submission/create workflows
+retain their separate created-object and compensation accounting.
+
+Local unsupported refusals still expose their operation and generic unsupported
+message key. Their detailed reasons are support diagnostics, not branchable API.
+The shared AccountError builder derives message keys from the kind and has no
+local unsupported-reason field; adding a sync-private enum cannot cross that
+boundary. A typed reason requires a bifrost-types contract change. Native-code
+telemetry remains reserved for provider codes. Send-as routing preserves its
+precedence: feature availability, scheduled-send support, known mailbox, then
+that mailbox's submission capability.

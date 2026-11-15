@@ -52,18 +52,24 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
             () = ctx.shutdown.cancelled() => return,
             () = tokio::time::sleep(interval) => {}
         }
-        // A paused account makes no provider calls on the engine's own
-        // initiative, cleanup included: a pause may be an operator override
-        // or a lost credential, and either way the next pass after resume
-        // picks the orphans up.
-        if matches!(
-            *ctx.boundary_tx.borrow(),
-            crate::cancel::BoundaryRequest::Pause | crate::cancel::BoundaryRequest::Stop
-        ) {
-            continue;
-        }
-        let account = ctx.current.load_full();
-        for handle in ctx.subscriptions.orphans(&ctx.account_id) {
+        for record in ctx.subscriptions.orphans(&ctx.account_id) {
+            let gate = super::maintenance::MaintenanceGate {
+                control: &ctx.control,
+                scheduler: &ctx.scheduler,
+                current: &ctx.current,
+                throttles: &ctx.throttles,
+                account_id: &ctx.account_id,
+                shutdown: &ctx.shutdown,
+                boundary_tx: &ctx.boundary_tx,
+                // Timer-driven: refuse and retry on the next tick.
+                wait_for_run: false,
+            };
+            // The registry retains the scopes behind this opaque handle, so
+            // cleanup honors their declared budgets as well as account holds.
+            let Ok((account, _activity, _admission)) = gate.acquire(&record.scopes).await else {
+                break;
+            };
+            let handle = record.handle;
             let _topology = super::TopologyBump(&ctx.push_topology);
             let result = tokio::select! {
                 biased;
@@ -82,6 +88,7 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
             match result {
                 Ok(Ok(())) => ctx.subscriptions.remove_orphan(&ctx.account_id, &handle),
                 Ok(Err(error)) => {
+                    super::bulk::record_error_throttle(&ctx.throttles, &ctx.account_id, &error);
                     tracing::debug!(
                         target: "bifrost.sync.push",
                         account = ?ctx.account_id,

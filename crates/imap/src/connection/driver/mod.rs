@@ -472,18 +472,16 @@ pub(super) async fn driver_task(
                         {
                             result = Err(error);
                         }
-                        // A failed refresh marks Logout without necessarily
-                        // being connection-fatal (a tagged NO); the channel
-                        // must still close before the answer, so the caller
-                        // never sees a reusable connection.
-                        if (!refused_before_send
-                            && result.as_ref().is_err_and(Error::is_connection_fatal))
-                            || (result.is_err()
-                                && state.session_state() == super::SessionState::Logout)
-                        {
-                            state.apply_infrastructure_failure();
-                            cmd_rx.close();
-                        }
+                        finish_exchange(
+                            &mut state,
+                            &mut cmd_rx,
+                            if refused_before_send {
+                                ExchangePhase::Untouched
+                            } else {
+                                ExchangePhase::Exchanged
+                            },
+                            result.as_ref().err(),
+                        );
                         publish_then_answer(
                             || {
                                 let _ = state_tx.send_replace(state.snapshot());
@@ -512,13 +510,12 @@ pub(super) async fn driver_task(
                             Ok(Gated::Ran(())) => Ok(()),
                             Err(error) => Err(error),
                         };
-                        if result.as_ref().is_err_and(Error::is_connection_fatal)
-                            || (result.is_err()
-                                && state.session_state() == super::SessionState::Logout)
-                        {
-                            state.apply_infrastructure_failure();
-                            cmd_rx.close();
-                        }
+                        finish_exchange(
+                            &mut state,
+                            &mut cmd_rx,
+                            ExchangePhase::Exchanged,
+                            result.as_ref().err(),
+                        );
                         let result = result.map(|()| Box::new(()) as Box<dyn std::any::Any + Send>);
                         publish_then_answer(
                             || {
@@ -533,6 +530,7 @@ pub(super) async fn driver_task(
                             trace!("driver: caller withdrew the batch before it reached the head of the queue");
                             continue;
                         };
+                        let mut phase = ExchangePhase::Untouched;
                         let result = match run_pipeline(
                             &mut wire_reader,
                             &mut state,
@@ -551,6 +549,7 @@ pub(super) async fn driver_task(
                             // command refused in `prepare_command`.
                             PipelineEnd::Refused(refusal) => Err(refusal),
                             PipelineEnd::Ran { results, failure } => {
+                                phase = ExchangePhase::Exchanged;
                                 // A batch that ended early can leave commands
                                 // on the wire whose responses nobody will
                                 // read, so the connection retires whatever
@@ -558,12 +557,12 @@ pub(super) async fn driver_task(
                                 // carry it to the caller.
                                 if let Some(failure) = failure {
                                     trace!(error = %failure, "driver: pipeline ended early");
-                                    state.apply_infrastructure_failure();
-                                    cmd_rx.close();
+                                    phase = ExchangePhase::Interrupted;
                                 }
                                 Ok(results)
                             }
                         };
+                        finish_exchange(&mut state, &mut cmd_rx, phase, result.as_ref().err());
                         publish_then_answer(
                             || {
                                 let _ = state_tx.send_replace(state.snapshot());
@@ -603,10 +602,12 @@ pub(super) async fn driver_task(
                             Ok(Gated::Ran(termination)) => Ok(termination),
                             Err(error) => Err(error),
                         };
-                        if result.as_ref().is_err_and(Error::is_connection_fatal) {
-                            state.apply_infrastructure_failure();
-                            cmd_rx.close();
-                        }
+                        finish_exchange(
+                            &mut state,
+                            &mut cmd_rx,
+                            ExchangePhase::Exchanged,
+                            result.as_ref().err(),
+                        );
                         publish_then_answer(
                             || {
                                 let _ = state_tx.send_replace(state.snapshot());
@@ -773,7 +774,7 @@ pub(in crate::connection) fn live_state_refusal(
 /// evidence of their own (`MissingCapability`, `InvalidInput` and their kin
 /// read as `Unsent`), and `StateChangedBeforeSend` reports `Unsent` by
 /// construction. No pending state effect is armed until this has succeeded,
-/// so a refused SELECT or LOGIN cannot leave `in_select` / `in_auth` behind
+/// so a refused SELECT or LOGIN cannot leave a selection / authentication effect behind
 /// for the next command's tagged OK to complete.
 pub(in crate::connection) fn prepare_command(
     state: &super::state::ProtocolState,
@@ -808,39 +809,7 @@ pub(in crate::connection) async fn run_prepared_command(
     let cmd_kind = cmd.kind();
     let cmd_target: Option<MailboxName> = cmd.mailbox_target().cloned();
 
-    // RFC 3501 Section6.1.3: tell apply_tagged to transition to Logout on
-    // the tagged OK. Must be set before the dispatch loop so the
-    // side-effect handler sees it when the tagged response arrives.
-    if matches!(cmd, Command::Logout) {
-        state.set_in_logout(tag.clone());
-    }
-
-    // RFC 3501 Section6.2.2, Section6.2.3: tell apply_tagged to transition to
-    // Authenticated on the tagged OK for LOGIN or AUTHENTICATE.
-    if matches!(cmd, Command::Login { .. } | Command::Authenticate { .. }) {
-        state.set_in_auth(true);
-    }
-
-    // RFC 3501 Section6.3.1-Section6.3.2: tell apply_tagged to transition to
-    // Selected on tagged OK, or Authenticated on tagged NO, for
-    // SELECT or EXAMINE.
-    if matches!(cmd, Command::Select { .. } | Command::Examine { .. }) {
-        state.set_in_select(cmd_target.clone());
-    }
-
-    // RFC 3501 Section6.4.2, RFC 3691 Section3, RFC 9051 Section6.4.2: tell apply_tagged
-    // to transition to Authenticated on tagged OK for CLOSE or UNSELECT.
-    if matches!(cmd, Command::Close | Command::Unselect) {
-        state.set_in_close(true);
-    }
-
-    // RFC 8437 Section2: tell apply_tagged to transition to NotAuthenticated
-    // on tagged OK for UNAUTHENTICATE.
-    if matches!(cmd, Command::Unauthenticate) {
-        state.set_in_unauthenticate(true);
-    }
-
-    state.arm_notify(cmd, &tag);
+    state.arm_effect(cmd, &tag);
 
     // Send. Exactly one command is on the wire, so the continuation wait has
     // no routing context; a refused literal comes back as that command's own
@@ -1052,6 +1021,39 @@ async fn dispatch_response_loop(
                 return Err(Error::Protocol("unexpected greeting mid-command".into()));
             }
         }
+    }
+}
+
+/// The exchange boundary supplies facts the error variant cannot express.
+#[derive(Clone, Copy)]
+enum ExchangePhase {
+    Untouched,
+    Exchanged,
+    Interrupted,
+}
+
+/// One retirement decision, before publishing or waking any caller.
+///
+/// Framing alone is insufficient: a required capability refresh may finish
+/// with tagged NO on a synchronized stream, yet leave a half-transitioned
+/// session. Upgrades may also poison the transport after a tagged OK. Those
+/// paths mark Logout at the point that invariant is lost. Keep that signal
+/// alongside the error default until read loops supply richer outcomes.
+/// Enterprise users expect a fresh connection after either failure, rather
+/// than later commands using stale capabilities or a poisoned transport.
+fn finish_exchange(
+    state: &mut super::state::ProtocolState,
+    cmd_rx: &mut mpsc::Receiver<DriverCommand>,
+    phase: ExchangePhase,
+    error: Option<&Error>,
+) {
+    let retire = state.session_state() == super::SessionState::Logout
+        || matches!(phase, ExchangePhase::Interrupted)
+        || (matches!(phase, ExchangePhase::Exchanged)
+            && error.is_some_and(Error::is_connection_fatal));
+    if retire {
+        state.apply_infrastructure_failure();
+        cmd_rx.close();
     }
 }
 

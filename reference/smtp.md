@@ -897,6 +897,14 @@ developers implementing a send queue should use batch submission and
 `submission_status`, preserving the lanes on the receipt. The direct contracts
 remain useful for callers implementing their own wire-level policy.
 
+Token-source failures use the direct `Connection` error class with and without
+`account-error`. An enterprise Outlook user expects a token endpoint outage to
+retry, rather than report invalid caller input or demand a replacement password.
+This wrapper class does not override the account-aware recovery projection:
+actual credential loss remains terminal and transient refresh failure remains
+retryable. Unsupported synchronous resolution remains local `InvalidInput`.
+The feature-independent credential test pins the direct class and AUTH phase.
+
 The typed OAuth projection stored inside the wire error is intentional. Direct
 and batch sends share credential resolution, but bifrost-net owns the distinction
 between terminal credential loss and transient token refresh failure. Typed SASL

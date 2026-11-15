@@ -60,8 +60,13 @@ fn scripted_dav_account(
 ) -> ImapAccount {
     ImapAccount::new(ImapAccountParts {
         folders: Arc::new(folders),
-        qresync_enabled,
-        qresync_negotiation_warning,
+        qresync: if qresync_enabled {
+            super::QresyncNegotiation::Enabled
+        } else if qresync_negotiation_warning.is_some() {
+            super::QresyncNegotiation::Refused(super::QresyncRefusal::EnableNotConfirmed)
+        } else {
+            super::QresyncNegotiation::NotRequested
+        },
         dav_scopes,
         ..scripted_account_parts(conn, pool_cap)
     })

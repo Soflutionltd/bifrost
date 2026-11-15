@@ -26,6 +26,7 @@ mod push;
 mod push_stream;
 mod push_tasks;
 mod reactions;
+mod scope;
 mod scopes;
 
 use std::collections::{BTreeMap, HashMap};
@@ -109,7 +110,7 @@ pub(crate) struct GraphAccount {
     /// `/users/{id}` routing key. Built once at `open` from the
     /// factory's configured shared mailboxes via
     /// `GraphClient::for_shared_mailbox`. Selecting the right client by
-    /// scope (`client_for_scope`) keeps every existing call site - which
+    /// scope (`GraphScope::client`) keeps each sync call site - which
     /// reads `api_path_prefix()` off the client - mailbox-correct by
     /// construction.
     pub(crate) shared_clients: Arc<HashMap<String, GraphClient>>,
@@ -512,17 +513,17 @@ impl GraphAccount {
     /// client routes there. A foreign id whose mailbox is no longer
     /// configured is rejected locally: stripping its owner and sending it
     /// to `/me` can target a different mailbox namespace.
+    #[cfg(test)]
     pub(crate) fn client_for_scope(
         &self,
         scope: &CursorScope,
     ) -> Result<&GraphClient, crate::error::GraphError> {
-        if let CursorScope::FolderType { folder, .. } = scope
-            && let Some(foreign) = foreign::parse_folder(folder).foreign()
-        {
-            self.client_for_owner(Some(&foreign.mailbox))
-        } else {
-            Ok(&self.client)
-        }
+        let parsed = scope::GraphScope::parse(scope).map_err(|_| {
+            crate::error::GraphError::Configuration {
+                message: "unsupported Graph scope".to_string(),
+            }
+        })?;
+        parsed.client(self)
     }
 
     /// Select the `GraphClient` for an owning mailbox decoded from a
@@ -585,21 +586,18 @@ impl GraphAccount {
         Ok(Resource::Batch(clients))
     }
 
-    /// The mailbox budget a drive of `scope` is charged to. Follows
-    /// `client_for_scope` exactly - a foreign `FolderType` scope routes to
-    /// its owner, every other REST scope to the primary - except for a bare
-    /// `CursorScope::Folder`, which this crate drives only for public folders
-    /// over EWS: no mailbox budget there.
+    /// The mailbox budget a drive of `scope` is charged to. Use the same
+    /// scope admission and client routing as sync. Public-folder polling
+    /// uses EWS rather than a REST mailbox budget.
     pub(crate) fn budget_for_scope(
         &self,
         scope: &CursorScope,
     ) -> Option<bifrost_types::ThrottleBudget> {
-        if matches!(scope, CursorScope::Folder(_)) {
+        let parsed = scope::GraphScope::parse(scope).ok()?;
+        if matches!(parsed, scope::GraphScope::PublicFolder(_)) {
             return None;
         }
-        self.client_for_scope(scope)
-            .ok()
-            .map(GraphClient::mailbox_budget)
+        parsed.client(self).ok().map(GraphClient::mailbox_budget)
     }
 
     /// Look up the public-folder routing for a native EWS folder id, or
@@ -755,20 +753,6 @@ impl GraphAccount {
         }
         let _ = folder;
         crate::ews::EwsItemShape::default()
-    }
-
-    /// The owning shared-mailbox identity for a foreign scope, or `None`
-    /// for a primary-mailbox scope. Used to decide whether a per-scope
-    /// permission denial quarantines just this scope (foreign) or
-    /// escalates account-wide (primary).
-    pub(crate) fn owner_of_scope(&self, scope: &CursorScope) -> Option<bifrost_types::MailboxId> {
-        if let CursorScope::FolderType { folder, .. } = scope {
-            foreign::parse_folder(folder)
-                .foreign()
-                .map(|foreign| bifrost_types::MailboxId(foreign.mailbox.clone()))
-        } else {
-            None
-        }
     }
 }
 
@@ -1080,52 +1064,53 @@ impl Account for GraphAccount {
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
         let account = self.clone();
         Box::pin(async move {
-            // Public-folder scope: discriminate by routing-map
-            // membership, NOT by the `CursorScope::Folder` variant alone
-            // (that variant is already live on the Graph delta path and
-            // must keep rejecting non-public folders).
-            if let CursorScope::Folder(folder) = &scope
-                && account.public_folder_routing(folder).await.is_some()
-            {
-                return Ok(CursorEstablishment::EstablishViaInventory);
-            }
-            // Fall through: a bare Folder NOT in the routing map stays
-            // Unsupported (preserving the reject-on-bare-Folder
-            // invariant), as does any other unsupported scope.
-            cursor::kind_for_scope(&scope).map_err(|e| {
+            let parsed = scope::GraphScope::parse(&scope).map_err(|error| {
                 graph_error::cursor_error_to_account_error(
-                    e,
+                    error,
                     graph_error::GraphErrorContext::graph(
                         bifrost_types::AccountOperation::EstablishCursor,
                     )
                     .with_scope(bifrost_types::ErrorScope::Cursor(scope.clone())),
                 )
             })?;
+            if let scope::GraphScope::PublicFolder(folder) = &parsed
+                && account.public_folder_routing(folder).await.is_none()
+            {
+                return Err(graph_error::cursor_error_to_account_error(
+                    cursor::CursorError::Unsupported,
+                    graph_error::GraphErrorContext::graph(
+                        bifrost_types::AccountOperation::EstablishCursor,
+                    )
+                    .with_scope(bifrost_types::ErrorScope::Cursor(scope)),
+                ));
+            }
             Ok(CursorEstablishment::EstablishViaInventory)
         })
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
-        // Route a public-folder `CursorScope::Folder` (present in the
-        // routing map) to the no-delta-token inventory pass; everything
-        // else (including a bare Folder for a non-public folder) stays
-        // on the existing delta inventory path, which still rejects it.
-        if let CursorScope::Folder(folder) = &scope {
+        let parsed = scope::GraphScope::parse(&scope);
+        if let Ok(scope::GraphScope::PublicFolder(folder)) = &parsed {
             let account = self.clone();
             let folder = folder.clone();
-            let scope = scope.clone();
             return Box::pin(
                 stream::once(async move {
                     if account.public_folder_routing(&folder).await.is_some() {
-                        public_folder::public_folder_inventory_stream(account, scope)
+                        public_folder::public_folder_inventory_stream_admitted(
+                            account, scope, folder,
+                        )
                     } else {
-                        inventory::inventory_stream(account, scope)
+                        inventory::inventory_stream_admitted(
+                            account,
+                            scope,
+                            Err(cursor::CursorError::Unsupported),
+                        )
                     }
                 })
                 .flatten(),
             );
         }
-        inventory::inventory_stream(self.clone(), scope)
+        inventory::inventory_stream_admitted(self.clone(), scope, parsed)
     }
 
     fn inventory_resume_stream(
@@ -1153,6 +1138,7 @@ impl Account for GraphAccount {
     }
 
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
+        let parsed = scope::GraphScope::parse(&cursor.scope);
         // A decoded `PublicFolder` payload routes to the no-delta-token
         // poll strategy; any other (or undecodable) cursor stays on the
         // existing delta changes path. The cursor kind is unambiguous,
@@ -1162,9 +1148,9 @@ impl Account for GraphAccount {
             cursor::decode_cursor(&cursor).map(|p| p.kind()),
             Ok(cursor::GraphCursorKind::PublicFolder(_))
         ) {
-            return public_folder::public_folder_changes_stream(self.clone(), cursor);
+            return public_folder::public_folder_changes_stream(self.clone(), cursor, parsed);
         }
-        changes::changes_stream(self.clone(), cursor)
+        changes::changes_stream_admitted(self.clone(), cursor, parsed)
     }
 
     fn push_subscribe(

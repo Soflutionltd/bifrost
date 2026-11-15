@@ -150,7 +150,7 @@ async fn recovered_ids_are_published_under_their_own_scope() {
                 other => panic!("repair publishes object changes, got {other:?}"),
             })
             .collect();
-        seen.push((event.scope.clone(), ids));
+        seen.push((event.scope.cursor().expect("cursor event").clone(), ids));
     }
     let _ = sentinel.try_recv();
 

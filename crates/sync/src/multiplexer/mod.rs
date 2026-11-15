@@ -52,6 +52,28 @@ pub struct MultiplexerHandle {
     pub changes_tx: broadcast::Sender<MultiplexerEvent>,
 }
 
+/// Whether an event concerns the whole attachment or one real cursor.
+/// An account cursor is distinct from attachment-wide engine diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EventScope {
+    /// Attachment-wide status, independent of any cursor's lifetime.
+    Account,
+    /// One actual cursor, including providers whose cursor is account-shaped.
+    Cursor(CursorScope),
+}
+
+impl EventScope {
+    /// The real cursor scope, if this event belongs to one.
+    #[must_use]
+    pub fn cursor(&self) -> Option<&CursorScope> {
+        match self {
+            Self::Account => None,
+            Self::Cursor(scope) => Some(scope),
+        }
+    }
+}
+
 /// Unified output of the multiplexer: either a synced `Change` batch
 /// (with optional checkpoint) or a per-scope warning/fatal.
 ///
@@ -59,7 +81,7 @@ pub struct MultiplexerHandle {
 /// broadcast.
 #[derive(Debug, Clone)]
 pub struct MultiplexerEvent {
-    pub scope: CursorScope,
+    pub scope: EventScope,
     pub event: Arc<SyncEvent<bifrost_types::Change>>,
     pub checkpoint: Option<Checkpoint>,
     /// Engine-issued identity for THIS publication of `checkpoint`, to be
@@ -80,7 +102,7 @@ pub struct MultiplexerEvent {
 impl MultiplexerEvent {
     /// An event carrying no checkpoint, and so nothing to acknowledge.
     #[must_use]
-    pub fn unacked(scope: CursorScope, event: Arc<SyncEvent<bifrost_types::Change>>) -> Self {
+    pub fn unacked(scope: EventScope, event: Arc<SyncEvent<bifrost_types::Change>>) -> Self {
         Self {
             scope,
             event,
@@ -469,7 +491,7 @@ impl ChangeDelivery {
              checkpoint they report may predate the retired batches.",
         ));
         let _ = self.tx.send(MultiplexerEvent::unacked(
-            CursorScope::Account,
+            EventScope::Account,
             Arc::new(SyncEvent::Warning(warning)),
         ));
     }
@@ -617,7 +639,7 @@ fn observer_lag_warning(skipped: u64) -> MultiplexerEvent {
         "an observer never acknowledges, so nothing was abandoned and the acknowledging \
          receiver is unaffected; what this observer missed is gone from its own view only.",
     ));
-    MultiplexerEvent::unacked(CursorScope::Account, Arc::new(SyncEvent::Warning(warning)))
+    MultiplexerEvent::unacked(EventScope::Account, Arc::new(SyncEvent::Warning(warning)))
 }
 
 fn lag_warning(skipped: u64, abandoned: usize) -> MultiplexerEvent {
@@ -634,7 +656,7 @@ fn lag_warning(skipped: u64, abandoned: usize) -> MultiplexerEvent {
          batches that were lost."
     )));
     MultiplexerEvent {
-        scope: CursorScope::Account,
+        scope: EventScope::Account,
         event: Arc::new(SyncEvent::Warning(warning)),
         checkpoint: None,
         publication: None,
@@ -1099,7 +1121,7 @@ impl Multiplexer {
                                             // reattach can repair credentials or policy, so
                                             // keep the reader alive to observe its generation.
                                             let _ = lifecycle_changes.send(MultiplexerEvent {
-                                                scope: CursorScope::Account,
+                                                scope: EventScope::Account,
                                                 event: Arc::new(SyncEvent::Terminated(err)),
                                                 checkpoint: None,
                                                 publication: None,
@@ -2337,9 +2359,17 @@ mod tests {
         run.await.expect("multiplexer");
     }
 
+    #[test]
+    fn account_cursor_and_attachment_events_are_distinct() {
+        let cursor = EventScope::Cursor(CursorScope::Account);
+        assert_ne!(cursor, EventScope::Account);
+        assert_eq!(cursor.cursor(), Some(&CursorScope::Account));
+        assert_eq!(EventScope::Account.cursor(), None);
+    }
+
     fn warning_event(message: &str) -> MultiplexerEvent {
         MultiplexerEvent {
-            scope: CursorScope::Account,
+            scope: EventScope::Account,
             event: Arc::new(SyncEvent::Warning(bifrost_types::Warning::user_safe(
                 bifrost_types::WarningKind::Other,
                 message,
@@ -2886,7 +2916,7 @@ mod tests {
         // Overflow the one-slot ring under the receiver.
         for state in [b"a".as_slice(), b"b".as_slice()] {
             let _ = tx.send(MultiplexerEvent::unacked(
-                CursorScope::Account,
+                EventScope::Account,
                 Arc::new(SyncEvent::Warning(bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::Other,
                     String::from_utf8_lossy(state).into_owned(),
@@ -2962,7 +2992,7 @@ mod tests {
             let checkpoint = Self::backfill_page(partition);
             let id = self.control.expect_checkpoint(checkpoint.clone());
             let event = MultiplexerEvent {
-                scope: CursorScope::Account,
+                scope: EventScope::Cursor(CursorScope::Account),
                 event: Arc::new(SyncEvent::Batch(bifrost_types::Batch {
                     items: Vec::new(),
                     page_boundary: bifrost_types::PageBoundary::Final,
@@ -3233,7 +3263,7 @@ mod tests {
         assert!(
             !h.delivery
                 .publish_acknowledgeable(MultiplexerEvent::unacked(
-                    CursorScope::Account,
+                    EventScope::Account,
                     Arc::new(SyncEvent::Warning(bifrost_types::Warning::user_safe(
                         bifrost_types::WarningKind::Other,
                         "live".to_owned(),

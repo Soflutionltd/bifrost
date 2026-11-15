@@ -184,11 +184,11 @@ async fn a_reset_between_partitions_stops_the_walk_it_invalidated() {
                 .clone()
                 .expect("a checkpointed page carries its publication");
             let checkpoint = event.checkpoint.clone().expect("a checkpointed page");
-            let _ = page_tx.send(event.scope.clone());
+            let _ = page_tx.send(event.scope.cursor().expect("cursor event").clone());
             let _ = reader_engine
                 .ack_checkpoint(
                     &reader_account,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     checkpoint,
                     Some(publication),
                 )

@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
-use crate::{DataType, PushObject};
+use crate::{DataType, PushBlock, PushObject};
 
 pub(crate) type DataTypeSet = HashSet<DataType>;
 
@@ -591,9 +591,9 @@ pub(crate) fn session<T: PushTransport>(
             awaiting_pong = false;
             match message {
                 Ok(crate::client_ws::WebSocketMessage::PushNotification(push)) => {
-                    remember_push_state(&push, &push_state).await;
-                    let mut hints = Vec::new();
-                    collect_push(push, &mut hints, &routing);
+                    let block = push.decompose();
+                    let hints = collect_push(&block, &routing);
+                    remember_push_state(&block, &push_state).await;
                     for hint in hints { yield E::Invalidated(hint); }
                 },
                 Ok(crate::client_ws::WebSocketMessage::UnknownFrame) => yield E::Invalidated(InvalidationHint { source: PushSource::JmapStateChange, payload: HintPayload::Unknown }),
@@ -645,50 +645,71 @@ async fn reenable_current_push_set<T: PushTransport>(
     transport.set_push_data_types(&current, push_state).await
 }
 
-async fn remember_push_state(push: &PushObject, state: &Arc<Mutex<Option<String>>>) {
-    if let Some(value) = last_push_state(push) {
-        *state.lock().await = Some(value.to_string());
+/// Keep the last present `pushState` of the block. `decompose` already
+/// resolved it across groups, so a block without one leaves the stored
+/// position untouched.
+async fn remember_push_state(block: &PushBlock, state: &Arc<Mutex<Option<String>>>) {
+    if let Some(value) = block.state.as_ref().and_then(|s| s.push_state.clone()) {
+        *state.lock().await = Some(value);
     }
 }
 
-fn last_push_state(push: &PushObject) -> Option<&str> {
-    match push {
-        PushObject::StateChange { push_state, .. } => push_state.as_deref(),
-        PushObject::Group { entries } => entries.iter().filter_map(last_push_state).next_back(),
-        _ => None,
-    }
-}
-
-fn collect_push(push: PushObject, tx: &mut Vec<InvalidationHint>, routing: &PushRouting) {
-    match push {
-        PushObject::StateChange { changed, .. } => {
-            // RFC 8620 s7.1: `changed` is keyed by `accountId`. Route each
-            // entry to the cursor scopes that account actually drives
-            // instead of collapsing every account onto the primary type
-            // scopes.
-            for (account_id, by_type) in &changed {
-                let has_email_state = by_type.contains_key(&DataType::Email);
-                for data_type in by_type.keys() {
-                    // RFC 8621 advances EmailDelivery when a new Email is
-                    // added, which also advances Email. If a server includes
-                    // both keys, the Email hint already covers the same
-                    // tracked cursor; do not emit it twice.
-                    if has_email_state && matches!(data_type, DataType::EmailDelivery) {
-                        continue;
-                    }
-                    collect_state_change(account_id, data_type, tx, routing);
+/// Route one decomposed push block to invalidation hints.
+///
+/// The token-free notifications come first, matching `decompose`'s ordering,
+/// then the merged per-account, per-type state changes.
+fn collect_push(block: &PushBlock, routing: &PushRouting) -> Vec<InvalidationHint> {
+    let mut tx = Vec::new();
+    let changed = block.state.as_ref().map(|s| &s.changed);
+    for notification in &block.notifications {
+        match notification {
+            PushObject::EmailPush { account_id, .. } => {
+                // A new message arrived in this account: exactly the Email
+                // state change a StateChange would announce. Route it the
+                // same narrow way, and skip it when the block's merged state
+                // already names Email or EmailDelivery for the account, which
+                // would emit the same hint twice.
+                let covered = changed
+                    .and_then(|c| c.get(account_id))
+                    .is_some_and(|types| {
+                        types.contains_key(&DataType::Email)
+                            || types.contains_key(&DataType::EmailDelivery)
+                    });
+                if !covered {
+                    collect_state_change(account_id, &DataType::Email, &mut tx, routing);
                 }
             }
-        }
-        PushObject::Group { entries } => {
-            for entry in entries {
-                collect_push(entry, tx, routing);
-            }
-        }
-        _ => {
-            tx.push(session_hint(HintPayload::Unknown));
+            // A fired alert reports a reminder time, not a data change: no
+            // event, calendar or mailbox state moved. An enterprise user
+            // expects the reminder, not a full account repoll, so the sync
+            // lane emits nothing for it.
+            #[cfg(feature = "calendars")]
+            PushObject::CalendarAlert(_) => {}
+            // `decompose` folds these into `block.state` and never leaves
+            // them in `notifications`.
+            PushObject::StateChange { .. } | PushObject::Group { .. } => {}
         }
     }
+    let Some(changed) = changed else {
+        return tx;
+    };
+    // RFC 8620 s7.1: `changed` is keyed by `accountId`. Route each entry to
+    // the cursor scopes that account actually drives instead of collapsing
+    // every account onto the primary type scopes.
+    for (account_id, by_type) in changed {
+        let has_email_state = by_type.contains_key(&DataType::Email);
+        for data_type in by_type.keys() {
+            // RFC 8621 advances EmailDelivery when a new Email is added,
+            // which also advances Email. If a server includes both keys, the
+            // Email hint already covers the same tracked cursor; do not emit
+            // it twice.
+            if has_email_state && matches!(data_type, DataType::EmailDelivery) {
+                continue;
+            }
+            collect_state_change(account_id, data_type, &mut tx, routing);
+        }
+    }
+    tx
 }
 
 fn collect_state_change(
@@ -753,9 +774,7 @@ mod tests {
     /// Route one push frame exactly as the session does and hand each hint
     /// to `tx`, so the routing tests read hints one by one.
     fn emit_push(push: PushObject, tx: &broadcast::Sender<WatchEvent>, routing: &PushRouting) {
-        let mut hints = Vec::new();
-        collect_push(push, &mut hints, routing);
-        for hint in hints {
+        for hint in collect_push(&push.decompose(), routing) {
             let _ = tx.send(WatchEvent::Invalidated { hint });
         }
     }
@@ -1045,6 +1064,50 @@ mod tests {
             &routing(),
         );
 
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    // An `EmailPush` is new mail in one account: it routes to that
+    // account's Email scope, never to a broad repoll, and collapses into a
+    // StateChange in the same block that already names Email.
+    #[test]
+    fn an_email_push_routes_narrowly_and_dedups_against_its_block_state() {
+        let push = || PushObject::EmailPush {
+            account_id: "acct-foreign".to_string(),
+            email: serde_json::Value::Null,
+        };
+        let (tx, mut rx) = broadcast::channel(8);
+        emit_push(push(), &tx, &routing());
+        let scopes = drain(&mut rx)
+            .iter()
+            .filter_map(hinted_scope)
+            .collect::<Vec<_>>();
+        assert_eq!(scopes, vec![foreign_scope("acct-foreign")]);
+
+        emit_push(
+            PushObject::Group {
+                entries: vec![push(), state_change("acct-foreign", DataType::Email, "f2")],
+            },
+            &tx,
+            &routing(),
+        );
+        let scopes = drain(&mut rx)
+            .iter()
+            .filter_map(hinted_scope)
+            .collect::<Vec<_>>();
+        assert_eq!(scopes, vec![foreign_scope("acct-foreign")]);
+    }
+
+    // A fired calendar alert moved no state; it must not cost a repoll.
+    #[cfg(feature = "calendars")]
+    #[test]
+    fn a_calendar_alert_emits_no_hint() {
+        let alert: PushObject = serde_json::from_str(
+            r#"{"@type":"CalendarAlert","accountId":"acct-primary","calendarEventId":"e1","uid":"u1","alertId":"al1"}"#,
+        )
+        .expect("alert decodes");
+        let (tx, mut rx) = broadcast::channel(8);
+        emit_push(alert, &tx, &routing());
         assert!(drain(&mut rx).is_empty());
     }
 
@@ -1863,17 +1926,28 @@ mod tests {
     async fn the_reader_captures_the_latest_push_state_and_never_unsets_it() {
         let state = Arc::new(Mutex::new(None));
 
-        remember_push_state(&state_change("u1", DataType::Email, "s1"), &state).await;
+        remember_push_state(
+            &state_change("u1", DataType::Email, "s1").decompose(),
+            &state,
+        )
+        .await;
         assert!(state.lock().await.is_none(), "no pushState, nothing cached");
 
-        let mut with_state = state_change("u1", DataType::Email, "s1");
-        if let PushObject::StateChange { push_state, .. } = &mut with_state {
-            *push_state = Some("ps-1".to_string());
-        }
-        remember_push_state(&with_state, &state).await;
+        let with_state = || {
+            let mut object = state_change("u1", DataType::Email, "s1");
+            if let PushObject::StateChange { push_state, .. } = &mut object {
+                *push_state = Some("ps-1".to_string());
+            }
+            object
+        };
+        remember_push_state(&with_state().decompose(), &state).await;
         assert_eq!(state.lock().await.as_deref(), Some("ps-1"));
 
-        remember_push_state(&state_change("u1", DataType::Email, "s2"), &state).await;
+        remember_push_state(
+            &state_change("u1", DataType::Email, "s2").decompose(),
+            &state,
+        )
+        .await;
         assert_eq!(
             state.lock().await.as_deref(),
             Some("ps-1"),
@@ -1885,9 +1959,9 @@ mod tests {
             *push_state = Some("ps-2".to_string());
         }
         let group = PushObject::Group {
-            entries: vec![with_state, later],
+            entries: vec![with_state(), later],
         };
-        remember_push_state(&group, &state).await;
+        remember_push_state(&group.decompose(), &state).await;
         assert_eq!(state.lock().await.as_deref(), Some("ps-2"));
     }
 

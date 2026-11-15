@@ -341,8 +341,8 @@ pub(crate) fn into_account_error(error: Error, mut ctx: GmailErrorContext) -> Ac
         // unreadable-success evidence: acknowledged, and the write the body
         // reports on may have landed.
         Error::Response(resp) => translate_response(*resp, &ctx),
-        Error::JsonDecode { source, .. } => {
-            parse_failed(&ctx, format!("Gmail JSON decode: {source}"))
+        Error::JsonDecode { service, source } => {
+            parse_failed(&ctx, format!("{service} JSON decode: {source}"))
         }
         Error::Base64 { encoding, source } => {
             parse_failed(&ctx, format!("Gmail {encoding} decode failed: {source}"))
@@ -540,6 +540,54 @@ pub(crate) fn merge_delete_fallback_error(
 // Internal helpers
 // ---------------------------------------------------------------------
 
+// Shared enums cannot name the non-mail Google APIs yet. Do not claim these
+// failures came from Gmail, or mislead users into granting mail permissions.
+fn provider_for(ctx: &GmailErrorContext) -> Option<Provider> {
+    (ctx.surface == crate::quota::ApiSurface::Gmail).then_some(Provider::Gmail)
+}
+
+fn protocol_for(ctx: &GmailErrorContext) -> Protocol {
+    if ctx.surface == crate::quota::ApiSurface::Gmail {
+        Protocol::Gmail
+    } else {
+        Protocol::Unknown
+    }
+}
+
+trait GoogleProvider {
+    fn google_provider(self, ctx: &GmailErrorContext) -> Self;
+}
+
+impl GoogleProvider for AccountErrorBuilder {
+    fn google_provider(self, ctx: &GmailErrorContext) -> Self {
+        match provider_for(ctx) {
+            Some(provider) => self.provider(provider),
+            None => self,
+        }
+    }
+}
+
+fn scope_for(ctx: &GmailErrorContext) -> &'static str {
+    use crate::quota::ApiSurface;
+    use AccountOperation::*;
+    match ctx.surface {
+        ApiSurface::Gmail => gmail_scope_for(ctx.operation),
+        ApiSurface::Drive => "drive.file",
+        ApiSurface::Calendar => match ctx.operation {
+            CalendarsList => "calendar.calendarlist.readonly",
+            EventsInRange | EventGet | EventSearch | EventAutocomplete => {
+                "calendar.events.readonly"
+            }
+            _ => "calendar.events",
+        },
+        ApiSurface::People => match ctx.operation {
+            DirectorySearch => "directory.readonly",
+            ContactCreate | ContactUpdate | ContactDelete => "contacts",
+            _ => "contacts.readonly",
+        },
+    }
+}
+
 fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -> AccountError {
     if let bifrost_net::Error::LocalHold { ref key, .. } = net_error {
         let budget = (ctx.surface == crate::quota::ApiSurface::Gmail)
@@ -547,8 +595,8 @@ fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -
         let error = bifrost_net::into_account_error_with_throttle_scope(
             net_error,
             bifrost_net::NetErrorContext {
-                provider: Some(Provider::Gmail),
-                protocol: Protocol::Gmail,
+                provider: provider_for(ctx),
+                protocol: protocol_for(ctx),
                 operation: ctx.operation,
                 scope: ctx.scope.clone(),
             },
@@ -588,8 +636,8 @@ fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -
     }
 
     let net_ctx = bifrost_net::NetErrorContext {
-        provider: Some(Provider::Gmail),
-        protocol: Protocol::Gmail,
+        provider: provider_for(ctx),
+        protocol: protocol_for(ctx),
         operation: ctx.operation,
         scope: ctx.scope.clone(),
     };
@@ -632,7 +680,7 @@ fn refine_status_with_gmail_body(
         .clone()
         .unwrap_or_else(|| crate::error::GmailResponseHeaders::from_headers(headers));
     let resp = GmailResponseError {
-        service: crate::error::GmailService::GmailApi,
+        service: ctx.surface.into(),
         status,
         headers: resp_headers,
         body: bytes::Bytes::copy_from_slice(body),
@@ -691,8 +739,8 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
     let (kind, cause) = classify_response(status, &signal, ctx, retry_hint);
 
     let mut builder = AccountErrorBuilder::new(kind, cause)
-        .provider(Provider::Gmail)
-        .protocol(Protocol::Gmail)
+        .google_provider(ctx)
+        .protocol(protocol_for(ctx))
         .operation(ctx.operation)
         .status(Some(status));
 
@@ -707,7 +755,13 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
         .unwrap_or_else(|| status.to_string());
     builder = builder.native_code(native);
 
-    builder = builder.push_cause(Cause::Wire(WireCause::Gmail(signal.clone())));
+    if ctx.surface == crate::quota::ApiSurface::Gmail {
+        builder = builder.push_cause(Cause::Wire(WireCause::Gmail(signal.clone())));
+    }
+    builder = builder.text(DiagnosticText::support_only(format!(
+        "{} response",
+        resp.service
+    )));
 
     // the response was acknowledged. Push the attempt
     // evidence so non-idempotent ops with a `Server(Error)` cause
@@ -808,7 +862,7 @@ fn classify_response(
         // outside the history endpoint a `failedPrecondition`
         // signals an etag/version mismatch on the targeted resource,
         // not a malformed client request.
-        GmailSignal::FailedPrecondition => {
+        GmailSignal::FailedPrecondition if ctx.surface != crate::quota::ApiSurface::Drive => {
             return (
                 AccountErrorKind::ConcurrencyConflict,
                 Cause::State(StateCause::ConcurrencyConflict),
@@ -840,7 +894,9 @@ fn classify_response(
         // A missing registration is retryable watch unavailability. Outlook
         // users expect polling to retain mail progress while push recovers;
         // a registration gap is not evidence that history has expired.
-        GmailSignal::PubSubSubscriptionDeleted | GmailSignal::PubSubSubscriptionExpired => {
+        GmailSignal::PubSubSubscriptionDeleted | GmailSignal::PubSubSubscriptionExpired
+            if ctx.surface == crate::quota::ApiSurface::Gmail =>
+        {
             return (
                 AccountErrorKind::Server(ServerErrorKind::Unavailable),
                 Cause::Server(ServerCause::Unavailable { retry_hint }),
@@ -851,14 +907,14 @@ fn classify_response(
             // the Gmail plan; these intentionally use Unknown { code }
             // and rely on `native_code` for downstream filters.
             match code.as_str() {
-                "invalidArgument" => {
+                "invalidArgument" | "INVALID_ARGUMENT" => {
                     return malformed_kind_cause(format!("HTTP {status} invalidArgument"));
                 }
-                "insufficientPermissions" => {
+                "insufficientPermissions" | "ACCESS_TOKEN_SCOPE_INSUFFICIENT" => {
                     return (
                         AccountErrorKind::Authorization(AccessErrorKind::InsufficientScope),
                         Cause::Access(AccessCause::InsufficientScope {
-                            needed: gmail_scope_for(ctx.operation),
+                            needed: scope_for(ctx),
                         }),
                     );
                 }
@@ -1091,12 +1147,12 @@ fn parse_failed(ctx: &GmailErrorContext, detail: String) -> AccountError {
     let mut builder = AccountErrorBuilder::new(
         AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
         Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Gmail,
+            protocol: protocol_for(ctx),
             detail: Some(DiagnosticText::support_only(detail.clone())),
         }),
     )
-    .provider(Provider::Gmail)
-    .protocol(Protocol::Gmail)
+    .google_provider(ctx)
+    .protocol(protocol_for(ctx))
     .operation(ctx.operation)
     .text(DiagnosticText::support_only(detail))
     // Post-200 decode failures (`JsonDecode`, `Base64`): the response was
@@ -1117,8 +1173,8 @@ fn malformed_request(ctx: &GmailErrorContext, detail: String) -> AccountError {
             detail: DiagnosticText::support_only(detail.clone()),
         }),
     )
-    .provider(Provider::Gmail)
-    .protocol(Protocol::Gmail)
+    .google_provider(ctx)
+    .protocol(protocol_for(ctx))
     .operation(ctx.operation)
     .text(DiagnosticText::support_only(detail));
     if let Some(scope) = ctx.scope.clone() {
@@ -1150,13 +1206,13 @@ fn provider_fault(
     let mut builder = AccountErrorBuilder::new(
         AccountErrorKind::Protocol(kind),
         Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Gmail,
+            protocol: protocol_for(ctx),
             detail: Some(detail.clone()),
         }),
     )
     .push_cause(Cause::Attempt(AttemptCause::new(state)))
-    .provider(Provider::Gmail)
-    .protocol(Protocol::Gmail)
+    .google_provider(ctx)
+    .protocol(protocol_for(ctx))
     .operation(ctx.operation)
     .text(detail);
     if let Some(scope) = ctx.scope.clone() {
@@ -1170,9 +1226,9 @@ fn provider_fault(
 fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountError {
     match local {
         GmailLocalError::Unsupported { operation, detail } => {
-            let mut builder = AccountError::unsupported(operation, Protocol::Gmail)
+            let mut builder = AccountError::unsupported(operation, protocol_for(ctx))
                 .into_builder()
-                .provider(Provider::Gmail);
+                .google_provider(ctx);
             if let Some(scope) = ctx.scope.clone() {
                 builder = builder.scope(scope);
             }
@@ -1202,8 +1258,8 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
                 ),
             };
             let mut builder = AccountErrorBuilder::new(sync_kind, cause)
-                .provider(Provider::Gmail)
-                .protocol(Protocol::Gmail)
+                .google_provider(ctx)
+                .protocol(protocol_for(ctx))
                 .operation(ctx.operation)
                 .scope(ErrorScope::Cursor(CursorScope::Account))
                 .text(DiagnosticText::support_only(detail));
@@ -1224,8 +1280,8 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
             Cause::State(StateCause::SchemaIncompatible),
         )
-        .provider(Provider::Gmail)
-        .protocol(Protocol::Gmail)
+        .google_provider(ctx)
+        .protocol(protocol_for(ctx))
         .operation(ctx.operation)
         .scope(ErrorScope::Cursor(CursorScope::Account))
         .native_code("cursor_account_identity_mismatch")
@@ -1244,9 +1300,9 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
         ),
         GmailLocalError::BlobRangeUnsupported { blob_id } => {
             let mut builder =
-                AccountError::unsupported(AccountOperation::OpenBlobRange, Protocol::Gmail)
+                AccountError::unsupported(AccountOperation::OpenBlobRange, protocol_for(ctx))
                     .into_builder()
-                    .provider(Provider::Gmail)
+                    .google_provider(ctx)
                     .text(DiagnosticText::support_only(format!(
                         "gmail blob {blob_id} does not support range reads"
                     )));
@@ -1288,15 +1344,15 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             let mut builder = AccountErrorBuilder::new(
                 AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
                 Cause::Wire(WireCause::MalformedResponse {
-                    protocol: Protocol::Gmail,
+                    protocol: protocol_for(ctx),
                     detail: Some(detail.clone()),
                 }),
             )
             .push_cause(Cause::Attempt(AttemptCause::new(
                 TransmissionState::Acknowledged,
             )))
-            .provider(Provider::Gmail)
-            .protocol(Protocol::Gmail)
+            .google_provider(ctx)
+            .protocol(protocol_for(ctx))
             .operation(ctx.operation)
             .text(detail);
             if let Some(scope) = ctx.scope.clone() {
@@ -1320,8 +1376,8 @@ fn internal(
         AccountErrorKind::Internal(kind),
         Cause::Internal(InternalCause::new(kind, Some(detail.clone()))),
     )
-    .provider(Provider::Gmail)
-    .protocol(Protocol::Gmail)
+    .google_provider(ctx)
+    .protocol(protocol_for(ctx))
     .operation(ctx.operation)
     .text(detail);
     if let Some(state) = attempt {
@@ -1379,6 +1435,66 @@ mod tests {
         format!(
             r#"{{"error":{{"code":429,"message":"x","errors":[{{"domain":"usageLimits","reason":"{reason}"}}]}}}}"#
         )
+    }
+
+    #[test]
+    fn non_mail_errors_keep_surface_and_permission_scope() {
+        for (surface, operation, scope) in [
+            (
+                crate::quota::ApiSurface::Calendar,
+                AccountOperation::EventGet,
+                "calendar.events.readonly",
+            ),
+            (
+                crate::quota::ApiSurface::Calendar,
+                AccountOperation::EventUpdate,
+                "calendar.events",
+            ),
+            (
+                crate::quota::ApiSurface::Calendar,
+                AccountOperation::CalendarsList,
+                "calendar.calendarlist.readonly",
+            ),
+            (
+                crate::quota::ApiSurface::People,
+                AccountOperation::ContactGet,
+                "contacts.readonly",
+            ),
+            (
+                crate::quota::ApiSurface::People,
+                AccountOperation::ContactUpdate,
+                "contacts",
+            ),
+            (
+                crate::quota::ApiSurface::People,
+                AccountOperation::DirectorySearch,
+                "directory.readonly",
+            ),
+            (
+                crate::quota::ApiSurface::Drive,
+                AccountOperation::HostAttachment,
+                "drive.file",
+            ),
+        ] {
+            let mut ctx = GmailErrorContext::base(operation);
+            ctx.surface = surface;
+            assert_eq!(scope_for(&ctx), scope);
+            let error = Error::response_from_parts(
+                surface.into(),
+                403,
+                crate::error::GmailResponseHeaders::default(),
+                Bytes::from_static(
+                    br#"{"error":{"errors":[{"reason":"insufficientPermissions"}]}}"#,
+                ),
+            );
+            let translated = into_account_error(error, ctx);
+            assert_eq!(translated.provider(), None);
+            assert_eq!(translated.protocol(), Some(Protocol::Unknown));
+            assert_eq!(
+                translated.kind(),
+                &AccountErrorKind::Authorization(AccessErrorKind::InsufficientScope)
+            );
+        }
     }
 
     #[test]

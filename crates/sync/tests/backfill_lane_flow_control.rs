@@ -567,7 +567,7 @@ async fn read_without_acknowledging(
             );
             if let Some(checkpoint) = backfill_checkpoint(&event) {
                 held.push((
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone().expect("checkpointed publication"),
                 ));
@@ -617,7 +617,7 @@ async fn a_consumer_that_holds_pages_unread_stalls_the_backfill_producer() {
             let event = events.recv().await.expect("the broadcast stays open");
             if let Some(checkpoint) = backfill_checkpoint(&event) {
                 return (
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone().expect("checkpointed publication"),
                 );
@@ -785,7 +785,7 @@ async fn no_backfill_page_is_lost_or_duplicated_under_the_bound() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -1143,7 +1143,7 @@ async fn ack_page_or_fenced(
     let outcome = engine
         .ack_checkpoint(
             account_id,
-            event.scope.clone(),
+            event.scope.cursor().expect("cursor event").clone(),
             Checkpoint::Backfill(checkpoint.clone()),
             event.publication.clone(),
         )
@@ -1252,7 +1252,7 @@ async fn a_page_lost_after_the_marker_was_published_is_refused_at_ack_time() {
         engine
             .ack_checkpoint(
                 &account_id,
-                event.scope.clone(),
+                event.scope.cursor().expect("cursor event").clone(),
                 Checkpoint::Backfill(checkpoint.clone()),
                 event.publication.clone(),
             )
@@ -1280,7 +1280,7 @@ async fn a_page_lost_after_the_marker_was_published_is_refused_at_ack_time() {
             );
             if checkpoint.partition.0 == b"complete:v2" {
                 return (
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 );
@@ -1288,7 +1288,7 @@ async fn a_page_lost_after_the_marker_was_published_is_refused_at_ack_time() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -1417,7 +1417,7 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -1441,7 +1441,7 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
             };
             if checkpoint.partition.0 == b"complete:v2" {
                 return (
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 );
@@ -1449,7 +1449,7 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -1522,7 +1522,7 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -1932,7 +1932,7 @@ async fn a_page_ack_replayed_across_a_detach_does_not_rebuild_the_resume_positio
             acked += 1;
             if acked == 6 {
                 unflushed = Some((
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone().expect("checkpointed publication"),
                 ));
@@ -2056,7 +2056,7 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -2081,7 +2081,7 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -2334,7 +2334,7 @@ async fn a_departure_inside_a_live_detach_records_no_loss() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -2580,7 +2580,7 @@ async fn a_loss_after_the_marker_is_durable_still_forces_a_fresh_walk() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -2606,7 +2606,7 @@ async fn a_loss_after_the_marker_is_durable_still_forces_a_fresh_walk() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -2749,7 +2749,7 @@ async fn an_incomplete_positional_walk_restarts_after_a_detach() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -2789,7 +2789,7 @@ async fn an_incomplete_positional_walk_restarts_after_a_detach() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -2865,7 +2865,7 @@ async fn a_withheld_marker_does_not_abandon_the_accounts_other_scopes() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -2903,7 +2903,7 @@ async fn a_withheld_marker_does_not_abandon_the_accounts_other_scopes() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -2973,7 +2973,7 @@ async fn the_runner_records_pages_that_reached_only_the_sentinel() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -3001,7 +3001,7 @@ async fn the_runner_records_pages_that_reached_only_the_sentinel() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -3134,7 +3134,7 @@ async fn a_completed_walk_does_not_strand_the_accounts_admission() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )
@@ -3328,7 +3328,7 @@ async fn an_eagerly_acknowledging_consumer_never_strands_lane_capacity() {
             engine
                 .ack_checkpoint(
                     &account_id,
-                    event.scope.clone(),
+                    event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
                     event.publication.clone(),
                 )

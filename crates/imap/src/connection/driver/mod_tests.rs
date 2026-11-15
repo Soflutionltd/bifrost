@@ -503,3 +503,44 @@ fn driver_literal_mode_follows_the_capability_authority() {
         LiteralMode::Synchronizing
     );
 }
+
+#[test]
+fn retirement_distinguishes_local_refusal_from_interrupted_exchange() {
+    let mut state = super::super::state::ProtocolState::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    let error = Error::Protocol("locally refused command".into());
+    finish_exchange(&mut state, &mut rx, ExchangePhase::Untouched, Some(&error));
+    assert!(!tx.is_closed());
+    assert_eq!(
+        state.session_state(),
+        super::super::SessionState::NotAuthenticated
+    );
+
+    // Even a normally reusable refusal cannot make unread responses safe.
+    let refusal = Error::no_with_code("refused".into(), None);
+    finish_exchange(
+        &mut state,
+        &mut rx,
+        ExchangePhase::Interrupted,
+        Some(&refusal),
+    );
+    assert!(tx.is_closed());
+    assert_eq!(state.session_state(), super::super::SessionState::Logout);
+}
+
+#[test]
+fn retirement_closes_admission_for_logout_even_without_an_error() {
+    let mut state = super::super::state::ProtocolState::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    state.arm_effect(&Command::Logout, "logout");
+    let _ = state.apply_side_effects(&crate::types::Response::Tagged(
+        crate::types::response::TaggedResponse {
+            tag: "logout".into(),
+            status: crate::types::response::StatusKind::Ok,
+            code: None,
+            text: String::new(),
+        },
+    ));
+    finish_exchange(&mut state, &mut rx, ExchangePhase::Exchanged, None);
+    assert!(tx.is_closed());
+}

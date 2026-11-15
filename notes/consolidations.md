@@ -681,21 +681,14 @@ width) and a classification table from which routing keys are computed.
 
 **Reported by:** imap-connection.
 
-Sites: `driver_task`'s `Run` arm (`(!refused_before_send && is_connection_fatal)
-|| (is_err && session == Logout)`); the `Upgrade` arm (`is_connection_fatal ||
-(is_err && Logout)`, no `refused_before_send`); the `Pipeline` arm
-(`failure.is_some()`, regardless of variant); the `Idle` arm
-(`is_connection_fatal` only, no Logout clause);
-`upgrade::retire_after_failed_refresh` and the STARTTLS/COMPRESS paths calling
-`apply_infrastructure_failure` directly; `Error::is_connection_fatal`, a variant
-list overridden by phase (`Closed` from `live_state_refusal` is "fatal" by
-variant yet framing-safe, which is why `refused_before_send` exists); and on the
-handle side `abandoned` (set by `Pending::drop`, `InFlightGuard`),
-`is_reusable` and the pool. The variant does not decide fatality; the framing
-state does, and the read loops know it. Owner: every loop returns a typed `enum
-Framing { Untouched, Synchronized, Desynchronized }` alongside its result, one
-driver function decides retirement, and `is_connection_fatal` is deleted or
-reduced to a default for errors raised outside a loop.
+The driver arms are consolidated: all four call `finish_exchange` before
+publishing state or answering, with explicit untouched, exchanged and
+interrupted phases. Residue: the read loops still do not return a typed
+`Framing` outcome, so exchanged errors fall back to `is_connection_fatal`. A
+framing-only rule was declined because a synchronized completion can still leave
+stale capabilities or a poisoned transport, so whatever replaces the fallback
+must keep those two retirement reasons. The typed outcome's natural producer is
+CON-034's single read loop.
 
 ## CON-034 - What does a foreign tag mean? Six IMAP read loops answer differently
 
@@ -724,27 +717,6 @@ emits no response-code events. Owner: one `ReadLoop` driven by a `LoopPolicy {
 on_own_tag, on_foreign_tag, on_continuation, route_untagged }`, which also makes
 literal budgets apply in every loop (BUG-037) and gives CON-033's `Framing` one
 producer.
-
-## CON-038 - How does a JMAP push object decompose into state changes and token-free notifications?
-
-**Reported by:** jmap-protocol (the two traversals already differ).
-
-`event_source/stream.rs::flatten_push_object`: a worklist over `Group` that
-MERGES every `StateChange` into one notification carrying the block's resume
-token, emits `CalendarAlert` and `EmailPush` as their own notifications first,
-and documents why that ordering is load-bearing. `sync/push.rs::collect_push` +
-`last_push_state`: recursion over `Group`, routing each state change per account,
-sending `CalendarAlert` and `EmailPush` to the `_ => HintPayload::Unknown` arm (a
-broad reconcile - so if a server delivers alerts on the WebSocket push channel,
-every fired alert costs a full repoll); `last_push_state` takes the last
-`pushState` in depth-first order. Its doc says the SSE traversal is "the same
-traversal" as the WS one; it is not. The `StateChange` shape is declared three
-times: `PushObject::StateChange`, `client_ws.rs::WebSocketStateChange` (needed for
-the `@type` framing), and `event_source::Changes`. The SSE lane is unwired, which
-is where this drifted (STR-096). Owner: one `PushObject::decompose(self) ->
-PushBlock { notifications, state: Option<MergedStateChange>, push_state }` in the
-crate root (or `core/push.rs`), consumed by both lanes, with
-`WebSocketStateChange` decoding straight into the shared struct.
 
 ## CON-042 - JMAP data type, capability and method name are restated at every invocation
 

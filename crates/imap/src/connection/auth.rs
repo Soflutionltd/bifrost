@@ -817,9 +817,9 @@ impl ImapConnection {
     /// State transitions are handled by `apply_side_effects` inside the
     /// driver task:
     /// - `* BYE` -> `Logout` (via `apply_untagged`)
-    /// - Tagged OK with `in_logout` -> `Logout` (via `apply_tagged`)
+    /// - Tagged OK with an armed LOGOUT effect -> `Logout` (via `apply_tagged`)
     ///
-    /// The driver sets `in_logout` automatically when it sees
+    /// The driver arms the LOGOUT effect automatically when it sees
     /// `Command::Logout`.
     pub async fn logout(&self) -> Result<(), Error> {
         use super::dispatch::LogoutConsumer;

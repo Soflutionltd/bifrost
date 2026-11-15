@@ -2,57 +2,52 @@ use std::time::Duration;
 
 use bifrost_types::{
     AccountOperation, AccountStream, Batch, ChangeCursor, Checkpoint, CursorScope, ErrorScope,
-    Fingerprint, FolderId, InventoryEntry, MembershipScope, ObjectId, ObjectType, PageBoundary,
-    ServerVersion, SyncEvent,
+    Fingerprint, InventoryEntry, ObjectId, PageBoundary, ServerVersion, SyncEvent,
 };
 use serde_json::Value;
 
 use crate::client::Resource;
 use crate::etag::GraphETag;
 use crate::origin::AdmittedUrl;
-use crate::types::{CONTACT_SELECT, ODataCollection};
+use crate::types::ODataCollection;
 
 use super::GraphAccount;
-use super::cursor::{
-    GraphCursorPayload, GraphPageMarker, encode_cursor, kind_for_scope, scope_for_kind,
-};
+#[cfg(test)]
+use super::cursor::kind_for_scope;
+use super::cursor::{GraphCursorPayload, GraphPageMarker, encode_cursor};
 use super::graph_error::{GraphErrorContext, cursor_error_to_account_error};
+#[cfg(test)]
+use bifrost_types::{FolderId, MembershipScope, ObjectType};
 
-const MESSAGE_SYNC_SELECT: &str = "\
+pub(super) const MESSAGE_SYNC_SELECT: &str = "\
 id,parentFolderId,isRead,flag,categories,changeKey,conversationId,\
 internetMessageHeaders,internetMessageId";
 
-// Microsoft documents that calendarView delta does not support `$select`,
-// and uses `Prefer: odata.maxpagesize={x}` for page size. Its event GET docs
-// define `Prefer: outlook.timezone` for response times. Keep the page size
-// and UTC preference on every page of both inventory and changes walks.
-// https://learn.microsoft.com/en-us/graph/delta-query-events
-// https://learn.microsoft.com/en-us/graph/api/event-get?view=graph-rest-1.0
-const EVENT_DELTA_PREFER: &str = "odata.maxpagesize=50, outlook.timezone=\"UTC\"";
-
-fn delta_prefer(scope: &CursorScope) -> Option<&'static str> {
-    matches!(
-        scope,
-        CursorScope::FolderType {
-            ty: ObjectType::Event | ObjectType::CalendarEvent,
-            ..
-        }
-    )
-    .then_some(EVENT_DELTA_PREFER)
-}
-
+#[cfg(test)]
 pub(crate) fn inventory_stream(
     account: GraphAccount,
     scope: CursorScope,
 ) -> AccountStream<bifrost_types::InventoryEvent> {
-    inventory_stream_from(account, scope, None)
+    let parsed = super::scope::GraphScope::parse(&scope);
+    inventory_stream_admitted(account, scope, parsed)
+}
+
+pub(crate) fn inventory_stream_admitted(
+    account: GraphAccount,
+    scope: CursorScope,
+    parsed: Result<super::scope::GraphScope, super::cursor::CursorError>,
+) -> AccountStream<bifrost_types::InventoryEvent> {
+    inventory_stream_from(account, scope, parsed, None)
 }
 
 /// The single acceptance condition for resuming a stored inventory page.
 ///
 /// `Account::is_inventory_cursor` delegates to `resume_inventory_stream`, so
 /// this is the single acceptance condition for both classification and resume.
-pub(crate) fn resumable_inventory_payload(cursor: &ChangeCursor) -> Option<GraphCursorPayload> {
+fn resumable_inventory(
+    cursor: &ChangeCursor,
+) -> Option<(GraphCursorPayload, super::scope::GraphScope)> {
+    let parsed = super::scope::GraphScope::parse(&cursor.scope).ok()?;
     let payload = match super::cursor::decode_cursor(cursor) {
         Ok(payload) => payload,
         // Keep recognizing an inventory row with no acknowledged position.
@@ -62,15 +57,20 @@ pub(crate) fn resumable_inventory_payload(cursor: &ChangeCursor) -> Option<Graph
         }
         Err(_) => return None,
     };
-    (payload.inventory_in_progress() && scope_matches_payload(&cursor.scope, &payload))
-        .then_some(payload)
+    (payload.inventory_in_progress() && parsed.matches_payload(&payload))
+        .then_some((payload, parsed))
+}
+
+#[cfg(test)]
+fn resumable_inventory_payload(cursor: &ChangeCursor) -> Option<GraphCursorPayload> {
+    resumable_inventory(cursor).map(|(payload, _)| payload)
 }
 
 pub(crate) fn resume_inventory_stream(
     account: GraphAccount,
     cursor: ChangeCursor,
 ) -> Option<AccountStream<bifrost_types::InventoryEvent>> {
-    let payload = resumable_inventory_payload(&cursor)?;
+    let (payload, parsed) = resumable_inventory(&cursor)?;
     if cursor.advanced_through.is_none() {
         return Some(Box::pin(async_stream::stream! {
             let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
@@ -80,23 +80,30 @@ pub(crate) fn resume_inventory_stream(
             ));
         }));
     }
-    Some(inventory_stream_from(account, cursor.scope, Some(payload)))
+    Some(inventory_stream_from(
+        account,
+        cursor.scope,
+        Ok(parsed),
+        Some(payload),
+    ))
 }
 
 fn inventory_stream_from(
     account: GraphAccount,
     scope: CursorScope,
+    parsed: Result<super::scope::GraphScope, super::cursor::CursorError>,
     resume: Option<GraphCursorPayload>,
 ) -> AccountStream<bifrost_types::InventoryEvent> {
     Box::pin(async_stream::stream! {
         let sync_ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
             .with_scope(ErrorScope::Cursor(scope.clone()));
-        if !sync_scope_readable(&scope) {
-            yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
-                super::cursor::CursorError::Unsupported, sync_ctx,
-            ));
-            return;
-        }
+        let parsed = match parsed.and_then(|parsed| parsed.kind().map(|_| parsed)) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
+                return;
+            }
+        };
         // Results this walk could not account for. Every checkpoint from the
         // first one onward declares the gap.
         let mut obligations: Vec<bifrost_types::InventoryObligation> = Vec::new();
@@ -104,7 +111,7 @@ fn inventory_stream_from(
         // One accumulator for the whole delta walk; each emitted page
         // takes and clears it, so a page reports the bytes of the
         // request that produced it rather than a running total.
-        let client = match account.client_for_scope(&scope) {
+        let client = match parsed.client(&account) {
             Ok(client) => client.clone(),
             Err(error) => {
                 yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
@@ -134,7 +141,7 @@ fn inventory_stream_from(
                     return;
                 }
             },
-            None => match initial_delta_request(&account, &scope, jiff::Timestamp::now()) {
+            None => match parsed.delta_path(&account, jiff::Timestamp::now()) {
                 Ok((path, window_end)) => match client.api_url(&path) {
                     Ok(url) => Ok((url, window_end)),
                     Err(error) => {
@@ -158,8 +165,8 @@ fn inventory_stream_from(
         // owner and the foreign mailbox's native folder ids cannot be
         // conflated with the primary's in the membership index (the
         // A5c-established owner-tag pattern). `None` for a primary scope.
-        let owner = account.owner_of_scope(&scope);
-        let kind = match kind_for_scope(&scope) {
+        let owner = parsed.owner().map(|owner| bifrost_types::MailboxId(owner.to_string()));
+        let kind = match parsed.kind() {
             Ok(kind) => kind,
             Err(error) => {
                 let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
@@ -180,7 +187,7 @@ fn inventory_stream_from(
             let page: ODataCollection<Value> = match fetch_page(
                 &client,
                 &current_url,
-                delta_prefer(&scope),
+                parsed.delta_prefer(),
             )
             .await
             {
@@ -223,8 +230,8 @@ fn inventory_stream_from(
             for value in page.value {
                 if is_removed(&value)
                     && let Some(id) = value.get("id").and_then(Value::as_str) {
-                    let id = sync_object_id(&scope, id);
-                    if is_mail_scope(&scope) {
+                    let id = parsed.mint_object_id(id);
+                    if parsed.etag_cached() {
                         removed_etag_ids.push(id.0.clone());
                     }
                     removed.push(id);
@@ -232,7 +239,7 @@ fn inventory_stream_from(
                 }
                 // An unidentifiable tombstone needs the same checkpoint
                 // barrier as an unidentifiable live value below.
-                let Some(mut entry) = inventory_entry_from_value(&scope, &value) else {
+                let Some(mut entry) = inventory_entry_from_parsed(&parsed, &value) else {
                     // A value with no usable `id`. It used to be
                     // dropped silently while the delta link advanced past it,
                     // which violates the checkpoint contract: the walk cannot
@@ -280,7 +287,7 @@ fn inventory_stream_from(
                     });
                     continue;
                 };
-                if is_mail_scope(&scope)
+                if parsed.etag_cached()
                     && let ServerVersion::ETag(etag) = &entry.fingerprint.server_version {
                     etags.push((entry.id.0.clone(), GraphETag::from_odata_annotation(etag)));
                 }
@@ -358,17 +365,25 @@ fn inventory_stream_from(
 pub(crate) async fn fetch_delta_page(
     client: &crate::client::GraphClient,
     url: &AdmittedUrl,
-    scope: &CursorScope,
+    scope: &super::scope::GraphScope,
 ) -> Result<ODataCollection<Value>, crate::error::GraphError> {
-    fetch_page(client, url, delta_prefer(scope)).await
+    fetch_page(client, url, scope.delta_prefer()).await
 }
 
 pub(crate) fn inventory_entry_from_value(
     scope: &CursorScope,
     value: &Value,
 ) -> Option<InventoryEntry> {
+    let parsed = super::scope::GraphScope::parse(scope).ok()?;
+    inventory_entry_from_parsed(&parsed, value)
+}
+
+fn inventory_entry_from_parsed(
+    scope: &super::scope::GraphScope,
+    value: &Value,
+) -> Option<InventoryEntry> {
     let id = value.get("id")?.as_str()?.to_string();
-    let membership = membership_from_value(scope, value);
+    let membership = scope.membership(value.get("parentFolderId").and_then(Value::as_str));
     let etag = graph_etag(value);
     let fingerprint = Fingerprint {
         server_version: etag
@@ -390,10 +405,10 @@ pub(crate) fn inventory_entry_from_value(
     let thread_id = value
         .get("conversationId")
         .and_then(Value::as_str)
-        .map(|thread| super::foreign::encode_thread_id(scope, thread));
+        .map(|thread| scope.thread_id(thread));
 
     Some(InventoryEntry {
-        id: sync_object_id(scope, &id),
+        id: scope.mint_object_id(&id),
         memberships: vec![membership],
         size: None,
         blob_id: None,
@@ -405,67 +420,23 @@ pub(crate) fn inventory_entry_from_value(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn membership_from_value(scope: &CursorScope, value: &Value) -> MembershipScope {
-    let fallback = match scope {
-        CursorScope::FolderType { folder, .. } | CursorScope::Folder(folder) => {
-            super::foreign::parse_folder(folder).native_id().to_string()
-        }
-        _ => String::new(),
-    };
-    let native = value
-        .get("parentFolderId")
-        .and_then(Value::as_str)
-        .filter(|folder| !folder.is_empty())
-        .unwrap_or(&fallback);
-    // For a foreign (shared/delegate) scope the item's `parentFolderId`
-    // is a *native* id within the owning mailbox. Discovery emits the
-    // folder membership foreign-encoded (`encode_foreign(mailbox,
-    // native)`), so emit the same encoding here - otherwise the engine's
-    // covering rule (folder-typed cursor covers the matching folder)
-    // cannot reconcile inventory/changes against discovery, and a foreign
-    // native id colliding with a primary id (e.g. `inbox`) would conflate
-    // into the primary mailbox's membership set.
-    let folder = match scope {
-        CursorScope::FolderType { folder, .. } | CursorScope::Folder(folder) => {
-            match super::foreign::parse_folder(folder).foreign() {
-                Some(foreign) => super::foreign::encode_foreign(&foreign.mailbox, native),
-                None => FolderId(native.to_string()),
-            }
-        }
-        _ => FolderId(native.to_string()),
-    };
-    MembershipScope::Folder(folder)
+    super::scope::GraphScope::parse(scope)
+        .expect("supported scope")
+        .membership(value.get("parentFolderId").and_then(Value::as_str))
 }
 
-pub(crate) fn is_mail_scope(scope: &CursorScope) -> bool {
-    matches!(
-        scope,
-        CursorScope::FolderType {
-            ty: ObjectType::Email,
-            ..
-        }
-    )
-}
-
+#[cfg(test)]
 pub(crate) fn sync_scope_readable(scope: &CursorScope) -> bool {
-    // Typed contact/calendar reads currently use the primary client. Do not
-    // emit shared non-mail ids that those doors would read in another mailbox.
-    !matches!(scope, CursorScope::FolderType { folder, ty }
-        if *ty != ObjectType::Email && super::foreign::parse_folder(folder).foreign().is_some())
+    super::scope::GraphScope::parse(scope).is_ok_and(|parsed| parsed.kind().is_ok())
 }
 
+#[cfg(test)]
 pub(crate) fn sync_object_id(scope: &CursorScope, id: &str) -> ObjectId {
-    match scope {
-        CursorScope::FolderType {
-            folder,
-            ty: ObjectType::Event | ObjectType::CalendarEvent,
-        } => ObjectId(super::calendar::join_event_id(&folder.0, id)),
-        CursorScope::FolderType {
-            ty: ObjectType::Contact,
-            ..
-        } => ObjectId(id.to_string()),
-        _ => super::foreign::encode_message_id(scope, id),
-    }
+    super::scope::GraphScope::parse(scope)
+        .expect("supported scope")
+        .mint_object_id(id)
 }
 
 pub(crate) fn graph_etag(value: &Value) -> Option<GraphETag> {
@@ -503,7 +474,7 @@ pub(crate) fn removed_id(value: &Value) -> Option<ObjectId> {
 /// A `calendarView` window bound, `days` from `now`, in the second-precision
 /// UTC form Graph expects. A bound that runs off the representable range
 /// falls back to `now` rather than widening the window unpredictably.
-fn calendar_view_bound(now: jiff::Timestamp, days: i64) -> String {
+pub(super) fn calendar_view_bound(now: jiff::Timestamp, days: i64) -> String {
     format_calendar_timestamp(calendar_view_timestamp(now, days))
 }
 
@@ -527,55 +498,17 @@ pub(crate) fn initial_delta_url(
     initial_delta_request(account, scope, jiff::Timestamp::now()).map(|(url, _)| url)
 }
 
+#[cfg(test)]
 fn initial_delta_request(
     account: &GraphAccount,
     scope: &CursorScope,
     now: jiff::Timestamp,
 ) -> Result<(String, Option<i64>), super::cursor::CursorError> {
-    // Route the prefix through the scope's owning client (primary or a
-    // shared mailbox) and use the *native* folder id in the path - the
-    // foreign-mailbox prefix lives in the URL's `/users/{id}` segment,
-    // not in the `/mailFolders/{id}` segment.
-    let prefix = account
-        .client_for_scope(scope)
-        .map_err(super::cursor::routing_error)?
-        .api_path_prefix();
-    match scope {
-        CursorScope::FolderType { folder, ty } => {
-            let native = super::foreign::parse_folder(folder).native_id().to_string();
-            let encoded = bifrost_net::url::encode_path_component(&native);
-            match ty {
-                ObjectType::Email => Ok((
-                    format!(
-                        "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SYNC_SELECT}&$top=50"
-                    ),
-                    None,
-                )),
-                ObjectType::Event | ObjectType::CalendarEvent => {
-                    let start = calendar_view_bound(now, -90);
-                    let end_at = calendar_view_timestamp(now, 365);
-                    let end = format_calendar_timestamp(end_at);
-                    Ok((
-                        format!(
-                            "{prefix}/calendars/{encoded}/calendarView/delta?startDateTime={start}&endDateTime={end}"
-                        ),
-                        Some(end_at.as_second()),
-                    ))
-                }
-                ObjectType::Contact => Ok((
-                    format!(
-                        "{prefix}/contactFolders/{encoded}/contacts/delta?$select={CONTACT_SELECT}&$top=250"
-                    ),
-                    None,
-                )),
-                _ => Err(super::cursor::CursorError::Unsupported),
-            }
-        }
-        _ => Err(super::cursor::CursorError::Unsupported),
-    }
+    let parsed = super::scope::GraphScope::parse(scope)?;
+    parsed.delta_path(account, now)
 }
 
-fn calendar_view_timestamp(now: jiff::Timestamp, days: i64) -> jiff::Timestamp {
+pub(super) fn calendar_view_timestamp(now: jiff::Timestamp, days: i64) -> jiff::Timestamp {
     // A Timestamp is an absolute UTC instant, so its arithmetic accepts fixed
     // durations rather than calendar-day spans. Treat these UTC window bounds
     // as exact 24-hour days; adding a Span with a non-zero `days` component
@@ -585,7 +518,7 @@ fn calendar_view_timestamp(now: jiff::Timestamp, days: i64) -> jiff::Timestamp {
         .unwrap_or(now)
 }
 
-fn format_calendar_timestamp(at: jiff::Timestamp) -> String {
+pub(super) fn format_calendar_timestamp(at: jiff::Timestamp) -> String {
     jiff::tz::Offset::UTC
         .to_datetime(at)
         .strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -645,25 +578,9 @@ pub(crate) fn batch<T>(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn scope_matches_payload(scope: &CursorScope, payload: &GraphCursorPayload) -> bool {
-    let canonical = scope_for_kind(&payload.kind());
-    *scope == canonical || event_aliases(scope, &canonical)
-}
-
-fn event_aliases(a: &CursorScope, b: &CursorScope) -> bool {
-    let (
-        CursorScope::FolderType { folder: fa, ty: ta },
-        CursorScope::FolderType { folder: fb, ty: tb },
-    ) = (a, b)
-    else {
-        return false;
-    };
-    let aliased = matches!(
-        (ta, tb),
-        (ObjectType::Event, ObjectType::CalendarEvent)
-            | (ObjectType::CalendarEvent, ObjectType::Event)
-    );
-    aliased && fa == fb
+    super::scope::GraphScope::parse(scope).is_ok_and(|parsed| parsed.matches_payload(payload))
 }
 
 async fn fetch_page(
@@ -1660,8 +1577,9 @@ mod tests {
             ObjectType::CalendarEvent,
             ObjectType::Contact,
         ] {
+            let folder = super::super::foreign::encode_foreign("shared@example.com", "collection");
             let scope = CursorScope::FolderType {
-                folder: super::super::foreign::encode_foreign("shared@example.com", "collection"),
+                folder: folder.clone(),
                 ty,
             };
             assert!(!sync_scope_readable(&scope));
@@ -1675,8 +1593,18 @@ mod tests {
                 events.as_slice(),
                 [bifrost_types::InventoryEvent::Terminated(_)]
             ));
+            // Simulate a stored cursor from before shared non-mail admission
+            // was unified; the current parser deliberately cannot mint it.
+            let kind = match ty {
+                ObjectType::Contact => super::super::cursor::GraphCursorKind::Contacts {
+                    folder_id: folder.0,
+                },
+                _ => super::super::cursor::GraphCursorKind::Events {
+                    calendar_id: folder.0,
+                },
+            };
             let payload = GraphCursorPayload::new(
-                kind_for_scope(&scope).expect("kind"),
+                kind,
                 &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
                 None,
             );

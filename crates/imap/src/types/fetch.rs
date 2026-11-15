@@ -348,6 +348,8 @@ pub struct StoreResult {
     /// conditional STORE preserves tagged `NO` so callers can attribute a
     /// `[MODIFIED ...]` rejection to the named messages.
     pub status: super::response::StatusKind,
+    /// Human-readable tagged completion text, including guarded refusals.
+    pub text: String,
     /// Response code from the tagged response, if any.
     ///
     /// When UNCHANGEDSINCE is used, this will be `Some(ResponseCode::Modified(...))`

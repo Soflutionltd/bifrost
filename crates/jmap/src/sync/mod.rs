@@ -20,6 +20,7 @@ mod filters;
 mod foreign;
 mod hydrate;
 mod inventory;
+mod mail_set;
 mod mutation;
 mod page_cursor;
 mod pim;

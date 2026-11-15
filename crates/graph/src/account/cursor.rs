@@ -1,7 +1,8 @@
 use bifrost_types::{
-    ChangeCursor, CursorScope, FolderId, ObjectType, OpaqueChangeState, OpaqueProgressBytes,
-    ProtocolKind,
+    ChangeCursor, CursorScope, OpaqueChangeState, OpaqueProgressBytes, ProtocolKind,
 };
+#[cfg(test)]
+use bifrost_types::{FolderId, ObjectType};
 use serde::{Deserialize, Serialize};
 
 use crate::origin::AdmittedUrl;
@@ -465,24 +466,12 @@ impl GraphCursorPayload {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn kind_for_scope(scope: &CursorScope) -> Result<GraphCursorKind, CursorError> {
-    match scope {
-        CursorScope::FolderType { folder, ty } => match ty {
-            ObjectType::Email => Ok(GraphCursorKind::Messages {
-                folder_id: folder.0.clone(),
-            }),
-            ObjectType::Event | ObjectType::CalendarEvent => Ok(GraphCursorKind::Events {
-                calendar_id: folder.0.clone(),
-            }),
-            ObjectType::Contact => Ok(GraphCursorKind::Contacts {
-                folder_id: folder.0.clone(),
-            }),
-            _ => Err(CursorError::Unsupported),
-        },
-        _ => Err(CursorError::Unsupported),
-    }
+    super::scope::GraphScope::parse(scope)?.kind()
 }
 
+#[cfg(test)]
 pub(crate) fn scope_for_kind(kind: &GraphCursorKind) -> CursorScope {
     match kind {
         GraphCursorKind::Messages { folder_id } => CursorScope::FolderType {
@@ -892,7 +881,7 @@ mod tests {
     #[test]
     fn encode_does_not_cross_check_the_scope_against_the_payload_kind() {
         // The scope/kind agreement guard lives in
-        // `inventory::scope_matches_payload`, asserted by `changes_stream`,
+        // `GraphScope::matches_payload`, asserted by the changes door,
         // NOT in the codec. Pin the split so a future reader does not
         // assume `decode_cursor` alone is enough to trust a stored cursor:
         // a persisted cursor whose bytes name a different collection than
@@ -995,7 +984,7 @@ mod tests {
     fn scope_for_kind_collapses_calendar_event_onto_event() {
         // Documented lossiness: the Events cursor cannot record whether the
         // scope asked for `Event` or `CalendarEvent`, so `scope_for_kind`
-        // always answers `Event` and `scope_matches_payload` compensates
+        // always answers `Event` and `GraphScope` normalizes the aliases
         // with the alias rule.
         let scope = CursorScope::FolderType {
             folder: FolderId("calendar".to_string()),

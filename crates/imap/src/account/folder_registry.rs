@@ -573,18 +573,15 @@ pub(crate) fn shared_overrides_personal(name: &str, namespace_prefix: &str) -> b
 ///
 /// Shared by the registry's role-name fallback and its callers.
 ///
-/// A `None` delimiter is LIST reporting a flat namespace, where the whole
-/// name IS the leaf. We still split on `/` there, deliberately: it is the
-/// long-standing behavior, and a server that reports NIL while genuinely
-/// nesting under `/` is likelier than a flat server with a literal `/` in
-/// a mailbox name. The cost of being wrong is a false role match on a
-/// name like `Foo/Sent`; revisit if a real server hits it.
+/// A `None` delimiter declares a flat namespace. Enterprise users expect a
+/// literal name such as `Projects/Sent` to stay an ordinary folder rather
+/// than receive account Sent copies based on a hierarchy the server denies.
 ///
 /// Pure so the delimiter rule is unit-pinnable without a live server.
 pub(crate) fn leaf_name(name: &str, delimiter: Option<char>) -> &str {
     match delimiter {
         Some(delimiter) => name.rsplit_once(delimiter).map_or(name, |(_, leaf)| leaf),
-        None => name.rsplit('/').next().unwrap_or(name),
+        None => name,
     }
 }
 
@@ -1538,8 +1535,8 @@ mod tests {
         );
         assert_eq!(
             leaf_name("INBOX/Sent", None),
-            "Sent",
-            "NIL keeps the slash fallback; see the helper's doc comment"
+            "INBOX/Sent",
+            "NIL declares a flat namespace"
         );
         assert_eq!(leaf_name("Drafts", None), "Drafts");
     }

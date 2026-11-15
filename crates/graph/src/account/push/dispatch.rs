@@ -34,23 +34,23 @@ pub(crate) async fn push_subscribe(
     let mut outcomes = bifrost_types::BatchOutcomeBuilder::new();
     let mut eligible = Vec::with_capacity(scopes.len());
     for (item, scope) in expected.iter().cloned().zip(scopes) {
-        // Public folders are poll-only in v1: a bare `CursorScope::Folder`
-        // has no push surface (EWS streaming notifications do not cover the
-        // public-folder hierarchy mailbox). It is refused per scope, not per
-        // request: one stale or poll-only scope in a mixed list must not
-        // disable push for every valid sibling, which is what bailing out
-        // before dispatch did.
-        if matches!(scope, CursorScope::Folder(_)) {
-            outcomes.push_failed(item, unsupported_push_scope_error(scope));
-            continue;
-        }
-        eligible.push((item, scope));
+        let parsed = match crate::account::scope::GraphScope::parse(&scope) {
+            Ok(parsed) if !matches!(parsed, crate::account::scope::GraphScope::PublicFolder(_)) => {
+                parsed
+            }
+            _ => {
+                outcomes.push_failed(item, unsupported_push_scope_error(scope));
+                continue;
+            }
+        };
+        eligible.push((item, scope, parsed));
     }
     // Nothing in the request was ever subscribable. There is no partial
     // success to report and no handle to hold, so this stays a whole-request
     // refusal the caller can act on rather than an empty success.
     if eligible.is_empty() {
-        return Err(unsupported_push_error());
+        let outcomes = finalize_push_outcomes(outcomes, &expected)?;
+        return Err(no_subscribable_push_scopes(outcomes.failed()));
     }
     subscribe_eligible(account, eligible, outcomes, &expected).await
 }
@@ -74,7 +74,11 @@ pub(super) type ArmOutcome = (
 /// cannot close, which no real request can produce.
 pub(super) async fn subscribe_eligible(
     account: GraphAccount,
-    eligible: Vec<(bifrost_types::BatchItemId, CursorScope)>,
+    eligible: Vec<(
+        bifrost_types::BatchItemId,
+        CursorScope,
+        crate::account::scope::GraphScope,
+    )>,
     outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
     expected: &[bifrost_types::BatchItemId],
 ) -> Result<bifrost_types::PushSubscription, AccountError> {

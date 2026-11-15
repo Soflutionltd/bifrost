@@ -1284,7 +1284,7 @@ pub(super) async fn emit_backfill_complete(
         }
     };
     let event = MultiplexerEvent {
-        scope: scope.clone(),
+        scope: EventScope::Cursor(scope.clone()),
         event: Arc::new(SyncEvent::Batch(batch)),
         checkpoint: Some(expected.clone()),
         publication: Some(publication.clone()),

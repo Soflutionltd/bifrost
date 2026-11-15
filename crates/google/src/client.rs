@@ -392,13 +392,14 @@ impl GmailClient {
 
     pub(crate) async fn delete(&self, path: &str, replay: bifrost_net::ReplayPolicy) -> Result<()> {
         let url = self.api_url(path);
-        self.delete_absolute(&url, "Gmail API", replay).await
+        self.delete_absolute(&url, self.surface_for_url(&url), replay)
+            .await
     }
 
     async fn delete_absolute(
         &self,
         url: &str,
-        service: &str,
+        service: crate::quota::ApiSurface,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<()> {
         let response = self.execute(url, "DELETE", None::<&()>, replay).await?;
@@ -413,7 +414,7 @@ impl GmailClient {
     ) -> Result<()> {
         let url = self.api_url(path);
         let response = self.execute(&url, "POST", Some(body), replay).await?;
-        check_response_status(response, "Gmail API").await
+        check_response_status(response, self.surface_for_url(&url)).await
     }
 
     pub(crate) fn api_url(&self, path: &str) -> String {
@@ -434,7 +435,7 @@ impl GmailClient {
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<T> {
         let response = self.execute(url, method, body, replay).await?;
-        parse_json_response(response, "Gmail API").await
+        parse_json_response(response, self.surface_for_url(url)).await
     }
 
     pub(crate) async fn execute<B: Serialize>(
@@ -530,24 +531,19 @@ impl GmailClient {
     pub(crate) async fn execute_builder(
         &self,
         builder: RequestBuilder,
-        service: &str,
+        service: crate::quota::ApiSurface,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<Response> {
         // Net errors retain their original shape alongside observation metadata so
         // the account-side translation boundary can inspect transmission
         // state, retry-after, and other forensic evidence. Service
         // attribution also identifies the raw Gmail data mutation path.
-        let builder = if service == "Gmail API" {
+        let builder = if service == crate::quota::ApiSurface::Gmail {
             builder.concurrency_limit(self.gmail_data_limit())
         } else {
             builder
         };
-        let surface = match service {
-            "Gmail API" => crate::quota::ApiSurface::Gmail,
-            "People API" => crate::quota::ApiSurface::People,
-            "Calendar API" => crate::quota::ApiSurface::Calendar,
-            _ => crate::quota::ApiSurface::Drive,
-        };
+        let surface = service;
         self.send_recorded(builder.replay(replay), surface).await
     }
 
@@ -682,32 +678,35 @@ impl GmailClient {
 
 pub(crate) async fn parse_json_response<T: DeserializeOwned>(
     response: Response,
-    _service: &str,
+    service: crate::quota::ApiSurface,
 ) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
         let headers = crate::error::GmailResponseHeaders::from_headers(response.headers());
         return Err(Error::response_from_parts(
-            crate::error::GmailService::GmailApi,
+            service.into(),
             status.as_u16(),
             headers,
             response.body,
         ));
     }
     serde_json::from_slice(response.body.as_ref()).map_err(|source| Error::JsonDecode {
-        service: crate::error::GmailService::GmailApi,
+        service: service.into(),
         source,
     })
 }
 
-pub(crate) async fn check_response_status(response: Response, _service: &str) -> Result<()> {
+pub(crate) async fn check_response_status(
+    response: Response,
+    service: crate::quota::ApiSurface,
+) -> Result<()> {
     let status = response.status();
     if status.is_success() {
         return Ok(());
     }
     let headers = crate::error::GmailResponseHeaders::from_headers(response.headers());
     Err(Error::response_from_parts(
-        crate::error::GmailService::GmailApi,
+        service.into(),
         status.as_u16(),
         headers,
         response.body,
@@ -900,7 +899,7 @@ mod tests {
                 client
                     .account_net()
                     .post("https://gmail.test/messages/batchModify"),
-                "Gmail API",
+                crate::quota::ApiSurface::Gmail,
                 bifrost_net::ReplayPolicy::Never,
             ),
         );

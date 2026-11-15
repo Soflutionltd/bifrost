@@ -471,7 +471,17 @@ fn spawn_subscribe_ews(
     let (item, scope, _) = pending(&["inbox"]).remove(0);
     tokio::spawn(async move {
         let expected = vec![item.clone()];
-        subscribe_ews(account, vec![(item, scope)], ledger(), &expected).await
+        subscribe_ews(
+            account,
+            vec![(
+                item,
+                scope.clone(),
+                crate::account::scope::GraphScope::parse(&scope).expect("mail scope"),
+            )],
+            ledger(),
+            &expected,
+        )
+        .await
     })
 }
 
