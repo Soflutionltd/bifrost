@@ -1568,24 +1568,6 @@ NoModSeq, Highest(ModSeq) }`, built once in `build_selected_mailbox`, read throu
 `SelectedMailbox::modseq() -> Option<ModSeq>`; `HIGHESTMODSEQ 0` normalization
 becomes part of `ModSeq` construction (BUG-024).
 
-## STR-067 - Smaller IMAP connection axes: tags, notify flags, tuple outputs
-
-**Reported by:** imap-connection.
-
-- Tags are `String`: `TagGenerator::next() -> String`, compared as `&str` in six
-  read loops and keyed as `String` in `tag_to_idx`. A `Tag` newtype (Copy, two
-  `u32`s, formatted on write) costs nothing and is the natural key for `Armed`
-  (STR-065).
-- `extensions::compute_notify_flags(&NotifySetParams) -> (bool, bool, bool)`
-  returns `(list, status, metadata)` and both callers rebuild `NotifyFlags` from
-  it; it should be `impl From<&NotifySetParams> for NotifyFlags`, living with
-  `NotifyFlags` in `types/` (STR-059).
-- `NamespaceConsumer` stores a `(Vec<_>, Vec<_>, Vec<_>)` triple instead of the
-  `NamespaceResponse` it returns; `IdConsumer` / `Command::Id` use
-  `Vec<(String, Option<String>)>`; `ListStatusConsumer::Output =
-  Vec<(MailboxInfo, Vec<StatusItem>)>`; `select_or_examine(.., is_examine: bool,
-  condstore: bool, ..)` decomposes the `SelectOptions` it was given.
-
 ## STR-068 - `connection/mod.rs` does seven jobs
 
 **Reported by:** imap-connection.
@@ -1962,9 +1944,12 @@ patches.
 
 **Reported by:** jmap-protocol.
 
-- HTTP method as `&str`: `ReqwestTransport::send` / `build_request` return
-  `TransportError::invariant("unsupported HTTP method")` for anything but
-  `"GET"`/`"POST"`; a two-variant enum (or `http::Method`) removes it.
+The HTTP method enum, typed `Blob/lookup` names with automatic capabilities,
+and `Timestamp` Email date setters landed. What remains needs coordinated
+edits in `crates/jmap/src/sync/` (account maps and push routing, mutation
+writers, `page_cursor.rs` and `pim.rs` search cursors, `calendar_ops.rs`), so
+it wants a fixer owning both halves of the crate:
+
 - Keywords as `String`, membership as `HashMap<MailboxId, bool>`: keywords have a
   grammar (IMAP atom, length bound) and the workspace treats flag identity as
   ASCII-case-insensitive (STR-004); a `Keyword` newtype in `email/` would own
@@ -1975,10 +1960,6 @@ patches.
   `EmailPush::account_id`, `CalendarAlert::account_id`, and on the sync side
   `foreign_mail: HashMap<String, MailAccount>`. `AccountId` exists and is used
   only inside method structs.
-- `Blob/lookup` `typeNames: Vec<String>` while `DataType` exists; the doc says the
-  caller must add matching capabilities to `using` and points at a
-  `lookup_blob_with_capabilities` helper that does not exist. `DataType ->
-  Capability` is the mapping a typed field would let the request add itself.
 - Query position is `i32` on the request and the response (RFC: response
   `position` is `UnsignedInt`), with `i32::try_from` at the sync call sites; a
   `QueryPosition` owning the conversion ends the ceremony.
@@ -1987,10 +1968,10 @@ patches.
   LocalDateTime / UTCDateTime / Duration grammar as `strftime`/`strptime` format
   strings and a hand parser in `sync/calendar_ops.rs` (BUG-060); they belong as
   types in `calendar_event/`.
-- `from_timestamp(i64) -> Timestamp` (`core/set.rs`) returns `UNIX_EPOCH` for an
-  out-of-range input; `EmailCreate::sent_at` / `received_at` and
-  `EmailImport::received_at` take `i64` and can fabricate a 1970 date. Take
-  `Timestamp`.
+- `from_timestamp(i64) -> Timestamp` (`core/set.rs`) still returns `UNIX_EPOCH`
+  for an out-of-range input; the Email setters no longer use it, but filters,
+  vacation dates and push-subscription expiry still do and can fabricate a
+  1970 date.
 
 ## STR-090 - JMAP failures that reach the caller as prose, or with the wrong provenance
 
@@ -2653,18 +2634,6 @@ vacation; thread and message hydration; `MailDocument`. Suggested split:
 the shared MIME selector), `search.rs` (with one query encoder, CON-053),
 `settings.rs`. The same shape in IMAP and JMAP is STR-079 and STR-104.
 
-## STR-131 - Smaller Google notes
-
-**Reported by:** google.
-
-- `GoogleAccountFactory::from_token_source_with_net` repeats the Gmail base
-  literal instead of using `GMAIL_API_BASE`.
-- `MutationCapabilities::reassertion.destroy = true` while a destroy can downgrade
-  to a TRASH move on a scope failure; a reasserted destroy repeats the same failing
-  `batchDelete` and its fallback. Consistent with the contract (`Downgraded` is not
-  replayed), but each reassertion costs a 50-unit refusal. The hunter asks whether
-  this is intended.
-
 ## STR-132 - The SMTP/LMTP dialect travels as the error-model `Protocol` enum
 
 **Reported by:** smtp-sasl.
@@ -2820,28 +2789,11 @@ with a variant for each, classified once.
 
 **Reported by:** smtp-sasl.
 
-- `SmtpConnection::read_response_inner(accept_negative: bool, manage_state: bool)`
-  (and its async twin) is a four-valued mode as two bools, three combinations used;
-  a `ReplyMode` enum names them.
-- `SmtpInfo` stores `authentication: Vec<Mechanism>` and an
-  `authentication_configured: bool`, and `set_credentials` rewrites the list from
-  `credentials.preferred_mechanisms()` unless the flag is set: setting credentials
-  after an explicit list keeps the list; setting them before makes the default stick
-  until `authentication` is called. It is `enum MechanismChoice { Default,
-  Explicit(Vec<Mechanism>) }`, resolved against the credential kind at use, not at
-  set time.
-- `authentication.rs` mixes the public credential types, the mechanism enum, the
-  stateless encoder, the SCRAM state machine, mechanism selection, channel-binding
-  resolution, `334` payload decoding and the `SaslError` mapping; after STR-135 most
-  of it moves to bifrost-sasl, the rest splitting into `credentials.rs` and framing
-  helpers.
-- `client/metering.rs`'s blocking admission loop is documented in
-  `reference/net.md` as orchestration "a separate blocking budget API could own";
-  the hunter agrees it belongs beside `BandwidthBudget` in bifrost-net.
-- `message_error_to_account_error` is `#[allow(dead_code)]` with no caller "so that
-  an account-oriented caller that DOES construct a `Message` has one translation
-  point"; each arm repeats its message string twice. Kept deliberately per its
-  comment; noted as a second copy of `crate::error::Error`'s Display strings.
+The reply-mode enum, `MechanismChoice`, the credentials and challenge-framing
+split, and the shared message-error strings landed. One residue needs a
+bifrost-net API first: `client/metering.rs`'s blocking admission loop belongs
+beside `BandwidthBudget` in bifrost-net as a blocking budget API, which does not
+exist yet. (The rest of `authentication.rs` moving to bifrost-sasl is STR-135.)
 
 ## STR-139 - The SMTP sans-IO core stops one layer too low
 
@@ -3021,20 +2973,6 @@ The engine's retry loops now share `ReconnectBackoff`, but their named policies
 are lazy statics because `bifrost_types::BackoffPolicy` cannot be built in a
 `const`. A `const fn` constructor lets each policy be a plain `const`.
 
-## STR-148 - DAV status and failure carriers are stringly
-
-**Reported by:** net-dav.
-
-Statuses: `FailedResource.status: Option<u16>`, `ResponseParts.response_status` and
-`staged_status` as `Option<String>`, `staged_success: Option<bool>`, and
-`complete_failure_error` turning a missing status into a synthetic 500. Failures as
-prose: `parse_multistatus`, `extract_*` and `decode_snapshot` return `Result<_,
-String>`, wrapped into an `AccountError` later. Stringly request parts: Depth passed
-as `"0"` / `"1"`, methods rebuilt with `Method::from_bytes(b"PROPFIND")` at each call
-site, and `DirectoryGuard` checking `method.as_str() == "REPORT"`. A `MemberStatus`
-type, a `Depth` enum, method constants and a typed `MultistatusError` cover these.
-Related: BUG-113.
-
 ## STR-149 - The DAV cursor carries two version axes and a duplicated collection URL
 
 **Reported by:** net-dav.
@@ -3109,18 +3047,6 @@ relocation, conditional CRUD, the unsupported lanes; (3) CalDAV keeps iCalendar,
 scheduling, recurrence ids and `sync-collection`, CardDAV keeps vCard, the directory
 guard and the ctag lane; (4) the mirrored tests move into dav-core, parameterized over
 both dialects - the dispatcher move applied one layer up.
-
-## STR-153 - The iCalendar and vCard content-line codec is duplicated
-
-**Reported by:** net-dav (agrees today).
-
-`ical.rs` and `vcard.rs` each carry fold-at-75-octets, `escape_text`,
-`unescape_text`, RFC 6868 `escape_param` / `unescape_param`, `text_value` and
-`param_value` validators, and a write-error struct (`WriteError`, `VCardWriteError`);
-the vCard fold even says "(matches fold_ical_lines)", and `escape_text` replace order
-differs but is equivalent. Single home: a `content_line` module in dav-core (or a
-small crate) covering RFC 5545 section 3.1 and RFC 6350 section 3.2 framing, TEXT
-escaping, caret parameters, and per-value-type validators behind one error type.
 
 ## STR-154 - bifrost-net forces consumers to rebuild responses it already turned into errors
 

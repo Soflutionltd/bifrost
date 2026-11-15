@@ -45,7 +45,13 @@ pub struct ScopeWalkDriver {
 impl ScopeWalkDriver {
     /// A walk over a known, finite partition set.
     #[must_use]
-    pub fn fixed(partitions: Vec<InventoryPartition>) -> Self {
+    pub fn fixed(mut partitions: Vec<InventoryPartition>) -> Self {
+        // Partition counts are planning hints. An Outlook user expects an
+        // apparently empty folder to be checked, not durably skipped because
+        // a stale zero hint prevented the provider from being asked at all.
+        if partitions.is_empty() {
+            partitions.push(InventoryPartition::Full);
+        }
         Self::with_source(PartitionSource::Fixed(partitions.into_iter()))
     }
 
@@ -195,6 +201,20 @@ mod tests {
             scope_walk: ScopeWalkStep::RequestNextPartition,
             end: Some(PartitionEnd::MoreBeyond),
         }
+    }
+
+    #[test]
+    fn an_empty_fixed_plan_checks_full_inventory_before_completion() {
+        let mut driver = ScopeWalkDriver::fixed(Vec::new());
+        assert_eq!(driver.next_partition(), Some(InventoryPartition::Full));
+        let _ = driver.fold(&exhausted(0));
+        assert!(driver.next_partition().is_none());
+        assert!(driver.completed());
+
+        let mut failed = ScopeWalkDriver::fixed(Vec::new());
+        assert_eq!(failed.next_partition(), Some(InventoryPartition::Full));
+        failed.fail();
+        assert!(!failed.completed());
     }
 
     fn fixed_three() -> ScopeWalkDriver {

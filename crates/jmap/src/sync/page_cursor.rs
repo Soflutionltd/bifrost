@@ -896,7 +896,10 @@ mod tests {
 
         // Like the envelope violation, a refused cursor now carries its
         // message in the `InvalidArgument` cause, so read the debug form.
-        let undecodable = format!("{:?}", decode(Some(b"100".to_vec())).expect_err("v1 cursor"));
+        let undecodable = format!(
+            "{:?}",
+            decode(Some(b"100".to_vec())).expect_err("v1 cursor")
+        );
         assert!(undecodable.contains("widget"), "{undecodable}");
     }
 }

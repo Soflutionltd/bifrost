@@ -159,7 +159,7 @@ fn collect_attachments(
     if let Some(body) = &part.body
         && let Some(attachment_id) = &body.attachment_id
     {
-        let size = u64::try_from(body.size).ok();
+        let size = body.size.and_then(|size| u64::try_from(size).ok());
         let handle = BlobHandle {
             id: encode_blob_id(message_id, attachment_id),
             size,

@@ -9,8 +9,6 @@ pub(crate) mod query;
 pub(crate) mod set;
 pub(crate) mod validate;
 
-use std::fmt::Display;
-
 use serde::{Deserialize, Serialize};
 
 use crate::core::id::BlobId;
@@ -75,27 +73,14 @@ pub(crate) struct SetArguments {
     on_success_deactivate_script: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "name")]
-    Name,
-    #[serde(rename = "blobId")]
-    BlobId,
-    #[serde(rename = "isActive")]
-    IsActive,
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::Name => write!(f, "name"),
-            Property::BlobId => write!(f, "blobId"),
-            Property::IsActive => write!(f, "isActive"),
-        }
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        Name => "name",
+        BlobId => "blobId",
+        IsActive => "isActive",
     }
 }
 

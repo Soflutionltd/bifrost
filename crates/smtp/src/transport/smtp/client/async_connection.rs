@@ -11,6 +11,7 @@ use bifrost_sasl::ScramChannelBinding;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
+use super::ReplyMode;
 use super::async_net::AsyncDeadline;
 #[cfg(feature = "tracing")]
 use super::escape_crlf;
@@ -625,12 +626,18 @@ impl AsyncSmtpConnection {
             Op::WriteBdat => op_done(self.write_bdat_body(email).await),
             Op::OpenReplyGroup => op_done(self.open_reply_group()),
             Op::ReadGrouped => op_reply(
-                self.read_response_with_budget_inner(self.per_operation_budget(), true, false)
-                    .await,
+                self.read_response_with_budget_inner(
+                    self.per_operation_budget(),
+                    ReplyMode::Grouped,
+                )
+                .await,
             ),
             Op::ReadSingle => op_reply(
-                self.read_response_with_budget_inner(self.per_operation_budget(), true, true)
-                    .await,
+                self.read_response_with_budget_inner(
+                    self.per_operation_budget(),
+                    ReplyMode::AnyStatus,
+                )
+                .await,
             ),
             Op::CloseReplyGroup => op_done(self.finish_reply_group()),
             Op::CloseLmtpDrain { restore_ok } => {
@@ -1347,7 +1354,7 @@ impl AsyncSmtpConnection {
     }
 
     async fn read_response_accepting_status(&mut self) -> Result<Response, Error> {
-        self.read_response_with_budget_inner(self.per_operation_budget(), true, true)
+        self.read_response_with_budget_inner(self.per_operation_budget(), ReplyMode::AnyStatus)
             .await
     }
 
@@ -1355,17 +1362,16 @@ impl AsyncSmtpConnection {
         &mut self,
         budget: TimeoutBudget,
     ) -> Result<Response, Error> {
-        self.read_response_with_budget_inner(budget, false, true)
+        self.read_response_with_budget_inner(budget, ReplyMode::Positive)
             .await
     }
 
     async fn read_response_with_budget_inner(
         &mut self,
         budget: TimeoutBudget,
-        accept_negative: bool,
-        manage_state: bool,
+        mode: ReplyMode,
     ) -> Result<Response, Error> {
-        if manage_state {
+        if mode.manages_state() {
             self.stream.get_ref().state().verify()?;
             self.stream.get_mut().set_state(ConnectionState::Broken);
         }
@@ -1458,14 +1464,14 @@ impl AsyncSmtpConnection {
             tracing::debug!("<< {}", escape_crlf(line));
             match parse_response(&buffer) {
                 Ok((_remaining, response)) => {
-                    if manage_state && !self.stream.buffer().is_empty() {
+                    if mode.manages_state() && !self.stream.buffer().is_empty() {
                         return Err(error::parse("SMTP server sent an unsolicited reply"));
                     }
-                    if manage_state {
+                    if mode.manages_state() {
                         self.stream.get_mut().set_state(ConnectionState::Ok);
                     }
 
-                    return if accept_negative || response.is_positive() {
+                    return if mode.accepts_negative() || response.is_positive() {
                         Ok(response)
                     } else {
                         Err(error::status(response))

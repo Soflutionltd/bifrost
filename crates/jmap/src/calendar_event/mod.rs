@@ -90,6 +90,9 @@ pub(crate) enum RelativeTo {
 pub(crate) struct GetArguments {
     #[serde(rename = "recurrenceOverridesBefore")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    // This is UTCDateTime, whereas event start is LocalDateTime and duration
+    // is an RFC 5545 duration. Their typed migration must include the account
+    // conversion layer so validation does not diverge between reads and writes.
     pub(crate) recurrence_overrides_before: Option<String>,
 
     #[serde(rename = "recurrenceOverridesAfter")]

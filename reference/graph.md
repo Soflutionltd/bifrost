@@ -1498,11 +1498,26 @@ address it. `public_folder.rs` therefore mints folder-qualified object ids
 distinct from the US-separated shared-mailbox form) in both the inventory
 projection and the poll's `Added`/`Destroyed` emissions.
 
-`get_stream` splits each chunk with `partition_ews_ids`: an id whose folder is
-present in `routing_map` goes to `fetch_ews_outcomes` (one `GetItem` per item,
+`get_stream` splits each chunk with `partition_ews_ids`: an encoded public
+item goes to `fetch_ews_outcomes` (one `GetItem` per item,
 because per-folder routing headers differ), everything else to the Graph
-`/$batch`. Both arms land in one `Batch`, so the consumer still sees exactly
-one outcome per pulled id. `hydrated_from_ews_item` projects into the SAME
+`/$batch`. Missing public-folder routing fails that item locally with
+`ConcurrencyConflict` / `Retry(AfterStateRefresh)`, matching typed message
+hydration. The encoded identity survives reopening even before discovery
+restores routing. An Outlook user expects that temporary routing gap to leave
+an item visible, rather than a REST 404 falsely declaring it deleted. The gap
+is temporary only until discovery has had its chance: ruling (wave 2), once a
+complete discovery pass (`GraphAccount::public_folder_discovery_complete`: the
+whole hierarchy browsed, with no early exit, skipped subtree or step-cap
+truncation) has run without restoring the folder, both message hydration
+doors (`fetch_ews_outcomes` and `pim::hydrate`) report the item
+`NotFound(Message)` with `Unsent` evidence
+(`graph_error::unroutable_public_item_error`, via
+`GraphAccount::missing_public_route_error`), so it stops retrying and drops
+out of view as an `ErrorItemNotFound` would. The flag starts false on every
+open and is reset at the start of each pass. The contact and calendar public
+doors keep the conflict refusal. Both
+arms land in one `Batch`, so the consumer still sees exactly one outcome per pulled id. `hydrated_from_ews_item` projects into the SAME
 `HydratedObject` shape the REST arm returns: `Metadata` (the identical
 inventory-entry projection) for the body-bearing projections, `FlagsOnly` for
 `FlagsOnly`, plus one blob handle per attachment descriptor. Body-bearing
@@ -2519,6 +2534,11 @@ the engine then records ALONE.
   `PreconditionFailed` / 412 -> `ConcurrencyConflict` ->
   `Retry::AfterStateRefresh`.
 
+A non-envelope 5xx batch body retains the status-based server classification,
+including 507 quota handling, just like an empty body. An Outlook user expects
+an HTML proxy error to retry like the same temporary failure with a JSON body;
+body diagnostics remain available without making that failure terminal.
+
 Batch readers reject numeric statuses outside 100..=999 as acknowledged
 `Protocol(ContractViolation)` errors rather than substituting a retryable 500.
 
@@ -2751,8 +2771,11 @@ OneDrive records a committed UploadSession before URL admission. Admission
 refusal is effectless and sends no cancel. Failed chunks distinguish session
 Updated from final CloudFile Created, while accepted earlier chunks remain
 historical. Existing session cancellation reverses only the session, never a
-possibly created file; its own outcome and error are retained. A failed
-createLink records the completed CloudFile. These effects are Repeatable
+possibly created file; its own outcome and error are retained. A cancel's
+404 or 410 records a successful compensation: an Outlook user expects cleanup
+to succeed once the session is absent, including expiry or completion elsewhere.
+This does not prove a possibly created file absent or suppress reconciliation.
+A failed createLink records the completed CloudFile. These effects are Repeatable
 by-products relative to hosting, and no pre-authenticated URL enters a scope.
 
 Bulk mutation streams already preserve per-item lanes and do not carry sibling

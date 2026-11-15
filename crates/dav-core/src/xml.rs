@@ -142,6 +142,12 @@ pub fn normalize_etag(text: &str) -> Option<String> {
 /// Rebase a DAV response href against its request URI at the XML decoding
 /// boundary. Client callers never expose parsed relative hrefs to the account
 /// layer.
+///
+/// Keep RFC 3986 request-relative joining here: unlike a configured account
+/// base directory, the effective request URI may name a resource. Appending a
+/// slash would resolve its sibling response href as a child of that resource.
+/// `DavDispatch::resolve_url` instead interprets user-configured base paths as
+/// directories. These are different inputs, not two identity policies.
 #[must_use]
 pub fn resolve_href(request_url: &str, href: &str) -> String {
     if href.starts_with("http://") || href.starts_with("https://") {

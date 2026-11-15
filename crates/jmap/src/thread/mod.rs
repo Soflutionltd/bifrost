@@ -1,7 +1,5 @@
 pub(crate) mod get;
 
-use std::fmt::Display;
-
 use serde::{Deserialize, Serialize};
 
 mod marker {
@@ -17,13 +15,13 @@ pub(crate) struct Thread {
     email_ids: Option<Vec<crate::email::EmailId>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "emailIds")]
-    EmailIds,
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        EmailIds => "emailIds",
+    }
 }
 
 impl crate::core::Object for Thread {
@@ -36,15 +34,6 @@ impl crate::core::Object for Thread {
 
 impl crate::core::changes::ChangesObject for Thread {
     type ChangesResponse = ();
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::EmailIds => write!(f, "emailIds"),
-        }
-    }
 }
 
 crate::define_get_method!(

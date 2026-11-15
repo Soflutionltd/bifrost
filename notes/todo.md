@@ -104,11 +104,6 @@ face.
   The other recipients' failures are dropped from that `Err`. Decide whether
   "acceptance uncertain, none acknowledged" becomes a receipt state, and if so
   what Sent filing and draft cleanup do for a maybe-sent message.
-- **Only IMAP fills `SendReceipt::recipients_not_accepted`.** JMAP decodes
-  `EmailSubmission.deliveryStatus` (`crates/jmap/src/email_submission/`) but the
-  send path in `crates/jmap/src/sync/pim.rs` never reads it; Gmail and Graph
-  expose no per-recipient answer. Decide whether JMAP should populate the field
-  from `deliveryStatus` (its `smtpReply` per recipient is the same evidence).
 
 - **Gmail and Graph ignore `save_to_sent = false`.** Both file the Sent copy
   server-side unconditionally (`_save_to_sent` is unused in
@@ -220,10 +215,6 @@ face.
   automatic retry can create another. Accepted Repeatable clutter, bounded by
   retry budgets. Orphan cleanup would be a new compensation; none exists in
   `pim/send.rs`.
-- **Graph cancel_upload_session records a 404 or 410 as a Failed
-  compensation,** though both mean the session is already gone. Google treats
-  404, 410 and 499 on its cancel as Succeeded. Decide whether Graph should
-  match.
 - **Mutation outcomes carry no per-id detail.**
   `MutationCounters::pending_retry` is a single count that lumps unsent work,
   exhausted retries, read-back mismatches and inconclusive read-backs, with no

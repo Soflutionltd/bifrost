@@ -52,6 +52,9 @@ pub(crate) struct Email {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mailbox_ids: Option<HashMap<MailboxId, bool>>,
 
+    // Keyword identity is ASCII-case-insensitive at the account boundary.
+    // A validated key type must preserve the original spelling for wire
+    // patches while sharing that identity with the flag judge and writers.
     #[serde(rename = "keywords")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) keywords: Option<HashMap<String, bool>>,
@@ -390,36 +393,66 @@ pub(crate) struct EmailHeader {
     pub(super) value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    Id,
-    BlobId,
-    ThreadId,
-    MailboxIds,
-    Keywords,
-    Size,
-    ReceivedAt,
-    MessageId,
-    InReplyTo,
-    References,
-    Sender,
-    From,
-    To,
-    Cc,
-    Bcc,
-    ReplyTo,
-    Subject,
-    SentAt,
-    BodyStructure,
-    BodyValues,
-    TextBody,
-    HtmlBody,
-    Attachments,
-    HasAttachment,
-    Preview,
-    Header(Header),
-    Other(String),
+// Header selections carry their own grammar. Keep that parser and unknown
+// extensions while deriving every fixed property's encode/decode spelling once.
+macro_rules! email_properties {
+    ($( $variant:ident => $wire:literal ),* $(,)?) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        #[non_exhaustive]
+        pub(crate) enum Property {
+            $( $variant, )*
+            Header(Header),
+            Other(String),
+        }
+
+        impl Property {
+            fn parse(value: &str) -> Option<Self> {
+                match value {
+                    $( $wire => Some(Self::$variant), )*
+                    _ if value.starts_with("header:") => Some(Self::Header(Header::parse(value)?)),
+                    _ => Some(Self::Other(value.to_string())),
+                }
+            }
+        }
+
+        impl Display for Property {
+            fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+                match self {
+                    $( Self::$variant => f.write_str($wire), )*
+                    Self::Header(header) => header.fmt(f),
+                    Self::Other(other) => f.write_str(other),
+                }
+            }
+        }
+    };
+}
+
+email_properties! {
+    Id => "id",
+    BlobId => "blobId",
+    ThreadId => "threadId",
+    MailboxIds => "mailboxIds",
+    Keywords => "keywords",
+    Size => "size",
+    ReceivedAt => "receivedAt",
+    MessageId => "messageId",
+    InReplyTo => "inReplyTo",
+    References => "references",
+    Sender => "sender",
+    From => "from",
+    To => "to",
+    Cc => "cc",
+    Bcc => "bcc",
+    ReplyTo => "replyTo",
+    Subject => "subject",
+    SentAt => "sentAt",
+    BodyStructure => "bodyStructure",
+    BodyValues => "bodyValues",
+    TextBody => "textBody",
+    HtmlBody => "htmlBody",
+    Attachments => "attachments",
+    HasAttachment => "hasAttachment",
+    Preview => "preview",
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -454,74 +487,6 @@ pub(crate) enum HeaderForm {
     MessageIds,
     Date,
     URLs,
-}
-
-impl Property {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "id" => Some(Property::Id),
-            "blobId" => Some(Property::BlobId),
-            "threadId" => Some(Property::ThreadId),
-            "mailboxIds" => Some(Property::MailboxIds),
-            "keywords" => Some(Property::Keywords),
-            "size" => Some(Property::Size),
-            "receivedAt" => Some(Property::ReceivedAt),
-            "messageId" => Some(Property::MessageId),
-            "inReplyTo" => Some(Property::InReplyTo),
-            "references" => Some(Property::References),
-            "sender" => Some(Property::Sender),
-            "from" => Some(Property::From),
-            "to" => Some(Property::To),
-            "cc" => Some(Property::Cc),
-            "bcc" => Some(Property::Bcc),
-            "replyTo" => Some(Property::ReplyTo),
-            "subject" => Some(Property::Subject),
-            "sentAt" => Some(Property::SentAt),
-            "hasAttachment" => Some(Property::HasAttachment),
-            "preview" => Some(Property::Preview),
-            "bodyValues" => Some(Property::BodyValues),
-            "textBody" => Some(Property::TextBody),
-            "htmlBody" => Some(Property::HtmlBody),
-            "attachments" => Some(Property::Attachments),
-            "bodyStructure" => Some(Property::BodyStructure),
-            _ if value.starts_with("header:") => Some(Property::Header(Header::parse(value)?)),
-            _ => Some(Property::Other(value.to_string())),
-        }
-    }
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::BlobId => write!(f, "blobId"),
-            Property::ThreadId => write!(f, "threadId"),
-            Property::MailboxIds => write!(f, "mailboxIds"),
-            Property::Keywords => write!(f, "keywords"),
-            Property::Size => write!(f, "size"),
-            Property::ReceivedAt => write!(f, "receivedAt"),
-            Property::MessageId => write!(f, "messageId"),
-            Property::InReplyTo => write!(f, "inReplyTo"),
-            Property::References => write!(f, "references"),
-            Property::Sender => write!(f, "sender"),
-            Property::From => write!(f, "from"),
-            Property::To => write!(f, "to"),
-            Property::Cc => write!(f, "cc"),
-            Property::Bcc => write!(f, "bcc"),
-            Property::ReplyTo => write!(f, "replyTo"),
-            Property::Subject => write!(f, "subject"),
-            Property::SentAt => write!(f, "sentAt"),
-            Property::BodyStructure => write!(f, "bodyStructure"),
-            Property::BodyValues => write!(f, "bodyValues"),
-            Property::TextBody => write!(f, "textBody"),
-            Property::HtmlBody => write!(f, "htmlBody"),
-            Property::Attachments => write!(f, "attachments"),
-            Property::HasAttachment => write!(f, "hasAttachment"),
-            Property::Preview => write!(f, "preview"),
-            Property::Header(header) => header.fmt(f),
-            Property::Other(other) => write!(f, "{other}"),
-        }
-    }
 }
 
 impl Serialize for Property {

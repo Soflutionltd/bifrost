@@ -184,7 +184,11 @@ pub(crate) fn build_capabilities(
             vacation_get: false,
             vacation_set: false,
             quota_get: profile.supports(Capability::Quota),
-            thread_hydrate: has_thread_references,
+            // Native thread handles resolve by SEARCH and need no THREAD
+            // algorithm; REFERENCES is only required to discover snapshots.
+            thread_hydrate: has_thread_references
+                || profile.supports(Capability::ObjectId)
+                || profile.supports(Capability::XGmExt1),
             message_hydrate: true,
             open_raw_rfc822: true,
             filters_list: has_sieve,

@@ -831,12 +831,7 @@ pub(in crate::connection) async fn run_prepared_command(
     // on tagged OK. NOTIFY SET computes flags from the registration
     // params; NOTIFY NONE resets to default (no notifications).
     if let Command::NotifySet(params) = cmd {
-        let (list, status, metadata) = super::extensions::compute_notify_flags(params);
-        state.set_in_notify_set(Some(super::NotifyFlags {
-            list,
-            status,
-            metadata,
-        }));
+        state.set_in_notify_set(Some(super::NotifyFlags::from(params)));
     }
     if matches!(cmd, Command::NotifyNone) {
         state.set_in_notify_set(Some(super::NotifyFlags::default()));

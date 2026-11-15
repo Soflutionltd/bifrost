@@ -35,7 +35,14 @@ Everything else in `crates/jmap/src/` is `pub(crate)` or narrower. Consumers rea
 Session-level Mail, Submission, Sieve, Calendars, Contacts, Principals and
 Blob objects are support markers. Their typed configuration lives on session
 accounts; Blob configuration readers select the primary Blob account's
-`accountCapabilities` object. Convenience session readers select the
+`accountCapabilities` object (RFC 9404 `maxDataSources`, `maxSizeBlobSet`,
+`supportedDigestAlgorithms`, `supportedTypeNames`, each preserved across
+serde). `Blob/lookup` takes its `typeNames` as `DataType`, and a method's
+`additional_capabilities` adds each known type's defining capability
+(`DataType::capability_uri`, which answers even for types whose module is
+feature-gated off) to the request's `using`, deduplicated; an unknown
+extension type still needs an explicit `Request::add_capability`.
+Convenience session readers select the
 capability's primary account; account readers support explicit foreign-account
 selection. Capability markers declare their placement, and generic
 configuration readers clone the decoded configuration without reserializing
@@ -251,19 +258,30 @@ from it, so a concurrent refresh cannot splice two sessions into one request.
 Every template comes from the server's session object, so one that does not
 parse (an unbalanced or unknown template variable) is
 `Error::MalformedSessionUrl` naming the session property (`uploadUrl`,
-`downloadUrl`, `eventSourceUrl`), not the caller's `InvalidUrl`. `URLPart::parse`
+`downloadUrl`, `eventSourceUrl`), not the caller's `InvalidUrl`. The upload
+template parses against its own variable set (`blob::UploadParameter`), which
+admits only `accountId`: an upload has no blob id, name or type yet, so a
+`uploadUrl` naming `blobId`, `name` or `type` is refused as
+`MalformedSessionUrl` rather than expanded with those variables silently
+blanked. `URLPart::parse`
 itself returns a bare description because it cannot know who wrote the
 template; `SessionState::derive` attaches the property.
 A template that parses must also be an absolute `http` / `https` URL with a
 host, checked on a probe expansion (each variable replaced by one unreserved
 character) so a legitimate level-1 template, including one whose host label is
 a variable, is never refused; `apiUrl` gets the same absoluteness check
-unexpanded, naming `apiUrl`. The upload and download templates and `apiUrl` are
-checked eagerly, because the account uses them throughout. `eventSourceUrl` is
-parsed with the session but a failure is only stored: `event_source_url()`
-returns a `Result` and raises `MalformedSessionUrl { property: "eventSourceUrl" }`
-at use, so a server whose EventSource template this crate cannot parse can still
-be opened for sync, which never touches EventSource.
+unexpanded, naming `apiUrl`. The download template and `apiUrl` are checked
+eagerly, because the account uses them throughout. `uploadUrl` and
+`eventSourceUrl` are parsed with the session but a failure is only stored:
+`upload_url()` and `event_source_url()` return a `Result` and raise
+`MalformedSessionUrl` naming their property at use. Ruling: an enterprise
+Outlook user whose server mis-advertises its upload template expects mail,
+contacts and calendars to keep working, so the session opens and each upload
+is refused as the provider's contract violation (`Protocol(ContractViolation)`
+at the account boundary). `attachment_upload` stays advertised, because the
+capability describes the protocol surface, not one session's template; the
+refusal is per call. Likewise a server whose EventSource template this crate
+cannot parse can still be opened for sync, which never touches EventSource.
 At the sync boundary, a method response whose `sessionState` differs marks the
 client stale and advances a watch generation. The always-driven scope lifecycle
 stream selects on that generation and terminates promptly with
@@ -363,7 +381,9 @@ Every JMAP object type under `crates/jmap/src/<type>/`:
 
 ## Two data models
 
-**Typed structs** (Mailbox, Calendar, AddressBook, etc.): serde derive, `Field<T>` for nullable properties.
+**Typed structs** (Mailbox, Calendar, AddressBook, etc.): serde derive, `Field<T>` for nullable properties. Their closed property vocabularies are declared through `core::method::define_property_enum!`, one table per enum giving each variant its wire spelling once; serde and `Display` both read that table, so the two cannot drift.
+
+Date setters on `EmailCreate` (`sent_at`, `received_at`) and `EmailImport` (`received_at`) take a `jiff::Timestamp`, never an `i64`: the integer form went through `from_timestamp`, which turns an out-of-range value into the Unix epoch and so silently sends a 1970 date. `from_timestamp` remains only for older integer-taking builders.
 
 **JSON map backing** (CalendarEvent, ContactCard): `serde_json::Map` via `json_object_struct!` macro. Property enum has `Other(String)`. Extension properties preserved on round-trip.
 
@@ -550,7 +570,7 @@ The crate-internal JMAP error type uses structured variants. No
 - Local request refusals: `RequestEncode`, `RequestCallLimit { max }`, `RequestSizeLimit { max, size }`, `NoPrimaryAccount { capability }`.
 - Response-shape failures: `ResponseDecode`, `CallNotFound`, `UnexpectedMethodResponse`, `IdNotFound`, `SetIdUnanswered`, `NotParsable`.
 - `InvalidUrl` - a URL or URL-component value the crate's own caller supplied is unusable. Sources include an empty session URL and an empty EventSource type list.
-- `MalformedSessionUrl { property, detail }` - a URL or URL template the SERVER published in its session is unusable: `apiUrl` and the `uploadUrl`, `downloadUrl` and `eventSourceUrl` templates (an unbalanced or unknown template variable, or not an absolute http or https URL; `eventSourceUrl` raises only when EventSource is used) and the WebSocket capability's `url` (an unparseable URI or a non-websocket scheme). The provider described itself wrongly, so this is never the caller's `InvalidUrl`.
+- `MalformedSessionUrl { property, detail }` - a URL or URL template the SERVER published in its session is unusable: `apiUrl` and the `uploadUrl`, `downloadUrl` and `eventSourceUrl` templates (an unbalanced or unknown template variable, or not an absolute http or https URL; `uploadUrl` raises only at an upload and `eventSourceUrl` only when EventSource is used) and the WebSocket capability's `url` (an unparseable URI or a non-websocket scheme). The provider described itself wrongly, so this is never the caller's `InvalidUrl`.
 - `MalformedCapability { capability }` - an advertised capability whose object does not parse.
 - Behind the `websockets` feature: `WebSocketHandshake`, `WebSocketRuntime` (a read-side failure after the handshake), `WebSocketSend` (a failed frame write to the connection's sink), `WebSocketClosed`, `WebSocketSetup(WebSocketSetupError)`, `WebSocketNotConnected`.
 - No `From<reqwest::Error>` - reqwest errors converted to TransportError at point of use. No `From<tokio_websockets::Error>` either - see "Error translation".
@@ -914,7 +934,22 @@ Scheduled send rides RFC 8621/4865 FUTURERELEASE: when `SendRequest::scheduled` 
 
 Search maps the shared `SearchRequest` AST to `Email/query` (query text as a JMAP `text` filter). `search_messages` returns native email ids; `search` uses `collapseThreads = true`, hydrates the emails' `threadId`, returns thread ids. That projection accounts for every submitted email id (`reconcile_search_threads`): an id declared `notFound`, an id answered in neither list, and an email returned without the mandatory `threadId` all ride `Page::failed_ids` instead of being dropped, which used to leave the page silently short of its own result count. Thread ids are deduplicated, since `collapseThreads` is not a guarantee that the server collapsed them. Every known `SearchFilter` variant is translated recursively; the required non-exhaustive catch-all returns `Unsupported(Search)` so a future shared variant cannot silently become an empty JMAP `AND` that matches everything. Page cursors are opaque position bytes, so the search query pins `receivedAt` desc exactly as the inventory walks do: RFC 8621 gives an unsorted `Email/query` a server-defined order with no cross-call stability guarantee, and paging an unstable order by integer position duplicates and skips results. `route_search` picks the account before the query is built, from the owners of the filter's `In` containers (`search_owner` walks And/Or/Not): no `In` or a primary `In` is primary-only, one foreign owner routes both legs to that share and re-qualifies the result ids, two owners or an unreachable owner are refused. The `In` arm therefore strips the owner qualifier on the wire - the native part is a mailbox id in exactly the account the query addresses - and the cursor carries the owner so a resume cannot cross accounts. See "Foreign (shared/delegate) accounts".
 
-Container CRUD is `Mailbox/get`/`set`. Rename, move and delete select the
+JMAP send receipts leave `recipients_not_accepted` empty across ordinary,
+raw and draft sends, including scheduled submissions. `EmailSubmission` exposes
+`delivery_status()` and each entry exposes `smtp_reply()` and `delivered()`,
+but these describe asynchronous delivery progress, not the acceptance transcript
+of this call. A negative delivery result can follow an accepted submission.
+An enterprise Outlook user expects later non-delivery to arrive as a delivery
+report, without being invited to repeat an already accepted send. Absence of
+recipient entries does not verify delivery; these send doors do not poll for
+later delivery status.
+
+Container CRUD is `Mailbox/get`/`set`. Rename and move require the requested
+native id in `updated` (including a null value) or surface its `notUpdated`
+error. An id absent from both lanes is mapped through `set_answer_error` as an
+unguarded unanswered `Mailbox/set` write; `newState` alone cannot prove that
+folder changed. The mailbox state cache advances only after that per-id check.
+Rename, move and delete select the
 registered owner from the qualified container id; child creation selects its
 parent's owner. Wire ids are stripped only for that selected owner, and a
 created child returns an owner-qualified id. Moving to the root keeps the
@@ -1110,7 +1145,7 @@ exposure any consumer of an unbounded query has.
 
 - `filters_list` runs `SieveScript/query`, hydrates with `SieveScript/get`, downloads each script's blob, returns `ServerFilter::Script`. The query's id list is however many scripts the account holds, so hydration is BATCHED at the session's `maxObjectsInGet` (`factory::max_objects_in_get`, the reader for doors that hold a bare `Account` rather than the `CoreLimits` built at open) - one unbounded `/get` is a call a server may refuse wholesale with `requestTooLarge`. Each answer is then RECONCILED against the ids that batch submitted, the way `reconcile_hydration` and `contacts::get_cards` do. An id the server leaves out of `list` used to vanish from the returned `Vec`, which reads to the consumer as "that filter does not exist" - a deletion the response never claimed, and one an absent `notFound` cannot disprove (see the `/get` leniency rule). This door has no per-item lane, so the whole page fails, retryably: `error::get_id_unresolved_after_query` classifies both an unanswered id and a declared `notFound` as `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, the same class `get_id_unanswered` uses and the same answer `contact_update` gives for an unanswered pre-read id. `notFound` deliberately shares that lane rather than taking the terminal `get_id_not_found` one: at page level the honest reading of a script the query named and the get disclaimed is a delete that raced the two calls, and the retry's fresh `/query` will not name it again. The downloads are independent of each other, so they run CONCURRENTLY under `factory::api_request_concurrency` (the server's `maxConcurrentRequests`, clamped `[1, 8]` - the same reading the open-time foreign probes use, deliberately one function rather than a second bound that could drift). Serially this was N+2 round trips for N scripts. It is `buffered`, never `buffer_unordered`: yielding in submission order is what keeps the error accounting identical to the serial loop's, where the first failing script in list order is the error the whole call returns. Arrival order would report whichever download happened to fail first.
 - `filter_create` uploads the body as `application/sieve`, creates a `SieveScript`, and `onSuccessActivateScript` when asked active.
-- `filter_update` patches name/body via `SieveScript/set` (body uploads a fresh blob first); `is_active: true` activates the target via `onSuccessActivateScript`. Deactivation first reads the target's `isActive`; an inactive target leaves activation alone while still applying name/body edits. An active target uses `onSuccessDeactivateScript` guarded by the read's `ifInState`, so a concurrent activation produces a conflict instead of deactivating another script. A target omitted from both read-result lanes fails retryably as `Protocol(PartialResponse)`; an explicit `notFound` remains `NotFound`.
+- `filter_update` patches name/body via `SieveScript/set` (body uploads a fresh blob first); `is_active: true` activates the target via `onSuccessActivateScript`. Deactivation first reads the target's `isActive`; an inactive target leaves activation alone while still applying name/body edits. An active target uses `onSuccessDeactivateScript` guarded by the read's `ifInState`, so a concurrent activation produces a conflict instead of deactivating another script. There is no automatic re-read and retry after `stateMismatch`, including one caused by an unrelated script edit. The patch can also replace name/body; preserving concurrent rule edits, as an enterprise Outlook user expects, takes precedence over silently authorizing the original patch against a newer ruleset. The caller refreshes and explicitly retries the whole patch; deactivation is not split into a second write. A target omitted from both read-result lanes fails retryably as `Protocol(PartialResponse)`; an explicit `notFound` remains `NotFound`.
 - `filter_delete` destroys the id; `filter_validate` uploads then `SieveScript/validate`, mapping set errors to `FilterValidation` diagnostics.
 
 Typed `ServerFilterCreate::Rule` / `ServerFilterPatch::Rule` return `Unsupported`.

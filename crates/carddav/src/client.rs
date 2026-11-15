@@ -8,7 +8,7 @@ pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery, PutCondition};
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{AccountError, AccountOperation, ErrorScope};
 use reqwest::header::{CONTENT_TYPE, ETAG};
-use reqwest::{Method, StatusCode};
+use reqwest::Method;
 
 use crate::CardDavConfig;
 use crate::parse::{
@@ -122,7 +122,7 @@ impl bifrost_dav_core::DavRequestGuard for DirectoryGuard {
         // The only exemption. New methods and operations are refused by
         // default, including pre-fetch GETs and every sync request.
         if operation == AccountOperation::DirectorySearch
-            && method.as_str() == "REPORT"
+            && *method == *bifrost_dav_core::REPORT
             && self.search_gateways.get().is_some_and(|gateways| {
                 gateways
                     .iter()
@@ -215,7 +215,7 @@ impl CardDavClient {
             .dav
             .propfind_raw(
                 &principal,
-                "0",
+                bifrost_dav_core::Depth::Zero,
                 PROPFIND_ADDRESSBOOK_HOME,
                 AccountOperation::Discover,
             )
@@ -264,7 +264,12 @@ impl CardDavClient {
     ) -> Result<Vec<AddressBookCollection>, AccountError> {
         let response = self
             .dav
-            .propfind_raw(home_url, "1", PROPFIND_ADDRESSBOOKS, operation)
+            .propfind_raw(
+                home_url,
+                bifrost_dav_core::Depth::One,
+                PROPFIND_ADDRESSBOOKS,
+                operation,
+            )
             .await?;
         let mut collections = parse_addressbook_collections(&response.text)
             .map_err(|error| parse_error(operation, format!("addressbook list: {error}")))?;
@@ -291,7 +296,12 @@ impl CardDavClient {
     ) -> Result<Option<String>, AccountError> {
         let response = self
             .dav
-            .propfind_raw(addressbook_url, "0", PROPFIND_CTAG, operation)
+            .propfind_raw(
+                addressbook_url,
+                bifrost_dav_core::Depth::Zero,
+                PROPFIND_CTAG,
+                operation,
+            )
             .await?;
         let mut collections = parse_addressbook_collections(&response.text)
             .map_err(|error| parse_error(operation, format!("collection metadata: {error}")))?;
@@ -321,7 +331,12 @@ impl CardDavClient {
     ) -> Result<CardDavContactListing, AccountError> {
         let response = self
             .dav
-            .propfind_raw(addressbook_url, "1", PROPFIND_CONTACTS, operation)
+            .propfind_raw(
+                addressbook_url,
+                bifrost_dav_core::Depth::One,
+                PROPFIND_CONTACTS,
+                operation,
+            )
             .await?;
         let mut listing = parse_propfind_contacts(&response.text)
             .map_err(|error| parse_error(operation, format!("contact list: {error}")))?;
@@ -368,7 +383,7 @@ impl CardDavClient {
             .map(|body| {
                 self.run_leg(MultigetLeg {
                     url: addressbook_url,
-                    depth: "0",
+                    depth: bifrost_dav_core::Depth::Zero,
                     body,
                     operation,
                     context: "multiget",
@@ -508,7 +523,12 @@ impl CardDavClient {
     ) -> HrefLeg {
         let response = match self
             .dav
-            .report_raw_response(addressbook_url, "1", body, operation)
+            .report_raw_response(
+                addressbook_url,
+                bifrost_dav_core::Depth::One,
+                body,
+                operation,
+            )
             .await
         {
             Ok(response) => response,
@@ -556,7 +576,7 @@ impl CardDavClient {
         let body = directory_query_body(query, limit);
         let response = self
             .dav
-            .report_raw_response(url, "1", &body, operation)
+            .report_raw_response(url, bifrost_dav_core::Depth::One, &body, operation)
             .await?;
         if !response.status.is_success() {
             return Err(if filter_unsupported(response.status, &response.body) {
@@ -870,7 +890,7 @@ fn addressbook_text_query_body(property: &str, query: &str) -> String {
 /// One REPORT leg of a multi-leg fetch, as handed to `accumulate_leg`.
 struct MultigetLeg<'a> {
     url: &'a str,
-    depth: &'a str,
+    depth: bifrost_dav_core::Depth,
     body: &'a str,
     operation: AccountOperation,
     /// Names the leg in a parse-failure message ("multiget", "query").
@@ -955,9 +975,9 @@ fn complete_failure_error(
     match outcome {
         MultigetOutcome::Usable => None,
         MultigetOutcome::CompleteFailure { status } => {
-            let code = status
-                .and_then(|code| StatusCode::from_u16(code).ok())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            // Only readable refusals can fail a complete response. Preserve
+            // their actual status rather than inventing a server failure.
+            let code = status;
             Some(status_error(
                 &reqwest::header::HeaderMap::new(),
                 operation,
@@ -1087,6 +1107,7 @@ const PROPFIND_CONTACTS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::StatusCode;
 
     use bifrost_types::{
         AccountErrorKind, Protocol, ProtocolErrorKind, RecoveryClass, RequestErrorKind,
@@ -3136,6 +3157,7 @@ mod directory_guard_contract_tests {
     use super::*;
     use bifrost_dav_core::DavResponse;
     use bifrost_dav_core::test_support::{dav_script, scripted_dav_net, transcripts};
+    use reqwest::StatusCode;
 
     #[tokio::test]
     async fn directory_round_three_every_account_operation_is_guarded_by_default() {

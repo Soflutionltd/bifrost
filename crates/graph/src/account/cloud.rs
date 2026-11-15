@@ -256,13 +256,24 @@ async fn cancel_upload_session(
         // redirect, naming the status only, since a `Location` kept in the
         // compensation would reach support exports and may carry the session
         // credential. bifrost-net resolves 4xx/5xx into an `Err` before a
-        // response surfaces, so a 2xx is the only acceptance.
+        // response surfaces; absent sessions are handled on that error path.
         Ok(response) if !response.status.is_success() => Err(contract_violation(format!(
             "OneDrive answered the upload session cancel with {}, which does not \
              cancel the session",
             response.status
         ))),
         Ok(_) => Ok(()),
+        // An Outlook user expects cleanup to succeed once the session is
+        // absent, whether deleted now, expired, or completed elsewhere. This
+        // says nothing about a possibly created file, which still reconciles.
+        Err(error)
+            if matches!(
+                error.response_status().map(|status| status.as_u16()),
+                Some(404 | 410)
+            ) =>
+        {
+            Ok(())
+        }
         Err(error) => Err(error),
     })
 }
@@ -1461,6 +1472,32 @@ mod tests {
             1,
             "no sharing link for a failed upload"
         );
+    }
+
+    #[tokio::test]
+    async fn an_absent_upload_session_is_a_successful_compensation() {
+        for status in [reqwest::StatusCode::NOT_FOUND, reqwest::StatusCode::GONE] {
+            let (client, error) = host_with([
+                accepted(json!({ "nextExpectedRanges": ["20-"] })),
+                ScriptedRestResponse::empty(status),
+            ])
+            .await;
+            assert_cancelled_once(&client, 1);
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ContractViolation
+                )
+            );
+            let record = error.partial_commit().expect("the session was created");
+            let [compensation] = record.compensations() else {
+                panic!("one cancel compensation: {record:?}");
+            };
+            assert!(matches!(
+                compensation.outcome(),
+                CompensationOutcome::Succeeded
+            ));
+        }
     }
 
     /// A redirect on the chunk PUT is not followed: the session URL was

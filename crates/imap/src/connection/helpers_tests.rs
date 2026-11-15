@@ -171,10 +171,10 @@ fn quota_resource_name_from_typed_capability() {
 }
 
 #[test]
-fn quota_resource_name_from_other_capability() {
-    let cap = Capability::Other("QUOTA=RES-MESSAGE".to_owned());
+fn quota_resource_name_uses_capability_parser() {
+    let cap = Capability::from_imap_str("QUOTA=RES-MESSAGE");
     assert_eq!(ImapConnection::quota_resource_name(&cap), Some("MESSAGE"));
-    let lower = Capability::Other("quota=res-message".to_owned());
+    let lower = Capability::from_imap_str("quota=res-message");
     assert_eq!(ImapConnection::quota_resource_name(&lower), Some("message"));
 }
 
@@ -191,7 +191,7 @@ fn quota_resource_name_rejects_bare_prefix_and_others() {
 
 #[test]
 fn has_quota_resource_matches_case_insensitively() {
-    let c = conn(vec![Capability::Other("QUOTA=RES-STORAGE".to_owned())]);
+    let c = conn(vec![Capability::from_imap_str("QUOTA=RES-STORAGE")]);
     assert!(c.has_quota_resource("storage"));
     assert!(!c.has_quota_resource("MESSAGE"));
 }

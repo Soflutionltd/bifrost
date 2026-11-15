@@ -23,6 +23,16 @@ impl<'de> Deserialize<'de> for HistoryId {
     }
 }
 
+fn message_history_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<HistoryId>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .map(HistoryId))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GmailMessage {
@@ -32,6 +42,9 @@ pub(crate) struct GmailMessage {
     pub(crate) label_ids: Vec<String>,
     #[serde(default)]
     pub(crate) snippet: String,
+    // Readable mail must remain visible even when its optional version is unusable.
+    // Unlike cursor IDs, message versions do not authorize sync advancement.
+    #[serde(default, deserialize_with = "message_history_id")]
     pub(crate) history_id: Option<HistoryId>,
     pub(crate) internal_date: Option<String>,
     pub(crate) payload: Option<GmailPayload>,
@@ -63,7 +76,7 @@ pub(crate) struct GmailHeader {
 pub(crate) struct GmailBody {
     pub(crate) attachment_id: Option<String>,
     #[serde(default)]
-    pub(crate) size: i64,
+    pub(crate) size: Option<i64>,
     pub(crate) data: Option<String>,
 }
 
@@ -296,12 +309,32 @@ mod history_id_tests {
                 }))
                 .is_err()
             );
-            assert!(
-                serde_json::from_value::<GmailMessage>(serde_json::json!({
-                    "id": "m", "threadId": "t", "historyId": value
-                }))
-                .is_err()
-            );
+            let message = serde_json::from_value::<GmailMessage>(serde_json::json!({
+                "id": "m", "threadId": "t", "historyId": value
+            }))
+            .expect("readable message survives an unusable version");
+            assert_eq!(message.history_id, None);
+        }
+    }
+
+    #[test]
+    fn unusable_message_version_preserves_thread_siblings() {
+        for value in [
+            serde_json::json!(42),
+            serde_json::json!({}),
+            serde_json::json!("bad"),
+        ] {
+            let thread: GmailThread = serde_json::from_value(serde_json::json!({
+                "id": "t",
+                "messages": [
+                    {"id": "a", "threadId": "t", "historyId": value},
+                    {"id": "b", "threadId": "t", "historyId": "42"}
+                ]
+            }))
+            .expect("optional version cannot hide readable siblings");
+            assert_eq!(thread.messages.len(), 2);
+            assert_eq!(thread.messages[0].history_id, None);
+            assert_eq!(thread.messages[1].history_id, Some(HistoryId(42)));
         }
     }
 

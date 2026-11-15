@@ -121,14 +121,10 @@ impl SmtpExecutor for TokioExecutor {
                 "scripted connectors require plaintext TCP configuration",
             ));
         }
+        let plan = crate::transport::smtp::DialPlan::new(tls, unix_socket)?;
         if let Some(path) = unix_socket {
             #[cfg(unix)]
             {
-                if !matches!(tls, Tls::None) {
-                    return Err(crate::transport::smtp::error::invalid_input(
-                        "TLS is not supported over Unix-domain LMTP sockets",
-                    ));
-                }
                 return AsyncSmtpConnection::connect_unix_with_protocol(
                     path, timeout, hello_name, protocol, metering,
                 )
@@ -144,16 +140,12 @@ impl SmtpExecutor for TokioExecutor {
             }
         }
 
-        let tls_parameters = match tls {
-            Tls::Wrapper(tls_parameters) => Some(tls_parameters.clone()),
-            _ => None,
-        };
         #[allow(unused_mut)]
         let mut conn = AsyncSmtpConnection::connect_with_protocol(
             (hostname, port),
             timeout,
             hello_name,
-            tls_parameters,
+            plan.implicit_tls.cloned(),
             None,
             protocol,
             metering,
@@ -162,14 +154,8 @@ impl SmtpExecutor for TokioExecutor {
         )
         .await?;
 
-        match tls {
-            Tls::Opportunistic(tls_parameters) if conn.can_starttls() => {
-                conn.starttls(tls_parameters.clone(), hello_name).await?;
-            }
-            Tls::Required(tls_parameters) => {
-                conn.starttls(tls_parameters.clone(), hello_name).await?;
-            }
-            _ => (),
+        if let Some(parameters) = plan.starttls(conn.can_starttls()) {
+            conn.starttls(parameters.clone(), hello_name).await?;
         }
 
         Ok(conn)

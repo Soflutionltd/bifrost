@@ -609,17 +609,6 @@ orchestrator writes both; with no incarnation, a re-established scope reads the
 previous incarnation's state until overwritten. Owner: the registry becomes a
 read-only projection of `BackfillScan` (STR-044), keyed by incarnation.
 
-## CON-027 - Push hint resolution and the coarsening rule are written twice
-
-**Reported by:** sync-lanes.
-
-`push::reconciler::scopes_for_hint` is published and has no production caller;
-`WorkSet::merge` does its own resolution (`scopes_for_membership`, then
-`all_scopes` at sweep). The coarsening rule ("more than `capacity` distinct
-items becomes full, count one coarsening") is implemented in both
-`PushIngress::invalidate` and `WorkSet::merge`. Owner: `WorkSet::merge` calls one
-resolver, and the coarsening rule lives on an `Intent` type (STR-038).
-
 ## CON-028 - IMAP folder role from attributes and names: two tables, already different
 
 **Reported by:** imap-protocol (live, minor).
@@ -793,17 +782,6 @@ emits no response-code events. Owner: one `ReadLoop` driven by a `LoopPolicy {
 on_own_tag, on_foreign_tag, on_continuation, route_untagged }`, which also makes
 literal budgets apply in every loop (BUG-037) and gives CON-033's `Framing` one
 producer.
-
-## CON-036 - Is this an IMAP quota resource capability?
-
-**Reported by:** imap-connection.
-
-`quota_resource_name` re-parses `Capability::Other("QUOTA=RES-...")` as a
-fallback beside `Capability::QuotaResource`, so the question is decided by the
-codec's capability parser and again there. Also `is_notify_list_event(info,
-filter_extended_markers)` is called with `true` in `dispatch/select.rs` (twice)
-and with a value derived from a SUBSCRIBED string scan in `mailbox.rs` and
-`pipeline/mod.rs` (folded by typed LIST options, STR-053).
 
 ## CON-038 - How does a JMAP push object decompose into state changes and token-free notifications?
 
@@ -1020,27 +998,6 @@ Or, Not). Owner: one Gmail query encoder. Lateral, for bifrost-types:
 overlapping variants, so every crate with both search and filters re-translates the
 overlap twice.
 
-## CON-054 - Which Google operations are multi-leg is decided far from the legs
-
-**Reported by:** google.
-
-`mod.rs::shutdown_account_future_error` hard-codes `EventUpdate | ContactUpdate` as
-the operations whose first write can commit before a second, narrowing their
-idempotency to false. The legs live in `calendar::update` (move, then PATCH) and
-`contacts::update` (fields, then photo), and each already builds a `PartialCommit`
-record. A new multi-leg operation, or a change to these two, will not update the
-list in `mod.rs`. Owner: the operation's own future reports its leg state, or at
-least declares its multi-leg-ness beside its `PartialCommit` builder.
-
-## CON-056 - Google extracts caller versions two ways
-
-**Reported by:** google.
-
-`calendar` uses `ServerVersion::expected_etag(Protocol::Gmail, op, false)`;
-`contacts::update` hand-matches `ServerVersion::ETag(etag) if !etag.is_empty()` and
-refuses everything else as `Unsupported`, including an empty ETag, which the shared
-helper may classify differently. Use one helper. Related: STR-008.
-
 ## CON-057 - Is a rejected SMTP recipient a failed send?
 
 **Reported by:** smtp-sasl (sibling methods answer oppositely).
@@ -1059,36 +1016,6 @@ every consumer the same "committed to someone, do not resend" rule; with the
 single protocol machine of STR-140 the direct-path difference becomes an explicit
 recipient-policy parameter. The IMAP "acceptance uncertain, none acknowledged" case
 is already an owner-ruling item in `notes/todo.md`.
-
-## CON-058 - The SMTP TLS-mode dial sequence is written twice
-
-**Reported by:** smtp-sasl (agrees today).
-
-"Given `Tls::{None, Opportunistic, Required, Wrapper}` and an optional Unix socket,
-how is the connection established and upgraded" lives in
-`transport.rs::SmtpClient::connection` (blocking) and in
-`executor.rs::TokioExecutor::connect` (async). Both reject TLS over a Unix socket
-with the same string, both pick `Wrapper` for implicit TLS, and both run the same
-STARTTLS match. Owner: a pure `DialPlan::from(&SmtpInfo) -> Result<DialPlan>` in the
-transport module; the executor should not own protocol dial policy at all
-(STR-141).
-
-## CON-059 - What is an SMTP MAIL parameter's keyword, and does the envelope need SMTPUTF8?
-
-**Reported by:** smtp-sasl.
-
-The keyword is decided three ways: `MailParameter`'s Display;
-`EnvelopeBuilder::mail_options` rendering each parameter and taking
-`split('=').next()` to detect duplicates; and the hand-maintained
-`TYPED_MAIL_KEYWORDS` array in `validate_custom_mail_keyword`, which must list every
-typed variant's keyword - adding a typed variant without touching it silently lets
-`Other { keyword: "NEW" }` bypass its capability check. `RcptParameter::has_same_keyword`
-is a fourth. Owner: an exhaustive `MailParameter::keyword() -> Keyword` (and the
-`RcptParameter` twin) from which Display, the duplicate check and the "typed
-keyword" refusal derive. Adjacent: "does the envelope need SMTPUTF8" is computed by
-`Envelope::has_non_ascii_addresses` on the direct path and by an inline
-`!AsRef::<str>::as_ref(address).is_ascii()` fold on the batch path in
-`EnvelopeBuilder::build_batch`.
 
 ## CON-060 - Two redirect walkers, two 401-refresh-once paths, two deadlines
 

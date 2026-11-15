@@ -1199,7 +1199,18 @@ fn gmail_mime_part(part: &GmailPayload, incomplete: &mut bool) -> bifrost_types:
         let bytes = match data.map(decode_base64url_nopad).transpose() {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
-                if content_type.ty == "text" && disposition != "attachment" && filename.is_none() {
+                // An explicitly empty body is complete: users should not see
+                // a download warning on an intentionally blank message. Missing
+                // size or an external body still supplies no evidence of bytes.
+                let known_empty = part
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| body.size == Some(0) && body.attachment_id.is_none());
+                if !known_empty
+                    && content_type.ty == "text"
+                    && disposition != "attachment"
+                    && filename.is_none()
+                {
                     *incomplete = true;
                 }
                 Vec::new()
@@ -1514,8 +1525,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hydrate_explicitly_empty_body_is_complete() {
+        let message = gmail_message(serde_json::json!({
+            "id": "m1", "threadId": "t1",
+            "payload": {"mimeType": "text/plain", "body": {"size": 0}}
+        }));
+        let hydrated = message_from_gmail(&[], &message, HydrationProjection::Full)
+            .await
+            .unwrap();
+        assert!(!hydrated.incomplete);
+    }
+
+    #[tokio::test]
     async fn hydrate_missing_or_invalid_body_is_incomplete() {
         for body in [
+            serde_json::json!({}),
+            serde_json::json!({"size": 42}),
+            serde_json::json!({"attachmentId": "external-body", "size": 0}),
             serde_json::json!({"attachmentId": "external-body", "size": 42}),
             serde_json::json!({"data": "!!!", "size": 42}),
         ] {

@@ -28,8 +28,8 @@ use crate::types::response::{
 };
 use crate::types::validated::ParsedUidSet;
 use crate::types::{
-    Capability, Command, CopyResult, ExpungeResult, FetchResponse, MoveResult, StatusItem,
-    StatusResult, StoreResult,
+    Capability, Command, CopyResult, ExpungeResult, FetchResponse, MoveResult, StatusResult,
+    StoreResult,
 };
 
 use super::MailboxInfo;
@@ -163,13 +163,7 @@ impl<'conn, T> Pipeline<'conn, T> {
         patterns: Vec<String>,
         return_options: Vec<String>,
     ) -> Pipeline<'conn, (Result<Vec<MailboxInfo>, Error>, T)> {
-        // RFC 5258 Section3: filter_extended is true when SUBSCRIBED is NOT
-        // in the selection options  -  those responses are NOTIFY markers.
-        let filter_extended = !selection_options
-            .iter()
-            .any(|o| o.eq_ignore_ascii_case("SUBSCRIBED"));
-        let consumer =
-            dispatch::ListExtendedConsumer::new(filter_extended, selection_options.clone());
+        let consumer = dispatch::ListExtendedConsumer::new(selection_options.clone());
         self.commands.push(Command::ListExtended {
             selection_options,
             reference: reference.into(),
@@ -192,7 +186,7 @@ impl<'conn, T> Pipeline<'conn, T> {
             reference: String,
             pattern: String,
             status_items: String,
-        ) -> Result<Vec<(MailboxInfo, Vec<StatusItem>)>, Error>;
+        ) -> Result<Vec<crate::types::ListStatusEntry>, Error>;
         command = Command::ListStatus { reference: reference.into(), pattern: pattern.into(), status_items };
         consumer = dispatch::ListStatusConsumer::new();
     }

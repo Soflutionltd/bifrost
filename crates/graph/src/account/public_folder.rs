@@ -862,6 +862,12 @@ pub(crate) async fn discover_public_folder_scopes(
 ) -> (Vec<CursorScope>, Vec<Warning>) {
     let mut scopes = Vec::new();
     let mut warnings = Vec::new();
+    // Every early return below leaves this false: only a browse that reached
+    // the end of the whole hierarchy may prove a folder absent.
+    account
+        .public_folder_discovery_complete
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut complete = true;
 
     let Some(user_email) = account.user_email.clone() else {
         warnings.push(Warning::support_only(
@@ -939,6 +945,7 @@ pub(crate) async fn discover_public_folder_scopes(
                 WarningKind::OperatorAttentionNeeded,
                 "public-folder discovery truncated: hierarchy browse step cap reached".to_string(),
             ));
+            complete = false;
             break;
         }
 
@@ -959,6 +966,7 @@ pub(crate) async fn discover_public_folder_scopes(
                 if parent_id == "publicfoldersroot" {
                     return (scopes, warnings);
                 }
+                complete = false;
                 continue;
             }
         };
@@ -1006,6 +1014,9 @@ pub(crate) async fn discover_public_folder_scopes(
         }
     }
 
+    account
+        .public_folder_discovery_complete
+        .store(complete, std::sync::atomic::Ordering::SeqCst);
     (scopes, warnings)
 }
 

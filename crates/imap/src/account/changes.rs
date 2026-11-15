@@ -14,6 +14,29 @@ use super::{
     route_scope, terminated_event,
 };
 
+// Admission and advertised cost must agree before any connection is acquired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangePlan {
+    RefuseIncomplete,
+    QResync,
+    Condstore,
+    Basic,
+}
+
+impl ChangePlan {
+    fn for_cursor(cursor: &FolderCursor, qresync_enabled: bool) -> Self {
+        match cursor {
+            FolderCursor::QResync {
+                known_uids_complete: false,
+                ..
+            } => Self::RefuseIncomplete,
+            FolderCursor::QResync { .. } if qresync_enabled => Self::QResync,
+            FolderCursor::QResync { .. } | FolderCursor::Condstore { .. } => Self::Condstore,
+            FolderCursor::Basic { .. } => Self::Basic,
+        }
+    }
+}
+
 pub(crate) fn describe_cursor(account: &ImapAccount, cursor: &ChangeCursor) -> CursorDescriptor {
     // A typed scope owned by a sub-account is described by that
     // sub-account; only IMAP folder cursors fall through to the
@@ -33,32 +56,26 @@ pub(crate) fn describe_cursor(account: &ImapAccount, cursor: &ChangeCursor) -> C
         .and_then(|folder| account.folders.get(folder))
         .and_then(|entry| entry.last_seen());
 
-    match decoded {
-        Ok(FolderCursor::QResync { .. }) if account.qresync_enabled() => CursorDescriptor {
-            cost_class: CostClass::Cheap,
-            strategy: SyncStrategy::QResync,
-            freshness,
-        },
-        Ok(FolderCursor::QResync { .. }) => CursorDescriptor {
-            cost_class: CostClass::Medium,
-            strategy: SyncStrategy::Condstore,
-            freshness,
-        },
-        Ok(FolderCursor::Condstore { .. }) => CursorDescriptor {
-            cost_class: CostClass::Medium,
-            strategy: SyncStrategy::Condstore,
-            freshness,
-        },
-        Ok(FolderCursor::Basic { .. }) => CursorDescriptor {
-            cost_class: CostClass::Expensive,
-            strategy: SyncStrategy::Basic,
-            freshness,
-        },
-        Err(_) => CursorDescriptor {
-            cost_class: CostClass::Expensive,
-            strategy: SyncStrategy::None,
-            freshness: None,
-        },
+    let plan = decoded
+        .as_ref()
+        .ok()
+        .map(|cursor| ChangePlan::for_cursor(cursor, account.qresync_enabled()));
+    let (cost_class, strategy) = match plan {
+        Some(ChangePlan::QResync) => (CostClass::Cheap, SyncStrategy::QResync),
+        Some(ChangePlan::Condstore) => (CostClass::Medium, SyncStrategy::Condstore),
+        Some(ChangePlan::Basic) => (CostClass::Expensive, SyncStrategy::Basic),
+        Some(ChangePlan::RefuseIncomplete) | None => {
+            return CursorDescriptor {
+                cost_class: CostClass::Expensive,
+                strategy: SyncStrategy::None,
+                freshness: None,
+            };
+        }
+    };
+    CursorDescriptor {
+        cost_class,
+        strategy,
+        freshness,
     }
 }
 
@@ -194,56 +211,54 @@ async fn run_changes(
         bifrost_types::AccountOperation::SyncChanges,
     )?;
     let cursor = decode_cursor(&change_cursor)?;
-    if matches!(
-        cursor,
-        FolderCursor::QResync {
-            known_uids_complete: false,
-            ..
-        }
-    ) {
-        return Err(super::error::incomplete_uid_baseline(&folder).into());
-    }
-    match cursor {
-        FolderCursor::QResync { .. } if account.qresync_enabled() => {
-            run_qresync(account, folder, cursor, tx).await
-        }
-        FolderCursor::QResync {
-            uidvalidity,
-            modseq,
-            known_uids,
-            known_uids_complete,
-        } => {
-            // The NON-consuming read, deliberately. This used to take the
-            // account-level one-shot first and fall back to this, which could
-            // not change a single byte of what this arm emits - both return the
-            // same `Option<String>` - while spending the one-shot so
-            // `run_inventory`, the only place it does real work, found it
-            // already gone. Since the stream is channel-backed by a spawned
-            // task that outlives a dropped receiver, and the engine now drops a
-            // pending changes stream on every PAUSE rather than only at
-            // teardown, that take could burn the account-level warning without
-            // anyone ever receiving it.
-            let reason = account.qresync_negotiation_reason().unwrap_or_else(|| {
-                "QRESYNC is disabled for this account session; continuing with CONDSTORE"
-                    .to_string()
-            });
-            send_strategy_downgrade(&tx, SyncStrategy::QResync, SyncStrategy::Condstore, &reason)
-                .await?;
-            run_condstore_with_baseline(
-                account,
-                folder,
-                FolderCursor::Condstore {
-                    uidvalidity,
-                    modseq,
-                    known_uids,
-                },
+    match ChangePlan::for_cursor(&cursor, account.qresync_enabled()) {
+        ChangePlan::RefuseIncomplete => Err(super::error::incomplete_uid_baseline(&folder).into()),
+        ChangePlan::QResync => run_qresync(account, folder, cursor, tx).await,
+        ChangePlan::Condstore => match cursor {
+            FolderCursor::QResync {
+                uidvalidity,
+                modseq,
+                known_uids,
                 known_uids_complete,
-                tx,
-            )
-            .await
-        }
-        FolderCursor::Condstore { .. } => run_condstore(account, folder, cursor, tx).await,
-        FolderCursor::Basic { .. } => run_basic(account, folder, cursor, tx).await,
+            } => {
+                // The NON-consuming read, deliberately. This used to take the
+                // account-level one-shot first and fall back to this, which could
+                // not change a single byte of what this arm emits - both return the
+                // same `Option<String>` - while spending the one-shot so
+                // `run_inventory`, the only place it does real work, found it
+                // already gone. Since the stream is channel-backed by a spawned
+                // task that outlives a dropped receiver, and the engine now drops a
+                // pending changes stream on every PAUSE rather than only at
+                // teardown, that take could burn the account-level warning without
+                // anyone ever receiving it.
+                let reason = account.qresync_negotiation_reason().unwrap_or_else(|| {
+                    "QRESYNC is disabled for this account session; continuing with CONDSTORE"
+                        .to_string()
+                });
+                send_strategy_downgrade(
+                    &tx,
+                    SyncStrategy::QResync,
+                    SyncStrategy::Condstore,
+                    &reason,
+                )
+                .await?;
+                run_condstore_with_baseline(
+                    account,
+                    folder,
+                    FolderCursor::Condstore {
+                        uidvalidity,
+                        modseq,
+                        known_uids,
+                    },
+                    known_uids_complete,
+                    tx,
+                )
+                .await
+            }
+            FolderCursor::Condstore { .. } => run_condstore(account, folder, cursor, tx).await,
+            _ => unreachable!("CONDSTORE plan requires a modseq cursor"),
+        },
+        ChangePlan::Basic => run_basic(account, folder, cursor, tx).await,
     }
 }
 

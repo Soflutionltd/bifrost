@@ -113,14 +113,21 @@ impl Authorization {
 pub(crate) struct SessionState {
     session: Arc<Session>,
     api_url: String,
-    upload_url: Vec<URLPart<blob::URLParameter>>,
+    /// Deferred like `event_source_url`. Ruling (wave 2): an upload template
+    /// this crate cannot expand - including one naming download-only
+    /// variables (`blobId`, `name`, `type`), which RFC 8620 does not define
+    /// for uploads - disables uploads only. An enterprise Outlook user whose
+    /// server mis-advertises one upload property expects mail, contacts and
+    /// calendars to keep working, with each upload refused as the server's
+    /// contract violation rather than the whole account failing to open.
+    upload_url: Result<Vec<URLPart<blob::UploadParameter>>, String>,
     download_url: Vec<URLPart<blob::URLParameter>>,
     /// Parsed with the session, but a template that fails is stored as its
     /// error detail and only raised when EventSource is actually used.
     /// Nothing in the sync `Account` uses EventSource, so refusing the
     /// whole session over it made a server whose EventSource template this
-    /// crate cannot parse impossible to open at all. The blob templates stay
-    /// eager because the account uses them throughout.
+    /// crate cannot parse impossible to open at all. The download template
+    /// stays eager because the account reads blobs throughout.
     event_source_url: Result<Vec<URLPart<crate::event_source::URLParameter>>, String>,
     default_account_id: crate::core::id::AccountId,
 }
@@ -216,7 +223,7 @@ impl SessionState {
 
         Ok(Self {
             api_url: api_url.to_string(),
-            upload_url: session_template("uploadUrl", session.upload_url())?,
+            upload_url: parse_session_template(session.upload_url()),
             download_url: session_template("downloadUrl", session.download_url())?,
             event_source_url: parse_session_template(session.event_source_url()),
             default_account_id,
@@ -232,8 +239,15 @@ impl SessionState {
         &self.api_url
     }
 
-    pub(crate) fn upload_url(&self) -> &[URLPart<blob::URLParameter>] {
-        &self.upload_url
+    /// The parsed upload template, or the session's malformed `uploadUrl`,
+    /// raised at each upload rather than when the session was derived.
+    pub(crate) fn upload_url(&self) -> crate::Result<&[URLPart<blob::UploadParameter>]> {
+        self.upload_url
+            .as_deref()
+            .map_err(|detail| crate::Error::MalformedSessionUrl {
+                property: "uploadUrl",
+                detail: detail.clone(),
+            })
     }
 
     pub(crate) fn download_url(&self) -> &[URLPart<blob::URLParameter>] {
@@ -685,7 +699,6 @@ mod session_state_tests {
     #[test]
     fn a_malformed_session_template_names_the_servers_property() {
         for (property, bad) in [
-            ("uploadUrl", "https://example.test/upload/{accountId"),
             ("downloadUrl", "https://example.test/dl/{notAVariable}"),
             ("apiUrl", "jmap/api"),
             ("apiUrl", "ftp://example.test/api"),
@@ -753,6 +766,93 @@ mod session_state_tests {
                 Err(other) => panic!("{bad}: expected MalformedSessionUrl, got {other:?}"),
                 Ok(_) => panic!("{bad}: a malformed template must fail at use"),
             }
+        }
+    }
+
+    #[test]
+    fn blob_lookup_adds_defining_capabilities_to_the_batch() {
+        let session =
+            serde_json::from_str(&session_json("old", "a", "s1")).expect("session parses");
+        let client = Client::with_transport(
+            RefreshingTransport {
+                api_urls: Arc::new(Mutex::new(Vec::new())),
+            },
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mut request = client.build();
+        request
+            .call(
+                crate::blob::manage::BlobLookupRequest::new()
+                    .type_names(["Email", "CalendarEvent", "Identity", "Email"])
+                    .ids(["b1"]),
+            )
+            .expect("lookup appended");
+        let wire = serde_json::to_value(request).expect("request encodes");
+        let using = wire["using"].as_array().expect("using is an array");
+        for uri in [
+            "urn:ietf:params:jmap:blob",
+            "urn:ietf:params:jmap:mail",
+            "urn:ietf:params:jmap:calendars",
+            "urn:ietf:params:jmap:submission",
+        ] {
+            assert_eq!(
+                using
+                    .iter()
+                    .filter(|value| value.as_str() == Some(uri))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    /// An upload template this crate cannot expand disables uploads only:
+    /// the client still builds, and the failure is raised at use as the
+    /// server's malformed `uploadUrl`.
+    #[test]
+    fn a_malformed_upload_template_fails_only_at_use() {
+        for bad in [
+            "https://example.test/upload/{accountId",
+            "https://example.test/upload/{accountId}/{blobId}",
+            "https://example.test/upload/{accountId}?name={name}&type={type}",
+            "upload/{accountId}",
+        ] {
+            let mut session =
+                serde_json::from_str::<serde_json::Value>(&session_json("up", "A1", "session-1"))
+                    .expect("fixture is json");
+            session["uploadUrl"] = json!(bad);
+            let session: Session = serde_json::from_value(session).expect("session parses");
+            let client = Client::with_transport(
+                RefreshingTransport {
+                    api_urls: Arc::new(Mutex::new(Vec::new())),
+                },
+                session,
+                "https://example.test/.well-known/jmap",
+            )
+            .unwrap_or_else(|e| panic!("{bad}: the client must still build, got {e:?}"));
+            match client.session_state().upload_url() {
+                Err(crate::Error::MalformedSessionUrl { property, detail }) => {
+                    assert_eq!(property, "uploadUrl");
+                    assert!(detail.contains(bad), "{bad}: {detail}");
+                }
+                Err(other) => panic!("{bad}: expected MalformedSessionUrl, got {other:?}"),
+                Ok(_) => panic!("{bad}: a malformed upload template must fail at use"),
+            }
+        }
+    }
+
+    #[test]
+    fn upload_templates_reject_download_only_parameters() {
+        for parameter in ["blobId", "name", "type"] {
+            let url = format!("https://example.test/upload/{{accountId}}/{{{parameter}}}");
+            assert!(matches!(
+                super::session_template::<crate::blob::UploadParameter>("uploadUrl", &url),
+                Err(crate::Error::MalformedSessionUrl {
+                    property: "uploadUrl",
+                    ..
+                })
+            ));
         }
     }
 
@@ -1285,7 +1385,7 @@ mod session_state_tests {
             "https://new.example.test/dl/"
         );
         assert_eq!(
-            leading_value(state.upload_url()),
+            leading_value(state.upload_url().expect("upload template parses")),
             "https://new.example.test/upload/"
         );
         assert_eq!(

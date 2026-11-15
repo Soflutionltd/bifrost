@@ -259,6 +259,12 @@ pub(crate) fn create(
     })
 }
 
+// A first write may commit before the next leg finishes. On shutdown the
+// adapter loses that progress, so never replay the original update blindly:
+// users expect a moved event or edited contact to be reconciled first. The
+// PartialCommit builder below retains the continuation on ordinary failures.
+pub(crate) const UPDATE_SHUTDOWN_IDEMPOTENT: bool = false;
+
 pub(crate) fn update(
     client: Arc<GmailClient>,
     contact: ContactId,
@@ -267,6 +273,9 @@ pub(crate) fn update(
     Box::pin(async move {
         // People carries an opaque source token in JSON, not an If-Match
         // header. Preserve it verbatim rather than applying HTTP quoting.
+        // ServerVersion::expected_etag validates HTTP entity-tag syntax;
+        // sharing it with Calendar would remove support for opaque People
+        // tokens such as caller-old. Empty tokens remain Unsupported here.
         let expected = match patch.expected_version.as_ref() {
             Some(bifrost_types::ServerVersion::ETag(etag)) if !etag.is_empty() => {
                 Some(etag.clone())

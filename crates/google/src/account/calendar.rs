@@ -197,6 +197,12 @@ fn reject_create_organizer(event: &EventCreate) -> Result<(), AccountError> {
     Ok(())
 }
 
+// A first write may commit before the next leg finishes. On shutdown the
+// adapter loses that progress, so never replay the original update blindly:
+// users expect a moved event or edited contact to be reconciled first. The
+// PartialCommit builder below retains the continuation on ordinary failures.
+pub(crate) const UPDATE_SHUTDOWN_IDEMPOTENT: bool = false;
+
 pub(crate) fn update(
     client: Arc<GmailClient>,
     event: EventId,

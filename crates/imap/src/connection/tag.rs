@@ -15,6 +15,11 @@
 //! > 32-bit prefix + a `u32` counter. Counter wrap regenerates the
 //! > prefix. Prefix is initialized via `getrandom`.
 
+// Keep the wire spelling as the correlation identity. Parsed response tags
+// and ESEARCH correlators are arbitrary IMAP strings, not necessarily our
+// generator's hex format; decoding them as two integers would also equate
+// distinct spellings (for example uppercase and lowercase hex). A generated
+// tag type would still need exact string comparisons at these boundaries.
 /// Generates unique IMAP command tags with a random prefix per
 /// connection (RFC 3501 Section2.2.1, invariant I12).
 pub(crate) struct TagGenerator {
@@ -63,16 +68,21 @@ mod tests {
     fn invariant_i12_tag_wrap_regenerates_prefix() {
         let mut generator = TagGenerator::new();
         let original_prefix = generator.prefix;
-        generator.counter = u32::MAX;
-        let _ = generator.next();
-        // The new prefix is random, so it *could* equal the original by
-        // chance (1 in 2^32). In practice this is a reliable assertion.
-        // If it ever flakes, buy a lottery ticket.
-        assert_ne!(
-            generator.prefix, original_prefix,
-            "wrap did not regenerate prefix"
-        );
-        assert_eq!(generator.counter, 0);
+        // One fresh prefix can equal the original by chance (1 in 2^32), so
+        // wrap repeatedly: a generator that never regenerates stays equal on
+        // every wrap, while a working one differs on some wrap with
+        // overwhelming (1 - 2^-128) probability.
+        let mut regenerated = false;
+        for _ in 0..4 {
+            generator.counter = u32::MAX;
+            let _ = generator.next();
+            assert_eq!(generator.counter, 0);
+            if generator.prefix != original_prefix {
+                regenerated = true;
+                break;
+            }
+        }
+        assert!(regenerated, "wrap did not regenerate prefix");
     }
 
     /// Tags are formatted as 16 hex characters: 8 for prefix, 8 for counter.

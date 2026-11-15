@@ -834,88 +834,13 @@ pub(crate) fn message_error_to_account_error(
     error: MessageError,
     protocol: Protocol,
 ) -> AccountError {
-    let (kind, cause, detail): (AccountErrorKind, Cause, String) = match &error {
-        MessageError::MissingFrom => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(
-                    "missing source address, invalid envelope".to_owned(),
-                ),
-            }),
-            "missing source address, invalid envelope".to_owned(),
-        ),
-        MessageError::MissingTo => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(
-                    "missing destination address, invalid envelope".to_owned(),
-                ),
-            }),
-            "missing destination address, invalid envelope".to_owned(),
-        ),
-        MessageError::TooManyFrom => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(
-                    "there can only be one source address".to_owned(),
-                ),
-            }),
-            "there can only be one source address".to_owned(),
-        ),
-        MessageError::EmailMissingAt => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("missing @ in email address".to_owned()),
-            }),
-            "missing @ in email address".to_owned(),
-        ),
-        MessageError::EmailMissingLocalPart => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(
-                    "missing local part in email address".to_owned(),
-                ),
-            }),
-            "missing local part in email address".to_owned(),
-        ),
-        MessageError::EmailMissingDomain => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("missing domain in email address".to_owned()),
-            }),
-            "missing domain in email address".to_owned(),
-        ),
-        MessageError::CannotParseFilename => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(
-                    "could not parse attachment filename".to_owned(),
-                ),
-            }),
-            "could not parse attachment filename".to_owned(),
-        ),
-        MessageError::NonAsciiChars => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("contains non-ASCII chars".to_owned()),
-            }),
-            "contains non-ASCII chars".to_owned(),
-        ),
-        MessageError::InvalidInput(message) => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(message.clone()),
-            }),
-            message.clone(),
-        ),
-        MessageError::Io(io) => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(io.to_string()),
-            }),
-            io.to_string(),
-        ),
-    };
+    // Message Display owns these diagnostics; keep this deliberate future
+    // translation boundary without duplicating every variant's wording.
+    let detail = error.to_string();
+    let kind = AccountErrorKind::Request(RequestErrorKind::Malformed);
+    let cause = Cause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only(detail.clone()),
+    });
 
     let builder = AccountErrorBuilder::new(kind, cause)
         .protocol(protocol)
@@ -1650,11 +1575,8 @@ mod tests {
 
     #[test]
     fn message_error_every_variant_maps() {
-        // smtp-D6 contract: every MessageError variant maps to AccountError
-        // without panicking. If a new variant is added to MessageError, the
-        // match in message_error_to_account_error becomes non-exhaustive
-        // and this test catches the gap at compile time via the boundary
-        // function. Here we just exercise each constructor.
+        // Every constructor uses the same malformed-input projection; wording
+        // comes from MessageError::Display rather than a parallel variant map.
         use crate::error::Error as ME;
         let cases: Vec<ME> = vec![
             ME::MissingFrom,

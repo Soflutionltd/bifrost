@@ -677,7 +677,8 @@ impl PoolInner {
             return Err(Error::closed());
         }
         if let Some(keepalive) = self.config.imap.keepalive {
-            conn.set_keepalive(keepalive).await?;
+            conn.set_keepalive(keepalive, self.config.imap.command_timeout)
+                .await?;
         }
         conn.authenticate_best(
             &self.config.credentials,

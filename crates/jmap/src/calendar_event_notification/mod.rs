@@ -2,8 +2,6 @@ pub(crate) mod get;
 pub(crate) mod query;
 pub(crate) mod set;
 
-use std::fmt::Display;
-
 use serde::{Deserialize, Serialize};
 
 mod marker {
@@ -83,39 +81,18 @@ pub(crate) enum NotificationType {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "created")]
-    Created,
-    #[serde(rename = "changedBy")]
-    ChangedBy,
-    #[serde(rename = "calendarEventId")]
-    CalendarEventId,
-    #[serde(rename = "isDraft")]
-    IsDraft,
-    #[serde(rename = "type")]
-    Type,
-    #[serde(rename = "event")]
-    Event,
-    #[serde(rename = "eventPatch")]
-    EventPatch,
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::Created => write!(f, "created"),
-            Property::ChangedBy => write!(f, "changedBy"),
-            Property::CalendarEventId => write!(f, "calendarEventId"),
-            Property::IsDraft => write!(f, "isDraft"),
-            Property::Type => write!(f, "type"),
-            Property::Event => write!(f, "event"),
-            Property::EventPatch => write!(f, "eventPatch"),
-        }
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        Created => "created",
+        ChangedBy => "changedBy",
+        CalendarEventId => "calendarEventId",
+        IsDraft => "isDraft",
+        Type => "type",
+        Event => "event",
+        EventPatch => "eventPatch",
     }
 }
 

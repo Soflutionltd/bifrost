@@ -1149,7 +1149,8 @@ mod tests {
 
     #[test]
     fn foreign_namespace_advertisement_requires_a_non_empty_foreign_prefix() {
-        use crate::types::{NamespaceDescriptor, NamespaceResponse};
+        use crate::types::NamespaceResponse;
+        use crate::types::response::NamespaceDescriptor;
 
         let personal_only = NamespaceResponse {
             personal: vec![NamespaceDescriptor {

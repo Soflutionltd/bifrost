@@ -158,7 +158,11 @@ impl ImapConnection {
         };
 
         if let Some(keepalive) = config.keepalive {
-            setup_keepalive_cancel_safe(&conn, conn.set_keepalive(keepalive)).await?;
+            setup_keepalive_cancel_safe(
+                &conn,
+                conn.set_keepalive(keepalive, config.command_timeout),
+            )
+            .await?;
         }
 
         Ok(conn)

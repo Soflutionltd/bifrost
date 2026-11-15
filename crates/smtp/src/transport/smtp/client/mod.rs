@@ -234,6 +234,23 @@ pub(super) fn escape_crlf(string: &str) -> String {
     string.replace("\r\n", "<CRLF>")
 }
 
+/// Grouped reads leave stream-state restoration and surplus checks to the drain.
+#[derive(Clone, Copy)]
+pub(super) enum ReplyMode {
+    Positive,
+    AnyStatus,
+    Grouped,
+}
+
+impl ReplyMode {
+    fn manages_state(self) -> bool {
+        !matches!(self, Self::Grouped)
+    }
+    fn accepts_negative(self) -> bool {
+        !matches!(self, Self::Positive)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

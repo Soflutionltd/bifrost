@@ -714,8 +714,8 @@ fn response_to_account_error(
 
     // `signal == None` means we could not decode a Graph error
     // envelope; that is provider contract violation territory unless
-    // the status code itself carries enough information (5xx with no
-    // body is plenty; 400 with no body is malformed-response).
+    // the status code itself carries enough information (5xx is enough,
+    // regardless of whether an edge server supplied an HTML body).
     let (kind, cause) = match signal.as_ref() {
         Some(signal) => classify(ctx, code, signal, retry_hint),
         None => classify_no_envelope(ctx, code, retry_hint, &body),
@@ -965,8 +965,8 @@ fn classify_by_status(
 
 /// `signal == None`: the body did not decode as a Graph error
 /// envelope. For 5xx the status is enough to classify as
-/// `Server(Unavailable)`. Only a 4xx carrying a *non-empty* body that
-/// failed to parse as a Graph error envelope is treated as a
+/// a server failure using the status mapping. Only a 4xx carrying a
+/// *non-empty* body that failed to parse as a Graph error envelope is treated as a
 /// provider-contract violation (Graph documents every error code it
 /// ships, so a non-empty body that does not decode is anomalous); an
 /// empty 4xx falls through to the plain status mapping.
@@ -976,17 +976,12 @@ fn classify_no_envelope(
     retry_hint: Option<RetryHint>,
     body: &bytes::Bytes,
 ) -> (AccountErrorKind, Cause) {
-    // 500-class without an envelope is still a server problem.
-    // 4xx/other land on the existing status fallback, which will pick
-    // the appropriate Auth/Authorization/etc. mapping based on the
-    // code itself. The malformed-response cause is attached only
-    // when the body is non-empty (a non-empty body that did not parse
-    // as JSON is an actual contract violation; an empty 503 is
-    // routine).
-    if code >= 500 || !body.is_empty() {
-        if body.is_empty() {
-            return classify_by_status(ctx, code, retry_hint);
-        }
+    // An Outlook user expects a temporary server failure to retry even if
+    // a proxy replaces its Graph JSON with HTML. Keep status-based recovery
+    // (including quota classification), with the body retained in diagnostics.
+    if (500..600).contains(&code) || body.is_empty() {
+        classify_by_status(ctx, code, retry_hint)
+    } else {
         // Non-empty body that did not parse as a Graph error
         // envelope -> protocol contract violation.
         (
@@ -998,8 +993,6 @@ fn classify_no_envelope(
                 ))),
             }),
         )
-    } else {
-        classify_by_status(ctx, code, retry_hint)
     }
 }
 
@@ -1346,6 +1339,43 @@ pub(crate) fn stale_local_state_error(
     .provider(Provider::Microsoft)
     .protocol(Protocol::Graph)
     .scope(scope)
+    .text(DiagnosticText::support_only(detail.into()))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// A public-folder item whose folder a COMPLETE discovery pass did not find.
+///
+/// Ruling (wave 2): before discovery has completed, a missing route is local
+/// state not yet restored, reported by [`stale_local_state_error`] as a
+/// retryable conflict. Once a full hierarchy browse has finished without the
+/// folder, the folder is no longer readable to this user (deleted, moved out
+/// of reach, or permission withdrawn). An enterprise Outlook user then expects
+/// the item to stop being retried and to drop out of view, as the server's
+/// own `ErrorItemNotFound` would make it: `NotFound(Message)`, refused before
+/// any request.
+#[must_use]
+pub(crate) fn unroutable_public_item_error(
+    operation: AccountOperation,
+    id: &str,
+    detail: impl Into<String>,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::NotFound(ResourceKind::Message),
+        Cause::Request(RequestCause::NotFound {
+            what: ResourceKind::Message,
+            id: Some(id.to_owned()),
+        }),
+    )
+    .push_cause(Cause::Attempt(bifrost_types::AttemptCause::new(
+        bifrost_types::TransmissionState::Unsent,
+    )))
+    .operation(operation)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .scope(ErrorScope::Message {
+        id: id.to_owned().into(),
+    })
     .text(DiagnosticText::support_only(detail.into()))
     .try_build()
     .expect("valid account error classification")
@@ -2262,12 +2292,13 @@ mod tests {
             graph_ctx(AccountOperation::SyncInventory),
             &[],
         );
-        // Non-empty 5xx body that does not parse as an envelope is
-        // classified as a contract violation rather than a server
-        // error, so the support team can flag Microsoft.
+        // A non-empty 5xx body that does not parse as an envelope was not
+        // written by Graph, so it stays on bifrost-net's status mapping
+        // (see `net_to_account_error`) rather than becoming a terminal
+        // contract violation; the body still reaches support text.
         match err.kind() {
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation) => {}
-            other => panic!("expected Protocol(ContractViolation), got {other:?}"),
+            AccountErrorKind::Server(_) => {}
+            other => panic!("expected Server error, got {other:?}"),
         }
         let support: Vec<_> = err.support_consented().support_text.into_iter().collect();
         assert!(support.iter().any(|t| t.contains("definitely not JSON")));
@@ -2392,6 +2423,22 @@ mod tests {
             "{:?}",
             error.kind()
         );
+    }
+
+    #[test]
+    fn non_envelope_batch_server_failures_keep_status_recovery() {
+        for status in [500, 502, 503, 504, 507] {
+            let ctx = graph_ctx(AccountOperation::Hydrate);
+            let empty = batch_status_error(status, HeaderMap::new(), Bytes::new(), &ctx);
+            let malformed = batch_status_error(
+                status,
+                HeaderMap::new(),
+                body("<html>upstream failure</html>"),
+                &ctx,
+            );
+            assert_eq!(malformed.kind(), empty.kind(), "HTTP {status}");
+            assert_eq!(malformed.recovery(), empty.recovery(), "HTTP {status}");
+        }
     }
 
     #[test]

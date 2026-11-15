@@ -218,7 +218,17 @@ async fn add_to_container_inner(
         return Err(super::error::unsupported(AccountOperation::AddToContainer).into());
     }
     let destination = folder_from_container(&container, AccountOperation::AddToContainer)?;
-    let ids = decoded_targets(&target, AccountOperation::AddToContainer)?;
+    // Members already in the destination are not copied into it again.
+    let ids = resolved_targets(
+        account,
+        &target,
+        ThreadScope::Except(&destination),
+        AccountOperation::AddToContainer,
+    )
+    .await?;
+    if ids.is_empty() && is_native_thread(&target) {
+        return Ok(Vec::new());
+    }
     copy_messages(account, ids, &destination, AccountOperation::AddToContainer).await
 }
 
@@ -243,11 +253,23 @@ async fn remove_from_container_inner(
         return Err(super::error::unsupported(AccountOperation::RemoveFromContainer).into());
     }
     let source = folder_from_container(&container, AccountOperation::RemoveFromContainer)?;
-    let ids = decoded_targets(&target, AccountOperation::RemoveFromContainer)?
-        .into_iter()
-        .filter(|id| id.folder == source)
-        .collect::<Vec<_>>();
+    let ids = resolved_targets(
+        account,
+        &target,
+        ThreadScope::Only(&source),
+        AccountOperation::RemoveFromContainer,
+    )
+    .await?
+    .into_iter()
+    .filter(|id| id.folder == source)
+    .collect::<Vec<_>>();
     if ids.is_empty() {
+        // A conversation with no current member in this folder is already
+        // out of it, which is the result an enterprise user asked removal to
+        // achieve. A snapshot handle naming another folder stays a refusal.
+        if is_native_thread(&target) {
+            return Ok(Vec::new());
+        }
         return Err(super::error::unsupported(AccountOperation::RemoveFromContainer).into());
     }
     delete_messages(account, ids, AccountOperation::RemoveFromContainer).await
@@ -264,7 +286,13 @@ pub(crate) fn set_keyword(
             return Err(super::error::unsupported(AccountOperation::SetKeyword));
         }
         let flag = imap_flag_for_keyword(&keyword);
-        let ids = decoded_targets(&target, AccountOperation::SetKeyword)?;
+        let ids = resolved_targets(
+            &account,
+            &target,
+            ThreadScope::Account,
+            AccountOperation::SetKeyword,
+        )
+        .await?;
         set_flag(&account, ids, flag, value, AccountOperation::SetKeyword)
             .await
             .map(|_| ())
@@ -281,7 +309,13 @@ pub(crate) fn set_is_read(
         if !account.capabilities.pim_methods.set_is_read {
             return Err(super::error::unsupported(AccountOperation::SetIsRead));
         }
-        let ids = decoded_targets(&target, AccountOperation::SetIsRead)?;
+        let ids = resolved_targets(
+            &account,
+            &target,
+            ThreadScope::Account,
+            AccountOperation::SetIsRead,
+        )
+        .await?;
         set_flag(
             &account,
             ids,
@@ -308,7 +342,13 @@ pub(crate) fn set_importance(
             return Err(super::error::unsupported(AccountOperation::SetImportance));
         }
         let important = importance_sets_important_keyword(level);
-        let ids = decoded_targets(&target, AccountOperation::SetImportance)?;
+        let ids = resolved_targets(
+            &account,
+            &target,
+            ThreadScope::Account,
+            AccountOperation::SetImportance,
+        )
+        .await?;
         set_flag(
             &account,
             ids,
@@ -1392,16 +1432,16 @@ pub(crate) fn thread_hydrate(
         if !account.capabilities.pim_methods.thread_hydrate {
             return Err(super::error::unsupported(AccountOperation::HydrateThread));
         }
-        let decoded = decode_thread_id(&thread, AccountOperation::HydrateThread)?;
+        let members = resolve_thread_members(
+            &account,
+            &thread,
+            ThreadScope::Account,
+            AccountOperation::HydrateThread,
+        )
+        .await?;
         let messages = hydrate_decoded(
             &account,
-            decoded
-                .uids
-                .iter()
-                .map(|uid| {
-                    DecodedObjectId::canonical(decoded.folder.clone(), decoded.uidvalidity, *uid)
-                })
-                .collect(),
+            members,
             HydrationProjection::Full,
             AccountOperation::HydrateThread,
         )
@@ -1466,10 +1506,77 @@ async fn move_thread_inner(
     target: ContainerId,
     source: Option<ContainerId>,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
+    if is_native_thread(&MutationTarget::Thread(thread.clone())) {
+        return move_native_thread(account, &thread, target, source).await;
+    }
     let mut done =
         add_to_container_inner(account, MutationTarget::Thread(thread.clone()), target).await?;
     if let Some(source) = source {
         match remove_from_container_inner(account, MutationTarget::Thread(thread), source).await {
+            Ok(next) => done.extend(next),
+            Err(mut failure) => {
+                done.append(&mut failure.done);
+                failure.done = done;
+                return Err(failure);
+            }
+        }
+    }
+    Ok(done)
+}
+
+/// Move an account-scoped native conversation. The removal set (members in
+/// `source`) is resolved BEFORE the copy set (members anywhere but `target`),
+/// and both before any write: a message present in the source at the first
+/// search is still visible to the second, so nothing is removed from the
+/// source that was not also copied, even if a reply arrives mid-move.
+async fn move_native_thread(
+    account: &ImapAccount,
+    thread: &ThreadId,
+    target: ContainerId,
+    source: Option<ContainerId>,
+) -> Result<Vec<FolderEffect>, FolderProgress> {
+    if !account.capabilities.pim_methods.add_to_container {
+        return Err(super::error::unsupported(AccountOperation::AddToContainer).into());
+    }
+    let destination = folder_from_container(&target, AccountOperation::AddToContainer)?;
+    let removal = match source {
+        Some(source) => {
+            if !account.capabilities.pim_methods.remove_from_container {
+                return Err(
+                    super::error::unsupported(AccountOperation::RemoveFromContainer).into(),
+                );
+            }
+            let source = folder_from_container(&source, AccountOperation::RemoveFromContainer)?;
+            resolve_thread_members(
+                account,
+                thread,
+                ThreadScope::Only(&source),
+                AccountOperation::RemoveFromContainer,
+            )
+            .await?
+        }
+        None => Vec::new(),
+    };
+    let copies = resolve_thread_members(
+        account,
+        thread,
+        ThreadScope::Except(&destination),
+        AccountOperation::AddToContainer,
+    )
+    .await?;
+    let mut done = if copies.is_empty() {
+        Vec::new()
+    } else {
+        copy_messages(
+            account,
+            copies,
+            &destination,
+            AccountOperation::AddToContainer,
+        )
+        .await?
+    };
+    if !removal.is_empty() {
+        match delete_messages(account, removal, AccountOperation::RemoveFromContainer).await {
             Ok(next) => done.extend(next),
             Err(mut failure) => {
                 done.append(&mut failure.done);
@@ -1754,13 +1861,11 @@ async fn hydrate_decoded(
         let Some(uid_set) = operand.uid_set() else {
             continue;
         };
+        let mut attrs = attrs_for_hydration(projection);
+        super::hydration::push_native_thread_attrs(&mut attrs, &conn.connection().server_profile());
         let fetches = conn
             .connection()
-            .uid_fetch(
-                uid_set.as_sequence_set(),
-                &attrs_for_hydration(projection),
-                account.command_timeout(),
-            )
+            .uid_fetch(uid_set.as_sequence_set(), &attrs, account.command_timeout())
             .await
             .map_err(err)?;
         let merged = super::get::merge_requested_fetches(fetches, operand.uids(), |_, _| {
@@ -1775,6 +1880,123 @@ async fn hydrate_decoded(
     }
     messages.sort_by(|a, b| a.id.0.cmp(&b.id.0));
     Ok(messages)
+}
+
+/// Which folders an account-scoped native thread is resolved in for one
+/// action. Snapshot handles ignore it: their members are fixed.
+#[derive(Debug, Clone, Copy)]
+enum ThreadScope<'a> {
+    /// Every folder that can hold a member (hydration, flag changes).
+    Account,
+    /// One folder only (removal from that folder).
+    Only(&'a MailboxName),
+    /// Every member folder except this one (copy into it).
+    Except(&'a MailboxName),
+}
+
+fn is_native_thread(target: &MutationTarget) -> bool {
+    matches!(target, MutationTarget::Thread(thread) if thread.0.starts_with("imapnative2:"))
+}
+
+/// The folders a native thread's members are searched in. Gmail labels are
+/// views of one message store, so X-GM-THRID is searched once in the `\All`
+/// folder when the server lists one (searching every label would return the
+/// same message once per label); OBJECTID servers hold distinct messages per
+/// folder, so THREADID is searched in every selectable folder. The order is
+/// the deterministic account order the search pager uses.
+fn native_thread_folders(
+    entries: Vec<std::sync::Arc<super::folder_registry::FolderEntry>>,
+    kind: super::envelope::NativeThreadKind,
+    scope: ThreadScope<'_>,
+) -> Vec<MailboxName> {
+    if let ThreadScope::Only(folder) = scope {
+        return vec![folder.clone()];
+    }
+    let selectable: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| entry.selectable())
+        .collect();
+    let all_mail = (kind == super::envelope::NativeThreadKind::Gmail)
+        .then(|| {
+            selectable.iter().find(|entry| {
+                entry
+                    .attributes()
+                    .iter()
+                    .any(|attr| matches!(attr, MailboxAttribute::All))
+            })
+        })
+        .flatten();
+    let mut folders: Vec<MailboxName> = match all_mail {
+        Some(entry) => vec![entry.name.clone()],
+        None => selectable.iter().map(|entry| entry.name.clone()).collect(),
+    };
+    if let ThreadScope::Except(excluded) = scope {
+        folders.retain(|folder| folder != excluded);
+    }
+    folders.sort_by(MailboxName::cmp_account_order);
+    folders
+}
+
+/// Resolve a thread handle to its current member ids.
+///
+/// A snapshot handle decodes to its recorded UIDs. An account-scoped native
+/// handle runs one UID SEARCH per folder chosen by `native_thread_folders`
+/// under the epoch SELECT reports now; the handle records no UIDVALIDITY, so
+/// there is no stale epoch to refuse here. An epoch change between this
+/// resolution and the write is refused by `valid_uids` as `Request(Malformed)`,
+/// the existing PIM rule for every IMAP mutation; whether that class should
+/// instead be a retryable conflict is an open ruling item shared by every
+/// PIM primitive, so it is deliberately not changed for threads alone.
+async fn resolve_thread_members(
+    account: &ImapAccount,
+    thread: &ThreadId,
+    scope: ThreadScope<'_>,
+    op: AccountOperation,
+) -> Result<Vec<DecodedObjectId>, AccountError> {
+    let Some(native) = super::envelope::decode_server_thread_id(thread, op)? else {
+        let decoded = decode_thread_id(thread, op)?;
+        return Ok(decoded
+            .uids
+            .into_iter()
+            .map(|uid| DecodedObjectId::canonical(decoded.folder.clone(), decoded.uidvalidity, uid))
+            .collect());
+    };
+    let preflight = preflight_err(op);
+    let mut members = Vec::new();
+    for folder in native_thread_folders(account.folders.entries(), native.kind, scope) {
+        let mut conn = account
+            .checkout_for_folder(&folder)
+            .await
+            .map_err(preflight)?;
+        let selected = account
+            .select_folder(&mut conn, &folder, None, true)
+            .await
+            .map_err(preflight)?;
+        let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
+        let uids = conn
+            .connection()
+            .uid_search(&native.criteria, account.command_timeout())
+            .await
+            .map_err(preflight)?
+            .ids;
+        members.extend(
+            uids.into_iter()
+                .map(|uid| DecodedObjectId::canonical(folder.clone(), uidvalidity, uid)),
+        );
+    }
+    Ok(members)
+}
+
+async fn resolved_targets(
+    account: &ImapAccount,
+    target: &MutationTarget,
+    scope: ThreadScope<'_>,
+    op: AccountOperation,
+) -> Result<Vec<DecodedObjectId>, AccountError> {
+    if let MutationTarget::Thread(thread) = target {
+        return resolve_thread_members(account, thread, scope, op).await;
+    }
+    decoded_targets(target, op)
 }
 
 fn decoded_targets(
@@ -1842,6 +2064,10 @@ fn valid_uids(
     let mut uids = Vec::new();
     for id in ids {
         if id.uidvalidity != uidvalidity {
+            // Ruling (wave 2): kept as Request(Malformed), the PIM-wide rule
+            // for a stale mailbox epoch, thread handles included. Whether this
+            // class should become a retryable conflict is an open ruling item
+            // shared by every PIM primitive; change it here, for all of them.
             return Err(pim_malformed(
                 op,
                 "UIDVALIDITY changed before IMAP operation",
@@ -2743,10 +2969,10 @@ fn fetch_to_message(
     };
     Some(Message {
         id: encode_object_id(folder, uidvalidity, uid),
-        thread_id: fetch
-            .thread_id
-            .map(ThreadId)
-            .or_else(|| fetch.gmail_thread_id.map(|id| ThreadId(id.to_string()))),
+        thread_id: super::envelope::encode_server_thread_id(
+            fetch.thread_id.as_deref(),
+            fetch.gmail_thread_id,
+        ),
         from: envelope
             .as_ref()
             .map(|env| addresses(&env.from))
@@ -4348,6 +4574,150 @@ mod partial_commit_tests {
     use crate::connection::test_support::{
         driver_pair, preauth_greeting, read_line, respond, tag_of,
     };
+    #[tokio::test]
+    async fn fetched_server_thread_handles_resolve_current_members() {
+        for (objectid, gmail, expected) in [
+            (
+                Some("T-objectid"),
+                Some(1234),
+                "UID SEARCH THREADID T-objectid",
+            ),
+            (None, Some(1234), "UID SEARCH X-GM-THRID 1234"),
+        ] {
+            let (conn, mut server) =
+                driver_pair(&preauth_greeting("IMAP4rev1 OBJECTID X-GM-EXT-1")).await;
+            let account = ImapAccount::new(scripted_account_parts(conn, 1));
+            let folder = MailboxName::new("INBOX").unwrap();
+            account
+                .folders
+                .replace_personal(vec![crate::types::MailboxInfo {
+                    name: folder.clone(),
+                    ..Default::default()
+                }]);
+            let fetch = crate::types::FetchResponse {
+                uid: Some(1),
+                flags: Some(Vec::new()),
+                thread_id: objectid.map(str::to_owned),
+                gmail_thread_id: gmail,
+                ..Default::default()
+            };
+            let inventory =
+                super::super::inventory::fetch_to_inventory(&folder, 7, fetch.clone(), None)
+                    .unwrap();
+            // The same conversation seen in another folder and epoch carries
+            // the same account-scoped id, so a consumer can group on it.
+            let elsewhere = super::super::inventory::fetch_to_inventory(
+                &MailboxName::new("Sent").unwrap(),
+                42,
+                fetch.clone(),
+                None,
+            )
+            .unwrap();
+            let message =
+                fetch_to_message(&folder, 7, fetch, HydrationProjection::Headers).unwrap();
+            assert_eq!(inventory.thread_id, message.thread_id);
+            assert_eq!(elsewhere.thread_id, message.thread_id);
+            let thread = message.thread_id.unwrap();
+            let script = tokio::spawn(async move {
+                let select = read_line(&mut server).await;
+                respond(&mut server, &format!(
+                    "* 2 EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Seen)\r\n* OK [UIDVALIDITY 7] epoch\r\n{} OK selected\r\n",
+                    tag_of(&select),
+                )).await;
+                let search = read_line(&mut server).await;
+                assert!(search.contains(expected), "unexpected command: {search}");
+                respond(
+                    &mut server,
+                    &format!("* SEARCH 1 9\r\n{} OK searched\r\n", tag_of(&search),),
+                )
+                .await;
+                server
+            });
+            let ids = resolved_targets(
+                &account,
+                &MutationTarget::Thread(thread),
+                ThreadScope::Account,
+                AccountOperation::SetIsRead,
+            )
+            .await
+            .unwrap();
+            assert_eq!(ids.iter().map(|id| id.uid).collect::<Vec<_>>(), [1, 9]);
+            assert!(
+                ids.iter()
+                    .all(|id| id.folder == folder && id.uidvalidity == 7)
+            );
+            let _server = script.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn native_thread_folders_cover_the_conversation_once() {
+        use super::super::envelope::NativeThreadKind;
+        use crate::types::MailboxAttribute;
+        let entry = |name: &str, attributes: Vec<MailboxAttribute>| {
+            std::sync::Arc::new(super::super::folder_registry::FolderEntry::from_mailbox(
+                crate::types::MailboxInfo {
+                    name: MailboxName::new(name).unwrap(),
+                    attributes,
+                    ..Default::default()
+                },
+            ))
+        };
+        let entries = || {
+            vec![
+                entry("Sent", Vec::new()),
+                entry("INBOX", Vec::new()),
+                entry("[Gmail]/All Mail", vec![MailboxAttribute::All]),
+                entry("[Gmail]", vec![MailboxAttribute::NoSelect]),
+            ]
+        };
+        let names = |folders: Vec<MailboxName>| {
+            folders
+                .iter()
+                .map(|f| f.as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        // Gmail: one search in \All, not one per label.
+        assert_eq!(
+            names(native_thread_folders(
+                entries(),
+                NativeThreadKind::Gmail,
+                ThreadScope::Account
+            )),
+            ["[Gmail]/All Mail"]
+        );
+        // OBJECTID: every selectable folder, never a \Noselect parent.
+        let all = names(native_thread_folders(
+            entries(),
+            NativeThreadKind::ObjectId,
+            ThreadScope::Account,
+        ));
+        assert_eq!(all.len(), 3);
+        assert!(!all.iter().any(|name| name == "[Gmail]"));
+        let inbox = MailboxName::new("INBOX").unwrap();
+        let except = names(native_thread_folders(
+            entries(),
+            NativeThreadKind::ObjectId,
+            ThreadScope::Except(&inbox),
+        ));
+        assert!(!except.iter().any(|name| name == "INBOX"));
+        assert_eq!(except.len(), 2);
+        assert_eq!(
+            names(native_thread_folders(
+                entries(),
+                NativeThreadKind::Gmail,
+                ThreadScope::Only(&inbox)
+            )),
+            ["INBOX"]
+        );
+        // Gmail without a listed \All falls back to every selectable folder.
+        let no_all = vec![entry("INBOX", Vec::new()), entry("Sent", Vec::new())];
+        assert_eq!(
+            native_thread_folders(no_all, NativeThreadKind::Gmail, ThreadScope::Account).len(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn partial_commit_copy_messages_second_folder_failure_keeps_first() {
         let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS")).await;

@@ -236,6 +236,12 @@ pub(crate) fn update<T: HttpTransport>(
         // Deactivation is account-wide on the wire. Read this script first,
         // and guard the write so a concurrent activation cannot redirect it
         // to another script between the read and the set.
+        // Keep a stateMismatch visible even if an unrelated script caused it.
+        // An Outlook user expects concurrent rule edits to be preserved: this
+        // call can also replace the target's name/body, so a fresh read and
+        // automatic retry would silently authorize those edits against a newer
+        // ruleset. The caller can refresh and explicitly retry the whole patch.
+        // Do not retry only the deactivation leg and split this atomic set.
         let deactivate = if patch.is_active == Some(false) {
             let response = account
                 .call(

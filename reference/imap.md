@@ -398,6 +398,16 @@ layer of the stream, so a departing caller withdraws it instead (see
 
 `TypedEvent` carries every unsolicited response (EXISTS, EXPUNGE, FETCH, FLAGS, STATUS, METADATA, NOTIFY-routed events). `drain_events()` and `next_event()` give callers ordered access.
 
+Which ongoing NOTIFY response types a registration can produce is derived in
+one place, `types::notify::NotifyFlags`, built directly from the
+`NotifySetParams` (`From<&NotifySetParams>`); the STATUS indicator only asks
+for the initial snapshot and sets no ongoing flag. LIST-EXTENDED derives its
+marker-filtering policy inside its consumer from the selection options
+(`ListExtendedConsumer::new`): with SUBSCRIBED, `\NonExistent` / `\NoAccess`
+are legitimate solicited results and are not reclassified as NOTIFY events,
+so the direct and pipelined paths cannot disagree. LIST-STATUS returns
+`ListStatusEntry { mailbox, status }` per solicited mailbox.
+
 `TypedEvent::impact()` returns `EventImpact` for cache-coherence: `SelectedMailboxChanged`, `SelectedMailboxResync`, `MailboxStateChanged`, `ServerMetadataChanged`, `Heartbeat`, `Extension`, `None`. RECENT maps to `None` (informational; deprecated by IMAP4rev2). ServerMetadataChange is server-scoped, not selected-mailbox scoped.
 
 `DriverEventSink` never waits on the event receiver. It buffers critical
@@ -665,6 +675,18 @@ Direct connection setup guards the post-spawn keepalive command as in-flight;
 cancellation there marks the connection abandoned so dropping its last handle
 aborts the driver instead of detaching a command that may still be queued.
 
+Local driver requests that send no IMAP command are bounded like wire
+commands: one caller deadline covers both queue admission and the reply wait,
+so a stalled head command cannot hold them indefinitely.
+`set_keepalive(keepalive, timeout)` takes a caller-supplied timeout (the pool
+dial and direct connection setup pass the configured command timeout), and
+every failure it returns, including expiry and a dead driver, carries
+`Unsent`, because applying a socket option transmits no IMAP command.
+`peer_certificate_der(deadline)` runs under the authentication attempt's
+deadline and reports expiry as `Timeout` / `Unsent`, never as an absent
+certificate: reading a slow lookup as "no certificate" would walk the SCRAM
+ladder down from the `PLUS` rung.
+
 Connect-time STARTTLS requires both an unauthenticated greeting and an
 advertised `STARTTLS`. A cleartext PREAUTH greeting is refused as
 `StartTlsUnavailable` before sending a command, as RFC 9051 requires closing
@@ -708,7 +730,7 @@ ruling. Its UIDs do not persist across selections, so its cursor is
 re-established whenever UIDVALIDITY moves; a cursor-free sync mode for such
 folders is an open follow-up, not current behaviour.
 
-`SelectedMailbox` carries `highest_mod_seq`, `uid_validity`, `uid_next`, `no_mod_seq`, and the SELECT-side VANISHED list. A missing `UIDVALIDITY` is a protocol error rather than a silent 0: the account layer judges it through one helper, `selected_uidvalidity`, at every site (sync lanes, PIM primitives, search, raw-body read), as `Error::ProtocolMissing` (`Protocol(MissingField)`, `ProviderContractViolation`) - the server's omission, never a caller-blaming `Request(Malformed)`; a `MODSEQ 0` in a FETCH response is rejected for the same reason.
+`SelectedMailbox` carries `highest_mod_seq`, `uid_validity`, `uid_next`, `no_mod_seq`, and the SELECT-side VANISHED list. A missing `UIDVALIDITY` is a protocol error rather than a silent 0: the account layer judges it through one helper, `selected_uidvalidity`, at every site (sync lanes, PIM primitives, search, raw-body read), as `Error::ProtocolMissing` (`Protocol(MissingField)`, `ProviderContractViolation`) - the server's omission, never a caller-blaming `Request(Malformed)`. A tolerated `MODSEQ 0` in a FETCH response is ignored by the opportunistic STORE-guard cache; it does not fail the sync walk.
 
 ## Account layer
 
@@ -837,6 +859,32 @@ race cannot be closed by this client.
   matches. Repair requires attachment-aware evaluation through boolean filters
   and paging; replacing the existing path with Unsupported requires an owner
   decision because it removes behavior.
+- FETCH thread keys in inventory and PIM messages are redeemable,
+  account-scoped `imapnative2:<kind>:<key>` handles: key kind and server key
+  only, no folder and no UIDVALIDITY. OBJECTID takes precedence over Gmail's
+  key. Ruling: an enterprise Outlook user sees one conversation across Inbox,
+  Sent and All Mail and expects one thread id on every message of it and a
+  thread action that covers all of it, so the same conversation carries the
+  same id in every folder and consumers may group on it. Servers send neither
+  key unrequested, so the inventory FETCH and PIM message hydration append
+  THREADID when OBJECTID is usable and X-GM-THRID when X-GM-EXT-1 is
+  (`hydration::push_native_thread_attrs`); without either capability the entry
+  carries no native handle. Hydration is advertised with OBJECTID or
+  X-GM-EXT-1 as well as THREAD=REFERENCES; native lookup does not require the
+  THREAD algorithm. Members are resolved at redemption time by UID SEARCH
+  (`pim::resolve_thread_members`) in the folders `native_thread_folders`
+  picks: for X-GM-THRID the one `\All` folder when listed (labels are views of
+  one store), else every selectable folder; for THREADID every selectable
+  folder. Hydration and flag changes use every such folder, removal searches
+  only the source folder, and a copy searches every folder but the
+  destination. A move resolves its removal set before its copy set and both
+  before any write, so nothing is removed from the source that was not also
+  copied. An empty resolved conversation hydrates empty and mutations are
+  no-ops; a conversation with no member in the removal folder is already
+  satisfied. An epoch change between resolution and the write is refused by
+  the PIM-wide `Request(Malformed)` stale-epoch rule. Search-generated
+  `imapthread1`/`imapthread2` handles retain their explicit UID snapshot
+  semantics and remain the fallback when neither key exists.
 - Search messages: UID SEARCH across selectable folders, `SearchFilter::In` restricting the selected mailbox. Thread search is advertised only with `THREAD=REFERENCES`, returning synthetic thread ids containing folder, UIDVALIDITY, and member UIDs.
 - Search paging (`pim::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. A changed UIDVALIDITY on the cursor's folder fails `ConcurrencyConflict` (repeat the walk); an undecodable cursor, a cursor outside the `SearchFilter::In` restriction, and a zero limit are `Request(Malformed)`. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
 - Containers: LIST-backed enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE (checks `STATUS MESSAGES`, refuses non-empty mailboxes).
@@ -1364,6 +1412,15 @@ commits do not acknowledge a later transport failure or make a refusal uncertain
 Grouped STORE, MOVE and EXPUNGE use the same rule.
 
 ### Strategy downgrade derivation
+
+`ChangePlan::for_cursor` is shared by cursor description and initial changes
+admission. An incomplete QRESYNC UID baseline is refused before checkout,
+regardless of session policy; its descriptor is None/Expensive with no
+freshness, rather than advertising a cheap run that cannot execute. Complete
+cursors use QRESYNC while enabled, CONDSTORE for either modseq cursor when
+QRESYNC is disabled, and Basic for a Basic cursor. Cursor minting still uses
+the SELECT result, which is not a resumable cursor until inventory supplies
+the complete UID baseline.
 
 `EngineDirective::DowngradeStrategy` is reserved for "all strategies exhausted", which IMAP never derives at runtime: `changes.rs` handles every QRESYNC -> CONDSTORE -> Basic downgrade inline via `Warning::StrategyDowngraded` plus a direct retry on the lower strategy. The `strategy_failure` helper is funnel-wired and tested so the directive is producible, but no runtime path reaches it while Basic is the universal fallback.
 

@@ -122,6 +122,10 @@ pub fn diff_snapshots(
         };
         for old_index in old_indices {
             let old = &previous[old_index];
+            // Exact spelling is only a tie-break INSIDE one identity bucket.
+            // Keep it: old cursors can contain multiple published aliases, and
+            // pairing their own spelling first avoids swapping their etags.
+            // It never decides whether two resources are equivalent.
             let new_position = new_indices
                 .iter()
                 .position(|new_index| current[*new_index].uri == old.uri)
@@ -307,6 +311,72 @@ pub fn encode_snapshot(
     bytes
 }
 
+/// The structural reason a stored snapshot cannot be decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SnapshotDecodeErrorKind {
+    MagicMismatch,
+    EntryCount,
+    TrailingBytes,
+    StringLength,
+    Utf8,
+    MissingTag,
+    InvalidTag,
+    TruncatedInteger,
+    IntegerShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotDecodeError {
+    pub kind: SnapshotDecodeErrorKind,
+    label: String,
+    detail: Option<String>,
+}
+
+impl SnapshotDecodeError {
+    fn new(label: &str, kind: SnapshotDecodeErrorKind) -> Self {
+        Self {
+            kind,
+            label: label.to_string(),
+            detail: None,
+        }
+    }
+
+    fn with_detail(mut self, detail: impl std::fmt::Display) -> Self {
+        self.detail = Some(detail.to_string());
+        self
+    }
+}
+
+impl std::fmt::Display for SnapshotDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self.kind {
+            SnapshotDecodeErrorKind::MagicMismatch => "magic mismatch",
+            SnapshotDecodeErrorKind::EntryCount => "entry count exceeds remaining payload",
+            SnapshotDecodeErrorKind::TrailingBytes => "has trailing bytes",
+            SnapshotDecodeErrorKind::StringLength => "string length exceeds payload",
+            SnapshotDecodeErrorKind::Utf8 => "string is not UTF-8",
+            SnapshotDecodeErrorKind::MissingTag => "option tag is missing",
+            SnapshotDecodeErrorKind::InvalidTag => "option tag is invalid",
+            SnapshotDecodeErrorKind::TruncatedInteger => "integer is truncated",
+            SnapshotDecodeErrorKind::IntegerShape => "integer shape",
+        };
+        write!(f, "{} cursor {reason}", self.label)?;
+        if let Some(detail) = &self.detail {
+            write!(f, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SnapshotDecodeError {}
+
+impl From<SnapshotDecodeError> for String {
+    fn from(error: SnapshotDecodeError) -> Self {
+        error.to_string()
+    }
+}
+
 /// Decode cursor bytes written by [`encode_snapshot`].
 ///
 /// `label` names the protocol in the diagnostics ("CalDAV" / "CardDAV"); the
@@ -318,18 +388,26 @@ pub fn encode_snapshot(
 /// smallest an entry can encode), so a corrupt count cannot make this allocate
 /// against a four-byte lie. Trailing bytes are an error too - a payload this
 /// did not fully consume is not a payload this understood.
-pub fn decode_snapshot(magic: &[u8], label: &str, bytes: &[u8]) -> Result<DecodedSnapshot, String> {
+pub fn decode_snapshot(
+    magic: &[u8],
+    label: &str,
+    bytes: &[u8],
+) -> Result<DecodedSnapshot, SnapshotDecodeError> {
     let mut input = bytes;
     if !input.starts_with(magic) {
-        return Err(format!("{label} cursor magic mismatch"));
+        return Err(SnapshotDecodeError::new(
+            label,
+            SnapshotDecodeErrorKind::MagicMismatch,
+        ));
     }
     input = &input[magic.len()..];
     let collection_url = read_string(&mut input, label)?;
     let token = read_option_string(&mut input, label)?;
     let count = read_u32(&mut input, label)?;
     if count > input.len() / 5 {
-        return Err(format!(
-            "{label} cursor entry count exceeds remaining payload"
+        return Err(SnapshotDecodeError::new(
+            label,
+            SnapshotDecodeErrorKind::EntryCount,
         ));
     }
     let mut entries = Vec::with_capacity(count);
@@ -340,7 +418,10 @@ pub fn decode_snapshot(magic: &[u8], label: &str, bytes: &[u8]) -> Result<Decode
         });
     }
     if !input.is_empty() {
-        return Err(format!("{label} cursor has trailing bytes"));
+        return Err(SnapshotDecodeError::new(
+            label,
+            SnapshotDecodeErrorKind::TrailingBytes,
+        ));
     }
     Ok(DecodedSnapshot {
         collection_url,
@@ -369,35 +450,49 @@ fn write_u32(bytes: &mut Vec<u8>, value: usize) {
     bytes.extend_from_slice(&value.to_be_bytes());
 }
 
-fn read_string(input: &mut &[u8], label: &str) -> Result<String, String> {
+fn read_string(input: &mut &[u8], label: &str) -> Result<String, SnapshotDecodeError> {
     let len = read_u32(input, label)?;
     if input.len() < len {
-        return Err(format!("{label} cursor string length exceeds payload"));
+        return Err(SnapshotDecodeError::new(
+            label,
+            SnapshotDecodeErrorKind::StringLength,
+        ));
     }
-    let value = String::from_utf8(input[..len].to_vec())
-        .map_err(|error| format!("{label} cursor string is not UTF-8: {error}"))?;
+    let value = String::from_utf8(input[..len].to_vec()).map_err(|error| {
+        SnapshotDecodeError::new(label, SnapshotDecodeErrorKind::Utf8).with_detail(error)
+    })?;
     *input = &input[len..];
     Ok(value)
 }
 
-fn read_option_string(input: &mut &[u8], label: &str) -> Result<Option<String>, String> {
+fn read_option_string(
+    input: &mut &[u8],
+    label: &str,
+) -> Result<Option<String>, SnapshotDecodeError> {
     let Some((tag, rest)) = input.split_first() else {
-        return Err(format!("{label} cursor option tag is missing"));
+        return Err(SnapshotDecodeError::new(
+            label,
+            SnapshotDecodeErrorKind::MissingTag,
+        ));
     };
     *input = rest;
     match tag {
         0 => Ok(None),
         1 => read_string(input, label).map(Some),
-        _ => Err(format!("{label} cursor option tag is invalid")),
+        _ => Err(SnapshotDecodeError::new(
+            label,
+            SnapshotDecodeErrorKind::InvalidTag,
+        )),
     }
 }
 
-fn read_u32(input: &mut &[u8], label: &str) -> Result<usize, String> {
-    let bytes = input
-        .get(..4)
-        .ok_or_else(|| format!("{label} cursor integer is truncated"))?;
-    let bytes = <[u8; 4]>::try_from(bytes)
-        .map_err(|error| format!("{label} cursor integer shape: {error}"))?;
+fn read_u32(input: &mut &[u8], label: &str) -> Result<usize, SnapshotDecodeError> {
+    let bytes = input.get(..4).ok_or_else(|| {
+        SnapshotDecodeError::new(label, SnapshotDecodeErrorKind::TruncatedInteger)
+    })?;
+    let bytes = <[u8; 4]>::try_from(bytes).map_err(|error| {
+        SnapshotDecodeError::new(label, SnapshotDecodeErrorKind::IntegerShape).with_detail(error)
+    })?;
     let value = u32::from_be_bytes(bytes);
     *input = &input[4..];
     Ok(value as usize)
@@ -458,16 +553,19 @@ pub struct PageSlice<T> {
     pub next_watermark: Option<String>,
 }
 
-/// Take the page that follows `watermark` out of a key-sorted sequence.
+/// Take the page that follows `watermark` out of a sequence of keyed items.
 ///
-/// `items` must already be sorted ASCENDING by `key`, and `key` must be stable
-/// across polls: each continuation re-runs the remote request, and DAV
-/// guarantees no ordering on a multistatus, so slicing raw response order would
-/// let an unchanged result set come back permuted between page one and page two
-/// and serve some members twice while never serving others at all. Both DAV
-/// crates key on the resource href (CalDAV through the recurrence-qualified
-/// event id, CardDAV through the native id), which is the only key the depth-1
-/// listing carries and the only one a member update cannot move.
+/// `key` must yield a resource href that is stable across polls. Items are
+/// ordered and deduplicated here by DAV identity ([`dav_href_key`]), and the
+/// watermark is compared by the same identity, so an equivalent spelling of
+/// the same href on a later request neither repeats nor skips it. Each
+/// continuation re-runs the remote request, and DAV guarantees no ordering on
+/// a multistatus, so slicing raw response order would let an unchanged result
+/// set come back permuted between page one and page two and serve some
+/// members twice while never serving others at all. Both DAV crates key on
+/// the resource href before hydration expands recurrence instances, which is
+/// the only key the depth-1 listing carries and the only one a member update
+/// cannot move.
 ///
 /// A member inserted BEFORE the watermark between two pages is therefore not
 /// re-served, and one inserted after it is served on a later page - the
@@ -490,13 +588,20 @@ pub fn slice_after_watermark<T>(
             next_watermark: None,
         };
     }
-    let mut remaining = match watermark {
-        Some(watermark) => items
-            .into_iter()
-            .filter(|item| key(item) > watermark)
-            .collect(),
-        None => items,
-    };
+    // Page identity and ordering must agree with the query candidate order.
+    // A continuation may observe a different spelling of the same href.
+    let mut keyed: Vec<_> = items
+        .into_iter()
+        .map(|item| (dav_href_key(key(&item)), item))
+        .collect();
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    keyed.dedup_by(|left, right| left.0 == right.0);
+    let watermark = watermark.map(dav_href_key);
+    let mut remaining: Vec<_> = keyed
+        .into_iter()
+        .filter(|(identity, _)| watermark.as_ref().is_none_or(|mark| identity > mark))
+        .map(|(_, item)| item)
+        .collect();
     let more = remaining.len() > page_size;
     remaining.truncate(page_size);
     let next_watermark = if more {
@@ -519,6 +624,31 @@ mod tests {
             uri: uri.to_string(),
             etag: etag.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn watermark_uses_identity_when_the_next_report_changes_spelling() {
+        let first = slice_after_watermark(
+            crate::sorted_candidate_hrefs(vec![
+                "https://dav.test/c/a".into(),
+                "https://dav.test/c/b".into(),
+            ]),
+            None,
+            1,
+            String::as_str,
+        );
+        let next = slice_after_watermark(
+            crate::sorted_candidate_hrefs(vec![
+                "https://DAV.test:443/c/%61".into(),
+                "https://DAV.test:443/c/b".into(),
+            ]),
+            first.next_watermark.as_deref(),
+            1,
+            String::as_str,
+        );
+        assert_eq!(next.items.len(), 1);
+        assert!(crate::same_dav_url(&next.items[0], "https://dav.test/c/b"));
+        assert!(next.next_watermark.is_none());
     }
 
     #[test]
@@ -563,10 +693,7 @@ mod tests {
         bytes[tail..].copy_from_slice(&u32::MAX.to_be_bytes());
 
         let error = decode_snapshot(b"MAGIC1", "CardDAV", &bytes).expect_err("refused");
-        assert!(
-            error.contains("entry count exceeds remaining payload"),
-            "{error}"
-        );
+        assert!(error.kind == SnapshotDecodeErrorKind::EntryCount, "{error}");
     }
 
     #[test]

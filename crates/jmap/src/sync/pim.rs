@@ -904,6 +904,12 @@ pub(crate) fn send_message<T: HttpTransport>(
         } else {
             ObjectId(public_email_id.as_str().to_owned())
         };
+        // deliveryStatus is asynchronous delivery evidence, not the SMTP
+        // acceptance transcript for this submission. Even delivered=no can
+        // describe a later bounce after acceptance. An Outlook user must not
+        // be invited to resend an accepted message from that evidence; leave
+        // recipients_not_accepted empty rather than reinterpret delivery as
+        // submission refusal. This applies to scheduled submissions too.
         Ok(bifrost_types::SendReceipt::new(id, sent_copy))
     })
 }
@@ -1086,6 +1092,12 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
             on_success,
             id.clone(),
         );
+        // deliveryStatus is asynchronous delivery evidence, not the SMTP
+        // acceptance transcript for this submission. Even delivered=no can
+        // describe a later bounce after acceptance. An Outlook user must not
+        // be invited to resend an accepted message from that evidence; leave
+        // recipients_not_accepted empty rather than reinterpret delivery as
+        // submission refusal. This applies to scheduled submissions too.
         Ok(bifrost_types::SendReceipt::new(id, sent_copy))
     })
 }
@@ -1348,6 +1360,12 @@ pub(crate) fn draft_send<T: HttpTransport>(
         }
         let id = ObjectId(draft_id.into_string());
         let sent_copy = implicit_sent_copy(implicit, OnSuccess::File, id.clone());
+        // deliveryStatus is asynchronous delivery evidence, not the SMTP
+        // acceptance transcript for this submission. Even delivered=no can
+        // describe a later bounce after acceptance. An Outlook user must not
+        // be invited to resend an accepted message from that evidence; leave
+        // recipients_not_accepted empty rather than reinterpret delivery as
+        // submission refusal. This applies to scheduled submissions too.
         Ok(bifrost_types::SendReceipt::new(id, sent_copy))
     })
 }
@@ -1720,14 +1738,18 @@ pub(crate) fn container_rename<T: HttpTransport>(
     Box::pin(async move {
         let mailbox = container_wire_id(&container, &account_id);
         let mut set = MailboxSet::new();
-        set.update(mailbox).name(name);
-        let response = mail
+        set.update(mailbox.clone()).name(name);
+        let mut response = mail
             .call(set)
             .await
             .map_err(to_acct_err(AccountOperation::ContainerRename))?;
-        response
-            .unwrap_update_errors()
-            .map_err(to_acct_err(AccountOperation::ContainerRename))?;
+        // Silence about this id is an unconfirmed write, not a successful
+        // folder change. Keep the sidebar honest even if newState advanced.
+        response.updated(&mailbox).map_err(set_answer_error(
+            AccountOperation::ContainerRename,
+            "Mailbox/set",
+            false,
+        ))?;
         if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
             state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
@@ -1756,15 +1778,19 @@ pub(crate) fn container_move<T: HttpTransport>(
         }
         let mailbox = container_wire_id(&container, &account_id);
         let mut set = MailboxSet::new();
-        set.update(mailbox)
+        set.update(mailbox.clone())
             .parent_id(new_parent.map(|id| container_wire_id(&id, &account_id)));
-        let response = mail
+        let mut response = mail
             .call(set)
             .await
             .map_err(to_acct_err(AccountOperation::ContainerMove))?;
-        response
-            .unwrap_update_errors()
-            .map_err(to_acct_err(AccountOperation::ContainerMove))?;
+        // Silence about this id is an unconfirmed write, not a successful
+        // folder change. Keep the sidebar honest even if newState advanced.
+        response.updated(&mailbox).map_err(set_answer_error(
+            AccountOperation::ContainerMove,
+            "Mailbox/set",
+            false,
+        ))?;
         if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
             state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
@@ -4841,6 +4867,55 @@ mod tests {
             container_wire_id(&ContainerId("mbx".into()), "primary").as_str(),
             "mbx"
         );
+    }
+
+    #[tokio::test]
+    async fn container_changes_require_an_answer_for_the_requested_id() {
+        for rename in [true, false] {
+            let client = crate::client::Client::with_transport(
+                OmittingSetTransport::default(),
+                search_session(),
+                "https://example.test/.well-known/jmap",
+            )
+            .expect("client builds");
+            let mail = crate::account::Account::new(client, "primary");
+            let states = send_state_map();
+            let result = if rename {
+                container_rename(
+                    mail,
+                    std::sync::Arc::clone(&states),
+                    "primary".to_string(),
+                    ContainerId("mbx".into()),
+                    "Renamed".to_string(),
+                    None,
+                )
+                .await
+            } else {
+                container_move(
+                    mail,
+                    std::sync::Arc::clone(&states),
+                    "primary".to_string(),
+                    ContainerId("mbx".into()),
+                    None,
+                )
+                .await
+            };
+            let error = result.expect_err("newState alone does not acknowledge this id");
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::PartialResponse
+                )
+            );
+            assert_eq!(
+                error.operation(),
+                Some(if rename {
+                    AccountOperation::ContainerRename
+                } else {
+                    AccountOperation::ContainerMove
+                })
+            );
+        }
     }
 
     #[tokio::test]

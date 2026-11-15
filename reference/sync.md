@@ -1291,6 +1291,12 @@ which worker wins the subscriber wake. Newly-created scopes and later
 delete + re-establish incarnations are discovered by subsequent scans
 and receive their own pass.
 
+An empty fixed backfill plan falls back to one `InventoryPartition::Full`
+request. Zero UID and item-count hints cannot establish durable completion
+without asking the provider: an enterprise Outlook user expects an apparently
+empty folder to be checked even when its planning hint is stale. The normal
+partition outcome and failure rules decide whether that pass can complete.
+
 The rescan retires an incarnation only on a durable conclusion: the plan
 ran to completion, or the checkpoint store already carries its
 completion marker. A partition failure or a checkpoint-store read
@@ -1984,6 +1990,11 @@ are submitted to the bounded recovery queue only while the boundary reads
 event for resubmission. A refusal may persist through a consumer pause.
 Controls intentionally overtake pending invalidations: invalidations are
 idempotent wake-ups and no control verdict discharges them.
+
+Ingress and retained work share `PendingPush::bound`: crossing the distinct
+hint capacity clears narrow intent, requests a full sweep and counts exactly
+one coarsening. The reconciler routes specific hints through `scopes_for_hint`;
+full intent remains unresolved until the sweep so it sees current topology.
 
 The reconciler owns a persistent work set. It resolves memberships at merge
 time and full reconciliation at sweep time, retaining undispatched scopes.
@@ -2952,6 +2963,15 @@ acknowledgement, so `ack_publication` handed a checkpoint publication's id
 refuses instead of consuming it - consuming it would make the later, real
 `ack_checkpoint` short-circuit as already persisted and return before writing,
 while the engine announced a durable boundary the store never accepted.
+
+`retire`, `retire_publication` and batch `abandon` share one retirement
+transition: remove the publication's boundary (including a subsumed registration),
+carry its debt without clean proof, remove its claim and wake capacity waiters.
+Lost delivery must not erase an outstanding obligation. Acknowledgement and
+claim folding remain separate operations because neither capacity release nor
+folding proves a durable checkpoint. Generation-specific quiescence publication
+still belongs to `SyncControl`; a ledger-only retirement does not publish that
+control notification.
 
 Boundary release and retirement identify the publication, never the checkpoint
 VALUE, for the same reason the claim does: equal values are routinely different

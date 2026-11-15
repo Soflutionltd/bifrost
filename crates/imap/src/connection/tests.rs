@@ -126,7 +126,10 @@ impl dispatch::Consumer for PanickingConsumer {
 async fn peer_certificate_der_none_over_memory_stream() {
     let (conn, _server) = make_driver_test_pair().await;
     assert!(
-        conn.peer_certificate_der().await.is_none(),
+        conn.peer_certificate_der(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap()
+            .is_none(),
         "in-memory (non-TLS) transport must have no peer certificate DER"
     );
 }
@@ -3315,5 +3318,43 @@ mod transition_refresh {
         let err = task.await.unwrap().unwrap_err();
         assert!(matches!(err, Error::Bad { .. }), "{err:?}");
         assert!(!conn.is_reusable());
+    }
+}
+
+/// Local driver queries must bound both a full admission queue and an
+/// unanswered admitted request, without reporting IMAP transmission.
+#[tokio::test(start_paused = true)]
+async fn local_driver_queries_bound_admission_and_reply() {
+    for full_queue in [false, true] {
+        for certificate in [false, true] {
+            let mut conn = test_support::detached(SessionState::NotAuthenticated, vec![], &[]);
+            let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(1);
+            conn.cmd_tx = cmd_tx;
+            let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+            if full_queue {
+                assert!(
+                    conn.cmd_tx
+                        .try_send(driver::DriverCommand::PeerCertificate { result_tx })
+                        .is_ok()
+                );
+            }
+            // Keep the receiver alive but never poll it. An empty queue admits
+            // the query and stalls the reply; a full queue stalls admission.
+            let timeout = Duration::from_secs(1);
+            let error = if certificate {
+                conn.peer_certificate_der(tokio::time::Instant::now() + timeout)
+                    .await
+                    .expect_err("a stalled lookup must not become an absent certificate")
+            } else {
+                conn.set_keepalive(TcpKeepalive::new(timeout, timeout), timeout)
+                    .await
+                    .expect_err("a stalled socket option must time out")
+            };
+            assert!(matches!(error, Error::Timeout { .. }));
+            assert_eq!(
+                error.attempt(),
+                Some(bifrost_types::TransmissionState::Unsent)
+            );
+        }
     }
 }

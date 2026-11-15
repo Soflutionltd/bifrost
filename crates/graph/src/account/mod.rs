@@ -157,6 +157,14 @@ pub(crate) struct GraphAccount {
     /// non-public folder on its existing (reject-on-delta) path.
     pub(crate) routing_map:
         Arc<RwLock<HashMap<bifrost_types::FolderId, cursor::PublicFolderRouting>>>,
+    /// Whether the most recent public-folder discovery pass browsed the
+    /// WHOLE hierarchy: no early exit, no skipped subtree, no step-cap
+    /// truncation. Only then does a folder missing from `routing_map` prove
+    /// the folder is gone for this user rather than not yet rediscovered;
+    /// hydration uses it to stop retrying such items (see
+    /// `graph_error::unroutable_public_item_error`). Starts false on every
+    /// open, like the map it qualifies.
+    pub(crate) public_folder_discovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Projection metadata for every discovered public folder (display name,
     /// EWS `FolderClass`, parent, effective rights), seeded in the same
     /// discovery pass that fills `routing_map`. `containers_list` reads this
@@ -371,6 +379,7 @@ impl GraphAccount {
             etag_index: Arc::new(RwLock::new(EtagIndex::default())),
             trash_folder_ids: Arc::new(RwLock::new(HashMap::new())),
             routing_map: Arc::new(RwLock::new(HashMap::new())),
+            public_folder_discovery_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             public_folder_meta: Arc::new(RwLock::new(HashMap::new())),
             public_item_classes: Arc::new(RwLock::new(HashMap::new())),
             public_folders,
@@ -584,6 +593,37 @@ impl GraphAccount {
         folder: &bifrost_types::FolderId,
     ) -> Option<cursor::PublicFolderRouting> {
         self.routing_map.read().await.get(folder).cloned()
+    }
+
+    /// The refusal for a public-folder item whose folder has no routing entry.
+    /// A retryable stale-local-state conflict until a complete discovery pass
+    /// has run; after one, `NotFound(Message)` so the item stops retrying
+    /// (ruling on `graph_error::unroutable_public_item_error`).
+    pub(crate) fn missing_public_route_error(
+        &self,
+        operation: bifrost_types::AccountOperation,
+        id: &bifrost_types::ObjectId,
+        folder: &bifrost_types::FolderId,
+    ) -> bifrost_types::AccountError {
+        let detail = format!("public folder {} has no routing entry", folder.0);
+        if self
+            .public_folder_discovery_complete
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            graph_error::unroutable_public_item_error(
+                operation,
+                &id.0,
+                format!("{detail} after a complete public-folder discovery"),
+            )
+        } else {
+            graph_error::stale_local_state_error(
+                operation,
+                bifrost_types::ErrorScope::Message {
+                    id: id.0.clone().into(),
+                },
+                detail,
+            )
+        }
     }
 
     /// Whether `folder` is a public folder this account has discovered: in

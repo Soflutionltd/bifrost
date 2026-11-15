@@ -733,9 +733,7 @@ impl ImapConnection {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<Option<bifrost_sasl::ScramChannelBinding>, Error> {
-        let der = tokio::time::timeout_at(deadline, self.peer_certificate_der())
-            .await
-            .map_err(|_| Error::timeout().with_attempt(TransmissionState::Unsent))?;
+        let der = self.peer_certificate_der(deadline).await?;
         scram_binding_from_der(der.as_deref())
     }
 

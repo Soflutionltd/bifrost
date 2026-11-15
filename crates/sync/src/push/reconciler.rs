@@ -52,8 +52,7 @@ pub struct Reconciler {
 
 #[derive(Default)]
 struct WorkSet {
-    full: bool,
-    scopes: HashSet<CursorScope>,
+    intent: super::PendingPush,
     hold: Option<(u64, tokio::time::Instant)>,
 }
 
@@ -65,20 +64,25 @@ impl WorkSet {
         ingress: &super::PushIngress,
     ) -> bool {
         let hinted = !pending.scopes.is_empty() || !pending.memberships.is_empty();
-        self.full |= pending.full;
-        if !self.full {
-            self.scopes.extend(pending.scopes);
-            for membership in pending.memberships {
-                self.scopes
-                    .extend(registry.scopes_for_membership(&membership));
+        self.intent.full |= pending.full;
+        if !self.intent.full {
+            for scope in pending.scopes {
+                self.intent.scopes.extend(scopes_for_hint(
+                    registry,
+                    &HintPayload::SpecificCursorScope(scope),
+                ));
             }
-            if hinted && self.scopes.len() > ingress.capacity() {
-                self.full = true;
-                ingress.count_coarsening();
+            for membership in pending.memberships {
+                self.intent.scopes.extend(scopes_for_hint(
+                    registry,
+                    &HintPayload::SpecificMembership(membership),
+                ));
             }
         }
-        if self.full {
-            self.scopes.clear();
+        // A full sweep is resolved at drive time so topology changes are seen.
+        // Do not apply the hint bound to an already resolved full sweep.
+        if (hinted || self.intent.full) && self.intent.bound(ingress.capacity()) {
+            ingress.count_coarsening();
         }
         pending.closed
     }
@@ -126,12 +130,12 @@ impl Reconciler {
                 .collect();
             for scope in ready {
                 deferred.remove(&scope);
-                work.scopes.insert(scope);
+                work.intent.scopes.insert(scope);
             }
-            if work.hold.is_none() && (work.full || !work.scopes.is_empty()) {
-                if work.full {
-                    work.full = false;
-                    work.scopes.extend(self.cursors.all_scopes());
+            if work.hold.is_none() && (work.intent.full || !work.intent.scopes.is_empty()) {
+                if work.intent.full {
+                    work.intent.full = false;
+                    work.intent.scopes.extend(self.cursors.all_scopes());
                 }
                 if let Err(error) = self.drive_scopes(&mut work, &mut deferred).await {
                     tracing::warn!(target: "bifrost.sync.reconcile", %error, "push reconcile failed");
@@ -196,13 +200,13 @@ impl Reconciler {
         work: &mut WorkSet,
         deferred: &mut HashSet<CursorScope>,
     ) -> Result<(), Error> {
-        let scopes: Vec<_> = work.scopes.iter().cloned().collect();
+        let scopes: Vec<_> = work.intent.scopes.iter().cloned().collect();
         for scope in scopes {
             #[cfg(test)]
             if let Some(attempts) = &self.attempts {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            work.scopes.remove(&scope);
+            work.intent.scopes.remove(&scope);
             // This dispatch speaks for any older deferral of the same scope:
             // drop it, so a fresh hint that drives the scope does not leave a
             // due entry behind for the timer to drive a second time. Every
@@ -381,7 +385,7 @@ impl Reconciler {
             match outcome {
                 ChangesEvent::Advanced | ChangesEvent::Done | ChangesEvent::Stopped => {}
                 ChangesEvent::Paused => {
-                    work.scopes.insert(scope);
+                    work.intent.scopes.insert(scope);
                     return Ok(());
                 }
                 ChangesEvent::Terminated(error) => {
@@ -699,7 +703,7 @@ mod tests {
         registry.link_membership(membership, scope("one"));
         let mut work = WorkSet::default();
         work.merge(ingress.take(), &registry, &ingress);
-        assert_eq!(work.scopes, HashSet::from([scope("one")]));
+        assert_eq!(work.intent.scopes, HashSet::from([scope("one")]));
     }
 
     #[test]
@@ -714,13 +718,13 @@ mod tests {
             };
             work.merge(pending, &registry, &ingress);
         }
-        assert!(work.full && work.scopes.is_empty());
+        assert!(work.intent.full && work.intent.scopes.is_empty());
         assert_eq!(ingress.coarsened(), 1);
-        work.full = false;
-        work.scopes.extend([scope("one"), scope("two")]);
+        work.intent.full = false;
+        work.intent.scopes.extend([scope("one"), scope("two")]);
         work.merge(PendingPush::default(), &registry, &ingress);
-        assert!(!work.full);
-        assert_eq!(work.scopes.len(), 2);
+        assert!(!work.intent.full);
+        assert_eq!(work.intent.scopes.len(), 2);
         assert_eq!(ingress.coarsened(), 1);
     }
 }

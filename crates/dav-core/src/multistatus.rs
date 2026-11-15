@@ -37,6 +37,39 @@ use crate::xml::{
     DAV_NAMESPACE, XmlName, property_namespace, push_text, resolved_xml_name, trimmed,
 };
 
+/// XML syntax and escaped-text failures remain distinguishable until mapping
+/// into the account error contract at the protocol boundary.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum MultistatusError {
+    Xml(quick_xml::Error),
+    Text(String),
+}
+
+impl std::fmt::Display for MultistatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Xml(error) => write!(f, "XML parse error: {error}"),
+            Self::Text(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for MultistatusError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Xml(error) => Some(error),
+            Self::Text(_) => None,
+        }
+    }
+}
+
+impl From<MultistatusError> for String {
+    fn from(error: MultistatusError) -> Self {
+        error.to_string()
+    }
+}
+
 /// The staged property bag one crate reads out of a `<prop>`.
 ///
 /// Implementors hold only the properties that crate asked the server for; the
@@ -105,7 +138,7 @@ pub enum MultiStatusOutcome {
     /// reason that is not "this resource is missing". Reporting this as an empty
     /// success lets a consumer record the collection as fully walked and drop
     /// the resources permanently.
-    CompleteFailure { status: Option<u16> },
+    CompleteFailure { status: reqwest::StatusCode },
 }
 
 /// The one RFC 4918 s13 status ladder, applied to any 207 that has a usable
@@ -128,13 +161,15 @@ pub fn classify_207(any_usable: bool, failed: &[FailedResource]) -> MultiStatusO
     // must not turn an enterprise user's whole folder into an error; the
     // failed lane still preserves that resource's local copy and holds the
     // collection token, so nothing is lost by staying Usable.
-    match failed
-        .iter()
-        .find(|failure| failure.status.is_some() && !failure.is_missing_resource())
-    {
-        Some(failure) => MultiStatusOutcome::CompleteFailure {
-            status: failure.status,
-        },
+    match failed.iter().find_map(|failure| {
+        if failure.is_missing_resource() {
+            return None;
+        }
+        failure
+            .status
+            .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
+    }) {
+        Some(status) => MultiStatusOutcome::CompleteFailure { status },
         None => MultiStatusOutcome::Usable,
     }
 }
@@ -147,6 +182,33 @@ pub fn commit_if_present<T>(committed: &mut Option<T>, staged: Option<T>) {
     }
 }
 
+/// A present member status is either readable HTTP or an unreadable refusal.
+/// Absence remains `None`: deployed servers omit propstat status on success.
+#[derive(Debug, Clone, Copy)]
+enum MemberStatus {
+    Http(reqwest::StatusCode),
+    Unreadable,
+}
+
+impl MemberStatus {
+    fn parse(line: &str) -> Self {
+        status_line_code(line)
+            .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
+            .map_or(Self::Unreadable, Self::Http)
+    }
+
+    fn code(self) -> Option<u16> {
+        match self {
+            Self::Http(code) => Some(code.as_u16()),
+            Self::Unreadable => None,
+        }
+    }
+
+    fn is_success(self) -> bool {
+        matches!(self, Self::Http(code) if code.is_success())
+    }
+}
+
 /// One `<response>` being read, with its staged and committed property sets.
 #[derive(Debug, Default, Clone)]
 pub struct ResponseParts<P> {
@@ -155,12 +217,11 @@ pub struct ResponseParts<P> {
     has_success_propstat: bool,
     saw_failed_propstat: bool,
     href: Option<String>,
-    response_status: Option<String>,
+    response_status: Option<MemberStatus>,
     /// Status codes of every non-2xx propstat in this response, in document
     /// order. Drives failure classification.
     failed_statuses: Vec<u16>,
-    staged_status: Option<String>,
-    staged_success: Option<bool>,
+    staged_status: Option<MemberStatus>,
     committed: P,
     staged: P,
 }
@@ -189,19 +250,18 @@ impl<P: PropSet> ResponseParts<P> {
         self.in_propstat = true;
         self.staged = P::default();
         self.staged_status = None;
-        self.staged_success = None;
     }
 
     /// Close a `<propstat>`, promoting its staged properties only on 2xx.
     pub fn commit_propstat(&mut self) {
         let staged = std::mem::take(&mut self.staged);
         let status = self.staged_status.take();
-        let success = self.staged_success.take();
+        let success = status.map(MemberStatus::is_success);
         self.in_propstat = false;
 
         if success == Some(false) {
             self.saw_failed_propstat = true;
-            if let Some(code) = status.as_deref().and_then(status_line_code) {
+            if let Some(code) = status.and_then(MemberStatus::code) {
                 self.failed_statuses.push(code);
             }
         }
@@ -242,9 +302,9 @@ impl<P: PropSet> ResponseParts<P> {
         self.href.as_deref()
     }
 
-    /// The response-level `<status>` line, when the server sent one.
-    pub fn response_status(&self) -> Option<&str> {
-        self.response_status.as_deref()
+    /// The readable response-level status code, when the server sent one.
+    pub fn response_status(&self) -> Option<u16> {
+        self.response_status.and_then(MemberStatus::code)
     }
 
     /// The status a `sync-collection` member should report.
@@ -266,7 +326,7 @@ impl<P: PropSet> ResponseParts<P> {
     /// no entries - an empty snapshot for a collection the server refused,
     /// whose diff destroys every resource in it.
     pub fn member_status_code(&self) -> Option<u16> {
-        if let Some(code) = self.response_status.as_deref().and_then(status_line_code) {
+        if let Some(code) = self.response_status.and_then(MemberStatus::code) {
             return Some(code);
         }
         if self.has_success_propstat {
@@ -319,8 +379,7 @@ impl<P: PropSet> ResponseParts<P> {
         }
         let response_failed = self
             .response_status
-            .as_deref()
-            .is_some_and(|line| !status_line_is_success(line));
+            .is_some_and(|status| !status.is_success());
         if response_failed || (self.saw_failed_propstat && !self.has_success_propstat) {
             self.href.as_deref()
         } else {
@@ -442,7 +501,10 @@ pub trait MultiStatusSink {
 /// `Err` is reserved for a malformed document. A well-formed body whose
 /// individual responses failed is NOT an error: those are per-resource
 /// outcomes, and RFC 4918 s13 makes them the whole point of a 207.
-pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<(), String> {
+pub fn parse_multistatus<S: MultiStatusSink>(
+    xml: &str,
+    sink: &mut S,
+) -> Result<(), MultistatusError> {
     let mut reader = NsReader::from_str(xml);
     let mut parts: ResponseParts<S::Props> = ResponseParts::default();
     let mut stack: Vec<XmlName> = Vec::new();
@@ -451,7 +513,7 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
     loop {
         let (resolved, event) = reader
             .read_resolved_event()
-            .map_err(|error| format!("XML parse error: {error}"))?;
+            .map_err(MultistatusError::Xml)?;
         let name = match &event {
             Event::Start(element) | Event::Empty(element) => {
                 Some(resolved_xml_name(resolved, element.name().as_ref()))
@@ -489,8 +551,15 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
                             .last()
                             .is_some_and(|parent| parent.is(DAV_NAMESPACE, "propstat"))
                     {
-                        parts.staged_status = None;
-                        parts.staged_success = Some(false);
+                        parts.staged_status = Some(MemberStatus::Unreadable);
+                    } else if name.is(DAV_NAMESPACE, "status")
+                        && stack
+                            .last()
+                            .is_some_and(|parent| parent.is(DAV_NAMESPACE, "response"))
+                    {
+                        // An empty status is present, not the absent-success
+                        // extension used by servers that omit status entirely.
+                        parts.response_status = Some(MemberStatus::Unreadable);
                     } else {
                         sink.element(name, &stack, &mut parts);
                     }
@@ -508,7 +577,9 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
                 // `element` and hrefs, never through accumulated text.
                 text.clear();
             }
-            Event::Text(value) => push_text(&mut text, value.as_ref())?,
+            Event::Text(value) => {
+                push_text(&mut text, value.as_ref()).map_err(MultistatusError::Text)?;
+            }
             Event::CData(value) => text.push_str(&value),
             Event::End(_) => {
                 let name = name.as_ref().expect("element event has a resolved name");
@@ -521,12 +592,11 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
                     } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "response"))
                         && name.is(DAV_NAMESPACE, "status")
                     {
-                        parts.response_status = trimmed(&text);
+                        parts.response_status = Some(MemberStatus::parse(&text));
                     } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "propstat"))
                         && name.is(DAV_NAMESPACE, "status")
                     {
-                        parts.staged_status = trimmed(&text);
-                        parts.staged_success = Some(status_line_is_success(&text));
+                        parts.staged_status = Some(MemberStatus::parse(&text));
                     } else {
                         sink.property(parent, name, &text, &mut parts);
                     }
@@ -561,7 +631,10 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
 /// Nested `<status>` elements belonging to some other property inside the same
 /// prop bag are ignored - only a `<status>` whose PARENT is the propstat says
 /// anything about it.
-pub fn extract_href_properties(xml: &str, property_name: &str) -> Result<Vec<String>, String> {
+pub fn extract_href_properties(
+    xml: &str,
+    property_name: &str,
+) -> Result<Vec<String>, MultistatusError> {
     extract_href_properties_in_namespace(xml, property_namespace(property_name), property_name)
 }
 
@@ -571,7 +644,7 @@ pub fn extract_href_properties_in_namespace(
     xml: &str,
     property_namespace: &str,
     property_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, MultistatusError> {
     let mut reader = NsReader::from_str(xml);
     let mut stack: Vec<XmlName> = Vec::new();
     let mut text = String::new();
@@ -582,7 +655,7 @@ pub fn extract_href_properties_in_namespace(
     loop {
         let (resolved, event) = reader
             .read_resolved_event()
-            .map_err(|error| format!("XML parse error: {error}"))?;
+            .map_err(MultistatusError::Xml)?;
         let name = match &event {
             Event::Start(element) | Event::Empty(element) => {
                 Some(resolved_xml_name(resolved, element.name().as_ref()))
@@ -615,7 +688,9 @@ pub fn extract_href_properties_in_namespace(
                 // where the paired spelling of the same child reads `def`.
                 text.clear();
             }
-            Event::Text(value) => push_text(&mut text, value.as_ref())?,
+            Event::Text(value) => {
+                push_text(&mut text, value.as_ref()).map_err(MultistatusError::Text)?;
+            }
             Event::CData(value) => text.push_str(&value),
             Event::End(_) => {
                 let name = name.as_ref().expect("element event has a resolved name");
@@ -663,7 +738,10 @@ pub fn extract_href_properties_in_namespace(
 /// The first `<href>` inside `property_name`, under the same propstat rule as
 /// [`extract_href_properties`]. Use [`extract_href_property_in_namespace`]
 /// when the property is outside the standard name table.
-pub fn extract_href_property(xml: &str, property_name: &str) -> Result<Option<String>, String> {
+pub fn extract_href_property(
+    xml: &str,
+    property_name: &str,
+) -> Result<Option<String>, MultistatusError> {
     extract_href_property_in_namespace(xml, property_namespace(property_name), property_name)
 }
 
@@ -672,7 +750,7 @@ pub fn extract_href_property_in_namespace(
     xml: &str,
     property_namespace: &str,
     property_name: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, MultistatusError> {
     Ok(
         extract_href_properties_in_namespace(xml, property_namespace, property_name)?
             .into_iter()
@@ -691,7 +769,10 @@ pub fn extract_href_property_in_namespace(
 /// This source-compatible helper infers namespaces for the standard properties
 /// known to the DAV clients. Use [`parse_collection_property_in_namespace`]
 /// for an extension property or any name outside that set.
-pub fn parse_collection_property(xml: &str, property_name: &str) -> Result<Option<String>, String> {
+pub fn parse_collection_property(
+    xml: &str,
+    property_name: &str,
+) -> Result<Option<String>, MultistatusError> {
     parse_collection_property_in_namespace(xml, property_namespace(property_name), property_name)
 }
 
@@ -700,7 +781,7 @@ pub fn parse_collection_property_in_namespace(
     xml: &str,
     property_namespace: &str,
     property_name: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, MultistatusError> {
     let mut reader = NsReader::from_str(xml);
     let mut stack: Vec<XmlName> = Vec::new();
     let mut text = String::new();
@@ -712,7 +793,7 @@ pub fn parse_collection_property_in_namespace(
     loop {
         let (resolved, event) = reader
             .read_resolved_event()
-            .map_err(|error| format!("XML parse error: {error}"))?;
+            .map_err(MultistatusError::Xml)?;
         let name = match &event {
             Event::Start(element) | Event::Empty(element) => {
                 Some(resolved_xml_name(resolved, element.name().as_ref()))
@@ -747,7 +828,9 @@ pub fn parse_collection_property_in_namespace(
                 // text glued to the text that follows it.
                 text.clear();
             }
-            Event::Text(value) => push_text(&mut text, value.as_ref())?,
+            Event::Text(value) => {
+                push_text(&mut text, value.as_ref()).map_err(MultistatusError::Text)?;
+            }
             Event::CData(value) => text.push_str(&value),
             Event::End(_) => {
                 let name = name.as_ref().expect("element event has a resolved name");
@@ -814,14 +897,41 @@ mod tests {
     }
 
     #[test]
+    fn present_empty_response_status_is_an_unreadable_member_refusal() {
+        for status in [
+            "<D:status/>",
+            "<D:status></D:status>",
+            "<D:status> </D:status>",
+        ] {
+            let xml = format!(
+                "<D:multistatus xmlns:D=\"DAV:\"><D:response>\
+                 <D:href>/c/a</D:href>{status}</D:response></D:multistatus>"
+            );
+            let mut sink = MemberSink::default();
+            parse_multistatus(&xml, &mut sink).expect("well-formed XML");
+            assert!(sink.entries.is_empty());
+            assert_eq!(
+                sink.failed_members,
+                vec![FailedResource {
+                    href: "/c/a".into(),
+                    status: None,
+                }]
+            );
+            assert_eq!(
+                classify_207(false, &sink.failed_members),
+                MultiStatusOutcome::Usable
+            );
+        }
+    }
+
+    #[test]
     fn unreadable_refusal_is_failed_in_both_member_lanes() {
         let mut parts = ResponseParts::<MemberProps> {
             href: Some("/c/a".into()),
             ..Default::default()
         };
         parts.begin_propstat();
-        parts.staged_status = Some("HTTP/1.1 garbage".into());
-        parts.staged_success = Some(false);
+        parts.staged_status = Some(MemberStatus::Unreadable);
         parts.commit_propstat();
         assert_eq!(parts.failed_member().unwrap().status, None);
         assert_eq!(parts.failed_resource(), Some(("/c/a", None)));
@@ -1142,7 +1252,9 @@ mod tests {
 
         assert_eq!(
             classify_207(false, std::slice::from_ref(&refused)),
-            MultiStatusOutcome::CompleteFailure { status: Some(403) }
+            MultiStatusOutcome::CompleteFailure {
+                status: reqwest::StatusCode::FORBIDDEN
+            }
         );
         // A resource deleted between the listing and the fetch is the benign
         // per-resource case, however many of them there are.
@@ -1189,7 +1301,9 @@ mod tests {
         // classified Usable and the caller minted an empty snapshot.
         assert_eq!(
             classify_207(false, &sink.failed_members),
-            MultiStatusOutcome::CompleteFailure { status: Some(403) }
+            MultiStatusOutcome::CompleteFailure {
+                status: reqwest::StatusCode::FORBIDDEN
+            }
         );
         // The multiget lane reads the same ladder from the same codes.
         assert_eq!(

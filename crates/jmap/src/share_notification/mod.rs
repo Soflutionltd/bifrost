@@ -9,7 +9,6 @@ pub(crate) mod query;
 pub(crate) mod set;
 
 use std::collections::HashMap;
-use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
@@ -97,42 +96,19 @@ impl ChangedBy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "created")]
-    Created,
-    #[serde(rename = "changedBy")]
-    ChangedBy,
-    #[serde(rename = "objectType")]
-    ObjectType,
-    #[serde(rename = "objectAccountId")]
-    ObjectAccountId,
-    #[serde(rename = "objectId")]
-    ObjectId,
-    #[serde(rename = "oldRights")]
-    OldRights,
-    #[serde(rename = "newRights")]
-    NewRights,
-    #[serde(rename = "name")]
-    Name,
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::Created => write!(f, "created"),
-            Property::ChangedBy => write!(f, "changedBy"),
-            Property::ObjectType => write!(f, "objectType"),
-            Property::ObjectAccountId => write!(f, "objectAccountId"),
-            Property::ObjectId => write!(f, "objectId"),
-            Property::OldRights => write!(f, "oldRights"),
-            Property::NewRights => write!(f, "newRights"),
-            Property::Name => write!(f, "name"),
-        }
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        Created => "created",
+        ChangedBy => "changedBy",
+        ObjectType => "objectType",
+        ObjectAccountId => "objectAccountId",
+        ObjectId => "objectId",
+        OldRights => "oldRights",
+        NewRights => "newRights",
+        Name => "name",
     }
 }
 

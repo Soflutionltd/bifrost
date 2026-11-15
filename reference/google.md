@@ -21,9 +21,11 @@ Google Calendar ride alongside it.
 
 Gmail response history IDs are decimal strings decoded once into the internal
 `HistoryId(u64)` type for profiles, messages, history pages and watches.
-Malformed or overflowing IDs fail JSON decoding and map to
-`Protocol(ParseFailed)` with acknowledged response evidence. An absent
-message history ID still yields `ServerVersion::Unavailable`. Change requests
+Malformed or overflowing profile, history-page and watch IDs fail JSON decoding
+and map to `Protocol(ParseFailed)` with acknowledged response evidence. Message
+history IDs are optional version metadata: absent, malformed, overflowing or
+non-string values yield `ServerVersion::Unavailable`, preserving readable mail
+and sibling messages rather than hiding them because one version is unusable. Change requests
 and watch state retain the validated type; cursor payloads retain their
 existing numeric `u64` representation and subscription handles retain strings.
 
@@ -1555,7 +1557,10 @@ already transfer-decoded; Content-Type parameters retain the declared charset.
 Selection respects multipart alternatives and excludes text attachments from
 body candidates. Full hydration marks missing payloads, unavailable text body
 bytes, invalid base64url and selector defects as incomplete; external body bytes
-are not fetched by this mapping.
+are not fetched by this mapping. A text body with no data, an explicit size of zero
+and no attachment id is complete and empty: users should not see a download
+warning for intentionally blank mail. An omitted size is unknown, not zero;
+attachment metadata likewise preserves an absent size as unknown.
 
 `blob_handles_for_message` remains as the
 `Vec<BlobHandle>`-only helper `open_blob`'s tests build against.
@@ -1838,3 +1843,22 @@ uncertainty, as do bulk mutation streams. Reaction reads have no write effects.
 Single-request event/contact/filter creates are outside this multi-step contract,
 including acknowledged creates without a usable id. Other event/contact writes
 are single requests and need no multi-step record.
+
+## Shutdown replay policy and token syntax
+
+Calendar and People updates declare their shutdown replay policy beside their
+update implementation and partial-commit construction. The adapter applies that
+policy without maintaining an operation list. Cancellation loses leg progress,
+so both updates require reconciliation rather than blind replay: users expect a
+completed move or contact field edit to survive interruption. Ordinary failed
+legs retain their partial-commit continuation.
+
+Calendar caller ETags use the shared HTTP entity-tag validator. People source
+ETags are opaque JSON tokens and are preserved verbatim when nonempty; HTTP
+quoting validation would reject supported contact tokens. Empty or non-ETag
+caller versions remain Unsupported on People updates.
+
+Destroy reassertion remains safe on stable Gmail ids even when a permission
+refusal leads to TRASH fallback. An uncertain delete should converge to absence
+for the user. Each reassertion may pay another 50-unit batchDelete refusal before
+the fallback; a reported Downgraded result is not replayed by reassertion.

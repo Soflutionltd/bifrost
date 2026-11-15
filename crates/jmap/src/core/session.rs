@@ -10,6 +10,9 @@ pub(crate) struct Session {
     #[serde(deserialize_with = "deserialize_session_capabilities_map")]
     capabilities: HashMap<String, Capabilities>,
 
+    // Account identity must remain byte-exact across session lookup, push
+    // routing and foreign-account cursors. A typed-key migration must include
+    // those readers rather than introduce a second, string-keyed identity map.
     #[serde(rename = "accounts")]
     accounts: HashMap<String, Account>,
 
@@ -304,6 +307,10 @@ pub(crate) struct QuotaCapabilities {}
 /// Capabilities for `urn:ietf:params:jmap:blob` (RFC 9404).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BlobCapabilities {
+    #[serde(rename = "maxDataSources")]
+    #[serde(default)]
+    max_data_sources: Option<u64>,
+
     #[serde(rename = "maxSizeBlobSet")]
     #[serde(default)]
     max_size_blob_set: Option<u64>,
@@ -805,6 +812,10 @@ impl SieveCapabilities {
 }
 
 impl BlobCapabilities {
+    pub(crate) fn max_data_sources(&self) -> Option<u64> {
+        self.max_data_sources
+    }
+
     pub(crate) fn max_size_blob_set(&self) -> Option<u64> {
         self.max_size_blob_set
     }
@@ -1093,5 +1104,22 @@ mod tests {
                 .capability_config::<crate::core::capability::Core>()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod blob_capability_limits {
+    #[test]
+    fn max_data_sources_is_preserved_by_serde() {
+        let capability: super::BlobCapabilities = serde_json::from_value(serde_json::json!({
+            "maxDataSources": 7,
+            "maxSizeBlobSet": 4096,
+            "supportedDigestAlgorithms": ["sha-256"],
+            "supportedTypeNames": ["Email"]
+        }))
+        .expect("blob capabilities decode");
+        assert_eq!(capability.max_data_sources(), Some(7));
+        let encoded = serde_json::to_value(capability).expect("blob capabilities encode");
+        assert_eq!(encoded["maxDataSources"], 7);
     }
 }

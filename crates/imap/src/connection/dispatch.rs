@@ -705,6 +705,10 @@ impl Consumer for MultiAppendConsumer {
 /// ID response. RFC 2971 Section3.2: the server MUST respond with an ID response.
 #[derive(Default)]
 pub(crate) struct IdConsumer {
+    // ID is an ordered list of arbitrary extension keys and nullable values,
+    // not a fixed identity record. Preserve NIL and order through the command,
+    // response, and account factory boundary; a typed replacement must update
+    // that boundary together rather than adding a second representation here.
     pairs: Option<Vec<(String, Option<String>)>>,
     buffered: Vec<UntaggedResponse>,
 }
@@ -757,11 +761,7 @@ impl Consumer for IdConsumer {
 /// descriptors from the untagged NAMESPACE response.
 #[derive(Default)]
 pub(crate) struct NamespaceConsumer {
-    namespace: Option<(
-        Vec<crate::types::NamespaceDescriptor>,
-        Vec<crate::types::NamespaceDescriptor>,
-        Vec<crate::types::NamespaceDescriptor>,
-    )>,
+    namespace: Option<crate::types::NamespaceResponse>,
     buffered: Vec<UntaggedResponse>,
 }
 
@@ -781,7 +781,11 @@ impl Consumer for NamespaceConsumer {
                 other,
                 shared,
             } if self.namespace.is_none() => {
-                self.namespace = Some((personal, other, shared));
+                self.namespace = Some(crate::types::NamespaceResponse {
+                    personal,
+                    other,
+                    shared,
+                });
             }
             other => self.buffered.push(other),
         }
@@ -800,14 +804,7 @@ impl Consumer for NamespaceConsumer {
             return Finalized::failure(e, self.buffered);
         }
         match self.namespace {
-            Some((personal, other, shared)) => Finalized::success(
-                crate::types::NamespaceResponse {
-                    personal,
-                    other,
-                    shared,
-                },
-                self.buffered,
-            ),
+            Some(namespace) => Finalized::success(namespace, self.buffered),
             None => Finalized::failure(
                 Error::ProtocolMissing(
                     "NAMESPACE OK but no untagged NAMESPACE response (RFC 2342 Section 5)".into(),

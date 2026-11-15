@@ -18,6 +18,11 @@ pub(crate) trait JmapMethod: Serialize + Send {
     type Response: DeserializeOwned + Send;
 
     fn set_account_id(&mut self, _account_id: &AccountId) {}
+
+    /// Capabilities selected by method arguments in addition to `Cap`.
+    fn additional_capabilities(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
 }
 
 /// Generates a JMAP /get method struct that wraps `GetRequest<O>`.
@@ -500,6 +505,31 @@ macro_rules! define_copy_method {
         }
     };
 }
+
+/// A closed property vocabulary: serde and Display share each wire spelling.
+macro_rules! define_property_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $( $variant:ident $(= $value:expr)? => $wire:literal ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $vis enum $name {
+            $( #[serde(rename = $wire)] $variant $(= $value)?, )*
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    $( Self::$variant => f.write_str($wire), )*
+                }
+            }
+        }
+    };
+}
+
+pub(crate) use define_property_enum;
 
 /// Generates a Property enum with `as_str()`, `Display`, `Serialize`,
 /// `Deserialize`, and `From<&str>` impls, plus an `Other(String)` catch-all.

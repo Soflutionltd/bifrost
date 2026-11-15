@@ -253,38 +253,53 @@ impl ImapConnection {
     ///
     /// # Errors
     ///
+    /// Returns [`Error::Timeout`] if admission or execution exceeds `timeout`.
     /// Returns [`Error::Io`] if the `setsockopt` call fails.
     /// Returns [`Error::DriverGone`] if the driver task has exited.
-    pub async fn set_keepalive(&self, keepalive: TcpKeepalive) -> Result<(), Error> {
+    pub async fn set_keepalive(
+        &self,
+        keepalive: TcpKeepalive,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        let deadline = tokio::time::Instant::now() + timeout;
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let dcmd = super::driver::DriverCommand::SetKeepalive {
             keepalive,
             result_tx,
         };
-        if self.cmd_tx.send(dcmd).await.is_err() {
-            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
-        }
-        match result_rx.await {
-            Ok(result) => result,
-            Err(_) => Err(self.observe_driver_panic(TransmissionState::InFlight).await),
-        }
+        // An enterprise user expects stalled account setup to return for retry.
+        // One caller budget covers both queue admission and the reply. No IMAP
+        // bytes are sent, even if this idempotent option is applied later.
+        tokio::time::timeout_at(deadline, async {
+            if self.cmd_tx.send(dcmd).await.is_err() {
+                return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
+            }
+            match result_rx.await {
+                Ok(result) => result,
+                Err(_) => Err(self.observe_driver_panic(TransmissionState::Unsent).await),
+            }
+        })
+        .await
+        .map_err(|_| Error::timeout().with_attempt(TransmissionState::Unsent))?
     }
 
-    /// DER of the peer (server) certificate, or `None` when the transport
-    /// is not TLS, native-tls cannot produce the DER, or the driver has
-    /// exited.
-    ///
-    /// A connection whose driver has died has no live TLS session and thus
-    /// no channel binding  -  the same observable outcome as a plaintext
-    /// connection  -  so the dead-driver path collapses to `None` rather
-    /// than surfacing a driver-gone error.
-    pub(crate) async fn peer_certificate_der(&self) -> Option<Vec<u8>> {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let dcmd = super::driver::DriverCommand::PeerCertificate { result_tx };
-        if self.cmd_tx.send(dcmd).await.is_err() {
-            return None;
-        }
-        result_rx.await.unwrap_or(None)
+    /// DER of the peer certificate, or `None` for a non-TLS transport,
+    /// unavailable DER, or an exited driver. Expiry is an error: treating a
+    /// stalled lookup as an absent certificate could downgrade authentication.
+    pub(crate) async fn peer_certificate_der(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        tokio::time::timeout_at(deadline, async {
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let dcmd = super::driver::DriverCommand::PeerCertificate { result_tx };
+            if self.cmd_tx.send(dcmd).await.is_err() {
+                return None;
+            }
+            result_rx.await.unwrap_or(None)
+        })
+        .await
+        .map_err(|_| Error::timeout().with_attempt(TransmissionState::Unsent))
     }
 
     /// If the driver task has terminated, return an error describing
@@ -298,8 +313,8 @@ impl ImapConnection {
     /// `InFlight` when the driver had claimed the command and the reply
     /// channel dropped (so it may have been written - "possibly
     /// transmitted", the convention `timeout_inflight` uses). Non-wire
-    /// requests (`set_keepalive`) keep the send-based rule: `Unsent` when the
-    /// send failed, `InFlight` once it succeeded. A non-idempotent command
+    /// requests (`set_keepalive`) remain `Unsent`: applying a socket option
+    /// transmits no IMAP command. A non-idempotent command
     /// in the second phase must be read back, not declared failed, so the
     /// phase is stamped on every outcome here - including when another
     /// caller already took the join handle, since the evidence cannot depend

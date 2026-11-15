@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use bifrost_types::{
     AccountError, AccountFuture, AccountStream, Checkpoint, CursorEstablishment, CursorScope,
     DiagnosticText, Fingerprint, InventoryEntry, PageBoundary, ServerVersion, SyncEvent,
-    SyncStrategy, ThreadId, Warning, WarningKind,
+    SyncStrategy, Warning, WarningKind,
 };
 use futures::StreamExt as _;
 
@@ -291,7 +291,8 @@ async fn run_inventory(
     // a cursor-free sync mode for such folders is filed separately.
     let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
     let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
-    let attrs = inventory_attrs(include_modseq);
+    let mut attrs = inventory_attrs(include_modseq);
+    super::hydration::push_native_thread_attrs(&mut attrs, &conn.connection().server_profile());
     let all_uids = UidSet::all();
     let (mut fetch_rx, fetch_fut) = conn.connection().uid_fetch_stream(
         all_uids.as_sequence_set(),
@@ -472,10 +473,10 @@ pub(crate) fn fetch_to_inventory(
             size: fetch.rfc822_size,
             flags_hash,
         },
-        thread_id: fetch
-            .thread_id
-            .or_else(|| fetch.gmail_thread_id.map(|id| id.to_string()))
-            .map(ThreadId),
+        thread_id: super::envelope::encode_server_thread_id(
+            fetch.thread_id.as_deref(),
+            fetch.gmail_thread_id,
+        ),
         message_id: envelope
             .as_ref()
             .and_then(|env| env.bare_message_id().map(str::to_owned)),
@@ -892,7 +893,10 @@ mod tests {
             ..Default::default()
         };
         let entry = fetch_to_inventory(&folder(), 9, both, None).unwrap();
-        assert_eq!(entry.thread_id, Some(ThreadId("T-objectid".to_owned())));
+        assert_eq!(
+            entry.thread_id,
+            crate::account::envelope::encode_server_thread_id(Some("T-objectid"), None)
+        );
 
         let gmail_only = FetchResponse {
             flags: Some(Vec::new()),
@@ -901,7 +905,10 @@ mod tests {
             ..Default::default()
         };
         let entry = fetch_to_inventory(&folder(), 9, gmail_only, None).unwrap();
-        assert_eq!(entry.thread_id, Some(ThreadId("1234".to_owned())));
+        assert_eq!(
+            entry.thread_id,
+            crate::account::envelope::encode_server_thread_id(None, Some(1234))
+        );
     }
 
     #[test]

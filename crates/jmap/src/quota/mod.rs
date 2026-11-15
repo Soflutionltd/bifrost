@@ -5,8 +5,6 @@
 pub(crate) mod get;
 pub(crate) mod query;
 
-use std::fmt::Display;
-
 use serde::{Deserialize, Serialize};
 
 use crate::core::field::Field;
@@ -65,45 +63,20 @@ pub(crate) struct Quota {
     pub(super) description: Field<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "resourceType")]
-    ResourceType,
-    #[serde(rename = "used")]
-    Used,
-    #[serde(rename = "hardLimit")]
-    HardLimit,
-    #[serde(rename = "scope")]
-    Scope,
-    #[serde(rename = "name")]
-    Name,
-    #[serde(rename = "types")]
-    Types,
-    #[serde(rename = "warnLimit")]
-    WarnLimit,
-    #[serde(rename = "softLimit")]
-    SoftLimit,
-    #[serde(rename = "description")]
-    Description,
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::ResourceType => write!(f, "resourceType"),
-            Property::Used => write!(f, "used"),
-            Property::HardLimit => write!(f, "hardLimit"),
-            Property::Scope => write!(f, "scope"),
-            Property::Name => write!(f, "name"),
-            Property::Types => write!(f, "types"),
-            Property::WarnLimit => write!(f, "warnLimit"),
-            Property::SoftLimit => write!(f, "softLimit"),
-            Property::Description => write!(f, "description"),
-        }
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        ResourceType => "resourceType",
+        Used => "used",
+        HardLimit => "hardLimit",
+        Scope => "scope",
+        Name => "name",
+        Types => "types",
+        WarnLimit => "warnLimit",
+        SoftLimit => "softLimit",
+        Description => "description",
     }
 }
 

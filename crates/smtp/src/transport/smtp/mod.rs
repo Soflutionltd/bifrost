@@ -323,9 +323,7 @@ struct SmtpInfo {
     /// TLS security configuration
     tls: Tls,
     /// Optional enforced authentication mechanism
-    authentication: Vec<Mechanism>,
-    /// Whether the authentication mechanism list was explicitly configured.
-    authentication_configured: bool,
+    authentication: MechanismChoice,
     /// Credentials
     credentials: Option<Credentials>,
     /// Allow AUTH over an unencrypted connection.
@@ -355,8 +353,7 @@ impl Default for SmtpInfo {
             hello_name: ClientId::default(),
             credentials: None,
             allow_insecure_auth: false,
-            authentication: DEFAULT_MECHANISMS.into(),
-            authentication_configured: false,
+            authentication: MechanismChoice::Default,
             timeout: Some(DEFAULT_TIMEOUT),
             tls: Tls::None,
             metering: WireMetering::disabled(),
@@ -364,6 +361,12 @@ impl Default for SmtpInfo {
             connector: None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum MechanismChoice {
+    Default,
+    Explicit(Vec<Mechanism>),
 }
 
 impl SmtpInfo {
@@ -378,19 +381,21 @@ impl SmtpInfo {
     }
 
     fn set_credentials(&mut self, credentials: Credentials) {
-        if !self.authentication_configured {
-            self.authentication = credentials.preferred_mechanisms().into();
-        }
         self.credentials = Some(credentials);
     }
 
     fn set_authentication(&mut self, mechanisms: Vec<Mechanism>) {
-        self.authentication = mechanisms;
-        self.authentication_configured = true;
+        self.authentication = MechanismChoice::Explicit(mechanisms);
     }
 
-    fn uses_tls(&self) -> bool {
-        !matches!(self.tls, Tls::None)
+    fn authentication(&self) -> &[Mechanism] {
+        match &self.authentication {
+            MechanismChoice::Default => self
+                .credentials
+                .as_ref()
+                .map_or(DEFAULT_MECHANISMS, Credentials::preferred_mechanisms),
+            MechanismChoice::Explicit(mechanisms) => mechanisms,
+        }
     }
 
     fn ensure_can_authenticate(&self, encrypted: bool) -> Result<(), Error> {
@@ -406,5 +411,53 @@ impl SmtpInfo {
                 "refusing to authenticate over an unencrypted {protocol} connection"
             )))
         }
+    }
+}
+
+// Dial policy belongs to SMTP, while the blocking and Tokio adapters own I/O.
+// Resolve before dialing so an invalid local TLS/socket combination never opens
+// a connection. Keep the platform refusal ahead of the TLS refusal on non-Unix.
+pub(crate) struct DialPlan<'a> {
+    pub(crate) implicit_tls: Option<&'a TlsParameters>,
+    starttls: Option<(&'a TlsParameters, bool)>,
+}
+
+impl<'a> DialPlan<'a> {
+    pub(crate) fn new(tls: &'a Tls, unix_socket: Option<&std::path::Path>) -> Result<Self, Error> {
+        if unix_socket.is_some() {
+            if !cfg!(unix) {
+                return Err(error::invalid_input(
+                    "Unix-domain LMTP sockets are only supported on Unix platforms",
+                ));
+            }
+            if !matches!(tls, Tls::None) {
+                return Err(error::invalid_input(
+                    "TLS is not supported over Unix-domain LMTP sockets",
+                ));
+            }
+        }
+        Ok(match tls {
+            Tls::None => Self {
+                implicit_tls: None,
+                starttls: None,
+            },
+            Tls::Wrapper(parameters) => Self {
+                implicit_tls: Some(parameters),
+                starttls: None,
+            },
+            Tls::Required(parameters) => Self {
+                implicit_tls: None,
+                starttls: Some((parameters, true)),
+            },
+            Tls::Opportunistic(parameters) => Self {
+                implicit_tls: None,
+                starttls: Some((parameters, false)),
+            },
+        })
+    }
+
+    pub(crate) fn starttls(&self, advertised: bool) -> Option<&'a TlsParameters> {
+        self.starttls
+            .and_then(|(parameters, required)| (required || advertised).then_some(parameters))
     }
 }

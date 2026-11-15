@@ -6,8 +6,6 @@
 pub(crate) mod get;
 pub(crate) mod set;
 
-use std::fmt::Display;
-
 use crate::core::set::skip_if_empty_list;
 use crate::email::EmailAddress;
 use serde::{Deserialize, Serialize};
@@ -119,39 +117,18 @@ impl Default for IdentityPatch {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "name")]
-    Name,
-    #[serde(rename = "email")]
-    Email,
-    #[serde(rename = "replyTo")]
-    ReplyTo,
-    #[serde(rename = "bcc")]
-    Bcc,
-    #[serde(rename = "textSignature")]
-    TextSignature,
-    #[serde(rename = "htmlSignature")]
-    HtmlSignature,
-    #[serde(rename = "mayDelete")]
-    MayDelete,
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::Name => write!(f, "name"),
-            Property::Email => write!(f, "email"),
-            Property::ReplyTo => write!(f, "replyTo"),
-            Property::Bcc => write!(f, "bcc"),
-            Property::TextSignature => write!(f, "textSignature"),
-            Property::HtmlSignature => write!(f, "htmlSignature"),
-            Property::MayDelete => write!(f, "mayDelete"),
-        }
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        Name => "name",
+        Email => "email",
+        ReplyTo => "replyTo",
+        Bcc => "bcc",
+        TextSignature => "textSignature",
+        HtmlSignature => "htmlSignature",
+        MayDelete => "mayDelete",
     }
 }
 

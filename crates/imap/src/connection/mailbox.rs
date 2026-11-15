@@ -110,19 +110,8 @@ impl ImapConnection {
                 .map(|option| (*option).to_owned())
                 .collect(),
         };
-        // RFC 5258 Section 3: with SUBSCRIBED, the server may return
-        // subscribed-but-deleted mailboxes with \NonExistent and
-        // subscribed-but-inaccessible ones with \NoAccess. In that
-        // context these are legitimate solicited attributes, not NOTIFY
-        // markers.
-        let filter_extended = !selection_options
-            .iter()
-            .any(|o| o.eq_ignore_ascii_case("SUBSCRIBED"));
-
-        let consumer = ListExtendedConsumer::new(
-            filter_extended,
-            selection_options.iter().map(|o| (*o).to_owned()).collect(),
-        );
+        let consumer =
+            ListExtendedConsumer::new(selection_options.iter().map(|o| (*o).to_owned()).collect());
         self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
             .await
     }
@@ -139,7 +128,7 @@ impl ImapConnection {
         pattern: &(impl crate::types::MailboxInput + ?Sized),
         status_items: &str,
         timeout: Duration,
-    ) -> Result<Vec<(MailboxInfo, Vec<StatusItem>)>, Error> {
+    ) -> Result<Vec<crate::types::ListStatusEntry>, Error> {
         use super::dispatch::ListStatusConsumer;
 
         self.check_utf8_only_enforced()?;
@@ -195,14 +184,8 @@ impl ImapConnection {
         options: &SelectOptions,
         timeout: Duration,
     ) -> Result<SelectedMailbox, Error> {
-        self.select_or_examine(
-            mailbox,
-            false,
-            options.condstore,
-            options.qresync.clone(),
-            timeout,
-        )
-        .await
+        self.select_or_examine(mailbox, false, options, timeout)
+            .await
     }
 
     /// EXAMINE a mailbox (read-only SELECT, RFC 3501 Section 6.3.2).
@@ -231,14 +214,8 @@ impl ImapConnection {
         options: &SelectOptions,
         timeout: Duration,
     ) -> Result<SelectedMailbox, Error> {
-        self.select_or_examine(
-            mailbox,
-            true,
-            options.condstore,
-            options.qresync.clone(),
-            timeout,
-        )
-        .await
+        self.select_or_examine(mailbox, true, options, timeout)
+            .await
     }
 
     /// Shared implementation for SELECT and EXAMINE commands
@@ -257,8 +234,7 @@ impl ImapConnection {
         &self,
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         is_examine: bool,
-        condstore: bool,
-        qresync: Option<QresyncParams>,
+        options: &SelectOptions,
         timeout: Duration,
     ) -> Result<SelectedMailbox, Error> {
         use super::dispatch::SelectConsumer;
@@ -266,24 +242,24 @@ impl ImapConnection {
         self.check_utf8_only_enforced()?;
         // SELECT and EXAMINE share one row of the table.
         self.require_state(crate::types::CommandKind::Select)?;
-        if condstore {
+        if options.condstore {
             self.require_condstore()?;
         }
-        if let Some(ref params) = qresync {
+        if let Some(ref params) = options.qresync {
             self.validate_qresync_params(params)?;
         }
         let wire_mailbox = mailbox.mailbox_name()?;
         let cmd = if is_examine {
             Command::Examine {
                 mailbox: wire_mailbox,
-                condstore,
-                qresync,
+                condstore: options.condstore,
+                qresync: options.qresync.clone(),
             }
         } else {
             Command::Select {
                 mailbox: wire_mailbox,
-                condstore,
-                qresync,
+                condstore: options.condstore,
+                qresync: options.qresync.clone(),
             }
         };
 

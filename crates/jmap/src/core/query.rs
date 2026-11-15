@@ -94,6 +94,9 @@ pub(crate) struct QueryResponse<O: Object> {
     #[serde(rename = "canCalculateChanges")]
     can_calculate_changes: Option<bool>,
 
+    // The wire response is UnsignedInt, unlike the signed request offset.
+    // Widening this must also widen the anchored-page and search-cursor
+    // validators; a narrowing accessor would hide valid large result positions.
     #[serde(rename = "position")]
     position: i32,
 

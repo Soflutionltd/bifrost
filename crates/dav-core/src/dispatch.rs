@@ -1090,15 +1090,14 @@ impl DavDispatch {
     pub async fn propfind_raw(
         &self,
         url: &str,
-        depth: &str,
+        depth: crate::Depth,
         body: &str,
         operation: AccountOperation,
     ) -> Result<DavBody, AccountError> {
-        let method = Method::from_bytes(b"PROPFIND")
-            .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
+        let method = crate::PROPFIND.clone();
         let request = DavRequest::new(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("Depth", depth)
+            .header("Depth", depth.as_str())
             // A read: replaying after a dropped connection cannot change state.
             .replay(bifrost_net::ReplayPolicy::Idempotent)
             .body(body.to_string());
@@ -1114,15 +1113,14 @@ impl DavDispatch {
     pub async fn report_raw_response(
         &self,
         url: &str,
-        depth: &str,
+        depth: crate::Depth,
         body: &str,
         operation: AccountOperation,
     ) -> Result<DavResponse, AccountError> {
-        let method = Method::from_bytes(b"REPORT")
-            .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
+        let method = crate::REPORT.clone();
         let request = DavRequest::new(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("Depth", depth)
+            .header("Depth", depth.as_str())
             .replay(bifrost_net::ReplayPolicy::Idempotent)
             .body(body.to_string());
         self.send_raw_request(request, operation).await
@@ -1131,7 +1129,7 @@ impl DavDispatch {
     pub async fn report_raw(
         &self,
         url: &str,
-        depth: &str,
+        depth: crate::Depth,
         body: &str,
         operation: AccountOperation,
     ) -> Result<DavBody, AccountError> {
@@ -1204,8 +1202,7 @@ impl DavDispatch {
                 self.protocol,
             ));
         }
-        let method = Method::from_bytes(b"MOVE")
-            .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
+        let method = crate::MOVE.clone();
         let destination = HeaderValue::from_str(to)
             .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
         let request = DavRequest::new(method, from)
@@ -1991,7 +1988,7 @@ mod tests {
             let error = dispatch
                 .propfind_raw(
                     &format!("{BASE}/start"),
-                    "0",
+                    crate::Depth::Zero,
                     "<propfind/>",
                     AccountOperation::Discover,
                 )
@@ -2034,7 +2031,7 @@ mod tests {
         let error = dispatch
             .propfind_raw(
                 &format!("{BASE}/start"),
-                "0",
+                crate::Depth::Zero,
                 "<propfind/>",
                 AccountOperation::Discover,
             )
@@ -2543,11 +2540,11 @@ mod tests {
                 let operation = AccountOperation::Discover;
                 let result = match wrapper {
                     0 => dispatch
-                        .propfind_raw(BASE, "0", "", operation)
+                        .propfind_raw(BASE, crate::Depth::Zero, "", operation)
                         .await
                         .map(|_| ()),
                     1 => dispatch
-                        .report_raw_response(BASE, "1", "", operation)
+                        .report_raw_response(BASE, crate::Depth::One, "", operation)
                         .await
                         .map(|_| ()),
                     2 => dispatch.delete_resource(BASE, operation).await,

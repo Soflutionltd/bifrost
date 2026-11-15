@@ -457,6 +457,8 @@ impl FolderEntry {
             // The decoder tolerates MODSEQ 0 from servers as a sentinel. The
             // cache only informs a later STORE guard, so this value has no
             // useful protection to record and must not fail the sync walk.
+            // Enterprise users should still receive mail when this optional
+            // concurrency hint is unusable; refusing it would halt that sync.
             return Ok(());
         }
         let mut modseqs = self

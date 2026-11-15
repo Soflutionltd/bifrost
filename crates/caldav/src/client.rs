@@ -140,7 +140,12 @@ impl CalDavClient {
     ) -> Result<CalDavDiscovery, AccountError> {
         let response = self
             .dav
-            .propfind_raw(principal, "0", PROPFIND_ACCOUNT, AccountOperation::Discover)
+            .propfind_raw(
+                principal,
+                bifrost_dav_core::Depth::Zero,
+                PROPFIND_ACCOUNT,
+                AccountOperation::Discover,
+            )
             .await?;
         let body = response.text;
         let base = response.url;
@@ -188,7 +193,12 @@ impl CalDavClient {
     ) -> Result<Vec<CalendarCollection>, AccountError> {
         let response = self
             .dav
-            .propfind_raw(home_url, "1", PROPFIND_CALENDARS, operation)
+            .propfind_raw(
+                home_url,
+                bifrost_dav_core::Depth::One,
+                PROPFIND_CALENDARS,
+                operation,
+            )
             .await?;
         let mut collections = parse_calendar_collections(&response.text)
             .map_err(|error| parse_error(operation, format!("calendar list: {error}")))?;
@@ -209,7 +219,12 @@ impl CalDavClient {
     ) -> Result<crate::parse::CalDavEventListing, AccountError> {
         let response = self
             .dav
-            .propfind_raw(calendar_url, "1", PROPFIND_EVENTS, operation)
+            .propfind_raw(
+                calendar_url,
+                bifrost_dav_core::Depth::One,
+                PROPFIND_EVENTS,
+                operation,
+            )
             .await?;
         let mut listing =
             parse_propfind_events(&response.text).map_err(|error| parse_error(operation, error))?;
@@ -261,7 +276,12 @@ impl CalDavClient {
     ) -> Result<Option<String>, AccountError> {
         let response = self
             .dav
-            .propfind_raw(calendar_url, "0", PROPFIND_SYNC_TOKEN, operation)
+            .propfind_raw(
+                calendar_url,
+                bifrost_dav_core::Depth::Zero,
+                PROPFIND_SYNC_TOKEN,
+                operation,
+            )
             .await?;
         crate::parse::parse_collection_sync_token(&response.text)
             .map_err(|error| parse_error(operation, format!("collection sync token: {error}")))
@@ -354,7 +374,7 @@ impl CalDavClient {
     ) -> HrefLeg {
         let response = match self
             .dav
-            .report_raw_response(calendar_url, "1", body, operation)
+            .report_raw_response(calendar_url, bifrost_dav_core::Depth::One, body, operation)
             .await
         {
             Ok(response) => response,
@@ -429,7 +449,7 @@ impl CalDavClient {
             .map(|body| {
                 self.run_leg(MultigetLeg {
                     url: calendar_url,
-                    depth: "0",
+                    depth: bifrost_dav_core::Depth::Zero,
                     body,
                     operation,
                     context: "multiget",
@@ -517,7 +537,12 @@ impl CalDavClient {
         let operation = AccountOperation::SyncChanges;
         let response = self
             .dav
-            .report_raw_response(calendar_url, "0", &body, operation)
+            .report_raw_response(
+                calendar_url,
+                bifrost_dav_core::Depth::Zero,
+                &body,
+                operation,
+            )
             .await?;
         let status = response.status;
         let effective_url = response.url;
@@ -815,7 +840,7 @@ fn cursor_invalid_error(calendar_url: &str, status: StatusCode, body: String) ->
 /// One REPORT leg of a multi-leg fetch, as handed to `accumulate_leg`.
 struct MultigetLeg<'a> {
     url: &'a str,
-    depth: &'a str,
+    depth: bifrost_dav_core::Depth,
     body: &'a str,
     operation: AccountOperation,
     /// Names the leg in a parse-failure message ("multiget", "query").
@@ -899,9 +924,9 @@ fn complete_failure_error(
     match outcome {
         MultigetOutcome::Usable => None,
         MultigetOutcome::CompleteFailure { status } => {
-            let code = status
-                .and_then(|code| StatusCode::from_u16(code).ok())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            // Only readable refusals can fail a complete response. Preserve
+            // their actual status rather than inventing a server failure.
+            let code = status;
             Some(status_error(
                 &reqwest::header::HeaderMap::new(),
                 operation,

@@ -489,9 +489,9 @@ impl InventoryFusion {
 
     /// Release both halves of a publication nothing can ever acknowledge.
     ///
-    /// Through `control` when there is one, because that also releases the
-    /// boundary registration - the two halves are one publication and must not
-    /// be retired separately.
+    /// Through `control` when there is one, because it also republishes
+    /// generation-specific quiescence. Both retirement doors release the
+    /// boundary registration and preserve debt together.
     fn retire_claim(&self, publication: Option<crate::cursor::PublicationId>) {
         let Some(id) = publication else {
             return;

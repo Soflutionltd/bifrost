@@ -6,8 +6,6 @@
 pub(crate) mod get;
 pub(crate) mod set;
 
-use std::fmt::Display;
-
 use crate::core::field::Field;
 use crate::core::set::skip_if_empty_str;
 use crate::core::set::skip_if_zero_date;
@@ -108,36 +106,17 @@ pub(crate) struct VacationResponsePatch {
     pub(super) html_body: Field<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "isEnabled")]
-    IsEnabled,
-    #[serde(rename = "fromDate")]
-    FromDate,
-    #[serde(rename = "toDate")]
-    ToDate,
-    #[serde(rename = "subject")]
-    Subject,
-    #[serde(rename = "textBody")]
-    TextBody,
-    #[serde(rename = "htmlBody")]
-    HtmlBody,
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::IsEnabled => write!(f, "isEnabled"),
-            Property::FromDate => write!(f, "fromDate"),
-            Property::ToDate => write!(f, "toDate"),
-            Property::Subject => write!(f, "subject"),
-            Property::TextBody => write!(f, "textBody"),
-            Property::HtmlBody => write!(f, "htmlBody"),
-        }
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        IsEnabled => "isEnabled",
+        FromDate => "fromDate",
+        ToDate => "toDate",
+        Subject => "subject",
+        TextBody => "textBody",
+        HtmlBody => "htmlBody",
     }
 }
 

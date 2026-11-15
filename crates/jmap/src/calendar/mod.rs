@@ -1,8 +1,6 @@
 pub(crate) mod get;
 pub(crate) mod set;
 
-use std::fmt::Display;
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -249,57 +247,24 @@ impl CalendarSetArguments {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "name")]
-    Name,
-    #[serde(rename = "description")]
-    Description,
-    #[serde(rename = "color")]
-    Color,
-    #[serde(rename = "sortOrder")]
-    SortOrder,
-    #[serde(rename = "isSubscribed")]
-    IsSubscribed,
-    #[serde(rename = "isVisible")]
-    IsVisible,
-    #[serde(rename = "isDefault")]
-    IsDefault,
-    #[serde(rename = "includeInAvailability")]
-    IncludeInAvailability,
-    #[serde(rename = "defaultAlertsWithTime")]
-    DefaultAlertsWithTime,
-    #[serde(rename = "defaultAlertsWithoutTime")]
-    DefaultAlertsWithoutTime,
-    #[serde(rename = "timeZone")]
-    TimeZone,
-    #[serde(rename = "shareWith")]
-    ShareWith,
-    #[serde(rename = "myRights")]
-    MyRights,
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::Name => write!(f, "name"),
-            Property::Description => write!(f, "description"),
-            Property::Color => write!(f, "color"),
-            Property::SortOrder => write!(f, "sortOrder"),
-            Property::IsSubscribed => write!(f, "isSubscribed"),
-            Property::IsVisible => write!(f, "isVisible"),
-            Property::IsDefault => write!(f, "isDefault"),
-            Property::IncludeInAvailability => write!(f, "includeInAvailability"),
-            Property::DefaultAlertsWithTime => write!(f, "defaultAlertsWithTime"),
-            Property::DefaultAlertsWithoutTime => write!(f, "defaultAlertsWithoutTime"),
-            Property::TimeZone => write!(f, "timeZone"),
-            Property::ShareWith => write!(f, "shareWith"),
-            Property::MyRights => write!(f, "myRights"),
-        }
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        Name => "name",
+        Description => "description",
+        Color => "color",
+        SortOrder => "sortOrder",
+        IsSubscribed => "isSubscribed",
+        IsVisible => "isVisible",
+        IsDefault => "isDefault",
+        IncludeInAvailability => "includeInAvailability",
+        DefaultAlertsWithTime => "defaultAlertsWithTime",
+        DefaultAlertsWithoutTime => "defaultAlertsWithoutTime",
+        TimeZone => "timeZone",
+        ShareWith => "shareWith",
+        MyRights => "myRights",
     }
 }
 

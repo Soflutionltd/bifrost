@@ -19,6 +19,8 @@ pub const UNLIMITED_BANDWIDTH: u64 = u64::MAX;
 // repeats waiter orchestration, not grant pricing or installation policy;
 // blocking_admission_readmits_after_an_unobserved_unlimited_epoch pins it.
 // MeteredStream implements Tokio I/O only and cannot replace this wait path.
+// Moving this orchestration requires a blocking admission API on BandwidthBudget
+// in bifrost-net first; deleting the loop here would remove blocking throttling.
 //
 // The Tokio half explicitly admits each read-buffer fill and write before the
 // connection arms its peer timer. Cumulative reply peer time excludes admission,

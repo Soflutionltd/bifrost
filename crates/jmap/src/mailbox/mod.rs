@@ -13,7 +13,6 @@ use crate::mailbox::set::role_not_set;
 use crate::principal::ACL;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::Display;
 
 mod marker {
     pub(crate) enum Mailbox {}
@@ -256,33 +255,23 @@ pub(crate) struct MailboxRights {
     pub(super) may_submit: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "name")]
-    Name,
-    #[serde(rename = "parentId")]
-    ParentId,
-    #[serde(rename = "role")]
-    Role,
-    #[serde(rename = "sortOrder")]
-    SortOrder,
-    #[serde(rename = "totalEmails")]
-    TotalEmails,
-    #[serde(rename = "unreadEmails")]
-    UnreadEmails,
-    #[serde(rename = "totalThreads")]
-    TotalThreads,
-    #[serde(rename = "unreadThreads")]
-    UnreadThreads,
-    #[serde(rename = "myRights")]
-    MyRights,
-    #[serde(rename = "isSubscribed")]
-    IsSubscribed,
-    #[serde(rename = "shareWith")]
-    ShareWith,
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        Name => "name",
+        ParentId => "parentId",
+        Role => "role",
+        SortOrder => "sortOrder",
+        TotalEmails => "totalEmails",
+        UnreadEmails => "unreadEmails",
+        TotalThreads => "totalThreads",
+        UnreadThreads => "unreadThreads",
+        MyRights => "myRights",
+        IsSubscribed => "isSubscribed",
+        ShareWith => "shareWith",
+    }
 }
 
 impl Property {
@@ -294,25 +283,6 @@ impl Property {
                 | Property::TotalThreads
                 | Property::UnreadThreads
         )
-    }
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::Name => write!(f, "name"),
-            Property::ParentId => write!(f, "parentId"),
-            Property::Role => write!(f, "role"),
-            Property::SortOrder => write!(f, "sortOrder"),
-            Property::TotalEmails => write!(f, "totalEmails"),
-            Property::UnreadEmails => write!(f, "unreadEmails"),
-            Property::TotalThreads => write!(f, "totalThreads"),
-            Property::UnreadThreads => write!(f, "unreadThreads"),
-            Property::MyRights => write!(f, "myRights"),
-            Property::IsSubscribed => write!(f, "isSubscribed"),
-            Property::ShareWith => write!(f, "shareWith"),
-        }
     }
 }
 

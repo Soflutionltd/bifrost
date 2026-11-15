@@ -170,12 +170,8 @@ impl ImapConnection {
     pub(super) fn quota_resource_name(cap: &Capability) -> Option<&str> {
         match cap {
             Capability::QuotaResource(name) => Some(name.as_str()),
-            Capability::Other(s)
-                if s.len() > "QUOTA=RES-".len()
-                    && s[.."QUOTA=RES-".len()].eq_ignore_ascii_case("QUOTA=RES-") =>
-            {
-                Some(&s["QUOTA=RES-".len()..])
-            }
+            // The capability parser owns recognition of QUOTA=RES-. An Other
+            // value is not a second spelling of a recognized resource.
             _ => None,
         }
     }

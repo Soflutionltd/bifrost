@@ -765,6 +765,13 @@ pub struct ThreadNode {
     pub children: Vec<Self>,
 }
 
+/// A solicited LIST entry and its correlated STATUS items (RFC 5819).
+#[derive(Debug, Clone)]
+pub(crate) struct ListStatusEntry {
+    pub(crate) mailbox: MailboxInfo,
+    pub(crate) status: Vec<StatusItem>,
+}
+
 #[cfg(test)]
 #[path = "response_tests.rs"]
 mod tests;

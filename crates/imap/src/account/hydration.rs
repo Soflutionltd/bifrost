@@ -61,6 +61,26 @@ impl FetchSelection {
     }
 }
 
+/// Append the server-native thread keys the connection can serve: RFC 8474
+/// THREADID under OBJECTID, and X-GM-THRID under X-GM-EXT-1. Inventory and PIM
+/// hydration mint redeemable thread handles from these fields, and a server
+/// sends neither unrequested, so without this every handle would fall back to
+/// a UID snapshot. An enterprise user expects a conversation shown in the UI
+/// to be actionable as a whole, including replies that arrive later. Gated on
+/// capability because the FETCH validator refuses either item otherwise.
+pub(super) fn push_native_thread_attrs(
+    attrs: &mut Vec<FetchAttr>,
+    profile: &crate::types::ServerProfile,
+) {
+    use crate::types::Capability;
+    if profile.supports(Capability::ObjectId) {
+        attrs.push(FetchAttr::ThreadId);
+    }
+    if profile.supports(Capability::XGmExt1) {
+        attrs.push(FetchAttr::GmailThreadId);
+    }
+}
+
 /// Decode the bytes selected from the shared FETCH surface. Both account
 /// hydration APIs start here; one returns these bytes and the other parses
 /// them through `bifrost_types::mime`.

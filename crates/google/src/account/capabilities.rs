@@ -48,6 +48,9 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             replay_safety: MutationReplaySafety::None,
             reassertion: bifrost_types::MutationReassertion {
                 set_flags: true,
+                // Outlook users expect an uncertain delete to converge to
+                // absence. Retrying may spend another batchDelete refusal
+                // before TRASH fallback; Downgraded outcomes are not replayed.
                 destroy: true,
             },
         },

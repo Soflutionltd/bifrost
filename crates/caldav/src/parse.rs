@@ -1,3 +1,4 @@
+use bifrost_dav_core::MultistatusError;
 use bifrost_dav_core::{
     APPLE_CALENDAR_NAMESPACE, CALDAV_NAMESPACE, DAV_NAMESPACE, MultiStatusSink, PropSet,
     ResponseParts, XmlName, classify_207, commit_if_present, normalize_etag, parse_multistatus,
@@ -410,7 +411,9 @@ impl MultiStatusSink for CalendarCollectionSink {
     }
 }
 
-pub(crate) fn parse_calendar_collections(xml: &str) -> Result<Vec<CalendarCollection>, String> {
+pub(crate) fn parse_calendar_collections(
+    xml: &str,
+) -> Result<Vec<CalendarCollection>, MultistatusError> {
     let mut sink = CalendarCollectionSink::default();
     parse_multistatus(xml, &mut sink)?;
     Ok(sink.collections)
@@ -475,7 +478,7 @@ impl MultiStatusSink for EventListingSink {
     }
 }
 
-pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, String> {
+pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, MultistatusError> {
     let mut sink = EventListingSink::default();
     parse_multistatus(xml, &mut sink)?;
     Ok(sink.listing)
@@ -552,7 +555,7 @@ impl MultiStatusSink for MultigetSink {
 /// `failed_hrefs` and every sibling that did come back is returned, so
 /// the caller can report the casualties through `Page::failed_ids`
 /// while the rest of the pull succeeds.
-pub(crate) fn parse_multiget_report(xml: &str) -> Result<CalDavMultigetReport, String> {
+pub(crate) fn parse_multiget_report(xml: &str) -> Result<CalDavMultigetReport, MultistatusError> {
     let mut sink = MultigetSink::default();
     parse_multistatus(xml, &mut sink)?;
     Ok(sink.report)
@@ -610,7 +613,9 @@ impl MultiStatusSink for SyncReportSink {
     }
 }
 
-pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport, String> {
+pub(crate) fn parse_sync_collection_report(
+    xml: &str,
+) -> Result<CalDavSyncReport, MultistatusError> {
     let mut sink = SyncReportSink::default();
     parse_multistatus(xml, &mut sink)?;
     Ok(CalDavSyncReport {
@@ -623,7 +628,7 @@ pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport
 /// Extract a collection sync token from a depth-0 PROPFIND. The token is
 /// committed only from a successful propstat so a stale value in a refused
 /// property cannot revive an invalid cursor.
-pub(crate) fn parse_collection_sync_token(xml: &str) -> Result<Option<String>, String> {
+pub(crate) fn parse_collection_sync_token(xml: &str) -> Result<Option<String>, MultistatusError> {
     bifrost_dav_core::parse_collection_property_in_namespace(xml, DAV_NAMESPACE, "sync-token")
 }
 
@@ -1252,7 +1257,9 @@ END:VCALENDAR</C:calendar-data></D:prop>
         let report = parse_multiget_report(xml).expect("valid 207");
         assert_eq!(
             report.classify(),
-            MultigetOutcome::CompleteFailure { status: Some(401) }
+            MultigetOutcome::CompleteFailure {
+                status: reqwest::StatusCode::UNAUTHORIZED
+            }
         );
     }
 

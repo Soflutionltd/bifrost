@@ -77,8 +77,11 @@ impl HrefQuery {
 /// name the same resource once per property it matched.
 #[must_use]
 pub fn sorted_candidate_hrefs(mut hrefs: Vec<String>) -> Vec<String> {
+    // Outlook users expect one row per resource, including when REPORT legs
+    // disagree only on URL spelling. Keep a deterministic native spelling.
     hrefs.sort_unstable();
-    hrefs.dedup();
+    hrefs.sort_by_cached_key(|href| crate::dav_href_key(href));
+    hrefs.dedup_by(|left, right| crate::same_dav_url(left, right));
     hrefs
 }
 
@@ -94,6 +97,19 @@ mod tests {
             "refused",
             DavProtocol::CalDav,
         )
+    }
+
+    #[test]
+    fn equivalent_url_spellings_are_one_candidate_in_identity_order() {
+        let hrefs = sorted_candidate_hrefs(vec![
+            "https://dav.test/c/b".into(),
+            "https://dav.test/c/a".into(),
+            "https://DAV.test:443/c/%61".into(),
+        ]);
+        assert_eq!(hrefs.len(), 2);
+        assert!(crate::same_dav_url(&hrefs[0], "https://dav.test/c/a"));
+        assert!(crate::same_dav_url(&hrefs[1], "https://dav.test/c/b"));
+        assert_eq!(hrefs, sorted_candidate_hrefs(hrefs.clone()));
     }
 
     #[test]

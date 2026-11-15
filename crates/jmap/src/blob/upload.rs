@@ -58,10 +58,11 @@ impl<Tr: HttpTransport> Client<Tr> {
                 size: data.len(),
             });
         }
-        let upload_url = expand(state.upload_url(), |param| {
+        // A malformed upload template is refused here, per upload, as the
+        // server's contract violation; the rest of the session stays usable.
+        let upload_url = expand(state.upload_url()?, |param| {
             TemplateValue::Scalar(match param {
-                super::URLParameter::AccountId => account_id.as_str().into(),
-                _ => "".into(),
+                super::UploadParameter::AccountId => account_id.as_str().into(),
             })
         });
 

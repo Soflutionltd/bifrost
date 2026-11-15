@@ -46,9 +46,10 @@ pub(crate) use notify::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetP
 pub(crate) use profile::ServerProfile;
 pub(crate) use response::{
     AclEntry, Capability, CopyResult, EsearchResponse, ExpungeResult, ListRightsResponse,
-    MetadataEntry, MetadataResult, MoveResult, NamespaceDescriptor, NamespaceResponse,
-    QresyncParams, QuotaResource, QuotaRootResponse, Response, ResponseCode, SelectOptions,
-    SeqBound, TaggedResponse, ThreadNode, UidRange, UntaggedResponse, UntaggedStatus,
+    ListStatusEntry, MetadataEntry, MetadataResult, MoveResult,
+    NamespaceResponse, QresyncParams, QuotaResource, QuotaRootResponse, Response, ResponseCode,
+    SelectOptions, SeqBound, TaggedResponse, ThreadNode, UidRange, UntaggedResponse,
+    UntaggedStatus,
 };
 pub(crate) use search::SearchCriteria;
 pub(crate) use secret::SecretString;

@@ -28,6 +28,22 @@ impl URLParser for URLParameter {
     }
 }
 
+// Uploads have no blob or filename yet. Reject download-only parameters
+// while parsing the session instead of silently sending an altered URL.
+#[non_exhaustive]
+pub(crate) enum UploadParameter {
+    AccountId,
+}
+
+impl URLParser for UploadParameter {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "accountId" => Some(Self::AccountId),
+            _ => None,
+        }
+    }
+}
+
 /// A reference to a blob, sufficient to construct a download URL.
 ///
 /// The unit that travels through the API for blob identity. RFC 8620

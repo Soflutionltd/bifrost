@@ -1082,7 +1082,7 @@ where
                 // mechanism to name here.
                 return Err(error.with_phase(SmtpCommandPhase::Auth { mechanism: None }));
             }
-            conn.auth(&self.info.authentication, credentials).await?;
+            conn.auth(self.info.authentication(), credentials).await?;
         }
         Ok(())
     }
@@ -1185,9 +1185,9 @@ mod tests {
             Some(Credentials::Password { ref username, ref password })
                 if username == "username" && password.as_str() == "password"
         ));
-        assert_eq!(builder.info.authentication, PASSWORD_MECHANISMS);
+        assert_eq!(builder.info.authentication(), PASSWORD_MECHANISMS);
         assert_eq!(
-            builder.info.authentication,
+            builder.info.authentication(),
             vec![
                 Mechanism::ScramSha256Plus,
                 Mechanism::ScramSha1Plus,
@@ -1210,9 +1210,9 @@ mod tests {
             Some(Credentials::OAuth2 { ref identity, .. })
                 if identity == "user@example.com"
         ));
-        assert_eq!(builder.info.authentication, OAUTH2_MECHANISMS);
+        assert_eq!(builder.info.authentication(), OAUTH2_MECHANISMS);
         assert_eq!(
-            builder.info.authentication,
+            builder.info.authentication(),
             [Mechanism::OAuthBearer, Mechanism::Xoauth2]
         );
     }
@@ -1224,12 +1224,12 @@ mod tests {
         let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
             .authentication(vec![Mechanism::Xoauth2])
             .oauth2("user@example.com", "token");
-        assert_eq!(builder.info.authentication, [Mechanism::Xoauth2]);
+        assert_eq!(builder.info.authentication(), [Mechanism::Xoauth2]);
 
         let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
             .authentication(vec![Mechanism::Plain])
             .password("username", "password");
-        assert_eq!(builder.info.authentication, [Mechanism::Plain]);
+        assert_eq!(builder.info.authentication(), [Mechanism::Plain]);
     }
 
     /// The insecure-auth escape hatch is a builder flag, and it is the only

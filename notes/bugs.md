@@ -296,50 +296,6 @@ persisted `last_error` or barrier `evidence` panics the account writer.
 ("encoding a variant the codec does not know panics"), and that codec runs
 inside consumer stores. The structural cause is STR-045.
 
-## BUG-020 - `PendingCoverage::retire` drops debt and strands the boundary entry; "retire a publication" has five doors
-
-**Reported by:** sync-lanes (latent foot-gun).
-
-`retire(id)` removes only `claims[id]`: it leaves the `BoundaryEntry` charged
-against the backfill bound and drops the claim's debt without `debt_only` or
-carry-forward. `retire_publication` exists because exactly that ("an earlier
-revision deleted the claim outright") destroyed rescued obligations. The
-runner's `(None, Some(pending), Some(id)) => pending.retire(id)` arm and
-fusion's `retire_claim` fallback both call the unsafe one; both are unreachable
-today (a publication id exists only when `control` is `Some`). `retire` is
-published and documented as the right call for a publication that "reached no
-real subscriber", which is exactly what it gets wrong.
-
-The doors:
-
-| Method | boundary entry | claim | debt carried | wake |
-|---|---|---|---|---|
-| `retire_publication` | removed (incl. subsumed) | removed | yes | yes |
-| `abandon([id])` | removed (incl. subsumed) | removed | yes | yes |
-| `retire` | kept | removed | no | no |
-| `acknowledge_checkpoint(&cp)` | removed by VALUE | kept | n/a | yes |
-| `acknowledge_publication` | removed | kept (consumed later by `claim_*`) | n/a | yes |
-| `supersede(a, b)` | untouched | folded | n/a | no |
-
-`retire_publication` and `abandon` are the same operation twice; `retire`,
-`acknowledge_checkpoint` and `supersede` each update half a publication, and the
-module's comments call two of them foot-guns. `SyncControl` also wraps
-`retire_publication` with `publish_quiescence`, which the ledger-level call does
-not, so a caller holding only the ledger retires without waking boundary
-waiters. Proposal: one `retire(id, why: RetireReason)` transition that always
-handles both halves, debt and wake, with quiescence owned by the same object
-(STR-042); the half-operations go crate-private (owner ruling: published).
-
-## BUG-023 - A `Fixed` backfill plan with zero partitions writes a durable completion without any inventory call
-
-**Reported by:** sync-lanes (lateral).
-
-`ScopeWalkDriver::with_source` starts `completed: true`, so a `Fixed` plan with
-zero partitions (UID or page `total == 0`) settles and writes a completion
-marker without asking the provider anything. That is right only if the
-provider's `max_uid` / `total` is authoritative; a stale or zero hint becomes a
-durable "done".
-
 ## BUG-024 - A server reporting UIDVALIDITY 0 makes every inventoried IMAP object unhydratable
 
 **Reported by:** imap-protocol (latent; "is a zero UIDVALIDITY / MODSEQ / UIDNEXT usable" has no owner).
@@ -725,36 +681,6 @@ scope derives DisableScope(scope)" is a recovery decision, and if `ErrorScope`
 (or the builder) could carry "owned by another principal", `derive` could apply
 it once and the four helpers collapse into a builder call.
 
-## BUG-047 - An IMAP `Message::thread_id` cannot be redeemed by the same account's thread methods
-
-**Reported by:** imap-account (live).
-
-`fetch_to_inventory` (`inventory.rs`) and `fetch_to_message` (`pim.rs`) set
-`thread_id` to the server's raw `THREADID` (RFC 8474) or the decimal X-GM-THRID;
-`search` returns `Page<ThreadId>` minted by `encode_thread_id`
-(`imapthread2:<len>:<folder>:<uidvalidity>:<uid,uid,..>`); `thread_hydrate`,
-`move_thread`, `delete_thread` and every `MutationTarget::Thread` path
-(`decoded_targets`) accept only the `imapthread` form. So `Message::thread_id` and
-`InventoryEntry::thread_id` from this account fail `Request(Malformed)` when
-handed back to its own thread methods. JMAP has one thread namespace. Either the
-two need different types (a grouping key vs a redeemable handle) or IMAP mints one
-redeemable form for both lanes; `bifrost-types` cannot currently express the
-difference, which is why nothing caught it.
-
-## BUG-049 - `describe_cursor` reports an incomplete QRESYNC cursor as cheap QRESYNC, which `run_changes` refuses
-
-**Reported by:** imap-account (live).
-
-`changes::describe_cursor` maps cursor tag plus `qresync_enabled()` to a strategy
-and cost; `run_changes` makes the same mapping again to dispatch; and
-`cursor_from_select` decides it a third time when minting. They agree because
-`describe_cursor_reports_the_strategy_the_run_will_actually_use` holds two in step
-- and that test misses the case where they already disagree: a `QResync {
-known_uids_complete: false }` cursor is described as `Cheap / QResync`, while
-`run_changes` refuses it with `CursorInvalid` before any wire work. Owner: a pure
-`ChangePlan::for_cursor(&FolderCursor, policy)` returning the strategy (and the
-`Refuse(incomplete baseline)` arm) both consume. The bool behind it is STR-076.
-
 ## BUG-050 - IMAP hydration and raw reads issue QRESYNC SELECTs and discard the payload
 
 **Reported by:** imap-account.
@@ -1082,31 +1008,6 @@ webhooks only, and Graph's EWS streaming maps to `InProcess`, so "OrEwsStream"
 in the published name is false. Rename it (renaming is ruled fine). The
 workspace-level form is CON-004.
 
-## BUG-079 - Graph reads back an unrouted public-folder item as deleted
-
-**Reported by:** graph (live).
-
-An `ObjectId` of the public-item shape whose folder is not in `routing_map` (which
-starts empty on each reopen, and discovery may skip a folder) gets three answers:
-`get::get_stream`, through `partition_ews_ids`, sends it down the REST arm, where
-Graph answers 404 and the item is reported `NotFound(Message)` (pinned as
-deliberate by `an_unrouted_public_folder_id_hydrates_through_the_rest_arm_url`);
-`pim::hydrate::public_message_hydrate` and `get::fetch_ews_outcomes` answer
-`stale_local_state_error` (`ConcurrencyConflict`, `Retry(AfterStateRefresh)`) - the
-branch in `fetch_ews_outcomes` unreachable because `partition_ews_ids` already
-diverted every unrouted id to REST; `mutate::submit_batch_with_version` answers
-`Unsupported`, its comment saying that sending such an id to REST produces "false
-claims that the item is gone", which is exactly what `get_stream` does on purpose.
-`get_stream` is the engine's read-back path, so a read-back of an unrouted public
-item reports it deleted (compare BUG-021). "Is this a public folder?" is itself
-answered four ways: presence in `routing_map` (`establish_initial_cursor`,
-`inventory_stream`, `partition_ews_ids`); the decoded cursor kind
-(`changes_stream`); the bare `CursorScope::Folder` variant (`budget_for_scope`,
-`push_subscribe`); `routing_map` or `public_folder_meta` (`is_known_public_folder`).
-Owner: a typed internal scope whose `PublicFolder` variant is produced once from
-discovery state (STR-106), plus one `PublicItemRoute::resolve(id) -> Routed |
-Unrouted` every lane matches on, with one classification for `Unrouted`.
-
 ## BUG-086 - Google stamps Calendar, People and Drive errors as Gmail, and names the wrong OAuth scope for them
 
 **Reported by:** google (live; its headline), net-dav (independently flagged `execute_builder`'s string service with its `_ => ApiSurface::Drive` default, and asked that it take `ApiSurface`).
@@ -1322,14 +1223,6 @@ cache stale, so readers queued behind the single-flight each issue their own
 `labels.list` in turn during an outage. A failure backoff (or sharing the
 failed result with the waiters) would bound it.
 
-## BUG-135 - JMAP container rename and move accept an omitted `updated` answer as success
-
-**Reported by:** wave 1 fixer (jmap-account, lateral).
-
-The container rename / move doors use `unwrap_update_errors()` without checking
-that the requested id appears in `updated`, so a server that answers neither
-`updated` nor `notUpdated` for it reads as success.
-
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 
 **Reported by:** imap-account; reopened by the wave 1 review.
@@ -1342,12 +1235,51 @@ cursor-free sync mode for such folders (re-inventory on each poll, no durable
 UID cursor, no CursorInvalid loop); the inventory site and `reference/imap.md`
 say so.
 
-## BUG-136 - `reference/imap.md` says MODSEQ 0 is rejected; the registry ignores it
+## BUG-141 - JMAP `identity_update` and `vacation_set` accept an omitted `updated` answer as success
 
-**Reported by:** wave 1 fixer (imap-account, lateral).
+**Reported by:** wave 2 fixer (jmap-account, lateral).
 
-`folder_registry::record_modseq` silently skips modseq 0 while the reference
-says it is rejected. One of the two is wrong.
+The same false-success shape container rename and move had: the set response is
+read for errors only, so a server that answers neither `updated` nor
+`notUpdated` for the id reads as success.
+
+## BUG-142 - Completion markers written by an empty backfill plan still skip inventory
+
+**Reported by:** wave 2 fixer (sync, lateral).
+
+A `Fixed` plan with zero partitions now runs one full inventory, but a durable
+completion marker an empty plan wrote before that fix is still honoured, so
+such a scope never inventories until the marker is cleared. No migration exists.
+
+## BUG-144 - DAV snapshot preservation dedups raw hrefs, so equivalent aliases survive
+
+**Reported by:** wave 2 fixer (dav, lateral).
+
+Query ordering, dedup and the watermark now use `DavHrefKey`, but snapshot
+preservation still dedups on the raw href, so both account snapshot builders
+can keep two spellings of one resource and expose duplicate inventory entries.
+
+## BUG-145 - JMAP advertises attachment upload when the session's upload template is unusable
+
+**Reported by:** wave 2 review (lateral).
+
+An unusable `uploadUrl` template now fails each upload with
+`MalformedSessionUrl` instead of failing the session, but
+`pim_methods.attachment_upload` stays `true`, because capabilities are built
+from the protocol surface rather than the derived session state. The flag
+promises a door that refuses on every call. Feeding the session's upload-URL
+state into the capability builder closes it.
+
+## BUG-146 - Graph public contact, calendar, attachment and poll doors still retry a missing route forever
+
+**Reported by:** wave 2 review (lateral).
+
+Message hydration now reports an unrouted public-folder item as
+`NotFound(Message)` once a complete public-folder discovery pass has run
+without restoring its route. The public contact (`contacts/public.rs`), public
+calendar (`calendar_public.rs`), attachment (`blob.rs`) and public-folder poll
+paths still answer the retryable conflict for the same case. Route them
+through `GraphAccount::missing_public_route_error`.
 
 ## BUG-140 - IMAP's search pager does not mark a stale cursor as a page-cursor fault
 
@@ -1357,50 +1289,6 @@ JMAP's stale page cursors are now `Request(Malformed)` with cause
 `InvalidArgument { field: Some("page_cursor") }`, the documented "restart from
 page one" signal. IMAP's search pager uses `Request(Malformed)` without that
 field, so a consumer cannot key on one signal across providers.
-
-## BUG-137 - Graph `classify_no_envelope` makes malformed 5xx subresponses terminal
-
-**Reported by:** wave 1 fixer (graph, lateral).
-
-`graph_error.rs::classify_no_envelope` documents status-based recovery for 5xx,
-but a nonempty non-envelope body becomes `ContractViolation`, so a malformed 5xx
-`$batch` subresponse may be terminal instead of retryable.
-
-## BUG-138 - JMAP blob capability and upload template gaps
-
-**Reported by:** wave 1 fixer (jmap-protocol, lateral).
-
-`core/session.rs::BlobCapabilities` does not model RFC 9404 `maxDataSources`,
-and `blob/upload.rs` accepts download-only URI template parameters and expands
-them to empty strings.
-
-## BUG-139 - IMAP `set_keepalive` and `peer_certificate_der` submit without a bound
-
-**Reported by:** wave 1 fixer (imap-connection, lateral).
-
-After the pipeline gained a deadline, these two non-wire requests are the last
-`cmd_tx.send(..).await` calls with no deadline of their own; their callers wrap
-them in `in_flight()` or `timeout_at`, so this is the residue of the "no
-infinite waits" promise rather than a live hang.
-
-## BUG-112 - Two DAV hrefs naming one resource both land on a page
-
-**Reported by:** net-dav (live).
-
-Are two hrefs the same resource, and in what order do they sort? `dav_href_key` /
-`same_dav_url` (decoded path segments, host case, default port) serve the snapshot
-diff, `DirectoryGuard` and relocation checks; `sorted_candidate_hrefs` sorts and
-dedups on raw strings; `slice_after_watermark` compares raw strings with `>`
-against the watermark; `diff_snapshots` uses raw `uri ==` for tie-breaking inside
-one key bucket; `url_origin` is a string origin for the credential gate; net
-`redirect::same_origin` works on `Url`; `DirectoryGuard::contains_url` is a
-hand-rolled ancestor walk; and `DavDispatch::resolve_url` vs `xml::resolve_href`
-join relative hrefs differently (with and without a trailing slash on the base).
-Consequence: two spellings of one resource a query returns survive
-`sorted_candidate_hrefs` and both land on a page; watermark ordering is on raw bytes
-while identity is on the key. Type fix: a parsed `DavHref` with its key and order
-derived once, and an `Origin` newtype in bifrost-net both redirect walkers and the
-DAV gate compare on (STR-146).
 
 ## BUG-116 - The HTTP bandwidth meter cannot be handed to the engine or IMAP
 
@@ -1422,17 +1310,6 @@ registry, meter }` (or `NetResources`) shared by Net, the engine and the IMAP
 factory, and behind it an `AccountRegistration` value owning every per-account
 entry, so detach and retag are one operation each. The string-keyed registries are
 STR-145.
-
-## BUG-123 - JMAP filter deactivation can now fail on an unrelated script change
-
-**Reported by:** resolution wave review (lateral; needs a ruling, not a defect on
-its face).
-
-`filters::update` (`crates/jmap/src/sync/filters.rs`) deactivates an active target
-with a `SieveScript/set` guarded by `ifInState` from the read just before, so any
-unrelated script change in between yields `ConcurrencyConflict`. Correct against
-the deactivate-the-wrong-filter hazard, but a new user-visible failure mode; decide
-whether one automatic re-read-and-retry belongs here.
 
 ## BUG-076 - Four Graph `$batch` reconcilers disagree on invalid subresponses and etag maintenance
 
@@ -1464,26 +1341,4 @@ restart before that ack. Before the ordering fixes the mark was always dropped, 
 the window is new. It needs a reattach attempt still pending while a scoped
 recovery runs on the same scope; decide whether that interleaving is reachable and
 whether a non-reattach resume should drop or transfer the mark.
-
-## BUG-132 - One malformed Gmail message history id now fails the whole response decode
-
-**Reported by:** resolution wave review (lateral; needs a ruling).
-
-With the typed `HistoryId` (`crates/google/src/types.rs`), a malformed `historyId`
-on one `GmailMessage` fails deserialization of the response it arrives in, where
-the hydration path used to degrade that message's version to
-`ServerVersion::Unavailable`. A uniform `ParseFailed` was the intended outcome, but
-it widens one bad field into a whole inventory or hydration page failure. Decide
-whether `GmailMessage.history_id` should decode leniently (an `Option` that reads
-`None` on a bad value) while profile, history and watch ids stay strict.
-
-## BUG-127 - A genuinely empty Gmail text part now marks the message incomplete
-
-**Reported by:** resolution wave review (lateral; product call).
-
-Gmail hydration (`gmail_mime_part` in `crates/google/src/account/pim.rs`) now goes
-through the shared MIME selector and marks a non-attachment text leaf with no
-`body.data` as `incomplete`. Gmail may omit `data` for an empty body (`size: 0`), so
-an empty but complete message reports `incomplete = true`. Decide whether
-`body.size == Some(0)` is treated as present-and-empty.
 

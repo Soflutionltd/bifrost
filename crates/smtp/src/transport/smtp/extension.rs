@@ -505,39 +505,72 @@ pub enum MailParameter {
     },
 }
 
+// One vocabulary drives typed keyword rendering and custom-keyword refusal.
+macro_rules! mail_keywords {
+    ($($variant:ident => $text:literal),+ $(,)?) => {
+        #[derive(Clone, Copy)]
+        pub(crate) enum MailKeyword<'a> { $($variant,)+ Custom(&'a str) }
+        impl<'a> MailKeyword<'a> {
+            pub(crate) fn as_str(self) -> &'a str {
+                match self { $(Self::$variant => $text,)+ Self::Custom(text) => text }
+            }
+            pub(crate) fn is_typed(text: &str) -> bool {
+                false $(|| text.eq_ignore_ascii_case($text))+
+            }
+        }
+    };
+}
+
+mail_keywords! {
+    Body => "BODY", Size => "SIZE", SmtpUtfEight => "SMTPUTF8",
+    RequireTls => "REQUIRETLS", HoldFor => "HOLDFOR", HoldUntil => "HOLDUNTIL",
+    DeliverBy => "BY", MtPriority => "MT-PRIORITY", DsnReturn => "RET",
+    EnvelopeId => "ENVID",
+}
+
 impl Display for MailParameter {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.keyword().as_str())?;
         match self {
-            MailParameter::Body(value) => write!(f, "BODY={value}"),
-            MailParameter::Size(size) => write!(f, "SIZE={size}"),
-            MailParameter::SmtpUtfEight => f.write_str("SMTPUTF8"),
-            MailParameter::RequireTls => f.write_str("REQUIRETLS"),
-            MailParameter::FutureRelease(value) => write!(f, "{value}"),
-            MailParameter::DeliverBy(value) => write!(f, "{value}"),
-            MailParameter::MtPriority(value) => write!(f, "MT-PRIORITY={value}"),
-            MailParameter::DsnReturn(value) => write!(f, "RET={value}"),
-            MailParameter::EnvelopeId(value) => write!(f, "ENVID={}", XText(value)),
-            MailParameter::Other {
-                keyword,
-                value: Some(value),
-            } => write!(f, "{}={}", keyword, XText(value)),
-            MailParameter::Other {
-                keyword,
-                value: None,
-            } => f.write_str(keyword),
-            MailParameter::OtherRaw {
-                keyword,
-                value: Some(value),
-            } => write!(f, "{keyword}={value}"),
-            MailParameter::OtherRaw {
-                keyword,
-                value: None,
-            } => f.write_str(keyword),
+            Self::Body(value) => write!(f, "={value}"),
+            Self::Size(value) => write!(f, "={value}"),
+            Self::SmtpUtfEight | Self::RequireTls => Ok(()),
+            Self::FutureRelease(FutureReleaseParameter::HoldFor(value)) => write!(f, "={value}"),
+            Self::FutureRelease(FutureReleaseParameter::HoldUntil(value)) => write!(f, "={value}"),
+            Self::DeliverBy(value) => value.fmt_value(f),
+            Self::MtPriority(value) => write!(f, "={value}"),
+            Self::DsnReturn(value) => write!(f, "={value}"),
+            Self::EnvelopeId(value) => write!(f, "={}", XText(value)),
+            Self::Other {
+                value: Some(value), ..
+            } => write!(f, "={}", XText(value)),
+            Self::OtherRaw {
+                value: Some(value), ..
+            } => write!(f, "={value}"),
+            Self::Other { value: None, .. } | Self::OtherRaw { value: None, .. } => Ok(()),
         }
     }
 }
 
 impl MailParameter {
+    pub(crate) fn keyword(&self) -> MailKeyword<'_> {
+        match self {
+            Self::Body(_) => MailKeyword::Body,
+            Self::Size(_) => MailKeyword::Size,
+            Self::SmtpUtfEight => MailKeyword::SmtpUtfEight,
+            Self::RequireTls => MailKeyword::RequireTls,
+            Self::FutureRelease(FutureReleaseParameter::HoldFor(_)) => MailKeyword::HoldFor,
+            Self::FutureRelease(FutureReleaseParameter::HoldUntil(_)) => MailKeyword::HoldUntil,
+            Self::DeliverBy(_) => MailKeyword::DeliverBy,
+            Self::MtPriority(_) => MailKeyword::MtPriority,
+            Self::DsnReturn(_) => MailKeyword::DsnReturn,
+            Self::EnvelopeId(_) => MailKeyword::EnvelopeId,
+            Self::Other { keyword, .. } | Self::OtherRaw { keyword, .. } => {
+                MailKeyword::Custom(keyword)
+            }
+        }
+    }
+
     /// Creates a validated `BY` parameter.
     pub fn deliver_by(
         seconds: i64,
@@ -834,9 +867,11 @@ pub enum FutureReleaseParameter {
 impl Display for FutureReleaseParameter {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            FutureReleaseParameter::HoldFor(seconds) => write!(f, "HOLDFOR={seconds}"),
+            FutureReleaseParameter::HoldFor(seconds) => {
+                write!(f, "{}={seconds}", MailKeyword::HoldFor.as_str())
+            }
             FutureReleaseParameter::HoldUntil(datetime) => {
-                write!(f, "HOLDUNTIL={datetime}")
+                write!(f, "{}={datetime}", MailKeyword::HoldUntil.as_str())
             }
         }
     }
@@ -898,7 +933,14 @@ impl DeliverByParameter {
 
 impl Display for DeliverByParameter {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "BY={};{}", self.seconds, self.mode)?;
+        f.write_str(MailKeyword::DeliverBy.as_str())?;
+        self.fmt_value(f)
+    }
+}
+
+impl DeliverByParameter {
+    fn fmt_value(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "={};{}", self.seconds, self.mode)?;
         if self.trace {
             f.write_str(";T")?;
         }
@@ -1008,22 +1050,19 @@ pub enum RcptParameter {
 
 impl Display for RcptParameter {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.keyword())?;
         match &self {
-            RcptParameter::Notify(value) => write!(f, "NOTIFY={value}"),
+            RcptParameter::Notify(value) => write!(f, "={value}"),
             RcptParameter::OriginalRecipient {
                 address_type,
                 address,
             } => {
-                write!(f, "ORCPT={};{}", address_type, XText(address))
+                write!(f, "={};{}", address_type, XText(address))
             }
             RcptParameter::Other {
-                keyword,
-                value: Some(value),
-            } => write!(f, "{keyword}={}", XText(value)),
-            RcptParameter::Other {
-                keyword,
-                value: None,
-            } => f.write_str(keyword),
+                value: Some(value), ..
+            } => write!(f, "={}", XText(value)),
+            RcptParameter::Other { value: None, .. } => Ok(()),
         }
     }
 }

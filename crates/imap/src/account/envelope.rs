@@ -333,6 +333,80 @@ pub(crate) fn decode_object_id(
     })
 }
 
+/// Which server-native grouping key a native thread handle carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeThreadKind {
+    /// RFC 8474 THREADID (OBJECTID).
+    ObjectId,
+    /// Gmail X-GM-THRID (X-GM-EXT-1).
+    Gmail,
+}
+
+/// A decoded account-scoped native thread handle: the key kind and the UID
+/// SEARCH criteria that find its current members in any one folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeThread {
+    pub(crate) kind: NativeThreadKind,
+    pub(crate) criteria: String,
+}
+
+// Ruling (wave 2): a server grouping key names ONE conversation across the
+// whole account, so the handle is account-scoped - kind plus server key, no
+// folder and no UIDVALIDITY. An enterprise Outlook user sees one
+// conversation spanning Inbox, Sent and All Mail, and expects the same
+// thread id on every message of it and a thread action that covers all of
+// it. Members are resolved at redemption time by UID SEARCH in each folder
+// that can hold them, so replies that arrived since hydration are included.
+// Snapshot handles (`imapthread1` / `imapthread2`) remain the fallback when
+// the server exposes neither key.
+pub(crate) fn encode_server_thread_id(
+    objectid: Option<&str>,
+    gmail: Option<u64>,
+) -> Option<ThreadId> {
+    if let Some(id) = objectid {
+        return Some(ThreadId(format!("imapnative2:objectid:{id}")));
+    }
+    Some(ThreadId(format!("imapnative2:gmail:{}", gmail?)))
+}
+
+pub(crate) fn decode_server_thread_id(
+    id: &ThreadId,
+    op: AccountOperation,
+) -> Result<Option<NativeThread>, AccountError> {
+    let Some(rest) = id.0.strip_prefix("imapnative2:") else {
+        return Ok(None);
+    };
+    let (kind, key) = rest.split_once(':').unwrap_or((rest, ""));
+    match kind {
+        // RFC 8474 objectid = 1*255(ALPHA / DIGIT / "_" / "-"); anything else
+        // could inject SEARCH criteria, so it is refused before any I/O.
+        "objectid"
+            if !key.is_empty()
+                && key.len() <= 255
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+        {
+            Ok(Some(NativeThread {
+                kind: NativeThreadKind::ObjectId,
+                criteria: format!("THREADID {key}"),
+            }))
+        }
+        "gmail" => {
+            let value = key
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| malformed("invalid Gmail thread id", op))?;
+            Ok(Some(NativeThread {
+                kind: NativeThreadKind::Gmail,
+                criteria: format!("X-GM-THRID {value}"),
+            }))
+        }
+        _ => Err(malformed("invalid IMAP server thread id", op)),
+    }
+}
+
 pub(crate) fn encode_thread_id(folder: &MailboxName, uidvalidity: u32, uids: &[u32]) -> ThreadId {
     let mut uids = uids.to_vec();
     uids.sort_unstable();
@@ -750,6 +824,41 @@ mod tests {
         assert_eq!(decoded.folder, folder);
         assert_eq!(decoded.uidvalidity, 10);
         assert_eq!(decoded.uid, 42);
+    }
+
+    #[test]
+    fn server_thread_handles_are_account_scoped_and_reject_criteria_injection() {
+        let folder = MailboxName::new("Team: replies").unwrap();
+        let thread = encode_server_thread_id(Some("T-key"), Some(99)).unwrap();
+        assert_eq!(thread.0, "imapnative2:objectid:T-key");
+        let native = decode_server_thread_id(&thread, AccountOperation::HydrateThread)
+            .unwrap()
+            .unwrap();
+        assert_eq!(native.kind, NativeThreadKind::ObjectId);
+        assert_eq!(native.criteria, "THREADID T-key");
+        let gmail = encode_server_thread_id(None, Some(99)).unwrap();
+        let native = decode_server_thread_id(&gmail, AccountOperation::HydrateThread)
+            .unwrap()
+            .unwrap();
+        assert_eq!(native.kind, NativeThreadKind::Gmail);
+        assert_eq!(native.criteria, "X-GM-THRID 99");
+        assert!(encode_server_thread_id(None, None).is_none());
+        for key in ["", "T-key ALL", "T-key\r\nNOOP"] {
+            let thread = encode_server_thread_id(Some(key), None).unwrap();
+            assert!(decode_server_thread_id(&thread, AccountOperation::HydrateThread).is_err());
+        }
+        let snapshot = encode_thread_id(&folder, 7, &[1, 9]);
+        assert!(
+            decode_server_thread_id(&snapshot, AccountOperation::HydrateThread)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            decode_thread_id(&snapshot, AccountOperation::HydrateThread)
+                .unwrap()
+                .uids,
+            [1, 9]
+        );
     }
 
     #[test]

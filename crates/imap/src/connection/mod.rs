@@ -16,10 +16,10 @@ use crate::types::{
     AclEntry, AppendMessage, Capability, Command, CopyResult, EsearchResponse, ExpungeResult,
     FetchAttr, FetchResponse, Flag, ListRightsResponse, MailboxAttribute, MailboxFilter,
     MailboxInfo, MailboxName, MetadataEntry, MetadataResult, MoveResult, NamespaceResponse,
-    NotifyEvent, NotifySetParams, QresyncParams, QuotaResource, QuotaRootResponse, Response,
-    ResponseCode, SelectOptions, SelectedMailbox, SequenceSet, StatusItem, StatusResult,
-    StoreOperation, StoreResult, TaggedResponse, ThreadNode, UidRange, UntaggedResponse,
-    UntaggedStatus, format_fetch_attrs,
+    NotifySetParams, QresyncParams, QuotaResource, QuotaRootResponse, Response, ResponseCode,
+    SelectOptions, SelectedMailbox, SequenceSet, StatusItem, StatusResult, StoreOperation,
+    StoreResult, TaggedResponse, ThreadNode, UidRange, UntaggedResponse, UntaggedStatus,
+    format_fetch_attrs,
 };
 
 pub(crate) const LOGOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -206,7 +206,7 @@ pub(crate) enum IdleEvent {
     /// Extension-defined untagged response not recognized by the parser
     /// (RFC 9051 Section 2.2.2).
     ///
-    /// When `NotifyEvent::Other(...)` is registered, the server may deliver
+    /// When `crate::types::NotifyEvent::Other(...)` is registered, the server may deliver
     /// extension-defined notifications using response types this client does
     /// not implement. The raw response line is preserved so callers can
     /// parse extension data themselves.
@@ -593,23 +593,7 @@ impl Drop for InFlightGuard<'_> {
     }
 }
 
-/// Per-type NOTIFY flags (RFC 5465 Sections 5.1-5.8).
-///
-/// Tracks which response types the current NOTIFY registration can produce
-/// so that IDLE event classification and LIST filtering during LIST-family
-/// commands know which types to expect.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct NotifyFlags {
-    /// `MailboxName` or `SubscriptionChange` events registered
-    /// (RFC 5465 Sections 5.4-5.5  -  delivered as LIST).
-    pub(crate) list: bool,
-    /// `MessageNew`/`MessageExpunge` on non-selected mailboxes or STATUS
-    /// indicator (RFC 5465 Sections 4, 5.1-5.2  -  delivered as STATUS).
-    pub(crate) status: bool,
-    /// `MailboxMetadataChange` or `ServerMetadataChange` events registered
-    /// (RFC 5465 Sections 5.6-5.7  -  delivered as METADATA).
-    pub(crate) metadata: bool,
-}
+pub(crate) use crate::types::notify::NotifyFlags;
 
 // Compile-time proof that ImapConnection is Send  -  required for
 // holding the connection across `.await` points in async tasks.
@@ -1079,6 +1063,8 @@ pub(super) fn is_notify_selection_mismatch(info: &MailboxInfo, selection_options
 /// results (i.e., LIST-EXTENDED with SUBSCRIBED).
 ///
 /// Create events carry no distinguishing marker and are not filtered.
+// SELECT has no SUBSCRIBED selection option, so its callers always filter
+// extended markers. LIST-EXTENDED derives this policy from its own options.
 pub(super) fn is_notify_list_event(info: &MailboxInfo, filter_extended_markers: bool) -> bool {
     // Rename event: OLDNAME extended data item  -  always a NOTIFY marker.
     if info.old_name.is_some() {

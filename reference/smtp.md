@@ -1090,3 +1090,38 @@ SMTP/LMTP submission is one transaction. Post-DATA per-recipient effects are
 already represented by the succeeded, failed and uncertain lanes in batch.rs
 and partial_completion_error. There is no applicable multi-step failure path
 requiring a partial-commit record above those lanes.
+
+## Dial policy and parameter identity
+
+`DialPlan` in the SMTP transport module owns the TLS/socket policy used by both
+blocking connection setup and Tokio's executor: implicit TLS parameters,
+required versus advertised-only STARTTLS, and refusal of TLS on Unix sockets.
+The adapters perform I/O and keep their existing timeout semantics. Invalid
+local combinations remain `InvalidInput` errors.
+
+MAIL parameters have an exhaustive `keyword()` projection to `MailKeyword`.
+One keyword vocabulary supplies rendering and the reserved typed-keyword check;
+duplicate detection reads this projection without rendering a parameter first.
+RCPT rendering uses its existing keyword projection and keeps last-value-wins
+normalization. Direct and batch envelope validation share
+`Envelope::addresses_need_smtputf8` for sender and recipient address inspection.
+
+Reply reads use `ReplyMode::{Positive, AnyStatus, Grouped}` rather than two
+booleans. Grouped reads leave state restoration and surplus detection to the
+reply-group close. Positive mode retains authentication's positive-reply rule;
+transaction completion and DATA admission retain their stricter phase rules.
+
+Authentication stores `MechanismChoice::{Default, Explicit}`. Defaults resolve
+against the current credential kind at use; explicit lists, including an empty
+list, survive credential replacement. Credential storage and live token-source
+resolution live in `authentication/credentials.rs`, re-exported at the existing
+public paths. SMTP challenge decoding lives in `authentication/framing.rs`. Mechanism
+selection and the SCRAM exchange driver remain in `authentication.rs`; the cryptographic computation
+already delegates to bifrost-sasl. The exchange interprets SMTP challenges and
+errors and is not a protocol-independent computation to move into that crate.
+
+The retained message-builder error translation uses `MessageError::Display`
+for both diagnostic copies, keeping all message construction failures in the
+existing malformed-input classification. Blocking bandwidth admission remains
+in the SMTP adapter until bifrost-net supplies a blocking budget API; removing
+that wait loop would remove blocking transport throttling.

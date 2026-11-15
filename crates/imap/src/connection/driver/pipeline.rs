@@ -161,12 +161,7 @@ fn apply_pipeline_pre_effects(
     };
     match routing.commands[idx] {
         Command::NotifySet(ref params) => {
-            let (list, status, metadata) = super::super::extensions::compute_notify_flags(params);
-            state.set_in_notify_set(Some(super::super::NotifyFlags {
-                list,
-                status,
-                metadata,
-            }));
+            state.set_in_notify_set(Some(super::super::NotifyFlags::from(params)));
         }
         Command::NotifyNone => {
             state.set_in_notify_set(Some(super::super::NotifyFlags::default()));

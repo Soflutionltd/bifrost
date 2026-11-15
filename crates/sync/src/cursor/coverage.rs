@@ -1509,25 +1509,7 @@ impl PendingCoverage {
     /// boundary nor carried debt, and the obligation is simply gone. Re-raising
     /// an obligation is idempotent; losing one is not.
     pub fn retire_publication(&self, id: PublicationId) {
-        {
-            let mut ledger = self.guard();
-            if let Some(index) = ledger.boundaries.iter().position(|entry| entry.id == id) {
-                ledger.boundaries.remove(index);
-            } else if let Some(entry) = ledger
-                .boundaries
-                .iter_mut()
-                .find(|entry| entry.subsumed.iter().any(|page| page.id == id))
-            {
-                // Retiring a page a later publication has since superseded. Its
-                // charge lives on the survivor, so the survivor is where it has
-                // to come off; searching only `entry.id` left it charged for
-                // ever, which for a failed store write on a multi-page partition
-                // is a bound that shrinks every time the store hiccups.
-                entry.subsumed.retain(|page| page.id != id);
-            }
-            Self::carry_and_forget(&mut ledger, std::iter::once(id));
-        }
-        self.wake_capacity();
+        self.abandon(std::iter::once(id));
     }
 
     /// The acknowledgement fence this scope's last durable reset installed, or
@@ -2023,9 +2005,14 @@ impl PendingCoverage {
     /// Drop a publication that can never be acknowledged: it reached no real
     /// subscriber, its subscriber lagged out, or the account detached.
     ///
-    /// Without this the registry grows for the life of the attachment.
+    /// Releases the boundary and carries debt, just like `retire_publication`.
+    /// A lost delivery must not erase obligations from an earlier publication.
+    /// Acknowledgement and claim folding remain separate: releasing capacity
+    /// does not prove a checkpoint durable, and folding debt does not settle
+    /// delivery. SyncControl owns generation-specific quiescence notifications;
+    /// ledger-only callers must arrange that notification through their control.
     pub fn retire(&self, id: PublicationId) {
-        self.guard().claims.remove(&id);
+        self.abandon(std::iter::once(id));
     }
 
     #[must_use]
@@ -2909,6 +2896,30 @@ mod tests {
             panic!("an empty claim is still a known publication");
         };
         assert!(claim.reports.is_empty());
+    }
+
+    #[test]
+    fn every_retirement_door_releases_the_boundary_and_preserves_debt() {
+        for door in 0..3 {
+            let pending = PendingCoverage::new();
+            let cp = backfill_checkpoint(b"page:0:10");
+            let id = pending.register(cp, CoverageClaim::new(degraded("owed"), 1));
+            assert_eq!(pending.pending_checkpoints(), 1);
+            match door {
+                0 => pending.retire(id),
+                1 => pending.retire_publication(id),
+                _ => pending.abandon([id]),
+            }
+            assert_eq!(pending.outstanding(), 0);
+            assert_eq!(pending.pending_checkpoints(), 0);
+            let carried = pending.invalidate_scope(&scope());
+            assert!(carried.reports.iter().any(|report| {
+                report
+                    .obligations()
+                    .iter()
+                    .any(|obligation| obligation.key().0.as_slice() == b"owed")
+            }));
+        }
     }
 
     #[test]

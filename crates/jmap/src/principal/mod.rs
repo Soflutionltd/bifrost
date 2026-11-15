@@ -226,37 +226,25 @@ impl PrincipalAccount {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id = 0,
-    #[serde(rename = "type")]
-    Type = 1,
-    #[serde(rename = "name")]
-    Name = 2,
-    #[serde(rename = "description")]
-    Description = 3,
-    #[serde(rename = "email")]
-    Email = 4,
-    #[serde(rename = "timeZone")]
-    Timezone = 5,
-    #[serde(rename = "capabilities")]
-    Capabilities = 6,
-    #[serde(rename = "aliases")]
-    Aliases = 7,
-    #[serde(rename = "secret")]
-    Secret = 8,
-    #[serde(rename = "dkim")]
-    DKIM = 9,
-    #[serde(rename = "quota")]
-    Quota = 10,
-    #[serde(rename = "picture")]
-    Picture = 11,
-    #[serde(rename = "members")]
-    Members = 12,
-    #[serde(rename = "accounts")]
-    Accounts = 13,
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id = 0 => "id",
+        Type = 1 => "type",
+        Name = 2 => "name",
+        Description = 3 => "description",
+        Email = 4 => "email",
+        Timezone = 5 => "timeZone",
+        Capabilities = 6 => "capabilities",
+        Aliases = 7 => "aliases",
+        Secret = 8 => "secret",
+        DKIM = 9 => "dkim",
+        Quota = 10 => "quota",
+        Picture = 11 => "picture",
+        Members = 12 => "members",
+        Accounts = 13 => "accounts",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
@@ -330,27 +318,6 @@ impl DKIM {
 
     pub(crate) fn expiration(&self) -> Option<i64> {
         self.dkim_expiration
-    }
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::Type => write!(f, "type"),
-            Property::Name => write!(f, "name"),
-            Property::Description => write!(f, "description"),
-            Property::Email => write!(f, "email"),
-            Property::Timezone => write!(f, "timeZone"),
-            Property::Capabilities => write!(f, "capabilities"),
-            Property::Aliases => write!(f, "aliases"),
-            Property::Secret => write!(f, "secret"),
-            Property::DKIM => write!(f, "dkim"),
-            Property::Quota => write!(f, "quota"),
-            Property::Picture => write!(f, "picture"),
-            Property::Members => write!(f, "members"),
-            Property::Accounts => write!(f, "accounts"),
-        }
     }
 }
 

@@ -37,7 +37,7 @@ impl ByteTally {
     }
 }
 
-const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
+pub(crate) const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
 // Local data-request policy, equal to inventory's HYDRATE_BATCH_SIZE, not a
 // discovered Gmail ceiling. Gmail's unpublished per-user concurrency limit is
 // shared with other clients, so this cannot guarantee staying below it.

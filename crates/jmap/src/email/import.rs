@@ -3,7 +3,7 @@ use crate::{
     core::{
         id::{AccountId, BlobId},
         request::ResultReference,
-        set::{SetError, from_timestamp},
+        set::SetError,
     },
     mailbox::MailboxId,
 };
@@ -158,8 +158,9 @@ impl EmailImport {
         self
     }
 
-    pub(crate) fn received_at(&mut self, received_at: i64) -> &mut Self {
-        self.received_at = Some(from_timestamp(received_at));
+    // A validated timestamp prevents an invalid send date becoming 1970.
+    pub(crate) fn received_at(&mut self, received_at: jiff::Timestamp) -> &mut Self {
+        self.received_at = Some(received_at);
         self
     }
 

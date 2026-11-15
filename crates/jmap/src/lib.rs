@@ -197,6 +197,45 @@ impl DataType {
     }
 }
 
+impl From<&str> for DataType {
+    fn from(value: &str) -> Self {
+        Self::parse(value)
+    }
+}
+
+impl From<String> for DataType {
+    fn from(value: String) -> Self {
+        Self::parse(&value)
+    }
+}
+
+impl DataType {
+    /// Capability defining a known type, including types whose module is
+    /// feature-gated off. Unknown extension types remain round-trippable;
+    /// their caller must supply the extension capability explicitly.
+    pub(crate) fn capability_uri(&self) -> Option<&'static str> {
+        use crate::core::capability::{self, Capability};
+        match self.to_string().as_str() {
+            "Core" | "PushSubscription" => Some(capability::Core::URI),
+            "Principal" | "ShareNotification" => Some(capability::Principals::URI),
+            "Email" | "EmailDelivery" | "Mailbox" | "Thread" | "SearchSnippet" => {
+                Some(capability::Mail::URI)
+            }
+            "EmailSubmission" | "Identity" => Some(capability::Submission::URI),
+            "VacationResponse" => Some(capability::VacationResponseCap::URI),
+            "SieveScript" => Some(capability::Sieve::URI),
+            "Calendar"
+            | "CalendarEvent"
+            | "CalendarEventNotification"
+            | "ParticipantIdentity"
+            | "CalendarAlert" => Some(capability::Calendars::URI),
+            "AddressBook" | "ContactCard" => Some(capability::Contacts::URI),
+            "Quota" => Some(capability::Quota::URI),
+            _ => None,
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for DataType {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where

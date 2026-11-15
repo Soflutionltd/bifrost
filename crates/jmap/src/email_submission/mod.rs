@@ -10,7 +10,6 @@ pub(crate) mod set;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::Display;
 
 use crate::core::request::ResultReference;
 use crate::email::{EmailId, EmailPatch};
@@ -182,45 +181,20 @@ pub(crate) enum Displayed {
     Other,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "identityId")]
-    IdentityId,
-    #[serde(rename = "emailId")]
-    EmailId,
-    #[serde(rename = "threadId")]
-    ThreadId,
-    #[serde(rename = "envelope")]
-    Envelope,
-    #[serde(rename = "sendAt")]
-    SendAt,
-    #[serde(rename = "undoStatus")]
-    UndoStatus,
-    #[serde(rename = "deliveryStatus")]
-    DeliveryStatus,
-    #[serde(rename = "dsnBlobIds")]
-    DsnBlobIds,
-    #[serde(rename = "mdnBlobIds")]
-    MdnBlobIds,
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::IdentityId => write!(f, "identityId"),
-            Property::EmailId => write!(f, "emailId"),
-            Property::ThreadId => write!(f, "threadId"),
-            Property::Envelope => write!(f, "envelope"),
-            Property::SendAt => write!(f, "sendAt"),
-            Property::UndoStatus => write!(f, "undoStatus"),
-            Property::DeliveryStatus => write!(f, "deliveryStatus"),
-            Property::DsnBlobIds => write!(f, "dsnBlobIds"),
-            Property::MdnBlobIds => write!(f, "mdnBlobIds"),
-        }
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        IdentityId => "identityId",
+        EmailId => "emailId",
+        ThreadId => "threadId",
+        Envelope => "envelope",
+        SendAt => "sendAt",
+        UndoStatus => "undoStatus",
+        DeliveryStatus => "deliveryStatus",
+        DsnBlobIds => "dsnBlobIds",
+        MdnBlobIds => "mdnBlobIds",
     }
 }
 

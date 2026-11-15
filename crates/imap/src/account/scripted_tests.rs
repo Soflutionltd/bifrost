@@ -3197,6 +3197,22 @@ async fn describe_cursor_reports_the_strategy_the_run_will_actually_use() {
     let described = super::changes::describe_cursor(&disabled, &basic_cursor);
     assert_eq!(described.strategy, SyncStrategy::Basic);
     assert_eq!(described.cost_class, CostClass::Expensive);
+
+    let incomplete = cursor_for(&FolderCursor::QResync {
+        uidvalidity: 1,
+        modseq: 1,
+        known_uids: CompactUidSet::default(),
+        known_uids_complete: false,
+    });
+    for account in [enabled, disabled] {
+        let described = super::changes::describe_cursor(&account, &incomplete);
+        assert_eq!(described.strategy, SyncStrategy::None);
+        assert_eq!(described.cost_class, CostClass::Expensive);
+        assert!(described.freshness.is_none());
+        let events = collect_changes(account, incomplete.clone()).await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], SyncEvent::Terminated(_)));
+    }
 }
 
 /// EXISTS disagreeing with the derived live UID set is a server-consistency

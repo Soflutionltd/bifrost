@@ -224,6 +224,12 @@ impl<'x, T: HttpTransport> Request<'x, T> {
             }
         }
 
+        for uri in method.additional_capabilities() {
+            if !self.using.contains(&uri) {
+                self.using.push(uri);
+            }
+        }
+
         // Auto-add capability
         let uri = M::Cap::URI;
         if !self.using.contains(&uri) {

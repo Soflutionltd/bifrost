@@ -165,7 +165,13 @@ pub(crate) struct ListExtendedConsumer {
 }
 
 impl ListExtendedConsumer {
-    pub(crate) fn new(filter_extended: bool, selection_options: Vec<String>) -> Self {
+    pub(crate) fn new(selection_options: Vec<String>) -> Self {
+        // SUBSCRIBED can legitimately return deleted or inaccessible mailboxes.
+        // In other requests those attributes identify NOTIFY events. Derive
+        // this policy here so the queued and direct paths cannot disagree.
+        let filter_extended = !selection_options
+            .iter()
+            .any(|option| option.eq_ignore_ascii_case("SUBSCRIBED"));
         Self {
             filter_extended,
             selection_options,
@@ -270,7 +276,7 @@ impl ListStatusConsumer {
 }
 
 impl Consumer for ListStatusConsumer {
-    type Output = Vec<(MailboxInfo, Vec<StatusItem>)>;
+    type Output = Vec<crate::types::ListStatusEntry>;
 
     fn on_response(
         &mut self,
@@ -313,7 +319,7 @@ impl Consumer for ListStatusConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Finalized<Vec<(MailboxInfo, Vec<StatusItem>)>> {
+    ) -> Finalized<Vec<crate::types::ListStatusEntry>> {
         // Marker events are reclassified regardless of success/failure, and
         // so is the generic `Either` buffer - it holds neither LIST nor
         // STATUS, so none of it can be this command's own output.
@@ -349,11 +355,14 @@ impl Consumer for ListStatusConsumer {
         // matching STATUS (non-conformant server or STATUS not
         // yet arrived). See RFC 5465 Section5.5 / RFC 5819 Section2 for
         // the ambiguity reasoning.
-        let paired: Vec<(MailboxInfo, Vec<StatusItem>)> = results
+        let paired: Vec<crate::types::ListStatusEntry> = results
             .into_iter()
             .map(|(mb, status)| {
                 let items = status.unwrap_or_default();
-                (mb, items)
+                crate::types::ListStatusEntry {
+                    mailbox: mb,
+                    status: items,
+                }
             })
             .collect();
 
@@ -544,10 +553,10 @@ mod tests {
         let finalized = Box::new(consumer).finalize(tagged_ok(), &context);
         let results = finalized.output.expect("LIST-STATUS succeeds");
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].0.name, noncanonical);
-        assert!(results[0].1.is_empty());
-        assert_eq!(results[1].1, vec![StatusItem::Messages(1)]);
-        assert_eq!(results[2].1, vec![StatusItem::Messages(2)]);
+        assert_eq!(results[0].mailbox.name, noncanonical);
+        assert!(results[0].status.is_empty());
+        assert_eq!(results[1].status, vec![StatusItem::Messages(1)]);
+        assert_eq!(results[2].status, vec![StatusItem::Messages(2)]);
     }
 
     #[test]
@@ -583,7 +592,7 @@ mod tests {
 
         let finalized = Box::new(consumer).finalize(tagged_ok(), &context);
         let results = finalized.output.expect("LIST-STATUS succeeds");
-        assert!(results[0].1.is_empty());
-        assert_eq!(results[1].1, vec![StatusItem::Messages(7)]);
+        assert!(results[0].status.is_empty());
+        assert_eq!(results[1].status, vec![StatusItem::Messages(7)]);
     }
 }

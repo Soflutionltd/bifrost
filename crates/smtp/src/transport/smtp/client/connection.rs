@@ -10,6 +10,7 @@ use std::{
 use bifrost_sasl::ScramChannelBinding;
 use zeroize::{Zeroize, Zeroizing};
 
+use super::ReplyMode;
 #[cfg(feature = "tracing")]
 use super::escape_crlf;
 use super::metering::WireMetering;
@@ -395,8 +396,8 @@ impl SmtpConnection {
             Op::WriteBody => op_done(self.write_body(email)),
             Op::WriteBdat => op_done(self.write_bdat_body(email)),
             Op::OpenReplyGroup => op_done(self.open_reply_group()),
-            Op::ReadGrouped => op_reply(self.read_response_inner(true, false)),
-            Op::ReadSingle => op_reply(self.read_response_inner(true, true)),
+            Op::ReadGrouped => op_reply(self.read_response_inner(ReplyMode::Grouped)),
+            Op::ReadSingle => op_reply(self.read_response_inner(ReplyMode::AnyStatus)),
             Op::CloseReplyGroup => op_done(self.finish_reply_group()),
             Op::CloseLmtpDrain { restore_ok } => {
                 let result = self.finish_lmtp_final_drain();
@@ -980,20 +981,16 @@ impl SmtpConnection {
 
     /// Gets the SMTP response
     pub(crate) fn read_response(&mut self) -> Result<Response, Error> {
-        self.read_response_inner(false, true)
+        self.read_response_inner(ReplyMode::Positive)
     }
 
     fn read_response_accepting_status(&mut self) -> Result<Response, Error> {
-        self.read_response_inner(true, true)
+        self.read_response_inner(ReplyMode::AnyStatus)
     }
 
-    fn read_response_inner(
-        &mut self,
-        accept_negative: bool,
-        manage_state: bool,
-    ) -> Result<Response, Error> {
+    fn read_response_inner(&mut self, mode: ReplyMode) -> Result<Response, Error> {
         let configured = self.read_timeout;
-        let result = self.read_response_until(accept_negative, manage_state, configured);
+        let result = self.read_response_until(mode, configured);
         if configured.is_some() {
             // Restore the full per-operation timeout for the next reply,
             // whichever way this one ended.
@@ -1006,13 +1003,12 @@ impl SmtpConnection {
     /// `read_timeout` field for why the deadline lives here.
     fn read_response_until(
         &mut self,
-        accept_negative: bool,
-        manage_state: bool,
+        mode: ReplyMode,
         configured: Option<Duration>,
     ) -> Result<Response, Error> {
         self.stream.get_mut().begin_reply(configured);
 
-        if manage_state {
+        if mode.manages_state() {
             self.stream.get_ref().state().verify()?;
             self.stream.get_mut().set_state(ConnectionState::Broken);
         }
@@ -1044,14 +1040,14 @@ impl SmtpConnection {
             tracing::debug!("<< {}", escape_crlf(line));
             match parse_response(&buffer) {
                 Ok((_remaining, response)) => {
-                    if manage_state && !self.stream.buffer().is_empty() {
+                    if mode.manages_state() && !self.stream.buffer().is_empty() {
                         return Err(error::parse("SMTP server sent an unsolicited reply"));
                     }
-                    if manage_state {
+                    if mode.manages_state() {
                         self.stream.get_mut().set_state(ConnectionState::Ok);
                     }
 
-                    return if accept_negative || response.is_positive() {
+                    return if mode.accepts_negative() || response.is_positive() {
                         Ok(response)
                     } else {
                         Err(error::status(response))

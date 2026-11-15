@@ -83,7 +83,12 @@ impl DavDispatch {
     /// request URI, since the walk may have followed a redirect.
     async fn discover_principal(&self, root: &str) -> Result<Option<String>, AccountError> {
         let response = self
-            .propfind_raw(root, "0", PROPFIND_PRINCIPAL, AccountOperation::Discover)
+            .propfind_raw(
+                root,
+                crate::Depth::Zero,
+                PROPFIND_PRINCIPAL,
+                AccountOperation::Discover,
+            )
             .await?;
         Ok(extract_href_property_in_namespace(
             &response.text,

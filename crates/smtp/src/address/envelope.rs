@@ -152,10 +152,13 @@ impl Envelope {
 
     /// Check if any of the addresses in the envelope contains non-ascii chars
     pub(crate) fn has_non_ascii_addresses(&self) -> bool {
-        self.reverse_path
-            .iter()
-            .chain(self.forward_path.iter())
-            .any(|a| !a.is_ascii())
+        Self::addresses_need_smtputf8(self.reverse_path.iter().chain(self.forward_path.iter()))
+    }
+
+    pub(crate) fn addresses_need_smtputf8<'a>(
+        mut addresses: impl Iterator<Item = &'a Address>,
+    ) -> bool {
+        addresses.any(|address| !address.is_ascii())
     }
 }
 

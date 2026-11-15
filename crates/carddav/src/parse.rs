@@ -1,3 +1,4 @@
+use bifrost_dav_core::MultistatusError;
 pub(crate) use bifrost_dav_core::extract_href_property_in_namespace;
 pub(crate) use bifrost_dav_core::resolve_href;
 use bifrost_dav_core::{
@@ -279,7 +280,7 @@ impl MultiStatusSink for AddressBookSink {
 
 pub(crate) fn parse_addressbook_collections(
     xml: &str,
-) -> Result<Vec<AddressBookCollection>, String> {
+) -> Result<Vec<AddressBookCollection>, MultistatusError> {
     let mut sink = AddressBookSink::default();
     parse_multistatus(xml, &mut sink)?;
     Ok(sink.collections)
@@ -332,7 +333,9 @@ impl MultiStatusSink for ContactListingSink {
     }
 }
 
-pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<CardDavContactListing, String> {
+pub(crate) fn parse_propfind_contacts(
+    xml: &str,
+) -> Result<CardDavContactListing, MultistatusError> {
     let mut sink = ContactListingSink::default();
     parse_multistatus(xml, &mut sink)?;
     Ok(sink.listing)
@@ -383,7 +386,7 @@ impl MultiStatusSink for MultigetSink {
             self.directory_request_url.as_deref(),
             parts.href(),
             parts.response_status(),
-        ) && bifrost_net::status_line_code(status) == Some(507)
+        ) && status == 507
             && bifrost_dav_core::same_dav_url(base, &resolve_href(base, href))
         {
             self.truncated = true;
@@ -406,7 +409,7 @@ impl MultiStatusSink for MultigetSink {
     }
 }
 
-pub(crate) fn parse_multiget_report(xml: &str) -> Result<CardDavMultigetReport, String> {
+pub(crate) fn parse_multiget_report(xml: &str) -> Result<CardDavMultigetReport, MultistatusError> {
     let mut sink = MultigetSink::default();
     parse_multistatus(xml, &mut sink)?;
     Ok(sink.report)
@@ -415,7 +418,7 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CardDavMultigetReport, 
 pub(crate) fn parse_directory_report(
     xml: &str,
     request_url: &str,
-) -> Result<(CardDavMultigetReport, bool), String> {
+) -> Result<(CardDavMultigetReport, bool), MultistatusError> {
     let mut sink = MultigetSink {
         directory_request_url: Some(request_url.to_string()),
         ..Default::default()
@@ -433,7 +436,7 @@ pub(crate) fn parse_directory_report(
 /// the short-circuit, or a server emitting an old ctag in a failed block would
 /// suppress a real change; the shared reader commits only from a successful
 /// propstat, exactly as the depth-1 parser does.
-pub(crate) fn parse_collection_ctag(xml: &str) -> Result<Option<String>, String> {
+pub(crate) fn parse_collection_ctag(xml: &str) -> Result<Option<String>, MultistatusError> {
     bifrost_dav_core::parse_collection_property_in_namespace(
         xml,
         CALENDAR_SERVER_NAMESPACE,
@@ -779,7 +782,9 @@ END:VCARD</C:address-data>
         assert_eq!(report.failed.len(), 2);
         assert_eq!(
             report.classify(),
-            MultigetOutcome::CompleteFailure { status: Some(401) }
+            MultigetOutcome::CompleteFailure {
+                status: reqwest::StatusCode::UNAUTHORIZED
+            }
         );
     }
 

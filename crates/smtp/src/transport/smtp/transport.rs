@@ -13,7 +13,7 @@ use super::batch::{SmtpBatchRecipient, batch_level_error};
 use super::pool::sync_impl::Pool;
 use super::{
     ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions, SmtpConnection,
-    SmtpInfo, error,
+    SmtpInfo,
 };
 use super::{PortTls, Tls, TlsParameters, default_port};
 use crate::address::Address;
@@ -884,14 +884,10 @@ impl SmtpClient {
     ///
     /// Handles encryption and authentication
     pub(super) fn connection(&self) -> Result<SmtpConnection, Error> {
+        let plan = super::DialPlan::new(&self.info.tls, self.info.unix_socket.as_deref())?;
         if let Some(path) = &self.info.unix_socket {
             #[cfg(unix)]
             {
-                if self.info.uses_tls() {
-                    return Err(error::invalid_input(
-                        "TLS is not supported over Unix-domain LMTP sockets",
-                    ));
-                }
                 let mut conn = SmtpConnection::connect_unix_with_protocol(
                     path,
                     self.info.timeout,
@@ -906,16 +902,11 @@ impl SmtpClient {
             #[cfg(not(unix))]
             {
                 let _ = path;
-                return Err(error::invalid_input(
+                return Err(super::error::invalid_input(
                     "Unix-domain LMTP sockets are only supported on Unix platforms",
                 ));
             }
         }
-
-        let tls_parameters = match &self.info.tls {
-            Tls::Wrapper(tls_parameters) => Some(tls_parameters),
-            _ => None,
-        };
 
         // Owned, because resolution may move to a helper thread that outlives
         // this call when it exceeds the timeout.
@@ -924,20 +915,14 @@ impl SmtpClient {
             (server.to_owned(), self.info.port),
             self.info.timeout,
             &self.info.hello_name,
-            tls_parameters,
+            plan.implicit_tls,
             None,
             self.info.protocol,
             self.info.metering.clone(),
         )?;
 
-        match &self.info.tls {
-            Tls::Opportunistic(tls_parameters) if conn.can_starttls() => {
-                conn.starttls(tls_parameters, &self.info.hello_name)?;
-            }
-            Tls::Required(tls_parameters) => {
-                conn.starttls(tls_parameters, &self.info.hello_name)?;
-            }
-            _ => (),
+        if let Some(parameters) = plan.starttls(conn.can_starttls()) {
+            conn.starttls(parameters, &self.info.hello_name)?;
         }
 
         self.authenticate_if_configured(&mut conn)?;
@@ -960,7 +945,7 @@ impl SmtpClient {
                 // mechanism to name here.
                 return Err(error.with_phase(SmtpCommandPhase::Auth { mechanism: None }));
             }
-            conn.auth(&self.info.authentication, credentials)?;
+            conn.auth(self.info.authentication(), credentials)?;
         }
         Ok(())
     }
@@ -1112,11 +1097,11 @@ mod tests {
             Some(Credentials::Password { ref username, ref password })
                 if username == "username" && password.as_str() == "password"
         ));
-        assert_eq!(builder.info.authentication, PASSWORD_MECHANISMS);
+        assert_eq!(builder.info.authentication(), PASSWORD_MECHANISMS);
         // Pin the grown default-construction surface explicitly: SCRAM is now
         // offered out of the box (strongest first), LOGIN is opt-in only.
         assert_eq!(
-            builder.info.authentication,
+            builder.info.authentication(),
             vec![
                 Mechanism::ScramSha256Plus,
                 Mechanism::ScramSha1Plus,
@@ -1138,9 +1123,9 @@ mod tests {
             Some(Credentials::OAuth2 { ref identity, .. })
                 if identity == "user@example.com"
         ));
-        assert_eq!(builder.info.authentication, OAUTH2_MECHANISMS);
+        assert_eq!(builder.info.authentication(), OAUTH2_MECHANISMS);
         assert_eq!(
-            builder.info.authentication,
+            builder.info.authentication(),
             [Mechanism::OAuthBearer, Mechanism::Xoauth2]
         );
     }
@@ -1151,13 +1136,13 @@ mod tests {
             .authentication(vec![Mechanism::Xoauth2])
             .oauth2("user@example.com", "token");
 
-        assert_eq!(builder.info.authentication, [Mechanism::Xoauth2]);
+        assert_eq!(builder.info.authentication(), [Mechanism::Xoauth2]);
 
         let builder = SmtpTransport::builder_dangerous("smtp.example.com")
             .authentication(vec![Mechanism::Plain])
             .password("username", "password");
 
-        assert_eq!(builder.info.authentication, [Mechanism::Plain]);
+        assert_eq!(builder.info.authentication(), [Mechanism::Plain]);
     }
 
     /// Finding 4c: ported off the loopback listener. The transcript scripts

@@ -6,8 +6,6 @@
 pub(crate) mod get;
 pub(crate) mod set;
 
-use std::fmt::Display;
-
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -97,36 +95,17 @@ pub(crate) struct PushSubscriptionPatch {
     pub(super) types: Field<Vec<DataType>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "deviceClientId")]
-    DeviceClientId,
-    #[serde(rename = "url")]
-    Url,
-    #[serde(rename = "keys")]
-    Keys,
-    #[serde(rename = "verificationCode")]
-    VerificationCode,
-    #[serde(rename = "expires")]
-    Expires,
-    #[serde(rename = "types")]
-    Types,
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::DeviceClientId => write!(f, "deviceClientId"),
-            Property::Url => write!(f, "url"),
-            Property::Keys => write!(f, "keys"),
-            Property::VerificationCode => write!(f, "verificationCode"),
-            Property::Expires => write!(f, "expires"),
-            Property::Types => write!(f, "types"),
-        }
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        DeviceClientId => "deviceClientId",
+        Url => "url",
+        Keys => "keys",
+        VerificationCode => "verificationCode",
+        Expires => "expires",
+        Types => "types",
     }
 }
 

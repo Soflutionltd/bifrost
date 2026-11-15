@@ -319,10 +319,15 @@ Supported contact primitives:
   (`an_empty_home_lists_no_address_books_rather_than_a_phantom` and its
   CalDAV twin).
 - `contacts_list` - `PROPFIND` depth 1 for vCard resources, local
-  WATERMARK-cursor slicing of hrefs - sorted by resolved href first, because
+  WATERMARK-cursor slicing of hrefs - sorted and deduplicated by `DavHrefKey`
+  first, because
   the cursor is local and every page re-runs the PROPFIND, and DAV guarantees
   no multistatus ordering - then batched `addressbook-multiget`
-  `REPORT` hydration for only the requested page.
+  `REPORT` hydration for only the requested page. Host case, default ports and
+  equivalent percent-encoded path spellings identify one candidate. The
+  watermark comparison uses the same identity key even if the next response
+  spells the href differently. Hydration and cursors retain an original href.
+  This implements the enterprise expectation of one row per resource.
   **There is no request limit, and that is the trait's shape rather than a
   crate omission**: `Account::contacts_list` takes an address book and a page
   cursor and nothing else, so `CONTACT_PAGE_SIZE` (250) is fixed here. Letting
@@ -895,3 +900,39 @@ Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.
 `Account::protocol` returns `Protocol::CardDav`, including for inherited
 default-method refusals.
+
+## Shared content lines and typed DAV decoding
+
+`bifrost_dav_core::content_line` owns the 75-octet UTF-8 folding, TEXT
+escaping and unescaping, RFC 6868 parameter encoding and decoding, TEXT and
+parameter validation, and the shared `WriteError`. Both projections call these
+functions directly. URI validation and iCalendar's nonempty raw-value checks
+remain local because their value grammars differ. Unwritable controls are
+refused before I/O rather than stripped: the saved value must match the
+enterprise user's input. Existing protocol writer tests still exercise the
+shared implementation through the real writers.
+
+The shared multistatus driver parses each present status once into a readable
+HTTP status or an unreadable refusal; absence stays distinct for servers that
+omit a successful propstat's status. Empty response-level statuses, including
+self-closing elements, are unreadable refusals. `FailedResource.status` remains
+`Option<u16>`: an unreadable refusal is reported per resource, preserves local
+data and blocks token advancement, but cannot alone fail the whole page.
+`CompleteFailure` carries a concrete `StatusCode`, so neither client invents a
+500 for missing status evidence. Both clients keep one failure gate for listing
+and multiget lanes.
+
+`MultistatusError` distinguishes XML syntax failures from escaped-text failures,
+and `SnapshotDecodeError.kind` identifies cursor structure failures without
+matching diagnostic prose. Protocol boundaries retain the existing account
+error and cursor recovery mappings. DAV requests take `Depth` and share the
+PROPFIND, REPORT and MOVE method values; the CardDAV directory exemption
+compares the typed REPORT method.
+
+The raw-string comparison inside snapshot diffing is only a tie-break within
+one DAV identity bucket. It preserves exact matches for previously published
+aliases before pairing equivalent spellings, avoiding swapped ETags. It does
+not decide resource identity. Response href resolution keeps RFC 3986 semantics
+against the effective request URI; configured account base paths deliberately
+use directory semantics instead. Adding a slash to a resource request URI would
+resolve a sibling response href as a child.

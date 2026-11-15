@@ -67,14 +67,13 @@ pub(super) async fn public_message_hydrate(
     // public-folder discovery, which can skip a folder after a per-folder
     // failure, so a legitimately minted, persisted id can miss here. Refused
     // before any EWS request, and neither the caller's fault nor the
-    // provider's: local state that no longer matches the id.
+    // provider's: local state that no longer matches the id - until a
+    // complete discovery pass has run without it, after which it is NotFound.
     let Some(routing) = account.public_folder_routing(folder).await else {
-        return Err(crate::account::graph_error::stale_local_state_error(
+        return Err(account.missing_public_route_error(
             AccountOperation::HydrateMessage,
-            ErrorScope::Message {
-                id: id.0.clone().into(),
-            },
-            format!("public folder {} has no routing entry", folder.0),
+            id,
+            folder,
         ));
     };
     let ews = crate::account::public_folder::ews_client(account).map_err(|error| {

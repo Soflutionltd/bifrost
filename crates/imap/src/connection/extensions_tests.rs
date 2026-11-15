@@ -24,14 +24,18 @@ fn message_new() -> NotifyEvent {
 }
 
 // ---------------------------------------------------------------------------
-// compute_notify_flags (RFC 5465 Sections 5.1-5.9)
+// NotifyFlags (RFC 5465 Sections 5.1-5.9)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn notify_flags_empty_registration_is_all_false() {
     assert_eq!(
-        compute_notify_flags(&params(Vec::new())),
-        (false, false, false)
+        NotifyFlags::from(&params(Vec::new())),
+        NotifyFlags {
+            list: false,
+            status: false,
+            metadata: false,
+        }
     );
 }
 
@@ -43,13 +47,27 @@ fn notify_flags_selected_message_events_produce_nothing_buffered() {
         MailboxFilter::Selected,
         vec![message_new(), NotifyEvent::MessageExpunge],
     )]);
-    assert_eq!(compute_notify_flags(&p), (false, false, false));
+    assert_eq!(
+        NotifyFlags::from(&p),
+        NotifyFlags {
+            list: false,
+            status: false,
+            metadata: false,
+        }
+    );
 
     let delayed = params(vec![group(
         MailboxFilter::SelectedDelayed,
         vec![NotifyEvent::FlagChange],
     )]);
-    assert_eq!(compute_notify_flags(&delayed), (false, false, false));
+    assert_eq!(
+        NotifyFlags::from(&delayed),
+        NotifyFlags {
+            list: false,
+            status: false,
+            metadata: false,
+        }
+    );
 }
 
 #[test]
@@ -60,7 +78,14 @@ fn notify_flags_non_selected_message_events_set_list_and_status() {
         MailboxFilter::Personal,
         vec![message_new(), NotifyEvent::MessageExpunge],
     )]);
-    assert_eq!(compute_notify_flags(&p), (true, true, false));
+    assert_eq!(
+        NotifyFlags::from(&p),
+        NotifyFlags {
+            list: true,
+            status: true,
+            metadata: false,
+        }
+    );
 }
 
 #[test]
@@ -69,7 +94,14 @@ fn notify_flags_mailbox_name_event_sets_list_only() {
         MailboxFilter::Personal,
         vec![NotifyEvent::MailboxName],
     )]);
-    assert_eq!(compute_notify_flags(&p), (true, false, false));
+    assert_eq!(
+        NotifyFlags::from(&p),
+        NotifyFlags {
+            list: true,
+            status: false,
+            metadata: false,
+        }
+    );
 }
 
 #[test]
@@ -78,7 +110,14 @@ fn notify_flags_metadata_events_set_metadata_from_any_filter() {
         MailboxFilter::Personal,
         vec![NotifyEvent::MailboxMetadataChange],
     )]);
-    assert_eq!(compute_notify_flags(&mailbox_meta), (true, false, true));
+    assert_eq!(
+        NotifyFlags::from(&mailbox_meta),
+        NotifyFlags {
+            list: true,
+            status: false,
+            metadata: true,
+        }
+    );
 
     // ServerMetadataChange is server-scoped, so it sets `metadata` even
     // under a selected filter (which contributes no `list`).
@@ -86,14 +125,28 @@ fn notify_flags_metadata_events_set_metadata_from_any_filter() {
         MailboxFilter::Selected,
         vec![NotifyEvent::ServerMetadataChange],
     )]);
-    assert_eq!(compute_notify_flags(&server_meta), (false, false, true));
+    assert_eq!(
+        NotifyFlags::from(&server_meta),
+        NotifyFlags {
+            list: false,
+            status: false,
+            metadata: true,
+        }
+    );
 }
 
 #[test]
 fn notify_flags_empty_event_list_does_not_set_list() {
     // RFC 5465 Section 8: an empty event list is `NONE` for that filter.
     let p = params(vec![group(MailboxFilter::Personal, Vec::new())]);
-    assert_eq!(compute_notify_flags(&p), (false, false, false));
+    assert_eq!(
+        NotifyFlags::from(&p),
+        NotifyFlags {
+            list: false,
+            status: false,
+            metadata: false,
+        }
+    );
 }
 
 #[test]
@@ -102,7 +155,14 @@ fn notify_flags_unknown_extension_event_enables_everything() {
         MailboxFilter::Subscribed,
         vec![NotifyEvent::Other("XVENDOR-THING".to_owned())],
     )]);
-    assert_eq!(compute_notify_flags(&p), (true, true, true));
+    assert_eq!(
+        NotifyFlags::from(&p),
+        NotifyFlags {
+            list: true,
+            status: true,
+            metadata: true,
+        }
+    );
 }
 
 #[test]
@@ -114,7 +174,14 @@ fn notify_flags_union_across_groups() {
             vec![NotifyEvent::MailboxMetadataChange],
         ),
     ]);
-    assert_eq!(compute_notify_flags(&p), (true, false, true));
+    assert_eq!(
+        NotifyFlags::from(&p),
+        NotifyFlags {
+            list: true,
+            status: false,
+            metadata: true,
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------

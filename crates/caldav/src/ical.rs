@@ -1,3 +1,11 @@
+pub(crate) use bifrost_dav_core::content_line::WriteError;
+#[cfg(test)]
+use bifrost_dav_core::content_line::escape_text;
+use bifrost_dav_core::content_line::{
+    escape_param, fold_lines as fold_ical_lines, param_value, text_value, unescape_param,
+    unescape_text,
+};
+
 use bifrost_types::{
     AttendeeRole, CalendarEvent, CalendarId, CalendarProvenance, EventAttendee, EventAvailability,
     EventCreate, EventId, EventOrganizer, EventPatch, EventRecurrence, EventReminder, EventStatus,
@@ -206,22 +214,6 @@ fn project_event(
     }
 }
 
-/// A consumer value the writers refuse to put on the wire.
-///
-/// The iCalendar writers emit `NAME:value` lines by concatenation, so a value
-/// holding a line break would inject arbitrary content lines into the stored
-/// resource. TEXT values are escaped (`escape_text`) and parameter values are
-/// encoded (`escape_param`, RFC 6868), but a value type with no escape form -
-/// RECUR, DATE-TIME, CAL-ADDRESS - cannot carry a control character at all. It
-/// is REFUSED rather than stripped: a stripped value writes something the
-/// caller did not ask for. The account layer maps this to `Request(Malformed)`
-/// naming `field`, before any request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WriteError {
-    pub(crate) field: &'static str,
-    pub(crate) reason: &'static str,
-}
-
 const CONTROL_CHARACTER: &str = "contains a control character";
 const EMPTY_VALUE: &str = "is empty";
 
@@ -242,40 +234,6 @@ fn plain_value<'a>(field: &'static str, value: &'a str) -> Result<&'a str, Write
         });
     }
     Ok(value)
-}
-
-/// A parameter value, encoded for the wire. RFC 5545 s3.2 forbids control
-/// characters and DQUOTE inside one; RFC 6868 (`escape_param`) gives CR, LF and
-/// DQUOTE a caret form, so those are encoded. Tab is legal (WSP). Any other
-/// control character has no encoding and is refused.
-fn param_value(field: &'static str, value: &str) -> Result<String, WriteError> {
-    if value
-        .chars()
-        .any(|ch| ch.is_ascii_control() && !matches!(ch, '\t' | '\r' | '\n'))
-    {
-        return Err(WriteError {
-            field,
-            reason: CONTROL_CHARACTER,
-        });
-    }
-    Ok(escape_param(value))
-}
-
-/// A TEXT value (RFC 5545 s3.3.11), escaped for the wire. CR and LF are
-/// escaped as the `\n` line break (`escape_text`), and tab is legal. Every
-/// other ASCII control character (NUL included) is excluded from TEXT by the
-/// grammar and has no escape form, so it is refused and named, never stripped.
-fn text_value(field: &'static str, value: &str) -> Result<String, WriteError> {
-    if value
-        .chars()
-        .any(|ch| ch.is_ascii_control() && !matches!(ch, '\t' | '\r' | '\n'))
-    {
-        return Err(WriteError {
-            field,
-            reason: CONTROL_CHARACTER,
-        });
-    }
-    Ok(escape_text(value))
 }
 
 pub(crate) fn create_to_ical(event: &EventCreate, uid: &str) -> Result<String, WriteError> {
@@ -1713,121 +1671,6 @@ fn physical_lines(text: &str) -> Vec<&str> {
         }
     }
     lines
-}
-
-fn fold_ical_lines(lines: Vec<String>) -> String {
-    let mut folded = String::new();
-    for line in lines {
-        let mut current = String::new();
-        let mut prefix = 0;
-        for ch in line.chars() {
-            if prefix + current.len() + ch.len_utf8() > 75 {
-                folded.push_str(&current);
-                folded.push_str("\r\n ");
-                current.clear();
-                // The folding space occupies one octet of the 75-octet
-                // budget on every continuation line.
-                prefix = 1;
-            }
-            current.push(ch);
-        }
-        folded.push_str(&current);
-        folded.push_str("\r\n");
-    }
-    folded
-}
-
-fn escape_text(value: &str) -> String {
-    // A CRLF pair and a lone CR are each one line break, as `escape_param`
-    // reads them. Dropping a lone CR merged the two halves it separated.
-    value
-        .replace('\\', "\\\\")
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace('\n', "\\n")
-        .replace(',', "\\,")
-        .replace(';', "\\;")
-}
-
-/// Single left-to-right scan rather than an ordering-dependent chain of
-/// `replace()` calls. A chain mis-handles adjacency such as `\\n` (backslash
-/// followed by a literal `n`), which a multi-pass replace would turn into a
-/// backslash plus newline. RFC 5545 sec 3.3.11 escapes only: `\\`, `\;`,
-/// `\,`, and `\N`/`\n` (newline); any other backslash pair is kept verbatim.
-fn unescape_text(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('n' | 'N') => out.push('\n'),
-            Some(',') => out.push(','),
-            Some(';') => out.push(';'),
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
-        }
-    }
-    out
-}
-
-/// RFC 6868 parameter-value decoding, the inverse of [`escape_param`]:
-/// `^n` is a newline, `^'` a `"`, `^^` a caret. A caret before anything
-/// else is literal, so a value from a producer that predates RFC 6868
-/// survives unchanged.
-fn unescape_param(value: &str) -> String {
-    if !value.contains('^') {
-        return value.to_string();
-    }
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '^' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('\'') => out.push('"'),
-            Some('^') => out.push('^'),
-            Some(other) => {
-                out.push('^');
-                out.push(other);
-            }
-            None => out.push('^'),
-        }
-    }
-    out
-}
-
-fn escape_param(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '^' => escaped.push_str("^^"),
-            '"' => escaped.push_str("^'"),
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                escaped.push_str("^n");
-            }
-            '\n' => escaped.push_str("^n"),
-            _ => escaped.push(ch),
-        }
-    }
-    if escaped.contains([';', ',', ':']) {
-        format!("\"{escaped}\"")
-    } else {
-        escaped
-    }
 }
 
 #[cfg(test)]

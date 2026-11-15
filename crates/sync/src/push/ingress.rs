@@ -13,6 +13,20 @@ pub struct PendingPush {
     pub closed: bool,
 }
 
+impl PendingPush {
+    /// Apply the bound only to newly merged hints, never to a resolved full
+    /// sweep. Returns whether this transition coarsened distinct intent.
+    pub(crate) fn bound(&mut self, capacity: usize) -> bool {
+        let coarsened = !self.full && self.scopes.len() + self.memberships.len() > capacity;
+        self.full |= coarsened;
+        if self.full {
+            self.scopes.clear();
+            self.memberships.clear();
+        }
+        coarsened
+    }
+}
+
 /// One account's pending push invalidations: distinct hinted scopes and
 /// memberships up to a capacity, past which they collapse into one full
 /// reconcile. Holds only invalidation intent; every method is synchronous
@@ -62,13 +76,8 @@ impl PushIngress {
                     state.full = true;
                 }
             }
-            if !state.full && state.scopes.len() + state.memberships.len() > self.capacity {
-                state.full = true;
+            if state.bound(self.capacity) {
                 self.count_coarsening();
-            }
-            if state.full {
-                state.scopes.clear();
-                state.memberships.clear();
             }
         }
         drop(state);

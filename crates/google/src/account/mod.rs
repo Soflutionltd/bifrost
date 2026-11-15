@@ -98,7 +98,7 @@ impl GoogleAccountFactory {
     #[must_use]
     pub fn from_token_source_with_net(source: Arc<dyn TokenSource>, net: bifrost_net::Net) -> Self {
         Self::from_client(GmailClient::with_api_base_source_and_net(
-            "https://www.googleapis.com/gmail/v1/users/me",
+            crate::client::GMAIL_API_BASE,
             source,
             net,
         ))
@@ -315,7 +315,16 @@ fn provider_managed(
 fn shutdown_future<T: Send + 'static>(
     shutdown: CancellationToken,
     operation: AccountOperation,
+    future: AccountFuture<Result<T, AccountError>>,
+) -> AccountFuture<Result<T, AccountError>> {
+    shutdown_future_with_policy(shutdown, operation, future, None)
+}
+
+fn shutdown_future_with_policy<T: Send + 'static>(
+    shutdown: CancellationToken,
+    operation: AccountOperation,
     mut future: AccountFuture<Result<T, AccountError>>,
+    idempotency: Option<bool>,
 ) -> AccountFuture<Result<T, AccountError>> {
     Box::pin(async move {
         if shutdown.is_cancelled() {
@@ -323,13 +332,16 @@ fn shutdown_future<T: Send + 'static>(
         }
         tokio::select! {
             biased;
-            () = shutdown.cancelled() => Err(shutdown_account_future_error(operation)),
+            () = shutdown.cancelled() => Err(shutdown_account_future_error(operation, idempotency)),
             result = &mut future => result,
         }
     })
 }
 
-fn shutdown_account_future_error(operation: AccountOperation) -> AccountError {
+fn shutdown_account_future_error(
+    operation: AccountOperation,
+    idempotency: Option<bool>,
+) -> AccountError {
     use bifrost_types::{AccountErrorBuilder, AccountErrorKind, AttemptCause, Cause};
 
     let builder = AccountErrorBuilder::new(
@@ -347,18 +359,10 @@ fn shutdown_account_future_error(operation: AccountOperation) -> AccountError {
     .push_cause(Cause::Attempt(AttemptCause::new(
         bifrost_types::TransmissionState::InFlight,
     )));
-    // These updates can commit a first write before awaiting a second one.
-    // The adapter has lost that progress and continuation context, so the
-    // operation's ordinary idempotency cannot justify replaying the input.
-    // Do not stamp the original event scope here: a completed move can make
-    // that scope wrong. Contact identity alone also cannot say whether the
-    // field or photo leg committed. Only the operation can supply a safe
-    // continuation; a generic wrapper cannot reconstruct it from its input.
-    let builder = if matches!(
-        operation,
-        AccountOperation::EventUpdate | AccountOperation::ContactUpdate
-    ) {
-        builder.idempotency_override(false)
+    // The operation owns the replay policy: the adapter has no leg progress
+    // or continuation identity from which to reconstruct it after cancellation.
+    let builder = if let Some(idempotent) = idempotency {
+        builder.idempotency_override(idempotent)
     } else {
         builder
     };
@@ -1103,9 +1107,11 @@ impl Account for GoogleAccount {
         contact: ContactId,
         patch: ContactPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        self.shutdown_future(
+        shutdown_future_with_policy(
+            self.shutdown.clone(),
             AccountOperation::ContactUpdate,
             contacts::update(Arc::clone(&self.client), contact, patch),
+            Some(contacts::UPDATE_SHUTDOWN_IDEMPOTENT),
         )
     }
 
@@ -1205,9 +1211,11 @@ impl Account for GoogleAccount {
         event: EventId,
         patch: EventPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        self.shutdown_future(
+        shutdown_future_with_policy(
+            self.shutdown.clone(),
             AccountOperation::EventUpdate,
             calendar::update(Arc::clone(&self.client), event, patch),
+            Some(calendar::UPDATE_SHUTDOWN_IDEMPOTENT),
         )
     }
 
@@ -1674,11 +1682,17 @@ mod tests {
 
     #[test]
     fn shutdown_of_composite_updates_never_advises_plain_retry() {
-        for operation in [
-            AccountOperation::EventUpdate,
-            AccountOperation::ContactUpdate,
+        for (operation, idempotent) in [
+            (
+                AccountOperation::EventUpdate,
+                calendar::UPDATE_SHUTDOWN_IDEMPOTENT,
+            ),
+            (
+                AccountOperation::ContactUpdate,
+                contacts::UPDATE_SHUTDOWN_IDEMPOTENT,
+            ),
         ] {
-            let error = shutdown_account_future_error(operation);
+            let error = shutdown_account_future_error(operation, Some(idempotent));
             assert!(error.recovery().requires_reconciliation());
         }
     }

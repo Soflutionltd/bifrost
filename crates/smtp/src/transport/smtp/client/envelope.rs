@@ -12,8 +12,9 @@ use crate::{
         error,
         error::{Error, SmtpCommandPhase, SmtpTransmissionState},
         extension::{
-            DeliverByMode, Extension, FutureReleaseParameter, MailBodyParameter, MailParameter,
-            RcptParameter, SendOptions, ServerInfo, addresses_match_for_recipient_options,
+            DeliverByMode, Extension, FutureReleaseParameter, MailBodyParameter, MailKeyword,
+            MailParameter, RcptParameter, SendOptions, ServerInfo,
+            addresses_match_for_recipient_options,
         },
     },
 };
@@ -62,10 +63,8 @@ impl EnvelopeBuilder<'_> {
             )
         })?;
 
-        let has_non_ascii = from
-            .iter()
-            .chain(addresses.iter().copied())
-            .any(|address| !AsRef::<str>::as_ref(address).is_ascii());
+        let has_non_ascii =
+            Envelope::addresses_need_smtputf8(from.iter().chain(addresses.iter().copied()));
         let mail_options = self
             .mail_options(has_non_ascii, email, options, false)
             .map_err(|error| {
@@ -200,8 +199,7 @@ impl EnvelopeBuilder<'_> {
         // No MAIL keyword may occur twice, regardless of ASCII case or value.
         let mut keywords = std::collections::HashSet::new();
         for parameter in &mail_options {
-            let rendered = parameter.to_string();
-            let keyword = rendered.split('=').next().expect("parameter has a keyword");
+            let keyword = parameter.keyword().as_str();
             if !keywords.insert(keyword.to_ascii_uppercase()) {
                 return Err(error::invalid_input("duplicate MAIL parameter keyword"));
             }
@@ -360,23 +358,7 @@ impl EnvelopeBuilder<'_> {
         // The generic variants are for extensions without a typed representation.
         // Letting them spell a standard MAIL keyword skips the capability and value
         // checks above, such as the SIZE advertisement and limit checks.
-        const TYPED_MAIL_KEYWORDS: [&str; 10] = [
-            "BODY",
-            "SIZE",
-            "SMTPUTF8",
-            "REQUIRETLS",
-            "HOLDFOR",
-            "HOLDUNTIL",
-            "BY",
-            "MT-PRIORITY",
-            "RET",
-            "ENVID",
-        ];
-
-        if TYPED_MAIL_KEYWORDS
-            .iter()
-            .any(|typed_keyword| keyword.eq_ignore_ascii_case(typed_keyword))
-        {
+        if MailKeyword::is_typed(keyword) {
             return Err(error::invalid_input(format!(
                 "standard MAIL parameter {keyword} must use its typed variant"
             )));

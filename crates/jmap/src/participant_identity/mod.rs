@@ -5,8 +5,6 @@
 pub(crate) mod get;
 pub(crate) mod set;
 
-use std::fmt::Display;
-
 use serde::{Deserialize, Serialize};
 
 mod marker {
@@ -79,27 +77,14 @@ pub(crate) struct ParticipantIdentityPatch {
     pub(super) calendar_address: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum Property {
-    #[serde(rename = "id")]
-    Id,
-    #[serde(rename = "name")]
-    Name,
-    #[serde(rename = "calendarAddress")]
-    CalendarAddress,
-    #[serde(rename = "isDefault")]
-    IsDefault,
-}
-
-impl Display for Property {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Id => write!(f, "id"),
-            Property::Name => write!(f, "name"),
-            Property::CalendarAddress => write!(f, "calendarAddress"),
-            Property::IsDefault => write!(f, "isDefault"),
-        }
+crate::core::method::define_property_enum! {
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
+    #[non_exhaustive]
+    pub(crate) enum Property {
+        Id => "id",
+        Name => "name",
+        CalendarAddress => "calendarAddress",
+        IsDefault => "isDefault",
     }
 }
 

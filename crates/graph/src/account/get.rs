@@ -93,25 +93,16 @@ pub(crate) fn get_stream(
 /// A public-folder item is a raw EWS `ItemId` carried inside a
 /// folder-qualified `ObjectId`; Graph REST has no route that can address it
 /// (`/me/messages/{ItemId}` 404s), so before this split every public-folder
-/// item hydrated as `Failed`. Membership in the routing map is the
-/// discriminator - a folder-qualified id whose folder was never discovered
-/// falls back to the REST arm, which reports the real miss rather than a
-/// fabricated local error.
-async fn partition_ews_ids(
-    account: &GraphAccount,
-    ids: &[ObjectId],
-) -> (Vec<(ObjectId, FolderId)>, Vec<ObjectId>) {
+/// item hydrated as `Failed`. The encoded identity is the discriminator,
+/// even when discovery has not restored its routing yet. An Outlook user
+/// expects a temporarily unroutable item to remain visible, not to be
+/// declared deleted by a REST endpoint that cannot address it.
+fn partition_ews_ids(ids: &[ObjectId]) -> (Vec<(ObjectId, FolderId)>, Vec<ObjectId>) {
     let mut ews = Vec::new();
     let mut rest = Vec::new();
     for id in ids {
         match super::pim::ews_read_folder(id) {
-            Some(folder) => {
-                if account.public_folder_routing(&folder).await.is_some() {
-                    ews.push((id.clone(), folder));
-                } else {
-                    rest.push(id.clone());
-                }
-            }
+            Some(folder) => ews.push((id.clone(), folder)),
             None => rest.push(id.clone()),
         }
     }
@@ -149,16 +140,12 @@ async fn fetch_ews_outcomes(
             // Refused per item, before any EWS request, rather than poisoning
             // the rest of the chunk - and neither the caller's fault nor the
             // provider's: local state that no longer matches the id.
-            outcomes.push(ItemOutcome::Failed(BatchFailure::new(
-                batch_id,
-                super::graph_error::stale_local_state_error(
-                    AccountOperation::Hydrate,
-                    ErrorScope::Message {
-                        id: (id.0.clone()).into(),
-                    },
-                    format!("public folder {} has no routing entry", folder.0),
-                ),
-            )));
+            // Once a complete discovery pass has run without finding the
+            // folder, that retry would never end, so the item is reported
+            // NotFound instead (ruling recorded on
+            // `graph_error::unroutable_public_item_error`).
+            let error = account.missing_public_route_error(AccountOperation::Hydrate, id, folder);
+            outcomes.push(ItemOutcome::Failed(BatchFailure::new(batch_id, error)));
             continue;
         };
         let ews = match super::public_folder::ews_client(account) {
@@ -291,7 +278,7 @@ async fn fetch_batch(
     let (metered, tally) = account.metered();
     let account = &metered;
     // Public-folder ids read over EWS; everything else over Graph REST.
-    let (ews_ids, rest_ids) = partition_ews_ids(account, ids).await;
+    let (ews_ids, rest_ids) = partition_ews_ids(ids);
     // The EWS-hydrated items ride in the same batch as the REST ones: the
     // consumer sees one outcome per pulled id regardless of which arm served
     // it - or of whether its arm could build a request at all.
@@ -1154,20 +1141,18 @@ mod tests {
 
         let public = super::super::foreign::encode_public_item_id(&folder, "AAMkItem=");
         let primary = ObjectId("AAMkmsg".to_string());
-        // A folder-qualified id whose folder was never discovered has no
-        // routing, so it stays on the REST arm rather than being dropped.
+        // Missing routing does not change the encoded public identity.
         let unknown = super::super::foreign::encode_public_item_id(
             &FolderId("AAMkOther=".to_string()),
             "AAMkItem=",
         );
 
-        let (ews, rest) = partition_ews_ids(
-            &account,
-            &[public.clone(), primary.clone(), unknown.clone()],
-        )
-        .await;
-        assert_eq!(ews, vec![(public, folder)]);
-        assert_eq!(rest, vec![primary, unknown]);
+        let (ews, rest) = partition_ews_ids(&[public.clone(), primary.clone(), unknown.clone()]);
+        assert_eq!(
+            ews,
+            vec![(public, folder), (unknown, FolderId("AAMkOther=".into()))]
+        );
+        assert_eq!(rest, vec![primary]);
     }
 
     /// A3: Graph hydration body projections no longer mint a JSON
@@ -1377,23 +1362,40 @@ mod tests {
         assert!(url.ends_with("?$select=id,changeKey"), "{url}");
     }
 
-    /// A public-folder id whose folder is NOT in the routing map falls back
-    /// to the REST arm (pinned by `public_folder_ids_partition_onto_the_ews_arm`).
-    /// This pins what that fallback then asks for: `/me/messages/{itemId}`
-    /// with the RS separator percent-encoded, which Graph answers with
-    /// `ErrorItemNotFound`. That is the deliberate "report the real miss"
-    /// behavior, not a silent drop.
-    #[test]
-    fn an_unrouted_public_folder_id_hydrates_through_the_rest_arm_url() {
-        let account =
-            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
-        let id = super::super::foreign::encode_public_item_id(
-            &FolderId("AAMkPF=".to_string()),
-            "AAMkItem=",
+    #[tokio::test]
+    async fn an_unrouted_public_item_requires_refresh_without_rest_io() {
+        let client = GraphClient::new("token");
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
+        let folder = FolderId("AAMkPF=".into());
+        let id = super::super::foreign::encode_public_item_id(&folder, "AAMkItem=");
+        let (ews, rest) = partition_ews_ids(std::slice::from_ref(&id));
+        assert!(rest.is_empty());
+        let outcomes = fetch_ews_outcomes(&account, &ews, Projection::FlagsOnly).await;
+        let [ItemOutcome::Failed(failure)] = outcomes.as_slice() else {
+            panic!("missing routing must fail per item: {outcomes:?}");
+        };
+        assert_eq!(
+            failure.error.kind(),
+            &bifrost_types::AccountErrorKind::ConcurrencyConflict
         );
-        let url = hydrate_url_for_id(&account, &id, "id").expect("primary");
-        assert!(url.starts_with("/me/messages/"), "{url}");
-        assert!(!url.contains('\u{1e}'), "{url}");
+        assert!(failure.error.recovery().is_retryable());
+        assert!(client.take_rest_requests().is_empty());
+
+        // After a complete discovery pass that did not restore the route,
+        // the item stops retrying and is reported gone.
+        account
+            .public_folder_discovery_complete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcomes = fetch_ews_outcomes(&account, &ews, Projection::FlagsOnly).await;
+        let [ItemOutcome::Failed(failure)] = outcomes.as_slice() else {
+            panic!("missing routing must fail per item: {outcomes:?}");
+        };
+        assert_eq!(
+            failure.error.kind(),
+            &bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message)
+        );
+        assert!(!failure.error.recovery().is_retryable());
+        assert!(client.take_rest_requests().is_empty());
     }
 
     // ── Class-conditional EWS hydration ─────────────────────

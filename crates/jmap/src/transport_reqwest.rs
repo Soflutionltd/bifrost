@@ -13,6 +13,14 @@ use crate::client::Authorization;
 use crate::core::transport::{HttpTransport, SseTransport, TransportError};
 use futures::Stream;
 
+// The transport only issues these two verbs; unsupported verbs cannot enter
+// the request pipeline as runtime invariant errors.
+#[derive(Clone, Copy)]
+enum HttpMethod {
+    Get,
+    Post,
+}
+
 /// Default HTTP transport implementation using `bifrost-net`.
 ///
 /// Routes through the shared HTTP pipeline for retry, metering, and
@@ -158,7 +166,7 @@ impl ReqwestTransport {
 
     async fn send(
         &self,
-        method: &str,
+        method: HttpMethod,
         url: &str,
         body: Option<Bytes>,
         content_type: Option<&str>,
@@ -178,7 +186,7 @@ impl ReqwestTransport {
     #[allow(clippy::too_many_arguments)]
     async fn send_measured(
         &self,
-        method: &str,
+        method: HttpMethod,
         url: &str,
         body: Option<Bytes>,
         content_type: Option<&str>,
@@ -207,7 +215,7 @@ impl ReqwestTransport {
     #[allow(clippy::too_many_arguments)]
     async fn build_request(
         &self,
-        method: &str,
+        method: HttpMethod,
         url: &str,
         body: Option<Bytes>,
         content_type: Option<&str>,
@@ -220,17 +228,8 @@ impl ReqwestTransport {
         // serialization (`Idempotent` only when every call is a read), uploads
         // pass `Never`, and GETs pass `Idempotent`.
         let mut request = match method {
-            "GET" => self.net.get(url),
-            "POST" => self.net.post(url),
-            // Every caller in this file passes GET or POST, and the only
-            // default header is `Forwarded`, formatted from an `IpAddr`: both
-            // failures are impossible by construction, so they are the
-            // client's own invariant, not a network fault to retry.
-            _ => {
-                return Err(TransportError::invariant(format!(
-                    "unsupported HTTP method: {method}"
-                )));
-            }
+            HttpMethod::Get => self.net.get(url),
+            HttpMethod::Post => self.net.post(url),
         };
         // Bulk blob doors pass `None`: they may be deliberately paced by a
         // bandwidth cap, so net's response-header and body-inactivity bounds
@@ -255,7 +254,7 @@ impl ReqwestTransport {
     #[allow(clippy::too_many_arguments)]
     async fn send_once(
         &self,
-        method: &str,
+        method: HttpMethod,
         url: &str,
         body: Option<Bytes>,
         content_type: Option<&str>,
@@ -315,7 +314,7 @@ impl HttpTransport for ReqwestTransport {
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<(bytes::Bytes, u64), TransportError> {
         self.send_measured(
-            "POST",
+            HttpMethod::Post,
             url,
             Some(Bytes::from(body)),
             Some("application/json"),
@@ -360,7 +359,7 @@ impl HttpTransport for ReqwestTransport {
     ) -> Result<bytes::Bytes, TransportError> {
         Ok(self
             .send_measured(
-                "POST",
+                HttpMethod::Post,
                 url,
                 Some(Bytes::from(body)),
                 content_type,
@@ -392,7 +391,7 @@ impl HttpTransport for ReqwestTransport {
 
     async fn get_session(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
         self.send(
-            "GET",
+            HttpMethod::Get,
             url,
             None,
             None,
@@ -414,7 +413,7 @@ impl crate::blob::download::BlobTransport for ReqwestTransport {
         // deadline. Both doors use net's retry, metering and inactivity bounds.
         let response = self
             .build_request(
-                "GET",
+                HttpMethod::Get,
                 url,
                 None,
                 None,

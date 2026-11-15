@@ -1,3 +1,13 @@
+pub(crate) use bifrost_dav_core::content_line::WriteError as VCardWriteError;
+#[cfg(test)]
+use bifrost_dav_core::content_line::escape_text;
+use bifrost_dav_core::content_line::{
+    fold_lines as fold_vcard_lines, param_value, text_value, unescape_param, unescape_text,
+};
+
+#[cfg(test)]
+use bifrost_dav_core::content_line::escape_param;
+
 use base64::Engine;
 use bifrost_types::{
     AddressBookId, ContactAddress, ContactCard, ContactCorpus, ContactCreate, ContactEmail,
@@ -111,51 +121,7 @@ pub(crate) fn directory_from_vcard(
     }))
 }
 
-/// A consumer value the writers refuse to put on the wire.
-///
-/// The vCard writers emit `NAME:value` lines by concatenation. TEXT values
-/// (RFC 6350 s3.4) escape CR and LF as `\n`, and parameter values take the
-/// RFC 6868 caret form for CR, LF and DQUOTE, but every other ASCII control
-/// character (NUL included) has no escape form in either and is not valid vCard.
-/// It is REFUSED rather than stripped: a stripped value writes something the
-/// caller did not ask for. The account layer maps this to `Request(Malformed)`
-/// naming `field`, before any request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VCardWriteError {
-    pub(crate) field: &'static str,
-    pub(crate) reason: &'static str,
-}
-
 const CONTROL_CHARACTER: &str = "contains a control character";
-
-/// Any ASCII control character other than tab, CR and LF.
-fn is_unwritable_control(ch: char) -> bool {
-    ch.is_ascii_control() && !matches!(ch, '\t' | '\r' | '\n')
-}
-
-/// A TEXT value, escaped for the wire; refused when it holds a control
-/// character CR and LF do not cover.
-fn text_value(field: &'static str, value: &str) -> Result<String, VCardWriteError> {
-    if value.chars().any(is_unwritable_control) {
-        return Err(VCardWriteError {
-            field,
-            reason: CONTROL_CHARACTER,
-        });
-    }
-    Ok(escape_text(value))
-}
-
-/// A parameter value, RFC 6868 encoded; refused when it holds a control
-/// character the caret form cannot carry.
-fn param_value(field: &'static str, value: &str) -> Result<String, VCardWriteError> {
-    if value.chars().any(is_unwritable_control) {
-        return Err(VCardWriteError {
-            field,
-            reason: CONTROL_CHARACTER,
-        });
-    }
-    Ok(escape_param(value))
-}
 
 /// A URI value, written verbatim: RFC 6350 section 3.4 escapes TEXT only, so a
 /// comma or semicolon in a URL goes on the wire bare. A URI has no escape form
@@ -1039,117 +1005,6 @@ fn mark_lowest_preference_primary<T>(
             *primary(item) = true;
         }
     }
-}
-
-/// RFC 6868 parameter-value decoding, the inverse of [`escape_param`]:
-/// `^n` is a newline, `^'` a `"`, `^^` a caret. A caret before anything
-/// else is literal, so a value from a producer that predates RFC 6868
-/// survives unchanged.
-fn unescape_param(value: &str) -> String {
-    if !value.contains('^') {
-        return value.to_string();
-    }
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '^' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('\'') => out.push('"'),
-            Some('^') => out.push('^'),
-            Some(other) => {
-                out.push('^');
-                out.push(other);
-            }
-            None => out.push('^'),
-        }
-    }
-    out
-}
-
-fn escape_param(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '^' => escaped.push_str("^^"),
-            '"' => escaped.push_str("^'"),
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                escaped.push_str("^n");
-            }
-            '\n' => escaped.push_str("^n"),
-            _ => escaped.push(ch),
-        }
-    }
-    if escaped.contains([';', ',', ':']) {
-        format!("\"{escaped}\"")
-    } else {
-        escaped
-    }
-}
-
-fn fold_vcard_lines(lines: Vec<String>) -> String {
-    let mut folded = String::new();
-    for line in lines {
-        let mut current = String::new();
-        let mut prefix = 0;
-        for ch in line.chars() {
-            if prefix + current.len() + ch.len_utf8() > 75 {
-                folded.push_str(&current);
-                folded.push_str("\r\n ");
-                current.clear();
-                // The folding space occupies one octet of the 75-octet budget
-                // on every continuation line (matches fold_ical_lines).
-                prefix = 1;
-            }
-            current.push(ch);
-        }
-        folded.push_str(&current);
-        folded.push_str("\r\n");
-    }
-    folded
-}
-
-fn escape_text(value: &str) -> String {
-    value
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace(';', "\\;")
-        .replace(',', "\\,")
-}
-
-fn unescape_text(value: &str) -> String {
-    let mut output = String::new();
-    let mut escaped = false;
-    for ch in value.chars() {
-        if escaped {
-            match ch {
-                'n' | 'N' => output.push('\n'),
-                '\\' | ';' | ',' => output.push(ch),
-                _ => {
-                    output.push('\\');
-                    output.push(ch);
-                }
-            }
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else {
-            output.push(ch);
-        }
-    }
-    if escaped {
-        output.push('\\');
-    }
-    output
 }
 
 /// Extract a photo URL from a PHOTO value. A 4.0 `data:` URI is inline binary,

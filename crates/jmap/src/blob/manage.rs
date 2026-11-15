@@ -135,6 +135,13 @@ impl crate::core::method::JmapMethod for BlobLookupRequest {
     fn set_account_id(&mut self, account_id: &AccountId) {
         self.account_id = account_id.clone();
     }
+
+    fn additional_capabilities(&self) -> Vec<&'static str> {
+        self.type_names
+            .iter()
+            .filter_map(crate::DataType::capability_uri)
+            .collect()
+    }
 }
 
 impl Default for BlobUploadRequest {
@@ -429,17 +436,16 @@ impl BlobGetResponse {
 /// Request for `Blob/lookup` - reverse lookup which objects reference a blob.
 ///
 /// **Important**: The JMAP request's `using` array must include the
-/// capability that defines each type listed in `typeNames`. For example,
-/// looking up `"Email"` requires `urn:ietf:params:jmap:mail`. Use
-/// [`Request::add_capability`] to add the required capabilities; callers
-/// must supply the capabilities for the requested types.
+/// capability that defines each type listed in `typeNames`. Types with a known defining capability
+/// add it automatically. For extension types, use
+/// [`Request::add_capability`] to supply the defining capability.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BlobLookupRequest {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
     #[serde(rename = "typeNames")]
-    type_names: Vec<String>,
+    type_names: Vec<crate::DataType>,
 
     #[serde(rename = "ids")]
     ids: Vec<BlobId>,
@@ -486,13 +492,13 @@ impl BlobLookupRequest {
 
     /// Set the JMAP type names to search (e.g. `"Email"`, `"CalendarEvent"`).
     ///
-    /// The caller must ensure the corresponding capabilities are added
-    /// to the request's `using` array.
+    /// Types with a known defining capability add it to `using`. Extension
+    /// types require an explicit [`Request::add_capability`].
     #[must_use]
     pub(crate) fn type_names<U, V>(mut self, type_names: U) -> Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<crate::DataType>,
     {
         self.type_names = type_names
             .into_iter()
