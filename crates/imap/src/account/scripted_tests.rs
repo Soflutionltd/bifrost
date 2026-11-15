@@ -3701,7 +3701,7 @@ async fn observe_refuses_a_missing_uidnext_and_a_uidnotsticky_folder() {
         "a server that omits UIDNEXT is not guessed at"
     );
     let (sticky, _) = poller_transcript(
-        "* 4 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 9] ok\r\n* NO [UIDNOTSTICKY] non-persistent UIDs\r\n",
+        "* 4 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 9] ok\r\n* OK [UIDNOTSTICKY] non-persistent UIDs\r\n",
         vec![],
         |poller| async move { poller.observe(&ContainerId("INBOX".into())).await },
     )
@@ -3851,7 +3851,7 @@ async fn fetch_raw_distinguishes_message_absent_and_generation() {
 async fn fetch_raw_refuses_a_uidnotsticky_folder() {
     let message = super::ImapMessageRef::new(&ContainerId("INBOX".into()), nz(4), nz(7)).unwrap();
     let (outcome, seen) = poller_transcript(
-        "* 4 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 9] ok\r\n* NO [UIDNOTSTICKY] non-persistent UIDs\r\n",
+        "* 4 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 9] ok\r\n* OK [UIDNOTSTICKY] non-persistent UIDs\r\n",
         vec![],
         |poller| async move { poller.fetch_raw(&message).await },
     )

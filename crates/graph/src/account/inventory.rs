@@ -53,8 +53,16 @@ pub(crate) fn inventory_stream(
 /// `Account::is_inventory_cursor` delegates to `resume_inventory_stream`, so
 /// this is the single acceptance condition for both classification and resume.
 pub(crate) fn resumable_inventory_payload(cursor: &ChangeCursor) -> Option<GraphCursorPayload> {
-    let payload = super::cursor::decode_cursor(cursor).ok()?;
-    (payload.inventory_in_progress && scope_matches_payload(&cursor.scope, &payload))
+    let payload = match super::cursor::decode_cursor(cursor) {
+        Ok(payload) => payload,
+        // Keep recognizing an inventory row with no acknowledged position.
+        // Resume reports a scoped restart without consuming its inner marker.
+        Err(super::cursor::CursorError::InventoryInProgress) => {
+            serde_json::from_slice(&cursor.server_state.bytes).ok()?
+        }
+        Err(_) => return None,
+    };
+    (payload.inventory_in_progress() && scope_matches_payload(&cursor.scope, &payload))
         .then_some(payload)
 }
 
@@ -63,6 +71,15 @@ pub(crate) fn resume_inventory_stream(
     cursor: ChangeCursor,
 ) -> Option<AccountStream<bifrost_types::InventoryEvent>> {
     let payload = resumable_inventory_payload(&cursor)?;
+    if cursor.advanced_through.is_none() {
+        return Some(Box::pin(async_stream::stream! {
+            let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
+                .with_scope(ErrorScope::Cursor(cursor.scope));
+            yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
+                super::cursor::CursorError::InventoryInProgress, ctx,
+            ));
+        }));
+    }
     Some(inventory_stream_from(account, cursor.scope, Some(payload)))
 }
 
@@ -102,9 +119,9 @@ fn inventory_stream_from(
             // client: it is the consumer's durable state, and following a
             // link that does not admit would send the bearer wherever it
             // names.
-            Some(payload) => match payload.advanced_through {
+            Some(payload) => match payload.advanced_through() {
                 Some(marker) => super::cursor::admit_resume_url(&client, &marker.next_link)
-                    .map(|url| (url, payload.calendar_window_end)),
+                    .map(|url| (url, payload.calendar_window_end())),
                 None => {
                     yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
                         // The envelope and payload are understood. The
@@ -629,7 +646,7 @@ pub(crate) fn batch<T>(
 }
 
 pub(crate) fn scope_matches_payload(scope: &CursorScope, payload: &GraphCursorPayload) -> bool {
-    let canonical = scope_for_kind(&payload.kind);
+    let canonical = scope_for_kind(&payload.kind());
     *scope == canonical || event_aliases(scope, &canonical)
 }
 
@@ -1588,7 +1605,7 @@ mod tests {
             let payload =
                 super::super::cursor::decode_cursor(&cursor).expect("inventory cursor decodes");
             assert!(
-                !payload.inventory_in_progress,
+                !payload.inventory_in_progress(),
                 "unexpected inventory cursor: {payload:?}"
             );
             assert!(

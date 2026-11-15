@@ -236,12 +236,58 @@ impl ImapAccount {
         self.pool.checkout_for_folder(folder).await
     }
 
+    /// Classify every mailbox command, including failures after selection.
+    /// Outlook users expect a revoked share to disable only that folder.
+    pub(crate) fn folder_error(
+        &self,
+        error: Error,
+        folder: &MailboxName,
+        ctx: error::ImapErrorContext,
+    ) -> AccountError {
+        let owner = self
+            .folders
+            .get(folder)
+            .and_then(|entry| entry.shared_owner.clone());
+        error::folder_error(error, folder, owner.as_ref(), ctx)
+    }
+
+    /// COPY/MOVE can be denied at either endpoint. Prefer a known shared
+    /// source, otherwise quarantine a shared destination on permission loss.
+    /// A user's personal mailbox must remain usable after a share is withdrawn.
+    pub(crate) fn folder_pair_error(
+        &self,
+        error: Error,
+        source: &MailboxName,
+        destination: Option<&MailboxName>,
+        ctx: error::ImapErrorContext,
+    ) -> AccountError {
+        let source_shared = self
+            .folders
+            .get(source)
+            .is_some_and(|entry| entry.shared_owner.is_some());
+        let folder = if !source_shared && error::permission_denied(&error, &ctx) {
+            destination
+                .filter(|folder| {
+                    self.folders
+                        .get(folder)
+                        .is_some_and(|entry| entry.shared_owner.is_some())
+                })
+                .unwrap_or(source)
+        } else {
+            source
+        };
+        self.folder_error(error, folder, ctx)
+    }
+
     pub(crate) async fn select_folder(
         &self,
         conn: &mut PooledConn,
         folder: &MailboxName,
         purpose: SelectPurpose<'_>,
     ) -> Result<SyncSelectResult, Error> {
+        // Classification stays at each operation's error boundary: SELECT is
+        // not the last command that can discover a withdrawn share. Preserve
+        // the raw error here for strategy downgrade and preflight restamping.
         let options = self.select_options(purpose);
         let result = conn
             .connection()
@@ -1269,10 +1315,7 @@ pub(crate) fn folder_from_scope(
 ) -> Result<MailboxName, AccountError> {
     match scope {
         CursorScope::Folder(folder) => MailboxName::from_account_id(&folder.0).map_err(|e| {
-            error::into_account_error(
-                Error::InvalidInput(e.to_string()),
-                error::ImapErrorContext::operation(op),
-            )
+            error::into_account_error(Error::from(e), error::ImapErrorContext::operation(op))
         }),
         _ => Err(error::unsupported(op)),
     }

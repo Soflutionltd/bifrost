@@ -2,11 +2,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
+use bifrost_types::{AccountErrorKind, ResourceKind};
 use bifrost_types::{
-    AccountErrorKind, AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId,
-    BatchSuccess, Checkpoint, CursorScope, Fingerprint, HydratedObject, HydratedObjectKind,
-    InventoryEntry, ItemOutcome, LabelId, MembershipScope, ObjectId, PageBoundary, Projection,
-    ResourceKind, ServerVersion, SyncEvent, ThreadId,
+    AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess, Checkpoint,
+    CursorScope, Fingerprint, HydratedObject, HydratedObjectKind, InventoryEntry, ItemOutcome,
+    LabelId, MembershipScope, ObjectId, PageBoundary, Projection, ServerVersion, SyncEvent,
+    ThreadId,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -22,7 +24,7 @@ use crate::types::GmailLabel;
 use crate::types::{GmailHeader, GmailMessage, GmailProfile};
 
 use super::blobs;
-use super::cursor::cursor_for_history;
+use super::cursor::{absence_proven_by_cursor_bridge, cursor_for_history};
 use super::error;
 use super::flags;
 use super::scopes::{ScopeCache, labels_for_flags};
@@ -143,30 +145,10 @@ pub(crate) fn repair_inventory(
                         error,
                         error::GmailErrorContext::inventory(),
                     );
-                    if matches!(
-                        account_error.kind(),
-                        AccountErrorKind::NotFound(ResourceKind::Message)
-                    ) {
-                        // Definitive, and the reason is the cursor model rather
-                        // than the status code. Gmail's cursor is anchored at
-                        // the historyId sampled BEFORE the walk that raised
-                        // this obligation, so any deletion since then is
-                        // reported by the change stream the consumer is already
-                        // reading. Absence is therefore the correct inventory
-                        // state and nothing is owed. Under a different
-                        // pagination or cursor model the same NotFound would
-                        // NOT be dischargeable.
+                    if let Some(evidence) = absence_proven_by_cursor_bridge(&account_error) {
                         bifrost_types::InventoryRepairOutcome::DefinitivelyIrrelevant {
                             attempt,
-                            evidence:
-                                bifrost_types::DefinitiveIrrelevance::AbsentUnderCursorBridge {
-                                    detail: format!(
-                                        "gmail message {} absent; the scope cursor is anchored \
-                                         before the walk that raised this obligation, so its \
-                                         removal is carried by the change stream",
-                                        id.0
-                                    ),
-                                },
+                            evidence,
                         }
                     } else {
                         bifrost_types::InventoryRepairOutcome::Deferred {
@@ -343,19 +325,10 @@ pub(crate) fn inventory_stream_cancellable(
                             error,
                             error::GmailErrorContext::inventory(),
                         );
-                        // A message may be deleted after users.messages.list
-                        // names it and before users.messages.get hydrates it.
-                        // That is DISCHARGED, not deferred: the id came from
-                        // this walk's own listing, the cursor is anchored
-                        // before the walk, and absence is the correct
-                        // inventory state - so nothing is owed. Note this
-                        // rests on those facts, not on the error kind alone;
-                        // the same NotFound under a different pagination model
-                        // would not be dischargeable.
-                        if matches!(
-                            account_error.kind(),
-                            AccountErrorKind::NotFound(ResourceKind::Message)
-                        ) {
+                        if absence_proven_by_cursor_bridge(&account_error).is_some() {
+                            // InventoryEvent has no per-object evidence lane.
+                            // Discharged absence contributes no obligation; do
+                            // not manufacture debt merely to report its repair.
                             continue;
                         }
                         if !account_error.recovery().is_item_local() {

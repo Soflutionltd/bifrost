@@ -30,6 +30,9 @@ pub enum TypedEvent {
         text: String,
     },
     /// RFC 5465 Section5.8 NOTIFICATIONOVERFLOW  -  NOTIFY registration cleared.
+    // `code` is the optional extension argument inside NOTIFICATIONOVERFLOW,
+    // not a serialized ResponseCode. Keeping it as text preserves unknown
+    // server arguments; wrapping it in ResponseCode would add no information.
     NotificationOverflow { code: Option<String>, text: String },
     /// Internal overflow marker. Emitted when the event queue drops events.
     QueueOverflow {

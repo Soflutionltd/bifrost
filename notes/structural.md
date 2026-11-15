@@ -595,32 +595,6 @@ attachment of this account" from "another account in this process"),
 `ReceiverSeq`, `UndeliveredMark`, `ProofGeneration` (BUG-015), its own
 `RepairAttemptId` counter, and a `ScopeIncarnation { scope, incarnation }` key.
 
-## STR-026 - Hand-rolled bool sets that each encode one state machine
-
-**Reported by:** sync-engine, sync-lanes.
-
-The sync-lanes hunter adds that `mark_unconfirmed` does not clear `torn_down`,
-so it can produce the forbidden `torn_down && teardown_unconfirmed` if ever
-called on such a record, and proposes `enum SubscriptionState { Live,
-LiveTeardownFailed, TornDownAwaitingRecreate, Orphan }` with the transitions as
-methods (`into_orphan`, `mark_unconfirmed`, `mark_torn_down`, `remove_orphan`,
-`orphans`, `take` each re-establish the invariant by hand today).
-
-- `RegisteredSubscription { teardown_unconfirmed, desired, torn_down }`:
-  `reference/sync.md` states "always desired, teardown_unconfirmed, or both" in
-  prose; records are built literally in `reattach.rs` and converted with
-  `into_orphan`, `mark_unconfirmed`, `mark_torn_down`. The real states are
-  Wanted, Wanted+TeardownUnconfirmed, Wanted+TornDown, Orphan(unconfirmed);
-  eight combinations are representable, two documented impossible.
-- `MutationCohort { submitted, readback, done }` plus `retry_at` and
-  `reconcile_at`: the phase is Unsubmitted, Submitted+retry pending, Readback or
-  Done; `done && readback` and `!submitted && readback` are representable;
-  `run_bulk_pipeline` flips the flags in about twenty places.
-- `RepairPacing { exhausted, observed, .. }`: `exhausted` is a side channel so
-  callers can recognise `Error::EstablishCursorFailed("recovery wait budget
-  exhausted")`; every caller matches `Err(_) if pacing.exhausted`. The result
-  type should carry `WaitBudgetExhausted`.
-
 ## STR-027 - Engine failures reach callers only as prose
 
 **Reported by:** sync-engine.
@@ -1359,41 +1333,6 @@ so it wants a fixer owning both sides:
   UidSet }>` (and the same struct inside `ResponseCode::CopyUid`); its readers
   are `account/mutate.rs` and three matches in `account/error.rs`.
 
-## STR-057 - IMAP failures and signals that reach callers only as prose
-
-**Reported by:** imap-protocol.
-
-- `Error::MissingCapability(String)` carries free text (`"QRESYNC (not
-  ENABLEd)"`, `"SELECT (CONDSTORE) requires CONDSTORE"`, `"AUTH=OAUTHBEARER"`);
-  the account maps it to `Unsupported` with support-only text, so nobody can
-  tell which capability, or advertised vs not-enabled. Carry `Capability` plus a
-  reason enum.
-- `ValidationError(String)` -> `Error::InvalidInput(e.to_string())`: every local
-  validation reason is prose.
-- `AuthPolicyFailure { offered: Vec<String>, rejected: Vec<..AuthMechanism..> }`:
-  one half typed, one half strings.
-- `TypedEvent::QueueOverflow { dropped_count }` (a data-loss signal) is
-  converted by `idle::typed_event_to_idle_event` into
-  `IdleEvent::Alert(format!("event queue overflow: {n} events dropped"))`;
-  `push::map_idle_event` maps every `Alert` to a coarse `Unknown` invalidation,
-  so the loss is handled safely only because Alert happens to get the coarse
-  treatment. Metadata changes become `ExtensionEvent("METADATA change during
-  IDLE")` and unrecognized responses `ExtensionEvent(format!("{other:?}"))` -
-  Debug output as an event payload.
-- `TypedEvent::NotificationOverflow { code: Option<String> }` although
-  `ResponseCode` exists.
-
-The imap-connection hunter lists what `Error::MissingCapability(String)` covers:
-"server does not advertise X", "X advertised but not ENABLEd", "removed in rev2"
-(`"STATUS item RECENT was removed in IMAP4rev2"`, CHECK on rev2),
-"LOGINDISABLED", and "literal exceeds the 4096-octet LITERAL- limit", all mapped
-by the account to `Unsupported(operation)`. It proposes `MissingCapability {
-capability, reason: NotAdvertised | NotEnabled | RemovedInRev2 | ... }`, so the
-account can tell "the server cannot" from "this session has not been put in the
-mode" (which already goes wrong, BUG-029). `Error::StateChangedBeforeSend(String)`
-and `Error::InvalidState(String)` carry the session state and legal set only as
-`format!` text.
-
 ## STR-058 - `MailboxName`'s wire encoding is a bool, and identity is recomputed per comparison
 
 **Reported by:** imap-protocol.
@@ -1908,20 +1847,21 @@ it wants a fixer owning both halves of the crate:
 
 **Reported by:** jmap-protocol.
 
-- `Error::NotParsable(String)` is overloaded: "this blob id is not parsable"
-  (`ParseResponse`), "Blob {id} not created: {debug}" (`BlobUploadResponse`), and
-  "Blob/copy response named accounts other than the requested source and
-  destination" (a provider contract violation); all classify as
-  `Protocol(ParseFailed)` (BUG-056).
-- `From<serde_json::Error> for Error` maps every stray `?` to `ResponseDecode`. To
-  compensate, `JmapErrorContext` carries `send_boundary: bool` and
-  `into_account_error` adds `Attempt(Acknowledged)` only when the caller set it.
-  Decode provenance is a fact at the source and should be a variant:
+A `Blob/upload` refusal now keeps its typed `SetError`, and full create and
+update failure iterators exist. The rest needs the protocol layer and
+`sync/error.rs` changed together:
+
+- `Error::NotParsable(String)` is still overloaded: an unparsable blob id
+  (`ParseResponse`), the `Blob/copy` response naming the wrong accounts (a
+  provider contract violation, which should classify as one), and, in
+  `sync/pim.rs`, a missing Email state; all classify as `Protocol(ParseFailed)`.
+- `From<serde_json::Error> for Error` maps every stray `?` to `ResponseDecode`;
+  the `RequestContract::Send` contract compensates. Decode provenance is a fact at the source and should be a variant:
   `EnvelopeDecode` (from `Client::send_request` / the WS frame), `ResultDecode {
   call_id }` (from `Response::get`), and no blanket `From`.
-- `SetResponse::unwrap_update_errors` / `unwrap_create_errors` return the first
-  error from a `HashMap` iteration, dropping which id failed and every other
-  error.
+- `SetResponse::unwrap_update_errors` / `unwrap_create_errors` still return the
+  first error from a `HashMap` iteration; their sync callers should move to the
+  new full-failure iterators.
 - `TransportError { message: String, .. }` with `TransportError::new(message)`
   and no `net` evidence classifies as a generic network fault (STR-091); the
   message is the only carrier.
@@ -1978,22 +1918,6 @@ estimates, so whole-`Account` tests replace the scaffolding. The jmap-protocol
 hunter's reading is that the generic is unnecessary because a scripted
 `ReqwestTransport` already exists; both readings agree the current pin is what
 makes `JmapAccount` hard to drive.
-
-## STR-092 - The JMAP `Client` does four jobs
-
-**Reported by:** jmap-protocol.
-
-`ClientInner` holds the session cell and refresh gate, the transport, the
-WebSocket sink plus the RFC 8887 request-id counter plus the pending-response map,
-a second copy of the credential (BUG-064), and the timeout; `Client` adds the
-per-handle `ByteTally`. The WS fields are `#[cfg(feature = "websockets")]` struct
-members, and `client_ws.rs` reaches into `Request`'s `pub(crate)` `using` /
-`method_calls` / `created_ids` fields to re-encode the envelope with
-`serde_json::to_value` - a second encoder of the request body beside `Request`'s
-`Serialize` impl. Proposal: split into `SessionCell` (state, refresh, divergence
-watch), the transport, and a `WsConnection` (sink, ids, pending, generation)
-owned by the push layer; the request envelope has one encoder both doors call,
-with the WS frame wrapping it.
 
 ## STR-095 - JMAP test layout mirrors review history
 
@@ -2054,25 +1978,6 @@ can tell apart only by reading text. The kind is mostly right; a typed refusal
 reason (or at least distinct message keys) would let a consumer tell "this account
 never sends" from "not scheduled, not for shares". Related: STR-010, STR-074.
 
-## STR-103 - JMAP lifecycle topology is two locks for one fact
-
-**Reported by:** jmap-account.
-
-`discover::scope_lifecycle` keeps the lifecycle position in
-`lifecycle_mailbox_states` and the announced names in `mailbox_names`, two separate
-`Arc<Mutex<..>>`s that must change together; the reseed path takes both locks to
-publish atomically, and a comment explains the drop hazard the split creates,
-while the normal path updates names per mailbox before the state commit. Both
-belong in one `LifecycleTopology { position, names }` behind one lock, owned by the
-lifecycle stream (nothing else reads either). The factory also fetches mailbox
-names at open and `discover::memberships` then issues a fresh `Mailbox/get` for ids
-only. Related seam mismatch: discovery emits primary per-mailbox memberships and
-the shared owner tags but never the shared per-mailbox memberships
-(`Folder("{acct}\u{1f}{mbx}")`) that inventory and hydration stamp on every shared
-message, so the engine's membership index learns those only from items -
-lifecycle is primary-only by design, and the hunter wants the membership gap
-stated in the reference.
-
 ## STR-104 - JMAP `pim.rs` does ten unrelated jobs, and `calendar_ops.rs` mixes doors with a conversion library
 
 **Reported by:** jmap-account.
@@ -2093,33 +1998,6 @@ duration parsing (BUG-060) and time classification; the conversion half is a pur
 mapping module, and the parts restating shared-vocabulary rules (window overlap,
 recurrence validation) belong in `bifrost-types` (BUG-001). Same question for IMAP:
 STR-079.
-
-## STR-105 - `GraphCursorPayload` is a product type encoding a sum
-
-**Reported by:** graph (its highest-value finding).
-
-`account/cursor.rs`: the payload carries `kind`, `delta_link: String`,
-`advanced_through: Option<GraphPageMarker>`, `inventory_in_progress: bool` and
-`calendar_window_end: Option<i64>` side by side, while the real states are three -
-a live delta cursor (delta link, optional mid-walk marker), an inventory page
-position (marker, no delta link), and a public-folder poll state (none of the
-delta fields). Everything else is constructible and refused elsewhere:
-`delta_link` is `String::new()` for two of the three, `resume_url()` returns `""`
-for a public folder, and tests pin these states as intended
-(`an_empty_delta_link_survives_the_round_trip`,
-`public_folder_kind_ignores_the_envelope_delta_fields`);
-`CursorError::InventoryInProgress` exists only to name two states a sum could not
-express; `calendar_window_end` is meaningful only for `GraphCursorKind::Events`
-and `calendar_window_needs_reseed` re-checks the kind; the folder id is stored
-twice (in `ChangeCursor::scope` and in `GraphCursorKind`), the agreement checked
-one layer up in `inventory::scope_matches_payload` (with its `event_aliases` escape
-hatch), and `encode_does_not_cross_check_the_scope_against_the_payload_kind` pins
-that the codec does not check it. Proposal: `enum GraphCursorState { Delta { link:
-AdmittedLink, marker: Option<GraphPageMarker>, window: Option<CalendarWindow> },
-InventoryPage { marker, window }, PublicFolder(PublicFolderCursor) }`, the
-collection derived from `ChangeCursor::scope` at decode time, `CalendarWindow` only
-on event scopes - an inner-envelope bump (v6), which the crate already treats as a
-reseed boundary.
 
 ## STR-106 - Graph scope to collection is decided by eight matches on `CursorScope`
 
@@ -2354,24 +2232,6 @@ ctx.history_endpoint` arms in `classify_response` and `classify_by_status`).
 Proposal: a `GmailEndpoint { Profile, History, Watch, Stop, MessagesGet,
 BatchModify, .. }` minted by the `api.rs` method building the request, owning the
 unit cost, the concurrency class and the history-endpoint classification.
-
-## STR-124 - Google mailbox identity is a bare email compared ad hoc
-
-**Reported by:** google.
-
-"Is this the same Google account" is answered by
-`cursor::decode_gmail_state_for_profile` (`eq_ignore_ascii_case`); `changes.rs`
-twice (it decodes the cursor and re-implements the same comparison inline instead of
-calling `decode_gmail_state_for_profile`, then compares again against a live
-`getProfile`); `push::mailbox_watch`, keyed on `to_ascii_lowercase()` (its own
-comment notes aliases and googlemail.com spellings escape coordination); and
-`cloud::account_domain`, which splits the same string to derive a sharing domain. A
-`MailboxAddress` newtype minted only from a `getProfile` response, with its own
-equality, gives every site one answer and makes "came from the provider, not the
-caller" true by construction (the distinction `cloud.rs` argues in prose:
-`ProviderValueUnusable` vs `InvalidRequest`). `MailDocument::ensure_from` also uses
-`IdentityId.0` as an address, the identity id doubling as the email
-(`identities_list` mints it from `send_as_email`). The Graph twin is BUG-077.
 
 ## STR-125 - Gmail label ids and flag tokens need types
 
@@ -2658,19 +2518,6 @@ dialing policy is not a property of the runtime. Moving `connect` out is interna
 dropping the `E` parameter needs the owner. `ConnectionOptions` exists "keeping the
 dial signature stable across features" - a symptom of the parameter list living in
 the wrong place.
-
-## STR-142 - bifrost-smtp's public API speaks two error vocabularies
-
-**Reported by:** smtp-sasl (whether the non-batch API also speaks `AccountError` is a product decision for the owner).
-
-Public `send_raw*` methods return `transport::smtp::Error`, and
-`send_raw_batch_with_options` returns `AccountError`. The SMTP `Error` then needs
-`preclassified_account_error: Option<Arc<AccountError>>` to tunnel a dependency's
-typed classification back out through itself (BUG-099), and `diagnostic_text()`
-reads the boxed `source`'s Display to produce support text, so
-classification-relevant detail (the SCRAM token, "no compatible mechanism") travels
-as the source's prose. With typed auth failures (STR-137) and a typed SASL error
-(STR-133) the tunnel and most prose reads go away.
 
 ## STR-143 - Submission composition lives in IMAP but is not IMAP's
 

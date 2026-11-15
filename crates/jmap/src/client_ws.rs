@@ -18,24 +18,36 @@ use crate::{
     },
 };
 
+/// Correlation survives reconnects. Keep this owner on the shared client:
+/// moving it into one push stream would let a late response alias a new call
+/// and would strand callers when that stream is dropped.
+pub(crate) struct WsConnection {
+    pub(crate) sink: tokio::sync::Mutex<Option<WsStream>>,
+    pub(crate) request_id: std::sync::atomic::AtomicU64,
+    pending: Arc<PendingRequests>,
+}
+
+impl WsConnection {
+    pub(crate) fn new() -> Self {
+        Self {
+            sink: None.into(),
+            request_id: std::sync::atomic::AtomicU64::new(0),
+            pending: Arc::new(PendingRequests::new()),
+        }
+    }
+}
+
 const JMAP_WS_SUBPROTOCOL: &str = "jmap";
 
-#[derive(Debug, Serialize)]
-struct WebSocketRequest {
+#[derive(Serialize)]
+struct WebSocketRequest<'a, 'client> {
     #[serde(rename = "@type")]
-    pub(crate) _type: WebSocketRequestType,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) id: Option<String>,
-
-    using: Vec<&'static str>,
-
-    #[serde(rename = "methodCalls")]
-    method_calls: serde_json::Value,
-
-    #[serde(rename = "createdIds")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    created_ids: Option<HashMap<String, String>>,
+    _type: WebSocketRequestType,
+    id: String,
+    // Request owns the envelope schema for both HTTP and WebSocket. Flattening
+    // adds only RFC 8887 metadata without a second method-call encoder.
+    #[serde(flatten)]
+    request: &'a Request<'client>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -550,9 +562,10 @@ impl Client {
         // against an installed connection, and every waiter of the
         // connection being replaced is failed here with a retryable
         // error instead of parking forever on a socket that is gone.
-        let mut sink = self.ws.lock().await;
+        let mut sink = self.connection.sink.lock().await;
         let generation = self
-            .ws_pending
+            .connection
+            .pending
             .begin_connection(|| crate::Error::WebSocketClosed);
         *sink = WsStream { tx }.into();
         drop(sink);
@@ -561,7 +574,7 @@ impl Client {
         // HTTP door runs. A `Client` clone is an `Arc` bump and the stream
         // outlives this call, so the closure owns one.
         let client = self.clone();
-        let pending = Arc::clone(&self.ws_pending);
+        let pending = Arc::clone(&self.connection.pending);
         Ok(Box::pin(frame_stream(
             Box::pin(rx),
             pending,
@@ -577,7 +590,7 @@ impl Client {
     /// Use [`Client::send_ws_awaiting`] to get the correlated response.
     pub(crate) async fn send_ws(&self, request: Request<'_>) -> crate::Result<String> {
         let (frame, request_id) = self.encode_ws_request(request)?;
-        let mut sink = self.ws.lock().await;
+        let mut sink = self.connection.sink.lock().await;
         sink.as_mut()
             .ok_or_else(|| crate::Error::WebSocketNotConnected)?
             .tx
@@ -604,13 +617,14 @@ impl Client {
         request: Request<'_>,
     ) -> crate::Result<PendingResponse> {
         let (frame, request_id) = self.encode_ws_request(request)?;
-        let mut sink = self.ws.lock().await;
+        let mut sink = self.connection.sink.lock().await;
         let ws = sink
             .as_mut()
             .ok_or_else(|| crate::Error::WebSocketNotConnected)?;
         let pending = self
-            .ws_pending
-            .register(request_id, self.ws_pending.generation());
+            .connection
+            .pending
+            .register(request_id, self.connection.pending.generation());
         ws.tx
             .send(Message::text(frame))
             .await
@@ -638,14 +652,10 @@ impl Client {
             .and_then(crate::core::session::CoreCapabilities::max_size_request);
         let request_id = self.next_ws_request_id();
 
-        let method_calls =
-            serde_json::to_value(&request.method_calls).map_err(crate::Error::RequestEncode)?;
         let frame = serde_json::to_string(&WebSocketRequest {
             _type: WebSocketRequestType::Request,
-            id: request_id.clone().into(),
-            using: request.using,
-            method_calls,
-            created_ids: request.created_ids,
+            id: request_id.clone(),
+            request: &request,
         })
         .map_err(crate::Error::RequestEncode)?;
 
@@ -682,7 +692,8 @@ impl Client {
             push_state: push_state.map(std::convert::Into::into),
         })
         .map_err(crate::Error::RequestEncode)?;
-        self.ws
+        self.connection
+            .sink
             .lock()
             .await
             .as_mut()
@@ -698,7 +709,8 @@ impl Client {
             _type: WebSocketPushDisableType::WebSocketPushDisable,
         })
         .map_err(crate::Error::RequestEncode)?;
-        self.ws
+        self.connection
+            .sink
             .lock()
             .await
             .as_mut()
@@ -710,7 +722,8 @@ impl Client {
     }
 
     pub(crate) async fn ws_ping(&self) -> crate::Result<()> {
-        self.ws
+        self.connection
+            .sink
             .lock()
             .await
             .as_mut()
@@ -1690,6 +1703,20 @@ mod tests {
             encoder.encode_ws_request(request),
             Err(crate::Error::RequestSizeLimit { max: 1, .. })
         ));
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn websocket_frame_wraps_the_http_request_envelope() {
+        let client = size_limited_client(10000);
+        let request = client.build_oversized_request();
+        let http = serde_json::to_value(&request).unwrap();
+        let (frame, id) = client.encode_ws_request(request).unwrap();
+        let mut frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let object = frame.as_object_mut().unwrap();
+        assert_eq!(object.remove("@type"), Some(serde_json::json!("Request")));
+        assert_eq!(object.remove("id"), Some(serde_json::json!(id)));
+        assert_eq!(frame, http);
     }
 
     #[cfg(feature = "mail")]

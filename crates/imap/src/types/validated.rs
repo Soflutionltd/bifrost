@@ -14,18 +14,43 @@ use std::fmt;
 /// Error returned when constructing a validated IMAP protocol type from an
 /// invalid string.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct ValidationError(String);
+#[error("{message}")]
+pub struct ValidationError {
+    pub(crate) reason: ValidationReason,
+    message: String,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationReason {
+    InvalidSequenceSet,
+    WildcardInKnownSet,
+    SearchResultInKnownSet,
+    EmptyAtom,
+    InvalidAtomByte(u8),
+    MailboxControlCharacter,
+    InvalidMailboxIdentity,
+    NonAsciiHierarchyDelimiter,
+    EmptyObjectId,
+    ObjectIdTooLong { length: usize, limit: usize },
+    InvalidObjectIdByte(u8),
+    ZeroIdentifier,
+    MissingAddressSeparator,
+    InvalidAddressParts,
+}
 
 impl ValidationError {
     /// Create a new validation error with the given message.
-    pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+    pub fn new(reason: ValidationReason, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
     }
 
     /// Return the error message as a string slice.
     pub fn message(&self) -> &str {
-        &self.0
+        &self.message
     }
 }
 
@@ -64,9 +89,10 @@ impl SequenceSet {
     pub fn new(s: impl Into<String>) -> Result<Self, ValidationError> {
         let s = s.into();
         if !is_valid_sequence_set(&s) {
-            return Err(ValidationError::new(format!(
-                "invalid sequence set per RFC 3501 Section 9: {s:?}"
-            )));
+            return Err(ValidationError::new(
+                ValidationReason::InvalidSequenceSet,
+                format!("invalid sequence set per RFC 3501 Section 9: {s:?}"),
+            ));
         }
         Ok(Self(s))
     }
@@ -81,6 +107,7 @@ impl SequenceSet {
         // RFC 7162 Section 3.2.5.2: "*" is not allowed in known-uids/sequence-set.
         if s.contains('*') {
             return Err(ValidationError::new(
+                ValidationReason::WildcardInKnownSet,
                 "\"*\" is not allowed in QRESYNC known-uids/sequence-set \
                  (RFC 7162 Section 3.2.5.2)",
             ));
@@ -88,6 +115,7 @@ impl SequenceSet {
         // RFC 5182 search result reference is not valid in QRESYNC context.
         if s.contains('$') {
             return Err(ValidationError::new(
+                ValidationReason::SearchResultInKnownSet,
                 "\"$\" (search result reference) is not allowed in QRESYNC \
                  known-uids/sequence-set (RFC 7162 Section 7)",
             ));
@@ -96,6 +124,7 @@ impl SequenceSet {
         // this validates nz-number ranges only).
         if !is_valid_sequence_set(&s) {
             return Err(ValidationError::new(
+                ValidationReason::InvalidSequenceSet,
                 "QRESYNC known-uids/sequence-set is not a valid sequence-set \
                  (RFC 7162 Section 7: known-uids = sequence-set)",
             ));
@@ -275,10 +304,13 @@ impl From<ImapAtom> for String {
 /// `resp-specials = "]"`.
 pub(crate) fn validate_atom_bytes(bytes: &[u8], context: &str) -> Result<(), ValidationError> {
     if bytes.is_empty() {
-        return Err(ValidationError::new(format!(
-            "{context} must be at least one character \
+        return Err(ValidationError::new(
+            ValidationReason::EmptyAtom,
+            format!(
+                "{context} must be at least one character \
              (RFC 3501 Section 9: atom = 1*ATOM-CHAR)"
-        )));
+            ),
+        ));
     }
     for &b in bytes {
         let is_atom_special = matches!(
@@ -288,10 +320,13 @@ pub(crate) fn validate_atom_bytes(bytes: &[u8], context: &str) -> Result<(), Val
         let is_ctl = b < 0x20 || b == 0x7F;
         let is_outside_char = b == 0 || b > 0x7F;
         if is_atom_special || is_ctl || is_outside_char {
-            return Err(ValidationError::new(format!(
-                "{context} contains invalid byte 0x{b:02X}  -  must be an atom \
+            return Err(ValidationError::new(
+                ValidationReason::InvalidAtomByte(b),
+                format!(
+                    "{context} contains invalid byte 0x{b:02X}  -  must be an atom \
                  (RFC 3501 Section 9: ATOM-CHAR excludes atom-specials, CTL, non-ASCII)"
-            )));
+                ),
+            ));
         }
     }
     Ok(())
@@ -372,6 +407,7 @@ impl MailboxName {
         let s = s.into();
         if s.bytes().any(|b| matches!(b, b'\0' | b'\r' | b'\n')) {
             return Err(ValidationError::new(
+                ValidationReason::MailboxControlCharacter,
                 "mailbox name must not contain NUL, CR, or LF  -  IMAP strings \
                  forbid NUL (RFC 3501 Section 9 / RFC 9051 Section 9) and \
                  commands are CRLF-delimited (RFC 3501 Section 2.2 / \
@@ -460,12 +496,23 @@ impl MailboxName {
         };
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)
-            .map_err(|_| ValidationError::new("invalid mailbox identity"))?;
+            .map_err(|_| {
+                ValidationError::new(
+                    ValidationReason::InvalidMailboxIdentity,
+                    "invalid mailbox identity",
+                )
+            })?;
         let Some((&mode, bytes)) = payload.split_first() else {
-            return Err(ValidationError::new("empty mailbox identity"));
+            return Err(ValidationError::new(
+                ValidationReason::InvalidMailboxIdentity,
+                "empty mailbox identity",
+            ));
         };
         if mode > 1 || bytes.contains(&0) {
-            return Err(ValidationError::new("invalid mailbox identity payload"));
+            return Err(ValidationError::new(
+                ValidationReason::InvalidMailboxIdentity,
+                "invalid mailbox identity payload",
+            ));
         }
         let display = if mode == 1 {
             String::from_utf8_lossy(bytes).into_owned()
@@ -483,6 +530,7 @@ impl MailboxName {
             // lenient display decoding. Never reconstruct a noncanonical parent.
             if !delimiter.is_ascii() && !self.can_reencode() {
                 return Err(ValidationError::new(
+                    ValidationReason::NonAsciiHierarchyDelimiter,
                     "noncanonical mailbox requires an ASCII hierarchy delimiter",
                 ));
             }
@@ -505,6 +553,7 @@ impl MailboxName {
         if let Some((bytes, utf8)) = &self.1 {
             if !delimiter.is_ascii() && !self.can_reencode() {
                 return Err(ValidationError::new(
+                    ValidationReason::NonAsciiHierarchyDelimiter,
                     "noncanonical mailbox requires an ASCII hierarchy delimiter",
                 ));
             }
@@ -686,24 +735,34 @@ impl ObjectId {
         let s = s.into();
         if s.is_empty() {
             return Err(ValidationError::new(
+                ValidationReason::EmptyObjectId,
                 "object identifier must not be empty (RFC 8474 Section 4)",
             ));
         }
         if s.len() > 255 {
-            return Err(ValidationError::new(format!(
-                "object identifier exceeds 255 characters ({} bytes) \
+            return Err(ValidationError::new(
+                ValidationReason::ObjectIdTooLong {
+                    length: s.len(),
+                    limit: 255,
+                },
+                format!(
+                    "object identifier exceeds 255 characters ({} bytes) \
                  (RFC 8474 Section 4: objectid = 1*255(...))",
-                s.len()
-            )));
+                    s.len()
+                ),
+            ));
         }
         for &b in s.as_bytes() {
             let valid = b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
             if !valid {
-                return Err(ValidationError::new(format!(
-                    "object identifier contains invalid byte 0x{b:02X}  -  \
+                return Err(ValidationError::new(
+                    ValidationReason::InvalidObjectIdByte(b),
+                    format!(
+                        "object identifier contains invalid byte 0x{b:02X}  -  \
                      only ALPHA / DIGIT / \"_\" / \"-\" are allowed \
                      (RFC 8474 Section 4)"
-                )));
+                    ),
+                ));
             }
         }
         Ok(Self(s))

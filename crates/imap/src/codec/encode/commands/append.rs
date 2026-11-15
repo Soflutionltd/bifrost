@@ -161,9 +161,12 @@ fn body_form(
         // The body is expressible; the server lacks the capability that
         // would carry it, so this is `Unsupported`, not a malformed request.
         Err(crate::Error::MissingCapability(
-            "APPEND data containing NUL requires BINARY literal8 support \
-             (RFC 3516 Section 4.4)"
-                .into(),
+            crate::error::CapabilityFailure::new(
+                "BINARY".into(),
+                crate::error::CapabilityFailureReason::NotAdvertised,
+                "APPEND data containing NUL requires BINARY literal8 support \
+             (RFC 3516 Section 4.4)",
+            ),
         ))
     }
 }

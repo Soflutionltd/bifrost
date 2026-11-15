@@ -143,10 +143,13 @@ pub(super) fn encode_search(
     // RFC 6855 Section 3: after ENABLE UTF8=ACCEPT, clients MUST NOT issue a
     // SEARCH command that contains a charset specification.
     if utf8 && search_criteria_starts_with_charset(criteria) {
-        return Err(crate::Error::InvalidInput(format!(
-            "{cmd} must not include a CHARSET specification when UTF8=ACCEPT is active \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{cmd} must not include a CHARSET specification when UTF8=ACCEPT is active \
              (RFC 6855 Section 3)"
-        )));
+            )
+            .into(),
+        ));
     }
     w.raw(tag.as_bytes());
     w.raw(b" ");
@@ -316,10 +319,13 @@ fn normalize_status_items(items: &str, context: &str) -> Result<String, crate::E
 fn normalize_status_items_body(items: &str, context: &str) -> Result<String, crate::Error> {
     let trimmed = items.trim();
     if trimmed.is_empty() {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must contain at least one status data item \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must contain at least one status data item \
              (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-        )));
+            )
+            .into(),
+        ));
     }
 
     let body = match (trimmed.strip_prefix('('), trimmed.strip_suffix(')')) {
@@ -327,34 +333,46 @@ fn normalize_status_items_body(items: &str, context: &str) -> Result<String, cra
             let inner = without_open
                 .strip_suffix(')')
                 .ok_or_else(|| {
-                    crate::Error::InvalidInput(format!(
-                        "{context} must be a single parenthesized status-att-list \
+                    crate::Error::InvalidInput(
+                        format!(
+                            "{context} must be a single parenthesized status-att-list \
                          (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                    ))
+                        )
+                        .into(),
+                    )
                 })?
                 .trim();
             if inner.is_empty() {
-                return Err(crate::Error::InvalidInput(format!(
-                    "{context} must contain at least one status data item \
+                return Err(crate::Error::InvalidInput(
+                    format!(
+                        "{context} must contain at least one status data item \
                      (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                )));
+                    )
+                    .into(),
+                ));
             }
             inner
         }
         (Some(_), None) | (None, Some(_)) => {
-            return Err(crate::Error::InvalidInput(format!(
-                "{context} must use balanced parentheses for status-att-list \
+            return Err(crate::Error::InvalidInput(
+                format!(
+                    "{context} must use balanced parentheses for status-att-list \
                  syntax (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-            )));
+                )
+                .into(),
+            ));
         }
         (None, None) => trimmed,
     };
 
     if body.contains('(') || body.contains(')') {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must be a flat status-att-list without nested parentheses \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must be a flat status-att-list without nested parentheses \
              (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-        )));
+            )
+            .into(),
+        ));
     }
 
     Ok(body.to_owned())
@@ -367,10 +385,13 @@ fn normalize_status_items_body(items: &str, context: &str) -> Result<String, cra
 /// for SORT and THREAD.
 fn validate_non_empty_search_criteria(criteria: &str, context: &str) -> Result<(), crate::Error> {
     if criteria.trim().is_empty() {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must contain at least one search criterion \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must contain at least one search criterion \
              (RFC 3501 Section 6.4.4 / RFC 5256 Section 6)"
-        )));
+            )
+            .into(),
+        ));
     }
     Ok(())
 }
@@ -424,24 +445,33 @@ fn validate_single_fetch_att(attr: &str) -> Result<(), crate::Error> {
 fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crate::Error> {
     let trimmed = items.trim();
     if trimmed.is_empty() {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must contain at least one message data item \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must contain at least one message data item \
              (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-        )));
+            )
+            .into(),
+        ));
     }
 
     if let Some(inner) = trimmed.strip_prefix('(') {
         let inner = inner.strip_suffix(')').ok_or_else(|| {
-            crate::Error::InvalidInput(format!(
-                "{context} must use balanced parentheses for fetch-att list \
+            crate::Error::InvalidInput(
+                format!(
+                    "{context} must use balanced parentheses for fetch-att list \
                  syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-            ))
+                )
+                .into(),
+            )
         })?;
         if inner.trim().is_empty() {
-            return Err(crate::Error::InvalidInput(format!(
-                "{context} must contain at least one message data item \
+            return Err(crate::Error::InvalidInput(
+                format!(
+                    "{context} must contain at least one message data item \
                  (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-            )));
+                )
+                .into(),
+            ));
         }
     }
 
@@ -470,30 +500,39 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
             '[' => bracket_depth += 1,
             ']' => {
                 if bracket_depth == 0 {
-                    return Err(crate::Error::InvalidInput(format!(
-                        "{context} must use balanced quotes and delimiters for fetch-att \
+                    return Err(crate::Error::InvalidInput(
+                        format!(
+                            "{context} must use balanced quotes and delimiters for fetch-att \
                          syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-                    )));
+                        )
+                        .into(),
+                    ));
                 }
                 bracket_depth -= 1;
             }
             '<' if bracket_depth == 0 => angle_depth += 1,
             '>' if bracket_depth == 0 => {
                 if angle_depth == 0 {
-                    return Err(crate::Error::InvalidInput(format!(
-                        "{context} must use balanced quotes and delimiters for fetch-att \
+                    return Err(crate::Error::InvalidInput(
+                        format!(
+                            "{context} must use balanced quotes and delimiters for fetch-att \
                          syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-                    )));
+                        )
+                        .into(),
+                    ));
                 }
                 angle_depth -= 1;
             }
             '(' if bracket_depth == 0 && angle_depth == 0 => paren_depth += 1,
             ')' if bracket_depth == 0 && angle_depth == 0 => {
                 if paren_depth == 0 {
-                    return Err(crate::Error::InvalidInput(format!(
-                        "{context} must use balanced quotes and delimiters for fetch-att \
+                    return Err(crate::Error::InvalidInput(
+                        format!(
+                            "{context} must use balanced quotes and delimiters for fetch-att \
                          syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-                    )));
+                        )
+                        .into(),
+                    ));
                 }
                 paren_depth -= 1;
             }
@@ -502,10 +541,13 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
     }
 
     if in_quote || bracket_depth != 0 || angle_depth != 0 || paren_depth != 0 {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must use balanced quotes and delimiters for fetch-att \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must use balanced quotes and delimiters for fetch-att \
              syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
-        )));
+            )
+            .into(),
+        ));
     }
 
     Ok(())

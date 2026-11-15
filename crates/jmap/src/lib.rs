@@ -378,6 +378,12 @@ pub(crate) enum Error {
     /// than a terminal missing field.
     SetIdUnanswered(String),
     /// Not parsable as the expected format.
+    ///
+    /// Keep this format-failure meaning separate from malformed provider
+    /// contracts. The account layer still constructs this variant for missing
+    /// state and mismatched blob-copy accounts; correcting those producers
+    /// needs their error translation changed together, not a guessed meaning
+    /// inferred from the diagnostic string here.
     NotParsable(String),
     /// A URL or URL-component value this crate's own caller supplied is
     /// unusable (an empty custom-transport session URL or EventSource type
@@ -481,6 +487,10 @@ impl From<core::transport::TransportError> for Error {
     }
 }
 
+// This legacy conversion cannot establish response provenance. Replacing it
+// requires the account error boundary and send partial-commit predicates to
+// distinguish envelope, method-result and session decoding together; changing
+// only the producer would silently alter retry and transmission evidence.
 // Default JSON-error conversion treats failures as response decoding.
 // Outbound request encoding sites must use Error::RequestEncode
 // explicitly rather than relying on `?`.

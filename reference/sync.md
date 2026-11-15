@@ -487,7 +487,11 @@ expires it; an orphan is therefore never recreated against a replacement,
 is carried across swaps, and is retried by the next reopen,
 `unsubscribe_push`, or the account's orphan-teardown timer
 (`PushConfig::orphan_teardown_retry_interval`).
-Two independent flags sit on each registry record, and they answer
+`SubscriptionState` represents four states: `Live`, `LiveTeardownFailed`,
+`TornDownAwaitingRecreate`, and `Orphan`. The `desired()`,
+`teardown_unconfirmed()` and `torn_down()` predicates below derive from that
+state; there are no independently writable flags. A failed teardown notification
+cannot resurrect a handle already known torn down. The predicates answer
 different questions. `teardown_unconfirmed` says a server-side teardown
 of the handle was attempted and failed, so it may still be live and its
 teardown is retried. `desired` says the consumer still wants the
@@ -569,8 +573,9 @@ writer's `GetChangeCursor`) passes its attempt as `claim_for`; if the row is
 still provisional the writer moves ownership to the resuming attempt, in queue
 order with inserts, aborts and commits. Without that, a dropped attempt's late
 abort deleted a row the installed topology depends on. A committed row has no
-provisional entry and is untouched, and reads outside a reattach (scope
-restart, and attach, which reads the store directly) never claim. The
+provisional entry and is untouched. Reads outside a reattach never claim:
+attach reads the store directly, and a scope restart's read sees a
+still-provisional row as absent (see "Resume ownership" below). The
 inventory fusion does not read stored cursors through the writer. Because the
 claim can land inside `run_establish`, the guard arms `rollback_owed` before
 each fresh-scope establishment rather than only before the first insert; an
@@ -608,11 +613,12 @@ before the take (and discarded by it) or after it (and sees the cancelled token
 and refuses). A check made before the write, as the cleanup task once did,
 leaves a window on a multi-thread runtime: the token is read, detach cancels
 and takes, and the orphan then lands under an id a later attach of the same
-`AccountId` inherits. Detach does not take the reopen lock to close that window,
-deliberately: consumer-driven reattaches hold it across `factory.open()` and
-network calls, detach does not wait for them, and a lock acquisition there would
-make the one call a consumer has for getting rid of an account wait on a wedged
-open. The same sealed write is used by the ordinary abort's unwind and by
+`AccountId` inherits. The reopen lock does not close that window: detach's wait
+for it before the take is bounded by `detach_timeout` (consumer-driven
+reattaches hold it across `factory.open()` and network calls, and the one call
+a consumer has for getting rid of an account must not wait on a wedged open),
+and on expiry detach proceeds without it. The token read inside the shard lock
+is what orders a restore against the take in every case. The same sealed write is used by the ordinary abort's unwind and by
 `unsubscribe_push`.
 
 A refused `record` or `replace` names subscriptions that are LIVE on the
@@ -4090,7 +4096,7 @@ no in-engine caller - teardown pulses the slot's
 is kept as published surface rather than removed, the same standing as
 `SyncControl::record_checkpoint`. `ChangeDelivery` is public from `multiplexer`
 (`new`, `sender`, `publish_backfill`, `subscribe`, `min_live`). `PendingCoverage`
-gained sixteen public methods: `mark_delivered`, `mark_received`
+gained the following methods (receiver membership mutators are now crate-private): `mark_delivered`, `mark_received`
 (the receipt bound's permit), `receiver_joined` and `receiver_departed` (the
 live numbered set the slowest-reader rule is evaluated against),
 `backfill_in_flight`,
@@ -4223,3 +4229,36 @@ same Arc. Unnumbered observers remain available through `observe`. The delivery
 lock still orders subscribe, send/stamp and departure, with delivery-to-coverage
 lock order. Receivers retain a weak delivery handle so they cannot keep the
 broadcast sender alive after detach; the ledger retains no delivery handle.
+
+
+## Resume ownership and explicit internal phases
+
+A dropped reattach can release the reopen lock while its rollback send waits
+for writer queue capacity. A scoped recovery can then read the row before the
+old abort arrives. Such a row was minted by a replacement that never became
+live, and no acknowledgement confirmed it, because any durable change
+acknowledgement would already have promoted it. Resuming the live scope from it
+could skip an inventory baseline the consumer never durably received. So an
+ordinary `GetChangeCursor` read (only the live incarnation's scope recovery
+issues one) is answered as absent while the row is still provisional, and the
+live scope establishes fresh. Its successful `PersistEstablished` releases the
+provisional mark, so the late abort cannot delete the live row. If no persist
+lands first, the abort deletes the unconfirmed row as intended. A reattach read
+(`claim_for`) still transfers ownership to its own attempt. Failed reads and
+absent rows change no ownership. The cost is one re-inventory in that window,
+which an enterprise user prefers to silently missing mail.
+
+Coverage membership mutation is crate-private. A coverage ledger also binds
+permanently to one delivery gate's weak identity on its first numbered
+subscription. Sharing it with a second gate is rejected before subscription,
+since independently issued receiver numbers cannot describe one live set.
+The weak identity keeps no sender alive; delivery-to-coverage lock order remains.
+
+Mutation cohorts use `CohortPhase` for unsubmitted, submitted, readback and
+completed work. Completion retains whether submission happened, because final
+outcome construction distinguishes known-unsent targets from uncertain writes.
+Retry and reconciliation deadlines remain independent scheduling data.
+Recovery wait allowance exhaustion returns `Error::WaitBudgetExhausted` through
+the result instead of a pacing side flag. The pacing `observed` flag remains
+independent evidence about recording the returned failure, separate from cleanup
+holds and the cumulative wait allowance.

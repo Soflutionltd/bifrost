@@ -62,7 +62,7 @@ pub(crate) fn list<T: HttpTransport>(
         // the wire that a server may refuse wholesale with
         // `requestTooLarge` (RFC 8620 s5.1). Batch at the advertised
         // `maxObjectsInGet`.
-        let batch = super::factory::max_objects_in_get(&account.client().session());
+        let batch = super::capabilities::max_objects_in_get(&account.client().session());
         let mut listed = Vec::new();
         let mut not_found: Vec<String> = Vec::new();
         for chunk in ids.chunks(batch) {

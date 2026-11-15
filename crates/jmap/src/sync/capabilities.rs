@@ -103,6 +103,31 @@ fn malformed_required_capability(uri: &str) -> AccountError {
 
 use crate::core::session::Session;
 
+/// The `maxObjectsInGet` a session advertises, for the doors that hold a
+/// bare `Account` rather than the `CoreLimits` built at open.
+/// `capabilities::build` refuses a session that omits or zeroes this, so
+/// the fallback is only ever reached by a caller running ahead of that
+/// validation; batching one id at a time is the safe shape there.
+pub(super) fn max_objects_in_get(session: &crate::core::session::Session) -> usize {
+    session
+        .core_capabilities()
+        .map(CoreLimits::from_core)
+        .map_or(1, |limits| limits.max_objects_in_get)
+}
+
+/// The per-call `/set` ceiling for paths that hold a bare `Account`
+/// instead of the validated `CoreLimits` from open. Keep the same upper
+/// bound used by bulk mutation batching, while never exceeding the
+/// server-advertised limit.
+pub(super) fn max_objects_in_set(session: &crate::core::session::Session) -> usize {
+    set_batch_size(
+        session
+            .core_capabilities()
+            .map(CoreLimits::from_core)
+            .map_or(1, |limits| limits.max_objects_in_set),
+    )
+}
+
 /// RFC 8620 section 2 requires maxSizeUpload. Zero permits only empty files;
 /// the suggested minimum is not a mandatory lower bound.
 pub(crate) fn upload_size_limit(session: &Session) -> Result<usize, AccountError> {
@@ -115,10 +140,29 @@ pub(crate) fn upload_size_limit(session: &Session) -> Result<usize, AccountError
     }
 }
 
+/// One local batching policy for advertised capabilities and request doors.
+pub(super) const BATCH_MAX_WAIT: Duration = Duration::from_millis(100);
+
+pub(super) fn set_batch_size(advertised: usize) -> usize {
+    advertised.clamp(1, 500)
+}
+
+// Bare protocol Accounts do not carry the validated sync slot. Until that
+// handle exposes its slot limits, these doors must read its session snapshot;
+// do not substitute the primary sync account's limits for a foreign handle.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CoreLimits {
     pub(crate) max_objects_in_get: usize,
     pub(crate) max_objects_in_set: usize,
+}
+
+impl CoreLimits {
+    fn from_core(core: &crate::core::session::CoreCapabilities) -> Self {
+        Self {
+            max_objects_in_get: core.max_objects_in_get().unwrap_or(1).max(1),
+            max_objects_in_set: core.max_objects_in_set().unwrap_or(1).max(1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,8 +237,10 @@ pub(crate) fn validate_session(session: &Session) -> Result<CoreLimits, AccountE
         return Err(unusable_core_limits());
     }
     // Every one of the four is `Some(> 0)` past this point.
-    let max_objects_in_get = core.max_objects_in_get().unwrap_or(1).max(1);
-    let max_objects_in_set = core.max_objects_in_set().unwrap_or(1).max(1);
+    let CoreLimits {
+        max_objects_in_get,
+        max_objects_in_set,
+    } = CoreLimits::from_core(core);
 
     // The same Absent / Malformed / Present split, applied to every other
     // capability this crate models. A block the account DEPENDS on -
@@ -254,7 +300,7 @@ pub(crate) fn build(
         }
     };
 
-    let max_items = max_objects_in_set.clamp(1, 500);
+    let max_items = set_batch_size(max_objects_in_set);
     let caps = AccountCapabilities {
         cursor_freshness: CursorFreshness::ServerIssued,
         // The existing JMAP transport exposes whole-blob downloads only.
@@ -285,7 +331,7 @@ pub(crate) fn build(
         },
         batching_policy: BatchingPolicy {
             max_items,
-            max_wait: Duration::from_millis(100),
+            max_wait: BATCH_MAX_WAIT,
             flush_on_input_close: true,
         },
         rate_limit_class: RateLimitClass::Generous,

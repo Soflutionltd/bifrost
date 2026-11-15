@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use bifrost_types::TransmissionState;
 
-use crate::types::{AuthMechanism, ResponseCode};
+use crate::types::{AuthMechanism, Capability, ResponseCode};
 
 /// Crate-internal wire-level transmission evidence attached to
 /// transport-shaped failures.
@@ -169,7 +169,7 @@ pub(crate) enum Error {
     /// mailbox name, validator failure). Distinct from `Protocol`,
     /// which means the *server* violated the wire contract.
     #[error("invalid input: {0}")]
-    InvalidInput(String),
+    InvalidInput(LocalFailure),
 
     /// The connection's local protocol state does not permit the command:
     /// the wrong session state for it (LOGIN once authenticated, CLOSE with
@@ -182,7 +182,7 @@ pub(crate) enum Error {
     /// A session already in Logout is `Closed` instead - the connection is
     /// gone, which is a transport condition, not a sequencing mistake.
     #[error("command not valid in the current connection state: {0}")]
-    InvalidState(String),
+    InvalidState(LocalFailure),
 
     /// The session state changed while the command waited in the driver's
     /// queue, so the check made against live state at the head of the queue
@@ -190,7 +190,7 @@ pub(crate) enum Error {
     /// caller may re-issue after refreshing state, which is why this maps to a
     /// transient conflict rather than a client bug.
     #[error("session state changed before the command was sent: {0}")]
-    StateChangedBeforeSend(String),
+    StateChangedBeforeSend(LocalFailure),
 
     /// The operation is valid but this version of the crate does not
     /// implement it - a variant of a published `#[non_exhaustive]` request
@@ -222,9 +222,10 @@ pub(crate) enum Error {
     #[error("authentication policy rejected authentication: {0}")]
     AuthPolicy(AuthPolicyFailure),
 
-    /// A capability required for the requested operation is not advertised.
+    /// A server prerequisite is unavailable; the payload identifies the
+    /// capability and distinguishes advertisement, negotiation, and policy.
     #[error("missing required capability: {0}")]
-    MissingCapability(String),
+    MissingCapability(CapabilityFailure),
 
     /// Message exceeds the server's advertised APPENDLIMIT (RFC 7889 Section 3).
     #[error("message size {size} exceeds server APPENDLIMIT of {limit}")]
@@ -310,7 +311,11 @@ impl From<std::io::Error> for Error {
 
 impl From<crate::types::ValidationError> for Error {
     fn from(e: crate::types::ValidationError) -> Self {
-        Self::InvalidInput(e.to_string())
+        Self::InvalidInput(LocalFailure {
+            message: e.to_string(),
+            validation: Some(e),
+            state: None,
+        })
     }
 }
 
@@ -394,11 +399,7 @@ impl PartialEq for Error {
             (Self::Protocol(a), Self::Protocol(b))
             | (Self::ProtocolMissing(a), Self::ProtocolMissing(b))
             | (Self::Parse(a), Self::Parse(b))
-            | (Self::InvalidInput(a), Self::InvalidInput(b))
-            | (Self::InvalidState(a), Self::InvalidState(b))
-            | (Self::StateChangedBeforeSend(a), Self::StateChangedBeforeSend(b))
             | (Self::UnsupportedOperation(a), Self::UnsupportedOperation(b))
-            | (Self::MissingCapability(a), Self::MissingCapability(b))
             | (Self::InvalidAppendDate(a), Self::InvalidAppendDate(b))
             | (Self::Internal(a), Self::Internal(b))
             | (Self::LocalRuntime(a), Self::LocalRuntime(b)) => a == b,
@@ -412,6 +413,10 @@ impl PartialEq for Error {
                     attempt: a2,
                 },
             ) => m1 == m2 && a1 == a2,
+            (Self::MissingCapability(a), Self::MissingCapability(b)) => a == b,
+            (Self::InvalidInput(a), Self::InvalidInput(b))
+            | (Self::InvalidState(a), Self::InvalidState(b))
+            | (Self::StateChangedBeforeSend(a), Self::StateChangedBeforeSend(b)) => a == b,
             (Self::AuthPolicy(a), Self::AuthPolicy(b)) => a == b,
             (Self::Timeout { attempt: a }, Self::Timeout { attempt: b })
             | (Self::Closed { attempt: a }, Self::Closed { attempt: b })
@@ -741,13 +746,19 @@ impl Error {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthPolicyFailure {
-    pub(crate) offered: Vec<String>,
+    pub(crate) offered: Vec<OfferedAuthentication>,
     pub(crate) rejected: Vec<AuthMechanismRejection>,
 }
 
 impl AuthPolicyFailure {
     pub(crate) fn new(offered: Vec<String>, rejected: Vec<AuthMechanismRejection>) -> Self {
-        Self { offered, rejected }
+        Self {
+            offered: offered
+                .into_iter()
+                .map(OfferedAuthentication::from)
+                .collect(),
+            rejected,
+        }
     }
 }
 
@@ -759,13 +770,21 @@ impl std::fmt::Display for AuthPolicyFailure {
             write!(
                 f,
                 "no permitted authentication mechanism among offered mechanisms: {}",
-                self.offered.join(", ")
+                self.offered
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         } else {
             write!(
                 f,
                 "no permitted authentication mechanism among offered mechanisms: {}; rejected: ",
-                self.offered.join(", ")
+                self.offered
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )?;
             for (idx, rejection) in self.rejected.iter().enumerate() {
                 if idx > 0 {
@@ -825,3 +844,241 @@ impl std::fmt::Display for AuthMechanismRejectionReason {
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod tests;
+
+/// Structured prerequisite evidence, with the original diagnostic retained for
+/// account translation and support logs. Consumers should inspect `reason`
+/// rather than infer session negotiation or protocol removal from prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapabilityFailure {
+    pub(crate) capability: Capability,
+    pub(crate) reason: CapabilityFailureReason,
+    pub(crate) message: String,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CapabilityFailureReason {
+    NotAdvertised,
+    NotEnabled,
+    ProhibitedByServer,
+    RemovedInRev2,
+    LiteralTooLarge {
+        size: usize,
+        limit: usize,
+    },
+    /// Any one of these advertisements would satisfy the operation.
+    Alternatives(Vec<Capability>),
+}
+
+impl CapabilityFailure {
+    pub(crate) fn new(
+        capability: Capability,
+        reason: CapabilityFailureReason,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            capability,
+            reason,
+            message: message.into(),
+        }
+    }
+}
+
+// Converting a bare wire capability is useful for simple advertisement gates.
+// Contextual refusals must use `new` at the gate, where the reason is known.
+impl From<String> for CapabilityFailure {
+    fn from(message: String) -> Self {
+        Self::new(
+            Capability::from(message.as_str()),
+            CapabilityFailureReason::NotAdvertised,
+            message,
+        )
+    }
+}
+
+impl From<&str> for CapabilityFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+impl From<CapabilityFailure> for String {
+    fn from(value: CapabilityFailure) -> Self {
+        value.message
+    }
+}
+
+impl std::ops::Deref for CapabilityFailure {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl PartialEq<str> for CapabilityFailure {
+    fn eq(&self, other: &str) -> bool {
+        self.message == other
+    }
+}
+
+impl PartialEq<&str> for CapabilityFailure {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
+}
+
+impl std::fmt::Display for CapabilityFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Local failure evidence. Free-form local input checks retain their message;
+/// validated types and session checks additionally retain their typed cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalFailure {
+    pub(crate) message: String,
+    pub(crate) validation: Option<crate::types::ValidationError>,
+    pub(crate) state: Option<StateRequirement>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StateRequirement {
+    LegalStates {
+        actual: crate::connection::SessionState,
+        allowed: Vec<crate::connection::SessionState>,
+    },
+    BeforeFirstSelection {
+        command: crate::types::CommandKind,
+    },
+    Enabled(Capability),
+}
+
+impl LocalFailure {
+    pub(crate) fn state(requirement: StateRequirement, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            validation: None,
+            state: Some(requirement),
+        }
+    }
+}
+
+impl From<String> for LocalFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            validation: None,
+            state: None,
+        }
+    }
+}
+
+impl From<&str> for LocalFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+impl From<LocalFailure> for String {
+    fn from(value: LocalFailure) -> Self {
+        value.message
+    }
+}
+
+impl std::ops::Deref for LocalFailure {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl PartialEq<str> for LocalFailure {
+    fn eq(&self, other: &str) -> bool {
+        self.message == other
+    }
+}
+
+impl PartialEq<&str> for LocalFailure {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
+}
+
+impl std::fmt::Display for LocalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Unknown SASL offers remain available for diagnostics and future mechanisms.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OfferedAuthentication {
+    Sasl(AuthMechanism),
+    OtherSasl(String),
+    LoginCommand,
+}
+
+impl From<String> for OfferedAuthentication {
+    fn from(value: String) -> Self {
+        if value.eq_ignore_ascii_case("LOGIN") {
+            return Self::LoginCommand;
+        }
+        let name = value.strip_prefix("AUTH=").unwrap_or(&value);
+        for mechanism in [
+            AuthMechanism::OAuthBearer,
+            AuthMechanism::XOAuth2,
+            AuthMechanism::ScramSha256Plus,
+            AuthMechanism::ScramSha1Plus,
+            AuthMechanism::ScramSha256,
+            AuthMechanism::ScramSha1,
+            AuthMechanism::Plain,
+            AuthMechanism::CramMd5,
+        ] {
+            if name.eq_ignore_ascii_case(mechanism.name()) {
+                return Self::Sasl(mechanism);
+            }
+        }
+        Self::OtherSasl(name.to_owned())
+    }
+}
+
+impl std::fmt::Display for OfferedAuthentication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sasl(mechanism) => write!(f, "AUTH={}", mechanism.name()),
+            Self::OtherSasl(name) => write!(f, "AUTH={name}"),
+            Self::LoginCommand => f.write_str("LOGIN"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod typed_failure_tests {
+    use super::*;
+
+    #[test]
+    fn validation_conversion_preserves_the_rule() {
+        let validation = crate::types::SequenceSet::new_known("*").unwrap_err();
+        let error = Error::from(validation.clone());
+        let Error::InvalidInput(detail) = error else {
+            panic!("expected local validation")
+        };
+        assert_eq!(detail.validation, Some(validation));
+        assert!(detail.state.is_none());
+    }
+
+    #[test]
+    fn capability_failure_preserves_negotiation_reason_and_message() {
+        let detail = CapabilityFailure::new(
+            Capability::QResync,
+            CapabilityFailureReason::NotEnabled,
+            "QRESYNC (not ENABLEd)",
+        );
+        assert_eq!(detail.capability, Capability::QResync);
+        assert_eq!(detail.reason, CapabilityFailureReason::NotEnabled);
+        assert_eq!(detail.to_string(), "QRESYNC (not ENABLEd)");
+    }
+}

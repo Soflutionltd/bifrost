@@ -12,6 +12,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, GmailCursorFailure, GmailLocalError};
 
+/// Gmail inventory samples its history cursor before listing. A missing
+/// message is therefore already absent or removed by the bridged change log.
+/// Users expect a concurrently deleted message to disappear without repair debt.
+/// This proof is only for inventory and its repair lane, not mutation success.
+pub(super) fn absence_proven_by_cursor_bridge(
+    error: &bifrost_types::AccountError,
+) -> Option<bifrost_types::DefinitiveIrrelevance> {
+    matches!(
+        error.kind(),
+        bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message)
+    )
+    .then(
+        || bifrost_types::DefinitiveIrrelevance::AbsentUnderCursorBridge {
+            detail: "Gmail message absent; the history cursor precedes the inventory walk, \
+                 so the change stream bridges any removal"
+                .to_string(),
+        },
+    )
+}
+
 pub(crate) const GMAIL_PROTOCOL: ProtocolKind = ProtocolKind::Gmail;
 pub(crate) const GMAIL_ENVELOPE_VERSION: u32 = 1;
 const GMAIL_SCHEMA_VERSION: u8 = 1;
@@ -81,7 +101,9 @@ pub(crate) fn decode_gmail_state_for_profile(
     profile_email: &str,
 ) -> Result<GmailChangeState, Error> {
     let decoded = decode_gmail_state(state)?;
-    if !decoded.profile_email.eq_ignore_ascii_case(profile_email) {
+    if !super::mailbox::MailboxAddress::from_provider_value(profile_email)
+        .matches(&decoded.profile_email)
+    {
         return Err(Error::Local(GmailLocalError::AccountIdentityMismatch {
             cursor_email: decoded.profile_email,
             profile_email: profile_email.to_string(),

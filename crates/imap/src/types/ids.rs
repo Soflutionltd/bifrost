@@ -22,7 +22,10 @@ macro_rules! nonzero_u32_id {
             /// Create the identifier, returning a validation error for zero.
             pub fn try_new(value: u32) -> Result<Self, ValidationError> {
                 Self::new(value).ok_or_else(|| {
-                    ValidationError::new(concat!(stringify!($name), " must be greater than zero"))
+                    ValidationError::new(
+                        super::validated::ValidationReason::ZeroIdentifier,
+                        concat!(stringify!($name), " must be greater than zero"),
+                    )
                 })
             }
 

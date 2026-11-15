@@ -294,7 +294,13 @@ impl ImapConnection {
                 .iter()
                 .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
             {
-                return Err(Error::MissingCapability("QRESYNC (not ENABLEd)".into()));
+                return Err(Error::MissingCapability(
+                    crate::error::CapabilityFailure::new(
+                        Capability::QResync,
+                        crate::error::CapabilityFailureReason::NotEnabled,
+                        "QRESYNC (not ENABLEd)",
+                    ),
+                ));
             }
         }
         // RFC 7162 Section 3.2.5.2 ABNF: seq-match-data is only valid after
@@ -393,11 +399,14 @@ impl ImapConnection {
         // non-use-attr values." Reject base LIST attributes like \Noselect,
         // \HasChildren, etc. before sending the command.
         if let Some(bad) = special_use.iter().find(|a| !a.is_special_use()) {
-            return Err(Error::InvalidInput(format!(
-                "CREATE USE parameter contains non-special-use attribute {} \
+            return Err(Error::InvalidInput(
+                format!(
+                    "CREATE USE parameter contains non-special-use attribute {} \
                  (RFC 6154 Section 3: USE MUST only contain use-attr values)",
-                bad.as_imap_str()
-            )));
+                    bad.as_imap_str()
+                )
+                .into(),
+            ));
         }
         let cmd = Command::CreateSpecialUse {
             mailbox: mailbox.mailbox_name()?,
@@ -519,9 +528,12 @@ impl ImapConnection {
         // Use LIST with \Subscribed return option instead.
         if self.is_rev2() {
             return Err(Error::MissingCapability(
-                "LSUB was deprecated in IMAP4rev2 (RFC 9051 Appendix F); \
-                 use list() with \\Subscribed attribute instead"
-                    .into(),
+                crate::error::CapabilityFailure::new(
+                    "IMAP4rev2".into(),
+                    crate::error::CapabilityFailureReason::RemovedInRev2,
+                    "LSUB was deprecated in IMAP4rev2 (RFC 9051 Appendix F); \
+                 use list() with \\Subscribed attribute instead",
+                ),
             ));
         }
 

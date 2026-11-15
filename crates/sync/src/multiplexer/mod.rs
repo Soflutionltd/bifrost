@@ -395,6 +395,7 @@ impl ChangeDelivery {
                 "delivery coverage ledger changed"
             );
         } else {
+            coverage.bind_delivery(self);
             state.coverage = Some(Arc::clone(&coverage));
         }
         // Subscribe INSIDE the lock: a receiver created here is numbered against

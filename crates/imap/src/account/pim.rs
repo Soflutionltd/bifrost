@@ -60,7 +60,15 @@ fn op_err(op: AccountOperation) -> impl Fn(Error) -> AccountError + Copy {
     move |e| account_error_with(e, super::error::ImapErrorContext::operation(op))
 }
 
-/// `op_err` for a failure in the PREFLIGHT of a per-folder step - the
+fn folder_err<'a>(
+    account: &'a ImapAccount,
+    folder: &'a MailboxName,
+    op: AccountOperation,
+) -> impl Fn(Error) -> AccountError + Copy + 'a {
+    move |error| account.folder_error(error, folder, super::error::ImapErrorContext::operation(op))
+}
+
+/// Folder-aware classification for a failure in the PREFLIGHT of a per-folder step - the
 /// checkout, the SELECT/EXAMINE, the UIDVALIDITY read - restamped `Unsent`
 /// relative to the operation, the rule `connection::append`'s
 /// `unsent_preflight` states for APPEND. The preflight command carries its own
@@ -69,15 +77,17 @@ fn op_err(op: AccountOperation) -> impl Fn(Error) -> AccountError + Copy {
 /// made of, which was never sent. Publishing the SELECT's evidence would make
 /// recovery reconcile a non-idempotent mutation that never reached the server.
 ///
-/// Scope: this speaks for the folder being prepared. Earlier folders of the
-/// same multi-folder call may already have been mutated, in which case
-/// `Unsent` understates what the call did; these `Result<(), _>` lanes cannot
-/// express partial success at all, a known gap this does not close.
-fn preflight_err(op: AccountOperation) -> impl Fn(Error) -> AccountError + Copy {
-    move |e| {
-        account_error_with(
-            e.with_attempt(bifrost_types::TransmissionState::Unsent),
-            super::error::ImapErrorContext::operation(op),
+/// This speaks only for the folder being prepared. Earlier folders' committed
+/// effects remain in FolderProgress and are attached by the public operation;
+/// an unsent preparation does not erase them.
+fn folder_preflight_err<'a>(
+    account: &'a ImapAccount,
+    folder: &'a MailboxName,
+    op: AccountOperation,
+) -> impl Fn(Error) -> AccountError + Copy + 'a {
+    move |error| {
+        folder_err(account, folder, op)(
+            error.with_attempt(bifrost_types::TransmissionState::Unsent),
         )
     }
 }
@@ -754,7 +764,7 @@ async fn fetch_full_message(
     account: &ImapAccount,
     decoded: &DecodedObjectId,
 ) -> Result<bytes::Bytes, AccountError> {
-    let err = op_err(AccountOperation::DraftSend);
+    let err = folder_err(account, &decoded.folder, AccountOperation::DraftSend);
     let mut conn = account
         .checkout_for_folder(&decoded.folder)
         .await
@@ -1117,13 +1127,13 @@ pub(crate) fn search(
         if !account.capabilities.pim_methods.search {
             return Err(super::error::unsupported(AccountOperation::Search));
         }
-        let err = op_err(AccountOperation::Search);
         let plan = search_plan(&request, AccountOperation::Search)?;
         let mut pager = SearchPager::new(&request, plan.folder.as_ref(), AccountOperation::Search)?;
         for folder in pager.folders(search_folders(&account, plan.folder.as_ref())) {
             if pager.is_full() {
                 break;
             }
+            let err = folder_err(&account, &folder, AccountOperation::Search);
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
             let selected = account
                 .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
@@ -1168,7 +1178,6 @@ pub(crate) fn search_messages(
         if !account.capabilities.pim_methods.search_messages {
             return Err(super::error::unsupported(AccountOperation::SearchMessages));
         }
-        let err = op_err(AccountOperation::SearchMessages);
         let plan = search_plan(&request, AccountOperation::SearchMessages)?;
         let mut pager = SearchPager::new(
             &request,
@@ -1179,6 +1188,7 @@ pub(crate) fn search_messages(
             if pager.is_full() {
                 break;
             }
+            let err = folder_err(&account, &folder, AccountOperation::SearchMessages);
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
             let selected = account
                 .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
@@ -1254,7 +1264,17 @@ pub(crate) fn container_create(
             &name,
             AccountOperation::ContainerCreate,
         )?;
-        let err = op_err(AccountOperation::ContainerCreate);
+        let authority = parent
+            .as_ref()
+            .map(|parent| folder_from_container(parent, AccountOperation::ContainerCreate))
+            .transpose()?;
+        let err = |error| {
+            account.folder_error(
+                error,
+                authority.as_ref().unwrap_or(&full_name),
+                super::error::ImapErrorContext::operation(AccountOperation::ContainerCreate),
+            )
+        };
         let conn = account.pool.checkout_any().await.map_err(err)?;
         conn.connection()
             .create(&full_name, account.command_timeout())
@@ -1282,7 +1302,7 @@ pub(crate) fn container_rename(
         let folder = folder_from_container(&container, AccountOperation::ContainerRename)?;
         let new_name =
             renamed_sibling(&account, &folder, &name, AccountOperation::ContainerRename)?;
-        let err = op_err(AccountOperation::ContainerRename);
+        let err = folder_err(&account, &folder, AccountOperation::ContainerRename);
         let mut conn = account.pool.checkout_any().await.map_err(err)?;
         conn.deselect_target(&folder, account.command_timeout())
             .await
@@ -1317,7 +1337,11 @@ pub(crate) fn container_move(
             &leaf,
             AccountOperation::ContainerMove,
         )?;
-        let err = op_err(AccountOperation::ContainerMove);
+        let destination = new_parent
+            .as_ref()
+            .map(|parent| folder_from_container(parent, AccountOperation::ContainerMove))
+            .transpose()?;
+        let err = folder_err(&account, &folder, AccountOperation::ContainerMove);
         let mut conn = account.pool.checkout_any().await.map_err(err)?;
         conn.deselect_target(&folder, account.command_timeout())
             .await
@@ -1325,7 +1349,14 @@ pub(crate) fn container_move(
         conn.connection()
             .rename(&folder, &new_name, account.command_timeout())
             .await
-            .map_err(err)?;
+            .map_err(|error| {
+                account.folder_pair_error(
+                    error,
+                    &folder,
+                    destination.as_ref(),
+                    super::error::ImapErrorContext::operation(AccountOperation::ContainerMove),
+                )
+            })?;
         refresh_folders(&account, conn.connection(), AccountOperation::ContainerMove)
             .await
             .map_err(|error| {
@@ -1340,7 +1371,7 @@ pub(crate) fn container_delete(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let folder = folder_from_container(&container, AccountOperation::ContainerDelete)?;
-        let err = op_err(AccountOperation::ContainerDelete);
+        let err = folder_err(&account, &folder, AccountOperation::ContainerDelete);
         let mut conn = account.pool.checkout_any().await.map_err(err)?;
         conn.deselect_target(&folder, account.command_timeout())
             .await
@@ -1654,10 +1685,17 @@ async fn copy_messages(
     destination: &MailboxName,
     op: AccountOperation,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
-    let err = op_err(op);
-    let preflight = preflight_err(op);
     let mut done = Vec::new();
     for (folder, ids) in group_by_folder(ids) {
+        let err = |error| {
+            account.folder_pair_error(
+                error,
+                &folder,
+                Some(destination),
+                super::error::ImapErrorContext::operation(op),
+            )
+        };
+        let preflight = folder_preflight_err(account, &folder, op);
         let mut stage = None;
         let result: Result<(), AccountError> = async {
             let mut conn = account
@@ -1709,10 +1747,10 @@ async fn delete_messages(
     ids: Vec<DecodedObjectId>,
     op: AccountOperation,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
-    let err = op_err(op);
-    let preflight = preflight_err(op);
     let mut done = Vec::new();
     for (folder, ids) in group_by_folder(ids) {
+        let err = folder_err(account, &folder, op);
+        let preflight = folder_preflight_err(account, &folder, op);
         let mut stage = None;
         let result: Result<(), AccountError> = async {
             let mut conn = account
@@ -1787,8 +1825,6 @@ async fn set_flag(
     value: bool,
     op: AccountOperation,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
-    let err = op_err(op);
-    let preflight = preflight_err(op);
     let operation = if value {
         StoreOperation::AddSilent
     } else {
@@ -1796,6 +1832,8 @@ async fn set_flag(
     };
     let mut done = Vec::new();
     for (folder, ids) in group_by_folder(ids) {
+        let err = folder_err(account, &folder, op);
+        let preflight = folder_preflight_err(account, &folder, op);
         let mut stage = None;
         let result: Result<(), AccountError> = async {
             let mut conn = account
@@ -1853,10 +1891,10 @@ async fn hydrate_decoded(
     projection: HydrationProjection,
     op: AccountOperation,
 ) -> Result<Vec<Message>, AccountError> {
-    let err = op_err(op);
-    let preflight = preflight_err(op);
     let mut messages = Vec::new();
     for (folder, ids) in group_by_folder(ids) {
+        let err = folder_err(account, &folder, op);
+        let preflight = folder_preflight_err(account, &folder, op);
         let mut conn = account
             .checkout_for_folder(&folder)
             .await
@@ -1970,9 +2008,9 @@ async fn resolve_thread_members(
             .map(|uid| DecodedObjectId::canonical(decoded.folder.clone(), decoded.uidvalidity, uid))
             .collect());
     };
-    let preflight = preflight_err(op);
     let mut members = Vec::new();
     for folder in native_thread_folders(account.folders.entries(), native.kind, scope) {
+        let preflight = folder_preflight_err(account, &folder, op);
         let mut conn = account
             .checkout_for_folder(&folder)
             .await

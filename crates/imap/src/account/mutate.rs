@@ -545,8 +545,14 @@ async fn run_folder_mutation(
                 } => Some((copy.clone(), *stored_deleted)),
                 _ => None,
             };
-            let leaf = super::account_error_with(
+            let leaf = account.folder_pair_error(
                 err,
+                folder,
+                if progress.is_some() {
+                    None
+                } else {
+                    move_destination
+                },
                 super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
             );
             Some(Err(if let Some((copy, stored_deleted)) = progress {
@@ -643,10 +649,27 @@ async fn run_destroy_mutation_groups(
             )
             .await;
         let outcome = match store {
-            Ok(result) => StoreWireOutcome::from_store_result(&result),
+            Ok(result) => {
+                if let Some(error) = store_permission_error(&result, AccountOperation::BulkDestroy)
+                {
+                    let error = account.folder_error(
+                        error,
+                        folder,
+                        super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy),
+                    );
+                    results.extend(target_batch.settle(
+                        AccountOperation::BulkDestroy,
+                        folder,
+                        |target| target.seal(mutation_error_verdict(&error)),
+                    ));
+                    continue;
+                }
+                StoreWireOutcome::from_store_result(&result)
+            }
             Err(err) => {
-                let error = super::account_error_with(
+                let error = account.folder_error(
                     err,
+                    folder,
                     super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
                         .with_folder_scope(folder),
                 );
@@ -677,7 +700,7 @@ async fn run_destroy_mutation_groups(
             // The expunge failure applies only to the UIDs this round
             // actually marked `\Deleted`; the rest keep the STORE's own
             // verdict.
-            let expunge_error = destroy_expunge_error(folder, err);
+            let expunge_error = destroy_expunge_error_with_account(account, folder, err);
             results.extend(
                 target_batch.settle(AccountOperation::BulkDestroy, folder, |target| {
                     let verdict = if expunge_uids.contains(&target.uid()) {
@@ -784,8 +807,9 @@ async fn run_flag_mutation_groups(
                 if matches!(op, FlagOp::Patch { .. }) {
                     account.folders.clear_modseqs(folder, uidvalidity, &uids);
                 }
-                Err(super::account_error_with(
+                Err(account.folder_error(
                     err,
+                    folder,
                     super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
                         .with_folder_scope(folder),
                 ))
@@ -860,7 +884,11 @@ async fn run_patch_mutation_group(
         // folder-wide uncertain lane.
         Err(err) => {
             account.folders.clear_modseqs(folder, uidvalidity, &uids);
-            let error = patch_first_store_failure(err, folder);
+            let error = account.folder_error(
+                err,
+                folder,
+                super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags),
+            );
             return target_batch.settle(AccountOperation::UpdateFlags, folder, |target| {
                 let verdict = mutation_error_verdict(&error);
                 target.seal(verdict)
@@ -881,8 +909,9 @@ async fn run_patch_mutation_group(
         )
         .await
         .map_err(|err| {
-            super::account_error_with(
+            account.folder_error(
                 err,
+                folder,
                 super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
                     .with_folder_scope(folder),
             )
@@ -894,18 +923,6 @@ async fn run_patch_mutation_group(
             patch_mutation_verdict(target.uid(), &first, &second, folder, work.caller_guard);
         target.seal(verdict)
     })
-}
-
-/// The error for a MODSEQ group whose guarded add STORE errored on the wire.
-/// Scoped to the group's own ids: the surrounding loop keeps the outcomes it
-/// has already established for other groups, matching the
-/// single-outcome-per-id contract the sync engine relies on.
-fn patch_first_store_failure(err: crate::Error, folder: &MailboxName) -> AccountError {
-    super::account_error_with(
-        err,
-        super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
-            .with_folder_scope(folder),
-    )
 }
 
 /// The verdict for one UID of a two-sided patch group.
@@ -1074,7 +1091,34 @@ async fn store_flags(
         .connection()
         .uid_store(set, operation, &flags, unchanged_since, timeout)
         .await?;
+    // Every `store_flags` caller is a flag mutation.
+    if let Some(error) = store_permission_error(&result, AccountOperation::UpdateFlags) {
+        return Err(error);
+    }
     Ok(StoreWireOutcome::from_store_result(&result))
+}
+
+// Guarded STORE preserves tagged NO as a result for MODIFIED handling.
+// Do not flatten an access refusal into the generic Failed outcome: that
+// would bypass shared-folder quarantine and discard its wire evidence.
+// StoreResult has already lost the response text; retain its code and the
+// acknowledged attempt here rather than inventing replacement server text.
+// `operation` is the caller's own: STORE serves both flag updates and the
+// `\Deleted` leg of a destroy, and the check classifies under that caller.
+fn store_permission_error(
+    result: &crate::types::StoreResult,
+    operation: AccountOperation,
+) -> Option<crate::Error> {
+    if matches!(result.status, crate::types::response::StatusKind::Ok) {
+        return None;
+    }
+    let error = crate::Error::no_with_code(String::new(), result.code.clone())
+        .with_attempt(bifrost_types::TransmissionState::Acknowledged);
+    super::error::permission_denied(
+        &error,
+        &super::error::ImapErrorContext::operation(operation),
+    )
+    .then_some(error)
 }
 
 // protocol-specific: IMAP STORE can return MODIFIED before it maps to shared MutationOutcome.
@@ -1313,12 +1357,34 @@ pub(super) fn finish_partial(error: AccountError, record: PartialCommitBuilder) 
         .try_build()
         .expect("valid IMAP partial commitment")
 }
-fn destroy_expunge_error(folder: &MailboxName, error: crate::Error) -> AccountError {
-    let leaf = super::account_error_with(
+fn destroy_expunge_error_with_account(
+    account: &ImapAccount,
+    folder: &MailboxName,
+    error: crate::Error,
+) -> AccountError {
+    let owner = account
+        .folders
+        .get(folder)
+        .and_then(|entry| entry.shared_owner.clone());
+    destroy_expunge_error(folder, owner.as_ref(), error)
+}
+
+/// The partial-commit error for an EXPUNGE that failed after its STORE marked
+/// UIDs `\Deleted`, classified through the shared folder-error rule.
+fn destroy_expunge_error(
+    folder: &MailboxName,
+    shared_owner: Option<&bifrost_types::MailboxId>,
+    error: crate::Error,
+) -> AccountError {
+    let leaf = super::error::folder_error(
         error,
-        super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
-            .with_folder_scope(folder),
+        folder,
+        shared_owner,
+        super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy),
     );
+    destroy_expunge_record(folder, leaf)
+}
+fn destroy_expunge_record(folder: &MailboxName, leaf: AccountError) -> AccountError {
     let targets = folder_targets(folder, TargetRole::Subject);
     let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
         StepEffect::Deleted,
@@ -1385,16 +1451,25 @@ fn move_fallback_record(
         ..
     }) = &copy.copy_uid
     {
+        // Support detail must be bounded by local policy, never a server's
+        // numeric span. The folder target still identifies every copied item
+        // when message detail is truncated (StepTargets::at_least).
+        let mut remaining = 256usize;
         for range in dest_uids {
-            for uid in range.start.min(range.end.unwrap_or(range.start))
-                ..=range.start.max(range.end.unwrap_or(range.start))
+            for uid in (range.start.min(range.end.unwrap_or(range.start))
+                ..=range.start.max(range.end.unwrap_or(range.start)))
+                .take(remaining)
             {
+                remaining -= 1;
                 refs.push(TargetRef::new(
                     TargetRole::Destination,
                     ErrorScope::Message {
                         id: super::encode_object_id(destination, *uid_validity, uid),
                     },
                 ));
+            }
+            if remaining == 0 {
+                break;
             }
         }
     }
@@ -1643,6 +1718,7 @@ mod tests {
     fn partial_commit_destroy_expunge_failure_marks_deleted() {
         let denied = destroy_expunge_error(
             &folder(),
+            None,
             crate::Error::No {
                 text: "permission denied".to_owned(),
                 code: Some(crate::types::ResponseCode::NoPerm),
@@ -1660,6 +1736,7 @@ mod tests {
 
         let over_quota = destroy_expunge_error(
             &folder(),
+            None,
             crate::Error::No {
                 text: "over quota".to_owned(),
                 code: Some(crate::types::ResponseCode::OverQuota),
@@ -1676,7 +1753,23 @@ mod tests {
             "distinct failures must keep deriving distinct recovery classes"
         );
 
-        for err in [&denied, &over_quota] {
+        // On a shared folder the same denial quarantines only that folder,
+        // and the partial-commit record still rides on it.
+        let revoked = destroy_expunge_error(
+            &folder(),
+            Some(&bifrost_types::MailboxId("alice".to_owned())),
+            crate::Error::No {
+                text: "permission denied".to_owned(),
+                code: Some(crate::types::ResponseCode::NoPerm),
+                attempt: None,
+            },
+        );
+        assert!(matches!(
+            revoked.kind(),
+            AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::ScopeRevoked)
+        ));
+
+        for err in [&denied, &over_quota, &revoked] {
             assert_eq!(
                 err.partial_commit().unwrap().steps()[0].effect(),
                 Some(StepEffect::MarkedDeleted)
@@ -1734,11 +1827,27 @@ mod tests {
         .expect("personal-folder permission error");
         assert!(stream_terminating(&personal_permission_denied));
 
-        let shared_revoked = super::super::error::scope_revoked(
+        // The same NO [NOPERM] on a shared folder, through the production
+        // folder classification, is a scoped revocation that must not end
+        // the stream.
+        let shared_revoked = super::super::error::folder_error(
+            crate::Error::No {
+                text: "permission denied".to_owned(),
+                code: Some(crate::types::ResponseCode::NoPerm),
+                attempt: None,
+            },
             &folder(),
-            &MailboxId("alice".to_owned()),
-            AccountOperation::UpdateFlags,
+            Some(&MailboxId("alice".to_owned())),
+            super::super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags),
         );
+        assert!(matches!(
+            shared_revoked.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+        ));
+        assert!(matches!(
+            shared_revoked.recovery(),
+            bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::DisableScope(_))
+        ));
         assert!(!stream_terminating(&shared_revoked));
 
         let transient = AccountErrorBuilder::new(
@@ -1955,9 +2064,13 @@ mod tests {
                 .count(),
             2,
         );
-        let error = patch_first_store_failure(
+        // The same classification `run_patch_mutation_group` applies to a
+        // first-STORE wire error, through `ImapAccount::folder_error`.
+        let error = super::super::error::folder_error(
             crate::Error::Protocol("STORE never answered".into()),
             &folder(),
+            None,
+            super::super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags),
         );
         results.extend(settled(&[5], AccountOperation::UpdateFlags, |_| {
             mutation_error_verdict(&error)
@@ -2085,8 +2198,11 @@ mod tests {
     fn an_expunge_failure_applies_only_to_the_uids_it_marked() {
         let expunge_uids = [2u32];
         let outcome = StoreWireOutcome::Modified(CompactUidSet::from_uids([3]));
-        let expunge_error =
-            destroy_expunge_error(&folder(), crate::Error::Protocol("EXPUNGE refused".into()));
+        let expunge_error = destroy_expunge_error(
+            &folder(),
+            None,
+            crate::Error::Protocol("EXPUNGE refused".into()),
+        );
         let outcomes = settled(&[2, 3], AccountOperation::BulkDestroy, |uid| {
             if expunge_uids.contains(&uid) {
                 mutation_error_verdict(&expunge_error)
@@ -2155,6 +2271,55 @@ mod tests {
         .try_build()
         .unwrap()
     }
+    #[test]
+    fn copyuid_diagnostic_detail_is_bounded_across_ranges() {
+        let copy = crate::types::CopyResult {
+            code: None,
+            copy_uid: Some(ResponseCode::CopyUid {
+                uid_validity: 9,
+                source_uids: vec![crate::types::UidRange::single(1)],
+                dest_uids: vec![
+                    crate::types::UidRange::range(1, 200),
+                    crate::types::UidRange::range(u32::MAX, 201),
+                    crate::types::UidRange::single(7),
+                ],
+            }),
+        };
+        let error = move_fallback_record(
+            partial_retry(),
+            &copy,
+            false,
+            &folder(),
+            &MailboxName::new("Archive").unwrap(),
+        );
+        let steps = error.partial_commit().unwrap().steps();
+        let targets = steps[0].targets();
+        assert_eq!(targets.refs.len(), 258);
+        assert!(!targets.complete);
+    }
+
+    #[test]
+    fn guarded_store_permission_denial_keeps_wire_and_attempt_evidence() {
+        let result = crate::types::StoreResult {
+            fetches: Vec::new(),
+            status: crate::types::response::StatusKind::No,
+            code: Some(ResponseCode::NoPerm),
+        };
+        let error = store_permission_error(&result, AccountOperation::BulkDestroy)
+            .expect("access refusal survives STORE result");
+        assert_eq!(
+            error.attempt(),
+            Some(bifrost_types::TransmissionState::Acknowledged)
+        );
+        assert!(matches!(
+            error,
+            crate::Error::No {
+                code: Some(ResponseCode::NoPerm),
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn partial_commit_move_fallback_retryable_store_refusal_is_protected() {
         let error = move_fallback_record(

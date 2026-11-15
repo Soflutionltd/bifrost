@@ -323,9 +323,25 @@ fn select_excludes(error: &AccountError, folder: &crate::types::MailboxName) -> 
         || matches!(error.recovery(), bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::DisableScope(scope)) if *scope == folder_scope(folder))
 }
 
-fn notify_failure(error: crate::Error, folder: &crate::types::MailboxName) -> (AccountError, bool) {
+/// Classify a failed NOTIFY SET through the shared folder-error rule (the
+/// registry owner comes from the caller) and decide whether it degrades to a
+/// warning that keeps selected-mailbox IDLE coverage.
+fn notify_failure(
+    error: crate::Error,
+    folder: &crate::types::MailboxName,
+    shared_owner: Option<&bifrost_types::MailboxId>,
+) -> (AccountError, bool) {
     let refused = matches!(error, crate::Error::No { .. } | crate::Error::Bad { .. });
-    let error = classify(error, folder);
+    let error = super::error::folder_error(
+        error,
+        folder,
+        shared_owner,
+        ImapErrorContext::operation(AccountOperation::PushStream),
+    );
+    notify_classified_failure(error, refused)
+}
+
+fn notify_classified_failure(error: AccountError, refused: bool) -> (AccountError, bool) {
     let degrade = refused
         && error.recovery().is_terminal()
         && matches!(
@@ -390,7 +406,7 @@ pub(crate) fn push_stream(
                 Ok(selected) => selected,
                 Err(e) => {
                     drop(conn);
-                    let e = classify(e, &folder);
+                    let e = account.folder_error(e, &folder, ImapErrorContext::operation(AccountOperation::PushStream));
                     if select_excludes(&e, &folder) { exclude(&account, &folder, version); yield E::UnitFailed(e); yield E::Ended(End::Reconfigure); }
                     else { yield E::Failed(e); }
                     return;
@@ -404,7 +420,12 @@ pub(crate) fn push_stream(
                 let registered = match notify {
                     Ok(registered) => registered,
                     Err(e) => {
-                        let (e, degrade) = notify_failure(e, &folder);
+                        let owner = account.folders.get(&folder).and_then(|entry| entry.shared_owner.clone());
+                        let (e, degrade) = notify_failure(e, &folder, owner.as_ref());
+                        if matches!(e.recovery(), bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::DisableScope(_))) {
+                            drop(conn); exclude(&account, &folder, version);
+                            yield E::UnitFailed(e); yield E::Ended(End::Reconfigure); return;
+                        }
                         if e.recovery().is_retryable() || e.recovery().requires_reconciliation() { yield E::UnitFailed(e); }
                         else if degrade { yield E::Warning(bifrost_types::Warning::support_only(bifrost_types::WarningKind::Other, format!("NOTIFY SET refused: {}", e.message_key()))); }
                         else { drop(conn); yield E::Failed(e); return; }
@@ -436,7 +457,7 @@ pub(crate) fn push_stream(
                         drop(conn);
                         yield E::Ended(End::Stopped); return;
                     }
-                    let event = match result { Ok(event) => event, Err(e) => { drop(conn); yield E::Failed(classify(e, &folder)); return; } };
+                    let event = match result { Ok(event) => event, Err(e) => { drop(conn); yield E::Failed(account.folder_error(e, &folder, ImapErrorContext::operation(AccountOperation::PushStream))); return; } };
                     if absorb_idle_event(&account, &folder, uidvalidity, &event).is_err() { yield invalidated(HintPayload::Unknown); }
                     if let Some(end) = idle_event_ending(&event, &folder) { drop(conn); yield end; return; }
                     if changed {
@@ -991,6 +1012,7 @@ mod session_classification_tests {
                 attempt: None,
             },
             &folder,
+            None,
         );
         assert!(degrade);
         let (_, degrade) = notify_failure(
@@ -1000,8 +1022,26 @@ mod session_classification_tests {
                 attempt: None,
             },
             &folder,
+            None,
         );
         assert!(!degrade);
+        // On a shared folder the denial is a scoped revocation, the class the
+        // stream answers by excluding just that folder; it never degrades.
+        let (revoked, degrade) = notify_failure(
+            crate::Error::No {
+                code: Some(crate::types::ResponseCode::NoPerm),
+                text: "denied".into(),
+                attempt: None,
+            },
+            &folder,
+            Some(&bifrost_types::MailboxId("alice".into())),
+        );
+        assert!(!degrade);
+        assert!(matches!(
+            revoked.recovery(),
+            bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::DisableScope(scope))
+                if *scope == folder_scope(&folder)
+        ));
     }
     /// The defensive `Bye` arm, which the live driver never reaches (it
     /// delivers a BYE as `idle()`'s error; `a_bye_never_excludes_the_selected_folder`

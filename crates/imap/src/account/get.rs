@@ -136,8 +136,9 @@ async fn flush_get_groups(
                 let (account_err, bytes_in) = match other {
                     GetError::Account(err, bytes_in) => (err, bytes_in),
                     GetError::Imap(err, bytes_in) => {
-                        let account_err = super::account_error_with(
+                        let account_err = account.folder_error(
                             err,
+                            &folder,
                             super::error::ImapErrorContext::operation(
                                 bifrost_types::AccountOperation::Hydrate,
                             )

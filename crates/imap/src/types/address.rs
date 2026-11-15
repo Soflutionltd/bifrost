@@ -48,11 +48,13 @@ impl Address {
 fn validate_email(email: &str) -> Result<(), super::ValidationError> {
     let Some((local, domain)) = email.split_once('@') else {
         return Err(super::ValidationError::new(
+            super::validated::ValidationReason::MissingAddressSeparator,
             "email address must contain an @ separator",
         ));
     };
     if local.is_empty() || domain.is_empty() || domain.contains('@') {
         return Err(super::ValidationError::new(
+            super::validated::ValidationReason::InvalidAddressParts,
             "email address must contain non-empty local and domain parts",
         ));
     }

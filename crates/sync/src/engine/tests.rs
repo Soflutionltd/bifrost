@@ -2805,7 +2805,9 @@ async fn only_a_reattach_resume_of_a_provisional_row_claims_it() {
 
     // A plain read (attach, scope restart) must not steal A's row.
     writer.insert(1, "s").await;
-    assert!(writer.read("s", None).await);
+    // An ordinary read of a still-provisional row answers absent (the live
+    // scope establishes fresh) rather than resuming an unconfirmed row.
+    assert!(!writer.read("s", None).await);
     writer.abort(1).await;
     assert!(
         !writer.has("s").await,

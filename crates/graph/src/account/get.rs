@@ -294,6 +294,15 @@ async fn fetch_batch(
     // all. That is ONE id's failure: propagating it would discard the valid
     // REST siblings of the same chunk AND the EWS outcomes already fetched
     // above, so it is filed on the failed lane and the chunk goes on.
+    // Outlook users expect a failed refresh to require a fresh observation
+    // before a conditional write, especially when the item is now absent.
+    // Retire old validators before dispatch so transport failure cannot retain one.
+    {
+        let mut cache = account.etag_index.write().await;
+        for id in &rest_ids {
+            cache.observe(&id.0, super::EtagObservation::Invalidated);
+        }
+    }
     let (routable, rejected) = super::batch_routing::partition_routable(&rest_ids, |id| {
         hydrate_url_for_id(account, id, select)
     });
@@ -349,8 +358,13 @@ async fn fetch_batch(
         &replayable,
     );
 
-    if !etags.is_empty() {
+    {
+        // A failed or validator-less body also supersedes any observation
+        // installed while this request was in flight.
         let mut cache = account.etag_index.write().await;
+        for id in &rest_ids {
+            cache.observe(&id.0, super::EtagObservation::Invalidated);
+        }
         for (id, etag) in etags {
             cache.observe(&id, super::EtagObservation::Read(etag));
         }

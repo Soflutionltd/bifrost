@@ -6484,7 +6484,11 @@ fn an_encoder_capability_refusal_names_the_command_and_the_capability() {
     let err = encode_command("A001", &cmd, &no_condstore).unwrap_err();
     assert_eq!(
         err,
-        crate::Error::MissingCapability("UID FETCH (CHANGEDSINCE) requires CONDSTORE".into())
+        crate::Error::MissingCapability(crate::error::CapabilityFailure::new(
+            Capability::Condstore,
+            crate::error::CapabilityFailureReason::NotAdvertised,
+            "UID FETCH (CHANGEDSINCE) requires CONDSTORE",
+        ))
     );
 }
 

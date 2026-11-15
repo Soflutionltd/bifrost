@@ -886,6 +886,25 @@ are rejected.
 
 ## Error model
 
+Direct SMTP and LMTP sends deliberately return the wire-level `Error`; batch
+submission returns shared `AccountError` values at the batch and recipient
+boundaries. This is a product choice: a transport integrator needs full SMTP
+replies and a stable direct error type even without `account-error`, while an
+enterprise Outlook user expects successful recipients to remain sent and failed
+or uncertain recipients to retain their own recovery information. Changing the
+direct error type alone cannot provide those recipient outcomes. Client
+developers implementing a send queue should use batch submission and
+`submission_status`, preserving the lanes on the receipt. The direct contracts
+remain useful for callers implementing their own wire-level policy.
+
+The typed OAuth projection stored inside the wire error is intentional. Direct
+and batch sends share credential resolution, but bifrost-net owns the distinction
+between terminal credential loss and transient token refresh failure. Typed SASL
+errors do not replace that information. Keeping it through the transport wrapper
+lets batch recovery retry a transient refresh failure instead of asking the user
+for another password. Local auth classification reads typed error kinds; source
+Display text remains support diagnostics rather than a local auth discriminator.
+
 `Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Non-reply buckets are `Parse`, `Authentication`, `InvalidInput`, `FeatureUnsupported`, `ParameterOverLimit`, `Internal`, `LocalRuntime`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `LocalRuntime` covers local facility failures such as SCRAM nonce entropy failure and maps to `Internal(RuntimeFailure)`, including on the AUTH lane. `Policy` covers local refusals such as plaintext-AUTH refusal. `FeatureUnsupported` / `ParameterOverLimit` are the FUTURERELEASE discriminators (a relay that did not advertise the extension vs a HOLDFOR over the advertised max interval), kept distinct from generic `InvalidInput` so the account-error mapping can tell scheduled-send-unsupported apart from a malformed parameter. SMTP replies are line-bounded before allocation and decoded from bytes, so oversized or non-UTF-8 replies are `Parse`, not retryable network errors.
 
 Internal pipeline errors carry value-side classification data:

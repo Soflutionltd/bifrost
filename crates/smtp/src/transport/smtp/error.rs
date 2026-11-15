@@ -15,7 +15,13 @@ use crate::{
 // Inspired by https://github.com/seanmonstar/reqwest/blob/a8566383168c0ef06c21f38cbc9213af6ff6db31/src/error.rs
 
 /// The Errors that may occur when sending an email over SMTP
-// pub: SMTP keeps full Response-carrying errors instead of Account recovery errors.
+///
+/// Direct sends retain this wire-level error, including the full server reply,
+/// with the same public type whether account integration is enabled or not.
+/// Client developers needing enterprise send-queue recovery should use the
+/// batch APIs: an Outlook user expects recipient refusals and uncertain delivery
+/// to survive alongside successful delivery, which a single direct result cannot
+/// represent. See the SMTP reference's error model for this boundary.
 pub struct Error {
     inner: Box<Inner>,
 }
@@ -56,6 +62,10 @@ struct Inner {
     /// A lower-level dependency already projected this failure into the
     /// shared account-error model. Keep the typed result through the SMTP
     /// wrapper so its protocol boundary does not flatten it into `InvalidInput`.
+    /// This is independent of SASL typing: the token endpoint owns refresh
+    /// recovery, and an enterprise user expects a transient refresh failure to
+    /// retry rather than request a replacement password. The direct and batch
+    /// paths share credential resolution, so the wrapper must retain this value.
     #[cfg(feature = "account-error")]
     preclassified_account_error: Option<Arc<AccountError>>,
 }
@@ -230,7 +240,8 @@ impl Error {
 
     /// Support-safe diagnostic string for the account-error mapper. AUTH paths
     /// already redact credentials before they reach here; this just exposes the
-    /// boxed source or the kind discriminant for support text.
+    /// boxed source for support text. Local auth classification uses typed kinds,
+    /// not this prose; retaining diagnostics does not make them recovery input.
     #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn diagnostic_text(&self) -> Option<String> {
         self.inner

@@ -534,9 +534,7 @@ async fn writer_boundary_case(stored_inventory: bool, exhaust: bool) {
     if exhaust {
         step(200).await;
         let result = establish.await;
-        assert!(
-            matches!(result, Err(Error::EstablishCursorFailed(ref reason)) if reason == "recovery wait budget exhausted")
-        );
+        assert!(matches!(result, Err(Error::WaitBudgetExhausted)));
         assert_eq!(calls(&account), 0);
         assert_eq!(account.inventory_calls.load(Ordering::SeqCst), 0);
     } else {
@@ -703,9 +701,11 @@ fn subscription(handle: &str, unconfirmed: bool) -> RegisteredSubscription {
     RegisteredSubscription {
         handle: bifrost_types::SubscriptionHandle(handle.into()),
         scopes: vec![],
-        teardown_unconfirmed: unconfirmed,
-        desired: !unconfirmed,
-        torn_down: false,
+        state: if unconfirmed {
+            crate::push::subscription::SubscriptionState::Orphan
+        } else {
+            crate::push::subscription::SubscriptionState::Live
+        },
     }
 }
 

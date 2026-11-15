@@ -14,6 +14,11 @@
 // up. The annotation is at the crate root because the dead surface is
 // spread across most of the connection module tree.
 #![allow(dead_code)]
+// The crate-private `Error` now carries typed failure evidence
+// (`LocalFailure`, `CapabilityFailure`) beside its message, so it is a large
+// `Err` type. It is cold-path and translated to `AccountError` at the account
+// boundary, so boxing it everywhere would only add an allocation per failure.
+#![allow(clippy::result_large_err)]
 
 // pub: consumers register the IMAP AccountFactory through this module.
 pub mod account;

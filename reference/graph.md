@@ -1077,7 +1077,7 @@ session's start or `close()`.
 ## Cursor envelope
 
 `OpaqueChangeState` for Graph is tagged `ProtocolKind::Graph` with
-`envelope_version = GRAPH_CURSOR_ENVELOPE_VERSION` (currently `4`);
+`envelope_version = GRAPH_CURSOR_ENVELOPE_VERSION` (currently `6`);
 `CHANGE_CURSOR_ENVELOPE_VERSION` is the matching
 `ChangeCursor.envelope_version`. v2 is an OBJECT-ID encoding change, not a
 payload-shape change: v1 minted bare `ThreadId`s for shared mailboxes, and
@@ -1097,10 +1097,19 @@ cannot be reconstructed from a v2 link safely, so v3 is also a reseed boundary.
 v4 adds the `inventory_in_progress` payload state: a page checkpoint has no
 delta link yet, so bifrost-sync recognizes it at attach and resumes
 `inventory_stream` at its saved next link rather than starting `changes_stream`.
-`GraphCursorPayload` carries a kind, final `@odata.deltaLink`, optional
-calendar window end, and optional mid-walk page marker
-(landing in `OpaqueChangeState::bytes`; page markers also in
-`ChangeCursor::advanced_through`).
+v6 replaces the sentinel-field product with `GraphCursorPayload::Delta`,
+`InventoryPage`, and `PublicFolder`. Delta carries its final link and optional
+mid-walk marker; inventory carries a required page marker without a delta link;
+public folders carry only their poll state and expose no REST resume URL. Delta and inventory retain their
+collection identity, with the optional horizon confined to event collections.
+The outer scope still cross-checks that identity, including event aliases;
+deriving identity solely from the scope would relabel an opaque delta link
+if a persisted row were attached to the wrong collection. All older inner envelopes,
+including v5, are refused as `SchemaIncompatible` before payload decoding and
+use the existing account-wide reseed boundary. Outlook users expect a complete
+fresh inventory rather than a cursor misread under the changed persisted format.
+Payloads live in `OpaqueChangeState::bytes`; page markers also live in
+`ChangeCursor::advanced_through`.
 
 `decode_cursor` rejects wrong protocol, incompatible envelopes, and malformed
 JSON. The OUTER `ChangeCursor::advanced_through` is the single source of truth
@@ -1111,8 +1120,8 @@ at all, and a marker the engine never acknowledged must not pick the resume
 URL). Overriding on presence but deferring on absence gave one field two
 sources with a silent precedence; `encode_cursor` writes both from the same
 value, so honoring the outer unconditionally loses nothing.
-When an in-progress inventory payload has no outer marker, the inventory walk
-returns `CursorError::InventoryInProgress`, which derives a restart of that
+When an in-progress inventory payload has no outer marker, decode refuses
+it and inventory recognition preserves the scoped restart; resume returns `CursorError::InventoryInProgress`, which derives a restart of that
 scope. The engine acknowledged no page position, so this does not clear every
 scope as a schema reset would.
 `changes_stream` cross-checks that payload kind projects back to
@@ -2578,8 +2587,12 @@ refresh. PIM batch writes instead evict every successful target, including
 property clears, through `pim::messages::submit_write_batch_resource`; the next
 bulk write cannot reuse a validator observed before that write. PIM writes also
 evict on 404 and 412, matching bulk writes: absence has no validator and a
-conflict disproves the cached observation. Reads cache only validated hydrated
-bodies' etags; reactions do not observe a whole-message validator.
+conflict disproves the cached observation. Hydration retires prior validators before dispatch, including routing and
+transport failures, then invalidates submitted ids again before recording only
+validated bodies' etags. Failed, missing, malformed and validator-less answers
+therefore leave no stale cache entry. Outlook users expect a failed refresh,
+especially a 404, to require a new observation before a conditional write;
+reactions do not observe a whole-message validator.
 `EtagIndex::observe` represents Read, Written and Invalidated observations, with
 deliberately different observations rather than one status-only cache rule:
 a read observes a version while a write consumes or replaces it. The outcome

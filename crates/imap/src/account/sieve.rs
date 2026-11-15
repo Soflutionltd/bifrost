@@ -276,6 +276,7 @@ fn to_acct_err(op: AccountOperation) -> impl Fn(Error) -> AccountError {
 }
 
 fn invalid(op: AccountOperation, detail: impl Into<String>) -> AccountError {
+    let detail: String = detail.into();
     account_error_with(
         Error::InvalidInput(detail.into()),
         ImapErrorContext::operation(op),
@@ -607,9 +608,9 @@ fn validate_tls_server_name(host: &str) -> Result<(), Error> {
         ));
     }
     if host.bytes().any(|b| b == 0 || b.is_ascii_whitespace()) {
-        return Err(Error::InvalidInput(format!(
-            "invalid TLS server name: {host:?}"
-        )));
+        return Err(Error::InvalidInput(
+            format!("invalid TLS server name: {host:?}").into(),
+        ));
     }
     Ok(())
 }

@@ -26,7 +26,7 @@ pub(in crate::codec::encode) fn encode_getmetadata(
     {
         return Err(crate::Error::InvalidInput(format!(
             "GETMETADATA MAXSIZE must fit in number (u32) per RFC 5464 Section 5 / RFC 3501 Section 9, got {n}"
-        )));
+        ).into()));
     }
 
     // RFC 5464 Section 4.2 ABNF: `entries = entry / "(" entry *(SP entry) ")"`.
@@ -46,10 +46,13 @@ pub(in crate::codec::encode) fn encode_getmetadata(
         && d != "1"
         && d != "infinity"
     {
-        return Err(crate::Error::InvalidInput(format!(
-            "GETMETADATA DEPTH must be \"0\", \"1\", or \"infinity\" \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "GETMETADATA DEPTH must be \"0\", \"1\", or \"infinity\" \
              (RFC 5464 Section 4.2.2), got: {d:?}"
-        )));
+            )
+            .into(),
+        ));
     }
 
     w.raw(tag.as_bytes());

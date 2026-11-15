@@ -22,8 +22,8 @@ pub(crate) enum CursorError {
     /// A calendarView cursor's fixed end bound is too near. It must be
     /// reseeded so Graph mints a delta link over a fresh window.
     CalendarWindowExpired,
-    /// A cursor claims inventory is in progress but has no acknowledged page
-    /// URL, or a mid-inventory cursor was handed to the changes walk, which
+    /// The outer envelope has no acknowledged inventory page URL, or a
+    /// mid-inventory cursor was handed to the changes walk, which
     /// has no delta link. The cursor envelope is understood, so this restarts
     /// the one scope rather than declaring the stored schema incompatible
     /// account-wide.
@@ -105,7 +105,9 @@ pub(crate) fn routing_error(error: crate::error::GraphError) -> CursorError {
 /// live changes cursor so bifrost-sync can restart the right stream.
 /// v5: public-folder baselines contain admitted mail only. Decode failures
 /// recover account-wide, so a payload-specific version cannot isolate recovery.
-pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 5;
+/// v6: explicit delta, inventory-page and public-folder states replace sentinel
+/// fields. Older rows reseed through SchemaIncompatible before deserialization.
+pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 6;
 pub(crate) const CHANGE_CURSOR_ENVELOPE_VERSION: u32 =
     bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION;
 
@@ -121,10 +123,8 @@ pub(crate) enum GraphCursorKind {
     Contacts {
         folder_id: String,
     },
-    /// Public folder: no delta token. Routing + poll state live here.
-    /// The enclosing `GraphCursorPayload`'s `delta_link` /
-    /// `advanced_through` fields are unused for this kind (a public
-    /// folder is never a server-issued delta cursor).
+    /// Public folder: no delta token. Used for scope projection; persisted
+    /// poll state lives in its own payload variant.
     PublicFolder(PublicFolderCursor),
 }
 
@@ -254,27 +254,37 @@ pub(crate) struct GraphPageMarker {
     pub(crate) last_seen_id: Option<String>,
 }
 
-// Graph deltaLink payloads are protocol-specific and intentionally live inside OpaqueChangeState.
+// Keep persisted collection identity cross-checked against the outer scope:
+// deriving it only from the scope would relabel an opaque delta link if a row
+// were attached to the wrong collection. Event aliases share a calendar, and
+// only that collection can carry a window bound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct GraphCursorPayload {
-    pub(crate) kind: GraphCursorKind,
-    pub(crate) delta_link: String,
-    #[serde(default)]
-    pub(crate) advanced_through: Option<GraphPageMarker>,
-    /// The marker is an inventory page position rather than a delta page
-    /// position. It has no delta link yet and must resume through
-    /// `inventory_stream`, never `changes_stream`.
-    #[serde(default)]
-    pub(crate) inventory_in_progress: bool,
-    /// Unix timestamp of the end of the calendarView window that minted this
-    /// cursor. Calendar delta links retain their original query bounds, so a
-    /// live cursor must be reseeded before this horizon reaches the present.
-    ///
-    /// v3 is deliberately a reseed boundary rather than an additive read:
-    /// v2 cursors have no recoverable window horizon, and treating one as
-    /// current would preserve the frozen-window bug indefinitely.
-    #[serde(default)]
-    pub(crate) calendar_window_end: Option<i64>,
+pub(crate) enum GraphDeltaCollection {
+    Messages {
+        folder_id: String,
+    },
+    Events {
+        calendar_id: String,
+        window_end: Option<i64>,
+    },
+    Contacts {
+        folder_id: String,
+    },
+}
+
+// Each persisted state carries only the progress that stream can consume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum GraphCursorPayload {
+    Delta {
+        collection: GraphDeltaCollection,
+        delta_link: String,
+        advanced_through: Option<GraphPageMarker>,
+    },
+    InventoryPage {
+        collection: GraphDeltaCollection,
+        marker: GraphPageMarker,
+    },
+    PublicFolder(PublicFolderCursor),
 }
 
 /// Re-admit a persisted resume link (a delta link or a page marker's next
@@ -302,25 +312,49 @@ pub(crate) fn admit_resume_url(
 }
 
 impl GraphCursorPayload {
-    /// A live delta cursor. Takes the delta link as an `AdmittedUrl`, so an
-    /// unadmitted server link cannot be persisted.
     pub(crate) fn new(
         kind: GraphCursorKind,
         delta_link: &AdmittedUrl,
         advanced_through: Option<GraphPageMarker>,
     ) -> Self {
-        Self {
-            kind,
+        let collection = match Self::collection_for_kind(kind) {
+            Ok(collection) => collection,
+            Err(pf) => return Self::PublicFolder(*pf),
+        };
+        Self::Delta {
+            collection,
             delta_link: delta_link.as_str().to_string(),
             advanced_through,
-            inventory_in_progress: false,
-            calendar_window_end: None,
         }
     }
 
     pub(crate) fn with_calendar_window_end_option(mut self, end: Option<i64>) -> Self {
-        self.calendar_window_end = end;
+        if let Self::Delta {
+            collection: GraphDeltaCollection::Events { window_end, .. },
+            ..
+        }
+        | Self::InventoryPage {
+            collection: GraphDeltaCollection::Events { window_end, .. },
+            ..
+        } = &mut self
+        {
+            *window_end = end;
+        }
         self
+    }
+
+    fn collection_for_kind(
+        kind: GraphCursorKind,
+    ) -> Result<GraphDeltaCollection, Box<PublicFolderCursor>> {
+        Ok(match kind {
+            GraphCursorKind::Messages { folder_id } => GraphDeltaCollection::Messages { folder_id },
+            GraphCursorKind::Events { calendar_id } => GraphDeltaCollection::Events {
+                calendar_id,
+                window_end: None,
+            },
+            GraphCursorKind::Contacts { folder_id } => GraphDeltaCollection::Contacts { folder_id },
+            GraphCursorKind::PublicFolder(pf) => return Err(Box::new(pf)),
+        })
     }
 
     pub(crate) fn inventory_page(
@@ -328,32 +362,106 @@ impl GraphCursorPayload {
         marker: GraphPageMarker,
         calendar_window_end: Option<i64>,
     ) -> Self {
-        Self {
-            kind,
-            delta_link: String::new(),
-            advanced_through: Some(marker),
-            inventory_in_progress: true,
-            calendar_window_end,
-        }
+        let collection = match Self::collection_for_kind(kind) {
+            Ok(collection) => collection,
+            Err(pf) => return Self::PublicFolder(*pf),
+        };
+        Self::InventoryPage { collection, marker }
+            .with_calendar_window_end_option(calendar_window_end)
     }
 
-    /// Build a public-folder payload. There is no delta link, so the
-    /// delta-specific fields are left empty; the entire state lives in
-    /// the `PublicFolderCursor` carried by the `kind`.
     pub(crate) fn public_folder(cursor: PublicFolderCursor) -> Self {
-        Self {
-            kind: GraphCursorKind::PublicFolder(cursor),
-            delta_link: String::new(),
-            advanced_through: None,
-            inventory_in_progress: false,
-            calendar_window_end: None,
+        Self::PublicFolder(cursor)
+    }
+
+    pub(crate) fn kind(&self) -> GraphCursorKind {
+        let collection = match self {
+            Self::Delta { collection, .. } | Self::InventoryPage { collection, .. } => collection,
+            Self::PublicFolder(pf) => return GraphCursorKind::PublicFolder(pf.clone()),
+        };
+        match collection {
+            GraphDeltaCollection::Messages { folder_id } => GraphCursorKind::Messages {
+                folder_id: folder_id.clone(),
+            },
+            GraphDeltaCollection::Events { calendar_id, .. } => GraphCursorKind::Events {
+                calendar_id: calendar_id.clone(),
+            },
+            GraphDeltaCollection::Contacts { folder_id } => GraphCursorKind::Contacts {
+                folder_id: folder_id.clone(),
+            },
         }
     }
 
-    pub(crate) fn resume_url(&self) -> &str {
-        self.advanced_through
-            .as_ref()
-            .map_or(self.delta_link.as_str(), |marker| marker.next_link.as_str())
+    pub(crate) fn inventory_in_progress(&self) -> bool {
+        matches!(self, Self::InventoryPage { .. })
+    }
+
+    pub(crate) fn calendar_window_end(&self) -> Option<i64> {
+        match self {
+            Self::Delta {
+                collection: GraphDeltaCollection::Events { window_end, .. },
+                ..
+            }
+            | Self::InventoryPage {
+                collection: GraphDeltaCollection::Events { window_end, .. },
+                ..
+            } => *window_end,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn advanced_through(&self) -> Option<&GraphPageMarker> {
+        match self {
+            Self::Delta {
+                advanced_through, ..
+            } => advanced_through.as_ref(),
+            Self::InventoryPage { marker, .. } => Some(marker),
+            Self::PublicFolder(_) => None,
+        }
+    }
+
+    pub(crate) fn set_marker(
+        &mut self,
+        marker: Option<GraphPageMarker>,
+    ) -> Result<(), CursorError> {
+        match self {
+            Self::Delta {
+                advanced_through, ..
+            } => *advanced_through = marker,
+            Self::InventoryPage {
+                marker: current, ..
+            } => *current = marker.ok_or(CursorError::InventoryInProgress)?,
+            Self::PublicFolder(_) => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_delta_link(&mut self, link: String) {
+        if let Self::Delta {
+            delta_link,
+            advanced_through,
+            ..
+        } = self
+        {
+            *delta_link = link;
+            *advanced_through = None;
+        }
+    }
+
+    pub(crate) fn resume_url(&self) -> Option<&str> {
+        match self {
+            Self::Delta {
+                delta_link,
+                advanced_through,
+                ..
+            } => Some(
+                advanced_through
+                    .as_ref()
+                    .map_or(delta_link.as_str(), |marker| marker.next_link.as_str()),
+            ),
+            Self::InventoryPage { marker, .. } => Some(&marker.next_link),
+            Self::PublicFolder(_) => None,
+        }
     }
 }
 
@@ -401,8 +509,7 @@ pub(crate) fn encode_cursor(
     payload: GraphCursorPayload,
 ) -> Result<ChangeCursor, CursorError> {
     let progress = payload
-        .advanced_through
-        .as_ref()
+        .advanced_through()
         .map(encode_page_marker)
         .transpose()?;
     let bytes =
@@ -442,11 +549,13 @@ pub(crate) fn decode_cursor(cursor: &ChangeCursor) -> Result<GraphCursorPayload,
     // have two sources with a silent precedence rule; `encode_cursor` writes
     // both from the same value, so honoring the outer unconditionally loses
     // nothing.
-    payload.advanced_through = cursor
-        .advanced_through
-        .as_ref()
-        .map(decode_page_marker)
-        .transpose()?;
+    payload.set_marker(
+        cursor
+            .advanced_through
+            .as_ref()
+            .map(decode_page_marker)
+            .transpose()?,
+    )?;
     Ok(payload)
 }
 
@@ -469,13 +578,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nc2a_v4_public_folder_baseline_is_rejected() {
+    fn a_v5_cursor_requires_reseed() {
         let mut cursor = encode_cursor(
             CursorScope::Folder(FolderId("pf".to_string())),
             GraphCursorPayload::public_folder(public_folder_cursor()),
         )
         .expect("encode");
-        cursor.server_state.envelope_version = 4;
+        cursor.server_state.envelope_version = 5;
         assert!(matches!(
             decode_cursor(&cursor),
             Err(CursorError::SchemaIncompatible)
@@ -507,10 +616,10 @@ mod tests {
         );
 
         let decoded = decode_cursor(&cursor).expect("cursor should decode");
-        assert_eq!(decoded.advanced_through, Some(marker));
+        assert_eq!(decoded.advanced_through(), Some(&marker));
         assert_eq!(
             decoded.resume_url(),
-            "https://graph.microsoft.com/v1.0/next"
+            Some("https://graph.microsoft.com/v1.0/next")
         );
     }
 
@@ -670,7 +779,7 @@ mod tests {
         );
 
         let decoded = decode_cursor(&cursor).expect("decode");
-        match decoded.kind {
+        match decoded.kind() {
             GraphCursorKind::PublicFolder(got) => assert_eq!(got, pf),
             other => panic!("expected PublicFolder kind, got {other:?}"),
         }
@@ -695,7 +804,7 @@ mod tests {
         );
         let cursor = encode_cursor(scope, payload).expect("encode");
         let decoded = decode_cursor(&cursor).expect("decode");
-        assert!(matches!(decoded.kind, GraphCursorKind::Messages { .. }));
+        assert!(matches!(decoded.kind(), GraphCursorKind::Messages { .. }));
     }
 
     #[test]
@@ -726,10 +835,10 @@ mod tests {
         cursor.advanced_through = Some(encode_page_marker(&acked).expect("encode marker"));
 
         let decoded = decode_cursor(&cursor).expect("decode");
-        assert_eq!(decoded.advanced_through, Some(acked));
+        assert_eq!(decoded.advanced_through(), Some(&acked));
         assert_eq!(
             decoded.resume_url(),
-            "https://graph.microsoft.com/v1.0/page-9"
+            Some("https://graph.microsoft.com/v1.0/page-9")
         );
     }
 
@@ -756,10 +865,10 @@ mod tests {
         cursor.advanced_through = None;
 
         let decoded = decode_cursor(&cursor).expect("decode");
-        assert_eq!(decoded.advanced_through, None);
+        assert_eq!(decoded.advanced_through(), None);
         assert_eq!(
             decoded.resume_url(),
-            "https://graph.microsoft.com/v1.0/delta"
+            Some("https://graph.microsoft.com/v1.0/delta")
         );
     }
 
@@ -776,7 +885,7 @@ mod tests {
         );
         assert_eq!(
             payload.resume_url(),
-            "https://graph.microsoft.com/v1.0/delta"
+            Some("https://graph.microsoft.com/v1.0/delta")
         );
     }
 
@@ -805,8 +914,8 @@ mod tests {
         assert_eq!(cursor.scope, email_scope);
 
         let decoded = decode_cursor(&cursor).expect("codec accepts the mismatch");
-        assert!(matches!(decoded.kind, GraphCursorKind::Contacts { .. }));
-        assert_ne!(scope_for_kind(&decoded.kind), email_scope);
+        assert!(matches!(decoded.kind(), GraphCursorKind::Contacts { .. }));
+        assert_ne!(scope_for_kind(&decoded.kind()), email_scope);
     }
 
     #[test]
@@ -825,31 +934,29 @@ mod tests {
             &AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
-        payload.delta_link = String::new();
+        payload.set_delta_link(String::new());
         let cursor = encode_cursor(scope, payload).expect("encode");
         let decoded = decode_cursor(&cursor).expect("decode");
-        assert_eq!(decoded.resume_url(), "");
+        assert_eq!(decoded.resume_url(), Some(""));
     }
 
     #[test]
-    fn public_folder_kind_ignores_the_envelope_delta_fields() {
+    fn public_folder_state_has_no_delta_fields() {
         // The payload IS the sync state for a public folder; the
         // delta-specific fields must stay empty so no code path mistakes it
         // for a server-issued cursor.
         let payload = GraphCursorPayload::public_folder(public_folder_cursor());
-        assert!(payload.delta_link.is_empty());
-        assert!(payload.advanced_through.is_none());
-        assert_eq!(payload.resume_url(), "");
+        assert!(matches!(payload, GraphCursorPayload::PublicFolder(_)));
+        assert!(payload.advanced_through().is_none());
+        assert_eq!(payload.resume_url(), None);
     }
 
     #[test]
-    fn a_v1_public_folder_cursor_without_the_additive_fields_decodes() {
+    fn a_public_folder_state_without_additive_fields_decodes() {
         // `boundary_ids` / `degraded` / `warned_classes` / `live_ids` are
-        // all `serde(default)` additions. A cursor persisted before they
-        // existed must still decode, or every public folder would reseed.
+        // all `serde(default)` additions within the current envelope.
         let bytes = serde_json::to_vec(&serde_json::json!({
-            "kind": {
-                "PublicFolder": {
+            "PublicFolder": {
                     "folder_id": "AAMkPF=",
                     "routing": {
                         "anchor_mailbox": "content@contoso.com",
@@ -857,10 +964,7 @@ mod tests {
                     },
                     "watermark": "2026-03-01T10:00:00Z",
                     "last_full_scan_at": null
-                }
-            },
-            "delta_link": "",
-            "issued_at_unix_secs": 1700000000
+            }
         }))
         .expect("serialize legacy payload");
         let cursor = ChangeCursor {
@@ -875,7 +979,7 @@ mod tests {
         };
 
         let decoded = decode_cursor(&cursor).expect("legacy public-folder cursor decodes");
-        match decoded.kind {
+        match decoded.kind() {
             GraphCursorKind::PublicFolder(pf) => {
                 assert!(pf.live_ids.is_empty());
                 assert!(pf.boundary_ids.is_empty());

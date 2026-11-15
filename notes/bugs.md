@@ -371,27 +371,6 @@ is dropped); binary sections compare `Vec<u32>` exactly. Proposal: a typed
 `SectionSpec { parts: Vec<u32>, text: Option<Header | HeaderFields(..) | Text |
 Mime> }`, with origin part of the key that owns "same section".
 
-## BUG-039 - IMAP SELECT swallows unrecognized coded statuses instead of publishing them
-
-**Reported by:** imap-connection.
-
-"Which SELECT/EXAMINE responses belong to the SELECT?" is answered by
-`selected_mailbox_effective_responses` (`mod.rs`, the `[CLOSED]` cut),
-`reclassify_select_responses` (`dispatch/select.rs`, a second `rposition` of
-`[CLOSED]`, then `is_select_solicited_response` decides consumed vs event),
-`build_selected_mailbox` / `extract_selected_code` (which responses and codes
-feed `SelectedMailbox`), `validate_select_responses` (the mandatory set: FLAGS,
-EXISTS, RECENT or LIST), `codec::classification` for SELECT/EXAMINE, and
-`account::selected_uidvalidity` (UIDVALIDITY's mandatoriness judged in the
-account layer). They disagree at the edges: `is_select_solicited_response`
-consumes every `Status { code: Some(_) }`, so a `* NO [EXPUNGEISSUED]` or any
-unrecognized coded status during SELECT is swallowed and never reaches the event
-stream, while `build_selected_mailbox` uses only the select codes. Owner: one
-`partition_select(responses, ctx) -> (SelectInputs, Vec<UntaggedResponse>)` that
-cuts on `[CLOSED]` once, assigns each response to exactly one side, and whose
-`SelectInputs` constructor judges mandatoriness (UIDVALIDITY included); the
-helpers belong in `dispatch/select.rs`, not `mod.rs` (STR-068).
-
 ## BUG-042 - IMAP `native_code` is `"OTHER"` for every unknown response code
 
 **Reported by:** imap-account (live), imap-protocol.
@@ -447,17 +426,10 @@ discovery, a primary-mailbox outage included. Its owner:
 `AccountError::revoke_foreign_scope(self, scope, owner) -> AccountError` in
 `bifrost-types`, keeping the original chain as the revoked error's cause.
 
-Within IMAP, `error::shared_folder_error` is applied by each caller after it
-looks up `folders.get(&folder).shared_owner` itself: `inventory::run_inventory`,
-`get::run_folder_get`, `blob::run_fetch`, `mutate::flush_mutation_groups`,
-`changes::select_error`, `poll::examine`. It is NOT applied by
-`pim::copy_messages`, `delete_messages`, `set_flag`, `hydrate_decoded` (so
-`set_is_read`, `set_keyword`, `set_importance`, `add/remove_from_container`,
-`draft_discard`, `draft_send`'s discard, `message_hydrate`, `thread_hydrate`,
-`move_thread`, `delete_thread`), `search`, `search_messages`,
-`fetch_full_message`, or the push session's SELECT. On those paths a revoked
-share's `NO [NOPERM]` derives terminal account-wide `NoPermission` - the
-escalation the helper exists to prevent.
+The IMAP half is fixed: every IMAP path that touches a shared folder now
+quarantines a revoked share as a scoped revocation and keeps the original
+cause, wire code, attempt evidence and diagnostics. What remains is the
+cross-crate owner below.
 
 Across the workspace the same decision has four copies:
 `imap::error::shared_folder_error`, `jmap::sync::error::shared_scope_error`,
@@ -919,35 +891,41 @@ factory, and behind it an `AccountRegistration` value owning every per-account
 entry, so detach and retag are one operation each. The string-keyed registries are
 STR-145.
 
-## BUG-133 - A stale reattach abort can delete a row a scoped recovery resumed
+## BUG-156 - Google sharing-domain extraction accepts malformed addresses
 
-**Reported by:** resolution wave review (lateral; needs a ruling).
+**Reported by:** wave 6 fixer (google, lateral).
 
-`crates/sync/src/engine/ack.rs` now keeps a provisional reattach mark until the
-owning write or delete succeeds. In the resume case the scoped re-establish reads
-with `claim_for = None`, so a surviving row stays marked for the old reattach
-attempt; if that attempt's `ReattachAbort` arrives after the live scope resumed the
-row, it deletes the durable row. In-memory state is unaffected and the next durable
-`Ack` rewrites and promotes it, so the exposure is losing the resume point across a
-restart before that ack. Before the ordering fixes the mark was always dropped, so
-the window is new. It needs a reattach attempt still pending while a scoped
-recovery runs on the same scope; decide whether that interleaving is reachable and
-whether a non-reattach resume should drop or transfer the mark.
+`MailboxAddress` now owns Google mailbox identity, but the sharing-domain split
+still accepts an address with a repeated `@` or other malformed shape as long
+as the suffix is nonempty, so a bad address yields a wrong sharing domain
+rather than a refusal.
 
-## BUG-150 - The Gmail query encoder drops time of day and substitutes the epoch on failure
+## BUG-157 - An SMTP token-source failure has two classes depending on a feature
 
-**Reported by:** wave 5 fixer (google, lateral).
+**Reported by:** wave 6 fixer (smtp, lateral).
 
-Date filters reach Gmail `q` as dates only, and a conversion failure yields the
-epoch rather than a refusal, so a bad bound silently searches from 1970.
+`authentication/credentials.rs` reports a token-source failure as
+`InvalidInput` when `account-error` is on and as `Connection` when it is off,
+so one failure is a caller error in one build and a transport error in the
+other.
 
-## BUG-151 - A failed Graph hydration keeps the cached etag
+## BUG-158 - IMAP guarded STORE drops the server's response text
 
-**Reported by:** wave 5 fixer (graph, lateral).
+**Reported by:** wave 6 fixer (imap-account, lateral).
 
-`account/get.rs` leaves the previously cached etag in place when hydration
-fails, a 404 included, so a later conditional write can carry the validator of
-an item already known to be gone.
+`StoreResult` from a guarded `UID STORE UNCHANGEDSINCE` carries no response
+text, so a refusal reaches the account without the server's explanation.
+Preserving it needs `types` and `connection` changes.
+
+## BUG-159 - JMAP Principal membership removal sends `false` instead of `null`
+
+**Reported by:** wave 6 review (lateral, pre-existing).
+
+`PrincipalPatch::alias(.., false)` and `member(.., false)` emit
+`"aliases/x": false`. For a `String[Boolean]` / `Id[Boolean]` set, RFC 8620
+PatchObject removal is `null`; a strict server will reject `false` or store it
+as a member with value false. A test currently pins `false`. The other id-set
+patches (`IdSetPatch`) should be checked for the same shape.
 
 ## BUG-152 - IMAP leaf matching and the quota fallback edge cases
 
@@ -956,31 +934,4 @@ an item already known to be gone.
 A `NIL` hierarchy delimiter still triggers slash-based leaf matching in role
 resolution, and the quota probe's fallback can still pick a shared folder when
 the account has no personal INBOX.
-
-## BUG-153 - A huge COPYUID range is expanded into one id per UID
-
-**Reported by:** wave 5 fixer (imap-protocol, lateral).
-
-`account/mutate.rs` expands every COPYUID destination range into individual
-target references, so a very large server-supplied range costs unbounded CPU
-and memory. Bound the expansion or keep the range as a range.
-
-## BUG-154 - JMAP foreign-id and principal patch paths skip validation
-
-**Reported by:** wave 5 fixers (jmap, lateral).
-
-`sync/foreign.rs::parse_foreign` accepts an empty account id and repeated
-separators. Separately, `principal/set.rs` alias and member paths interpolate
-unescaped tokens and can coexist with a whole-property replacement, bypassing
-the new `PatchPath` overlap rule.
-
-## BUG-155 - Public coverage membership mutators can bypass subscription ownership
-
-**Reported by:** wave 5 fixer (sync, lateral).
-
-`PendingCoverage` now owns live-receiver membership, but its membership
-mutators are still public, and one ledger can be shared by several delivery
-gates, so a caller holding the coverage can break the ownership assumption the
-delivery gate relies on. Nothing in production does this; narrowing the
-mutators' visibility closes it.
 

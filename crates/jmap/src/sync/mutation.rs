@@ -137,7 +137,7 @@ pub(super) fn versioned_stream<T: HttpTransport>(
         // within the advertised object limit, without advancing caller tokens.
         // ready_chunks flushes when input is pending, so a live producer does
         // not have to fill the limit before seeing a result.
-        let mut chunks = targets.ready_chunks(limits.max_objects_in_set.clamp(1, 500));
+        let mut chunks = targets.ready_chunks(super::capabilities::set_batch_size(limits.max_objects_in_set));
         while let Some(chunk) = chunks.next().await {
             let mut groups: Vec<(String, Option<String>, Vec<ObjectId>)> = Vec::new();
             let mut rejected = Vec::new();
@@ -371,7 +371,7 @@ fn mutation_stream<T: HttpTransport>(
     kind: MutationKind,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     Box::pin(async_stream::stream! {
-        let batch_size = limits.max_objects_in_set.clamp(1, 500);
+        let batch_size = super::capabilities::set_batch_size(limits.max_objects_in_set);
         let primary_account_id = mail.id_str().to_string();
         let mut buffers = RouteBuffers::new(batch_size);
 

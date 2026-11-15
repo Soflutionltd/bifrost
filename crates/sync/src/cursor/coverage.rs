@@ -571,6 +571,7 @@ pub(crate) const PENDING_BOUNDARY_CAP: usize = 1024;
 #[derive(Debug)]
 pub struct PendingCoverage {
     ledger: Mutex<Ledger>,
+    delivery_owner: Mutex<Option<std::sync::Weak<crate::multiplexer::ChangeDelivery>>>,
     next: AtomicU64,
     /// This instance's id segment: the high bits every id it mints carries.
     /// Lets a publication minted by a PRIOR attachment be recognised as such.
@@ -617,6 +618,7 @@ impl Default for PendingCoverage {
         let segment = NEXT_LEDGER_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             ledger: Mutex::new(Ledger::default()),
+            delivery_owner: Mutex::new(None),
             next: AtomicU64::new(segment << Self::SEGMENT_SHIFT),
             segment,
             next_generation: AtomicU64::new(0),
@@ -646,6 +648,28 @@ impl PendingCoverage {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // Membership numbers are local to one delivery gate. Keep its weak identity
+    // even after departure so a second gate cannot reuse numbers in this ledger.
+    // This lock never reaches back into delivery; lock order stays delivery first.
+    pub(crate) fn bind_delivery(
+        &self,
+        delivery: &std::sync::Arc<crate::multiplexer::ChangeDelivery>,
+    ) {
+        let mut owner = self
+            .delivery_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let candidate = std::sync::Arc::downgrade(delivery);
+        if let Some(bound) = owner.as_ref() {
+            assert!(
+                bound.ptr_eq(&candidate),
+                "coverage ledger already bound to another delivery gate"
+            );
+        } else {
+            *owner = Some(candidate);
+        }
     }
 
     /// Issue a generation for one enumeration walk.
@@ -1108,7 +1132,7 @@ impl PendingCoverage {
     /// It can never re-charge a page that is already out of the ring: it is
     /// numbered at or above every existing page's `delivered_at`, and only
     /// receivers numbered strictly below one hold it. So this never needs a wake.
-    pub fn receiver_joined(&self, receiver_seq: u64) {
+    pub(crate) fn receiver_joined(&self, receiver_seq: u64) {
         self.guard().live.insert(receiver_seq);
     }
 
@@ -1120,7 +1144,7 @@ impl PendingCoverage {
     /// of the attachment - the same failure the sweep in
     /// [`PendingCoverage::release_undelivered`] exists to prevent, one step
     /// earlier. Called under the delivery gate's lock, ahead of that sweep.
-    pub fn receiver_departed(&self, receiver_seq: u64) {
+    pub(crate) fn receiver_departed(&self, receiver_seq: u64) {
         let mut ledger = self.guard();
         let was_live = ledger.live.remove(&receiver_seq);
         drop(ledger);
@@ -2050,6 +2074,18 @@ pub type Publications = PendingCoverage;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[should_panic(expected = "coverage ledger already bound to another delivery gate")]
+    fn a_ledger_cannot_share_receiver_numbers_between_delivery_gates() {
+        let ledger = super::PendingCoverage::new();
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        let first = std::sync::Arc::new(crate::multiplexer::ChangeDelivery::new(tx.clone()));
+        let second = std::sync::Arc::new(crate::multiplexer::ChangeDelivery::new(tx));
+        ledger.bind_delivery(&first);
+        ledger.bind_delivery(&first);
+        ledger.bind_delivery(&second);
+    }
+
     use super::{ClaimLookup, CoverageClaim, Lane, PendingCoverage};
     use bifrost_types::{
         AccountErrorBuilder, AccountErrorKind, Cause, ChangeCursor, Checkpoint, CoverageDomain,

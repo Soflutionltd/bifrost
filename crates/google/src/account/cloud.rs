@@ -776,10 +776,9 @@ async fn create_sharing_permission(
 /// value failing to parse (`Protocol(ParseFailed)`), refused before this
 /// exchange sends anything (`Unsent`).
 fn account_domain(account_email: &str) -> Result<String, Error> {
-    account_email
-        .rsplit_once('@')
-        .map(|(_, domain)| domain.to_owned())
-        .filter(|d| !d.is_empty())
+    super::mailbox::MailboxAddress::from_provider_value(account_email)
+        .domain()
+        .map(str::to_owned)
         .ok_or_else(|| {
             Error::provider_value_unusable(
                 ProviderFault::ParseFailed,

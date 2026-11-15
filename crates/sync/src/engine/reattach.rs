@@ -812,15 +812,15 @@ struct RepairPacing {
     // until the next open, when there is no replacement left to ask.
     failed_keys: Vec<bifrost_types::ThrottleKey>,
     waited: Duration,
-    exhausted: bool,
+    // Orthogonal evidence: cleanup holds do not mean the returned failure was
+    // observed. This resets per attempt, independently of the cumulative budget.
     observed: bool,
 }
 
 impl RepairPacing {
     fn exhaust_wait_budget(&mut self) -> Error {
         self.waited = REPAIR_WAIT_BUDGET.0;
-        self.exhausted = true;
-        Error::EstablishCursorFailed("recovery wait budget exhausted".into())
+        Error::WaitBudgetExhausted
     }
 
     fn observe(&mut self, ctx: &RecoveryContext<'_>, error: &AccountError) {
@@ -1101,7 +1101,7 @@ async fn re_establish_scope_with_backoff(
                     }
                 }
             }
-            Err(_) if pacing.exhausted => {
+            Err(Error::WaitBudgetExhausted) => {
                 warn_wait_budget(ctx, scope);
                 return;
             }
@@ -1821,7 +1821,7 @@ async fn reattach_account_paced(
             // the retry: its old handle was torn down or carried as an orphan,
             // nothing replaced it, and the consumer's push coverage vanished
             // without an error.
-            record.desired && next.capabilities().push != bifrost_types::PushCapability::None
+            record.desired() && next.capabilities().push != bifrost_types::PushCapability::None
         }) {
             let scopes: Vec<CursorScope> = record
                 .scopes
@@ -1846,9 +1846,7 @@ async fn reattach_account_paced(
                         guard.push(RegisteredSubscription {
                             handle,
                             scopes: covered,
-                            teardown_unconfirmed: false,
-                            desired: true,
-                            torn_down: false,
+                            state: crate::push::subscription::SubscriptionState::Live,
                         });
                     }
                 }
@@ -1926,7 +1924,7 @@ async fn reattach_account_paced(
         // `desired`, recreated by whichever reopen next commits.
         let mut first_refusal: Option<AccountError> = None;
         for record in &previous_subscriptions {
-            if record.torn_down {
+            if record.torn_down() {
                 // An earlier attempt already deleted it server-side and then
                 // aborted; the record is only the consumer's desire, which the
                 // recreation loop above has honoured. Deleting it again is
@@ -1959,7 +1957,7 @@ async fn reattach_account_paced(
                     ctx.subscriptions
                         .mark_torn_down(ctx.account_id, &record.handle);
                 }
-                Err(error) if record.teardown_unconfirmed => {
+                Err(error) if record.teardown_unconfirmed() => {
                     // Its teardown already failed once. The handle may belong
                     // to a connection that is long gone, so a repeated failure
                     // must not block the swap; keep carrying it so the next
@@ -2055,7 +2053,7 @@ async fn reattach_account_paced(
             ctx.shutdown,
         ) {
             for record in refused {
-                if record.desired {
+                if record.desired() {
                     guard.push(record);
                 } else {
                     refused_install += 1;
@@ -2220,8 +2218,8 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
                 return false;
             }
         }
-        if pacing.wait(ctx, None, None).await.is_err() {
-            if pacing.exhausted {
+        if let Err(error) = pacing.wait(ctx, None, None).await {
+            if matches!(error, Error::WaitBudgetExhausted) {
                 warn_wait_budget(ctx, CursorScope::Account);
                 engine_pause(ctx, PauseReason::RetryBudgetExhausted);
             }
@@ -2242,8 +2240,8 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
             // serialization lock nor an activity may be carried across it.
             drop(reopen_guard);
             drop(activity);
-            if pacing.wait(ctx, None, None).await.is_err() {
-                if pacing.exhausted {
+            if let Err(error) = pacing.wait(ctx, None, None).await {
+                if matches!(error, Error::WaitBudgetExhausted) {
                     warn_wait_budget(ctx, CursorScope::Account);
                     engine_pause(ctx, PauseReason::RetryBudgetExhausted);
                 }
@@ -2277,7 +2275,7 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
                         last_error = Some(error);
                         attempt = attempt.saturating_add(1);
                     }
-                    Err(_) if pacing.exhausted => {
+                    Err(Error::WaitBudgetExhausted) => {
                         warn_wait_budget(ctx, CursorScope::Account);
                         engine_pause(ctx, PauseReason::RetryBudgetExhausted);
                         return false;
@@ -2488,8 +2486,9 @@ async fn run_establish(
             None => None,
         };
         // Only a reattach passes an attempt. Its resume read claims a still
-        // provisional row through the writer; every other caller reads without
-        // claiming.
+        // provisional row through the writer. An ordinary read (the live
+        // scope's recovery) is shown a still-provisional row as absent and
+        // establishes fresh; its PersistEstablished then owns the row.
         match writer
             .get_change_cursor(scope.clone(), reattach_attempt)
             .await

@@ -467,21 +467,46 @@ pub(super) async fn ack_writer(
                 claim_for,
                 done,
             } => {
-                let result = store.get_change_cursor(&account_id, &scope).await;
-                // A reattach resuming a row another attempt inserted and has
-                // not settled takes it over, so that attempt's delayed abort
-                // cannot delete a row the resuming topology now depends on.
-                // Only an existing, still-provisional row moves; a committed
-                // row has no entry and a non-reattach read passes `None`.
-                if let (Some(attempt), Ok(Some(_))) = (claim_for, &result)
-                    && let Some(owner) = provisional.get_mut(&scope)
-                {
-                    *owner = attempt;
+                let mut result = store.get_change_cursor(&account_id, &scope).await;
+                // A reattach's own resume read (`claim_for`) takes over a row an
+                // earlier attempt inserted and has not settled, so that
+                // attempt's delayed abort cannot delete a row the resuming
+                // topology depends on.
+                //
+                // An ordinary read comes only from the LIVE incarnation's scoped
+                // recovery. It must not see, and must not adopt, a row that is
+                // still provisional. Drop can defer an abort send past the
+                // reopen lock, so this read can land between an aborted
+                // reattach's insert and its rollback. That row was minted by a
+                // replacement that never became live, and no acknowledgement
+                // ever confirmed it: any acknowledged change checkpoint would
+                // already have promoted it out of `provisional`. Resuming from
+                // it would skip an inventory baseline the consumer never
+                // durably received, and a replacement opened against different
+                // credentials could even hand the live handle another mailbox's
+                // state. So the live scope sees the row as absent and
+                // establishes fresh. Its `PersistEstablished` then releases the
+                // mark, so the late abort cannot delete the live row. An
+                // enterprise user pays one re-inventory in this window rather
+                // than silently missing mail.
+                if matches!(&result, Ok(Some(_))) && provisional.contains_key(&scope) {
+                    match claim_for {
+                        Some(attempt) => {
+                            provisional.insert(scope.clone(), attempt);
+                        }
+                        None => result = Ok(None),
+                    }
                 }
                 let _ = done.send(result);
                 continue;
             }
             WriterRequest::PersistEstablished { cursor, done } => {
+                // Only the live incarnation persists through this request
+                // (a reattach writes through `ReattachInsert`). A successful
+                // write replaces any provisional row the live read was shown
+                // as absent, so the row now belongs to the live scope and an
+                // aborting attempt must not delete it.
+                let scope = cursor.scope.clone();
                 let result = store
                     .apply_transition(
                         &account_id,
@@ -491,6 +516,9 @@ pub(super) async fn ack_writer(
                         },
                     )
                     .await;
+                if result.is_ok() {
+                    provisional.remove(&scope);
+                }
                 let _ = done.send(result);
                 continue;
             }
@@ -627,9 +655,12 @@ pub(super) async fn ack_writer(
                 // Retaining it cannot let the old attempt's abort delete a
                 // freshly established cursor: both reset callers
                 // (`establish_if_absent`, `restart_scope_admitted`) re-establish
-                // through `run_establish`, which reads the row first
-                // and reaches `PersistEstablished` only when it is ABSENT. A row
-                // that survived a failed reset is resumed, never overwritten.
+                // through `run_establish`, which reads the row first and reaches
+                // `PersistEstablished` only when the read answered ABSENT. A
+                // still-provisional row is answered absent to that live read, so
+                // it is overwritten rather than resumed, and the persist then
+                // releases the mark. A committed row that survived a failed
+                // reset is resumed.
                 if result.is_ok() {
                     provisional.remove(&scope);
                 }
@@ -1987,6 +2018,108 @@ mod tests {
         } else {
             assert!(saved.is_none(), "{case} ack must preserve abort ownership");
         }
+        drop(tx);
+        task.await.expect("writer finished");
+    }
+
+    #[tokio::test]
+    async fn a_live_read_neither_sees_nor_adopts_an_unsettled_reattach_row() {
+        let store = seeded_store().await;
+        let account = AccountId("acct".into());
+        let (tx, task) = start_flaky_writer(Arc::clone(&store));
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ReattachInsert {
+            attempt: 71,
+            cursor: change_cursor(b"never-live"),
+            done,
+        })
+        .await
+        .expect("writer alive");
+        wait.await.expect("insert answered").expect("insert landed");
+        // The live scope's ordinary read is shown the provisional row as absent.
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::GetChangeCursor {
+            scope: email_scope(),
+            claim_for: None,
+            done,
+        })
+        .await
+        .expect("writer alive");
+        assert!(
+            wait.await
+                .expect("read answered")
+                .expect("read landed")
+                .is_none()
+        );
+        // It establishes fresh and persists its own row, which takes the row
+        // over from the aborting attempt.
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::PersistEstablished {
+            cursor: change_cursor(b"live"),
+            done,
+        })
+        .await
+        .expect("writer alive");
+        wait.await
+            .expect("persist answered")
+            .expect("persist landed");
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ReattachAbort { attempt: 71, done })
+            .await
+            .expect("writer alive");
+        wait.await.expect("abort answered");
+        let saved = store
+            .inner
+            .get_change_cursor(&account, &email_scope())
+            .await
+            .expect("durable read")
+            .expect("live row survives the abort");
+        assert_eq!(saved.server_state.bytes, b"live");
+        drop(tx);
+        task.await.expect("writer finished");
+    }
+
+    #[tokio::test]
+    async fn a_live_read_alone_leaves_an_aborted_reattach_row_to_its_rollback() {
+        let store = seeded_store().await;
+        let account = AccountId("acct".into());
+        let (tx, task) = start_flaky_writer(Arc::clone(&store));
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ReattachInsert {
+            attempt: 71,
+            cursor: change_cursor(b"never-live"),
+            done,
+        })
+        .await
+        .expect("writer alive");
+        wait.await.expect("insert answered").expect("insert landed");
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::GetChangeCursor {
+            scope: email_scope(),
+            claim_for: None,
+            done,
+        })
+        .await
+        .expect("writer alive");
+        assert!(
+            wait.await
+                .expect("read answered")
+                .expect("read landed")
+                .is_none()
+        );
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ReattachAbort { attempt: 71, done })
+            .await
+            .expect("writer alive");
+        wait.await.expect("abort answered");
+        assert!(
+            store
+                .inner
+                .get_change_cursor(&account, &email_scope())
+                .await
+                .expect("durable read")
+                .is_none()
+        );
         drop(tx);
         task.await.expect("writer finished");
     }

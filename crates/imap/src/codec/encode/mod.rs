@@ -47,10 +47,13 @@ use dispatch::encode_command_to_buf;
 /// prematurely and allow injection of arbitrary commands.
 fn validate_no_crlf(s: &str, context: &str) -> Result<(), crate::Error> {
     if s.bytes().any(|b| b == b'\r' || b == b'\n') {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must not contain CR or LF  -  IMAP commands are \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must not contain CR or LF  -  IMAP commands are \
              CRLF-delimited (RFC 3501 Section 2.2)"
-        )));
+            )
+            .into(),
+        ));
     }
     Ok(())
 }
@@ -88,7 +91,9 @@ fn validate_search_criteria_crlf(
             } = literal_marker_at(bytes, i)
             {
                 let size = usize::try_from(size).map_err(|_| {
-                    crate::Error::InvalidInput(format!("{context} literal count exceeds usize"))
+                    crate::Error::InvalidInput(
+                        format!("{context} literal count exceeds usize").into(),
+                    )
                 })?;
                 let has_plus = !synchronizing;
                 // A non-synchronizing literal the caller wrote is well-formed;
@@ -97,33 +102,56 @@ fn validate_search_criteria_crlf(
                 if has_plus {
                     match literal_mode {
                         LiteralMode::Synchronizing => {
-                            return Err(crate::Error::MissingCapability(format!(
-                                "{context} uses a non-synchronizing literal \
+                            return Err(crate::Error::MissingCapability(
+                                crate::error::CapabilityFailure::new(
+                                    "LITERAL+".into(),
+                                    crate::error::CapabilityFailureReason::Alternatives(vec![
+                                        "LITERAL-".into(),
+                                    ]),
+                                    format!(
+                                        "{context} uses a non-synchronizing literal \
                                  without negotiated LITERAL+/LITERAL- support \
                                  (RFC 7888 Section 3)"
-                            )));
+                                    ),
+                                ),
+                            ));
                         }
                         LiteralMode::LiteralMinus if size > LITERAL_MINUS_MAX => {
-                            return Err(crate::Error::MissingCapability(format!(
-                                "{context} uses a non-synchronizing literal of {size} octets, \
+                            return Err(crate::Error::MissingCapability(
+                                crate::error::CapabilityFailure::new(
+                                    "LITERAL+".into(),
+                                    crate::error::CapabilityFailureReason::LiteralTooLarge {
+                                        size,
+                                        limit: LITERAL_MINUS_MAX,
+                                    },
+                                    format!(
+                                        "{context} uses a non-synchronizing literal of {size} octets, \
                                  which exceeds the 4096-octet limit for LITERAL- / IMAP4rev2 \
                                  mode (RFC 7888 Section 5 / RFC 9051 Section 4.3)"
-                            )));
+                                    ),
+                                ),
+                            ));
                         }
                         LiteralMode::LiteralMinus | LiteralMode::LiteralPlus => {}
                     }
                 }
                 let data_end = data_start.checked_add(size).ok_or_else(|| {
-                    crate::Error::InvalidInput(format!(
-                        "{context} literal length overflows usize \
+                    crate::Error::InvalidInput(
+                        format!(
+                            "{context} literal length overflows usize \
                          (RFC 3501 Section 4.3)"
-                    ))
+                        )
+                        .into(),
+                    )
                 })?;
                 if data_end > bytes.len() {
-                    return Err(crate::Error::InvalidInput(format!(
-                        "{context} literal declares {size} octets but the provided \
+                    return Err(crate::Error::InvalidInput(
+                        format!(
+                            "{context} literal declares {size} octets but the provided \
                          criteria fragment ends early (RFC 3501 Section 4.3)"
-                    )));
+                        )
+                        .into(),
+                    ));
                 }
                 i = data_end;
                 continue;
@@ -131,10 +159,13 @@ fn validate_search_criteria_crlf(
         }
 
         if matches!(bytes[i], b'\r' | b'\n') {
-            return Err(crate::Error::InvalidInput(format!(
-                "{context} must not contain raw CR or LF except inside an IMAP literal \
+            return Err(crate::Error::InvalidInput(
+                format!(
+                    "{context} must not contain raw CR or LF except inside an IMAP literal \
                  (RFC 3501 Sections 2.2 and 4.3)"
-            )));
+                )
+                .into(),
+            ));
         }
 
         i += 1;
@@ -231,10 +262,13 @@ pub(crate) fn validate_login_credential_ascii(
     field: &str,
 ) -> Result<(), crate::Error> {
     if !value.is_ascii() {
-        return Err(crate::Error::InvalidInput(format!(
-            "LOGIN {field} must be ASCII-only; RFC 6855 Section 5 requires \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "LOGIN {field} must be ASCII-only; RFC 6855 Section 5 requires \
              AUTHENTICATE for non-ASCII credentials"
-        )));
+            )
+            .into(),
+        ));
     }
     Ok(())
 }
@@ -289,14 +323,15 @@ const MOD_SEQ_MAX: u64 = i64::MAX as u64;
 /// (RFC 7162 Section 3.2.5.2).
 fn validate_mod_sequence_value(val: u64, context: &str) -> Result<(), crate::Error> {
     if val == 0 {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} mod-sequence-value must be >= 1 per RFC 7162 Section 7, got 0"
-        )));
+        return Err(crate::Error::InvalidInput(
+            format!("{context} mod-sequence-value must be >= 1 per RFC 7162 Section 7, got 0")
+                .into(),
+        ));
     }
     if val > MOD_SEQ_MAX {
         return Err(crate::Error::InvalidInput(format!(
             "{context} mod-sequence-value must be <= {MOD_SEQ_MAX} per RFC 7162 Section 7, got {val}"
-        )));
+        ).into()));
     }
     Ok(())
 }
@@ -309,7 +344,7 @@ fn validate_mod_sequence_valzer(val: u64, context: &str) -> Result<(), crate::Er
     if val > MOD_SEQ_MAX {
         return Err(crate::Error::InvalidInput(format!(
             "{context} mod-sequence-valzer must be <= {MOD_SEQ_MAX} per RFC 7162 Section 7, got {val}"
-        )));
+        ).into()));
     }
     Ok(())
 }
@@ -398,18 +433,24 @@ fn validate_sort_thread_charset(charset: &str) -> Result<(), crate::Error> {
 fn validate_imap_quoted_string(s: &str, context: &str) -> Result<(), crate::Error> {
     let bytes = s.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must be either an atom or a quoted-string \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must be either an atom or a quoted-string \
              (RFC 5256 Section 5 / RFC 3501 Section 9): {s:?}"
-        )));
+            )
+            .into(),
+        ));
     }
 
     let inner = &bytes[1..bytes.len() - 1];
     if inner.is_empty() {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must not be empty (RFC 5256 Section 5: charset values \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must not be empty (RFC 5256 Section 5: charset values \
              name an IANA-registered charset)"
-        )));
+            )
+            .into(),
+        ));
     }
 
     let mut idx = 0usize;
@@ -417,36 +458,51 @@ fn validate_imap_quoted_string(s: &str, context: &str) -> Result<(), crate::Erro
         match inner[idx] {
             b'\\' => {
                 let Some(&escaped) = inner.get(idx + 1) else {
-                    return Err(crate::Error::InvalidInput(format!(
-                        "{context} quoted-string must not end with a bare backslash \
+                    return Err(crate::Error::InvalidInput(
+                        format!(
+                            "{context} quoted-string must not end with a bare backslash \
                          (RFC 3501 Section 9)"
-                    )));
+                        )
+                        .into(),
+                    ));
                 };
                 if escaped != b'"' && escaped != b'\\' {
-                    return Err(crate::Error::InvalidInput(format!(
-                        "{context} quoted-string may only escape DQUOTE or backslash \
+                    return Err(crate::Error::InvalidInput(
+                        format!(
+                            "{context} quoted-string may only escape DQUOTE or backslash \
                          (RFC 3501 Section 9): {s:?}"
-                    )));
+                        )
+                        .into(),
+                    ));
                 }
                 idx += 2;
             }
             b'"' => {
-                return Err(crate::Error::InvalidInput(format!(
-                    "{context} quoted-string contains an unescaped DQUOTE \
+                return Err(crate::Error::InvalidInput(
+                    format!(
+                        "{context} quoted-string contains an unescaped DQUOTE \
                      (RFC 3501 Section 9): {s:?}"
-                )));
+                    )
+                    .into(),
+                ));
             }
             b'\r' | b'\n' | 0x00 => {
-                return Err(crate::Error::InvalidInput(format!(
-                    "{context} quoted-string contains CR, LF, or NUL \
+                return Err(crate::Error::InvalidInput(
+                    format!(
+                        "{context} quoted-string contains CR, LF, or NUL \
                      (RFC 3501 Section 9): {s:?}"
-                )));
+                    )
+                    .into(),
+                ));
             }
             byte if !byte.is_ascii() => {
-                return Err(crate::Error::InvalidInput(format!(
-                    "{context} quoted-string must be ASCII-only \
+                return Err(crate::Error::InvalidInput(
+                    format!(
+                        "{context} quoted-string must be ASCII-only \
                      (RFC 3501 Section 9 CHAR): {s:?}"
-                )));
+                    )
+                    .into(),
+                ));
             }
             _ => {
                 idx += 1;
@@ -474,50 +530,65 @@ pub(crate) fn validate_flag_keyword(s: &str) -> Result<(), crate::Error> {
 /// the annotation scope and is currently limited to `/private` or `/shared`.
 fn validate_metadata_entry_name(entry: &str, context: &str) -> Result<(), crate::Error> {
     if entry.contains("//") {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must not contain consecutive '/' characters \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must not contain consecutive '/' characters \
              (RFC 5464 Section 3.2): {entry:?}"
-        )));
+            )
+            .into(),
+        ));
     }
 
     if entry.ends_with('/') {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must not end with '/' (RFC 5464 Section 3.2): {entry:?}"
-        )));
+        return Err(crate::Error::InvalidInput(
+            format!("{context} must not end with '/' (RFC 5464 Section 3.2): {entry:?}").into(),
+        ));
     }
 
     if !entry.is_ascii() {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must not contain non-ASCII characters \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must not contain non-ASCII characters \
              (RFC 5464 Section 3.2): {entry:?}"
-        )));
+            )
+            .into(),
+        ));
     }
 
     if entry
         .bytes()
         .any(|byte| matches!(byte, 0x00..=0x19) || byte == b'*' || byte == b'%')
     {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must not contain '*', '%', or control octets \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must not contain '*', '%', or control octets \
              0x00..=0x19 (RFC 5464 Section 3.2): {entry:?}"
-        )));
+            )
+            .into(),
+        ));
     }
 
     // RFC 5464 Section 3.2: entry names are slash-separated hierarchical
     // paths whose first component defines the annotation scope. The only
     // standardized scope prefixes are `/private` and `/shared`.
     let Some(stripped) = entry.strip_prefix('/') else {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must start with '/' and use the /private or /shared \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must start with '/' and use the /private or /shared \
              scope prefixes (RFC 5464 Section 3.2): {entry:?}"
-        )));
+            )
+            .into(),
+        ));
     };
     let scope = stripped.split('/').next().unwrap_or_default();
     if !matches!(scope.to_ascii_lowercase().as_str(), "private" | "shared") {
-        return Err(crate::Error::InvalidInput(format!(
-            "{context} must use the /private or /shared scope prefixes \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "{context} must use the /private or /shared scope prefixes \
              (RFC 5464 Section 3.2): {entry:?}"
-        )));
+            )
+            .into(),
+        ));
     }
 
     Ok(())

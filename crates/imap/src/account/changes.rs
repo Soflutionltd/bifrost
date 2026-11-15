@@ -85,35 +85,33 @@ pub(crate) fn changes_stream(
 ) -> bifrost_types::AccountStream<SyncEvent<Change>> {
     // Route first: a typed scope owned by a sub-account delegates the
     // whole changes stream.
-    match route_scope(
+    let folder = match route_scope(
         &account,
         &cursor.scope,
         bifrost_types::AccountOperation::SyncChanges,
     ) {
         Ok(ScopeHandler::Delegate(sub)) => return sub.changes_stream(cursor),
-        Ok(ScopeHandler::Folder(_)) => {}
+        Ok(ScopeHandler::Folder(folder)) => folder,
         Err(error) => {
             return Box::pin(futures::stream::iter([SyncEvent::Terminated(error)]));
         }
-    }
+    };
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
-    let scope_for_ctx = cursor.scope.clone();
     let task = tokio::spawn(async move {
-        match run_changes(account, cursor, tx.clone()).await {
+        match run_changes(account.clone(), cursor, tx.clone()).await {
             Ok(()) | Err(ChangeError::ChannelDropped) => {}
             Err(ChangeError::Account(err)) => {
                 let _ = tx.send(terminated_event(err)).await;
             }
             Err(ChangeError::Imap(err)) => {
-                let _ = tx
-                    .send(terminated_event((
-                        err,
-                        super::error::ImapErrorContext::operation(
-                            bifrost_types::AccountOperation::SyncChanges,
-                        )
-                        .with_cursor_scope(scope_for_ctx),
-                    )))
-                    .await;
+                let error = account.folder_error(
+                    err,
+                    &folder,
+                    super::error::ImapErrorContext::operation(
+                        bifrost_types::AccountOperation::SyncChanges,
+                    ),
+                );
+                let _ = tx.send(terminated_event(error)).await;
             }
             Err(ChangeError::UidValidityChanged {
                 folder,
@@ -1002,8 +1000,20 @@ fn should_disable_qresync(err: &crate::Error) -> bool {
         // advertises QRESYNC without ENABLE (possible pre-rev2): in this
         // QRESYNC-only context a missing ENABLE means QRESYNC cannot be
         // negotiated, which is a downgrade, not a terminal error.
-        crate::Error::MissingCapability(cap) => {
-            mentions_qresync_capability(cap) || cap.eq_ignore_ascii_case("ENABLE")
+        // The typed capability decides, never the diagnostic prose: QRESYNC
+        // not advertised or not ENABLEd, or an alternatives gate that QRESYNC
+        // would have satisfied.
+        crate::Error::MissingCapability(failure) => {
+            use crate::error::CapabilityFailureReason;
+            use crate::types::Capability;
+            match (&failure.capability, &failure.reason) {
+                (Capability::QResync, _) => true,
+                (Capability::Enable, CapabilityFailureReason::NotAdvertised) => true,
+                (_, CapabilityFailureReason::Alternatives(alts)) => {
+                    alts.contains(&Capability::QResync)
+                }
+                _ => false,
+            }
         }
         _ => false,
     }
@@ -1011,12 +1021,6 @@ fn should_disable_qresync(err: &crate::Error) -> bool {
 
 fn should_discard_conn_after_qresync_error(err: &crate::Error) -> bool {
     matches!(err, crate::Error::Parse(_))
-}
-
-fn mentions_qresync_capability(value: &str) -> bool {
-    value
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '=')))
-        .any(|token| token.eq_ignore_ascii_case("QRESYNC"))
 }
 
 #[cfg(test)]
@@ -1417,24 +1421,43 @@ mod tests {
         assert!(should_disable_qresync(&crate::Error::Parse(
             "malformed FETCH".to_string(),
         )));
+        use crate::error::{CapabilityFailure, CapabilityFailureReason};
+        use crate::types::Capability;
         assert!(should_disable_qresync(&crate::Error::MissingCapability(
-            "QRESYNC (not ENABLEd)".to_string(),
+            CapabilityFailure::new(
+                Capability::QResync,
+                CapabilityFailureReason::NotEnabled,
+                "QRESYNC (not ENABLEd)",
+            ),
+        )));
+        // The dispatch gate on a server that does not advertise QRESYNC.
+        assert!(should_disable_qresync(&crate::Error::MissingCapability(
+            CapabilityFailure::new(
+                Capability::QResync,
+                CapabilityFailureReason::NotAdvertised,
+                "SELECT (QRESYNC) requires QRESYNC",
+            ),
         )));
         // The enable() leg on a server advertising QRESYNC without ENABLE.
         assert!(should_disable_qresync(&crate::Error::MissingCapability(
-            "ENABLE".to_string(),
+            "ENABLE".into(),
         )));
         assert!(!should_disable_qresync(&crate::Error::Protocol(
             "missing FLAGS".to_string(),
         )));
         assert!(!should_disable_qresync(&crate::Error::MissingCapability(
-            "CONDSTORE".to_string(),
+            "CONDSTORE".into(),
         )));
         assert!(!should_disable_qresync(&crate::Error::MissingCapability(
-            "QRESYNC_V2".to_string(),
+            "QRESYNC_V2".into(),
         )));
-        assert!(mentions_qresync_capability(
-            "SELECT (QRESYNC) requires QRESYNC"
-        ));
+        // Prose naming QRESYNC on another capability's failure does not count.
+        assert!(!should_disable_qresync(&crate::Error::MissingCapability(
+            CapabilityFailure::new(
+                Capability::Condstore,
+                CapabilityFailureReason::NotAdvertised,
+                "QRESYNC session needs CONDSTORE",
+            ),
+        )));
     }
 }

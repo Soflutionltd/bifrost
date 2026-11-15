@@ -88,7 +88,7 @@ pub(crate) struct BlobUploadResponse {
     created: Option<HashMap<String, BlobUploadCreated>>,
 
     #[serde(rename = "notCreated")]
-    not_created: Option<HashMap<String, serde_json::Value>>,
+    not_created: Option<HashMap<String, crate::core::set::SetError<String>>>,
 }
 
 /// Result of a successfully created blob.
@@ -251,9 +251,7 @@ impl BlobUploadResponse {
         if let Some(result) = self.created.as_mut().and_then(|r| r.remove(id)) {
             Ok(result)
         } else if let Some(error) = self.not_created.as_ref().and_then(|r| r.get(id)) {
-            Err(Error::NotParsable(format!(
-                "Blob {id} not created: {error:?}"
-            )))
+            Err(Error::Set(error.clone()))
         } else {
             Err(Error::SetIdUnanswered(id.to_string()))
         }
@@ -538,5 +536,31 @@ impl BlobLookupResponse {
 
     pub(crate) fn not_found(&self) -> Option<&[BlobId]> {
         self.not_found.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn upload_preserves_set_error_codes() {
+        let mut response: BlobUploadResponse = serde_json::from_value(serde_json::json!({
+            "accountId": "a", "notCreated": {
+                "c1": {"type": "overQuota", "description": "Storage full"},
+                "c2": {"type": "vendorFailure"}
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            response.created("c1"),
+            Err(Error::Set(error))
+                if error.error_type() == &crate::core::set::SetErrorType::OverQuota
+        ));
+        assert!(matches!(
+            response.created("c2"),
+            Err(Error::Set(error))
+                if error.error_type() == &crate::core::set::SetErrorType::Other("vendorFailure".into())
+        ));
     }
 }

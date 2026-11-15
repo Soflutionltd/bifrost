@@ -21,7 +21,9 @@ use crate::client::GmailClient;
 use crate::error::{Error, GmailLocalError, PageRefusal};
 use crate::types::{GmailHistoryItem, GmailMessage, GmailProfile};
 
-use super::cursor::{cursor_for_history, decode_gmail_state};
+#[cfg(test)]
+use super::cursor::decode_gmail_state;
+use super::cursor::{cursor_for_history, decode_gmail_state_for_profile};
 use super::error as account_error;
 
 /// Upper bound on `users.history.list` pages in a single walk.
@@ -106,7 +108,10 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
                 );
                 return Some((SyncEvent::Terminated(account_error), state));
             };
-            let decoded = match decode_gmail_state(&cursor.server_state) {
+            let decoded = match decode_gmail_state_for_profile(
+                &cursor.server_state,
+                &state.profile.email_address,
+            ) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     state.finished = true;
@@ -118,21 +123,6 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
                     return Some((SyncEvent::Terminated(account_error), state));
                 }
             };
-            if !decoded
-                .profile_email
-                .eq_ignore_ascii_case(&state.profile.email_address)
-            {
-                state.finished = true;
-                state.emitted_done = true;
-                let account_error = account_error::into_account_error(
-                    Error::Local(GmailLocalError::AccountIdentityMismatch {
-                        cursor_email: decoded.profile_email,
-                        profile_email: state.profile.email_address.clone(),
-                    }),
-                    account_error::GmailErrorContext::changes(),
-                );
-                return Some((SyncEvent::Terminated(account_error), state));
-            }
             // One `users.getProfile` per poll, KEPT DELIBERATELY. The cost
             // objection is correct and has already been answered: it doubles
             // the request count and the failure surface on a 30-second poll
@@ -149,9 +139,10 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
             };
             match profile {
                 Ok(current)
-                    if current
-                        .email_address
-                        .eq_ignore_ascii_case(&decoded.profile_email) =>
+                    if super::mailbox::MailboxAddress::from_provider_value(
+                        &current.email_address,
+                    )
+                    .matches(&decoded.profile_email) =>
                 {
                     state.start_history_id = Some(crate::types::HistoryId(decoded.history_id));
                     state.checked_profile = true;

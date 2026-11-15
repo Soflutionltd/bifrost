@@ -13,47 +13,38 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct RegisteredSubscription {
     pub handle: SubscriptionHandle,
     pub scopes: Vec<CursorScope>,
-    /// A server-side teardown for this handle was attempted and failed, so
-    /// the subscription may still be live on the provider. A further failed
-    /// retry is logged rather than aborting the caller - the handle may belong
-    /// to a connection that is already gone, and one unreachable orphan must
-    /// not wedge every future reopen.
-    ///
-    /// This says nothing about whether the consumer still wants the coverage;
-    /// that is `desired`. The two were once one flag, and a reopen whose
-    /// old-side teardown failed then treated the consumer's live subscription
-    /// as an orphan: the next attempt carried the old handle but never
-    /// recreated it on the replacement, so the subscription silently vanished.
-    pub teardown_unconfirmed: bool,
-    /// The consumer still wants this subscription's coverage, so a reopen
-    /// recreates it on the replacement connection. False for a pure orphan -
-    /// a handle the consumer asked to tear down, a replacement-side handle
-    /// unwound by an aborted reopen, or an old handle carried past a
-    /// committed reopen whose desire now lives in the recreated record - which
-    /// is kept only so its server-side teardown can be retried and is never
-    /// recreated. A record is always `desired`, `teardown_unconfirmed`, or
-    /// both; `into_orphan` is the only way to clear `desired`.
-    pub desired: bool,
-    /// The old-side teardown of this handle already SUCCEEDED in a reopen
-    /// attempt that then aborted, so the server-side subscription is gone and
-    /// the record survives only as the consumer's desire, to be recreated by
-    /// the next attempt. Such a record is never handed to `push_unsubscribe`
-    /// again (a provider that errors on an unknown handle would turn that into
-    /// another abort) and is dropped, not torn down, by `take`. Implies
-    /// `desired` and not `teardown_unconfirmed`.
-    pub torn_down: bool,
+    pub state: SubscriptionState,
+}
+
+/// Server handle lifetime and consumer desire are one state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubscriptionState {
+    Live,
+    LiveTeardownFailed,
+    TornDownAwaitingRecreate,
+    Orphan,
 }
 
 impl RegisteredSubscription {
-    /// This record as an orphan: its server-side teardown is unconfirmed and
-    /// nobody wants its coverage any more, so it is carried for retry and
-    /// never recreated.
+    pub(crate) fn desired(&self) -> bool {
+        self.state != SubscriptionState::Orphan
+    }
+
+    pub(crate) fn torn_down(&self) -> bool {
+        self.state == SubscriptionState::TornDownAwaitingRecreate
+    }
+
+    pub(crate) fn teardown_unconfirmed(&self) -> bool {
+        matches!(
+            self.state,
+            SubscriptionState::LiveTeardownFailed | SubscriptionState::Orphan
+        )
+    }
+
     #[must_use]
     pub(crate) fn into_orphan(self) -> Self {
         Self {
-            teardown_unconfirmed: true,
-            desired: false,
-            torn_down: false,
+            state: SubscriptionState::Orphan,
             ..self
         }
     }
@@ -98,9 +89,7 @@ impl SubscriptionRegistry {
         entry.or_default().push(RegisteredSubscription {
             handle,
             scopes,
-            teardown_unconfirmed: false,
-            desired: true,
-            torn_down: false,
+            state: SubscriptionState::Live,
         });
         true
     }
@@ -116,7 +105,7 @@ impl SubscriptionRegistry {
     pub(crate) fn take(&self, account: &AccountId) -> Vec<RegisteredSubscription> {
         match self.inner.remove(account) {
             Some((_, mut v)) => {
-                v.retain(|record| !record.torn_down);
+                v.retain(|record| !record.torn_down());
                 v
             }
             None => Vec::new(),
@@ -139,11 +128,13 @@ impl SubscriptionRegistry {
     /// multi-thread runtime in which detach can cancel AND take, and the orphan
     /// then lands under an id a later attach of the same `AccountId` inherits.
     ///
-    /// Detach does not take the slot's reopen lock to close that interval: a
-    /// consumer-driven reattach holds it across `factory.open()` and network
-    /// calls, detach does not wait for those, and a lock acquisition there would
-    /// make the one call a consumer has for getting rid of an account wait on a
-    /// wedged open.
+    /// The slot's reopen lock does not close that interval. Detach does wait
+    /// for it before the take, but only for a bounded `detach_timeout`, because
+    /// a consumer-driven reattach holds it across `factory.open()` and network
+    /// calls and the one call a consumer has for getting rid of an account must
+    /// not wait on a wedged open; on expiry detach proceeds without the lock.
+    /// Only the token read
+    /// inside the shard lock orders this write against the take in every case.
     pub(crate) fn restore_orphans(
         &self,
         account: AccountId,
@@ -170,8 +161,9 @@ impl SubscriptionRegistry {
     pub(crate) fn mark_unconfirmed(&self, account: &AccountId, handle: &SubscriptionHandle) {
         if let Some(mut records) = self.inner.get_mut(account) {
             for record in records.iter_mut() {
-                if &record.handle == handle {
-                    record.teardown_unconfirmed = true;
+                // A failed teardown cannot resurrect a handle already known gone.
+                if &record.handle == handle && record.state == SubscriptionState::Live {
+                    record.state = SubscriptionState::LiveTeardownFailed;
                 }
             }
         }
@@ -188,9 +180,8 @@ impl SubscriptionRegistry {
                 if &record.handle != handle {
                     return true;
                 }
-                if record.desired {
-                    record.torn_down = true;
-                    record.teardown_unconfirmed = false;
+                if record.desired() {
+                    record.state = SubscriptionState::TornDownAwaitingRecreate;
                     true
                 } else {
                     false
@@ -208,7 +199,7 @@ impl SubscriptionRegistry {
             .map(|records| {
                 records
                     .iter()
-                    .filter(|record| !record.desired && record.teardown_unconfirmed)
+                    .filter(|record| !record.desired() && record.teardown_unconfirmed())
                     .map(|record| record.handle.clone())
                     .collect()
             })
@@ -219,7 +210,7 @@ impl SubscriptionRegistry {
     /// record under the same handle is left alone.
     pub(crate) fn remove_orphan(&self, account: &AccountId, handle: &SubscriptionHandle) {
         if let Some(mut records) = self.inner.get_mut(account) {
-            records.retain(|record| record.desired || &record.handle != handle);
+            records.retain(|record| record.desired() || &record.handle != handle);
         }
     }
 
@@ -290,11 +281,29 @@ mod tests {
         RegisteredSubscription {
             handle: SubscriptionHandle(handle.to_owned()),
             scopes: Vec::new(),
-            teardown_unconfirmed: false,
-            desired: true,
-            torn_down: false,
+            state: SubscriptionState::Live,
         }
         .into_orphan()
+    }
+
+    #[test]
+    fn a_late_teardown_failure_does_not_resurrect_a_dead_handle() {
+        let registry = SubscriptionRegistry::new();
+        let account = AccountId("gone".into());
+        let handle = SubscriptionHandle("handle".into());
+        assert!(registry.record(
+            account.clone(),
+            handle.clone(),
+            vec![],
+            &CancellationToken::new()
+        ));
+        registry.mark_torn_down(&account, &handle);
+        registry.mark_unconfirmed(&account, &handle);
+        let records = registry.snapshot(&account);
+        assert!(records[0].desired());
+        assert!(records[0].torn_down());
+        assert!(!records[0].teardown_unconfirmed());
+        assert!(registry.take(&account).is_empty());
     }
 
     /// A live slot's orphans are merged into what is registered.

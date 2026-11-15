@@ -21,7 +21,7 @@ impl From<bifrost_sasl::SaslError> for Error {
     fn from(e: bifrost_sasl::SaslError) -> Self {
         match e {
             bifrost_sasl::SaslError::Protocol(m) => Error::Protocol(m),
-            bifrost_sasl::SaslError::InvalidCredential(m) => Error::InvalidInput(m),
+            bifrost_sasl::SaslError::InvalidCredential(m) => Error::InvalidInput(m.into()),
             bifrost_sasl::SaslError::AuthFailed(m) => Error::auth_with_code(m, None),
             // `SaslError` is `#[non_exhaustive]`; any future variant is an
             // unclassified auth failure until it is mapped explicitly.
@@ -367,7 +367,7 @@ impl AuthenticateScramConsumer {
                 Error::Protocol(format!("{m} (mechanism {mechanism})"))
             }
             bifrost_sasl::SaslError::InvalidCredential(m) => {
-                Error::InvalidInput(format!("{m} (mechanism {mechanism})"))
+                Error::InvalidInput(format!("{m} (mechanism {mechanism})").into())
             }
             bifrost_sasl::SaslError::AuthFailed(m) => {
                 Error::auth_with_mechanism(m, None, mechanism)

@@ -408,6 +408,22 @@ impl<O: SetObject> SetResponse<O> {
         self.destroyed.as_ref().is_some_and(|m| !m.is_empty())
     }
 
+    /// All failed updates with their object identities, without selecting a
+    /// hash-iteration winner or consuming sibling failures.
+    pub(crate) fn update_errors(&self) -> impl Iterator<Item = (&O::Id, &SetError<O::Property>)> {
+        self.not_updated.iter().flat_map(|errors| errors.iter())
+    }
+
+    /// All failed creates with their request-owned creation identities.
+    pub(crate) fn create_errors(&self) -> impl Iterator<Item = (&String, &SetError<O::Property>)> {
+        self.not_created.iter().flat_map(|errors| errors.iter())
+    }
+
+    // These legacy single-error helpers cannot represent a batch failure.
+    // Keep their shape until the account boundary can translate an aggregate
+    // of (object id, SetError) entries; dropping all but one entry there would
+    // still hide failed objects from an enterprise user's mutation results.
+    // Per-id callers should use updated()/created() to retain their identity.
     pub(crate) fn unwrap_update_errors(&self) -> crate::Result<()> {
         if let Some(errors) = &self.not_updated
             && let Some(err) = errors.values().next()

@@ -100,7 +100,7 @@ fn metadata_change_returns_some_extension() {
     assert_eq!(
         result,
         Some(IdleEvent::ExtensionEvent(
-            "METADATA change during IDLE".into()
+            super::super::IdleExtension::MetadataChange { server: false }
         ))
     );
 }
@@ -112,7 +112,7 @@ fn server_metadata_change_returns_some_extension() {
     assert_eq!(
         result,
         Some(IdleEvent::ExtensionEvent(
-            "METADATA change during IDLE".into()
+            super::super::IdleExtension::MetadataChange { server: true }
         ))
     );
 }
@@ -202,4 +202,22 @@ fn untagged_metadata_returns_some() {
     };
     let result = untagged_to_idle_event(resp);
     assert!(matches!(result, Some(IdleEvent::MetadataChange { .. })));
+}
+
+#[test]
+fn queue_loss_retains_typed_count_and_start() {
+    let since = std::time::Instant::now();
+    let event = typed_event_to_idle_event(TypedEvent::QueueOverflow {
+        dropped_count: 7,
+        since,
+    });
+    assert_eq!(
+        event,
+        Some(IdleEvent::ExtensionEvent(
+            super::super::IdleExtension::QueueOverflow {
+                dropped_count: 7,
+                since
+            },
+        ))
+    );
 }

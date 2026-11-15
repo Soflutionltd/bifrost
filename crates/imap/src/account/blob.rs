@@ -55,7 +55,7 @@ pub(crate) fn open_raw_rfc822(
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     let scope_id = message.0.clone();
     let task = tokio::spawn(async move {
-        match run_raw(account, message, &tx).await {
+        match run_raw(account.clone(), message.clone(), &tx).await {
             Ok(()) => {
                 let _ = tx.send(SyncEvent::Done(None::<Checkpoint>)).await;
             }
@@ -64,13 +64,21 @@ pub(crate) fn open_raw_rfc822(
                 let _ = tx.send(terminated_event(err)).await;
             }
             Err(BlobError::Imap(err)) => {
-                let _ = tx
-                    .send(terminated_event((
+                let error = match super::decode_object_id(&message, AccountOperation::OpenRawRfc822)
+                {
+                    Ok(decoded) => account.folder_error(
+                        err,
+                        &decoded.folder,
+                        super::error::ImapErrorContext::operation(AccountOperation::OpenRawRfc822)
+                            .with_message_id(scope_id),
+                    ),
+                    Err(_) => super::account_error_with(
                         err,
                         super::error::ImapErrorContext::operation(AccountOperation::OpenRawRfc822)
                             .with_message_id(scope_id),
-                    )))
-                    .await;
+                    ),
+                };
+                let _ = tx.send(terminated_event(error)).await;
             }
         }
     });

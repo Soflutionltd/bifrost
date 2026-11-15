@@ -109,10 +109,9 @@ impl ImapConnection {
                 .capabilities
                 .contains(&Capability::Thread(algorithm.to_uppercase()))
             {
-                return Err(Error::MissingCapability(format!(
-                    "THREAD={}",
-                    algorithm.to_uppercase()
-                )));
+                return Err(Error::MissingCapability(
+                    format!("THREAD={}", algorithm.to_uppercase()).into(),
+                ));
             }
         }
         let cmd = Command::Thread {
@@ -152,10 +151,9 @@ impl ImapConnection {
                 .capabilities
                 .contains(&Capability::Thread(algorithm.to_uppercase()))
             {
-                return Err(Error::MissingCapability(format!(
-                    "THREAD={}",
-                    algorithm.to_uppercase()
-                )));
+                return Err(Error::MissingCapability(
+                    format!("THREAD={}", algorithm.to_uppercase()).into(),
+                ));
             }
         }
         let cmd = Command::UidThread {

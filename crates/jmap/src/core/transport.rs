@@ -57,6 +57,10 @@ impl std::error::Error for TransportError {
 }
 
 impl TransportError {
+    // No status or transmission evidence can be inferred from this message.
+    // Preserve this custom-transport door until the account error boundary
+    // supports an explicit unknown-provenance failure; inventing net evidence
+    // here would mislead retry and partial-commit decisions.
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),

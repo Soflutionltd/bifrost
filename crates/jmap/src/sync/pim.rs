@@ -119,7 +119,7 @@ pub(crate) fn set_keyword<T: HttpTransport>(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let ids = resolve_target(&mail, target, AccountOperation::SetKeyword).await?;
-        let batch_size = super::factory::max_objects_in_set(&mail.client().session());
+        let batch_size = super::capabilities::max_objects_in_set(&mail.client().session());
         let mut progress = SetProgress::default();
         for chunk in ids.chunks(batch_size) {
             let keyword_for_set = keyword.clone();
@@ -2491,7 +2491,7 @@ async fn resolve_thread_emails_in_mailbox<T: HttpTransport>(
 
     // A conversation can exceed maxObjectsInGet; keep every Email/get
     // within the account's advertised per-call bound.
-    let batch_size = super::factory::max_objects_in_get(&mail.client().session());
+    let batch_size = super::capabilities::max_objects_in_get(&mail.client().session());
     let mut in_mailbox = Vec::new();
     let mut selected = HashSet::new();
     let mut read_state = None;
@@ -2561,7 +2561,7 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
             "Trash membership read returned no Email state".to_string(),
         ))
     })?;
-    let batch_size = super::factory::max_objects_in_set(&mail.client().session());
+    let batch_size = super::capabilities::max_objects_in_set(&mail.client().session());
     let mut if_in_state = read_state;
     let mut progress = SetProgress::default();
     for (index, chunk) in ids.chunks(batch_size).enumerate() {
@@ -2651,7 +2651,7 @@ async fn patch_mailbox_membership_of<T: HttpTransport>(
     // same account as the target, so the only work left is stripping the
     // qualification the selected account does not use.
     let mailbox = MailboxId::new(wire_id_for_mail(&container.0, mail.id_str()));
-    let batch_size = super::factory::max_objects_in_set(&mail.client().session());
+    let batch_size = super::capabilities::max_objects_in_set(&mail.client().session());
     let mut progress = SetProgress::default();
     for chunk in ids.chunks(batch_size) {
         let ids_for_set = chunk.to_vec();

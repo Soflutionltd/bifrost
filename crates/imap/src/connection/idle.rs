@@ -277,18 +277,19 @@ fn typed_event_to_idle_event(ev: TypedEvent) -> Option<IdleEvent> {
         TypedEvent::Bye { code, text } => Some(IdleEvent::Bye { code, text }),
         TypedEvent::QueueOverflow {
             dropped_count,
-            since: _,
-        } => Some(IdleEvent::Alert(format!(
-            "event queue overflow: {dropped_count} events dropped"
-        ))),
-        TypedEvent::MetadataChange {} | TypedEvent::ServerMetadataChange {} => {
-            // Metadata changes during IDLE  -  no detailed info in
-            // the TypedEvent variant. Map to a generic MetadataChange.
-            // The caller can re-query metadata if needed.
-            Some(IdleEvent::ExtensionEvent(
-                "METADATA change during IDLE".into(),
-            ))
-        }
+            since,
+        } => Some(IdleEvent::ExtensionEvent(
+            super::IdleExtension::QueueOverflow {
+                dropped_count,
+                since,
+            },
+        )),
+        TypedEvent::MetadataChange {} => Some(IdleEvent::ExtensionEvent(
+            super::IdleExtension::MetadataChange { server: false },
+        )),
+        TypedEvent::ServerMetadataChange {} => Some(IdleEvent::ExtensionEvent(
+            super::IdleExtension::MetadataChange { server: true },
+        )),
         TypedEvent::Extension(resp) => untagged_to_idle_event(*resp),
     }
 }
@@ -350,7 +351,9 @@ fn untagged_to_idle_event(resp: UntaggedResponse) -> Option<IdleEvent> {
             None
         }
         // Everything else: wrap as extension event.
-        other => Some(IdleEvent::ExtensionEvent(format!("{other:?}"))),
+        other => Some(IdleEvent::ExtensionEvent(super::IdleExtension::Response(
+            Box::new(other),
+        ))),
     }
 }
 

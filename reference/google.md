@@ -1892,3 +1892,34 @@ the fallback; a reported Downgraded result is not replayed by reassertion.
 
 Streaming error boundaries use `RecoveryClass::is_item_local` from bifrost-types
 to decide whether an item failure must terminate the stream.
+
+## Mailbox identity and cursor-bridged absence
+
+`account/mailbox.rs::MailboxAddress` owns the ASCII-insensitive mailbox key
+used by cursor checks, live profile checks, watch coordination and Drive sharing
+domain extraction. Production watch keys already come from `getProfile`, not
+caller configuration; the earlier alias warning at that site was stale. No
+alias, dot, plus-address or gmail/googlemail rewriting is guessed. Enterprise
+users expect unrelated mailboxes to remain separate unless the provider gives
+them the same profile identity. The key consumes provider strings and persisted
+cursor copies; it does not claim type-level proof of getProfile provenance.
+Send-as identities remain separate: Gmail identity IDs are sendAsEmail values,
+and selecting a delegated sender must preserve that sender on the message.
+
+`cursor::absence_proven_by_cursor_bridge` is the common inventory/repair proof
+for `NotFound(Message)`: the history cursor sampled before the walk bridges any
+subsequent deletion. Users expect deleted messages to disappear without repair
+debt. Repair returns the typed evidence. The walk has no per-object evidence
+variant in `InventoryEvent`, so it discharges absence without adding an
+obligation. Mutation 404 isolation proves an operation target is missing, not
+inventory coverage, and deliberately does not use this cursor proof.
+
+Structured Gmail search and stored-filter date bounds use Unix seconds,
+preserving time of day without timezone-dependent calendar-date interpretation.
+A fractional-second bound is rounded outward: `after` floors and `before` ceils
+to whole seconds. That widens the interval by under one second and never drops
+a matching message, so a range built from `SystemTime::now()` works, which is
+what a user typing a search expects. Only bounds Gmail cannot represent at all
+(pre-epoch, or past signed Unix seconds) are refused, as malformed caller
+input, before the request they would shape is sent. Both surfaces use the
+same encoder.

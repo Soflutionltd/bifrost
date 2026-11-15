@@ -72,6 +72,12 @@ pub(crate) fn encode_foreign_account(account_id: &str) -> FolderId {
 /// occurs for JMAP, whose primary scopes are `Type(_)`, but guards the
 /// boundary regardless).
 pub(crate) fn parse_foreign(folder: &FolderId) -> Option<ForeignMailbox> {
+    // Keep the historical first-separator grammar, including empty owners
+    // and separators in the suffix. The encoders accept arbitrary strings,
+    // and protocol Id deserialization does not validate them either: these
+    // exact forms may already be persisted ids minted by this crate. Tightening
+    // only this reader would orphan those containers on a later reopen. A
+    // stricter format needs a versioned codec and a legacy decoding path.
     folder
         .0
         .split_once(FOREIGN_SEP)

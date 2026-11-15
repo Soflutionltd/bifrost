@@ -291,7 +291,7 @@ impl SyncEngine {
             if !aborting && !blocked_by_engine {
                 let mut reroute = Vec::new();
                 for cohort in &mut cohorts {
-                    if !cohort.submitted && !cohort.done {
+                    if !cohort.submitted() && !cohort.done() {
                         cohort.remaining.retain(|id| {
                             let identity = cohort_identity(
                                 &mut identities,
@@ -310,7 +310,9 @@ impl SyncEngine {
                             }
                         });
                         cohort.targets = cohort.remaining.clone();
-                        cohort.done = cohort.remaining.is_empty();
+                        if cohort.remaining.is_empty() {
+                            cohort.finish();
+                        }
                     }
                 }
                 for id in reroute {
@@ -330,8 +332,8 @@ impl SyncEngine {
             // yields to siblings; neither a hold nor an admission re-check burns
             // an attempt, and no admission or activity spans a hold wait.
             if aborting || blocked_by_engine {
-                for cohort in cohorts.iter_mut().filter(|cohort| !cohort.done) {
-                    if !cohort.submitted {
+                for cohort in cohorts.iter_mut().filter(|cohort| !cohort.done()) {
+                    if !cohort.submitted() {
                         for id in &cohort.targets {
                             outcomes.insert(
                                 id.clone(),
@@ -342,7 +344,7 @@ impl SyncEngine {
                                 },
                             );
                         }
-                        cohort.done = true;
+                        cohort.finish();
                         continue;
                     }
                     for id in &cohort.targets {
@@ -364,7 +366,7 @@ impl SyncEngine {
                             }
                         }
                     }
-                    cohort.readback = true;
+                    cohort.phase = CohortPhase::Readback;
                 }
             }
             let readback_set: HashSet<_> = unresolved_readback_ids(&outcomes).into_iter().collect();
@@ -373,10 +375,10 @@ impl SyncEngine {
             for offset in 0..cohorts.len() {
                 let index = (cursor + offset) % cohorts.len();
                 let cohort = &mut cohorts[index];
-                if cohort.done {
+                if cohort.done() {
                     continue;
                 }
-                let ids = if cohort.readback {
+                let ids = if cohort.phase == CohortPhase::Readback {
                     cohort
                         .targets
                         .iter()
@@ -387,10 +389,10 @@ impl SyncEngine {
                     cohort.remaining.clone()
                 };
                 if ids.is_empty() {
-                    cohort.done = true;
+                    cohort.finish();
                     continue;
                 }
-                let keys = if cohort.readback {
+                let keys = if cohort.phase == CohortPhase::Readback {
                     crate::recovery::declared_keys(
                         account.as_ref().as_ref(),
                         account_id,
@@ -400,7 +402,7 @@ impl SyncEngine {
                     campaign_keys(account.as_ref().as_ref(), account_id, &ids, &op)
                 };
                 let now = tokio::time::Instant::now();
-                let mut ready_at = if cohort.readback {
+                let mut ready_at = if cohort.phase == CohortPhase::Readback {
                     cohort.reconcile_at
                 } else {
                     cohort.retry_at
@@ -443,7 +445,7 @@ impl SyncEngine {
                         // release all permits, and let ready siblings run.
                         // It consumes neither a submission nor a retry slot.
                         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
-                        if cohorts[index].readback {
+                        if cohorts[index].phase == CohortPhase::Readback {
                             cohorts[index].reconcile_at = deadline;
                         } else {
                             cohorts[index].retry_at = deadline;
@@ -458,7 +460,7 @@ impl SyncEngine {
             // than restarting, resetting or disabling the replacement.
             let incarnation = Some(account.generation());
             let cohort = &mut cohorts[index];
-            let keys = if cohort.readback {
+            let keys = if cohort.phase == CohortPhase::Readback {
                 crate::recovery::declared_keys(
                     account.as_ref().as_ref(),
                     account_id,
@@ -473,7 +475,7 @@ impl SyncEngine {
                 drop(admission);
                 continue;
             }
-            if !cohort.submitted
+            if !cohort.submitted()
                 && remaining.iter().any(|id| {
                     cohort_identity(
                         &mut identities,
@@ -496,7 +498,7 @@ impl SyncEngine {
                 }
                 continue;
             };
-            if cohort.readback {
+            if cohort.phase == CohortPhase::Readback {
                 // Observed state cannot prove an uncertain caller-guarded
                 // write passed its precondition. Leave those targets pending.
                 let remaining = remaining
@@ -511,7 +513,7 @@ impl SyncEngine {
                     })
                     .collect::<Vec<_>>();
                 if remaining.is_empty() {
-                    cohort.done = true;
+                    cohort.finish();
                     drop(activity);
                     drop(admission);
                     continue;
@@ -592,9 +594,9 @@ impl SyncEngine {
                     .filter(|id| matches!(outcomes.get(id), Some(MutationBucket::ReadyReassert)))
                     .collect();
                 if cohort.remaining.is_empty() {
-                    cohort.done = true;
+                    cohort.finish();
                 } else {
-                    cohort.readback = false;
+                    cohort.phase = CohortPhase::Submitted;
                     cohort.retry_at = tokio::time::Instant::now();
                 }
                 drop(activity);
@@ -626,7 +628,7 @@ impl SyncEngine {
                 }
             });
             if remaining.is_empty() {
-                cohort.done = true;
+                cohort.finish();
                 drop(activity);
                 drop(admission);
                 continue;
@@ -634,7 +636,7 @@ impl SyncEngine {
             for id in &remaining {
                 outcomes.insert(id.clone(), MutationBucket::InFlight);
             }
-            cohort.submitted = true;
+            cohort.phase = CohortPhase::Submitted;
             let key = cohort.key.clone();
             let mut retry_ids = Vec::new();
             let mut reconcile_at = cohort.reconcile_at;
@@ -1013,7 +1015,7 @@ impl SyncEngine {
                 }
             }
             if first_error.is_some() || blocked_by_engine || next.is_empty() {
-                cohort.readback = true;
+                cohort.phase = CohortPhase::Readback;
             } else {
                 cohort.remaining = next;
                 if let Some(advice) = stream_termination_advice.or(item_retry_advice) {
@@ -1038,11 +1040,11 @@ impl SyncEngine {
         // unresolved targets explicit rather than implying a terminal failure.
         for cohort in &cohorts {
             for id in &cohort.targets {
-                if !cohort.submitted {
+                if !cohort.submitted() {
                     outcomes
                         .entry(id.clone())
                         .or_insert(MutationBucket::PendingRetry);
-                } else if !cohort.done {
+                } else if !cohort.done() {
                     let value = outcomes
                         .entry(id.clone())
                         .or_insert(MutationBucket::Unresolved);
@@ -1122,14 +1124,47 @@ fn cohort_identity(
         .collect()
 }
 
+// Completed unsent work must remain distinguishable from a completed submission
+// when the campaign constructs its final per-target outcomes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CohortPhase {
+    Unsubmitted,
+    Submitted,
+    Readback,
+    DoneUnsubmitted,
+    DoneSubmitted,
+}
+
+impl MutationCohort {
+    fn submitted(&self) -> bool {
+        !matches!(
+            self.phase,
+            CohortPhase::Unsubmitted | CohortPhase::DoneUnsubmitted
+        )
+    }
+
+    fn done(&self) -> bool {
+        matches!(
+            self.phase,
+            CohortPhase::DoneUnsubmitted | CohortPhase::DoneSubmitted
+        )
+    }
+
+    fn finish(&mut self) {
+        self.phase = if self.submitted() {
+            CohortPhase::DoneSubmitted
+        } else {
+            CohortPhase::DoneUnsubmitted
+        };
+    }
+}
+
 struct MutationCohort {
     identity: std::collections::BTreeSet<usize>,
     key: bifrost_types::IdempotencyKey,
     targets: Vec<bifrost_types::ObjectId>,
     remaining: Vec<bifrost_types::ObjectId>,
-    submitted: bool,
-    readback: bool,
-    done: bool,
+    phase: CohortPhase,
     attempt: u64,
     retry_at: tokio::time::Instant,
     reconcile_at: tokio::time::Instant,
@@ -1152,7 +1187,7 @@ fn route_target(
     );
     if let Some(cohort) = cohorts
         .iter_mut()
-        .find(|c| c.identity == identity && !c.submitted && !c.done)
+        .find(|c| c.identity == identity && !c.submitted() && !c.done())
     {
         cohort.targets.push(id.clone());
         cohort.remaining.push(id);
@@ -1162,9 +1197,7 @@ fn route_target(
             key: vendor.next(protocol),
             targets: vec![id.clone()],
             remaining: vec![id],
-            submitted: false,
-            readback: false,
-            done: false,
+            phase: CohortPhase::Unsubmitted,
             attempt: 0,
             retry_at: tokio::time::Instant::now(),
             reconcile_at: tokio::time::Instant::now(),

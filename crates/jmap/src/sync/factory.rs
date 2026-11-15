@@ -453,31 +453,6 @@ pub(super) fn api_request_concurrency(session: &crate::core::session::Session) -
     session.api_request_concurrency().min(MAX_PROBE_CONCURRENCY)
 }
 
-/// The `maxObjectsInGet` a session advertises, for the doors that hold a
-/// bare `Account` rather than the `CoreLimits` built at open.
-/// `capabilities::build` refuses a session that omits or zeroes this, so
-/// the fallback is only ever reached by a caller running ahead of that
-/// validation; batching one id at a time is the safe shape there.
-pub(super) fn max_objects_in_get(session: &crate::core::session::Session) -> usize {
-    session
-        .core_capabilities()
-        .and_then(crate::core::session::CoreCapabilities::max_objects_in_get)
-        .unwrap_or(1)
-        .max(1)
-}
-
-/// The per-call `/set` ceiling for paths that hold a bare `Account`
-/// instead of the validated `CoreLimits` from open. Keep the same upper
-/// bound used by bulk mutation batching, while never exceeding the
-/// server-advertised limit.
-pub(super) fn max_objects_in_set(session: &crate::core::session::Session) -> usize {
-    session
-        .core_capabilities()
-        .and_then(crate::core::session::CoreCapabilities::max_objects_in_set)
-        .unwrap_or(1)
-        .clamp(1, 500)
-}
-
 /// The optional PIM family handles a session yields, each already read
 /// through the Absent / Malformed / Present lane rule.
 ///

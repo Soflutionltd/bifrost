@@ -3,8 +3,6 @@
 use std::time::SystemTime;
 
 use bifrost_types::{AccountError, AccountOperation, FilterCondition, Provider, SearchFilter};
-use jiff::Timestamp;
-use jiff::tz::Offset;
 
 use super::error::{GmailErrorContext, into_account_error};
 
@@ -87,10 +85,16 @@ pub(super) fn condition_query(
         FilterCondition::DateRange { after, before } => {
             let mut parts = Vec::new();
             if let Some(after) = after {
-                parts.push(format!("after:{}", gmail_date(*after)));
+                parts.push(format!(
+                    "after:{}",
+                    gmail_date(*after, BoundSide::After, op)?
+                ));
             }
             if let Some(before) = before {
-                parts.push(format!("before:{}", gmail_date(*before)));
+                parts.push(format!(
+                    "before:{}",
+                    gmail_date(*before, BoundSide::Before, op)?
+                ));
             }
             Ok(parts.join(" "))
         }
@@ -156,17 +160,88 @@ pub(super) fn container_query(id: &str) -> String {
         .unwrap_or_else(|| format!("label:{}", query_term(id)))
 }
 
-pub(super) fn gmail_date(time: SystemTime) -> String {
-    let dt = Offset::UTC
-        .to_datetime(Timestamp::try_from(time).unwrap_or(Timestamp::UNIX_EPOCH))
-        .date();
-    format!("{:04}/{:02}/{:02}", dt.year(), dt.month(), dt.day())
+/// Which side of a range a bound is. A fractional bound is rounded outward:
+/// `After` floors and `Before` ceils to whole seconds.
+#[derive(Clone, Copy)]
+pub(super) enum BoundSide {
+    After,
+    Before,
+}
+
+pub(super) fn gmail_date(
+    time: SystemTime,
+    side: BoundSide,
+    op: AccountOperation,
+) -> Result<String, AccountError> {
+    // Users expect a time bound to keep its time of day, and a search built
+    // from SystemTime::now() to work. Gmail takes whole Unix seconds, so a
+    // fractional bound is rounded outward (after floors, before ceils). That
+    // widens the range by under one second and never drops a matching
+    // message. Only bounds Gmail cannot represent at all (before the epoch,
+    // or past signed seconds) are refused.
+    let elapsed = time.duration_since(SystemTime::UNIX_EPOCH).map_err(|_| {
+        invalid(
+            op,
+            "Gmail query date bounds must be on or after the Unix epoch",
+        )
+    })?;
+    let mut secs = elapsed.as_secs();
+    if matches!(side, BoundSide::Before) && elapsed.subsec_nanos() != 0 {
+        secs = secs
+            .checked_add(1)
+            .ok_or_else(|| invalid(op, "Gmail query date bound exceeds signed Unix seconds"))?;
+    }
+    let seconds = i64::try_from(secs)
+        .map_err(|_| invalid(op, "Gmail query date bound exceeds signed Unix seconds"))?;
+    Ok(seconds.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bifrost_types::ContainerId;
+
+    #[test]
+    fn date_bounds_keep_time_of_day_on_both_surfaces() {
+        let after = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(131_696);
+        let before = after + std::time::Duration::from_secs(123);
+        let search = SearchFilter::DateRange {
+            after: Some(after),
+            before: Some(before),
+        };
+        let rule = FilterCondition::DateRange {
+            after: Some(after),
+            before: Some(before),
+        };
+        assert_eq!(filter_query(&search).unwrap(), "after:131696 before:131819");
+        assert_eq!(
+            condition_query(&rule, AccountOperation::FilterCreate).unwrap(),
+            "after:131696 before:131819"
+        );
+    }
+
+    #[test]
+    fn unrepresentable_date_bounds_are_refused() {
+        let op = AccountOperation::Search;
+        let before_epoch = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert!(gmail_date(before_epoch, BoundSide::After, op).is_err());
+        assert!(gmail_date(before_epoch, BoundSide::Before, op).is_err());
+    }
+
+    #[test]
+    fn fractional_bounds_round_outward() {
+        let op = AccountOperation::Search;
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(131_696_250);
+        assert_eq!(gmail_date(t, BoundSide::After, op).unwrap(), "131696");
+        assert_eq!(gmail_date(t, BoundSide::Before, op).unwrap(), "131697");
+        let whole = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(131_696);
+        assert_eq!(gmail_date(whole, BoundSide::Before, op).unwrap(), "131696");
+        let search = SearchFilter::DateRange {
+            after: Some(t),
+            before: Some(t),
+        };
+        assert_eq!(filter_query(&search).unwrap(), "after:131696 before:131697");
+    }
 
     #[test]
     fn search_and_rule_queries_share_nested_encoding() {

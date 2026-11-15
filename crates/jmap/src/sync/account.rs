@@ -124,8 +124,7 @@ pub(crate) struct JmapAccount {
     /// Private Mailbox/changes position for scope lifecycle polling. This is
     /// deliberately separate from `mailbox_states`, whose consumers may
     /// fast-forward it after a delta pass or local Mailbox/set.
-    pub(crate) lifecycle_mailbox_states: StateMap,
-    pub(crate) mailbox_names: Arc<Mutex<HashMap<String, String>>>,
+    pub(crate) lifecycle_topology: Arc<Mutex<discover::LifecycleTopology>>,
 }
 
 impl JmapAccount {
@@ -177,8 +176,10 @@ impl JmapAccount {
             subscription_seq: AtomicU64::new(1),
             email_states: Arc::new(Mutex::new(email_states)),
             mailbox_states: Arc::new(Mutex::new(mailbox_states)),
-            lifecycle_mailbox_states: Arc::new(Mutex::new(lifecycle_mailbox_states)),
-            mailbox_names: Arc::new(Mutex::new(mailbox_names)),
+            lifecycle_topology: Arc::new(Mutex::new(discover::LifecycleTopology {
+                positions: lifecycle_mailbox_states,
+                names: mailbox_names,
+            })),
         }
     }
 
@@ -526,9 +527,8 @@ impl Account for JmapAccount {
         discover::scope_lifecycle(
             self.mail.clone(),
             self.core_limits,
-            Arc::clone(&self.lifecycle_mailbox_states),
+            Arc::clone(&self.lifecycle_topology),
             self.mail.id_str().to_string(),
-            Arc::clone(&self.mailbox_names),
             self.shutdown.clone(),
             self.client.clone(),
         )

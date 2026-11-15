@@ -267,10 +267,9 @@ impl SessionState {
     }
 }
 
-/// Internal shared state of a [`Client`]. Stored behind an `Arc` so the
-/// client itself is cheap to clone and pass around.
-pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
-    transport: T,
+/// Session publication, refresh serialization and divergence notification share
+/// one owner. Transport and WebSocket lifetime are independent of a refresh.
+struct SessionCell {
     state: std::sync::Mutex<Arc<SessionState>>,
     /// Session fetch and install are one serialized operation. Without this
     /// gate, an earlier GET that completes last can overwrite a newer
@@ -285,28 +284,18 @@ pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
     /// `session_updated`.
     #[cfg(feature = "tokio")]
     session_changes: tokio::sync::watch::Sender<u64>,
+}
+
+/// Internal shared state of a [`Client`]. Stored behind an `Arc` so the
+/// client itself is cheap to clone and pass around.
+pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
+    transport: T,
+    session_cell: SessionCell,
 
     pub(crate) timeout: Duration,
 
     #[cfg(feature = "websockets")]
-    pub(crate) ws: tokio::sync::Mutex<Option<crate::client_ws::WsStream>>,
-    /// RFC 8887 `requestId` counter for WebSocket requests.
-    ///
-    /// It lives on the CLIENT, not on the `WsStream`, so it survives a
-    /// reconnect. Per-connection it restarted at 0, which meant a response
-    /// arriving late from a previous connection carried an id the new
-    /// connection was about to reuse - the one case where correlation by
-    /// id is actively worse than none.
-    #[cfg(feature = "websockets")]
-    pub(crate) ws_request_id: std::sync::atomic::AtomicU64,
-    /// Callers awaiting a WebSocket response, keyed by that `requestId`.
-    ///
-    /// On the CLIENT for the same reason the counter is: the map has to
-    /// outlive any one connection so a reconnect can fail the waiters
-    /// the dropped connection will never answer, instead of leaving them
-    /// parked forever on a socket that is gone.
-    #[cfg(feature = "websockets")]
-    pub(crate) ws_pending: Arc<crate::client_ws::PendingRequests>,
+    pub(crate) connection: crate::client_ws::WsConnection,
 }
 
 /// A JMAP client. Cheap to clone - wraps an `Arc<ClientInner>` internally.
@@ -489,20 +478,18 @@ impl ClientBuilder {
         Ok(Client {
             tally: None,
             inner: Arc::new(ClientInner {
-                state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
-                refresh_gate: futures::lock::Mutex::new(()),
-                session_url,
-                session_updated: true.into(),
-                #[cfg(feature = "tokio")]
-                session_changes: tokio::sync::watch::channel(0).0,
+                session_cell: SessionCell {
+                    state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
+                    refresh_gate: futures::lock::Mutex::new(()),
+                    session_url,
+                    session_updated: true.into(),
+                    #[cfg(feature = "tokio")]
+                    session_changes: tokio::sync::watch::channel(0).0,
+                },
                 timeout: self.timeout,
                 transport,
                 #[cfg(feature = "websockets")]
-                ws: None.into(),
-                #[cfg(feature = "websockets")]
-                ws_request_id: std::sync::atomic::AtomicU64::new(0),
-                #[cfg(feature = "websockets")]
-                ws_pending: Arc::new(crate::client_ws::PendingRequests::new()),
+                connection: crate::client_ws::WsConnection::new(),
             }),
         })
     }
@@ -1580,20 +1567,18 @@ impl<T: HttpTransport> Client<T> {
         Ok(Client {
             tally: None,
             inner: Arc::new(ClientInner {
-                state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
-                refresh_gate: futures::lock::Mutex::new(()),
-                session_url,
-                session_updated: true.into(),
-                #[cfg(feature = "tokio")]
-                session_changes: tokio::sync::watch::channel(0).0,
+                session_cell: SessionCell {
+                    state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
+                    refresh_gate: futures::lock::Mutex::new(()),
+                    session_url,
+                    session_updated: true.into(),
+                    #[cfg(feature = "tokio")]
+                    session_changes: tokio::sync::watch::channel(0).0,
+                },
                 timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
                 transport,
                 #[cfg(feature = "websockets")]
-                ws: None.into(),
-                #[cfg(feature = "websockets")]
-                ws_request_id: std::sync::atomic::AtomicU64::new(0),
-                #[cfg(feature = "websockets")]
-                ws_pending: Arc::new(crate::client_ws::PendingRequests::new()),
+                connection: crate::client_ws::WsConnection::new(),
             }),
         })
     }
@@ -1612,6 +1597,7 @@ impl<T: HttpTransport> Client<T> {
     /// sessions into one request.
     pub(crate) fn session_state(&self) -> Arc<SessionState> {
         self.inner
+            .session_cell
             .state
             .lock()
             .expect("session mutex poisoned")
@@ -1623,7 +1609,7 @@ impl<T: HttpTransport> Client<T> {
     }
 
     pub(crate) fn session_url(&self) -> &str {
-        &self.inner.session_url
+        &self.inner.session_cell.session_url
     }
 
     pub(crate) fn default_account_id(&self) -> crate::core::id::AccountId {
@@ -1672,7 +1658,8 @@ impl<T: HttpTransport> Client<T> {
     #[cfg(feature = "websockets")]
     pub(crate) fn next_ws_request_id(&self) -> String {
         self.inner
-            .ws_request_id
+            .connection
+            .request_id
             .fetch_add(1, Ordering::Relaxed)
             .to_string()
     }
@@ -1689,11 +1676,17 @@ impl<T: HttpTransport> Client<T> {
     /// connection that stays open longest.
     pub(crate) fn note_session_state(&self, session_state: &str) {
         if session_state != self.session_state().session().state() {
-            self.inner.session_updated.store(false, Ordering::Release);
+            self.inner
+                .session_cell
+                .session_updated
+                .store(false, Ordering::Release);
             #[cfg(feature = "tokio")]
-            self.inner.session_changes.send_modify(|generation| {
-                *generation = generation.wrapping_add(1);
-            });
+            self.inner
+                .session_cell
+                .session_changes
+                .send_modify(|generation| {
+                    *generation = generation.wrapping_add(1);
+                });
         }
     }
 
@@ -1708,11 +1701,11 @@ impl<T: HttpTransport> Client<T> {
     /// in `reference/jmap.md` rather than deleted - an audit finding it
     /// uncalled has found a recorded state, not dead code.
     pub(crate) async fn refresh_session(&self) -> crate::Result<()> {
-        let _refresh = self.inner.refresh_gate.lock().await;
+        let _refresh = self.inner.session_cell.refresh_gate.lock().await;
         let bytes = self
             .inner
             .transport
-            .get_session(&self.inner.session_url)
+            .get_session(&self.inner.session_cell.session_url)
             .await
             .map_err(crate::Error::from)?;
         let session: Session = serde_json::from_slice(&bytes)?;
@@ -1722,23 +1715,34 @@ impl<T: HttpTransport> Client<T> {
         // Both limits are applied under the same lock as the state they came
         // from, so two overlapping refreshes cannot leave one session beside
         // another session's gates. The setters are synchronous.
-        let mut installed = self.inner.state.lock().expect("session mutex poisoned");
+        let mut installed = self
+            .inner
+            .session_cell
+            .state
+            .lock()
+            .expect("session mutex poisoned");
         *installed = state;
         self.inner.transport.set_api_concurrency(api_limit);
         self.inner.transport.set_upload_concurrency(upload_limit);
-        self.inner.session_updated.store(true, Ordering::Release);
+        self.inner
+            .session_cell
+            .session_updated
+            .store(true, Ordering::Release);
         drop(installed);
         Ok(())
     }
 
     pub(crate) fn is_session_updated(&self) -> bool {
-        self.inner.session_updated.load(Ordering::Acquire)
+        self.inner
+            .session_cell
+            .session_updated
+            .load(Ordering::Acquire)
     }
 
     /// Subscribe to session-state divergence detected at the response boundary.
     #[cfg(feature = "tokio")]
     pub(crate) fn session_changes(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.inner.session_changes.subscribe()
+        self.inner.session_cell.session_changes.subscribe()
     }
 
     /// A handle over the same client - same transport, same session

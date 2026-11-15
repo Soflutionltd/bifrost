@@ -36,9 +36,9 @@ use super::flags::{
     ARCHIVE_ID, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_TRASH, LABEL_UNREAD,
     is_archive_id,
 };
-use super::query::filter_query;
 #[cfg(test)]
-use super::query::{container_query, gmail_date};
+use super::query::container_query;
+use super::query::filter_query;
 use super::scopes::{
     ScopeCache, invalidate_scope_snapshot, labels_for_flags, refresh_scope_snapshot,
 };
@@ -1317,6 +1317,10 @@ impl MailDocument {
         }
     }
 
+    // Gmail identities are sendAsEmail addresses by API contract. They may be
+    // aliases rather than the owning getProfile mailbox: users selecting a
+    // shared or delegated sender expect that sender on the message. Do not
+    // replace this identity with the mailbox coordination key.
     fn ensure_from(&mut self, default_address: &str) {
         if self.from.is_none() {
             let address = self
@@ -2091,8 +2095,16 @@ mod tests {
     }
 
     #[test]
-    fn date_query_uses_gmail_slash_date() {
+    fn date_query_uses_gmail_epoch_seconds() {
         let time = UNIX_EPOCH + Duration::from_secs(86_400);
-        assert_eq!(gmail_date(time), "1970/01/02");
+        assert_eq!(
+            super::super::query::gmail_date(
+                time,
+                super::super::query::BoundSide::After,
+                bifrost_types::AccountOperation::Search,
+            )
+            .unwrap(),
+            "86400",
+        );
     }
 }

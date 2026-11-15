@@ -38,7 +38,7 @@ pub(crate) fn inventory_stream(
 ) -> AccountStream<bifrost_types::InventoryEvent> {
     // Route first: a typed scope owned by a sub-account delegates the
     // whole inventory stream rather than checking out an IMAP folder.
-    match route_scope(
+    let folder = match route_scope(
         &account,
         &scope,
         bifrost_types::AccountOperation::SyncInventory,
@@ -47,31 +47,38 @@ pub(crate) fn inventory_stream(
         // passes straight through. Converting here instead would relabel
         // whatever coverage the delegate reported as COMPLETE.
         Ok(ScopeHandler::Delegate(sub)) => return sub.inventory_stream(scope),
-        Ok(ScopeHandler::Folder(_)) => {}
+        Ok(ScopeHandler::Folder(folder)) => folder,
         Err(error) => {
             return Box::pin(futures::stream::iter([
                 bifrost_types::InventoryEvent::Terminated(error),
             ]));
         }
-    }
+    };
     let domain = bifrost_types::CoverageDomain::full(scope.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     let ticket = QresyncWarningTicket::new(account.clone(), tx.clone());
     let ledger = ObligationLedger::default();
     let task_ledger = ledger.clone();
     let task = tokio::spawn(async move {
-        match run_inventory(account, scope.clone(), tx.clone(), &ticket, &task_ledger).await {
+        match run_inventory(
+            account.clone(),
+            scope.clone(),
+            tx.clone(),
+            &ticket,
+            &task_ledger,
+        )
+        .await
+        {
             Ok(()) | Err(InventoryError::ChannelDropped) => {}
             Err(InventoryError::Imap(err)) => {
-                let _ = tx
-                    .send(terminated_event((
-                        err,
-                        super::error::ImapErrorContext::operation(
-                            bifrost_types::AccountOperation::SyncInventory,
-                        )
-                        .with_cursor_scope(scope),
-                    )))
-                    .await;
+                let error = account.folder_error(
+                    err,
+                    &folder,
+                    super::error::ImapErrorContext::operation(
+                        bifrost_types::AccountOperation::SyncInventory,
+                    ),
+                );
+                let _ = tx.send(terminated_event(error)).await;
             }
             Err(InventoryError::Account(err)) => {
                 let _ = tx

@@ -77,38 +77,50 @@ pub(super) fn validate_imap_date(date: &str) -> Result<(), crate::Error> {
     // RFC 3501 Section 9: date-text = date-day "-" date-month "-" date-year.
     let parts: Vec<&str> = date.splitn(3, '-').collect();
     if parts.len() != 3 {
-        return Err(crate::Error::InvalidInput(format!(
-            "invalid IMAP date {date:?}  -  must be date-day \"-\" date-month \"-\" date-year \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "invalid IMAP date {date:?}  -  must be date-day \"-\" date-month \"-\" date-year \
              (RFC 3501 Section 9)"
-        )));
+            )
+            .into(),
+        ));
     }
     let (day, month, year) = (parts[0], parts[1], parts[2]);
 
     // RFC 3501 Section 9: date-day = 1*2DIGIT.
     if day.is_empty() || day.len() > 2 || !day.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(crate::Error::InvalidInput(format!(
-            "invalid IMAP date day {day:?}  -  must be 1 or 2 digits \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "invalid IMAP date day {day:?}  -  must be 1 or 2 digits \
              (RFC 3501 Section 9: date-day = 1*2DIGIT)"
-        )));
+            )
+            .into(),
+        ));
     }
 
     if !VALID_MONTHS
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(month))
     {
-        return Err(crate::Error::InvalidInput(format!(
-            "invalid IMAP date month {month:?}  -  must be one of Jan, Feb, Mar, Apr, \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "invalid IMAP date month {month:?}  -  must be one of Jan, Feb, Mar, Apr, \
              May, Jun, Jul, Aug, Sep, Oct, Nov, Dec \
              (RFC 3501 Section 9: date-month)"
-        )));
+            )
+            .into(),
+        ));
     }
 
     // RFC 3501 Section 9: date-year = 4DIGIT.
     if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(crate::Error::InvalidInput(format!(
-            "invalid IMAP date year {year:?}  -  must be exactly 4 digits \
+        return Err(crate::Error::InvalidInput(
+            format!(
+                "invalid IMAP date year {year:?}  -  must be exactly 4 digits \
              (RFC 3501 Section 9: date-year = 4DIGIT)"
-        )));
+            )
+            .into(),
+        ));
     }
 
     // Use the APPEND date-time validator's calendar rules as well as its
@@ -121,7 +133,7 @@ pub(super) fn validate_imap_date(date: &str) -> Result<(), crate::Error> {
     crate::codec::encode::validate_append_datetime(&format!(
         "{fixed_day}-{month}-{year} 00:00:00 +0000"
     ))
-    .map_err(|error| crate::Error::InvalidInput(error.to_string()))?;
+    .map_err(|error| crate::Error::InvalidInput(error.to_string().into()))?;
 
     Ok(())
 }

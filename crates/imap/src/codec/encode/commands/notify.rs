@@ -86,11 +86,14 @@ fn validate_notify_event_group(group: &NotifyEventGroup) -> Result<(), crate::Er
     if is_selected_filter {
         for event in &group.events {
             if !is_message_event(event) {
-                return Err(crate::Error::InvalidInput(format!(
-                    "selected/selected-delayed filters only accept message events \
+                return Err(crate::Error::InvalidInput(
+                    format!(
+                        "selected/selected-delayed filters only accept message events \
                      (MessageNew, MessageExpunge, FlagChange, AnnotationChange), \
                      got {event:?} (RFC 5465 Section 6.1)"
-                )));
+                    )
+                    .into(),
+                ));
             }
         }
     }

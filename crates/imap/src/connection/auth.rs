@@ -318,9 +318,12 @@ impl ImapConnection {
                 .any(|c| matches!(c, Capability::LoginDisabled))
             {
                 return Err(Error::MissingCapability(
-                    "LOGIN disabled by server (LOGINDISABLED capability \
-                     advertised, RFC 3501 Section 6.2.3)"
-                        .into(),
+                    crate::error::CapabilityFailure::new(
+                        "LOGINDISABLED".into(),
+                        crate::error::CapabilityFailureReason::ProhibitedByServer,
+                        "LOGIN disabled by server (LOGINDISABLED capability \
+                     advertised, RFC 3501 Section 6.2.3)",
+                    ),
                 ));
             }
 
@@ -748,7 +751,7 @@ impl ImapConnection {
             .capabilities
             .contains(&Capability::Auth(mechanism.to_owned()))
         {
-            return Err(Error::MissingCapability(format!("AUTH={mechanism}")));
+            return Err(Error::MissingCapability(format!("AUTH={mechanism}").into()));
         }
         Ok(())
     }

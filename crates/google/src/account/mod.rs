@@ -11,6 +11,7 @@ pub(crate) mod error;
 mod filters;
 mod flags;
 mod inventory;
+mod mailbox;
 mod mutation;
 mod pim;
 mod push;

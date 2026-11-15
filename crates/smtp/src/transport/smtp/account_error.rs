@@ -6,6 +6,11 @@
 //! emitting the low-level `transport::smtp::Error` / `crate::error::Error`
 //! shapes and decorates SMTP errors with attempt and phase evidence.
 //!
+//! This boundary deliberately belongs to batch submission rather than changing
+//! the direct transport's error type with a feature flag. A mail client needs
+//! per-recipient outcomes to avoid duplicate delivery when only some recipients
+//! succeeded; changing only the direct error type would not supply that contract.
+//!
 //! Recovery is never constructed here. Every conversion funnels through
 //! `AccountErrorBuilder::try_build` (via `finish`; the infallible `build` is
 //! gone), which derives recovery centrally from the kind + cause chain +

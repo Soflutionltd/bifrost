@@ -18,10 +18,12 @@ use super::inventory::{
 const CALENDAR_WINDOW_RESEED_LEAD_SECS: i64 = 90 * 24 * 60 * 60;
 
 fn calendar_window_needs_reseed(payload: &super::cursor::GraphCursorPayload, now: i64) -> bool {
-    matches!(&payload.kind, super::cursor::GraphCursorKind::Events { .. })
-        && payload
-            .calendar_window_end
-            .is_none_or(|end| now >= end.saturating_sub(CALENDAR_WINDOW_RESEED_LEAD_SECS))
+    matches!(
+        &payload.kind(),
+        super::cursor::GraphCursorKind::Events { .. }
+    ) && payload
+        .calendar_window_end()
+        .is_none_or(|end| now >= end.saturating_sub(CALENDAR_WINDOW_RESEED_LEAD_SECS))
 }
 
 pub(crate) fn changes_stream(
@@ -62,7 +64,7 @@ pub(crate) fn changes_stream(
         // changes walk, which would resume from an empty URL. Refuse
         // instead, so the engine restarts the scope rather than silently
         // syncing nothing.
-        if payload.inventory_in_progress {
+        if payload.inventory_in_progress() {
             let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
                 .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
             yield SyncEvent::Terminated(cursor_error_to_account_error(
@@ -116,7 +118,8 @@ pub(crate) fn changes_stream(
         // here because serde cannot know the client's origin. A link that
         // does not admit would otherwise be fetched with the account bearer;
         // refusing it as an unreadable cursor reseeds the scope.
-        let mut current_url = match super::cursor::admit_resume_url(&client, payload.resume_url()) {
+        let resume_url = payload.resume_url().ok_or(CursorError::Unsupported);
+        let mut current_url = match resume_url.and_then(|url| super::cursor::admit_resume_url(&client, url)) {
             Ok(url) => url,
             Err(error) => {
                 let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
@@ -276,7 +279,7 @@ pub(crate) fn changes_stream(
                 }
             };
             if let Some(next_link) = next_link {
-                payload.advanced_through = Some(page_marker(&next_link, last_seen_id));
+                payload.set_marker(Some(page_marker(&next_link, last_seen_id))).expect("delta marker");
                 let checkpoint_cursor =
                     match encode_cursor(scope.clone(), payload.clone()) {
                         Ok(cursor) => cursor,
@@ -291,8 +294,7 @@ pub(crate) fn changes_stream(
                 yield batch(changes, PageBoundary::Page, Some(checkpoint_cursor), tally.take());
                 current_url = next_link;
             } else if let Some(delta_link) = delta_link {
-                payload.delta_link = delta_link.as_str().to_string();
-                payload.advanced_through = None;
+                payload.set_delta_link(delta_link.as_str().to_string());
                 let checkpoint_cursor =
                     match encode_cursor(scope.clone(), payload.clone()) {
                         Ok(cursor) => cursor,
@@ -855,7 +857,8 @@ mod tests {
         };
         let marker = decode_cursor(&cursor)
             .expect("page cursor decodes")
-            .advanced_through
+            .advanced_through()
+            .cloned()
             .expect("page marker is present");
         assert_eq!(
             marker.last_seen_id.as_deref(),
@@ -977,7 +980,7 @@ mod tests {
                 &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
                 None,
             );
-            payload.delta_link = link.to_string();
+            payload.set_delta_link(link.to_string());
             let cursor = encode_cursor(email_scope("inbox"), payload).expect("cursor encodes");
 
             let mut stream = changes_stream(account, cursor);

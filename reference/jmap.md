@@ -172,6 +172,25 @@ the submission call id. `Response::get_method` reads that response by its
 method type after the explicit submission result. In-place removal preserves
 order; swapping the tail into the vacated slot reorders later lookups.
 
+`SetResponse::create_errors()` and `update_errors()` iterate every `notCreated`
+and `notUpdated` entry with its creation id or object id, so a batch caller can
+report each failed object instead of whichever entry hash order surfaced first.
+The older `unwrap_*_errors` helpers still return a single error and are kept
+only until the account boundary can translate an aggregate; per-id callers use
+`created()` / `updated()`.
+
+A `Blob/upload` `notCreated` entry decodes as a typed `SetError` and surfaces
+as `Error::Set`, so its `type` (`overQuota`, `tooLarge`, a vendor type kept as
+`Other`) reaches error translation instead of a debug-formatted
+`NotParsable` string.
+
+`PrincipalPatch` membership setters are latest-setter-wins. `alias` / `member`
+write an escaped `aliases/<token>` or `members/<token>` PatchObject path and
+clear any pending whole-list replacement of that property; `aliases(..)` /
+`members(..)` replace the whole list and drop every pending path under it. An
+administrator's last edit therefore supersedes the earlier one rather than the
+patch carrying an overlapping, invalid pair.
+
 ## Internal transport abstraction
 
 `Client<T: HttpTransport = ReqwestTransport>` is generic over transport.
@@ -814,14 +833,15 @@ boundary remain outside the plaintext smoothing guarantee described in
 
 `send_ws` puts an RFC 8887 `Request` frame on the socket and returns the `requestId` it assigned. Three properties that door needs, and now has:
 
-- The id counter is on the `Client`, not on the per-connection `WsStream`, so ids do not restart at 0 on reconnect. A per-connection counter meant a late response from the dropped connection carried an id the new connection was about to reuse - correlation that is actively worse than none.
+- The frame is the HTTP request envelope plus RFC 8887 metadata: `WebSocketRequest` flattens a borrowed `Request` beside `@type` and `id`, so `Request`'s own serializer is the single encoder for `using`, `methodCalls` and `createdIds` on both doors.
+- The id counter is on the client-owned `WsConnection` (in `client_ws.rs`), not on the per-connection `WsStream`, so ids do not restart at 0 on reconnect. A per-connection counter meant a late response from the dropped connection carried an id the new connection was about to reuse - correlation that is actively worse than none.
 - `WebSocketResponse` decodes `requestId` (RFC 8887 s4.3.4) and `WebSocketMessage::Response` carries it, so a reader can match a response frame to the request it answers. It was previously dropped at decode, which made two in-flight WebSocket requests indistinguishable on the read stream.
 - `frame_stream` runs the session-divergence comparison on every response frame's `sessionState`, through the same `Client::note_session_state` the HTTP door uses - including on a frame whose method responses fail to decode, whose session state was still truthful. The WS door previously handed responses up without ever looking, losing staleness detection on the connection that stays open longest.
 - A `Response` frame decodes in a single pass. The frame is not an HTTP response body - it carries `@type` and `requestId` beside the envelope fields - so `WebSocketResponse` keeps `methodResponses` as a raw JSON slice and hands it to `Response::from_frame_parts`, which runs the same per-call success/`MethodError` split (`split_call_results`) the HTTP envelope deserializer runs. It previously decoded the array into a `serde_json::Value` tree, rebuilt a `json!` envelope from it, and deserialized that a second time, re-allocating every method response on every frame. The frame dispatch is hand-written (`decode_frame` reads the `@type` discriminator by itself, then deserializes the variant from the same bytes) rather than `#[serde(tag = "@type")]`, because an internally-tagged enum buffers the frame into serde's private `Content` tree before selecting a variant and a `RawValue` cannot survive that buffer - it re-emerges as the newtype token. The same trap applies to every `#[serde(tag)]` / `#[serde(untagged)]` type in this crate: none can hold a `RawValue`, and the failure is a runtime decode error, not a compile error. Unknown `@type` values are ignored for forward compatibility. A malformed known push payload is converted to an `UnknownFrame` notification, which the push session turns into a broad invalidation so the bad frame cannot hide a state change or terminate the connection. Malformed text envelopes, unclaimed method-response decode failures, and binary frames close the current WebSocket as `WebSocketClosed`, which ends the push session `Failed` with a retryable class; a correlated method-response decode failure still fails its waiter. Session divergence is still checked on the frame's own `sessionState` before the method responses are touched, so a frame whose method responses fail to decode still reports its truthful session state and still fails its own waiter with `ResponseDecode`.
 
 - A `maxSizeRequest` guard (RFC 8620 s2) on the encoded frame, matching the HTTP door's refusal to send an oversized batch. It is measured on the FRAME, envelope and `requestId` included, because over WebSocket the frame is the request. Only an advertised, non-zero limit is enforced, for the same reason `CallLimit` refuses to enforce its two unusable states - and since the limit is an `Option`, an omitted `maxSizeRequest` declines to enforce without being confused for an advertised zero, which the session validator refuses separately. Over-limit raises `Error::RequestSizeLimit { max, size }` -> `Request(Malformed)` / `ClientBug`; the HTTP door can answer `Ok(None)` against a caller-supplied bound instead because `send_methods_within` has that contract, and `send_ws` has none - it either writes the frame or it does not.
 
-The await side is `PendingRequests`, a map of waiters keyed by `requestId`, held on the `Client` (not the `WsStream`) so it outlives any one connection. `Client::send_ws_awaiting` (and `Request::send_ws_awaiting`, the WebSocket counterpart of `Request::send`) registers a waiter and returns a `PendingResponse` that resolves to the correlated `Response`. `send_ws` is unchanged and still fire-and-forget.
+The await side is `PendingRequests`, a map of waiters keyed by `requestId`, held with the sink and the id counter in `WsConnection` on the shared `ClientInner` (not the `WsStream`, and not any one push stream) so it outlives any one connection. `Client::send_ws_awaiting` (and `Request::send_ws_awaiting`, the WebSocket counterpart of `Request::send`) registers a waiter and returns a `PendingResponse` that resolves to the correlated `Response`. `send_ws` is unchanged and still fire-and-forget.
 
 Four properties hold that map together:
 
@@ -859,7 +879,7 @@ and its state commit, or after a successful reseed commit. The engine owns
 failure pacing; the provider retains its healthy cadence and session-change
 wake.
 
-`scope_lifecycle_stream` polls `Mailbox/changes` against the primary mailbox state, hydrating changed names before advancing its state cache, then emits `ScopeLifecycle::Created`/`Renamed`/`Deleted`. A transient name-hydration failure leaves the state unchanged for replay; terminal/engine classes emit `Terminated`. Renames emit only when the stored and hydrated names differ and carry both names even when the stable scope id is unchanged.
+`scope_lifecycle_stream` polls `Mailbox/changes` against the primary mailbox state, hydrating changed names and emitting `ScopeLifecycle::Created`/`Renamed`/`Deleted` before publishing names and position together. A transient name-hydration failure leaves the state unchanged for replay; terminal/engine classes emit `Terminated`. Renames emit only when the stored and hydrated names differ and carry both names even when the stable scope id is unchanged.
 
 On `cannotCalculateChanges` or `tooManyChanges`, lifecycle fetches a full
 `Mailbox/get` name snapshot, diffs it against its known names, emits net
@@ -881,7 +901,7 @@ The follow-up `Mailbox/get` batches at `maxObjectsInGet` on its own. It was prev
 Two shapes decide which event a change is, and both are about what the CONSUMER has already been told, not about which change collection the server filed the id under:
 
 - **An id the poller holds no name for is a discovery, not a rename.** `updated` is not evidence of a prior announcement: the poller's window opens at the state seeded at `open`, so a mailbox created before that state and renamed after it arrives as an `updated` id the names map has never seen. It used to emit `Renamed { old_name: "" }`, asserting a previous name that never existed and handing the consumer a scope to move rather than one to create. It now emits `Created`, which is both the honest event and the only one that establishes the scope. An id in `created` is `Created` regardless of the names map.
-- **A create that vanished before it could be read is surfaced as `Created` then `Deleted`.** An id named in `created`/`updated` that the follow-up `Mailbox/get` answers in neither `list` nor at all was destroyed between the two calls. The state commit cannot be withheld for it - the mailbox is gone, so no later poll will ever mention that id again and there is nothing to replay - which is exactly why the create must be surfaced here or be lost to the lifecycle stream forever. Emitting the pair keeps the engine's per-folder cursor model sound: the scope is established and then torn down, which is what happened on the server, whereas a lone `Deleted` names a scope the consumer never had. Ids the same response already reports under `destroyed` are left to that loop, and an id the poller never knew and that was only `updated` produces nothing at all - it was never announced, so it has no lifecycle to close. The 300s poll pauses select on the shutdown token, so the stream ends promptly for a consumer still polling after `close()` (pull-based, so it cannot leak either way). Foreign-account mailbox lifecycle is not polled (see Foreign accounts).
+- **A create that vanished before it could be read is surfaced as `Created` then `Deleted`.** An id named in `created`/`updated` that the follow-up `Mailbox/get` answers in neither `list` nor at all was destroyed between the two calls. The state commit cannot be withheld for it - the mailbox is gone, so no later poll will ever mention that id again and there is nothing to replay - which is exactly why the create must be surfaced here or be lost to the lifecycle stream forever. Emitting the pair keeps the engine's per-folder cursor model sound: the scope is established and then torn down, which is what happened on the server, whereas a lone `Deleted` names a scope the consumer never had. Ids the same response already reports under `destroyed` are left to that loop, and an id the poller never knew and that was only `updated` takes the same `Created` then `Deleted` pair: an unknown `updated` id that the get does answer is announced as a discovery, so one that vanished is a discovery torn down. An enterprise user sees no folder either way, and the pair removes any scope the consumer acquired by another route rather than leaving a ghost folder. An id the poller already announced gets only `Deleted`. The 300s poll pauses select on the shutdown token, so the stream ends promptly for a consumer still polling after `close()` (pull-based, so it cannot leak either way). Foreign-account mailbox lifecycle is not polled (see Foreign accounts).
 
 ### Mutation pipeline
 
@@ -1187,7 +1207,7 @@ exposure any consumer of an unbounded query has.
 
 `filters.rs` maps Stage 2 filter primitives onto JMAP Sieve:
 
-- `filters_list` runs `SieveScript/query`, hydrates with `SieveScript/get`, downloads each script's blob, returns `ServerFilter::Script`. The query's id list is however many scripts the account holds, so hydration is BATCHED at the session's `maxObjectsInGet` (`factory::max_objects_in_get`, the reader for doors that hold a bare `Account` rather than the `CoreLimits` built at open) - one unbounded `/get` is a call a server may refuse wholesale with `requestTooLarge`. Each answer is then RECONCILED against the ids that batch submitted, the way `reconcile_hydration` and `contacts::get_cards` do. An id the server leaves out of `list` used to vanish from the returned `Vec`, which reads to the consumer as "that filter does not exist" - a deletion the response never claimed, and one an absent `notFound` cannot disprove (see the `/get` leniency rule). This door has no per-item lane, so the whole page fails, retryably: `error::get_id_unresolved_after_query` classifies both an unanswered id and a declared `notFound` as `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, the same class `get_id_unanswered` uses and the same answer `contact_update` gives for an unanswered pre-read id. `notFound` deliberately shares that lane rather than taking the terminal `get_id_not_found` one: at page level the honest reading of a script the query named and the get disclaimed is a delete that raced the two calls, and the retry's fresh `/query` will not name it again. The downloads are independent of each other, so they run CONCURRENTLY under `factory::api_request_concurrency` (the server's `maxConcurrentRequests`, clamped `[1, 8]` - the same reading the open-time foreign probes use, deliberately one function rather than a second bound that could drift). Serially this was N+2 round trips for N scripts. It is `buffered`, never `buffer_unordered`: yielding in submission order is what keeps the error accounting identical to the serial loop's, where the first failing script in list order is the error the whole call returns. Arrival order would report whichever download happened to fail first.
+- `filters_list` runs `SieveScript/query`, hydrates with `SieveScript/get`, downloads each script's blob, returns `ServerFilter::Script`. The query's id list is however many scripts the account holds, so hydration is BATCHED at the session's `maxObjectsInGet` (`capabilities::max_objects_in_get`, the reader for doors that hold a bare `Account` rather than the `CoreLimits` built at open) - one unbounded `/get` is a call a server may refuse wholesale with `requestTooLarge`. Each answer is then RECONCILED against the ids that batch submitted, the way `reconcile_hydration` and `contacts::get_cards` do. An id the server leaves out of `list` used to vanish from the returned `Vec`, which reads to the consumer as "that filter does not exist" - a deletion the response never claimed, and one an absent `notFound` cannot disprove (see the `/get` leniency rule). This door has no per-item lane, so the whole page fails, retryably: `error::get_id_unresolved_after_query` classifies both an unanswered id and a declared `notFound` as `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, the same class `get_id_unanswered` uses and the same answer `contact_update` gives for an unanswered pre-read id. `notFound` deliberately shares that lane rather than taking the terminal `get_id_not_found` one: at page level the honest reading of a script the query named and the get disclaimed is a delete that raced the two calls, and the retry's fresh `/query` will not name it again. The downloads are independent of each other, so they run CONCURRENTLY under `factory::api_request_concurrency` (the server's `maxConcurrentRequests`, clamped `[1, 8]` - the same reading the open-time foreign probes use, deliberately one function rather than a second bound that could drift). Serially this was N+2 round trips for N scripts. It is `buffered`, never `buffer_unordered`: yielding in submission order is what keeps the error accounting identical to the serial loop's, where the first failing script in list order is the error the whole call returns. Arrival order would report whichever download happened to fail first.
 - `filter_create` uploads the body as `application/sieve`, creates a `SieveScript`, and `onSuccessActivateScript` when asked active.
 - `filter_update` patches name/body via `SieveScript/set` (body uploads a fresh blob first); `is_active: true` activates the target via `onSuccessActivateScript`. Deactivation first reads the target's `isActive`; an inactive target leaves activation alone while still applying name/body edits. An active target uses `onSuccessDeactivateScript` guarded by the read's `ifInState`, so a concurrent activation produces a conflict instead of deactivating another script. There is no automatic re-read and retry after `stateMismatch`, including one caused by an unrelated script edit. The patch can also replace name/body; preserving concurrent rule edits, as an enterprise Outlook user expects, takes precedence over silently authorizing the original patch against a newer ruleset. The caller refreshes and explicitly retries the whole patch; deactivation is not split into a second write. A target omitted from both read-result lanes fails retryably as `Protocol(PartialResponse)`; an explicit `notFound` remains `NotFound`.
 - `filter_delete` destroys the id; `filter_validate` uploads then `SieveScript/validate`, mapping set errors to `FilterValidation` diagnostics.
@@ -1659,3 +1679,34 @@ Bulk streams already preserve per-item lanes and carry no failed siblings.
 
 Mailbox `mayShare` is projected into `ContainerRights::may_share`, including
 false when the server omits the optional sharing right.
+
+### Sync limit policy and lifecycle publication
+
+`sync/capabilities.rs` owns core object-limit decoding, the local set batch
+ceiling of 500, and the 100 ms batching wait. Capability advertisement and both
+bulk mutation streams use the same set-size function; hydration uses the same
+wait constant. Bare protocol Account doors still read their own session through
+the capabilities helpers. Those handles do not carry the validated sync slot;
+using the primary slot for a routed foreign handle would obscure that boundary.
+
+The primary lifecycle walk stores its positions and announced mailbox names in
+one `LifecycleTopology` behind one lock. Both ordinary changes pages and expired
+history reseeds publish them together after yielding their events. A dropped
+partial page leaves both unchanged, allowing a replacement stream to replay the
+page. Duplicate events after interruption are preferable to missing sidebar
+changes for an enterprise mailbox user. The open-time names snapshot remains
+the baseline for rename detection; membership discovery deliberately performs a
+fresh primary `Mailbox/get`, since discovery may run after open.
+
+Membership discovery emits primary mailbox memberships and shared owner tags,
+but does not enumerate shared per-mailbox Folder memberships. Those qualified
+memberships enter the index through inventory and hydration. Foreign mailbox
+lifecycle remains primary-only polling's documented limitation.
+
+The foreign Folder codec retains its historical first-separator decoding,
+including an empty owner and additional separators in the mailbox suffix.
+The encoders accept arbitrary strings and protocol Id deserialization does not
+validate them, so such ids may already have been minted and persisted. Rejecting
+these shapes only at this reader could orphan persisted containers. The empty
+mailbox suffix also remains the intentional account-level scope encoding. A
+stricter codec requires versioning and continued legacy decoding.

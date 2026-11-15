@@ -53,6 +53,9 @@ pub enum Error {
     /// Engine is shutting down; no new work accepted.
     #[error("engine is shutting down")]
     ShuttingDown,
+    /// Recovery holds consumed the cumulative wait allowance.
+    #[error("recovery wait budget exhausted")]
+    WaitBudgetExhausted,
     /// Account is paused.
     #[error("account is paused")]
     Paused,

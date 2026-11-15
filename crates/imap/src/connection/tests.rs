@@ -11,6 +11,7 @@
     clippy::wildcard_imports
 )]
 use super::*;
+use crate::types::response::TaggedResponse;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
@@ -523,7 +524,11 @@ fn selected_mailbox_ignores_state_from_before_closed() {
         UntaggedResponse::Exists(4),
         ok_code(ResponseCode::UidValidity(2)),
     ];
-    let mailbox = build_selected_mailbox(&untagged, &tagged(None), false);
+    let mailbox = build_selected_mailbox(
+        selected_mailbox_effective_responses(&untagged),
+        &tagged(None),
+        false,
+    );
     assert_eq!(mailbox.exists, 4);
     assert_eq!(mailbox.uid_validity, Some(2));
 }

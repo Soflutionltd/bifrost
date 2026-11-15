@@ -729,15 +729,28 @@ pub(in crate::connection) fn live_state_refusal(
         if session == super::SessionState::Logout {
             return Some(Error::closed().with_attempt(TransmissionState::Unsent));
         }
-        return Some(Error::StateChangedBeforeSend(format!(
-            "session moved to {session:?}, out of {legal:?}, before {kind:?} could be sent"
-        )));
+        return Some(Error::StateChangedBeforeSend(
+            crate::error::LocalFailure::state(
+                crate::error::StateRequirement::LegalStates {
+                    actual: session,
+                    allowed: legal.to_vec(),
+                },
+                format!(
+                    "session moved to {session:?}, out of {legal:?}, before {kind:?} could be sent"
+                ),
+            ),
+        ));
     }
     if kind.refused_after_selection() && state.mailbox_selected() {
-        return Some(Error::StateChangedBeforeSend(format!(
-            "a mailbox was selected in this session before {kind:?} could be sent \
+        return Some(Error::StateChangedBeforeSend(
+            crate::error::LocalFailure::state(
+                crate::error::StateRequirement::BeforeFirstSelection { command: kind },
+                format!(
+                    "a mailbox was selected in this session before {kind:?} could be sent \
              (RFC 5161 Section 3.1)"
-        )));
+                ),
+            ),
+        ));
     }
     None
 }

@@ -14,7 +14,11 @@ use super::{CommandWriter, EncodeOptions, WireCommand, encode_enable, validate_a
 /// The refusal for a command whose prerequisite capability is not usable on
 /// this connection (I6). One wording for every command: `<cmd> requires <cap>`.
 fn missing(cmd: &str, cap: &str) -> crate::Error {
-    crate::Error::MissingCapability(format!("{cmd} requires {cap}"))
+    crate::Error::MissingCapability(crate::error::CapabilityFailure::new(
+        cap.into(),
+        crate::error::CapabilityFailureReason::NotAdvertised,
+        format!("{cmd} requires {cap}"),
+    ))
 }
 
 /// Encodes an IMAP command into a [`WireCommand`].
@@ -65,7 +69,9 @@ pub(crate) fn encode_command(
                     crate::connection::ImapConnection::search_criteria_contains_atom(criteria, atom)
                 }) && !opts.has_capability(&capability)
                 {
-                    return Err(crate::Error::MissingCapability(capability.to_string()));
+                    return Err(crate::Error::MissingCapability(
+                        capability.to_string().into(),
+                    ));
                 }
             }
         }

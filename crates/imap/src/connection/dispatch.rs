@@ -50,6 +50,8 @@ pub(crate) use search::{
     SearchSaveConsumer,
 };
 pub(crate) use select::SelectConsumer;
+#[cfg(test)]
+pub(super) use select::{build_selected_mailbox, selected_mailbox_effective_responses};
 pub(crate) use thread_sort::{SortConsumer, ThreadConsumer};
 
 #[cfg(test)]

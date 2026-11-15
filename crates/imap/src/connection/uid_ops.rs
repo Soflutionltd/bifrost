@@ -162,7 +162,13 @@ impl ImapConnection {
                 .iter()
                 .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
             {
-                return Err(Error::MissingCapability("QRESYNC (not ENABLEd)".into()));
+                return Err(Error::MissingCapability(
+                    crate::error::CapabilityFailure::new(
+                        Capability::QResync,
+                        crate::error::CapabilityFailureReason::NotEnabled,
+                        "QRESYNC (not ENABLEd)",
+                    ),
+                ));
             }
         }
         // Parse the requested set for defensive filtering of VANISHED (EARLIER)
@@ -217,7 +223,13 @@ impl ImapConnection {
                 .iter()
                 .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
             {
-                return Err(Error::MissingCapability("QRESYNC (not ENABLEd)".into()));
+                return Err(Error::MissingCapability(
+                    crate::error::CapabilityFailure::new(
+                        Capability::QResync,
+                        crate::error::CapabilityFailureReason::NotEnabled,
+                        "QRESYNC (not ENABLEd)",
+                    ),
+                ));
             }
         }
         let parsed_set = ParsedUidSet::new(sequence_set);
@@ -634,7 +646,11 @@ impl ImapConnection {
             // Plain EXPUNGE would delete ALL \Deleted messages, not just the
             // requested set (RFC 9051 Section 6.4.3).
             Err(Error::MissingCapability(
-                "MOVE or UIDPLUS (plain EXPUNGE is unsafe for move fallback)".into(),
+                crate::error::CapabilityFailure::new(
+                    "MOVE".into(),
+                    crate::error::CapabilityFailureReason::Alternatives(vec!["UIDPLUS".into()]),
+                    "MOVE or UIDPLUS (plain EXPUNGE is unsafe for move fallback)",
+                ),
             ))
         }
     }

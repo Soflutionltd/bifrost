@@ -78,11 +78,11 @@ impl ImapConnection {
         if needs_utf8 {
             // A mode the caller has not established, not a missing server
             // capability: the same request succeeds after the ENABLE.
-            return Err(Error::InvalidState(
+            return Err(Error::InvalidState(crate::error::LocalFailure::state(
+                crate::error::StateRequirement::Enabled(Capability::Utf8Accept),
                 "server requires ENABLE UTF8=ACCEPT before use \
-                 (UTF8=ONLY advertised, RFC 6855 Section 3)"
-                    .into(),
-            ));
+                 (UTF8=ONLY advertised, RFC 6855 Section 3)",
+            )));
         }
         Ok(())
     }
@@ -108,9 +108,12 @@ impl ImapConnection {
             return Err(refusal);
         }
         if kind.refused_after_selection() && mailbox_selected {
-            return Err(Error::InvalidState(format!(
-                "{kind:?} is not valid once a mailbox has been selected in the session \
+            return Err(Error::InvalidState(crate::error::LocalFailure::state(
+                crate::error::StateRequirement::BeforeFirstSelection { command: kind },
+                format!(
+                    "{kind:?} is not valid once a mailbox has been selected in the session \
                  (RFC 5161 Section 3.1)"
+                ),
             )));
         }
         Ok(())
@@ -314,9 +317,12 @@ impl ImapConnection {
                 "RECENT" => {
                     if self.is_rev2() {
                         return Err(Error::MissingCapability(
-                            "STATUS item RECENT was removed in IMAP4rev2 \
-                             (RFC 9051 Section 6.3.11)"
-                                .into(),
+                            crate::error::CapabilityFailure::new(
+                                "IMAP4rev2".into(),
+                                crate::error::CapabilityFailureReason::RemovedInRev2,
+                                "STATUS item RECENT was removed in IMAP4rev2 \
+                             (RFC 9051 Section 6.3.11)",
+                            ),
                         ));
                     }
                 }
@@ -331,10 +337,15 @@ impl ImapConnection {
                     // those two sources.
                     if !self.is_rev2() && !self.has_quota_resource("MESSAGE") {
                         return Err(Error::MissingCapability(
-                            "STATUS item DELETED requires IMAP4rev2 or \
+                            crate::error::CapabilityFailure::new(
+                                "QUOTA=RES-MESSAGE".into(),
+                                crate::error::CapabilityFailureReason::Alternatives(vec![
+                                    "IMAP4rev2".into(),
+                                ]),
+                                "STATUS item DELETED requires IMAP4rev2 or \
                              QUOTA=RES-MESSAGE (RFC 9051 Section 6.3.11 / \
-                             RFC 9208 Section 4.1.4)"
-                                .into(),
+                             RFC 9208 Section 4.1.4)",
+                            ),
                         ));
                     }
                 }
@@ -560,7 +571,11 @@ impl ImapConnection {
         // servers). Once rev2 is active, CHECK is undefined.
         if self.is_rev2() {
             return Err(Error::MissingCapability(
-                "CHECK is not defined in IMAP4rev2 (RFC 9051); use NOOP instead".into(),
+                crate::error::CapabilityFailure::new(
+                    "IMAP4rev2".into(),
+                    crate::error::CapabilityFailureReason::RemovedInRev2,
+                    "CHECK is not defined in IMAP4rev2 (RFC 9051); use NOOP instead",
+                ),
             ));
         }
         self.submit_regular(
@@ -609,8 +624,12 @@ pub(super) fn state_refusal(state: SessionState, allowed: &[SessionState]) -> Op
     if state == SessionState::Logout {
         return Some(Error::closed().with_attempt(bifrost_types::TransmissionState::Unsent));
     }
-    Some(Error::InvalidState(format!(
-        "command not valid in {state:?} state (expected one of {allowed:?})"
+    Some(Error::InvalidState(crate::error::LocalFailure::state(
+        crate::error::StateRequirement::LegalStates {
+            actual: state,
+            allowed: allowed.to_vec(),
+        },
+        format!("command not valid in {state:?} state (expected one of {allowed:?})"),
     )))
 }
 

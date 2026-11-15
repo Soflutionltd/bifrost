@@ -217,8 +217,9 @@ impl SubmissionTransport {
         // account boundary classifies it as a client-side request error.
         // Keep this conversion: relay/starttls_relay only construct local TLS
         // parameters, and cannot produce a network or handshake failure.
-        let smtp_config_err =
-            |e: bifrost_smtp::transport::smtp::Error| crate::Error::InvalidInput(e.to_string());
+        let smtp_config_err = |e: bifrost_smtp::transport::smtp::Error| {
+            crate::Error::InvalidInput(e.to_string().into())
+        };
         let mut builder = match cfg.tls {
             SubmissionTls::Implicit => {
                 AsyncSmtpTransport::<TokioExecutor>::relay(&cfg.host).map_err(smtp_config_err)?

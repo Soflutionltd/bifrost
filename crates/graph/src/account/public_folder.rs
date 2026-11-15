@@ -110,7 +110,7 @@ use bifrost_types::{
 
 use super::GraphAccount;
 use super::cursor::{
-    FULL_SCAN_INTERVAL_SECS, GraphCursorKind, GraphCursorPayload, PUBLIC_FOLDER_LIVE_IDS_CAP,
+    FULL_SCAN_INTERVAL_SECS, GraphCursorPayload, PUBLIC_FOLDER_LIVE_IDS_CAP,
     PublicFolderCursor, PublicFolderRouting, cap_live_ids, decode_cursor, encode_cursor,
 };
 use super::graph_error::{
@@ -1471,7 +1471,7 @@ pub(crate) fn public_folder_changes_stream(
             yield SyncEvent::Done(None);
             return;
         }
-        let GraphCursorPayload { kind: GraphCursorKind::PublicFolder(pf), .. } = payload else {
+        let GraphCursorPayload::PublicFolder(pf) = payload else {
             // changes_stream routes only `PublicFolder` payloads here.
             let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
@@ -1599,6 +1599,7 @@ pub(crate) fn public_folder_changes_stream(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::cursor::GraphCursorKind;
     use super::*;
 
     #[tokio::test]
@@ -1639,7 +1640,8 @@ mod tests {
         else {
             panic!("complete checkpoint expected")
         };
-        let GraphCursorKind::PublicFolder(pf) = decode_cursor(&cursor).expect("decode").kind else {
+        let GraphCursorKind::PublicFolder(pf) = decode_cursor(&cursor).expect("decode").kind()
+        else {
             panic!("public folder cursor expected")
         };
         assert_eq!(pf.live_ids, vec!["meeting"]);

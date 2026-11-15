@@ -1,11 +1,11 @@
 use crate::connection::NotifyFlags;
 use crate::error::Error;
-use crate::types::SelectedMailbox;
-use crate::types::response::{ResponseCode, StatusKind, TaggedResponse, UntaggedResponse};
-
-use super::super::{
-    build_selected_mailbox, is_notify_list_event, selected_mailbox_effective_responses,
+use crate::types::response::{
+    ResponseCode, StatusKind, TaggedResponse, UntaggedResponse, UntaggedStatus,
 };
+use crate::types::{Flag, SelectedMailbox};
+
+use super::super::is_notify_list_event;
 use super::{Consumer, ConsumerContext, Finalized};
 
 /// Consumer for SELECT (RFC 3501 Section6.3.1) and EXAMINE (RFC 3501 Section6.3.2).
@@ -83,24 +83,25 @@ impl Consumer for SelectConsumer {
                     tagged.code.as_ref() == Some(&ResponseCode::ReadOnly)
                 };
 
-                // Validate mandatory responses (RFC 3501 Section6.3.1-6.3.2).
-                // Only post-[CLOSED] responses count; pre-CLOSED belong to
-                // the previously selected mailbox (RFC 7162 Section3.2.11).
-                let effective = selected_mailbox_effective_responses(&self.responses);
-                if let Err(e) = validate_select_responses(effective, self.is_examine, ctx) {
-                    // Validation failed. Reclassify everything as events so
-                    // legitimate unsolicited updates are not lost.
-                    return Finalized::failure(e, self.responses);
+                let (inputs, reclassified, order) = partition_select(self.responses, ctx);
+                if let Err(e) = validate_select_responses(&inputs, &tagged, self.is_examine, ctx) {
+                    // A malformed result must not hide unrelated events.
+                    let mut inputs = inputs.into_iter();
+                    let mut events = reclassified.into_iter();
+                    let all = order
+                        .into_iter()
+                        .map(|selected| {
+                            (if selected {
+                                inputs.next()
+                            } else {
+                                events.next()
+                            })
+                            .expect("partition retains each response")
+                        })
+                        .collect();
+                    return Finalized::failure(e, all);
                 }
-
-                // Build the SelectedMailbox from accumulated responses. The
-                // helper internally handles the [CLOSED] boundary.
-                let result = build_selected_mailbox(&self.responses, &tagged, read_only);
-
-                // Partition for reclassification. Pre-CLOSED responses are
-                // old-mailbox data -> events. Post-CLOSED non-SELECT types
-                // and NOTIFY-marked LIST are async notifications -> events.
-                let reclassified = reclassify_select_responses(self.responses, ctx);
+                let result = build_selected_mailbox(&inputs, &tagged, read_only);
 
                 Finalized::success(result, reclassified)
             }
@@ -115,50 +116,39 @@ impl Consumer for SelectConsumer {
 /// RECENT, FLAGS, VANISHED, FETCH, status codes, and the solicited rev2
 /// LIST) are consumed by [`build_selected_mailbox`]; everything else
 /// (EXPUNGE, NOTIFY-marked LIST, etc.) is reclassified as events.
+fn partition_select(
+    responses: Vec<UntaggedResponse>,
+    ctx: &ConsumerContext,
+) -> (Vec<UntaggedResponse>, Vec<UntaggedResponse>, Vec<bool>) {
+    let boundary = responses.len() - selected_mailbox_effective_responses(&responses).len();
+    let mut inputs = Vec::new();
+    let mut events = Vec::new();
+    let mut order = Vec::new();
+    let mut consumed_select_list = false;
+    for (index, response) in responses.into_iter().enumerate() {
+        if boundary != 0 && index + 1 == boundary {
+            // The CLOSED delimiter itself has no mailbox payload.
+            continue;
+        }
+        if index >= boundary
+            && is_select_solicited_response(&response, ctx, &mut consumed_select_list)
+        {
+            order.push(true);
+            inputs.push(response);
+        } else {
+            order.push(false);
+            events.push(response);
+        }
+    }
+    (inputs, events, order)
+}
+
+#[cfg(test)]
 fn reclassify_select_responses(
     responses: Vec<UntaggedResponse>,
     ctx: &ConsumerContext,
 ) -> Vec<UntaggedResponse> {
-    let closed_idx = responses.iter().rposition(|r| {
-        matches!(
-            r,
-            UntaggedResponse::Status {
-                code: Some(ResponseCode::Closed),
-                ..
-            }
-        )
-    });
-
-    let mut reclassified = Vec::new();
-
-    // Track whether the solicited rev2 LIST has been consumed (at most one).
-    let mut consumed_select_list = false;
-
-    match closed_idx {
-        Some(idx) => {
-            let mut owned = responses;
-            let post = owned.split_off(idx + 1);
-            // Drop the CLOSED marker itself (last element of pre-split).
-            owned.pop();
-            // Pre-CLOSED: all go to events (old-mailbox notifications).
-            reclassified = owned;
-            // Post-CLOSED: non-SELECT types go to events.
-            for r in post {
-                if !is_select_solicited_response(&r, ctx, &mut consumed_select_list) {
-                    reclassified.push(r);
-                }
-            }
-        }
-        None => {
-            for r in responses {
-                if !is_select_solicited_response(&r, ctx, &mut consumed_select_list) {
-                    reclassified.push(r);
-                }
-            }
-        }
-    }
-
-    reclassified
+    partition_select(responses, ctx).1
 }
 
 /// Check whether a response is one of the types solicited by SELECT/EXAMINE.
@@ -186,8 +176,25 @@ fn is_select_solicited_response(
         | UntaggedResponse::Recent(_)
         | UntaggedResponse::Flags(_)
         | UntaggedResponse::Vanished { earlier: true, .. }
-        | UntaggedResponse::Fetch(_)
-        | UntaggedResponse::Status { code: Some(_), .. } => true,
+        | UntaggedResponse::Fetch(_) => true,
+        // Only successful SELECT metadata belongs to the result. Preserve
+        // other coded statuses as events: users must still see warnings and
+        // extension signals that arrived while their folder was opening.
+        UntaggedResponse::Status {
+            status: UntaggedStatus::Ok,
+            code: Some(code),
+            ..
+        } => matches!(
+            code,
+            ResponseCode::UidValidity(_)
+                | ResponseCode::UidNext(_)
+                | ResponseCode::PermanentFlags(_)
+                | ResponseCode::HighestModSeq(_)
+                | ResponseCode::NoModSeq
+                | ResponseCode::Unseen(_)
+                | ResponseCode::MailboxId(_)
+                | ResponseCode::UidNotSticky
+        ),
         // RFC 9051 Section6.3.2: rev2 SELECT solicits exactly one LIST for
         // the selected mailbox. Consume the first unmarked LIST
         // matching the command target; reclassify NOTIFY-marked LIST.
@@ -215,6 +222,7 @@ fn is_select_solicited_response(
 /// For `IMAP4rev2`: FLAGS, EXISTS, and a matching LIST are required.
 fn validate_select_responses(
     effective: &[UntaggedResponse],
+    tagged: &TaggedResponse,
     is_examine: bool,
     ctx: &ConsumerContext,
 ) -> Result<(), Error> {
@@ -280,13 +288,254 @@ fn validate_select_responses(
         )));
     }
 
+    let untagged_validity = effective
+        .iter()
+        .filter_map(|resp| match resp {
+            UntaggedResponse::Status {
+                status: UntaggedStatus::Ok,
+                code: Some(ResponseCode::UidValidity(value)),
+                ..
+            } => Some(*value),
+            _ => None,
+        })
+        .next_back();
+    let validity = match tagged.code.as_ref() {
+        Some(ResponseCode::UidValidity(value)) => Some(*value),
+        _ => untagged_validity,
+    };
+    if validity.is_none_or(|value| value == 0) {
+        return Err(Error::ProtocolMissing(format!(
+            "{command_name} completed without the required nonzero UIDVALIDITY ({section})"
+        )));
+    }
+
     Ok(())
+}
+
+/// Build a `SelectedMailbox` from collected untagged and tagged responses.
+///
+/// Extracts EXISTS, RECENT, FLAGS, UIDVALIDITY, UIDNEXT, PERMANENTFLAGS,
+/// HIGHESTMODSEQ, and UIDNOTSTICKY from the responses per RFC 3501 Section 7.
+pub(in crate::connection) fn build_selected_mailbox(
+    untagged: &[UntaggedResponse],
+    tagged: &TaggedResponse,
+    read_only: bool,
+) -> SelectedMailbox {
+    let mut exists = 0;
+    let mut recent = 0;
+    let mut uid_validity: Option<u32> = None;
+    let mut uid_next = Option::None;
+    let mut flags = Vec::new();
+    let mut permanent_flags = Vec::new();
+    let mut highest_mod_seq = Option::None;
+    let mut no_mod_seq = false;
+    let mut unseen: Option<u32> = None;
+    // RFC 8474 Section 5.1: unique mailbox identifier from [MAILBOXID (<id>)].
+    let mut mailbox_id: Option<String> = None;
+    // RFC 4315 Section 2 / RFC 9051 Section 7.1: [UIDNOTSTICKY]  -  UIDs are not persistent.
+    let mut uid_not_sticky = false;
+    // RFC 7162 Section 3.2.5.2: QRESYNC SELECT responses include
+    // VANISHED (EARLIER) with UIDs removed since last sync, and
+    // FETCH responses with changed flags.
+    let mut vanished = Vec::new();
+    let mut changed_messages = Vec::new();
+
+    for resp in untagged {
+        match resp {
+            UntaggedResponse::Exists(n) => exists = *n,
+            UntaggedResponse::Recent(n) => recent = *n,
+            UntaggedResponse::Flags(f) => flags.clone_from(f),
+            UntaggedResponse::Status {
+                status: UntaggedStatus::Ok,
+                code: Some(code),
+                ..
+            } => {
+                extract_selected_code(
+                    code,
+                    &mut uid_validity,
+                    &mut uid_next,
+                    &mut permanent_flags,
+                    &mut highest_mod_seq,
+                    &mut no_mod_seq,
+                    &mut unseen,
+                    &mut mailbox_id,
+                    &mut uid_not_sticky,
+                );
+            }
+            // RFC 7162 Section 3.2.5.2: capture VANISHED (EARLIER) responses
+            // sent during QRESYNC SELECT/EXAMINE. Only `earlier: true` responses
+            // belong to the initial sync; `earlier: false` are unsolicited and
+            // should not be included in the SelectedMailbox.
+            UntaggedResponse::Vanished {
+                earlier: true,
+                uids,
+            } => {
+                vanished.extend_from_slice(uids);
+            }
+            // RFC 7162 Section 3.2.5.2: capture FETCH responses with
+            // updated flags sent during QRESYNC SELECT/EXAMINE.
+            UntaggedResponse::Fetch(fetch) => {
+                changed_messages.push((**fetch).clone());
+            }
+            _ => {}
+        }
+    }
+
+    // Also check the tagged response code
+    if let Some(code) = &tagged.code {
+        extract_selected_code(
+            code,
+            &mut uid_validity,
+            &mut uid_next,
+            &mut permanent_flags,
+            &mut highest_mod_seq,
+            &mut no_mod_seq,
+            &mut unseen,
+            &mut mailbox_id,
+            &mut uid_not_sticky,
+        );
+    }
+
+    SelectedMailbox {
+        exists,
+        recent,
+        uid_validity,
+        uid_next,
+        flags,
+        permanent_flags,
+        highest_mod_seq,
+        no_mod_seq,
+        unseen,
+        mailbox_id,
+        read_only,
+        uid_not_sticky,
+        vanished,
+        changed_messages,
+    }
+}
+
+/// Restrict SELECT/EXAMINE processing to responses belonging to the newly
+/// selected mailbox.
+///
+/// RFC 7162 Section 3.2.11: when switching mailboxes, `* OK [CLOSED]`
+/// separates responses for the previously selected mailbox from the new one.
+pub(in crate::connection) fn selected_mailbox_effective_responses(
+    untagged: &[UntaggedResponse],
+) -> &[UntaggedResponse] {
+    match untagged.iter().rposition(|r| {
+        matches!(
+            r,
+            UntaggedResponse::Status {
+                status: UntaggedStatus::Ok,
+                code: Some(ResponseCode::Closed),
+                ..
+            }
+        )
+    }) {
+        Some(closed_idx) => &untagged[closed_idx + 1..],
+        None => untagged,
+    }
+}
+
+/// Extract mailbox metadata from a response code (RFC 3501 Section 7.1).
+#[allow(clippy::too_many_arguments)]
+fn extract_selected_code(
+    code: &ResponseCode,
+    uid_validity: &mut Option<u32>,
+    uid_next: &mut Option<u32>,
+    permanent_flags: &mut Vec<Flag>,
+    highest_mod_seq: &mut Option<u64>,
+    no_mod_seq: &mut bool,
+    unseen: &mut Option<u32>,
+    mailbox_id: &mut Option<String>,
+    uid_not_sticky: &mut bool,
+) {
+    match code {
+        ResponseCode::UidValidity(v) => *uid_validity = Some(*v),
+        ResponseCode::UidNext(v) => *uid_next = Some(*v),
+        ResponseCode::PermanentFlags(f) => permanent_flags.clone_from(f),
+        ResponseCode::HighestModSeq(v) => {
+            // RFC 7162 Section 3.1.2.1: mod-sequence-value >= 1.
+            // HIGHESTMODSEQ 0 is semantically invalid  -  the server should
+            // have sent [NOMODSEQ] instead. Treat it equivalently per
+            // Postel's law (RFC 1122 Section 1.2.2).
+            if *v == 0 {
+                *no_mod_seq = true;
+            } else {
+                *highest_mod_seq = Some(*v);
+            }
+        }
+        // RFC 7162 Section 3.1.2: [NOMODSEQ]  -  mailbox does not support
+        // mod-sequences. Distinct from the server simply not sending
+        // HIGHESTMODSEQ.
+        ResponseCode::NoModSeq => *no_mod_seq = true,
+        // RFC 3501 Section 7.1: [UNSEEN n]  -  first unseen message sequence number.
+        // Dropped in IMAP4rev2 (RFC 9051), but commonly sent by rev1 servers.
+        ResponseCode::Unseen(v) => *unseen = Some(*v),
+        // RFC 8474 Section 5.1: [MAILBOXID (<id>)]  -  unique mailbox identifier.
+        ResponseCode::MailboxId(id) => *mailbox_id = Some(id.clone()),
+        // RFC 4315 Section 2 / RFC 9051 Section 7.1: [UIDNOTSTICKY]  -
+        // UIDs assigned to messages in this mailbox are not persistent.
+        ResponseCode::UidNotSticky => *uid_not_sticky = true,
+        _ => {}
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{MailboxInfo, MailboxName, UidRange};
+
+    #[test]
+    fn select_preserves_unrecognized_and_failure_statuses() {
+        let warning = UntaggedResponse::Status {
+            status: UntaggedStatus::No,
+            code: Some(ResponseCode::UidNext(7)),
+            text: "warning".into(),
+        };
+        let unknown = UntaggedResponse::Status {
+            status: UntaggedStatus::Ok,
+            code: Some(ResponseCode::Other {
+                name: "FUTURE".into(),
+                value: None,
+            }),
+            text: "extension".into(),
+        };
+        let metadata = UntaggedResponse::Status {
+            status: UntaggedStatus::Ok,
+            code: Some(ResponseCode::UidValidity(9)),
+            text: "validity".into(),
+        };
+        let (inputs, events, _) = partition_select(
+            vec![warning.clone(), metadata.clone(), unknown.clone()],
+            &default_ctx(),
+        );
+        assert_eq!(inputs, vec![metadata]);
+        assert_eq!(events, vec![warning, unknown]);
+    }
+
+    #[test]
+    fn select_requires_final_nonzero_uidvalidity() {
+        let inputs = vec![
+            UntaggedResponse::Flags(vec![]),
+            UntaggedResponse::Exists(0),
+            UntaggedResponse::Recent(0),
+        ];
+        let mut tagged = TaggedResponse {
+            tag: "A001".into(),
+            status: StatusKind::Ok,
+            code: None,
+            text: "done".into(),
+        };
+        assert!(matches!(
+            validate_select_responses(&inputs, &tagged, false, &default_ctx()),
+            Err(Error::ProtocolMissing(_))
+        ));
+        tagged.code = Some(ResponseCode::UidValidity(1));
+        assert!(validate_select_responses(&inputs, &tagged, false, &default_ctx()).is_ok());
+        tagged.code = Some(ResponseCode::UidValidity(0));
+        assert!(validate_select_responses(&inputs, &tagged, false, &default_ctx()).is_err());
+    }
 
     fn default_ctx() -> ConsumerContext<'static> {
         ConsumerContext {

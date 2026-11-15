@@ -451,6 +451,15 @@ a loss is pending, later events join that loss window and are counted until the
 marker is delivered, so neither a newer event nor the marker can overtake the
 event sequence it summarizes.
 
+During IDLE, extension signals reach the caller as typed
+`IdleEvent::ExtensionEvent(IdleExtension)` values rather than formatted text:
+`QueueOverflow { dropped_count, since }` keeps the queue-loss count and the
+start of the loss window, `MetadataChange { server }` distinguishes a
+mailbox-scoped METADATA change from a server-scoped one, and any other
+unrecognized untagged response is carried parsed as `Response(..)`. The account
+push loop cannot know what such an event changed, so it conservatively answers
+every `ExtensionEvent` with an `Unknown` invalidation.
+
 ## Streaming FETCH
 
 Streaming never drops responses. The driver-side consumer is a bounded pipe (`BoundedStreamingPipe`, default capacity 64) that pre-reserves an `OwnedPermit` *before* each socket read, so a slow consumer applies TCP backpressure instead of either buffering without limit or silently discarding under a failed `try_send`.
@@ -750,6 +759,8 @@ unchanged. Its evidence describes the refresh, not the transition; the only
 recovery open is a fresh connection, which is safe whatever this one reached.
 
 ## Sync helpers
+
+`SelectConsumer` partitions the SELECT/EXAMINE responses once, at the last `* OK [CLOSED]` marker (RFC 7162 Section 3.2.11): everything before it belongs to the previously selected mailbox and becomes events, and the marker itself is dropped. After it, only the solicited types are consumed into the `SelectedMailbox`; among coded untagged statuses that means only a successful (`OK`) status carrying recognized selection metadata (UIDVALIDITY, UIDNEXT, PERMANENTFLAGS, HIGHESTMODSEQ, NOMODSEQ, UNSEEN, MAILBOXID, UIDNOTSTICKY). A NO/BAD status or an unrecognized code stays an event, so a warning or extension signal that arrived while the folder was opening is not swallowed. Validation and construction read the same partition. A successful selection requires a nonzero UIDVALIDITY, read from the tagged response code when present and otherwise from the last untagged one; a missing or zero value is `ProtocolMissing`. On a validation failure every response is returned as an event in its original order.
 
 `SyncSelectOptions` / `SyncSelectResult` wrap SELECT/EXAMINE with CONDSTORE and QRESYNC parameters (UIDVALIDITY, last-known MODSEQ, known UIDs, VANISHED parsed off the SELECT response).
 
@@ -1302,7 +1313,38 @@ Two registry rules keep the shared tagging (and therefore the owner and the righ
 - **Overlap precedence** (`shared_overrides_personal`, pure). RFC 2342 leaves `LIST "" "*"` free to include the non-personal namespaces and several servers do, so the same path can arrive from both the personal LIST and its own namespace LIST. `ingest_shared` lets the namespace candidate WIN that overlap when its path actually lies under its non-empty NAMESPACE prefix - the server's own declaration that the path is not personal. Skipping the overlap (the prior rule) left the folder registered bare: no owner, no `Shared` namespace, and `Container::rights == None` for a folder whose MYRIGHTS had been parsed and then discarded. A candidate NOT under its prefix is still skipped, which is what stops a reference-ignoring server from demoting a real personal INBOX.
 - **Personal-only refresh** (`FolderRegistry::replace_personal`). A mid-session re-LIST after a create / rename / move / delete enumerates only the personal root, so `refresh_folders` must not `replace_all`: clearing the map would drop every shared entry, its owner tag, and its rights, blanking the shared half of `containers_list` until the next reopen. The refresh is also IN PLACE for the personal half, on the same reasoning as `apply_mailbox_event`: a personal folder whose name survives the re-LIST keeps its existing `Arc<FolderEntry>` with only `refresh_listing` applied, so its cursor and 50k-entry MODSEQ cache are not zeroed on every folder CRUD and no concurrently held entry is orphaned mid-run. Only names the re-LIST no longer reports are removed, and only names it newly reports are added.
 
-Revocation quarantines, not escalates. A shared-folder SELECT permission denial in the inventory, changes, and mutation preparation paths routes through `error::shared_folder_error` to `SyncState(ScopeRevoked)` scoped to `Cursor(Folder(id))`, deriving `Engine(DisableScope(scope))`: the engine deletes that scope's cursor and broadcasts a scoped warning while siblings keep syncing. Mutation reports the denied folder's submitted ids as per-item failures and continues to later folders. The same denial on a personal folder (`shared_owner == None`) stays the account-level terminal `NoPermission`. ACL rights are advisory (gate discovery only); `NO [ACL]` stays authoritative per-mutation.
+Revocation quarantines, not escalates. Mailbox command failures in inventory,
+changes, hydration, raw reads, polling, PIM primitives and conveniences, search,
+container edits, bulk mutations and push use the registry's shared ownership
+when classifying permission denials. This applies after SELECT too: access can
+be withdrawn before FETCH, SEARCH, STORE, COPY or EXPUNGE. The account's
+`folder_error` funnels these failures through `error::shared_folder_error` to
+`SyncState(ScopeRevoked)` scoped to `Cursor(Folder(id))`, deriving
+`Engine(DisableScope(scope))`. The original access cause, wire response code,
+attempt evidence, native code and diagnostic text remain in the error; the
+revocation cause is primary. An enterprise Outlook user expects a withdrawn
+share to disappear without disabling their own mailbox. Mutation reports the
+denied folder's submitted ids as per-item failures and continues to later
+folders. Push SELECT and NOTIFY denials exclude that folder and reconfigure.
+Connection establishment and connection-level BYE remain account/session
+failures, since they do not establish a folder-specific denial.
+
+COPY/MOVE permission failures prefer a known shared source, otherwise a known
+shared destination. IMAP does not identify the denied endpoint; this conservative
+choice preserves personal mailbox access. Once fallback COPY has committed,
+a subsequent STORE/EXPUNGE failure belongs to the source. Personal-only
+permission loss stays account-level terminal `NoPermission`. Guarded STORE
+access refusals are classified before the completed result is flattened into
+per-UID concurrency outcomes. Its result type retains status and response code,
+but does not retain the server's response text. ACL rights are advisory (gate
+discovery only); `NO [ACL]` stays authoritative per-mutation.
+
+Fallback MOVE's partial-commit diagnostics retain source and destination folder
+targets plus at most 256 destination message targets from COPYUID, across all
+ranges, including reversed ranges. The target set remains explicitly incomplete
+(`StepTargets::at_least`); a broad server-supplied range cannot force numeric-span
+allocation or iteration. The committed copy and replay protection remain present
+when message-level diagnostic detail is truncated.
 
 ## Error model
 
@@ -1320,7 +1362,7 @@ A driver death carries the caller's phase. `ImapConnection::observe_driver_panic
 
 IDLE is the case where the phase is easy to get wrong. `next_event` submits no command, so it stamps a driver death `Unsent`, which is not IDLE's phase. When `ImapConnection::idle` sees the event channel close (`DriverGone` / `DriverPanicked`), it first does a non-blocking `Pending::try_take` on the IDLE result channel: the driver answers the IDLE command before exiting whenever it can, so the real outcome (a BYE, an I/O failure) is usually already there and is returned as the error (or `ServerTerminated` for an `Ok`), instead of being replaced by a generic `DriverGone`. With no answer it withdraws the IDLE and restamps the death `Unsent` if never committed, or `InFlight` once committed. Inside the driver, IDLE's own reads (the `+` grant wait, the loop, the DONE write, the post-DONE drain) stamp transport failures `InFlight` for the same reason; an EOF mid-IDLE used to carry no phase and read as `Unsent`.
 
-Local refusals made before the first byte follow the cross-crate rule in `reference/error-model.md` ("Local refusals") and each has its own variant, none of them connection-fatal: `InvalidInput` (caller input the encoder or a handle validator refuses) -> `Request(Malformed)`; `InvalidState` (a command the connection's local state does not permit - wrong session state, or UTF8=ONLY before `ENABLE UTF8=ACCEPT`) -> `Request(Malformed)`; `MissingCapability` (the server lacks an extension, or its revision removed the command, e.g. LSUB, STATUS RECENT or CHECK on rev2, or STATUS DELETED without rev2 or `QUOTA=RES-MESSAGE`) -> `Unsupported(op)`; `UnsupportedOperation` (a variant of a published `#[non_exhaustive]` request type this crate has not learned) -> `Unsupported(op)`; `StateChangedBeforeSend` (the driver's head-of-queue check found the session had moved) -> `ConcurrencyConflict` with `Unsent`. A session already in Logout is `Closed` with `Unsent` at either check, through the shared `helpers::state_refusal`. `MissingCapability` stays distinct from `UnsupportedOperation` because `should_disable_qresync` reads `MissingCapability` strings as evidence about the server.
+Local refusals made before the first byte follow the cross-crate rule in `reference/error-model.md` ("Local refusals") and each has its own variant, none of them connection-fatal: `InvalidInput` (caller input the encoder or a handle validator refuses) -> `Request(Malformed)`; `InvalidState` (a command the connection's local state does not permit - wrong session state, or UTF8=ONLY before `ENABLE UTF8=ACCEPT`) -> `Request(Malformed)`; `MissingCapability` (the server lacks an extension, or its revision removed the command, e.g. LSUB, STATUS RECENT or CHECK on rev2, or STATUS DELETED without rev2 or `QUOTA=RES-MESSAGE`) -> `Unsupported(op)`; `UnsupportedOperation` (a variant of a published `#[non_exhaustive]` request type this crate has not learned) -> `Unsupported(op)`; `StateChangedBeforeSend` (the driver's head-of-queue check found the session had moved) -> `ConcurrencyConflict` with `Unsent`. A session already in Logout is `Closed` with `Unsent` at either check, through the shared `helpers::state_refusal`. `MissingCapability` stays distinct from `UnsupportedOperation` because `should_disable_qresync` reads it as evidence about the server. These payloads are typed, with the diagnostic text kept alongside for translation and support logs: `MissingCapability` carries a `CapabilityFailure` (the capability plus a `CapabilityFailureReason`: not advertised, not ENABLEd, prohibited by the server, removed in rev2, literal too large, or a set of alternatives), and `InvalidInput` / `InvalidState` / `StateChangedBeforeSend` carry a `LocalFailure` that keeps the `ValidationError` rule or the `StateRequirement` (legal states, before first selection, an extension that must be enabled) when there is one. Consumers inspect the typed fields, never the prose: `should_disable_qresync` downgrades on a QRESYNC capability failure of any reason, a missing ENABLE, or an alternatives gate QRESYNC would satisfy.
 
 The scope readers inside `classify_response_code` (`resource_from_scope`, `id_from_scope`, `mailbox_throttle`) must each accept BOTH mailbox scope shapes. Folder producers build `ErrorScope::Cursor(Folder(id))` via `with_folder_scope`, not `ErrorScope::Mailbox { id }` - `with_mailbox` is reached only from tests. A reader matching just the latter degrades on every real folder-scoped failure while its mailbox-scoped test keeps passing, which is exactly how `ThrottleScope::Mailbox` became unreachable (widening per-mailbox `[LIMIT]` to account-wide pauses) and how the folder id was dropped from `RequestCause::NotFound`. Both fixed and pinned folder-side; keep new readers symmetric.
 

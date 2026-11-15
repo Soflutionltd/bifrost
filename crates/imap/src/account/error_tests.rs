@@ -351,7 +351,8 @@ fn no_with_noperm_maps_to_permission_denied_with_scope_resource() {
 
 #[test]
 fn shared_folder_permission_loss_derives_disable_scope() {
-    let err = Error::no_with_code("no perm".into(), Some(ResponseCode::NoPerm));
+    let err = Error::no_with_code("no perm".into(), Some(ResponseCode::NoPerm))
+        .with_attempt(TransmissionState::Acknowledged);
     let folder = mailbox("Shared/alice/INBOX");
     let owner = bifrost_types::MailboxId("alice".to_owned());
     let account = shared_folder_error(
@@ -374,6 +375,22 @@ fn shared_folder_permission_loss_derives_disable_scope() {
     assert_eq!(
         account.scope(),
         Some(&ErrorScope::Cursor(folder_cursor("Shared/alice/INBOX")))
+    );
+    assert!(account.chain().iter().any(|cause| matches!(
+        cause,
+        Cause::Access(bifrost_types::AccessCause::PermissionDenied { .. })
+    )));
+    assert!(account.chain().iter().any(|cause| matches!(
+        cause,
+        Cause::Wire(WireCause::Imap(ImapResponseCode::NoPerm))
+    )));
+    assert!(account.chain().iter().any(|cause| matches!(cause,
+        Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged)));
+    assert!(
+        account
+            .support_consented()
+            .support_text
+            .contains(&"no perm")
     );
 }
 

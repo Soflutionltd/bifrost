@@ -776,18 +776,12 @@ tests in `tests.rs` that exist only because there are two answers.
 
 **Reported by:** jmap-account.
 
-Computed in five places: `capabilities::validate_session` (`unwrap_or(1).max(1)`
-after proving `> 0`); `capabilities::build` (`batching_policy.max_items =
-max_objects_in_set.clamp(1, 500)`, `max_wait = 100ms`);
-`mutation::mutation_stream` and `mutation::versioned_stream` (each `clamp(1, 500)`
-again); `factory::max_objects_in_get` / `factory::max_objects_in_set`, which re-read
-the session (with the same `unwrap_or(1)` fallback) for "doors that hold a bare
-Account" (`pim.rs` single doors and `filters::list`); and `hydrate::ROUTE_MAX_WAIT`,
-a local constant whose comment says it duplicates the advertised `max_wait`
-because threading it was inconvenient. The factory is the wrong home for a
-per-request limit, and doors "hold a bare Account" because the handle does not
-carry its `CoreLimits` (BUG-057). Owner: the limits live on the per-account slot
-(STR-097), one reading.
+The sync-side duplication is gone: limit decoding lives in
+`sync/capabilities.rs`, one helper replaces the set-size clamps, and one
+constant replaces the two wait definitions. Residue: bare protocol account
+handles still read session snapshots for their limits, because the handle does
+not carry its `CoreLimits` (BUG-057). Owner: a protocol-owned limits accessor
+on the account handle, or the per-account slot (STR-097).
 
 ## CON-046 - The pagination guard: five copies, two opposite orders
 
@@ -901,17 +895,12 @@ four lifecycle carriers, STR-083.
 
 **Reported by:** google.
 
-The reason absence is not owed - the cursor is anchored at the historyId sampled
-before the walk - is written out as prose at two sites that then act differently:
-the inventory walk drops the id silently (`continue`); `repair_inventory` mints
-`DefinitivelyIrrelevant::AbsentUnderCursorBridge`. Both test `account_error.kind()
-== NotFound(Message)` after translation. The bisection and per-item lanes in
-`mutation.rs` answer "is this a 404" a third way, from the raw status (`is_not_found`
-on `response_parts`), and `MutationProgress::finish_failures` takes that answer as a
-`not_found: bool`. Owner: one `fn absence_proven_by_cursor_bridge(&AccountError) ->
-Option<Evidence>` beside `cursor.rs` (the proof rests on the cursor model), called by
-both inventory sites; the walk should arguably report the same evidence rather than
-silently `continue`, so the engine sees it. Related: BUG-021.
+The two inventory sites now share one evidence-producing helper in
+`account/cursor.rs`, and repair reports its evidence. Residue: the inventory
+walk still discharges a proven absence silently, because `InventoryEvent` has
+no per-object evidence variant, so the engine never sees the proof. That needs
+a shared inventory API change in bifrost-types. (Mutation 404 handling stays
+separate on purpose: it proves target absence, not inventory coverage.)
 
 ## CON-060 - Two redirect walkers, two 401-refresh-once paths, two deadlines
 

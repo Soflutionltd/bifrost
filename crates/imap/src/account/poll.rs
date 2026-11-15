@@ -359,7 +359,10 @@ impl ImapPoller {
                 .connection()
                 .uid_search(format!("UID {lo}:{hi}"), self.account.command_timeout())
                 .await
-                .map_err(|err| folder_error(err, &folder, op))?
+                .map_err(|err| {
+                    self.account
+                        .folder_error(err, &folder, ImapErrorContext::operation(op))
+                })?
                 .ids;
             found.retain(|uid| (lo..=hi).contains(uid));
             found.sort_unstable();
@@ -456,8 +459,9 @@ impl ImapPoller {
                 }
             }
             Err(BlobError::Account(err)) => Err(err),
-            Err(BlobError::Imap(err)) => Err(super::account_error_with(
+            Err(BlobError::Imap(err)) => Err(self.account.folder_error(
                 err,
+                &folder,
                 ImapErrorContext::operation(op).with_message_id(message.object_id().0),
             )),
             Err(BlobError::ChannelDropped) => {

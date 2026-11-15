@@ -16,11 +16,7 @@ use super::inventory::{email_to_inventory, inventory_properties};
 
 type MailAccount<T> = crate::account::Account<T>;
 
-// JMAP advertises this same `max_wait` through its BatchingPolicy. Hydration
-// receives CoreLimits, which currently carries only the wire object limits;
-// keep the timer local rather than widening account construction and every
-// CoreLimits fixture just to pass this one value.
-const ROUTE_MAX_WAIT: Duration = Duration::from_millis(100);
+use super::capabilities::BATCH_MAX_WAIT;
 
 struct PendingHydration {
     ids: Vec<ObjectId>,
@@ -148,7 +144,7 @@ pub(crate) fn stream<T: HttpTransport>(
         loop {
             let deadline = buffers
                 .values()
-                .map(|buffer| buffer.deadline(ROUTE_MAX_WAIT))
+                .map(|buffer| buffer.deadline(BATCH_MAX_WAIT))
                 .min();
             let input = tokio::select! {
                 biased;
@@ -164,7 +160,7 @@ pub(crate) fn stream<T: HttpTransport>(
             let now = tokio::time::Instant::now();
             let (ready, at_end) = match input {
                 None => (
-                    take_ready_routes(&mut buffers, now, limit, ROUTE_MAX_WAIT, false),
+                    take_ready_routes(&mut buffers, now, limit, BATCH_MAX_WAIT, false),
                     false,
                 ),
                 Some(Some(id)) => {
@@ -174,12 +170,12 @@ pub(crate) fn stream<T: HttpTransport>(
                         .or_insert_with(|| PendingHydration::new(now))
                         .push(id, now);
                     (
-                        take_ready_routes(&mut buffers, now, limit, ROUTE_MAX_WAIT, false),
+                        take_ready_routes(&mut buffers, now, limit, BATCH_MAX_WAIT, false),
                         false,
                     )
                 }
                 Some(None) => (
-                    take_ready_routes(&mut buffers, now, limit, ROUTE_MAX_WAIT, true),
+                    take_ready_routes(&mut buffers, now, limit, BATCH_MAX_WAIT, true),
                     true,
                 ),
             };

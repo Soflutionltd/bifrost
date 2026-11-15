@@ -14,8 +14,17 @@ use crate::core::transport::HttpTransport;
 use crate::mailbox::{Mailbox, MailboxChanges, MailboxGet, MailboxId, Property};
 
 use super::capabilities::CoreLimits;
-use super::state_cache::{self, StateMap};
 use super::state_walk::ChangesWalk;
+
+/// Lifecycle position and announced names are published together. A dropped
+/// stream replays the unfinished page rather than hiding sidebar changes.
+#[derive(Default)]
+pub(crate) struct LifecycleTopology {
+    pub(crate) positions: HashMap<String, Option<String>>,
+    pub(crate) names: HashMap<String, String>,
+}
+
+type Topology = Arc<Mutex<LifecycleTopology>>;
 
 type MailAccount<T> = crate::account::Account<T>;
 
@@ -134,9 +143,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(300);
 pub(crate) fn scope_lifecycle<T: HttpTransport>(
     mail: MailAccount<T>,
     limits: CoreLimits,
-    mailbox_states: StateMap,
+    topology: Topology,
     account_id: String,
-    mailbox_names: Arc<Mutex<HashMap<String, String>>>,
     shutdown: CancellationToken,
     client: crate::client::Client<T>,
 ) -> AccountStream<ScopeLifecycleEvent> {
@@ -165,7 +173,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                 break;
             }
 
-            let since_state = state_cache::get(&mailbox_states, &account_id).await;
+            let since_state = topology.lock().await.positions.get(&account_id).cloned().flatten();
 
             let Some(since_state) = since_state else {
                 walk = None;
@@ -245,6 +253,10 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                     };
 
                     let FetchedMailboxes { list: fetched, not_found } = fetched;
+                    // Stage the complete page locally. Outlook users expect a
+                    // cancelled sidebar refresh to replay unfinished changes,
+                    // so names cannot advance before the matching position.
+                    let mut names = topology.lock().await.names.clone();
                     let mut answered: Vec<String> = Vec::new();
                     for mailbox in fetched {
                         let id = mailbox.id().map(ToString::to_string);
@@ -254,12 +266,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                         };
                         answered.push(id.clone());
 
-                        let old_name = replace_mailbox_name(
-                            &mailbox_names,
-                            id.clone(),
-                            name.clone(),
-                        )
-                        .await;
+                        let old_name = names.insert(id.clone(), name.clone());
 
                         // A mailbox this poller has no name for is one the
                         // consumer has never been told about, whichever
@@ -336,13 +343,19 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                         {
                             continue;
                         }
-                        let known = remove_mailbox_name(&mailbox_names, id).await;
+                        let known = names.remove(id);
                         let scope = MembershipScope::Mailbox(
                             bifrost_types::MailboxId(id.to_string()),
                         );
-                        // An id the consumer never heard of is not created
-                        // and deleted for its benefit; it never existed as
-                        // far as this stream is concerned.
+                        // An id this poller holds no name for - created, or
+                        // `updated` but never announced - is a discovery,
+                        // exactly as it would be had the get answered it.
+                        // Its vanishing is therefore surfaced as Created
+                        // then Deleted, the same pair a vanished create gets:
+                        // an Outlook user sees no folder either way, and the
+                        // pair tears down any scope the consumer acquired by
+                        // another route instead of leaving it behind. A known
+                        // id was already announced and needs only Deleted.
                         if known.is_none() {
                             yield ScopeLifecycleEvent::Lifecycle(
                                 ScopeLifecycle::Created(scope.clone()),
@@ -353,7 +366,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
 
                     for destroyed_id in destroyed {
                         let id = destroyed_id.into_string();
-                        drop(remove_mailbox_name(&mailbox_names, &id).await);
+                        drop(names.remove(&id));
                         yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Deleted(MembershipScope::Mailbox(
                             bifrost_types::MailboxId(id),
                         )));
@@ -361,7 +374,11 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
 
                     // Commit only after every follow-up needed to describe
                     // this changes response has completed successfully.
-                    state_cache::set(&mailbox_states, &account_id, new_state.clone()).await;
+                    {
+                        let mut published = topology.lock().await;
+                        published.names = names;
+                        published.positions.insert(account_id.clone(), Some(new_state.clone()));
+                    }
 
                     if !response.has_more_changes() {
                         // The burst is over; the next poll starts a new
@@ -392,20 +409,17 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                         match fetch_mailbox_names(&mail).await {
                             Ok((state, names)) => {
                                 let events = {
-                                    let previous = mailbox_names.lock().await;
-                                    mailbox_snapshot_diff(&previous, &names)
+                                    let previous = topology.lock().await;
+                                    mailbox_snapshot_diff(&previous.names, &names)
                                 };
                                 for event in events {
                                     yield ScopeLifecycleEvent::Lifecycle(event);
                                 }
-                                // Publish neither map until all events have
-                                // been yielded and both locks are held. A
-                                // dropped stream must not leave fresh names
-                                // hiding unannounced events on the next reseed.
-                                let mut previous = mailbox_names.lock().await;
-                                let mut states = mailbox_states.lock().await;
-                                *previous = names;
-                                states.insert(account_id.clone(), Some(state.clone()));
+                                // Publish once, after event delivery. Dropping
+                                // before this point leaves both facts replayable.
+                                let mut published = topology.lock().await;
+                                published.names = names;
+                                published.positions.insert(account_id.clone(), Some(state.clone()));
                                 state_walk.reset_changes_burst(&state);
                             }
                             Err(err) => {
@@ -507,23 +521,6 @@ async fn fetch_mailboxes<'a, T: HttpTransport>(
     }
 
     Ok(fetched)
-}
-
-async fn replace_mailbox_name(
-    names: &Arc<Mutex<HashMap<String, String>>>,
-    id: String,
-    name: String,
-) -> Option<String> {
-    let mut guard = names.lock().await;
-    guard.insert(id, name)
-}
-
-async fn remove_mailbox_name(
-    names: &Arc<Mutex<HashMap<String, String>>>,
-    id: &str,
-) -> Option<String> {
-    let mut guard = names.lock().await;
-    guard.remove(id)
 }
 
 #[cfg(test)]
@@ -694,7 +691,7 @@ mod tests {
     ) -> (
         AccountStream<ScopeLifecycleEvent>,
         CancellationToken,
-        StateMap,
+        Topology,
     ) {
         lifecycle_stream_with_names(replies, HashMap::new())
     }
@@ -705,7 +702,7 @@ mod tests {
     ) -> (
         AccountStream<ScopeLifecycleEvent>,
         CancellationToken,
-        StateMap,
+        Topology,
     ) {
         let (stream, shutdown, states, _) = lifecycle_stream_with_limit(replies, names, 256);
         (stream, shutdown, states)
@@ -720,7 +717,7 @@ mod tests {
     ) -> (
         AccountStream<ScopeLifecycleEvent>,
         CancellationToken,
-        StateMap,
+        Topology,
         Recorder,
     ) {
         let (stream, shutdown, states, recorder) =
@@ -735,7 +732,7 @@ mod tests {
     ) -> (
         AccountStream<ScopeLifecycleEvent>,
         CancellationToken,
-        StateMap,
+        Topology,
         Recorder,
     ) {
         let recorder = Recorder::default();
@@ -746,10 +743,10 @@ mod tests {
         )
         .expect("client builds");
         let mail = crate::account::Account::new(client.clone(), "primary");
-        let states: StateMap = Arc::new(Mutex::new(HashMap::from([(
-            "primary".to_string(),
-            Some("mbx-1".to_string()),
-        )])));
+        let states = Arc::new(Mutex::new(LifecycleTopology {
+            positions: HashMap::from([("primary".to_string(), Some("mbx-1".to_string()))]),
+            names,
+        }));
         let shutdown = CancellationToken::new();
         let stream = scope_lifecycle(
             mail,
@@ -759,7 +756,6 @@ mod tests {
             },
             Arc::clone(&states),
             "primary".to_string(),
-            Arc::new(Mutex::new(names)),
             shutdown.clone(),
             client,
         );
@@ -809,7 +805,7 @@ mod tests {
         ));
         assert_eq!(requests.lock().expect("requests").len(), 2);
         assert_eq!(
-            states.lock().await.get("primary"),
+            states.lock().await.positions.get("primary"),
             Some(&Some("mbx-3".into()))
         );
         shutdown.cancel();
@@ -832,7 +828,7 @@ mod tests {
         ));
         assert!(stream.next().await.is_none());
         assert_eq!(
-            states.lock().await.get("primary"),
+            states.lock().await.positions.get("primary"),
             Some(&Some("mbx-1".into()))
         );
     }
@@ -887,7 +883,14 @@ mod tests {
             assert_eq!(new, old);
             assert_eq!((old_name.as_str(), new_name.as_str()), ("Before", "After"));
             assert_eq!(
-                state_cache::get(&states, "primary").await.as_deref(),
+                states
+                    .lock()
+                    .await
+                    .positions
+                    .get("primary")
+                    .cloned()
+                    .flatten()
+                    .as_deref(),
                 Some("mbx-1")
             );
             // Pull past the snapshot's final yield, committing its state and
@@ -900,7 +903,14 @@ mod tests {
             };
             assert_eq!(id.0, "e-later");
             assert_eq!(
-                state_cache::get(&states, "primary").await.as_deref(),
+                states
+                    .lock()
+                    .await
+                    .positions
+                    .get("primary")
+                    .cloned()
+                    .flatten()
+                    .as_deref(),
                 Some("mbx-fresh")
             );
             {
@@ -935,7 +945,14 @@ mod tests {
             assert_eq!(started.elapsed(), std::time::Duration::ZERO);
             assert_eq!(requests.lock().expect("requests").len(), expected_requests);
             assert_eq!(
-                state_cache::get(&states, "primary").await.as_deref(),
+                states
+                    .lock()
+                    .await
+                    .positions
+                    .get("primary")
+                    .cloned()
+                    .flatten()
+                    .as_deref(),
                 Some("mbx-1"),
                 "the replacement reader must retry the uncommitted position",
             );
@@ -960,7 +977,14 @@ mod tests {
         ));
         assert_eq!(started.elapsed(), std::time::Duration::ZERO);
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            states
+                .lock()
+                .await
+                .positions
+                .get("primary")
+                .cloned()
+                .flatten()
+                .as_deref(),
             Some("mbx-1")
         );
         assert_eq!(requests.lock().expect("requests").len(), 2);
@@ -982,11 +1006,10 @@ mod tests {
         )
         .expect("client builds");
         let mail = crate::account::Account::new(client.clone(), "primary");
-        let states = Arc::new(Mutex::new(HashMap::from([(
-            "primary".to_string(),
-            Some("mbx-1".to_string()),
-        )])));
-        let names = Arc::new(Mutex::new(HashMap::new()));
+        let states = Arc::new(Mutex::new(LifecycleTopology {
+            positions: HashMap::from([("primary".to_string(), Some("mbx-1".to_string()))]),
+            names: HashMap::new(),
+        }));
         let shutdown = CancellationToken::new();
         let open_stream = || {
             skip_polled(scope_lifecycle(
@@ -997,7 +1020,6 @@ mod tests {
                 },
                 Arc::clone(&states),
                 "primary".to_string(),
-                Arc::clone(&names),
                 shutdown.clone(),
                 client.clone(),
             ))
@@ -1008,9 +1030,16 @@ mod tests {
             Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(_),))
         ));
         drop(first);
-        assert!(names.lock().await.is_empty());
+        assert!(states.lock().await.names.is_empty());
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            states
+                .lock()
+                .await
+                .positions
+                .get("primary")
+                .cloned()
+                .flatten()
+                .as_deref(),
             Some("mbx-1")
         );
 
@@ -1026,10 +1055,102 @@ mod tests {
         }
         shutdown.cancel();
         assert!(resumed.next().await.is_none());
-        assert_eq!(names.lock().await.len(), 2);
+        assert_eq!(states.lock().await.names.len(), 2);
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            states
+                .lock()
+                .await
+                .positions
+                .get("primary")
+                .cloned()
+                .flatten()
+                .as_deref(),
             Some("mbx-fresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_partial_changes_page_preserves_names_and_position() {
+        let client = crate::client::Client::with_transport(
+            ScriptTransport::new([
+                changes_reply(&[], &["a-new", "b-new"], &[]),
+                snapshot_reply("mbx-fresh", &[("a-new", "New"), ("b-new", "New")]),
+                changes_reply(&[], &["a-new", "b-new"], &[]),
+                snapshot_reply("mbx-fresh", &[("a-new", "New"), ("b-new", "New")]),
+            ]),
+            test_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client.clone(), "primary");
+        let states = Arc::new(Mutex::new(LifecycleTopology {
+            positions: HashMap::from([("primary".to_string(), Some("mbx-1".to_string()))]),
+            names: HashMap::from([
+                ("a-new".into(), "Old".into()),
+                ("b-new".into(), "Old".into()),
+            ]),
+        }));
+        let shutdown = CancellationToken::new();
+        let open_stream = || {
+            skip_polled(scope_lifecycle(
+                mail.clone(),
+                CoreLimits {
+                    max_objects_in_get: 256,
+                    max_objects_in_set: 256,
+                },
+                Arc::clone(&states),
+                "primary".to_string(),
+                shutdown.clone(),
+                client.clone(),
+            ))
+        };
+        let mut first = open_stream();
+        assert!(matches!(
+            first.next().await,
+            Some(ScopeLifecycleEvent::Lifecycle(
+                ScopeLifecycle::Renamed { .. }
+            ))
+        ));
+        drop(first);
+        assert!(states.lock().await.names.values().all(|name| name == "Old"));
+        assert_eq!(
+            states
+                .lock()
+                .await
+                .positions
+                .get("primary")
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("mbx-1")
+        );
+
+        let mut resumed = open_stream();
+        for expected in ["a-new", "b-new"] {
+            let Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Renamed {
+                old_name,
+                new: MembershipScope::Mailbox(id),
+                ..
+            })) = resumed.next().await
+            else {
+                panic!("missing replayed rename");
+            };
+            assert_eq!(id.0, expected);
+            assert_eq!(old_name, "Old");
+        }
+        shutdown.cancel();
+        assert!(resumed.next().await.is_none());
+        assert_eq!(states.lock().await.names.len(), 2);
+        assert_eq!(
+            states
+                .lock()
+                .await
+                .positions
+                .get("primary")
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("mbx-2")
         );
     }
 
@@ -1044,7 +1165,14 @@ mod tests {
         };
         assert!(error.recovery().is_terminal());
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            states
+                .lock()
+                .await
+                .positions
+                .get("primary")
+                .cloned()
+                .flatten()
+                .as_deref(),
             Some("mbx-1")
         );
         assert!(stream.next().await.is_none());
@@ -1175,7 +1303,13 @@ mod tests {
         shutdown.cancel();
         assert!(stream.next().await.is_none());
         assert_eq!(
-            state_cache::get(&states, "primary").await,
+            states
+                .lock()
+                .await
+                .positions
+                .get("primary")
+                .cloned()
+                .flatten(),
             Some("mbx-2".to_string()),
             "the state still advances; the vanished create is not replayable"
         );
@@ -1237,7 +1371,13 @@ mod tests {
         }
         assert!(stream.next().await.is_none());
         assert_eq!(
-            state_cache::get(&states, "primary").await,
+            states
+                .lock()
+                .await
+                .positions
+                .get("primary")
+                .cloned()
+                .flatten(),
             Some("mbx-1".to_string()),
             "the refused page is not committed; the state never moved"
         );
@@ -1413,7 +1553,13 @@ mod tests {
         // the shared `mailbox_states` cache that a delta pass or a local
         // `Mailbox/set` may fast-forward past unseen lifecycle events.
         assert_eq!(
-            state_cache::get(&states, "primary").await,
+            states
+                .lock()
+                .await
+                .positions
+                .get("primary")
+                .cloned()
+                .flatten(),
             Some("mbx-2".to_string()),
             "the lifecycle poller advances the map it was handed"
         );

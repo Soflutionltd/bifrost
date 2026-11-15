@@ -1042,7 +1042,7 @@ impl Account for GraphAccount {
         // A public folder is a client-maintained watermark poll, not a
         // server-issued delta token; report `Poll` so the descriptor is
         // honest about its strategy. Delta kinds stay `ServerCursor`.
-        let strategy = match decoded.as_ref().map(|p| &p.kind) {
+        let strategy = match decoded.as_ref().map(cursor::GraphCursorPayload::kind) {
             Some(cursor::GraphCursorKind::PublicFolder(_)) => SyncStrategy::Poll,
             Some(_) => SyncStrategy::ServerCursor,
             None => SyncStrategy::None,
@@ -1159,7 +1159,7 @@ impl Account for GraphAccount {
         // so no routing-map check is needed - the routing rides in the
         // payload.
         if matches!(
-            cursor::decode_cursor(&cursor).map(|p| p.kind),
+            cursor::decode_cursor(&cursor).map(|p| p.kind()),
             Ok(cursor::GraphCursorKind::PublicFolder(_))
         ) {
             return public_folder::public_folder_changes_stream(self.clone(), cursor);

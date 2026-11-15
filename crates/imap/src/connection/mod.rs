@@ -18,7 +18,7 @@ use crate::types::{
     MailboxInfo, MailboxName, MetadataEntry, MetadataResult, MoveResult, NamespaceResponse,
     NotifySetParams, QresyncParams, QuotaResource, QuotaRootResponse, Response, ResponseCode,
     SelectOptions, SelectedMailbox, SequenceSet, StatusItem, StatusResult, StoreOperation,
-    StoreResult, TaggedResponse, ThreadNode, UidRange, UntaggedResponse, UntaggedStatus,
+    StoreResult, ThreadNode, UidRange, UntaggedResponse, UntaggedStatus,
     format_fetch_attrs,
 };
 
@@ -203,14 +203,10 @@ pub(crate) enum IdleEvent {
     /// use the `tag` field (if present) to correlate with the original search
     /// context and determine the number semantics.
     SearchUpdate(Box<crate::types::EsearchResponse>),
-    /// Extension-defined untagged response not recognized by the parser
-    /// (RFC 9051 Section 2.2.2).
-    ///
-    /// When `crate::types::NotifyEvent::Other(...)` is registered, the server may deliver
-    /// extension-defined notifications using response types this client does
-    /// not implement. The raw response line is preserved so callers can
-    /// parse extension data themselves.
-    ExtensionEvent(String),
+    /// Extension-defined responses, metadata signals, and local queue loss.
+    /// Parsed response data is retained without using Debug output as an
+    /// event protocol. Consumers conservatively invalidate on these signals.
+    ExtensionEvent(IdleExtension),
     /// Unsolicited status update with a response code  -  `* OK [code]` or
     /// `* NO [code]` (RFC 3501 Section 7.1).
     ///
@@ -262,6 +258,22 @@ pub(crate) enum IdleEvent {
     /// waiting for the client's DONE. When this happens, the client MUST NOT
     /// send DONE because the IDLE command is already complete.
     ServerTerminated,
+}
+
+/// Typed IDLE signals that require conservative account invalidation.
+/// Queue loss is distinct from a server ALERT: Outlook users expect cached
+/// mail to be reconciled after loss, even when no human-readable alert exists.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum IdleExtension {
+    QueueOverflow {
+        dropped_count: usize,
+        since: std::time::Instant,
+    },
+    MetadataChange {
+        server: bool,
+    },
+    Response(Box<UntaggedResponse>),
 }
 
 /// Result of a SEARCH or UID SEARCH command.
@@ -721,9 +733,9 @@ fn validate_tls_server_name(host: &str) -> Result<(), Error> {
         ));
     }
     if host.bytes().any(|b| b == 0 || b.is_ascii_whitespace()) {
-        return Err(Error::InvalidInput(format!(
-            "invalid TLS server name: {host:?}"
-        )));
+        return Err(Error::InvalidInput(
+            format!("invalid TLS server name: {host:?}").into(),
+        ));
     }
     Ok(())
 }
@@ -827,172 +839,6 @@ fn expand_uid_ranges(ranges: &[UidRange]) -> Result<Vec<u32>, Error> {
     Ok(uids)
 }
 
-/// Build a `SelectedMailbox` from collected untagged and tagged responses.
-///
-/// Extracts EXISTS, RECENT, FLAGS, UIDVALIDITY, UIDNEXT, PERMANENTFLAGS,
-/// HIGHESTMODSEQ, and UIDNOTSTICKY from the responses per RFC 3501 Section 7.
-fn build_selected_mailbox(
-    untagged: &[UntaggedResponse],
-    tagged: &TaggedResponse,
-    read_only: bool,
-) -> SelectedMailbox {
-    let mut exists = 0;
-    let mut recent = 0;
-    let mut uid_validity: Option<u32> = None;
-    let mut uid_next = Option::None;
-    let mut flags = Vec::new();
-    let mut permanent_flags = Vec::new();
-    let mut highest_mod_seq = Option::None;
-    let mut no_mod_seq = false;
-    let mut unseen: Option<u32> = None;
-    // RFC 8474 Section 5.1: unique mailbox identifier from [MAILBOXID (<id>)].
-    let mut mailbox_id: Option<String> = None;
-    // RFC 4315 Section 2 / RFC 9051 Section 7.1: [UIDNOTSTICKY]  -  UIDs are not persistent.
-    let mut uid_not_sticky = false;
-    // RFC 7162 Section 3.2.5.2: QRESYNC SELECT responses include
-    // VANISHED (EARLIER) with UIDs removed since last sync, and
-    // FETCH responses with changed flags.
-    let mut vanished = Vec::new();
-    let mut changed_messages = Vec::new();
-
-    let effective_responses = selected_mailbox_effective_responses(untagged);
-
-    for resp in effective_responses {
-        match resp {
-            UntaggedResponse::Exists(n) => exists = *n,
-            UntaggedResponse::Recent(n) => recent = *n,
-            UntaggedResponse::Flags(f) => flags.clone_from(f),
-            UntaggedResponse::Status {
-                code: Some(code), ..
-            } => {
-                extract_selected_code(
-                    code,
-                    &mut uid_validity,
-                    &mut uid_next,
-                    &mut permanent_flags,
-                    &mut highest_mod_seq,
-                    &mut no_mod_seq,
-                    &mut unseen,
-                    &mut mailbox_id,
-                    &mut uid_not_sticky,
-                );
-            }
-            // RFC 7162 Section 3.2.5.2: capture VANISHED (EARLIER) responses
-            // sent during QRESYNC SELECT/EXAMINE. Only `earlier: true` responses
-            // belong to the initial sync; `earlier: false` are unsolicited and
-            // should not be included in the SelectedMailbox.
-            UntaggedResponse::Vanished {
-                earlier: true,
-                uids,
-            } => {
-                vanished.extend_from_slice(uids);
-            }
-            // RFC 7162 Section 3.2.5.2: capture FETCH responses with
-            // updated flags sent during QRESYNC SELECT/EXAMINE.
-            UntaggedResponse::Fetch(fetch) => {
-                changed_messages.push((**fetch).clone());
-            }
-            _ => {}
-        }
-    }
-
-    // Also check the tagged response code
-    if let Some(code) = &tagged.code {
-        extract_selected_code(
-            code,
-            &mut uid_validity,
-            &mut uid_next,
-            &mut permanent_flags,
-            &mut highest_mod_seq,
-            &mut no_mod_seq,
-            &mut unseen,
-            &mut mailbox_id,
-            &mut uid_not_sticky,
-        );
-    }
-
-    SelectedMailbox {
-        exists,
-        recent,
-        uid_validity,
-        uid_next,
-        flags,
-        permanent_flags,
-        highest_mod_seq,
-        no_mod_seq,
-        unseen,
-        mailbox_id,
-        read_only,
-        uid_not_sticky,
-        vanished,
-        changed_messages,
-    }
-}
-
-/// Restrict SELECT/EXAMINE processing to responses belonging to the newly
-/// selected mailbox.
-///
-/// RFC 7162 Section 3.2.11: when switching mailboxes, `* OK [CLOSED]`
-/// separates responses for the previously selected mailbox from the new one.
-fn selected_mailbox_effective_responses(untagged: &[UntaggedResponse]) -> &[UntaggedResponse] {
-    match untagged.iter().rposition(|r| {
-        matches!(
-            r,
-            UntaggedResponse::Status {
-                code: Some(ResponseCode::Closed),
-                ..
-            }
-        )
-    }) {
-        Some(closed_idx) => &untagged[closed_idx + 1..],
-        None => untagged,
-    }
-}
-
-/// Extract mailbox metadata from a response code (RFC 3501 Section 7.1).
-#[allow(clippy::too_many_arguments)]
-fn extract_selected_code(
-    code: &ResponseCode,
-    uid_validity: &mut Option<u32>,
-    uid_next: &mut Option<u32>,
-    permanent_flags: &mut Vec<Flag>,
-    highest_mod_seq: &mut Option<u64>,
-    no_mod_seq: &mut bool,
-    unseen: &mut Option<u32>,
-    mailbox_id: &mut Option<String>,
-    uid_not_sticky: &mut bool,
-) {
-    match code {
-        ResponseCode::UidValidity(v) => *uid_validity = Some(*v),
-        ResponseCode::UidNext(v) => *uid_next = Some(*v),
-        ResponseCode::PermanentFlags(f) => permanent_flags.clone_from(f),
-        ResponseCode::HighestModSeq(v) => {
-            // RFC 7162 Section 3.1.2.1: mod-sequence-value >= 1.
-            // HIGHESTMODSEQ 0 is semantically invalid  -  the server should
-            // have sent [NOMODSEQ] instead. Treat it equivalently per
-            // Postel's law (RFC 1122 Section 1.2.2).
-            if *v == 0 {
-                *no_mod_seq = true;
-            } else {
-                *highest_mod_seq = Some(*v);
-            }
-        }
-        // RFC 7162 Section 3.1.2: [NOMODSEQ]  -  mailbox does not support
-        // mod-sequences. Distinct from the server simply not sending
-        // HIGHESTMODSEQ.
-        ResponseCode::NoModSeq => *no_mod_seq = true,
-        // RFC 3501 Section 7.1: [UNSEEN n]  -  first unseen message sequence number.
-        // Dropped in IMAP4rev2 (RFC 9051), but commonly sent by rev1 servers.
-        ResponseCode::Unseen(v) => *unseen = Some(*v),
-        // RFC 8474 Section 5.1: [MAILBOXID (<id>)]  -  unique mailbox identifier.
-        ResponseCode::MailboxId(id) => *mailbox_id = Some(id.clone()),
-        // RFC 4315 Section 2 / RFC 9051 Section 7.1: [UIDNOTSTICKY]  -
-        // UIDs assigned to messages in this mailbox are not persistent.
-        ResponseCode::UidNotSticky => *uid_not_sticky = true,
-        _ => {}
-    }
-}
-
 /// Check whether a LIST response's attributes conflict with the selection
 /// options of a LIST-EXTENDED command (RFC 5258 Section 3).
 ///
@@ -1086,3 +932,6 @@ pub(super) fn is_notify_list_event(info: &MailboxInfo, filter_extended_markers: 
     }
     false
 }
+
+#[cfg(test)]
+use dispatch::{build_selected_mailbox, selected_mailbox_effective_responses};
