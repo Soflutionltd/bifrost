@@ -1280,7 +1280,7 @@ async fn one_undecodable_scope_clears_every_row_of_the_account_at_attach() {
             repair: Vec::new(),
         }],
     );
-    ledger.ingest_debt_only(&report, 1, 1);
+    ledger.ingest_debt_only(&report, walk_generation(1), 1);
     let ledger_bytes = bifrost_sync::cursor::encode_ledger(&ledger);
     store
         .put_ledger(&account_id, ledger)
@@ -3143,4 +3143,13 @@ async fn a_deferred_inventory_that_raises_schema_incompatible_is_established_aft
     assert_eq!(walks.lock().expect("walks").get(&a), Some(&2));
     assert_eq!(walks.lock().expect("walks").get(&b), Some(&1));
     engine.detach(&id).await.expect("detach");
+}
+
+// Mint test proof orders through the same owner as production walks.
+fn walk_generation(value: u64) -> bifrost_sync::cursor::WalkGeneration {
+    let coverage = bifrost_sync::cursor::PendingCoverage::new();
+    for _ in 0..value {
+        let _ = coverage.next_generation();
+    }
+    coverage.next_generation()
 }

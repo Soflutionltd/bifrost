@@ -75,7 +75,8 @@ pub use metered_stream::MeteredStream;
 pub use net::{AccountNet, AccountSpec, Net};
 pub use rate::{RateGeneration, RateLimit, RateLimitGovernor, RequestCost};
 pub use redirect::{
-    DEFAULT_MAX_HOPS, FollowRedirects, RedirectAction, RedirectPolicy, RedirectStep,
+    DEFAULT_MAX_HOPS, FollowRedirects, HopCredential, HopPolicy, MethodRewrite, RedirectAction,
+    RedirectPolicy, RedirectStep, origin_key, same_origin,
 };
 pub use request::{
     ByteStream, ReplayPolicy, RequestBuilder, RequestByteCounter, Response, StreamingResponse,

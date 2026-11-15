@@ -1575,7 +1575,14 @@ async fn a_queued_append_is_validated_against_the_state_at_execution() {
         .expect("append task")
         .expect_err("an APPEND the live state cannot carry must not be sent");
     assert!(
-        matches!(err, Error::MissingCapability(ref m) if m.contains("requires BINARY literal8 support")),
+        // The handle admitted it while BINARY was advertised; the driver found
+        // the capability gone at the head of the queue, so it is a state change
+        // before send (safe to re-issue), not a permanent refusal.
+        matches!(
+            err,
+            Error::StateChangedBeforeSend(ref f)
+                if f.message.contains("requires BINARY literal8 support")
+        ),
         "the driver must validate the queued APPEND against the state it \
          executes under; got {err:?}"
     );
@@ -2472,10 +2479,24 @@ async fn a_queued_command_is_refused_when_the_session_left_its_legal_states() {
 #[tokio::test(start_paused = true)]
 async fn a_refused_select_leaves_no_pending_selection_behind() {
     let (conn, mut server) = crate::connection::test_support::driver_pair(&preauth_greeting(
-        "IMAP4rev1 CONDSTORE QRESYNC",
+        "IMAP4rev1 ENABLE CONDSTORE QRESYNC",
     ))
     .await;
     let script = tokio::spawn(async move {
+        // QRESYNC parameters need a confirmed ENABLE (an unconfirmed one is an
+        // InvalidState sequencing refusal at admission), so confirm it first;
+        // the zero uidvalidity must then be refused by the encoder.
+        let enable = read_line(&mut server).await;
+        assert!(
+            enable.contains(" ENABLE QRESYNC"),
+            "expected ENABLE, got {enable:?}"
+        );
+        let tag = tag_of(&enable).to_owned();
+        respond(
+            &mut server,
+            &format!("* ENABLED QRESYNC\r\n{tag} OK enabled\r\n"),
+        )
+        .await;
         let next = read_line(&mut server).await;
         assert!(
             next.ends_with(" NOOP\r\n"),
@@ -2485,6 +2506,9 @@ async fn a_refused_select_leaves_no_pending_selection_behind() {
         respond(&mut server, &format!("{tag} OK NOOP completed\r\n")).await;
         server
     });
+    conn.enable(&["QRESYNC"], Duration::from_secs(5))
+        .await
+        .expect("ENABLE QRESYNC");
 
     // RFC 3501 Section 9: a QRESYNC uidvalidity is nz-number, so the encoder
     // refuses 0 before writing anything.

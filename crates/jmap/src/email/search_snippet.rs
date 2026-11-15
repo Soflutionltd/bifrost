@@ -31,6 +31,8 @@ pub(crate) struct SearchSnippetGetRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct SearchSnippetGetResponse {
+    #[serde(skip)]
+    pub(crate) answer_context: crate::core::answer::AnswerContext,
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -46,6 +48,10 @@ impl crate::core::method::JmapMethod for SearchSnippetGetRequest {
     const NAME: &'static str = "SearchSnippet/get";
     type Cap = crate::core::capability::Mail;
     type Response = SearchSnippetGetResponse;
+
+    fn stamp_response(response: &mut Self::Response, context: crate::core::answer::AnswerContext) {
+        response.answer_context = context;
+    }
 
     fn set_account_id(&mut self, account_id: &AccountId) {
         self.account_id = account_id.clone();
@@ -116,6 +122,14 @@ impl SearchSnippet {
 }
 
 impl SearchSnippetGetResponse {
+    pub(crate) fn answer(&self, id: &EmailId) -> crate::core::answer::IdAnswer<&SearchSnippet> {
+        crate::core::answer::IdAnswer::from_parts(
+            self.list.iter().find(|entry| &entry.email_id == id),
+            None,
+            self.not_found.as_ref().is_some_and(|ids| ids.contains(id)),
+        )
+    }
+
     pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }

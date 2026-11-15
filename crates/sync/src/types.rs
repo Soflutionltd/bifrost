@@ -264,6 +264,25 @@ impl Default for MutationConfig {
     }
 }
 
+/// Identity of an installed account connection, owned by `Incarnation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AccountGeneration(u64);
+
+impl AccountGeneration {
+    pub(crate) fn successor(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    pub(crate) fn is_replacement(self) -> bool {
+        self.0 != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// One installed account instance together with the account generation it was
 /// installed under.
 ///
@@ -281,22 +300,34 @@ impl Default for MutationConfig {
 #[derive(Clone)]
 pub struct Incarnation {
     account: Arc<dyn Account>,
-    generation: u64,
+    generation: crate::types::AccountGeneration,
 }
 
 impl Incarnation {
+    /// Initial attachment identity; replacement connections advance from this.
     #[must_use]
-    pub fn new(account: Arc<dyn Account>, generation: u64) -> Self {
+    pub const fn initial_generation() -> AccountGeneration {
+        AccountGeneration(0)
+    }
+
+    #[must_use]
+    pub fn new(account: Arc<dyn Account>, generation: crate::types::AccountGeneration) -> Self {
         Self {
             account,
             generation,
         }
     }
 
+    /// Identity to install on the next replacement connection.
+    #[must_use]
+    pub fn replacement_generation(&self) -> AccountGeneration {
+        self.generation.successor()
+    }
+
     /// The account generation this instance was installed under: zero at
     /// attach, one more at every committed reattach.
     #[must_use]
-    pub fn generation(&self) -> u64 {
+    pub fn generation(&self) -> AccountGeneration {
         self.generation
     }
 
@@ -346,10 +377,10 @@ pub(crate) struct AccountSlot {
     /// lifecycle streams select on it so they drop the old stream even when
     /// that stream never terminates itself. A wake signal only: a stale
     /// recovery request is judged against `current`, never against this.
-    pub account_generation_tx: watch::Sender<u64>,
+    pub account_generation_tx: watch::Sender<crate::types::AccountGeneration>,
     pub push_health_tx: watch::Sender<crate::push::health::PushHealth>,
-    pub push_topology_tx: watch::Sender<u64>,
-    pub push_retired_tx: watch::Sender<u64>,
+    pub push_topology_tx: watch::Sender<crate::engine::PushTopologyGeneration>,
+    pub push_retired_tx: watch::Sender<crate::types::AccountGeneration>,
     pub reopen_lock: Arc<tokio::sync::Mutex<()>>,
     pub capabilities: Arc<std::sync::RwLock<AccountCapabilities>>,
     pub multiplexer: MultiplexerHandle,

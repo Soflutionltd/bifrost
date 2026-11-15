@@ -587,7 +587,7 @@ async fn apply_batch_with_version<T: HttpTransport>(
                 response.updated(&email_id).map(|_| ())
             }
         };
-        results.push(classify_set_response(raw, id, operation, guarded));
+        results.push(classify_set_response(raw, id, operation));
     }
 
     Ok(Some(Batch {
@@ -1591,10 +1591,16 @@ mod tests {
     #[test]
     fn an_unanswered_set_id_is_a_reconcilable_partial_response() {
         let outcome = classify_set_response(
-            Err(crate::Error::SetIdUnanswered("m1".to_string())),
+            Err(crate::Error::IdUnanswered {
+                id: "m1".into(),
+                context: crate::core::answer::AnswerContext {
+                    method: "Email/set",
+                    guarded: false,
+                    write: true,
+                },
+            }),
             ObjectId("m1".to_string()),
             AccountOperation::BulkDestroy,
-            false,
         );
 
         let ItemOutcome::Failed(failure) = outcome else {

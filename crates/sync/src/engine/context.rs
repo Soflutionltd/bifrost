@@ -33,9 +33,9 @@ pub(super) struct SlotContext {
     pub boundary_tx: watch::Sender<crate::cancel::BoundaryRequest>,
     pub capabilities: Arc<std::sync::RwLock<AccountCapabilities>>,
     pub subscriptions: Arc<SubscriptionRegistry>,
-    pub account_generation_tx: watch::Sender<u64>,
-    pub push_retired: watch::Sender<u64>,
-    pub push_topology: watch::Sender<u64>,
+    pub account_generation_tx: watch::Sender<crate::types::AccountGeneration>,
+    pub push_retired: watch::Sender<crate::types::AccountGeneration>,
+    pub push_topology: watch::Sender<crate::engine::PushTopologyGeneration>,
     pub push_drain_wait: Duration,
     pub reopen_lock: Arc<AsyncMutex<()>>,
     /// Slot-lifetime open-skip lane; a successful reattach replaces it
@@ -87,7 +87,7 @@ impl SlotContext {
         &self,
         scope: Option<CursorScope>,
         error: AccountError,
-        expected_generation: Option<u64>,
+        expected_generation: Option<crate::types::AccountGeneration>,
     ) {
         let writer = self.writer();
         let mut recovery = self.recovery(&writer);

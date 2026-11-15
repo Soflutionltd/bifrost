@@ -17,11 +17,6 @@ impl ImapConnection {
         items: &[FetchAttr],
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.validate_requested_fetch_items(items)?;
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         self.fetch_impl(
             Command::Fetch {
                 sequence_set: sequence_set.clone(),
@@ -47,11 +42,6 @@ impl ImapConnection {
         mod_seq: u64,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.validate_requested_fetch_items(items)?;
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         self.fetch_impl(
             Command::Fetch {
                 sequence_set: sequence_set.clone(),
@@ -99,16 +89,13 @@ impl ImapConnection {
         ),
         Error,
     > {
-        self.validate_requested_fetch_items(items)?;
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
         let cmd = Command::Fetch {
             sequence_set: sequence_set.clone(),
             items: format_fetch_attrs(items),
             changed_since: None,
         };
+        self.admit_command(&cmd)?;
         let fut = self.fetch_stream_bounded_impl(cmd, tx, timeout);
         Ok((rx, fut))
     }
@@ -246,7 +233,6 @@ impl ImapConnection {
         cmd: Command,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.require_state(cmd.kind())?;
         // RFC 6855 Section 6: SEARCH RETURN (SAVE) remains part of the SEARCH
         // command family and must be rejected until UTF8=ACCEPT is enabled.
         self.check_utf8_only_enforced()?;
@@ -274,10 +260,6 @@ impl ImapConnection {
         unchanged_since: Option<u64>,
         timeout: Duration,
     ) -> Result<StoreResult, Error> {
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         // RFC 3501 Section 2.3.2 / Section 9: \Recent is server-only and \*
         // is not valid in STORE flag lists. Filter them out before encoding,
         // consistent with append() (RFC 3501 Section 6.3.11).
@@ -309,10 +291,6 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<CopyResult, Error> {
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         let mbox = mailbox.mailbox_name()?;
         self.copy_impl(
             Command::Copy {
@@ -342,19 +320,9 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<MoveResult, Error> {
-        self.require_state(crate::types::CommandKind::Move)?;
         self.check_utf8_only_enforced()?;
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         // MOVE is a base feature in IMAP4rev2 (RFC 9051 Appendix E item 2).
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Move) {
-                return Err(Error::MissingCapability("MOVE".into()));
-            }
-        }
+
         let mbox = mailbox.mailbox_name()?;
         self.move_native_impl(
             Command::Move {

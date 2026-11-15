@@ -155,7 +155,7 @@ const COMPACTION_THRESHOLD: usize = 512;
 ///   for something that never was. That is precisely the silent-loss shape this
 ///   module exists to prevent, so a bounded-but-lying answer is worse than no
 ///   answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DischargeAudit {
     /// How many entries were folded away for this scope.
@@ -171,7 +171,17 @@ pub struct DischargeAudit {
     pub root: [u8; 32],
     /// The newest generation folded away, so an audit can bound when the
     /// compacted history stops.
-    pub latest_generation: u64,
+    pub latest_generation: crate::cursor::WalkGeneration,
+}
+
+impl Default for DischargeAudit {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            root: [0; 32],
+            latest_generation: super::PendingCoverage::initial_generation(),
+        }
+    }
 }
 
 impl DischargeAudit {
@@ -181,7 +191,12 @@ impl DischargeAudit {
     /// compare it against the one the ledger carries. The fingerprint is the
     /// stable part of the contract: key, generation, and which KIND of evidence
     /// closed it.
-    pub fn fold(&mut self, key: &ObligationKey, generation: u64, evidence: &DischargeEvidence) {
+    pub fn fold(
+        &mut self,
+        key: &ObligationKey,
+        generation: crate::cursor::WalkGeneration,
+        evidence: &DischargeEvidence,
+    ) {
         self.count = self.count.saturating_add(1);
         self.root = add_wrapping_256(self.root, discharge_fingerprint(key, generation, evidence));
         self.latest_generation = self.latest_generation.max(generation);
@@ -219,7 +234,7 @@ fn add_wrapping_256(accumulator: [u8; 32], addend: [u8; 32]) -> [u8; 32] {
 #[must_use]
 pub fn discharge_fingerprint(
     key: &ObligationKey,
-    generation: u64,
+    generation: crate::cursor::WalkGeneration,
     evidence: &DischargeEvidence,
 ) -> [u8; 32] {
     use sha2::Digest;
@@ -360,7 +375,7 @@ pub struct LedgerEntry {
     pub domain: CoverageDomain,
     /// Engine-issued walk generation that raised it. Orders proof events; does
     /// not itself prove coverage.
-    pub generation: u64,
+    pub generation: crate::cursor::WalkGeneration,
     pub proof: ProofStatus,
     pub policy: PolicyStatus,
     /// The account-minted material a repair pass needs to address this.
@@ -419,7 +434,7 @@ impl LedgerEntry {
 pub struct BarrierIncident {
     pub key: ObligationKey,
     pub domain: CoverageDomain,
-    pub generation: u64,
+    pub generation: crate::cursor::WalkGeneration,
     pub failure_label: String,
     pub evidence: AccountError,
     pub policy: PolicyStatus,
@@ -439,7 +454,7 @@ pub struct DebtLedger {
     /// Domains proved complete, with the generation that proved them. Retained
     /// because coverage discharges by UNION: repartitioning can leave old debt
     /// covered by two later windows and by neither alone.
-    proved: Vec<(u64, CoverageDomain)>,
+    proved: Vec<(crate::cursor::WalkGeneration, CoverageDomain)>,
     /// Terminal history that no longer has an entry, per scope.
     ///
     /// A `Vec` with a linear lookup rather than a map, because `CursorScope` is
@@ -484,7 +499,7 @@ impl DebtLedger {
     pub(crate) fn from_parts(
         entries: BTreeMap<ObligationKey, LedgerEntry>,
         barriers: BTreeMap<ObligationKey, BarrierIncident>,
-        proved: Vec<(u64, CoverageDomain)>,
+        proved: Vec<(crate::cursor::WalkGeneration, CoverageDomain)>,
         compacted: Vec<(CursorScope, DischargeAudit)>,
         lineages: BTreeMap<ObligationKey, LineageBudget>,
     ) -> Self {
@@ -577,7 +592,7 @@ impl DebtLedger {
     /// engine-internal consequence of `record_proof`, not a query. The codec
     /// needs it because a restart that forgets a retained proof re-opens debt
     /// a later partial walk can no longer discharge by union.
-    pub(crate) fn proved(&self) -> &[(u64, CoverageDomain)] {
+    pub(crate) fn proved(&self) -> &[(crate::cursor::WalkGeneration, CoverageDomain)] {
         &self.proved
     }
 
@@ -660,7 +675,7 @@ impl DebtLedger {
     pub fn cross_waived_barriers(
         &mut self,
         report: &InventoryCoverageReport,
-        generation: u64,
+        generation: crate::cursor::WalkGeneration,
         now: i64,
     ) -> bool {
         let barriers: Vec<_> = report
@@ -722,7 +737,12 @@ impl DebtLedger {
     /// never persisted, so it cannot be allowed to prove anything.
     ///
     /// The single exhaustive ingestion path. Nothing else mutates entries.
-    pub fn ingest(&mut self, report: &InventoryCoverageReport, generation: u64, now: i64) {
+    pub fn ingest(
+        &mut self,
+        report: &InventoryCoverageReport,
+        generation: crate::cursor::WalkGeneration,
+        now: i64,
+    ) {
         for obligation in report.obligations() {
             // A barrier never becomes ledger debt here. It is recorded as a
             // blocked-progress incident by the walk that hit it, and only
@@ -752,7 +772,7 @@ impl DebtLedger {
     pub fn ingest_debt_only(
         &mut self,
         report: &InventoryCoverageReport,
-        generation: u64,
+        generation: crate::cursor::WalkGeneration,
         now: i64,
     ) {
         for obligation in report.obligations() {
@@ -935,7 +955,7 @@ impl DebtLedger {
         &mut self,
         obligation: &InventoryObligation,
         domain: &CoverageDomain,
-        generation: u64,
+        generation: crate::cursor::WalkGeneration,
         now: i64,
     ) {
         let key = obligation.key().clone();
@@ -986,7 +1006,7 @@ impl DebtLedger {
     }
 
     /// Record a domain proved complete, and discharge whatever it covers.
-    fn record_proof(&mut self, domain: CoverageDomain, generation: u64) {
+    fn record_proof(&mut self, domain: CoverageDomain, generation: crate::cursor::WalkGeneration) {
         self.proved.push((generation, domain));
         for entry in self.entries.values_mut() {
             if !entry.is_open() {
@@ -1141,7 +1161,7 @@ impl DebtLedger {
     pub fn discharge_repaired(
         &mut self,
         key: &ObligationKey,
-        generation: u64,
+        generation: crate::cursor::WalkGeneration,
         evidence: DischargeEvidence,
     ) -> bool {
         let Some(entry) = self.entries.get_mut(key) else {
@@ -1179,7 +1199,7 @@ impl DebtLedger {
         key: &ObligationKey,
         proved: &[CoverageDomain],
         children: &[InventoryObligation],
-        generation: u64,
+        generation: crate::cursor::WalkGeneration,
         now: i64,
     ) -> Result<ReplacementProgress, ReplacementRefusal> {
         let Some(parent) = self.entries.get(key).cloned() else {
@@ -1365,8 +1385,8 @@ fn domains_may_join(proof: &CoverageDomain, target: &CoverageDomain) -> bool {
 }
 
 fn proof_union_covers(
-    proofs: &[(u64, CoverageDomain)],
-    minimum_generation: u64,
+    proofs: &[(crate::cursor::WalkGeneration, CoverageDomain)],
+    minimum_generation: crate::cursor::WalkGeneration,
     target: &CoverageDomain,
 ) -> bool {
     if proofs
@@ -1519,7 +1539,7 @@ mod tests {
         let mut ledger = DebtLedger::new();
         ledger.ingest(
             &InventoryCoverageReport::degraded(CoverageDomain::full(scope()), vec![object("a")]),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             100,
         );
         assert!(!ledger.completion_permitted(&scope()));
@@ -1535,7 +1555,7 @@ mod tests {
         let mut ledger = DebtLedger::new();
         ledger.ingest(
             &InventoryCoverageReport::degraded(time_domain(30, 90), vec![object("a")]),
-            4,
+            crate::cursor::WalkGeneration::for_test(4),
             100,
         );
         ledger.ingest(
@@ -1543,7 +1563,7 @@ mod tests {
                 domain: time_domain(0, 180),
                 outcome: bifrost_types::CoverageOutcome::Complete,
             },
-            5,
+            crate::cursor::WalkGeneration::for_test(5),
             200,
         );
 
@@ -1561,7 +1581,7 @@ mod tests {
         let mut ledger = DebtLedger::new();
         ledger.ingest(
             &InventoryCoverageReport::degraded(time_domain(30, 90), vec![object("a")]),
-            4,
+            crate::cursor::WalkGeneration::for_test(4),
             100,
         );
         ledger.ingest(
@@ -1569,7 +1589,7 @@ mod tests {
                 domain: time_domain(7, 60),
                 outcome: bifrost_types::CoverageOutcome::Complete,
             },
-            5,
+            crate::cursor::WalkGeneration::for_test(5),
             200,
         );
 
@@ -1587,12 +1607,12 @@ mod tests {
         let mut ledger = DebtLedger::new();
         ledger.ingest(
             &InventoryCoverageReport::degraded(time_domain(30, 90), vec![object("a")]),
-            4,
+            crate::cursor::WalkGeneration::for_test(4),
             100,
         );
         ledger.ingest(
             &InventoryCoverageReport::complete(time_domain(7, 60)),
-            5,
+            crate::cursor::WalkGeneration::for_test(5),
             200,
         );
         assert!(
@@ -1604,7 +1624,7 @@ mod tests {
 
         ledger.ingest(
             &InventoryCoverageReport::complete(time_domain(60, 180)),
-            6,
+            crate::cursor::WalkGeneration::for_test(6),
             300,
         );
         assert!(matches!(
@@ -1622,7 +1642,7 @@ mod tests {
         let mut ledger = DebtLedger::new();
         ledger.ingest(
             &InventoryCoverageReport::degraded(CoverageDomain::full(scope()), vec![object("a")]),
-            9,
+            crate::cursor::WalkGeneration::for_test(9),
             100,
         );
         ledger.ingest(
@@ -1630,7 +1650,7 @@ mod tests {
                 domain: CoverageDomain::full(scope()),
                 outcome: bifrost_types::CoverageOutcome::Complete,
             },
-            3,
+            crate::cursor::WalkGeneration::for_test(3),
             200,
         );
         assert!(
@@ -1649,7 +1669,7 @@ mod tests {
         let mut ledger = DebtLedger::new();
         ledger.ingest(
             &InventoryCoverageReport::degraded(CoverageDomain::full(scope()), vec![object("a")]),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             100,
         );
         assert!(ledger.waive(&ObligationKey(b"a".to_vec()), "operator".into(), 500));
@@ -1672,9 +1692,9 @@ mod tests {
         let mut ledger = DebtLedger::new();
         let report =
             InventoryCoverageReport::degraded(CoverageDomain::full(scope()), vec![object("a")]);
-        ledger.ingest(&report, 1, 100);
+        ledger.ingest(&report, crate::cursor::WalkGeneration::for_test(1), 100);
         ledger.block(&ObligationKey(b"a".to_vec()));
-        ledger.ingest(&report, 2, 900);
+        ledger.ingest(&report, crate::cursor::WalkGeneration::for_test(2), 900);
 
         let entry = ledger.entry(&ObligationKey(b"a".to_vec())).expect("entry");
         assert_eq!(
@@ -1699,7 +1719,7 @@ mod tests {
         };
         ledger.ingest(
             &InventoryCoverageReport::degraded(CoverageDomain::full(scope()), vec![barrier]),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             100,
         );
         assert_eq!(
@@ -1711,7 +1731,7 @@ mod tests {
         ledger.record_barrier(BarrierIncident {
             key: ObligationKey(b"page-7".to_vec()),
             domain: CoverageDomain::full(scope()),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
             evidence: error(),
             policy: PolicyStatus::Retrying { attempts: 0 },
@@ -1744,7 +1764,7 @@ mod tests {
         ledger.record_barrier(BarrierIncident {
             key: key.clone(),
             domain: report.domain.clone(),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
             evidence: error(),
             policy: PolicyStatus::Retrying { attempts: 0 },
@@ -1752,9 +1772,13 @@ mod tests {
         });
         assert!(ledger.waive(&key, "operator".into(), 500));
 
-        assert!(ledger.cross_waived_barriers(&report, 2, 600));
+        assert!(ledger.cross_waived_barriers(
+            &report,
+            crate::cursor::WalkGeneration::for_test(2),
+            600
+        ));
         assert!(
-            ledger.cross_waived_barriers(&report, 2, 600),
+            ledger.cross_waived_barriers(&report, crate::cursor::WalkGeneration::for_test(2), 600),
             "a cumulative Done report must not recreate the barrier crossed by its batch"
         );
         assert!(
@@ -1773,7 +1797,7 @@ mod tests {
         ledger.record_barrier(BarrierIncident {
             key: key.clone(),
             domain: CoverageDomain::full(scope()),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
             evidence: error(),
             policy: PolicyStatus::Retrying { attempts: 0 },
@@ -1800,7 +1824,7 @@ mod tests {
         ledger.record_barrier(BarrierIncident {
             key: key.clone(),
             domain: CoverageDomain::full(scope()),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
             evidence: error(),
             policy: PolicyStatus::Retrying { attempts: 0 },
@@ -1845,7 +1869,11 @@ mod tests {
         )
     }
 
-    fn ingest_one(ledger: &mut DebtLedger, obligation: InventoryObligation, generation: u64) {
+    fn ingest_one(
+        ledger: &mut DebtLedger,
+        obligation: InventoryObligation,
+        generation: crate::cursor::WalkGeneration,
+    ) {
         ledger.ingest(
             &InventoryCoverageReport::degraded(CoverageDomain::full(scope()), vec![obligation]),
             generation,
@@ -1858,9 +1886,21 @@ mod tests {
     #[test]
     fn only_obligations_with_a_repair_descriptor_are_repairable() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, object("a"), 1);
-        ingest_one(&mut ledger, replayable("r"), 1);
-        ingest_one(&mut ledger, region("b", RegionRecovery::barrier()), 1);
+        ingest_one(
+            &mut ledger,
+            object("a"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
+        ingest_one(
+            &mut ledger,
+            replayable("r"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
+        ingest_one(
+            &mut ledger,
+            region("b", RegionRecovery::barrier()),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         assert_eq!(ledger.repairable().count(), 2);
     }
 
@@ -1868,8 +1908,16 @@ mod tests {
     #[test]
     fn waived_and_blocked_obligations_are_not_repairable() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, object("a"), 1);
-        ingest_one(&mut ledger, object("b"), 1);
+        ingest_one(
+            &mut ledger,
+            object("a"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
+        ingest_one(
+            &mut ledger,
+            object("b"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         ledger.waive(&ObligationKey(b"a".to_vec()), "operator".into(), 1);
         ledger.block(&ObligationKey(b"b".to_vec()));
         assert_eq!(ledger.repairable().count(), 0);
@@ -1881,7 +1929,11 @@ mod tests {
     #[test]
     fn an_expired_budget_blocks_rather_than_abandons() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, object("a"), 1);
+        ingest_one(
+            &mut ledger,
+            object("a"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let key = ObligationKey(b"a".to_vec());
 
         assert!(!ledger.record_attempt(&key, 3));
@@ -1909,12 +1961,22 @@ mod tests {
     #[test]
     fn attempts_accrue_at_the_lineage_root() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("parent"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("parent"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let parent = ObligationKey(b"parent".to_vec());
         ledger.record_attempt(&parent, 10);
 
         ledger
-            .replace_obligation(&parent, &[], &[replayable("child")], 1, 200)
+            .replace_obligation(
+                &parent,
+                &[],
+                &[replayable("child")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
         let child = ObligationKey(b"child".to_vec());
         assert_eq!(ledger.lineage_root(&child), parent);
@@ -1940,10 +2002,20 @@ mod tests {
     #[test]
     fn an_expired_lineage_stops_repairing_its_open_members() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("parent"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("parent"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let parent = ObligationKey(b"parent".to_vec());
         ledger
-            .replace_obligation(&parent, &[], &[replayable("a"), replayable("b")], 1, 200)
+            .replace_obligation(
+                &parent,
+                &[],
+                &[replayable("a"), replayable("b")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
         let a = ObligationKey(b"a".to_vec());
         let b = ObligationKey(b"b".to_vec());
@@ -1969,23 +2041,37 @@ mod tests {
     #[test]
     fn a_member_reopened_into_a_spent_lineage_comes_back_blocked() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("parent"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("parent"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let parent = ObligationKey(b"parent".to_vec());
         ledger
-            .replace_obligation(&parent, &[], &[replayable("a"), replayable("b")], 1, 200)
+            .replace_obligation(
+                &parent,
+                &[],
+                &[replayable("a"), replayable("b")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
         let a = ObligationKey(b"a".to_vec());
         let b = ObligationKey(b"b".to_vec());
         assert!(ledger.discharge_repaired(
             &b,
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             DischargeEvidence::ProvedIrrelevant {
                 detail: "covered".into(),
             },
         ));
         assert!(ledger.record_attempt(&a, 1));
 
-        ingest_one(&mut ledger, replayable("b"), 2);
+        ingest_one(
+            &mut ledger,
+            replayable("b"),
+            crate::cursor::WalkGeneration::for_test(2),
+        );
         assert_eq!(
             ledger.entry(&b).expect("reopened").policy,
             PolicyStatus::OperatorBlocked
@@ -2001,10 +2087,20 @@ mod tests {
     #[test]
     fn expiry_leaves_a_waived_member_waived() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("parent"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("parent"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let parent = ObligationKey(b"parent".to_vec());
         ledger
-            .replace_obligation(&parent, &[], &[replayable("a"), replayable("b")], 1, 200)
+            .replace_obligation(
+                &parent,
+                &[],
+                &[replayable("a"), replayable("b")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
         let a = ObligationKey(b"a".to_vec());
         let b = ObligationKey(b"b".to_vec());
@@ -2024,12 +2120,22 @@ mod tests {
     #[test]
     fn a_replacement_against_an_operator_decision_is_refused() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("parent"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("parent"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let parent = ObligationKey(b"parent".to_vec());
         assert!(ledger.block(&parent));
 
         assert_eq!(
-            ledger.replace_obligation(&parent, &[], &[replayable("child")], 1, 200),
+            ledger.replace_obligation(
+                &parent,
+                &[],
+                &[replayable("child")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200
+            ),
             Err(ReplacementRefusal::PolicyNoLongerRetrying)
         );
         let entry = ledger.entry(&parent).expect("parent");
@@ -2043,23 +2149,51 @@ mod tests {
     #[test]
     fn a_child_reusing_a_lineage_key_is_refused() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("root"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("root"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let root = ObligationKey(b"root".to_vec());
         assert_eq!(
-            ledger.replace_obligation(&root, &[], &[replayable("root")], 1, 200),
+            ledger.replace_obligation(
+                &root,
+                &[],
+                &[replayable("root")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200
+            ),
             Err(ReplacementRefusal::ChildReusesLineageKey)
         );
 
         ledger
-            .replace_obligation(&root, &[], &[replayable("a")], 1, 200)
+            .replace_obligation(
+                &root,
+                &[],
+                &[replayable("a")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
         let a = ObligationKey(b"a".to_vec());
         assert_eq!(
-            ledger.replace_obligation(&a, &[], &[replayable("a")], 1, 200),
+            ledger.replace_obligation(
+                &a,
+                &[],
+                &[replayable("a")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200
+            ),
             Err(ReplacementRefusal::ChildReusesLineageKey)
         );
         assert_eq!(
-            ledger.replace_obligation(&a, &[], &[replayable("root")], 1, 200),
+            ledger.replace_obligation(
+                &a,
+                &[],
+                &[replayable("root")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200
+            ),
             Err(ReplacementRefusal::ChildReusesLineageKey)
         );
         assert!(ledger.entry(&a).expect("a").is_open());
@@ -2071,14 +2205,22 @@ mod tests {
     #[test]
     fn a_child_naming_another_live_lineage_is_refused() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("x"), 1);
-        ingest_one(&mut ledger, replayable("r"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("x"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
+        ingest_one(
+            &mut ledger,
+            replayable("r"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         ledger
             .replace_obligation(
                 &ObligationKey(b"x".to_vec()),
                 &[],
                 &[replayable("y")],
-                1,
+                crate::cursor::WalkGeneration::for_test(1),
                 200,
             )
             .expect("replacement accepted");
@@ -2088,7 +2230,7 @@ mod tests {
                 &ObligationKey(b"r".to_vec()),
                 &[],
                 &[replayable("x")],
-                1,
+                crate::cursor::WalkGeneration::for_test(1),
                 200,
             ),
             Err(ReplacementRefusal::ChildCollidesWithForeignLineage)
@@ -2102,15 +2244,29 @@ mod tests {
     #[test]
     fn a_compacted_root_re_raised_under_a_live_lineage_rejoins_it() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("root"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("root"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let root = ObligationKey(b"root".to_vec());
         ledger
-            .replace_obligation(&root, &[], &[replayable("child")], 1, 200)
+            .replace_obligation(
+                &root,
+                &[],
+                &[replayable("child")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
         assert!(ledger.record_attempt(&ObligationKey(b"child".to_vec()), 1));
         assert_eq!(ledger.compact_discharged(), 1, "the root folds");
 
-        ingest_one(&mut ledger, replayable("root"), 2);
+        ingest_one(
+            &mut ledger,
+            replayable("root"),
+            crate::cursor::WalkGeneration::for_test(2),
+        );
         assert_eq!(
             ledger.entry(&root).expect("re-raised").policy,
             PolicyStatus::OperatorBlocked,
@@ -2124,14 +2280,22 @@ mod tests {
     #[test]
     fn a_child_naming_a_discharged_foreign_entry_is_refused() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("x"), 1);
-        ingest_one(&mut ledger, replayable("r"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("x"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
+        ingest_one(
+            &mut ledger,
+            replayable("r"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         ledger
             .replace_obligation(
                 &ObligationKey(b"x".to_vec()),
                 &[],
                 &[replayable("w")],
-                1,
+                crate::cursor::WalkGeneration::for_test(1),
                 200,
             )
             .expect("replacement accepted");
@@ -2139,7 +2303,7 @@ mod tests {
         assert!(ledger.waive(&w, "op".into(), 500));
         assert!(ledger.discharge_repaired(
             &w,
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             DischargeEvidence::ProvedIrrelevant {
                 detail: "covered".into(),
             },
@@ -2150,7 +2314,7 @@ mod tests {
                 &ObligationKey(b"r".to_vec()),
                 &[],
                 &[replayable("w")],
-                1,
+                crate::cursor::WalkGeneration::for_test(1),
                 200,
             ),
             Err(ReplacementRefusal::ChildCollidesWithForeignLineage)
@@ -2163,11 +2327,21 @@ mod tests {
     #[test]
     fn replacement_closes_the_parent() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("parent"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("parent"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let parent = ObligationKey(b"parent".to_vec());
 
         ledger
-            .replace_obligation(&parent, &[], &[object("child")], 1, 200)
+            .replace_obligation(
+                &parent,
+                &[],
+                &[object("child")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
 
         assert!(!ledger.entry(&parent).expect("parent retained").is_open());
@@ -2186,13 +2360,17 @@ mod tests {
     #[test]
     fn a_region_becoming_objects_counts_as_progress() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("parent"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("parent"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let progress = ledger
             .replace_obligation(
                 &ObligationKey(b"parent".to_vec()),
                 &[],
                 &[object("c1"), object("c2")],
-                1,
+                crate::cursor::WalkGeneration::for_test(1),
                 200,
             )
             .expect("replacement accepted");
@@ -2205,13 +2383,17 @@ mod tests {
     #[test]
     fn repartitioning_into_equally_opaque_regions_is_a_stall() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("parent"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("parent"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let progress = ledger
             .replace_obligation(
                 &ObligationKey(b"parent".to_vec()),
                 &[],
                 &[replayable("r1"), replayable("r2")],
-                1,
+                crate::cursor::WalkGeneration::for_test(1),
                 200,
             )
             .expect("replacement accepted");
@@ -2224,13 +2406,21 @@ mod tests {
     #[test]
     fn a_stale_repair_result_cannot_discharge_a_reopened_obligation() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, object("a"), 1);
+        ingest_one(
+            &mut ledger,
+            object("a"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         // Rediscovered by a later walk: the obligation moves to generation 5.
-        ingest_one(&mut ledger, object("a"), 5);
+        ingest_one(
+            &mut ledger,
+            object("a"),
+            crate::cursor::WalkGeneration::for_test(5),
+        );
 
         let discharged = ledger.discharge_repaired(
             &ObligationKey(b"a".to_vec()),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             DischargeEvidence::RepairedAndPublished {
                 attempt: bifrost_types::RepairAttemptId(1),
             },
@@ -2253,14 +2443,22 @@ mod tests {
     #[test]
     fn a_child_colliding_with_a_foreign_lineage_is_refused() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("parent-a"), 1);
-        ingest_one(&mut ledger, replayable("parent-b"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("parent-a"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
+        ingest_one(
+            &mut ledger,
+            replayable("parent-b"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
 
         let refusal = ledger.replace_obligation(
             &ObligationKey(b"parent-a".to_vec()),
             &[],
             &[replayable("parent-b")],
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             200,
         );
         assert_eq!(
@@ -2276,13 +2474,25 @@ mod tests {
     #[test]
     fn compaction_folds_the_proved_side_and_leaves_every_waived_entry_whole() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, object("proved"), 1);
-        ingest_one(&mut ledger, object("waived"), 1);
-        ingest_one(&mut ledger, object("owed"), 1);
+        ingest_one(
+            &mut ledger,
+            object("proved"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
+        ingest_one(
+            &mut ledger,
+            object("waived"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
+        ingest_one(
+            &mut ledger,
+            object("owed"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         assert!(ledger.waive(&ObligationKey(b"waived".to_vec()), "op".into(), 500));
         assert!(ledger.discharge_repaired(
             &ObligationKey(b"proved".to_vec()),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             DischargeEvidence::RepairedAndPublished {
                 attempt: bifrost_types::RepairAttemptId(7),
             },
@@ -2311,7 +2521,10 @@ mod tests {
 
         let audit = ledger.discharge_audit(&scope()).expect("audit recorded");
         assert_eq!(audit.count, 1);
-        assert_eq!(audit.latest_generation, 1);
+        assert_eq!(
+            audit.latest_generation,
+            crate::cursor::WalkGeneration::for_test(1)
+        );
     }
 
     /// PRESERVATION CHECK, not a demonstration of a defect: replace
@@ -2325,7 +2538,7 @@ mod tests {
         let mut ledger = DebtLedger::new();
         ledger.ingest(
             &InventoryCoverageReport::degraded(time_domain(30, 90), vec![object("w")]),
-            4,
+            crate::cursor::WalkGeneration::for_test(4),
             100,
         );
         assert!(ledger.waive(&ObligationKey(b"w".to_vec()), "op".into(), 500));
@@ -2333,7 +2546,7 @@ mod tests {
 
         ledger.ingest(
             &InventoryCoverageReport::complete(time_domain(0, 180)),
-            5,
+            crate::cursor::WalkGeneration::for_test(5),
             200,
         );
         assert!(matches!(
@@ -2355,12 +2568,22 @@ mod tests {
     #[test]
     fn a_discharged_lineage_root_folds_while_its_child_keeps_the_budget() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("parent"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("parent"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let parent = ObligationKey(b"parent".to_vec());
         let child = ObligationKey(b"child".to_vec());
         ledger.record_attempt(&parent, 2);
         ledger
-            .replace_obligation(&parent, &[], &[replayable("child")], 1, 200)
+            .replace_obligation(
+                &parent,
+                &[],
+                &[replayable("child")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
 
         assert_eq!(ledger.compact_discharged(), 1, "the root folds");
@@ -2381,19 +2604,23 @@ mod tests {
     #[test]
     fn a_lineage_folds_entirely_once_no_open_entry_names_the_root() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("parent"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("parent"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         ledger
             .replace_obligation(
                 &ObligationKey(b"parent".to_vec()),
                 &[],
                 &[replayable("child")],
-                1,
+                crate::cursor::WalkGeneration::for_test(1),
                 200,
             )
             .expect("replacement accepted");
         assert!(ledger.discharge_repaired(
             &ObligationKey(b"child".to_vec()),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             DischargeEvidence::ProvedIrrelevant {
                 detail: "not owed".into(),
             },
@@ -2412,24 +2639,56 @@ mod tests {
     #[test]
     fn audit_fold_is_order_independent_and_distinguishes_sample_histories() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, object("a"), 3);
-        ingest_one(&mut ledger, object("b"), 3);
+        ingest_one(
+            &mut ledger,
+            object("a"),
+            crate::cursor::WalkGeneration::for_test(3),
+        );
+        ingest_one(
+            &mut ledger,
+            object("b"),
+            crate::cursor::WalkGeneration::for_test(3),
+        );
         let evidence = || DischargeEvidence::ProvedIrrelevant {
             detail: "not owed".into(),
         };
-        assert!(ledger.discharge_repaired(&ObligationKey(b"a".to_vec()), 3, evidence()));
-        assert!(ledger.discharge_repaired(&ObligationKey(b"b".to_vec()), 3, evidence()));
+        assert!(ledger.discharge_repaired(
+            &ObligationKey(b"a".to_vec()),
+            crate::cursor::WalkGeneration::for_test(3),
+            evidence()
+        ));
+        assert!(ledger.discharge_repaired(
+            &ObligationKey(b"b".to_vec()),
+            crate::cursor::WalkGeneration::for_test(3),
+            evidence()
+        ));
         assert_eq!(ledger.compact_discharged(), 2);
         let audit = *ledger.discharge_audit(&scope()).expect("audit");
 
         let mut rebuilt = super::DischargeAudit::default();
-        rebuilt.fold(&ObligationKey(b"b".to_vec()), 3, &evidence());
-        rebuilt.fold(&ObligationKey(b"a".to_vec()), 3, &evidence());
+        rebuilt.fold(
+            &ObligationKey(b"b".to_vec()),
+            crate::cursor::WalkGeneration::for_test(3),
+            &evidence(),
+        );
+        rebuilt.fold(
+            &ObligationKey(b"a".to_vec()),
+            crate::cursor::WalkGeneration::for_test(3),
+            &evidence(),
+        );
         assert_eq!(rebuilt, audit, "the fold is order-independent");
 
         let mut wrong = super::DischargeAudit::default();
-        wrong.fold(&ObligationKey(b"a".to_vec()), 3, &evidence());
-        wrong.fold(&ObligationKey(b"c".to_vec()), 3, &evidence());
+        wrong.fold(
+            &ObligationKey(b"a".to_vec()),
+            crate::cursor::WalkGeneration::for_test(3),
+            &evidence(),
+        );
+        wrong.fold(
+            &ObligationKey(b"c".to_vec()),
+            crate::cursor::WalkGeneration::for_test(3),
+            &evidence(),
+        );
         assert_eq!(wrong.count, audit.count, "same size, different history");
         assert_ne!(wrong.root, audit.root, "the root must see the difference");
     }
@@ -2443,9 +2702,17 @@ mod tests {
             detail: "not owed".into(),
         };
         let mut audit = super::DischargeAudit::default();
-        audit.fold(&ObligationKey(b"a".to_vec()), 3, &evidence);
+        audit.fold(
+            &ObligationKey(b"a".to_vec()),
+            crate::cursor::WalkGeneration::for_test(3),
+            &evidence,
+        );
         let once = audit.root;
-        audit.fold(&ObligationKey(b"a".to_vec()), 3, &evidence);
+        audit.fold(
+            &ObligationKey(b"a".to_vec()),
+            crate::cursor::WalkGeneration::for_test(3),
+            &evidence,
+        );
         assert_eq!(audit.count, 2);
         assert_ne!(audit.root, once);
         assert_ne!(
@@ -2467,8 +2734,16 @@ mod tests {
         };
         let fold = |left: &[u8], right: &[u8]| {
             let mut audit = super::DischargeAudit::default();
-            audit.fold(&ObligationKey(left.to_vec()), 3, &evidence());
-            audit.fold(&ObligationKey(right.to_vec()), 3, &evidence());
+            audit.fold(
+                &ObligationKey(left.to_vec()),
+                crate::cursor::WalkGeneration::for_test(3),
+                &evidence(),
+            );
+            audit.fold(
+                &ObligationKey(right.to_vec()),
+                crate::cursor::WalkGeneration::for_test(3),
+                &evidence(),
+            );
             audit
         };
         let one = fold(b"00", b"05");
@@ -2486,7 +2761,7 @@ mod tests {
         super::LedgerEntry {
             key: ObligationKey(key.as_bytes().to_vec()),
             domain: CoverageDomain::full(scope()),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
             proof: if discharged {
                 ProofStatus::Discharged {
                     evidence: DischargeEvidence::ReplacedByChildren {
@@ -2611,15 +2886,25 @@ mod tests {
     #[test]
     fn a_result_for_a_key_discharged_in_flight_charges_nothing() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("root"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("root"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let root = ObligationKey(b"root".to_vec());
         ledger
-            .replace_obligation(&root, &[], &[replayable("a"), replayable("b")], 1, 200)
+            .replace_obligation(
+                &root,
+                &[],
+                &[replayable("a"), replayable("b")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
         let a = ObligationKey(b"a".to_vec());
         assert!(ledger.discharge_repaired(
             &a,
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             DischargeEvidence::ProvedIrrelevant {
                 detail: "covered".into(),
             },
@@ -2645,22 +2930,40 @@ mod tests {
     #[test]
     fn a_lineage_budget_lives_while_a_member_is_retained() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("root"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("root"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let root = ObligationKey(b"root".to_vec());
         ledger
-            .replace_obligation(&root, &[], &[replayable("a"), replayable("b")], 1, 200)
+            .replace_obligation(
+                &root,
+                &[],
+                &[replayable("a"), replayable("b")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
         ledger.record_attempt(&ObligationKey(b"a".to_vec()), 10);
         let irrelevant = || DischargeEvidence::ProvedIrrelevant {
             detail: "covered".into(),
         };
-        assert!(ledger.discharge_repaired(&ObligationKey(b"a".to_vec()), 1, irrelevant()));
+        assert!(ledger.discharge_repaired(
+            &ObligationKey(b"a".to_vec()),
+            crate::cursor::WalkGeneration::for_test(1),
+            irrelevant()
+        ));
         assert!(
             ledger.lineages().contains_key(&root),
             "`b` is still open, so the budget stays"
         );
 
-        assert!(ledger.discharge_repaired(&ObligationKey(b"b".to_vec()), 1, irrelevant()));
+        assert!(ledger.discharge_repaired(
+            &ObligationKey(b"b".to_vec()),
+            crate::cursor::WalkGeneration::for_test(1),
+            irrelevant()
+        ));
         assert!(
             ledger.lineages().contains_key(&root),
             "every member is discharged but retained, so the budget stays"
@@ -2680,7 +2983,7 @@ mod tests {
         let mut ledger = DebtLedger::new();
         ledger.ingest(
             &InventoryCoverageReport::degraded(time_domain(30, 90), vec![object("a")]),
-            4,
+            crate::cursor::WalkGeneration::for_test(4),
             100,
         );
         let a = ObligationKey(b"a".to_vec());
@@ -2689,14 +2992,14 @@ mod tests {
 
         ledger.ingest(
             &InventoryCoverageReport::complete(time_domain(0, 180)),
-            5,
+            crate::cursor::WalkGeneration::for_test(5),
             200,
         );
         assert!(!ledger.entry(&a).expect("retained").is_open());
 
         ledger.ingest(
             &InventoryCoverageReport::degraded(time_domain(30, 90), vec![object("a")]),
-            6,
+            crate::cursor::WalkGeneration::for_test(6),
             300,
         );
         assert_eq!(
@@ -2715,21 +3018,35 @@ mod tests {
     #[test]
     fn a_rediscovered_key_does_not_inherit_its_folded_lineage() {
         let mut ledger = DebtLedger::new();
-        ingest_one(&mut ledger, replayable("root"), 1);
+        ingest_one(
+            &mut ledger,
+            replayable("root"),
+            crate::cursor::WalkGeneration::for_test(1),
+        );
         let root = ObligationKey(b"root".to_vec());
         ledger
-            .replace_obligation(&root, &[], &[replayable("a"), replayable("b")], 1, 200)
+            .replace_obligation(
+                &root,
+                &[],
+                &[replayable("a"), replayable("b")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
         assert!(ledger.discharge_repaired(
             &ObligationKey(b"a".to_vec()),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             DischargeEvidence::ProvedIrrelevant {
                 detail: "covered".into(),
             },
         ));
         assert_eq!(ledger.compact_discharged(), 2, "root and `a` fold");
 
-        ingest_one(&mut ledger, replayable("a"), 9);
+        ingest_one(
+            &mut ledger,
+            replayable("a"),
+            crate::cursor::WalkGeneration::for_test(9),
+        );
         let raised = ObligationKey(b"a".to_vec());
         assert_eq!(
             ledger.lineage_root(&raised),
@@ -2759,7 +3076,7 @@ mod tests {
             .collect();
         ledger.ingest(
             &InventoryCoverageReport::degraded(time_domain(30, 90), obligations),
-            4,
+            crate::cursor::WalkGeneration::for_test(4),
             100,
         );
         assert_eq!(ledger.entries().count(), super::COMPACTION_THRESHOLD);
@@ -2770,7 +3087,7 @@ mod tests {
 
         ledger.ingest(
             &InventoryCoverageReport::complete(time_domain(0, 180)),
-            5,
+            crate::cursor::WalkGeneration::for_test(5),
             200,
         );
         assert_eq!(
@@ -2793,7 +3110,7 @@ mod tests {
         let incident = || BarrierIncident {
             key: ObligationKey(b"page-7".to_vec()),
             domain: CoverageDomain::full(scope()),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
             evidence: error(),
             policy: PolicyStatus::Retrying { attempts: 0 },

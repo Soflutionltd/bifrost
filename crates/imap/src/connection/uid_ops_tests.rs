@@ -96,7 +96,7 @@ async fn uid_fetch_vanished_requires_qresync_enabled() {
     assert!(matches!(
         conn.uid_fetch_vanished(&set("1:5"), &[FetchAttr::Uid], 10, T)
             .await,
-        Err(Error::MissingCapability(_))
+        Err(Error::InvalidState(_))
     ));
     let enabled = detached(
         SessionState::Selected,
@@ -259,14 +259,16 @@ async fn thread_requires_the_matching_algorithm_capability() {
         Err(Error::DriverGone { .. })
     ));
     match conn.uid_thread("ORDEREDSUBJECT", "UTF-8", "ALL", T).await {
-        Err(Error::MissingCapability(msg)) => assert_eq!(msg, "THREAD=ORDEREDSUBJECT"),
+        Err(Error::MissingCapability(msg)) => {
+            assert_eq!(msg.capability, Capability::Thread("ORDEREDSUBJECT".into()));
+        }
         other => panic!("expected MissingCapability, got {other:?}"),
     }
 }
 
 #[test]
 fn sort_and_thread_inherit_the_search_criteria_gates() {
-    use crate::codec::encode::{EncodeOptions, LiteralMode, encode_command};
+    use crate::codec::encode::{EncodeOptions, LiteralMode};
     use crate::types::Command;
 
     let opts = EncodeOptions {
@@ -279,7 +281,7 @@ fn sort_and_thread_inherit_the_search_criteria_gates() {
         ],
         enabled: Vec::new(),
     };
-    // The criteria gate runs at encoding, where queued commands see the
+    // The criteria gate runs at admission, where queued commands see the
     // capability snapshot that is current when they reach the wire.
     for command in [
         Command::Sort {
@@ -294,7 +296,7 @@ fn sort_and_thread_inherit_the_search_criteria_gates() {
         },
     ] {
         assert!(matches!(
-            encode_command("A001", &command, &opts),
+            crate::connection::admit_for_encoding(&command, &opts),
             Err(Error::MissingCapability(_))
         ));
     }

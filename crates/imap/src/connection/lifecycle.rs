@@ -112,6 +112,7 @@ impl ImapConnection {
         let setup_peer_budget = wire::PeerBudget::new(timeout);
         wire_reader.set_peer_budget(Some(setup_peer_budget.clone()));
         let mut proto_state = state::ProtocolState::new();
+        proto_state.set_tls_active(tls_mode.uses_implicit_tls());
         let mut tag_gen = tag::TagGenerator::new();
 
         // Set up the event channel.
@@ -382,26 +383,7 @@ impl ImapConnection {
         tls_connector: native_tls::TlsConnector,
         timeout: Duration,
     ) -> Result<(), Error> {
-        if self.tls_active.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Error::InvalidInput(
-                "STARTTLS requires an unencrypted connection".into(),
-            ));
-        }
-        self.require_state(crate::types::CommandKind::StartTls)?;
-
-        // A direct upgrade from a plaintext connection follows the same
-        // capability rule as connection-time STARTTLS. An empty snapshot is
-        // not evidence that STARTTLS is available.
-        {
-            let snap = self.state_rx.borrow();
-            if !snap
-                .capabilities
-                .iter()
-                .any(|c| matches!(c, Capability::StartTls))
-            {
-                return Err(Error::StartTlsUnavailable);
-            }
-        }
+        self.admit_command(&Command::StartTls)?;
 
         // Validate server name before submitting so malformed input fails
         // without involving the driver.
@@ -423,22 +405,25 @@ impl ImapConnection {
     }
 }
 
+/// Connection-time STARTTLS admission, through the same policy as every other
+/// entry path: session state, an unencrypted transport, and the advertised
+/// capability. The PREAUTH case never reaches here on the connect path:
+/// `ensure_starttls_session` refuses it first as a TLS-policy error.
+fn ensure_starttls_available(state: &super::state::ProtocolState) -> Result<(), Error> {
+    let snapshot = state.snapshot();
+    super::admission::admit(
+        &Command::StartTls,
+        &super::admission::SessionView {
+            snapshot: &snapshot,
+            tls_active: state.tls_active(),
+        },
+    )
+}
+
 /// STARTTLS is only available before authentication, even when the greeting
 /// advertises the capability. PREAUTH therefore means the server has already
 /// chosen an authenticated cleartext session and the client must refuse it as
 /// a TLS-policy error instead of reporting a stale command-state transition.
-fn ensure_starttls_available(state: &super::state::ProtocolState) -> Result<(), Error> {
-    ensure_starttls_session(state)?;
-    if !state
-        .capabilities()
-        .iter()
-        .any(|capability| matches!(capability, Capability::StartTls))
-    {
-        return Err(Error::StartTlsUnavailable);
-    }
-    Ok(())
-}
-
 fn ensure_starttls_session(state: &super::state::ProtocolState) -> Result<(), Error> {
     if state.session_state() != super::SessionState::NotAuthenticated {
         return Err(Error::StartTlsUnavailable);
@@ -643,10 +628,10 @@ mod starttls_policy_tests {
             })
             .unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             ensure_starttls_available(&state),
-            Err(Error::StartTlsUnavailable)
-        );
+            Err(Error::InvalidState(_))
+        ));
     }
 
     #[test]

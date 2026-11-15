@@ -52,7 +52,7 @@ fn two_scope_ledger() -> DebtLedger {
             CoverageDomain::full(scope(name)),
             vec![obligation(name)],
         );
-        ledger.ingest(&report, 1, 1_700_000_000);
+        ledger.ingest(&report, walk_generation(1), 1_700_000_000);
     }
     ledger
 }
@@ -163,4 +163,13 @@ async fn recovered_ids_are_published_under_their_own_scope() {
         ],
         "every recovered id must be announced under the scope it was recovered from"
     );
+}
+
+// Mint test proof orders through the same owner as production walks.
+fn walk_generation(value: u64) -> bifrost_sync::cursor::WalkGeneration {
+    let coverage = bifrost_sync::cursor::PendingCoverage::new();
+    for _ in 0..value {
+        let _ = coverage.next_generation();
+    }
+    coverage.next_generation()
 }

@@ -234,7 +234,7 @@ pub async fn drive_changes_stream(
             let expected = match (&control, &checkpoint) {
                 (Some(control), Some(checkpoint)) => {
                     let publication =
-                        control.publish_checkpoint_without_report(checkpoint.clone(), 0);
+                        control.publish_checkpoint_without_report(checkpoint.clone());
                     me.publication = Some(publication.clone());
                     Some(publication)
                 }
@@ -505,7 +505,7 @@ pub enum WriterRequest {
     /// touch this one's rows. A later attempt inserting the same scope takes
     /// ownership of it.
     ReattachInsert {
-        attempt: u64,
+        attempt: crate::engine::ReattachAttempt,
         cursor: ChangeCursor,
         done: oneshot::Sender<Result<(), Error>>,
     },
@@ -514,12 +514,14 @@ pub enum WriterRequest {
     /// meantime is no longer provisional and survives, and so does a row now
     /// owned by a different attempt.
     ReattachAbort {
-        attempt: u64,
+        attempt: crate::engine::ReattachAttempt,
         done: oneshot::Sender<()>,
     },
     /// The named reattach attempt cut over: the rows it owns are now ordinary
     /// durable state. Rows owned by other attempts stay provisional.
-    ReattachCommit { attempt: u64 },
+    ReattachCommit {
+        attempt: crate::engine::ReattachAttempt,
+    },
     /// Read one cursor through the same account-owned boundary used for writes.
     ///
     /// `claim_for` is set only by a reattach's resume read. When the row is
@@ -531,7 +533,7 @@ pub enum WriterRequest {
     /// scope restart, anything outside a reattach) never claims.
     GetChangeCursor {
         scope: CursorScope,
-        claim_for: Option<u64>,
+        claim_for: Option<crate::engine::ReattachAttempt>,
         done: oneshot::Sender<Result<Option<ChangeCursor>, Error>>,
     },
     /// Read the authoritative ledger, including debt retained after a failed write.
@@ -604,7 +606,7 @@ pub enum WriterRequest {
     /// and convert an all-waived set into accepted-loss debt before crossing.
     CrossWaivedBarriers {
         report: bifrost_types::InventoryCoverageReport,
-        generation: u64,
+        generation: crate::cursor::WalkGeneration,
         done: oneshot::Sender<Result<bool, Error>>,
     },
     /// Read whether operator policy currently parks this scope at a barrier.
@@ -621,7 +623,7 @@ pub enum WriterRequest {
     /// under-reporting it costs objects nobody ever sees again.
     RecordDebt {
         report: bifrost_types::InventoryCoverageReport,
-        generation: u64,
+        generation: crate::cursor::WalkGeneration,
         done: oneshot::Sender<Result<(), Error>>,
     },
     /// Apply the outcomes of one repair pass.

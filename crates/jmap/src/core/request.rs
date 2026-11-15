@@ -17,7 +17,7 @@ use super::response::Response;
 /// ensuring compile-time safety when extracting the response.
 pub(crate) struct CallHandle<M: JmapMethod> {
     pub(crate) call_id: String,
-    pub(crate) method_name: &'static str,
+    pub(crate) answer_context: super::answer::AnswerContext,
     pub(crate) _phantom: PhantomData<M>,
 }
 
@@ -29,7 +29,7 @@ impl<M: JmapMethod> CallHandle<M> {
     pub(crate) fn result_reference(&self, path: impl Into<String>) -> ResultReference {
         ResultReference {
             result_of: self.call_id.clone(),
-            name: self.method_name,
+            name: self.answer_context.method,
             path: path.into(),
         }
     }
@@ -211,6 +211,24 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         let arguments =
             serde_json::value::to_raw_value(&method).map_err(crate::Error::RequestEncode)?;
 
+        // Read the actual serialized guard, including method-specific copy guards.
+        #[derive(serde::Deserialize)]
+        struct Guards {
+            #[serde(rename = "ifInState")]
+            state: Option<serde::de::IgnoredAny>,
+            #[serde(rename = "ifFromInState")]
+            from: Option<serde::de::IgnoredAny>,
+            #[serde(rename = "destroyFromIfInState")]
+            destroy: Option<serde::de::IgnoredAny>,
+        }
+        let guards: Guards =
+            serde_json::from_str(arguments.get()).map_err(crate::Error::RequestEncode)?;
+        let answer_context = super::answer::AnswerContext {
+            method: M::NAME,
+            guarded: guards.state.is_some() || guards.from.is_some() || guards.destroy.is_some(),
+            write: !M::REPLAY_SAFE,
+        };
+
         // Accountless methods (notably PushSubscription/get and /set) remain
         // legal without primary accounts. Inspect the actual wire member so
         // this guard follows each method's accountId serialization contract.
@@ -244,8 +262,8 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         });
 
         Ok(CallHandle {
+            answer_context,
             call_id,
-            method_name: M::NAME,
             _phantom: PhantomData,
         })
     }

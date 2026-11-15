@@ -4,6 +4,26 @@ use super::*;
 use crate::types::response::Capability;
 use crate::types::validated::{MailboxName, SequenceSet};
 
+/// Capability assertions exercise admission; the encoder itself is pure.
+fn admit_and_encode(
+    tag: &str,
+    cmd: &Command,
+    opts: &EncodeOptions,
+) -> Result<WireCommand, crate::Error> {
+    crate::connection::admit_for_encoding(cmd, opts)?;
+    super::encode_command(tag, cmd, opts)
+}
+
+fn admit_and_encode_to_buf(
+    buf: &mut BytesMut,
+    tag: &str,
+    cmd: &Command,
+    opts: &EncodeOptions,
+) -> Result<(), crate::Error> {
+    buf.extend_from_slice(&admit_and_encode(tag, cmd, opts)?.to_vec());
+    Ok(())
+}
+
 /// Build an [`EncodeOptions`] with the given literal mode, utf8 flag, and a
 /// generous set of capabilities that allows all commands to encode.
 fn opts(literal_mode: LiteralMode, utf8_mode: bool) -> EncodeOptions {
@@ -35,6 +55,7 @@ fn opts(literal_mode: LiteralMode, utf8_mode: bool) -> EncodeOptions {
             Capability::LiteralPlus,
             Capability::LiteralMinus,
             Capability::Sort,
+            Capability::Thread("REFERENCES".into()),
         ],
         enabled: Vec::new(),
     }
@@ -208,7 +229,7 @@ fn append_command(
     multi: bool,
     opts: &EncodeOptions,
 ) -> Result<WireCommand, crate::Error> {
-    encode_command(
+    admit_and_encode(
         tag,
         &Command::Append {
             mailbox: mailbox.into(),
@@ -2763,7 +2784,7 @@ fn append_nul_body_without_binary_is_refused() {
     )
     .expect_err("literal8 needs BINARY");
     assert!(
-        matches!(err, crate::Error::MissingCapability(ref m) if m.contains("requires BINARY literal8 support")),
+        matches!(err, crate::Error::MissingCapability(ref m) if m.contains("requires BINARY")),
         "got {err:?}"
     );
 }
@@ -2876,7 +2897,7 @@ fn rev2_does_not_imply_binary_for_append() {
     let err = append_command("A", "INBOX", &[append_nul_msg(100)], false, &rev2)
         .expect_err("pure rev2 without BINARY cannot carry a NUL body");
     assert!(
-        matches!(err, crate::Error::MissingCapability(ref m) if m.contains("requires BINARY literal8 support")),
+        matches!(err, crate::Error::MissingCapability(ref m) if m.contains("requires BINARY")),
         "got {err:?}"
     );
 }
@@ -4004,7 +4025,7 @@ fn append_shape_and_capability_validation() {
 
     assert!(matches!(
         append_command("A", "INBOX", &one, true, &without_cap),
-        Err(crate::Error::MissingCapability(ref m)) if m == "MULTIAPPEND"
+        Err(crate::Error::MissingCapability(ref m)) if m.capability == Capability::MultiAppend
     ));
     // A plain APPEND never needs it.
     assert!(append_command("A", "INBOX", &one, false, &without_cap).is_ok());
@@ -5816,7 +5837,7 @@ fn wire_command_debug_never_prints_payload() {
 // -----------------------------------------------------------------------
 
 fn uid_search(criteria: &str, opts: &EncodeOptions) -> Result<WireCommand, crate::Error> {
-    encode_command(
+    admit_and_encode(
         "A001",
         &Command::UidSearch {
             criteria: criteria.to_owned(),
@@ -6433,7 +6454,7 @@ fn search_rejects_non_synchronizing_literal_without_extension() {
         criteria: "TEXT {3+}\r\nfoo".into(),
     };
     let mut buf = BytesMut::new();
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
+    let result = admit_and_encode_to_buf(&mut buf, "A001", &cmd, &default_opts());
     let err = result.expect_err(
         "SEARCH must reject non-synchronizing literals without negotiated \
          LITERAL+/LITERAL- support (RFC 7888 Section 3)",
@@ -6481,7 +6502,7 @@ fn an_encoder_capability_refusal_names_the_command_and_the_capability() {
         capabilities: vec![Capability::Imap4Rev1],
         enabled: Vec::new(),
     };
-    let err = encode_command("A001", &cmd, &no_condstore).unwrap_err();
+    let err = admit_and_encode("A001", &cmd, &no_condstore).unwrap_err();
     assert_eq!(
         err,
         crate::Error::MissingCapability(crate::error::CapabilityFailure::new(
@@ -6639,7 +6660,7 @@ fn thread_rejects_oversized_non_synchronizing_literal_in_literal_minus_mode() {
         criteria: format!("TEXT {{4097+}}\r\n{oversized}"),
     };
     let mut buf = BytesMut::new();
-    let result = encode_command_to_buf(
+    let result = admit_and_encode_to_buf(
         &mut buf,
         "A001",
         &cmd,

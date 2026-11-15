@@ -40,6 +40,7 @@ use crate::types::validated::MailboxName;
 pub(crate) struct ProtocolState {
     /// Current session state (RFC 3501 Section3).
     state: SessionState,
+    tls_active: bool,
     /// Driver exchange evidence, independent of protocol error classification.
     /// Reset at request admission; sends leave it unfinished until ReadLoop
     /// observes the terminal completion. Logout remains an independent veto.
@@ -93,6 +94,7 @@ impl ProtocolState {
     pub(crate) fn new() -> Self {
         Self {
             state: SessionState::NotAuthenticated,
+            tls_active: false,
             framing: super::driver::read_loop::Framing::Untouched,
             capabilities: Vec::new(),
             notify: NotifyFlags::default(),
@@ -110,6 +112,14 @@ impl ProtocolState {
     }
 
     // -- Read-only getters --
+
+    pub(in crate::connection) fn tls_active(&self) -> bool {
+        self.tls_active
+    }
+
+    pub(in crate::connection) fn set_tls_active(&mut self, active: bool) {
+        self.tls_active = active;
+    }
 
     /// Current session state (RFC 3501 Section3).
     pub(crate) fn session_state(&self) -> SessionState {

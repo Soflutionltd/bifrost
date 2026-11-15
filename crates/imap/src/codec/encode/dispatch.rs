@@ -1,5 +1,4 @@
 use crate::types::Command;
-use crate::types::response::Capability;
 
 use super::commands::{
     encode_append, encode_authenticate, encode_create_special_use, encode_fetch,
@@ -11,72 +10,15 @@ use super::commands::{
 };
 use super::{CommandWriter, EncodeOptions, WireCommand, encode_enable, validate_atom};
 
-/// The refusal for a command whose prerequisite capability is not usable on
-/// this connection (I6). One wording for every command: `<cmd> requires <cap>`.
-fn missing(cmd: &str, cap: &str) -> crate::Error {
-    crate::Error::MissingCapability(crate::error::CapabilityFailure::new(
-        cap.into(),
-        crate::error::CapabilityFailureReason::NotAdvertised,
-        format!("{cmd} requires {cap}"),
-    ))
-}
-
-/// Encodes an IMAP command into a [`WireCommand`].
-///
-/// The single encoder for every command, APPEND and MULTIAPPEND included.
-/// The driver calls it at send time with [`EncodeOptions`] built from the
-/// state it owns, so literal markers (RFC 7888), literal8 eligibility, the
-/// mailbox encoding (modified UTF-7 or UTF-8, RFC 6855 Section 3) and every
-/// capability gate reflect the connection as it is when the command reaches
-/// the head of the queue.
-///
-/// Capability prerequisite checks (I6) run before any byte is produced:
-/// commands that require capabilities not usable per `opts` return
-/// [`crate::Error::MissingCapability`]. Every failure here is a refusal before
-/// the first byte, so the connection stays usable.
-///
-/// Tag-command format per RFC 3501 Section 2.2.1 / RFC 9051 Section 2.2.1.
+/// Encode command syntax using the negotiated wire representation.
+/// Session and extension admission belongs to `connection::admission`.
+/// Syntax validation remains here so malformed data can never reach the wire.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn encode_command(
     tag: &str,
     command: &Command,
     opts: &EncodeOptions,
 ) -> Result<WireCommand, crate::Error> {
-    // Check criteria at encoding: a queued command's handle snapshot may
-    // predate a CAPABILITY/ENABLE update, including inside a pipeline.
-    match command {
-        Command::Search { criteria }
-        | Command::UidSearch { criteria }
-        | Command::SearchReturn { criteria, .. }
-        | Command::UidSearchReturn { criteria, .. }
-        | Command::SearchSave { criteria }
-        | Command::UidSearchSave { criteria }
-        | Command::Sort { criteria, .. }
-        | Command::UidSort { criteria, .. }
-        | Command::Thread { criteria, .. }
-        | Command::UidThread { criteria, .. } => {
-            for (atoms, capability) in [
-                (&["MODSEQ"][..], Capability::Condstore),
-                (&["OLDER", "YOUNGER"][..], Capability::Within),
-                (
-                    &["SAVEDBEFORE", "SAVEDON", "SAVEDSINCE", "SAVEDATESUPPORTED"][..],
-                    Capability::SaveDate,
-                ),
-                (&["EMAILID", "THREADID"][..], Capability::ObjectId),
-                (&["$"][..], Capability::SearchRes),
-            ] {
-                if atoms.iter().any(|atom| {
-                    crate::connection::ImapConnection::search_criteria_contains_atom(criteria, atom)
-                }) && !opts.has_capability(&capability)
-                {
-                    return Err(crate::Error::MissingCapability(
-                        capability.to_string().into(),
-                    ));
-                }
-            }
-        }
-        _ => {}
-    }
     let mut w = CommandWriter::new(opts);
     let utf8 = opts.utf8_mode;
     match command {
@@ -93,9 +35,6 @@ pub(crate) fn encode_command(
         }
         // RFC 3501 Section 6.2.1 / RFC 9051 Section 6.2.1
         Command::StartTls => {
-            if !opts.has_capability(&Capability::StartTls) {
-                return Err(missing("STARTTLS", "STARTTLS"));
-            }
             encode_simple(&mut w, tag, "STARTTLS");
         }
         // RFC 3501 Section 6.1.3 / RFC 9051 Section 6.1.3
@@ -104,10 +43,6 @@ pub(crate) fn encode_command(
         }
         // RFC 5161 Section 3
         Command::Enable { capabilities } => {
-            // RFC 5161 Section 3.1: ENABLE requires ENABLE capability.
-            if !opts.has_capability(&Capability::Enable) {
-                return Err(missing("ENABLE", "ENABLE"));
-            }
             encode_enable(&mut w, tag, capabilities)?;
         }
         Command::List { reference, pattern } => {
@@ -148,14 +83,6 @@ pub(crate) fn encode_command(
             condstore,
             qresync,
         } => {
-            // RFC 7162 Section 3.1.1: CONDSTORE requires CONDSTORE capability.
-            if *condstore && !opts.has_condstore() {
-                return Err(missing("SELECT (CONDSTORE)", "CONDSTORE"));
-            }
-            // RFC 7162 Section 3.2.5.2: QRESYNC requires QRESYNC capability.
-            if qresync.is_some() && !opts.has_capability(&Capability::QResync) {
-                return Err(missing("SELECT (QRESYNC)", "QRESYNC"));
-            }
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_select_or_examine(
                 &mut w,
@@ -172,14 +99,6 @@ pub(crate) fn encode_command(
             condstore,
             qresync,
         } => {
-            // RFC 7162 Section 3.1.1: CONDSTORE requires CONDSTORE capability.
-            if *condstore && !opts.has_condstore() {
-                return Err(missing("EXAMINE (CONDSTORE)", "CONDSTORE"));
-            }
-            // RFC 7162 Section 3.2.5.2: QRESYNC requires QRESYNC capability.
-            if qresync.is_some() && !opts.has_capability(&Capability::QResync) {
-                return Err(missing("EXAMINE (QRESYNC)", "QRESYNC"));
-            }
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_select_or_examine(
                 &mut w,
@@ -199,10 +118,6 @@ pub(crate) fn encode_command(
             mailbox,
             special_use,
         } => {
-            // RFC 6154 Section 3: CREATE-SPECIAL-USE capability required.
-            if !opts.has_capability(&Capability::CreateSpecialUse) {
-                return Err(missing("CREATE (USE)", "CREATE-SPECIAL-USE"));
-            }
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_create_special_use(&mut w, tag, &wire, special_use, utf8);
         }
@@ -233,9 +148,9 @@ pub(crate) fn encode_command(
             w.string(&wire_pat, utf8);
             w.raw(b"\r\n");
         }
-        // RFC 3501 Section 6.3.11 / RFC 3502: APPEND and MULTIAPPEND carry
-        // their own validation (MULTIAPPEND, BINARY for a NUL body outside
-        // the RFC 6855 wrapper, flags, dates), all against these live options.
+        // Admission has established MULTIAPPEND and BINARY eligibility.
+        // Encoding retains shape, flag and date validation and chooses body
+        // framing from the live negotiated options.
         Command::Append {
             mailbox,
             messages,
@@ -253,10 +168,6 @@ pub(crate) fn encode_command(
         }
         // RFC 3691 Section 3
         Command::Unselect => {
-            // RFC 3691 Section 2: UNSELECT requires UNSELECT capability.
-            if !opts.has_capability(&Capability::Unselect) {
-                return Err(missing("UNSELECT", "UNSELECT"));
-            }
             encode_simple(&mut w, tag, "UNSELECT");
         }
         Command::Status { mailbox, items } => {
@@ -280,10 +191,6 @@ pub(crate) fn encode_command(
             items,
             changed_since,
         } => {
-            // RFC 7162 Section 3.1.4.1: CHANGEDSINCE requires CONDSTORE.
-            if changed_since.is_some() && !opts.has_condstore() {
-                return Err(missing("FETCH (CHANGEDSINCE)", "CONDSTORE"));
-            }
             // SequenceSet is pre-validated at construction time (RFC 3501 Section 9).
             encode_fetch(&mut w, tag, sequence_set.as_str(), items, *changed_since)?;
         }
@@ -293,10 +200,6 @@ pub(crate) fn encode_command(
             flags,
             unchanged_since,
         } => {
-            // RFC 7162 Section 3.1.3: UNCHANGEDSINCE requires CONDSTORE.
-            if unchanged_since.is_some() && !opts.has_condstore() {
-                return Err(missing("STORE (UNCHANGEDSINCE)", "CONDSTORE"));
-            }
             // SequenceSet is pre-validated at construction time (RFC 3501 Section 9).
             encode_store(
                 &mut w,
@@ -328,10 +231,6 @@ pub(crate) fn encode_command(
             sequence_set,
             mailbox,
         } => {
-            // RFC 6851 Section 3: MOVE requires MOVE capability.
-            if !opts.has_capability(&Capability::Move) {
-                return Err(missing("MOVE", "MOVE"));
-            }
             // SequenceSet is pre-validated at construction time (RFC 3501 Section 9).
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_two_arg(
@@ -369,14 +268,6 @@ pub(crate) fn encode_command(
             changed_since,
             vanished,
         } => {
-            // RFC 7162 Section 3.1.4.1: CHANGEDSINCE requires CONDSTORE.
-            if changed_since.is_some() && !opts.has_condstore() {
-                return Err(missing("UID FETCH (CHANGEDSINCE)", "CONDSTORE"));
-            }
-            // RFC 7162 Section 3.2.6: VANISHED requires QRESYNC.
-            if *vanished && !opts.has_capability(&Capability::QResync) {
-                return Err(missing("UID FETCH (VANISHED)", "QRESYNC"));
-            }
             // SequenceSet is pre-validated at construction time (RFC 3501 Section 9).
             encode_uid_fetch(
                 &mut w,
@@ -393,10 +284,6 @@ pub(crate) fn encode_command(
             flags,
             unchanged_since,
         } => {
-            // RFC 7162 Section 3.1.3: UNCHANGEDSINCE requires CONDSTORE.
-            if unchanged_since.is_some() && !opts.has_condstore() {
-                return Err(missing("UID STORE (UNCHANGEDSINCE)", "CONDSTORE"));
-            }
             // SequenceSet is pre-validated at construction time (RFC 3501 Section 9).
             encode_store(
                 &mut w,
@@ -412,10 +299,6 @@ pub(crate) fn encode_command(
             sequence_set,
             mailbox,
         } => {
-            // RFC 6851 Section 3: MOVE requires MOVE capability.
-            if !opts.has_capability(&Capability::Move) {
-                return Err(missing("UID MOVE", "MOVE"));
-            }
             // SequenceSet is pre-validated at construction time (RFC 3501 Section 9).
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_two_arg(
@@ -445,18 +328,11 @@ pub(crate) fn encode_command(
             )?;
         }
         Command::UidExpunge { sequence_set } => {
-            // RFC 4315: UID EXPUNGE requires UIDPLUS capability.
-            if !opts.has_capability(&Capability::UidPlus) {
-                return Err(missing("UID EXPUNGE", "UIDPLUS"));
-            }
             // SequenceSet is pre-validated at construction time (RFC 3501 Section 9).
             encode_uid_expunge(&mut w, tag, sequence_set.as_str())?;
         }
         // RFC 2342 Section 5 / RFC 9051 Section 6.3.10
         Command::Namespace => {
-            if !opts.has_capability(&Capability::Namespace) {
-                return Err(missing("NAMESPACE", "NAMESPACE"));
-            }
             encode_simple(&mut w, tag, "NAMESPACE");
         }
         // RFC 3501 Section 6.4.1 (removed in IMAP4rev2)
@@ -469,10 +345,6 @@ pub(crate) fn encode_command(
         }
         // RFC 2177 Section 3 / RFC 9051 Section 6.3.13
         Command::Idle => {
-            // RFC 2177 Section 1: IDLE requires IDLE capability.
-            if !opts.has_capability(&Capability::Idle) {
-                return Err(missing("IDLE", "IDLE"));
-            }
             encode_simple(&mut w, tag, "IDLE");
         }
         // RFC 3501 Section 6.1.1 / RFC 9051 Section 6.1.1
@@ -484,10 +356,6 @@ pub(crate) fn encode_command(
             encode_simple(&mut w, tag, "NOOP");
         }
         Command::Id(params) => {
-            // RFC 2971 Section 2: ID requires ID capability.
-            if !opts.has_capability(&Capability::Id) {
-                return Err(missing("ID", "ID"));
-            }
             encode_id(&mut w, tag, params, utf8)?;
         }
         Command::GetMetadata {
@@ -496,12 +364,6 @@ pub(crate) fn encode_command(
             max_size,
             depth,
         } => {
-            // RFC 5464 Section 1: METADATA or METADATA-SERVER capability required.
-            if !opts.has_capability(&Capability::Metadata)
-                && !opts.has_capability(&Capability::MetadataServer)
-            {
-                return Err(missing("GETMETADATA", "METADATA"));
-            }
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_getmetadata(
                 &mut w,
@@ -514,12 +376,6 @@ pub(crate) fn encode_command(
             )?;
         }
         Command::SetMetadata { mailbox, entries } => {
-            // RFC 5464 Section 1: METADATA or METADATA-SERVER capability required.
-            if !opts.has_capability(&Capability::Metadata)
-                && !opts.has_capability(&Capability::MetadataServer)
-            {
-                return Err(missing("SETMETADATA", "METADATA"));
-            }
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_setmetadata(&mut w, tag, &wire, entries, utf8)?;
         }
@@ -568,35 +424,19 @@ pub(crate) fn encode_command(
             )?;
         }
         Command::Compress => {
-            // RFC 4978 Section 4: COMPRESS DEFLATE requires COMPRESS=DEFLATE.
-            if !opts.has_capability(&Capability::CompressDeflate) {
-                return Err(missing("COMPRESS", "COMPRESS=DEFLATE"));
-            }
             w.raw(tag.as_bytes());
             w.raw(b" COMPRESS DEFLATE\r\n");
         }
 
         // --- QUOTA (RFC 2087) ---
         Command::GetQuota { root } => {
-            // RFC 2087 Section 4.2: GETQUOTA requires QUOTA capability.
-            if !opts.has_capability(&Capability::Quota) {
-                return Err(missing("GETQUOTA", "QUOTA"));
-            }
             encode_mailbox_cmd(&mut w, tag, "GETQUOTA", root, utf8);
         }
         Command::GetQuotaRoot { mailbox } => {
-            // RFC 2087 Section 4.3: GETQUOTAROOT requires QUOTA capability.
-            if !opts.has_capability(&Capability::Quota) {
-                return Err(missing("GETQUOTAROOT", "QUOTA"));
-            }
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_mailbox_cmd(&mut w, tag, "GETQUOTAROOT", &wire, utf8);
         }
         Command::SetQuota { root, resources } => {
-            // RFC 9208 Section 4.1.3: SETQUOTA requires QUOTASET capability.
-            if !opts.has_capability(&Capability::QuotaSet) {
-                return Err(missing("SETQUOTA", "QUOTASET"));
-            }
             encode_set_quota(&mut w, tag, root, resources, utf8)?;
         }
 
@@ -606,10 +446,6 @@ pub(crate) fn encode_command(
             identifier,
             rights,
         } => {
-            // RFC 4314 Section 3.1: SETACL requires ACL capability.
-            if !opts.has_capability(&Capability::Acl) {
-                return Err(missing("SETACL", "ACL"));
-            }
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_set_acl(&mut w, tag, &wire, identifier, rights, utf8);
         }
@@ -617,18 +453,10 @@ pub(crate) fn encode_command(
             mailbox,
             identifier,
         } => {
-            // RFC 4314 Section 3.2: DELETEACL requires ACL capability.
-            if !opts.has_capability(&Capability::Acl) {
-                return Err(missing("DELETEACL", "ACL"));
-            }
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_two_quoted_args(&mut w, tag, "DELETEACL", &wire, identifier, utf8);
         }
         Command::GetAcl { mailbox } => {
-            // RFC 4314 Section 3.3: GETACL requires ACL capability.
-            if !opts.has_capability(&Capability::Acl) {
-                return Err(missing("GETACL", "ACL"));
-            }
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_mailbox_cmd(&mut w, tag, "GETACL", &wire, utf8);
         }
@@ -636,35 +464,19 @@ pub(crate) fn encode_command(
             mailbox,
             identifier,
         } => {
-            // RFC 4314 Section 3.4: LISTRIGHTS requires ACL capability.
-            if !opts.has_capability(&Capability::Acl) {
-                return Err(missing("LISTRIGHTS", "ACL"));
-            }
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_two_quoted_args(&mut w, tag, "LISTRIGHTS", &wire, identifier, utf8);
         }
         Command::MyRights { mailbox } => {
-            // RFC 4314 Section 3.5: MYRIGHTS requires ACL capability.
-            if !opts.has_capability(&Capability::Acl) {
-                return Err(missing("MYRIGHTS", "ACL"));
-            }
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_mailbox_cmd(&mut w, tag, "MYRIGHTS", &wire, utf8);
         }
 
         // --- NOTIFY (RFC 5465) ---
         Command::NotifySet(params) => {
-            // RFC 5465 Section 3: NOTIFY requires NOTIFY capability.
-            if !opts.has_capability(&Capability::Notify) {
-                return Err(missing("NOTIFY SET", "NOTIFY"));
-            }
             encode_notify_set(&mut w, tag, params, utf8)?;
         }
         Command::NotifyNone => {
-            // RFC 5465 Section 3: NOTIFY requires NOTIFY capability.
-            if !opts.has_capability(&Capability::Notify) {
-                return Err(missing("NOTIFY NONE", "NOTIFY"));
-            }
             encode_simple(&mut w, tag, "NOTIFY NONE");
         }
     }

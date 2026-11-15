@@ -87,10 +87,8 @@ pub struct RedirectPolicy {
     pub trusted_hosts: HashSet<String>,
 }
 
-/// The default redirect hop cap. A named constant rather than a bare
-/// literal in `Default` because non-pipeline redirect walkers (dav-core's
-/// self-walked loop) cite the same number; changing the default must
-/// change them together, visibly.
+/// The shared walk permits ten relocations, bounding server loops without
+/// rejecting ordinary enterprise proxy and discovery chains.
 pub const DEFAULT_MAX_HOPS: u8 = 10;
 
 impl Default for RedirectPolicy {
@@ -165,6 +163,76 @@ impl RedirectPolicy {
     }
 }
 
+/// Method semantics for endpoint relocation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MethodRewrite {
+    /// Preserve the transport's existing HTTP rewrite behavior.
+    #[default]
+    Http,
+    /// DAV queries and mutations must keep their meaning. Return 303 as data.
+    PreserveAndRefuse303,
+}
+
+/// A credential admitted for exactly the URL passed to `HopPolicy::admit`.
+/// Net never carries this credential to another origin without admission.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum HopCredential {
+    /// Send no Authorization header.
+    None,
+    /// Present a prebuilt Authorization value, such as Basic authentication.
+    Header(HeaderValue),
+    /// Resolve and refresh this admitted source under the request deadline.
+    Bearer(crate::CoordinatedTokenSource),
+}
+
+/// Protocol policy around the shared walk, retry, refresh and deadline engine.
+/// Admission precedes credential lookup; target checks follow admission waits
+/// and lookup, immediately before dispatch. The total deadline covers the walk.
+/// Policy errors can retain a protocol's typed local refusal through `Error::HopPolicy`.
+pub trait HopPolicy: Send + Sync {
+    fn method_rewrite(&self) -> MethodRewrite {
+        MethodRewrite::Http
+    }
+
+    /// Admit the request target. `prior` is `None` until the first redirect,
+    /// then the URL of the most recent hop that redirected; same-hop retries
+    /// keep that value. Return only a credential authorized for `next`, never
+    /// a prior hop's header. `admit` may run more than once for one hop (once
+    /// when the redirect is classified, again before each attempt), so it must
+    /// be a pure decision with no side effects.
+    ///
+    /// Every error a policy returns, from any hook, leaves through the
+    /// request's single completion boundary, so earlier answered hops stay in
+    /// the `AttemptHistory` commit evidence.
+    fn admit(
+        &self,
+        prior: Option<&reqwest::Url>,
+        next: &reqwest::Url,
+    ) -> Result<HopCredential, Error>;
+
+    /// Rewrite protocol headers after relocation, before target validation.
+    fn rewrite_headers(
+        &self,
+        _prior: &reqwest::Url,
+        _next: &reqwest::Url,
+        _headers: &mut HeaderMap,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Validate the complete request, including any secondary target headers.
+    fn check_target(
+        &self,
+        _method: &Method,
+        _url: &reqwest::Url,
+        _headers: &HeaderMap,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 /// Result of `classify_redirect`: what to do on a 3xx response.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -223,6 +291,28 @@ pub(crate) fn classify_redirect(
     status: StatusCode,
     headers: &HeaderMap,
 ) -> Result<RedirectAction, Error> {
+    classify_redirect_with_mode(
+        policy,
+        prior_method,
+        prior_url,
+        status,
+        headers,
+        MethodRewrite::Http,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn classify_redirect_with_mode(
+    policy: &RedirectPolicy,
+    prior_method: &Method,
+    prior_url: &reqwest::Url,
+    status: StatusCode,
+    headers: &HeaderMap,
+    mode: MethodRewrite,
+) -> Result<RedirectAction, Error> {
+    if mode == MethodRewrite::PreserveAndRefuse303 && status == StatusCode::SEE_OTHER {
+        return Ok(RedirectAction::PassThrough);
+    }
     if !matches!(
         status,
         StatusCode::MOVED_PERMANENTLY
@@ -257,15 +347,21 @@ pub(crate) fn classify_redirect(
     // also drops the request body because the next method (GET) is
     // semantically distinct from the prior POST.
     let safe_prior = prior_method.is_safe();
-    let (next_method, preserve_body) = match status {
-        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if !safe_prior => (Method::GET, false),
-        StatusCode::SEE_OTHER => (Method::GET, false),
-        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => {
-            (prior_method.clone(), true)
+    let (next_method, preserve_body) = if mode == MethodRewrite::PreserveAndRefuse303 {
+        (prior_method.clone(), true)
+    } else {
+        match status {
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if !safe_prior => {
+                (Method::GET, false)
+            }
+            StatusCode::SEE_OTHER => (Method::GET, false),
+            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => {
+                (prior_method.clone(), true)
+            }
+            // 301 / 302 with a safe method: method preserved; body
+            // retained for OPTIONS/TRACE as well.
+            _ => (prior_method.clone(), prior_method != Method::HEAD),
         }
-        // 301 / 302 with a safe method: method preserved; body
-        // retained for OPTIONS/TRACE as well.
-        _ => (prior_method.clone(), prior_method != Method::HEAD),
     };
 
     if !policy.admits_hop(Some(prior_url), &next_url) {
@@ -294,6 +390,18 @@ fn location_to_str(value: &HeaderValue) -> Result<String, Error> {
         })
 }
 
+/// Canonical scheme/host/effective-port identity for credential admission.
+/// Paths, userinfo and fragments confer no authority.
+#[must_use]
+pub fn origin_key(url: &reqwest::Url) -> Option<String> {
+    Some(format!(
+        "{}://{}:{}",
+        url.scheme(),
+        url.host_str()?.to_ascii_lowercase(),
+        url.port_or_known_default()?
+    ))
+}
+
 /// Same-origin test for the redirect hop's `keep_auth` decision.
 ///
 /// HTTP hosts are case-insensitive (RFC 3986 §3.2.2), so a mixed-case
@@ -316,16 +424,11 @@ fn location_to_str(value: &HeaderValue) -> Result<String, Error> {
 /// the hop treated as same-origin and the bearer token carried onto it
 /// in cleartext. A credential-stripping decision must not rest on a
 /// port coincidence.
-fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
-    if a.scheme() != b.scheme() {
-        return false;
-    }
-    let host_eq = match (a.host_str(), b.host_str()) {
-        (Some(ha), Some(hb)) => ha.eq_ignore_ascii_case(hb),
-        (None, None) => true,
-        _ => false,
-    };
-    host_eq && a.port_or_known_default() == b.port_or_known_default()
+#[must_use]
+pub fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    // Compare canonical credential origins, including the effective port.
+    // Unnameable origins cannot authorize credential retention.
+    origin_key(a).is_some_and(|origin| Some(origin) == origin_key(b))
 }
 
 /// Resolve `location` against `base`. Handles absolute URLs and

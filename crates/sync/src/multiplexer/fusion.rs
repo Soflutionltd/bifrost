@@ -67,7 +67,7 @@ pub struct InventoryFusion {
     /// checkpoint-less batches (and, with no `control`, every batch and the
     /// terminal `Done`) are withheld once it has moved, and the terminal cursor
     /// is installed only under it. Ignored when `coverage` is `None`.
-    pub expected_fence: u64,
+    pub expected_fence: crate::cursor::ScopeFence,
     pub account_id: bifrost_types::AccountId,
     pub cursors: Arc<CursorRegistry>,
     pub control: Option<SyncControl>,
@@ -81,7 +81,7 @@ pub struct InventoryFusion {
     pub writer_tx: Option<tokio::sync::mpsc::Sender<super::WriterRequest>>,
     /// Engine-issued generation for this walk. Orders proof events even when
     /// two walks produce identical cursor bytes.
-    pub generation: u64,
+    pub generation: crate::cursor::WalkGeneration,
     /// Cancelled when the walk's owner is tearing down. The walk then stops at
     /// its next provider poll and returns [`Error::ShuttingDown`], dropping the
     /// provider stream, instead of waiting on a stream that neither yields nor
@@ -804,13 +804,13 @@ mod tests {
         let (tx, rx) = tokio::sync::broadcast::channel(16);
         (
             InventoryFusion {
-                expected_fence: 0,
+                expected_fence: crate::cursor::PendingCoverage::initial_fence(),
                 account_id: bifrost_types::AccountId("guarded".into()),
                 cursors: Arc::new(CursorRegistry::new()),
                 control: Some(control),
                 coverage: Some(coverage),
                 writer_tx: None,
-                generation: 1,
+                generation: crate::cursor::WalkGeneration::for_test(1),
                 shutdown: None,
             },
             Arc::new(ChangeDelivery::new(tx)),
@@ -1221,13 +1221,13 @@ mod tests {
         writer_tx: tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>,
     ) -> InventoryFusion {
         InventoryFusion {
-            expected_fence: 0,
+            expected_fence: crate::cursor::PendingCoverage::initial_fence(),
             account_id: bifrost_types::AccountId("fusion-unit".into()),
             cursors: Arc::new(CursorRegistry::new()),
             control: None,
             coverage: None,
             writer_tx: Some(writer_tx),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
             shutdown: None,
         }
     }

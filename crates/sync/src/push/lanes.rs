@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct PushLanes {
     pub account_id: AccountId,
     pub current: Arc<ArcSwap<crate::types::Incarnation>>,
-    pub generation: watch::Receiver<u64>,
-    pub topology: watch::Receiver<u64>,
+    pub generation: watch::Receiver<crate::types::AccountGeneration>,
+    pub topology: watch::Receiver<crate::engine::PushTopologyGeneration>,
     pub ingress: Arc<PushIngress>,
     pub delivery: Arc<ChangeDelivery>,
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
@@ -37,7 +37,7 @@ pub(crate) struct PushLanes {
     pub health: watch::Sender<PushHealth>,
     /// Zero before retirement; generation + 1 after that generation drains.
     /// Reattach waits on it before closing the account it replaced.
-    pub retired: watch::Sender<u64>,
+    pub retired: watch::Sender<crate::types::AccountGeneration>,
     /// `EngineConfig::detach_timeout / 2`, so a drain that uses its whole
     /// bound still finishes inside detach's worker deadline.
     pub drain_bound: Duration,
@@ -94,7 +94,7 @@ impl PushLanes {
                 .zip(results)
                 .map(|(s, n)| (s.lane, n))
                 .collect();
-            self.retired.send_replace(generation.saturating_add(1));
+            self.retired.send_replace(generation.successor());
             if self.shutdown.is_cancelled() {
                 return;
             }
@@ -162,7 +162,7 @@ impl PushLanes {
     fn failure(
         &self,
         error: AccountError,
-        generation: u64,
+        generation: crate::types::AccountGeneration,
         pending: &mut VecDeque<ReopenRequest>,
     ) -> (Duration, bool, bool) {
         match recovery::plan_recovery(error.clone()) {
@@ -229,7 +229,7 @@ impl PushLanes {
         account: &dyn Account,
         spec: PushLaneSpec,
         index: usize,
-        generation: u64,
+        generation: crate::types::AccountGeneration,
         stop: CancellationToken,
         carried: u32,
     ) -> u32 {
@@ -247,7 +247,7 @@ impl PushLanes {
         account: &dyn Account,
         spec: PushLaneSpec,
         index: usize,
-        generation: u64,
+        generation: crate::types::AccountGeneration,
         stop: CancellationToken,
         carried: u32,
     ) -> u32 {
@@ -256,10 +256,10 @@ impl PushLanes {
         let mut boundary = self.boundary.clone();
         let mut topology = self.topology.clone();
         let connection = spec.kind == PushLaneKind::Connection;
-        let mut owe = connection && generation > 0;
+        let mut owe = connection && generation.is_replacement();
         let mut last_error = None;
         let mut blind = 0_u32;
-        if !connection && generation > 0 {
+        if !connection && generation.is_replacement() {
             self.ingress.request_full();
         }
         if !self

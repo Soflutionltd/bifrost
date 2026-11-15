@@ -1,4 +1,3 @@
-use crate::Error;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -62,6 +61,8 @@ pub(crate) struct SetRequest<O: SetObject> {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct SetResponse<O: SetObject> {
+    #[serde(skip)]
+    pub(crate) answer_context: crate::core::answer::AnswerContext,
     #[serde(rename = "accountId")]
     account_id: Option<AccountId>,
 
@@ -325,39 +326,42 @@ impl<O: SetObject> SetResponse<O> {
 
     /// Look up a successful or failed create by its create-id (e.g. "c1").
     pub(crate) fn created(&mut self, id: &str) -> crate::Result<O> {
-        if let Some(result) = self.created.as_mut().and_then(|r| r.remove(id)) {
-            Ok(result)
-        } else if let Some(error) = self.not_created.as_mut().and_then(|r| r.remove(id)) {
-            Err(error.to_string_error().into())
-        } else {
-            // An omitted create may still have landed: no answer, not a
-            // proven failure, exactly as for `updated` / `destroyed`.
-            Err(Error::SetIdUnanswered(id.to_string()))
-        }
+        crate::core::answer::IdAnswer::from_parts(
+            self.created.as_mut().and_then(|values| values.remove(id)),
+            self.not_created
+                .as_mut()
+                .and_then(|values| values.remove(id))
+                .map(|error| crate::Error::Set(error.to_string_error())),
+            false,
+        )
+        .into_result(id, self.answer_context)
     }
 
     pub(crate) fn updated(&mut self, id: &O::Id) -> crate::Result<Option<O>> {
-        if let Some(result) = self.updated.as_mut().and_then(|r| r.remove(id)) {
-            Ok(result)
-        } else if let Some(error) = self.not_updated.as_mut().and_then(|r| r.remove(id)) {
-            Err(error.to_string_error().into())
-        } else {
-            Err(Error::SetIdUnanswered(id.to_string()))
-        }
+        crate::core::answer::IdAnswer::from_parts(
+            self.updated.as_mut().and_then(|values| values.remove(id)),
+            self.not_updated
+                .as_mut()
+                .and_then(|values| values.remove(id))
+                .map(|error| crate::Error::Set(error.to_string_error())),
+            false,
+        )
+        .into_result(&id.to_string(), self.answer_context)
     }
 
     pub(crate) fn destroyed(&mut self, id: &O::Id) -> crate::Result<()> {
-        if self
-            .destroyed
-            .as_ref()
-            .is_some_and(|r| r.iter().any(|i| i == id))
-        {
-            Ok(())
-        } else if let Some(error) = self.not_destroyed.as_mut().and_then(|r| r.remove(id)) {
-            Err(error.to_string_error().into())
-        } else {
-            Err(Error::SetIdUnanswered(id.to_string()))
-        }
+        crate::core::answer::IdAnswer::from_parts(
+            self.destroyed
+                .as_ref()
+                .filter(|ids| ids.contains(id))
+                .map(|_| ()),
+            self.not_destroyed
+                .as_mut()
+                .and_then(|values| values.remove(id))
+                .map(|error| crate::Error::Set(error.to_string_error())),
+            false,
+        )
+        .into_result(&id.to_string(), self.answer_context)
     }
 
     /// Iterate the create-ids of successful creates. Create-ids are

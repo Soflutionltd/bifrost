@@ -189,7 +189,7 @@ pub(super) async fn ack_writer(
     // attempt has already inserted, and an account-wide set let that stale
     // abort delete the newer attempt's rows. A later attempt inserting a scope
     // takes ownership of it.
-    let mut provisional: HashMap<CursorScope, u64> = HashMap::new();
+    let mut provisional: HashMap<CursorScope, crate::engine::ReattachAttempt> = HashMap::new();
     let mut pending_repairs: HashMap<
         crate::cursor::PublicationId,
         Vec<crate::repair::RepairResolution>,
@@ -211,7 +211,10 @@ pub(super) async fn ack_writer(
     // request is dispatched, so its write carries the debt. Unbounded while the
     // ledger never loads, deliberately: every entry is one report a producer
     // already held in memory, and dropping one is the loss this exists to close.
-    let mut pending_debt: Vec<(bifrost_types::InventoryCoverageReport, u64)> = Vec::new();
+    let mut pending_debt: Vec<(
+        bifrost_types::InventoryCoverageReport,
+        crate::cursor::WalkGeneration,
+    )> = Vec::new();
     while let Some(req) = rx.recv().await {
         if loaded_ledger.is_none() {
             match store.get_ledger(&account_id).await {
@@ -835,7 +838,7 @@ impl WriterHandle {
     pub(super) async fn get_change_cursor(
         &self,
         scope: CursorScope,
-        claim_for: Option<u64>,
+        claim_for: Option<crate::engine::ReattachAttempt>,
     ) -> Result<Option<ChangeCursor>, Error> {
         let (done, recv) = oneshot::channel();
         self.tx
@@ -924,7 +927,7 @@ impl WriterHandle {
 
     pub(super) async fn reattach_insert(
         &self,
-        attempt: u64,
+        attempt: crate::engine::ReattachAttempt,
         cursor: ChangeCursor,
     ) -> Result<(), Error> {
         let (done, recv) = oneshot::channel();
@@ -939,7 +942,7 @@ impl WriterHandle {
         recv.await.map_err(|_| Error::ShuttingDown)?
     }
 
-    pub(super) async fn reattach_abort(&self, attempt: u64) {
+    pub(super) async fn reattach_abort(&self, attempt: crate::engine::ReattachAttempt) {
         let (done, recv) = oneshot::channel();
         if self
             .tx
@@ -951,7 +954,10 @@ impl WriterHandle {
         }
     }
 
-    pub(super) async fn reattach_commit(&self, attempt: u64) -> Result<(), Error> {
+    pub(super) async fn reattach_commit(
+        &self,
+        attempt: crate::engine::ReattachAttempt,
+    ) -> Result<(), Error> {
         self.tx
             .send(WriterRequest::ReattachCommit { attempt })
             .await
@@ -1053,7 +1059,10 @@ async fn reject_unloaded_request(
     error: Error,
     account: &AccountId,
     store: &Arc<DynCheckpointStore>,
-    pending_debt: &mut Vec<(bifrost_types::InventoryCoverageReport, u64)>,
+    pending_debt: &mut Vec<(
+        bifrost_types::InventoryCoverageReport,
+        crate::cursor::WalkGeneration,
+    )>,
 ) {
     match req {
         WriterRequest::Ack(req) => {
@@ -1231,7 +1240,7 @@ fn apply_replacement(
     ledger: &mut crate::cursor::DebtLedger,
     key: &bifrost_types::ObligationKey,
     proof: &bifrost_types::RegionRepairProof,
-    generation: u64,
+    generation: crate::cursor::WalkGeneration,
     now: i64,
 ) {
     match proof {
@@ -1882,7 +1891,7 @@ mod tests {
                 bifrost_types::CoverageDomain::full(email_scope()),
                 vec![unrepresentable("refused")],
             ),
-            7,
+            crate::cursor::WalkGeneration::for_test(7),
         );
         crate::inventory_walk::record_refused_debt(Some(&tx), claim)
             .await
@@ -1935,7 +1944,7 @@ mod tests {
             vec![unrepresentable("owed")],
         );
         let mut ledger = crate::cursor::DebtLedger::default();
-        ledger.ingest_debt_only(&report, 1, 1);
+        ledger.ingest_debt_only(&report, crate::cursor::WalkGeneration::for_test(1), 1);
         store
             .inner
             .put_ledger(&AccountId("acct".into()), ledger)
@@ -1950,7 +1959,7 @@ mod tests {
         let (tx, task) = start_flaky_writer(Arc::clone(&store));
         let (done, wait) = oneshot::channel();
         tx.send(WriterRequest::ReattachInsert {
-            attempt: 71,
+            attempt: crate::engine::ReattachAttempt::for_test(71),
             cursor: change_cursor(b"provisional"),
             done,
         })
@@ -1987,7 +1996,7 @@ mod tests {
             publication: (case == "publication").then(|| {
                 PendingCoverage::new().publish(crate::cursor::CoverageClaim {
                     reports: Vec::new(),
-                    generation: 0,
+                    generation: crate::cursor::WalkGeneration::for_test(0),
                 })
             }),
             auto: false,
@@ -2001,9 +2010,12 @@ mod tests {
             matches!(case, "rejected" | "failed" | "publication")
         );
         let (done, wait) = oneshot::channel();
-        tx.send(WriterRequest::ReattachAbort { attempt: 71, done })
-            .await
-            .expect("writer alive");
+        tx.send(WriterRequest::ReattachAbort {
+            attempt: crate::engine::ReattachAttempt::for_test(71),
+            done,
+        })
+        .await
+        .expect("writer alive");
         wait.await.expect("abort answered");
         let saved = store
             .inner
@@ -2029,7 +2041,7 @@ mod tests {
         let (tx, task) = start_flaky_writer(Arc::clone(&store));
         let (done, wait) = oneshot::channel();
         tx.send(WriterRequest::ReattachInsert {
-            attempt: 71,
+            attempt: crate::engine::ReattachAttempt::for_test(71),
             cursor: change_cursor(b"never-live"),
             done,
         })
@@ -2064,9 +2076,12 @@ mod tests {
             .expect("persist answered")
             .expect("persist landed");
         let (done, wait) = oneshot::channel();
-        tx.send(WriterRequest::ReattachAbort { attempt: 71, done })
-            .await
-            .expect("writer alive");
+        tx.send(WriterRequest::ReattachAbort {
+            attempt: crate::engine::ReattachAttempt::for_test(71),
+            done,
+        })
+        .await
+        .expect("writer alive");
         wait.await.expect("abort answered");
         let saved = store
             .inner
@@ -2086,7 +2101,7 @@ mod tests {
         let (tx, task) = start_flaky_writer(Arc::clone(&store));
         let (done, wait) = oneshot::channel();
         tx.send(WriterRequest::ReattachInsert {
-            attempt: 71,
+            attempt: crate::engine::ReattachAttempt::for_test(71),
             cursor: change_cursor(b"never-live"),
             done,
         })
@@ -2108,9 +2123,12 @@ mod tests {
                 .is_none()
         );
         let (done, wait) = oneshot::channel();
-        tx.send(WriterRequest::ReattachAbort { attempt: 71, done })
-            .await
-            .expect("writer alive");
+        tx.send(WriterRequest::ReattachAbort {
+            attempt: crate::engine::ReattachAttempt::for_test(71),
+            done,
+        })
+        .await
+        .expect("writer alive");
         wait.await.expect("abort answered");
         assert!(
             store
@@ -2302,7 +2320,7 @@ mod tests {
         let resolution = || crate::repair::RepairResolution::Irrelevant {
             key: key.clone(),
             detail: "the object is no longer owed".into(),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
         };
 
         store

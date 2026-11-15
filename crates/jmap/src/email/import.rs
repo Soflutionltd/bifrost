@@ -1,5 +1,4 @@
 use crate::{
-    Error,
     core::{
         id::{AccountId, BlobId},
         request::ResultReference,
@@ -52,6 +51,8 @@ pub(crate) struct EmailImport {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct EmailImportResponse {
+    #[serde(skip)]
+    pub(crate) answer_context: crate::core::answer::AnswerContext,
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -73,6 +74,10 @@ impl crate::core::method::JmapMethod for EmailImportRequest {
     const NAME: &'static str = <super::Email as crate::core::Object>::METHODS.import;
     type Cap = <super::Email as crate::core::Object>::Cap;
     type Response = EmailImportResponse;
+
+    fn stamp_response(response: &mut Self::Response, context: crate::core::answer::AnswerContext) {
+        response.answer_context = context;
+    }
 
     fn set_account_id(&mut self, account_id: &AccountId) {
         self.account_id = account_id.clone();
@@ -187,13 +192,15 @@ impl EmailImportResponse {
     }
 
     pub(crate) fn created(&mut self, id: &str) -> crate::Result<Email> {
-        if let Some(result) = self.created.as_mut().and_then(|r| r.remove(id)) {
-            Ok(result)
-        } else if let Some(error) = self.not_created.as_mut().and_then(|r| r.remove(id)) {
-            Err(error.to_string_error().into())
-        } else {
-            Err(Error::SetIdUnanswered(id.to_string()))
-        }
+        crate::core::answer::IdAnswer::from_parts(
+            self.created.as_mut().and_then(|values| values.remove(id)),
+            self.not_created
+                .as_mut()
+                .and_then(|values| values.remove(id))
+                .map(|error| crate::Error::Set(error.to_string_error())),
+            false,
+        )
+        .into_result(id, self.answer_context)
     }
 
     pub(crate) fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {

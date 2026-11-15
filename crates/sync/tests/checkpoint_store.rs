@@ -368,7 +368,7 @@ async fn clear_account_checkpoints_drops_every_row_of_the_account_and_only_that_
     ledger.record_barrier(bifrost_sync::cursor::BarrierIncident {
         key: bifrost_types::ObligationKey(b"barrier".to_vec()),
         domain: bifrost_types::CoverageDomain::full(scopes[0].clone()),
-        generation: 1,
+        generation: walk_generation(1),
         failure_label: "blocked".into(),
         evidence: bifrost_types::AccountError::unsupported(
             bifrost_types::AccountOperation::SyncInventory,
@@ -429,4 +429,13 @@ async fn checked_empty_completion_wins_legacy_marker_at_equal_progress() {
             .expect("present");
         assert_eq!(got.partition, Partition(b"complete:v2".to_vec()));
     }
+}
+
+// Mint test proof orders through the same owner as production walks.
+fn walk_generation(value: u64) -> bifrost_sync::cursor::WalkGeneration {
+    let coverage = bifrost_sync::cursor::PendingCoverage::new();
+    for _ in 0..value {
+        let _ = coverage.next_generation();
+    }
+    coverage.next_generation()
 }

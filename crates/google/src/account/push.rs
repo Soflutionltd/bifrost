@@ -68,6 +68,14 @@ struct MailboxWatch {
     holders: Mutex<usize>,
 }
 
+// This registry needs Net-owned typed shared storage before it can move out
+// of process scope. Net's shared_hold and shared_concurrency_limit registries
+// contain only their own concrete payloads, not arbitrary provider state.
+// AccountNet::shares_transport_with can compare live handles, but exposes no
+// weak Net identity or storage. Keeping AccountNet handles in a global map
+// would pin transports; a factory-local map would fail to coordinate accounts
+// opened by separate factories sharing one Net. Preserve coordination until
+// Net exposes a shared-state registry rather than silently weakening it.
 static MAILBOX_WATCHES: LazyLock<
     Mutex<HashMap<super::mailbox::MailboxAddress, Weak<MailboxWatch>>>,
 > = LazyLock::new(Mutex::default);

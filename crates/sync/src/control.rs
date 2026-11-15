@@ -43,6 +43,10 @@ pub struct SyncControl {
     admitted: bool,
 }
 
+/// Control-boundary observation order, independent of coverage proof order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CheckpointGeneration(u64);
+
 /// Latest checkpoint snapshot carried by the `watch` channel. The
 /// generation counter increments each time `pause` or
 /// `checkpoint_now` is invoked. A waiter returns only after a
@@ -51,7 +55,7 @@ pub struct SyncControl {
 #[derive(Debug, Clone)]
 struct CheckpointSnapshot {
     /// Generation at which this checkpoint was recorded.
-    generation: u64,
+    generation: CheckpointGeneration,
     /// The checkpoint itself, if any has been recorded yet.
     checkpoints: DurableCheckpointSet,
     /// No engine stream operation is active and every broadcast
@@ -134,7 +138,7 @@ impl SyncControl {
         publications: Arc<crate::cursor::Publications>,
     ) -> Self {
         let (checkpoint_tx, _rx) = watch::channel(CheckpointSnapshot {
-            generation: 0,
+            generation: CheckpointGeneration(0),
             checkpoints: DurableCheckpointSet::default(),
             quiescent: true,
         });
@@ -320,7 +324,7 @@ impl SyncControl {
                     .collect(),
             )
         };
-        let generation = self.inner.generation.load(Ordering::SeqCst);
+        let generation = CheckpointGeneration(self.inner.generation.load(Ordering::SeqCst));
         let snapshot = CheckpointSnapshot {
             generation,
             checkpoints,
@@ -351,7 +355,7 @@ impl SyncControl {
     /// publication cannot exist with only one of its halves.
     #[cfg(test)]
     pub(crate) fn expect_checkpoint(&self, checkpoint: Checkpoint) -> crate::cursor::PublicationId {
-        self.publish_checkpoint_without_report(checkpoint, 0)
+        self.publish_checkpoint_without_report(checkpoint)
     }
 
     /// Atomically create both halves of a checkpoint publication:
@@ -381,7 +385,7 @@ impl SyncControl {
         &self,
         checkpoint: Checkpoint,
         claim: crate::cursor::CoverageClaim,
-        expected_fence: u64,
+        expected_fence: crate::cursor::ScopeFence,
     ) -> Result<crate::cursor::PublicationId, crate::cursor::CoverageClaim> {
         self.inner
             .publications
@@ -396,14 +400,14 @@ impl SyncControl {
     pub(crate) fn publish_walk_marker_if_fence(
         &self,
         checkpoint: Checkpoint,
-        walk_watermark: u64,
-        expected_fence: u64,
+        walk_watermark: crate::cursor::UndeliveredMark,
+        expected_fence: crate::cursor::ScopeFence,
     ) -> Result<crate::cursor::PublicationId, crate::cursor::CoverageClaim> {
         self.inner.publications.register_if_fence(
             checkpoint,
             crate::cursor::CoverageClaim {
                 reports: Vec::new(),
-                generation: 0,
+                generation: crate::cursor::PendingCoverage::initial_generation(),
             },
             expected_fence,
             Some(walk_watermark),
@@ -419,8 +423,10 @@ impl SyncControl {
     pub(crate) fn publish_checkpoint_without_report(
         &self,
         checkpoint: Checkpoint,
-        generation: u64,
     ) -> crate::cursor::PublicationId {
+        // A report-less publication still takes its generation from the
+        // coverage owner, never from a bare integer.
+        let generation = self.inner.publications.next_generation();
         self.inner.publications.register(
             checkpoint,
             crate::cursor::CoverageClaim {
@@ -447,7 +453,7 @@ impl SyncControl {
     /// still in flight, and taking its coverage claim with it.
     pub(crate) fn retire_publication(&self, publication: crate::cursor::PublicationId) {
         self.inner.publications.retire_publication(publication);
-        let generation = self.inner.generation.load(Ordering::SeqCst);
+        let generation = CheckpointGeneration(self.inner.generation.load(Ordering::SeqCst));
         self.publish_quiescence(generation);
     }
 
@@ -487,7 +493,7 @@ impl SyncControl {
                  that can no longer be acked"
             );
         }
-        let generation = self.inner.generation.load(Ordering::SeqCst);
+        let generation = CheckpointGeneration(self.inner.generation.load(Ordering::SeqCst));
         self.publish_quiescence(generation);
         abandoned
     }
@@ -503,7 +509,7 @@ impl SyncControl {
     /// last outstanding boundary while a `pause` or `checkpoint_now` waiter sits
     /// on the checkpoint watch, and that waiter never wakes.
     pub(crate) fn publish_boundary_progress(&self) {
-        let generation = self.inner.generation.load(Ordering::SeqCst);
+        let generation = CheckpointGeneration(self.inner.generation.load(Ordering::SeqCst));
         self.publish_quiescence(generation);
     }
 
@@ -574,7 +580,7 @@ impl SyncControl {
         self.inner.publications.pending_checkpoints() == 0
     }
 
-    fn publish_quiescence(&self, generation: u64) {
+    fn publish_quiescence(&self, generation: CheckpointGeneration) {
         if !self.is_quiescent() {
             return;
         }
@@ -590,7 +596,7 @@ impl SyncControl {
         let previous = self.inner.active.fetch_sub(1, Ordering::SeqCst);
         debug_assert!(previous > 0, "sync activity counter underflow");
         if previous == 1 {
-            let generation = self.inner.generation.load(Ordering::SeqCst);
+            let generation = CheckpointGeneration(self.inner.generation.load(Ordering::SeqCst));
             self.publish_quiescence(generation);
         }
     }
@@ -612,7 +618,7 @@ impl SyncControl {
     /// inert during teardown by ruling, so the rescue is deliberate instead.
     async fn wait_for_checkpoint_at_or_after(
         &self,
-        generation: u64,
+        generation: CheckpointGeneration,
     ) -> Result<DurableCheckpointSet, AccountError> {
         // Subscribe to a fresh receiver. The current value is the
         // last recorded snapshot; if it already matches the
@@ -713,7 +719,8 @@ impl Control for SyncControl {
             // Bump the generation BEFORE flipping the boundary so
             // `record_checkpoint` calls that race with us land in the
             // new generation, not the old one.
-            let gen_id = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let gen_id =
+                CheckpointGeneration(self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1);
             self.engine_pause(bifrost_types::PauseReason::ConsumerRequested);
             self.publish_quiescence(gen_id);
             self.wait_for_checkpoint_at_or_after(gen_id).await
@@ -730,7 +737,8 @@ impl Control for SyncControl {
         >,
     > {
         Box::pin(async move {
-            let gen_id = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let gen_id =
+                CheckpointGeneration(self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1);
             // Read-and-install is one atomic step, so a `Pause` landing
             // between the two is never displaced by this request.
             // The guard restores on EVERY exit from the wait, not just

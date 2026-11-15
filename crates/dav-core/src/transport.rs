@@ -1,14 +1,9 @@
 //! The DAV request record, response shape, and origin comparison.
 //!
 //! DAV traffic rides `bifrost-net` like every other HTTP protocol crate, so the
-//! retry budget, per-host rate limiting, bandwidth metering and observability
-//! are the shared ones rather than a second implementation. What DAV keeps for
-//! itself is the credential-origin gate and the redirect walk that enforces it:
-//! `AccountNet` strips `Authorization` on a cross-origin hop with no way to
-//! restore it, and its trusted-host allowlist compares hosts where the DAV gate
-//! compares scheme, host and effective port. Redirects are therefore disabled on
-//! the account spec and walked here, one hop at a time, each with credentials
-//! minted for the origin actually being addressed.
+//! retry budget, per-host rate limiting, bandwidth metering, redirect walk,
+//! refresh and total deadline are shared. DAV supplies credential-origin
+//! admission and dialect header/target rules through net's hop policy.
 
 use std::time::Duration;
 
@@ -48,12 +43,9 @@ pub struct DavBody {
 
 /// A DAV request as an owned record rather than a builder.
 ///
-/// The redirect walk re-dispatches the same logical request against a new
-/// origin, with the credential for that origin swapped in. A `reqwest`-style
-/// builder cannot express that: it is consumed on send and only conditionally
-/// cloneable, so the previous walk replayed through `try_clone` and gave up
-/// with a local error when a body made the request unclonable. An owned record
-/// is rebuildable per hop by construction.
+/// Wrappers assemble this record without reading credentials. The dispatcher
+/// forwards its owned bytes and replay declaration to net once; net rebuilds
+/// each retry and redirect hop and consults DAV's credential and target policy.
 #[derive(Debug, Clone)]
 pub struct DavRequest {
     pub(crate) method: Method,
@@ -212,13 +204,7 @@ pub fn origin_is_secure(value: &str) -> bool {
 #[must_use]
 pub fn url_origin(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
-    let host = url.host_str()?.to_ascii_lowercase();
-    Some(format!(
-        "{}://{}:{}",
-        url.scheme().to_ascii_lowercase(),
-        host,
-        url.port_or_known_default()?
-    ))
+    bifrost_net::origin_key(&url)
 }
 
 #[cfg(test)]

@@ -419,7 +419,7 @@ pub(crate) fn get_stream(
 /// `stream::unfold` at all: the lifecycle stream is an unfold but emits a
 /// different event enum with no batches, no boundary, no byte tally and no
 /// terminal `Done`, and the inventory walk is an `async_stream::stream!`. What
-/// the three unfolds actually share is a seven-line `finished` / `emitted_done`
+/// the three unfolds actually share is a small completion
 /// epilogue. Everything around it differs, and each difference is load-bearing:
 ///
 /// - Batch source. Mutation and hydration drain an input `AccountStream`; the
@@ -453,7 +453,8 @@ pub(crate) fn get_stream(
 ///
 /// A driver covering all of it needs roughly a dozen parameters, several of
 /// them closures returning the next batch, to delete seven duplicated lines
-/// three times. Keep the machines separate.
+/// three times. Keep the machines separate, with each phase enum owning
+/// its pending output and completion state.
 pub(crate) fn get_stream_cancellable(
     client: Arc<GmailClient>,
     cache: ScopeCache,
@@ -473,26 +474,20 @@ pub(crate) fn get_stream_cancellable(
         ids,
         projection,
         shutdown,
-        finished: false,
-        emitted_done: false,
-        pending_termination: None,
+        phase: HydratePhase::Reading,
     };
 
     Box::pin(stream::unfold(state, |mut state| async move {
         if state.shutdown.is_cancelled() {
             return None;
         }
-        if let Some(error) = state.pending_termination.take() {
-            state.finished = true;
-            state.emitted_done = true;
-            return Some((SyncEvent::Terminated(error), state));
-        }
-        if state.finished {
-            if state.emitted_done {
-                return None;
+        match std::mem::replace(&mut state.phase, HydratePhase::Ended) {
+            HydratePhase::Ended => return None,
+            HydratePhase::Done => return Some((SyncEvent::Done(None), state)),
+            HydratePhase::Terminating(error) => {
+                return Some((SyncEvent::Terminated(error), state));
             }
-            state.emitted_done = true;
-            return Some((SyncEvent::Done(None), state));
+            HydratePhase::Reading => state.phase = HydratePhase::Reading,
         }
 
         let mut ids = Vec::new();
@@ -525,12 +520,11 @@ pub(crate) fn get_stream_cancellable(
             }
         }
         if ids.is_empty() {
-            state.finished = true;
-            state.emitted_done = true;
+            state.phase = HydratePhase::Ended;
             return Some((SyncEvent::Done(None), state));
         }
         if final_batch {
-            state.finished = true;
+            state.phase = HydratePhase::Done;
         }
 
         // Resolved after the id drain, not before it: `labels_for_flags`
@@ -543,8 +537,7 @@ pub(crate) fn get_stream_cancellable(
         let labels = match labels_result {
             Ok(labels) => labels,
             Err(error) => {
-                state.finished = true;
-                state.emitted_done = true;
+                state.phase = HydratePhase::Ended;
                 // Not one id of the batch was transmitted: the label
                 // refresh failed before any `users.messages.get` went out,
                 // so every drained id stays UNREPORTED behind the
@@ -617,12 +610,11 @@ pub(crate) fn get_stream_cancellable(
         drop(hydrated);
 
         if let Some(error) = stream_error {
-            state.finished = true;
             if items.is_empty() {
-                state.emitted_done = true;
+                state.phase = HydratePhase::Ended;
                 return Some((SyncEvent::Terminated(error), state));
             }
-            state.pending_termination = Some(error);
+            state.phase = HydratePhase::Terminating(error);
         }
 
         Some((
@@ -642,15 +634,21 @@ pub(crate) fn get_stream_cancellable(
     }))
 }
 
+// A deferred termination owns its error, so it cannot also promise Done.
+enum HydratePhase {
+    Reading,
+    Done,
+    Terminating(bifrost_types::AccountError),
+    Ended,
+}
+
 struct HydrateState {
     client: Arc<GmailClient>,
     tally: crate::client::ByteTally,
     cache: ScopeCache,
     ids: AccountStream<ObjectId>,
     projection: Projection,
-    finished: bool,
-    emitted_done: bool,
-    pending_termination: Option<bifrost_types::AccountError>,
+    phase: HydratePhase,
     shutdown: CancellationToken,
 }
 

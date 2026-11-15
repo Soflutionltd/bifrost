@@ -10,6 +10,7 @@ mod changes;
 mod cloud;
 mod contacts;
 mod cursor;
+mod delta;
 mod error;
 mod ews_stream;
 mod filters;

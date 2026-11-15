@@ -276,7 +276,11 @@ async fn queued_search_uses_capabilities_received_by_preceding_command() {
         driver_pair, preauth_greeting, read_line, respond, select_inbox, tag_of,
     };
     use std::time::Duration;
-    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    // The handle admits against its snapshot (WITHIN advertised at submission),
+    // then the preceding command's CAPABILITY drops WITHIN. The driver checks
+    // live state at the head of the queue: the search is refused as a state
+    // change before send and never reaches the wire.
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 WITHIN")).await;
     select_inbox(&conn, &mut server).await;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
@@ -287,17 +291,17 @@ async fn queued_search_uses_capabilities_received_by_preceding_command() {
         queued_rx.await.unwrap();
         respond(
             &mut server,
-            &format!("* CAPABILITY IMAP4rev1 WITHIN\r\n{noop_tag} OK done\r\n"),
+            &format!("* CAPABILITY IMAP4rev1\r\n{noop_tag} OK done\r\n"),
         )
         .await;
-        let search = read_line(&mut server).await;
-        assert!(search.contains("UID SEARCH OLDER 1"));
-        let search_tag = tag_of(&search).to_owned();
-        respond(
-            &mut server,
-            &format!("* SEARCH 1\r\n{search_tag} OK done\r\n"),
-        )
-        .await;
+        // Read until the client hangs up; any SEARCH means the stale command
+        // reached the wire.
+        let mut rest = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut server, &mut rest)
+            .await
+            .unwrap();
+        let rest = String::from_utf8_lossy(&rest);
+        assert!(!rest.contains("SEARCH"), "stale SEARCH written: {rest:?}");
     });
     let search = async {
         ready_rx.await.unwrap();
@@ -305,11 +309,12 @@ async fn queued_search_uses_capabilities_received_by_preceding_command() {
         conn.uid_search("OLDER 1", Duration::from_secs(5)).await
     };
     let (noop, search) = tokio::join!(conn.noop(Duration::from_secs(5)), search);
-    if search.is_err() {
-        script.abort();
-    }
     noop.unwrap();
-    search.unwrap();
+    assert!(
+        matches!(search, Err(Error::StateChangedBeforeSend(_))),
+        "{search:?}"
+    );
+    drop(conn);
     script.await.unwrap();
 }
 

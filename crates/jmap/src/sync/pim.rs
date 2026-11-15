@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::error::set_answer_error;
+use super::error::answer_error;
 
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AccountStream, AttachmentSource,
@@ -147,12 +147,7 @@ pub(crate) fn set_keyword<T: HttpTransport>(
                 }
             };
             for id in chunk {
-                progress.item(
-                    id,
-                    response.updated(id),
-                    AccountOperation::SetKeyword,
-                    false,
-                );
+                progress.item(id, response.updated(id), AccountOperation::SetKeyword);
             }
             if progress.is_failed() {
                 break;
@@ -264,18 +259,12 @@ impl SetProgress {
             error,
         });
     }
-    /// Record one id's `Email/set` answer. `guarded` says the set carried
-    /// `ifInState`. An unanswered id is `Uncertain` explicitly: for an
+    /// Record one id's `Email/set` answer with its request-stamped guard.
+    /// An unanswered id is `Uncertain` explicitly: for an
     /// idempotent unguarded op its PartialResponse leaf advises a same-request
     /// retry, which `from_leaf` would read as `NotApplied`.
-    fn item(
-        &mut self,
-        id: &EmailId,
-        result: crate::Result<impl Sized>,
-        op: AccountOperation,
-        guarded: bool,
-    ) {
-        let missing = matches!(&result, Err(crate::Error::SetIdUnanswered(_)));
+    fn item(&mut self, id: &EmailId, result: crate::Result<impl Sized>, op: AccountOperation) {
+        let missing = matches!(&result, Err(crate::Error::IdUnanswered { .. }));
         let outcome = super::mail_set::classify_set_response(
             result.map(|_| ()),
             ObjectId(self.owner.as_deref().map_or_else(
@@ -283,7 +272,6 @@ impl SetProgress {
                 |owner| super::foreign::encode_object(owner, id.as_str()),
             )),
             op,
-            guarded,
         );
         match outcome {
             bifrost_types::ItemOutcome::Succeeded(success) => {
@@ -414,10 +402,7 @@ fn submission_create_error(
         _ => false,
     };
     // An omitted submission create is not a refusal: it may have landed.
-    (
-        set_answer_error(operation, "EmailSubmission/set", false)(error),
-        rejected,
-    )
+    (answer_error(operation)(error), rejected)
 }
 /// A send whose submission did not succeed. `rejected` is a proven refusal
 /// (`notCreated`, or any method error except `serverPartialFail`): the
@@ -599,7 +584,7 @@ fn take_implicit_email_set(
     };
     let outcome = match answer {
         Ok(()) => ImplicitOutcome::Applied,
-        Err(error @ crate::Error::SetIdUnanswered(_)) => ImplicitOutcome::Unknown(error),
+        Err(error @ crate::Error::IdUnanswered { .. }) => ImplicitOutcome::Unknown(error),
         Err(error) => ImplicitOutcome::Refused(error),
     };
     (state, outcome)
@@ -869,7 +854,7 @@ pub(crate) fn send_message<T: HttpTransport>(
             Ok((mut result, state)) => (
                 result
                     .created(&email_create_id)
-                    .map_err(set_answer_error(AccountOperation::Send, "Email/set", false))
+                    .map_err(answer_error(AccountOperation::Send))
                     .and_then(|email| require_created_email_id(&email, AccountOperation::Send)),
                 state,
             ),
@@ -1048,11 +1033,7 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
             Ok((mut result, state)) => (
                 result
                     .created(&import_create_id)
-                    .map_err(set_answer_error(
-                        AccountOperation::Send,
-                        "Email/import",
-                        false,
-                    ))
+                    .map_err(answer_error(AccountOperation::Send))
                     .and_then(|email| require_created_email_id(&email, AccountOperation::Send)),
                 state,
             ),
@@ -1212,11 +1193,9 @@ pub(crate) fn draft_create<T: HttpTransport>(
             state_cache::set_transition(response.old_state(), response.new_state()),
         )
         .await;
-        let email = response.created(&create_id).map_err(set_answer_error(
-            AccountOperation::DraftCreate,
-            "Email/set",
-            false,
-        ))?;
+        let email = response
+            .created(&create_id)
+            .map_err(answer_error(AccountOperation::DraftCreate))?;
         let email_id =
             require_created_email_id(&email, AccountOperation::DraftCreate).map_err(|error| {
                 let mut record =
@@ -1264,11 +1243,7 @@ pub(crate) fn draft_update<T: HttpTransport>(
         .await?;
         response
             .updated(&email_id)
-            .map_err(super::error::set_answer_error(
-                AccountOperation::DraftUpdate,
-                "Email/set",
-                false,
-            ))?;
+            .map_err(super::error::answer_error(AccountOperation::DraftUpdate))?;
         Ok(())
     })
 }
@@ -1707,11 +1682,9 @@ pub(crate) fn container_create<T: HttpTransport>(
         if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
             state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
-        let mailbox = response.created(&create_id).map_err(set_answer_error(
-            AccountOperation::ContainerCreate,
-            "Mailbox/set",
-            false,
-        ))?;
+        let mailbox = response
+            .created(&create_id)
+            .map_err(answer_error(AccountOperation::ContainerCreate))?;
         // An id-less success entry is refused, never handed back as an empty
         // ContainerId; the state cache above still advances, since the set
         // reported its new state either way.
@@ -1743,11 +1716,9 @@ pub(crate) fn container_rename<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::ContainerRename))?;
         // Silence about this id is an unconfirmed write, not a successful
         // folder change. Keep the sidebar honest even if newState advanced.
-        response.updated(&mailbox).map_err(set_answer_error(
-            AccountOperation::ContainerRename,
-            "Mailbox/set",
-            false,
-        ))?;
+        response
+            .updated(&mailbox)
+            .map_err(answer_error(AccountOperation::ContainerRename))?;
         if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
             state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
@@ -1784,11 +1755,9 @@ pub(crate) fn container_move<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::ContainerMove))?;
         // Silence about this id is an unconfirmed write, not a successful
         // folder change. Keep the sidebar honest even if newState advanced.
-        response.updated(&mailbox).map_err(set_answer_error(
-            AccountOperation::ContainerMove,
-            "Mailbox/set",
-            false,
-        ))?;
+        response
+            .updated(&mailbox)
+            .map_err(answer_error(AccountOperation::ContainerMove))?;
         if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
             state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
@@ -1814,10 +1783,8 @@ pub(crate) fn container_delete<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::ContainerDelete))?;
         response
             .destroyed(&mailbox)
-            .map_err(super::error::set_answer_error(
+            .map_err(super::error::answer_error(
                 AccountOperation::ContainerDelete,
-                "Mailbox/set",
-                false,
             ))?;
         if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
             state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
@@ -2015,11 +1982,7 @@ pub(crate) fn identity_update<T: HttpTransport>(
         response
             .updated(&identity)
             .map(drop)
-            .map_err(set_answer_error(
-                AccountOperation::IdentityUpdate,
-                "Identity/set",
-                false,
-            ))
+            .map_err(answer_error(AccountOperation::IdentityUpdate))
     })
 }
 
@@ -2081,11 +2044,7 @@ pub(crate) fn vacation_set<T: HttpTransport>(
         response
             .updated(&VacationResponseId::new("singleton"))
             .map(drop)
-            .map_err(set_answer_error(
-                AccountOperation::VacationSet,
-                "VacationResponse/set",
-                false,
-            ))
+            .map_err(answer_error(AccountOperation::VacationSet))
     })
 }
 
@@ -2549,7 +2508,6 @@ async fn resolve_thread_emails_in_mailbox<T: HttpTransport>(
         }
 
         let requested = chunk.iter().cloned().collect::<HashSet<_>>();
-        let mut answered = HashSet::new();
         for email in response.list() {
             let Some(id) = email.id() else {
                 continue;
@@ -2557,7 +2515,6 @@ async fn resolve_thread_emails_in_mailbox<T: HttpTransport>(
             if !requested.contains(id) {
                 continue;
             }
-            answered.insert(id.clone());
             if email
                 .mailbox_ids()
                 .iter()
@@ -2573,11 +2530,15 @@ async fn resolve_thread_emails_in_mailbox<T: HttpTransport>(
         // id in neither response lane makes membership unknowable; fail closed
         // before sending any permanent-delete request.
         for id in chunk {
-            if !answered.contains(id) && !response.not_found().contains(id) {
-                return Err(super::error::get_id_unanswered(
-                    id.as_str(),
-                    super::error::JmapErrorContext::new(op),
-                ));
+            let answer = response.answer(id, |email| email.id() == Some(id));
+            match answer {
+                crate::core::answer::IdAnswer::Ok(_)
+                | crate::core::answer::IdAnswer::NotFound(_) => {}
+                other => {
+                    other
+                        .into_result(id.as_str(), response.answer_context)
+                        .map_err(super::error::answer_error(op))?;
+                }
             }
         }
     }
@@ -2630,7 +2591,7 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
             .filter(|state| !state.is_empty())
             .map(str::to_string);
         for id in chunk {
-            progress.item(id, response.destroyed(id), op, true);
+            progress.item(id, response.destroyed(id), op);
         }
         if progress.is_failed() {
             break;
@@ -2717,7 +2678,7 @@ async fn patch_mailbox_membership_of<T: HttpTransport>(
             }
         };
         for id in chunk {
-            progress.item(id, response.updated(id), op, false);
+            progress.item(id, response.updated(id), op);
         }
         if progress.is_failed() {
             break;
@@ -2854,7 +2815,6 @@ async fn destroy_emails<T: HttpTransport>(
             response.destroyed(id),
             ObjectId(id.as_str().to_owned()),
             op,
-            false,
         ) {
             bifrost_types::ItemOutcome::Succeeded(_) => {}
             bifrost_types::ItemOutcome::Failed(failure) => return Err(failure.error),
@@ -4085,10 +4045,13 @@ async fn copy_attachment_blob<T: HttpTransport>(
     if response.from_account_id().as_str() != source_account
         || response.account_id().as_str() != mail.id_str()
     {
-        return Err(to_acct_err(op)(crate::Error::NotParsable(
-            "Blob/copy response named accounts other than the requested source and destination"
-                .to_string(),
-        )));
+        // A readable answer for different accounts cannot establish this copy.
+        // This is a broken response contract, not a blob-format parse failure.
+        return Err(super::error::contract_violation(
+            op,
+            None,
+            "Blob/copy response named accounts other than the requested source and destination",
+        ));
     }
     response.copied(&blob_id).map_err(to_acct_err(op))
 }
@@ -4178,10 +4141,8 @@ pub(crate) fn cancel_scheduled_send<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::CancelScheduledSend))?;
         set_response
             .updated(&submission_id)
-            .map_err(super::error::set_answer_error(
+            .map_err(super::error::answer_error(
                 AccountOperation::CancelScheduledSend,
-                "EmailSubmission/set",
-                false,
             ))?;
         Ok(())
     })
@@ -4228,18 +4189,15 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
             .call(email_get)
             .await
             .map_err(to_acct_err(AccountOperation::RescheduleSend))?;
-        if !email_response
-            .list()
-            .iter()
-            .any(|email| email.id() == Some(&email_id))
-        {
-            if email_response.not_found().contains(&email_id) {
+        match email_response.answer(&email_id, |email| email.id() == Some(&email_id)) {
+            crate::core::answer::IdAnswer::NotFound(_) => {
                 return Err(reschedule_not_found(email_id.as_str()));
             }
-            return Err(super::error::get_id_unanswered(
-                email_id.as_str(),
-                super::error::JmapErrorContext::new(AccountOperation::RescheduleSend),
-            ));
+            answer => {
+                answer
+                    .into_result(email_id.as_str(), email_response.answer_context)
+                    .map_err(super::error::answer_error(AccountOperation::RescheduleSend))?;
+            }
         }
 
         let mail_from_email = existing
@@ -4269,11 +4227,7 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
         // is a plain reconcilable PartialResponse leaf with no record.
         cancel_response
             .updated(&submission_id)
-            .map_err(super::error::set_answer_error(
-                AccountOperation::RescheduleSend,
-                "EmailSubmission/set",
-                false,
-            ))?;
+            .map_err(super::error::answer_error(AccountOperation::RescheduleSend))?;
 
         let mut set = EmailSubmissionSet::new();
         {
@@ -4293,14 +4247,10 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
             let raisable = matches!(
                 &error,
                 crate::Error::ResponseDecode(_)
-                    | crate::Error::SetIdUnanswered(_)
+                    | crate::Error::IdUnanswered { .. }
                     | crate::Error::CallNotFound(_)
             ) || matches!(&error, crate::Error::Transport(transport) if transport.local.is_none());
-            let error = set_answer_error(
-                AccountOperation::RescheduleSend,
-                "EmailSubmission/set",
-                false,
-            )(error);
+            let error = answer_error(AccountOperation::RescheduleSend)(error);
             let unsent = error.chain().iter().any(|cause| {
                 matches!(
                     cause,
@@ -8886,14 +8836,19 @@ mod tests {
             &EmailId::new("applied"),
             Ok(()),
             AccountOperation::SetKeyword,
-            false,
         );
         for id in ["missing-one", "missing-two"] {
             progress.item(
                 &EmailId::new(id),
-                Err::<(), _>(crate::Error::SetIdUnanswered(id.to_owned())),
+                Err::<(), _>(crate::Error::IdUnanswered {
+                    id: id.to_owned(),
+                    context: crate::core::answer::AnswerContext {
+                        method: "Email/set",
+                        guarded: false,
+                        write: true,
+                    },
+                }),
                 AccountOperation::SetKeyword,
-                false,
             );
         }
         let error = progress.finish(StepEffect::Updated).unwrap_err();
@@ -8922,7 +8877,6 @@ mod tests {
                 serde_json::from_str(r#"{"type":"notFound"}"#).unwrap(),
             )),
             AccountOperation::SetKeyword,
-            false,
         );
         assert!(!progress.is_failed());
         assert!(progress.committed.is_empty());

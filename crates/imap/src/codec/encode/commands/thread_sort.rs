@@ -32,7 +32,11 @@ pub(in crate::codec::encode) fn encode_thread_or_sort_cmd(
     }
     // RFC 5256 Section 5: charset = atom / quoted.
     validate_sort_thread_charset(charset)?;
-    validate_search_criteria_crlf(criteria, &format!("{cmd} criteria"), w.literal_mode())?;
+    validate_search_criteria_crlf(
+        criteria,
+        &format!("{cmd} criteria"),
+        super::super::LiteralMode::LiteralPlus,
+    )?;
     validate_non_empty_search_criteria(criteria, cmd)?;
 
     w.raw(tag.as_bytes());

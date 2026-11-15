@@ -13,7 +13,9 @@ use tracing::trace;
 use bifrost_types::TransmissionState;
 
 use crate::codec::classification::{self, ClassificationContext, SolicitationRule};
-use crate::codec::encode::{EncodeOptions, LiteralMode, WireCommand, encode_command};
+#[cfg(test)]
+use crate::codec::encode::LiteralMode;
+use crate::codec::encode::{EncodeOptions, WireCommand, encode_command};
 use crate::error::Error;
 use crate::types::Command;
 use crate::types::response::{Capability, UntaggedResponse, UntaggedStatus};
@@ -104,6 +106,8 @@ pub(super) enum DriverCommand {
     /// `done_rx` fires or the server terminates IDLE (RFC 2177).
     Idle {
         reply: Reply<oneshot::Receiver<()>, Result<IdleTermination, Error>>,
+        /// Handle-admission proof; see `admit_live`.
+        admitted: super::admission::HandleAdmitted,
     },
 }
 
@@ -574,7 +578,7 @@ pub(super) async fn driver_task(
                         // No protocol state changed  -  skip snapshot publish.
                         continue;
                     }
-                    DriverCommand::Idle { reply } => {
+                    DriverCommand::Idle { reply, admitted: _ } => {
                         let Some((done_rx, reply)) = reply.claim() else {
                             trace!("driver: caller withdrew IDLE before it reached the head of the queue");
                             continue;
@@ -707,40 +711,66 @@ pub(in crate::connection) struct PreparedCommand {
 /// `StateChangedBeforeSend`, which the caller may re-issue after a state
 /// refresh. A session that reached Logout is gone, and the honest answer is
 /// `Closed` with `Unsent` evidence. Both leave the framing intact.
+#[cfg(test)]
 pub(in crate::connection) fn live_state_refusal(
     state: &super::state::ProtocolState,
     kind: crate::types::CommandKind,
 ) -> Option<Error> {
-    let session = state.session_state();
-    let legal = kind.legal_states();
-    if !legal.contains(&session) {
-        if session == super::SessionState::Logout {
-            return Some(Error::closed().with_attempt(TransmissionState::Unsent));
+    let snapshot = state.snapshot();
+    super::admission::SessionView {
+        snapshot: &snapshot,
+        tls_active: state.tls_active(),
+    }
+    .require_state(kind)
+    .err()
+    .map(|error| match error {
+        Error::InvalidState(reason) => Error::StateChangedBeforeSend(reason),
+        other => other,
+    })
+}
+
+/// The head-of-queue authority uses the same policy as the handle. A mode
+/// or state that moved while queued is a sequencing race, never unsupported.
+///
+/// The blanket mapping to `StateChangedBeforeSend` is sound because every
+/// queued IMAP command carries a `HandleAdmitted` proof: the only doors onto
+/// the queue (`submit_driver_command` and the IDLE send) require one, and only
+/// `connection::admission` mints it after the same policy passed against the
+/// handle snapshot. A refusal here therefore always contradicts an earlier
+/// admission. The connect-time setup commands that run before a handle exists
+/// (CAPABILITY, the STARTTLS upgrade) have their own checks in `lifecycle`.
+pub(in crate::connection) fn admit_live(
+    state: &super::state::ProtocolState,
+    command: &Command,
+) -> Result<(), Error> {
+    let snapshot = state.snapshot();
+    super::admission::admit(
+        command,
+        &super::admission::SessionView {
+            snapshot: &snapshot,
+            tls_active: state.tls_active(),
+        },
+    )
+    .map_err(|error| match error {
+        Error::InvalidState(reason) => Error::StateChangedBeforeSend(reason),
+        Error::MissingCapability(reason) => {
+            Error::StateChangedBeforeSend(crate::error::LocalFailure::state(
+                crate::error::StateRequirement::Capability(reason.clone()),
+                reason.message,
+            ))
         }
-        return Some(Error::StateChangedBeforeSend(
-            crate::error::LocalFailure::state(
-                crate::error::StateRequirement::LegalStates {
-                    actual: session,
-                    allowed: legal.to_vec(),
-                },
-                format!(
-                    "session moved to {session:?}, out of {legal:?}, before {kind:?} could be sent"
-                ),
-            ),
-        ));
-    }
-    if kind.refused_after_selection() && state.mailbox_selected() {
-        return Some(Error::StateChangedBeforeSend(
-            crate::error::LocalFailure::state(
-                crate::error::StateRequirement::BeforeFirstSelection { command: kind },
-                format!(
-                    "a mailbox was selected in this session before {kind:?} could be sent \
-             (RFC 5161 Section 3.1)"
-                ),
-            ),
-        ));
-    }
-    None
+        Error::StartTlsUnavailable => {
+            Error::StateChangedBeforeSend(crate::error::LocalFailure::state(
+                crate::error::StateRequirement::Capability(crate::error::CapabilityFailure::new(
+                    Capability::StartTls,
+                    crate::error::CapabilityFailureReason::NotAdvertised,
+                    "STARTTLS is no longer available",
+                )),
+                "STARTTLS is no longer available",
+            ))
+        }
+        other => other,
+    })
 }
 
 /// Check and encode `cmd` from the state this task owns, writing nothing and
@@ -768,9 +798,7 @@ pub(in crate::connection) fn prepare_command(
     tag_gen: &mut super::tag::TagGenerator,
     cmd: &Command,
 ) -> Result<PreparedCommand, Error> {
-    if let Some(refusal) = live_state_refusal(state, cmd.kind()) {
-        return Err(refusal);
-    }
+    admit_live(state, cmd)?;
     let tag = tag_gen.next();
     // `Command`'s Debug never prints a message body or a credential.
     trace!(tag, ?cmd, "driver: encoding IMAP command from live state");
@@ -1178,46 +1206,21 @@ pub(super) fn process_untagged_prefix(
 // Pure helpers  -  derive protocol context from ProtocolState
 // ---------------------------------------------------------------------------
 
-/// Derive whether the connection is in `IMAP4rev2` mode.
-///
-/// RFC 9051 Section6.3.1, via the single authority in `crate::types::profile`.
-/// The rule is NOT restated here. This is the driver's view of it, and it is
-/// the one that decides wire bytes - `utf8_mode`, `literal_mode` and the
-/// `allow_literal8` choice all read it - so a copy that drifted here would send
-/// bytes the server's active revision does not accept.
-fn is_rev2(state: &super::state::ProtocolState) -> bool {
-    crate::types::profile::imap4rev2_active(state.capabilities(), state.enabled())
-}
-
 /// Derive the UTF-8 wire mode from protocol state.
 ///
-/// True when `UTF8=ACCEPT` (RFC 6855 Section3) has been enabled or `IMAP4rev2`
-/// is active (RFC 9051 Section7).
+/// True when `UTF8=ACCEPT` (RFC 6855 Section 3) has been enabled or
+/// `IMAP4rev2` is active (RFC 9051 Section 7). Asks the same authority the
+/// encoder uses so reads and writes cannot disagree.
 fn utf8_mode(state: &super::state::ProtocolState) -> bool {
-    state
-        .enabled()
-        .iter()
-        .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT"))
-        || is_rev2(state)
+    build_encode_options(state).utf8_mode
 }
 
 /// Derive the literal negotiation mode from capabilities.
 ///
 /// RFC 7888 Section4 (LITERAL+), Section5 (LITERAL-), RFC 3501 Section4.3 (synchronizing).
+#[cfg(test)]
 fn literal_mode(state: &super::state::ProtocolState) -> LiteralMode {
-    let usable = |capability: &Capability| {
-        crate::types::profile::supports(state.capabilities(), state.enabled(), capability)
-    };
-    // Both arms ask the authority. Its rev2 baseline folds in LITERAL- and
-    // not LITERAL+ (RFC 9051 Appendix E), so pure rev2 lands on the
-    // 4096-octet LITERAL- behaviour and unbounded LITERAL+ needs the token.
-    if usable(&Capability::LiteralPlus) {
-        LiteralMode::LiteralPlus
-    } else if usable(&Capability::LiteralMinus) {
-        LiteralMode::LiteralMinus
-    } else {
-        LiteralMode::Synchronizing
-    }
+    build_encode_options(state).literal_mode
 }
 
 /// Build an [`EncodeOptions`] snapshot from protocol state.
@@ -1225,12 +1228,7 @@ fn literal_mode(state: &super::state::ProtocolState) -> LiteralMode {
 /// The driver builds encode options from the state it owns; there is no
 /// second builder on the connection handle.
 fn build_encode_options(state: &super::state::ProtocolState) -> EncodeOptions {
-    EncodeOptions {
-        utf8_mode: utf8_mode(state),
-        literal_mode: literal_mode(state),
-        capabilities: state.capabilities().to_vec(),
-        enabled: state.enabled().to_vec(),
-    }
+    super::admission::encode_options(&state.snapshot())
 }
 
 /// Build a [`ConsumerContext`] from protocol state.

@@ -74,9 +74,9 @@ async fn run(
         None,
         None,
         None,
-        0,
+        walk_generation(0),
         None,
-        0,
+        bifrost_sync::cursor::PendingCoverage::initial_fence(),
         &delivery,
     )
     .await
@@ -114,9 +114,9 @@ async fn run_observed(
         None,
         None,
         None,
-        0,
+        walk_generation(0),
         None,
-        0,
+        bifrost_sync::cursor::PendingCoverage::initial_fence(),
         &delivery,
     )
     .await
@@ -212,4 +212,13 @@ async fn a_completion_whose_checkpoint_disagrees_with_its_coverage_fails_the_par
         end: PartitionEnd::Exhausted,
     });
     assert_contract_violation(run(vec![done]).await, "a mislabelled completion");
+}
+
+// Mint test proof orders through the same owner as production walks.
+fn walk_generation(value: u64) -> bifrost_sync::cursor::WalkGeneration {
+    let coverage = bifrost_sync::cursor::PendingCoverage::new();
+    for _ in 0..value {
+        let _ = coverage.next_generation();
+    }
+    coverage.next_generation()
 }

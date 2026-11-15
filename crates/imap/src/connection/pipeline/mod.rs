@@ -716,18 +716,20 @@ impl<T> Pipeline<'_, T> {
         self,
         timeout: std::time::Duration,
     ) -> Result<Vec<Result<Box<dyn Any + Send>, Error>>, PipelineError> {
-        for cmd in &self.commands {
-            self.conn
-                .require_state(cmd.kind())
-                .map_err(PipelineError::Driver)?;
-        }
+        let admitted = self
+            .conn
+            .admit_commands(&self.commands)
+            .map_err(PipelineError::Driver)?;
         // One deadline covers queue admission and the wire exchange. A user
         // waiting on a batch expects the same bounded wait as a single command.
         let deadline = tokio::time::Instant::now() + timeout;
         self.conn
-            .submit_driver_command((self.commands, self.pending), Some(deadline), |reply| {
-                super::driver::DriverCommand::Pipeline { reply }
-            })
+            .submit_driver_command(
+                admitted,
+                (self.commands, self.pending),
+                Some(deadline),
+                |reply| super::driver::DriverCommand::Pipeline { reply },
+            )
             .await
             .map_err(|error| match error {
                 Error::DriverGone { .. } | Error::DriverPanicked { .. } => {

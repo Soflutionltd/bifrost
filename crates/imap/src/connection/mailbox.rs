@@ -19,7 +19,6 @@ impl ImapConnection {
         use super::dispatch::ListConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::List)?;
         let cmd = Command::List {
             reference: reference.mailbox_name()?.into(),
             pattern: pattern.mailbox_name()?.into(),
@@ -86,7 +85,6 @@ impl ImapConnection {
         use super::dispatch::ListExtendedConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::List)?;
         let names = patterns
             .iter()
             .map(crate::types::MailboxInput::mailbox_name)
@@ -132,19 +130,10 @@ impl ImapConnection {
         use super::dispatch::ListStatusConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::ListStatus)?;
         // RFC 5819 Section 2 extends the LIST command syntax from RFC 5258
         // Section 3, so IMAP4rev1 needs both LIST-STATUS and LIST-EXTENDED.
         // RFC 9051 Section 6.3.9 folds LIST-STATUS into the IMAP4rev2 base.
-        {
-            let snap = self.state_rx.borrow();
-            if !auth::snapshot_supports(&snap, &Capability::ListStatus) {
-                return Err(Error::MissingCapability("LIST-STATUS".into()));
-            }
-            if !auth::snapshot_supports(&snap, &Capability::ListExtended) {
-                return Err(Error::MissingCapability("LIST-EXTENDED".into()));
-            }
-        }
+
         self.validate_requested_status_items(status_items)?;
         let cmd = Command::ListStatus {
             reference: reference.mailbox_name()?.into(),
@@ -239,15 +228,6 @@ impl ImapConnection {
     ) -> Result<SelectedMailbox, Error> {
         use super::dispatch::SelectConsumer;
 
-        self.check_utf8_only_enforced()?;
-        // SELECT and EXAMINE share one row of the table.
-        self.require_state(crate::types::CommandKind::Select)?;
-        if options.condstore {
-            self.require_condstore()?;
-        }
-        if let Some(ref params) = options.qresync {
-            self.validate_qresync_params(params)?;
-        }
         let wire_mailbox = mailbox.mailbox_name()?;
         let cmd = if is_examine {
             Command::Examine {
@@ -282,37 +262,11 @@ impl ImapConnection {
     /// present when known-uids is also present (per the ABNF in RFC 7162
     /// Section 3.2.5.2).
     pub(super) fn validate_qresync_params(&self, params: &QresyncParams) -> Result<(), Error> {
-        // RFC 7162 Section 3.2.3: the client MUST issue ENABLE QRESYNC
-        // before using QRESYNC parameters in SELECT/EXAMINE.
-        {
-            let snap = self.state_rx.borrow();
-            // The ENABLED echo is stored as the server spelled it, and RFC 9051
-            // Section 9 makes the name an atom, so match it case-insensitively
-            // exactly as `ServerProfile::enabled` does.
-            if !snap
-                .enabled
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
-            {
-                return Err(Error::MissingCapability(
-                    crate::error::CapabilityFailure::new(
-                        Capability::QResync,
-                        crate::error::CapabilityFailureReason::NotEnabled,
-                        "QRESYNC (not ENABLEd)",
-                    ),
-                ));
-            }
+        super::admission::SessionView {
+            snapshot: &self.state_rx.borrow(),
+            tls_active: self.is_encrypted(),
         }
-        // RFC 7162 Section 3.2.5.2 ABNF: seq-match-data is only valid after
-        // known-uids. Reject invalid combinations instead of fabricating data.
-        if params.seq_match_data.is_some() && params.known_uids.is_none() {
-            return Err(Error::InvalidInput(
-                "QRESYNC seq-match-data requires known-uids \
-                 (RFC 7162 Section 3.2.5.2)"
-                    .into(),
-            ));
-        }
-        Ok(())
+        .validate_qresync_params(params)
     }
 
     /// CREATE a mailbox (RFC 3501 Section 6.3.3).
@@ -341,7 +295,6 @@ impl ImapConnection {
         use super::dispatch::CreateConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::Create)?;
         let cmd = Command::Create {
             mailbox: mailbox.mailbox_name()?,
         };
@@ -388,13 +341,7 @@ impl ImapConnection {
         self.check_utf8_only_enforced()?;
         // RFC 6154 Section 3: CREATE is a `command-auth`  -  valid only in
         // Authenticated or Selected state.
-        self.require_state(crate::types::CommandKind::Create)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::CreateSpecialUse) {
-                return Err(Error::MissingCapability("CREATE-SPECIAL-USE".into()));
-            }
-        }
+
         // RFC 6154 Section 3: "The USE parameter MUST NOT contain any
         // non-use-attr values." Reject base LIST attributes like \Noselect,
         // \HasChildren, etc. before sending the command.
@@ -429,7 +376,6 @@ impl ImapConnection {
         use super::dispatch::TaggedOkConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::Delete)?;
         let cmd = Command::Delete {
             mailbox: mailbox.mailbox_name()?,
         };
@@ -451,7 +397,6 @@ impl ImapConnection {
         use super::dispatch::TaggedOkConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::Rename)?;
         let cmd = Command::Rename {
             mailbox: mailbox.mailbox_name()?,
             new_name: new_name.mailbox_name()?,
@@ -476,7 +421,6 @@ impl ImapConnection {
         use super::dispatch::TaggedOkConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::Subscribe)?;
         let cmd = Command::Subscribe {
             mailbox: mailbox.mailbox_name()?,
         };
@@ -497,7 +441,6 @@ impl ImapConnection {
         use super::dispatch::TaggedOkConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::Unsubscribe)?;
         let cmd = Command::Unsubscribe {
             mailbox: mailbox.mailbox_name()?,
         };
@@ -522,20 +465,9 @@ impl ImapConnection {
         use super::dispatch::LsubConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::Lsub)?;
 
         // RFC 9051 Appendix F item 19: LSUB was deprecated in IMAP4rev2.
         // Use LIST with \Subscribed return option instead.
-        if self.is_rev2() {
-            return Err(Error::MissingCapability(
-                crate::error::CapabilityFailure::new(
-                    "IMAP4rev2".into(),
-                    crate::error::CapabilityFailureReason::RemovedInRev2,
-                    "LSUB was deprecated in IMAP4rev2 (RFC 9051 Appendix F); \
-                 use list() with \\Subscribed attribute instead",
-                ),
-            ));
-        }
 
         let cmd = Command::Lsub {
             reference: reference.mailbox_name()?.into(),
@@ -560,7 +492,6 @@ impl ImapConnection {
     pub async fn close(&self, timeout: Duration) -> Result<(), Error> {
         use super::dispatch::TaggedOkConsumer;
 
-        self.require_state(crate::types::CommandKind::Close)?;
         self.submit_regular(
             Command::Close,
             TaggedOkConsumer::default(),
@@ -588,13 +519,6 @@ impl ImapConnection {
     /// The state snapshot transitions to `Authenticated` only after the
     /// tagged OK is received and processed by the driver.
     pub async fn unselect(&self, timeout: Duration) -> Result<(), Error> {
-        self.require_state(crate::types::CommandKind::Unselect)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Unselect) {
-                return Err(Error::MissingCapability("UNSELECT".into()));
-            }
-        }
         self.submit_regular(
             Command::Unselect,
             super::dispatch::TaggedOkConsumer::default(),
@@ -622,7 +546,6 @@ impl ImapConnection {
         use super::dispatch::StatusConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::Status)?;
         self.validate_requested_status_items(items)?;
         let cmd = Command::Status {
             mailbox: mailbox.mailbox_name()?,

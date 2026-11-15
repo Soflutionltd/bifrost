@@ -6,7 +6,7 @@ use bifrost_types::{AccountError, PushLane, PushLaneKind};
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PushHealth {
-    pub generation: u64,
+    pub generation: crate::types::AccountGeneration,
     pub lanes: Vec<PushLaneHealth>,
 }
 #[derive(Debug, Clone)]

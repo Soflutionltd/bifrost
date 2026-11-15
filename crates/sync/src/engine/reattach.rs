@@ -20,16 +20,16 @@ pub(crate) struct RecoveryContext<'a> {
     pub throttles: &'a Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
     pub capabilities: &'a Arc<std::sync::RwLock<AccountCapabilities>>,
     pub subscriptions: &'a Arc<SubscriptionRegistry>,
-    pub account_generation_tx: &'a watch::Sender<u64>,
+    pub account_generation_tx: &'a watch::Sender<crate::types::AccountGeneration>,
     /// The lane supervisor's retirement watch (drained generation plus
     /// one). Reattach waits on it before closing the account it replaced.
-    pub push_retired: &'a watch::Sender<u64>,
+    pub push_retired: &'a watch::Sender<crate::types::AccountGeneration>,
     /// Bound on that wait (`EngineConfig::detach_timeout`).
     pub push_drain_wait: Duration,
     /// The incarnation generation a stamped request (`PushRecovery`, or a
     /// `Recovery` carrying one) was raised against; `None` for an unstamped
     /// request, which acts on whichever incarnation is current.
-    pub expected_generation: Option<u64>,
+    pub expected_generation: Option<crate::types::AccountGeneration>,
     pub reopen_lock: &'a Arc<AsyncMutex<()>>,
     /// Slot-lifetime open-skip lane; a successful reattach replaces it
     /// with the replacement open's `OpenedAccount::skipped_scopes`.
@@ -312,7 +312,7 @@ async fn handle_engine_directive(
                 // anything else means a later replacement owns the account now.
                 if ctx
                     .expected_generation
-                    .is_some_and(|g| ctx.current.load().generation() != g.saturating_add(1))
+                    .is_some_and(|g| ctx.current.load().generation() != g.successor())
                 {
                     tracing::debug!(
                         target: "bifrost.sync.recovery",
@@ -376,16 +376,19 @@ pub(crate) enum RecoveryFollowUp {
     None,
     /// A cursorless scope repair declined under a pause, with the scope's
     /// lifecycle epoch read at decline time.
-    ParkScope { scope: CursorScope, epoch: u64 },
+    ParkScope {
+        scope: CursorScope,
+        epoch: crate::cursor::LifecycleEpoch,
+    },
     /// An account reset declined or exhausted; scopes it owes re-establishment
     /// (scope -> lifecycle epoch).
-    ParkSchemaReset(HashMap<CursorScope, u64>),
+    ParkSchemaReset(HashMap<CursorScope, crate::cursor::LifecycleEpoch>),
     /// Several cursorless establishments declined under a pause: what a parked
     /// schema reset, finding a reset already committed since its decline, owes
     /// when a second pause refuses the establishments it runs instead. Each is
     /// parked as its own [`RecoveryFollowUp::ParkScope`]; this is only the
     /// batched form, since one dispatch can decline many.
-    ParkScopes(HashMap<CursorScope, u64>),
+    ParkScopes(HashMap<CursorScope, crate::cursor::LifecycleEpoch>),
 }
 
 /// Scope repairs declined under a pause that nothing else will raise again,
@@ -418,7 +421,7 @@ pub(crate) enum RecoveryFollowUp {
 /// tasks.
 #[derive(Clone)]
 pub(crate) struct DeferredScopeRepairs {
-    parked: Arc<std::sync::Mutex<HashMap<CursorScope, u64>>>,
+    parked: Arc<std::sync::Mutex<HashMap<CursorScope, crate::cursor::LifecycleEpoch>>>,
 }
 
 impl DeferredScopeRepairs {
@@ -428,7 +431,9 @@ impl DeferredScopeRepairs {
         }
     }
 
-    fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<CursorScope, u64>> {
+    fn guard(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<CursorScope, crate::cursor::LifecycleEpoch>> {
         self.parked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -437,7 +442,7 @@ impl DeferredScopeRepairs {
     /// Remove the entry for `scope` only if it still maps to `epoch`, and
     /// report whether it did. A task whose entry was unparked (its folder was
     /// deleted) or overwritten by a newer epoch takes nothing.
-    pub(crate) fn claim(&self, scope: &CursorScope, epoch: u64) -> bool {
+    pub(crate) fn claim(&self, scope: &CursorScope, epoch: crate::cursor::LifecycleEpoch) -> bool {
         let mut parked = self.guard();
         if parked.get(scope) != Some(&epoch) {
             return false;
@@ -453,7 +458,7 @@ impl DeferredScopeRepairs {
     pub(crate) fn park(
         &self,
         scope: CursorScope,
-        epoch: u64,
+        epoch: crate::cursor::LifecycleEpoch,
         control: SyncControl,
         shutdown: CancellationToken,
         reopen_tx: mpsc::Sender<ReopenRequest>,
@@ -510,18 +515,43 @@ pub(crate) struct DeferredSchemaReset {
     state: Arc<std::sync::Mutex<ParkedReset>>,
 }
 
-#[derive(Default)]
+/// Completed schema clears, owned by the deferred reset state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ResetCount(u64);
+
+impl ResetCount {
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+
+    fn committed(&mut self) {
+        self.0 += 1;
+    }
+}
+
 struct ParkedReset {
     /// Scopes owed re-establishment, `None` when no reset is owed. `Some` of
     /// an empty map is still an owed reset: its scopes are the registered ones
     /// the reset snapshots when it runs.
-    owed: Option<HashMap<CursorScope, u64>>,
+    owed: Option<HashMap<CursorScope, crate::cursor::LifecycleEpoch>>,
     /// Whether a task is parked waiting to send `owed`.
     task: bool,
     /// Account resets whose clear committed during this attachment.
-    completed: u64,
+    completed: ResetCount,
     /// `completed` as of the most recent `park`.
-    parked_at: u64,
+    parked_at: ResetCount,
+}
+
+impl Default for ParkedReset {
+    fn default() -> Self {
+        Self {
+            owed: None,
+            task: false,
+            completed: ResetCount(0),
+            parked_at: ResetCount(0),
+        }
+    }
 }
 
 impl DeferredSchemaReset {
@@ -531,7 +561,7 @@ impl DeferredSchemaReset {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn merge(state: &mut ParkedReset, scopes: HashMap<CursorScope, u64>) {
+    fn merge(state: &mut ParkedReset, scopes: HashMap<CursorScope, crate::cursor::LifecycleEpoch>) {
         let owed = state.owed.get_or_insert_with(HashMap::new);
         for (scope, epoch) in scopes {
             let entry = owed.entry(scope).or_insert(epoch);
@@ -540,13 +570,13 @@ impl DeferredSchemaReset {
     }
 
     /// How many account resets have committed during this attachment.
-    pub(crate) fn completed(&self) -> u64 {
+    pub(crate) fn completed(&self) -> ResetCount {
         self.guard().completed
     }
 
     /// Record that an account reset's clear committed.
     pub(crate) fn reset_completed(&self) {
-        self.guard().completed += 1;
+        self.guard().completed.committed();
     }
 
     /// Drop one deleted scope from the owed set. An optimisation only: the
@@ -561,7 +591,7 @@ impl DeferredSchemaReset {
     /// generation, and spawn the re-raising task unless one is already parked.
     pub(crate) fn park(
         &self,
-        scopes: HashMap<CursorScope, u64>,
+        scopes: HashMap<CursorScope, crate::cursor::LifecycleEpoch>,
         control: SyncControl,
         shutdown: CancellationToken,
         reopen_tx: mpsc::Sender<ReopenRequest>,
@@ -613,7 +643,7 @@ impl DeferredSchemaReset {
 pub(crate) async fn establish_if_absent(
     ctx: &RecoveryContext<'_>,
     scope: CursorScope,
-    epoch: u64,
+    epoch: crate::cursor::LifecycleEpoch,
 ) -> RecoveryFollowUp {
     if ctx.cursors.lifecycle_epoch(&scope) != epoch || ctx.cursors.snapshot(&scope).is_some() {
         return RecoveryFollowUp::None;
@@ -646,8 +676,8 @@ pub(crate) async fn establish_if_absent(
 /// is still absent instead of running a second reset. Otherwise run the reset.
 pub(crate) async fn run_parked_schema_reset(
     ctx: &RecoveryContext<'_>,
-    reestablish: HashMap<CursorScope, u64>,
-    parked_at: u64,
+    reestablish: HashMap<CursorScope, crate::cursor::LifecycleEpoch>,
+    parked_at: ResetCount,
 ) -> RecoveryFollowUp {
     if ctx.deferred_schema_reset.completed() <= parked_at {
         return handle_schema_incompatible(ctx, reestablish).await;
@@ -703,7 +733,7 @@ pub(crate) async fn run_parked_schema_reset(
 /// scope that never finalized and that nobody would otherwise re-establish.
 async fn handle_schema_incompatible(
     ctx: &RecoveryContext<'_>,
-    extra: HashMap<CursorScope, u64>,
+    extra: HashMap<CursorScope, crate::cursor::LifecycleEpoch>,
 ) -> RecoveryFollowUp {
     let Some(activity) = ctx.control.begin_activity() else {
         tracing::debug!(
@@ -1021,7 +1051,7 @@ async fn re_establish_scope_with_backoff(
     ctx: &RecoveryContext<'_>,
     scope: CursorScope,
     control: &SyncControl,
-    walk_fence: u64,
+    walk_fence: crate::cursor::ScopeFence,
 ) {
     let mut backoff = crate::backoff::ReconnectBackoff::new(REOPEN_BACKOFF);
     let mut last_account_error: Option<AccountError> = None;
@@ -1276,11 +1306,26 @@ pub(super) struct ReattachGuard {
     /// abort or commit that settles them, so the writer touches only rows this
     /// attempt owns, even when a delayed send from a dropped attempt arrives
     /// after a later attempt has inserted.
-    attempt: u64,
+    attempt: crate::engine::ReattachAttempt,
     live: Vec<RegisteredSubscription>,
     close_owed: Option<Arc<dyn Account>>,
     rollback_owed: bool,
     commit_owed: bool,
+}
+
+/// Provisional row owner, minted by replacement-account attempts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReattachAttempt(u64);
+
+impl ReattachAttempt {
+    fn mint() -> Self {
+        Self(NEXT_REATTACH_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
 }
 
 /// Source of reattach attempt ids. Process-wide and monotonic, so an id is
@@ -1290,7 +1335,7 @@ static NEXT_REATTACH_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::
 impl ReattachGuard {
     fn new(ctx: &RecoveryContext<'_>, account: Arc<dyn Account>) -> Self {
         Self {
-            attempt: NEXT_REATTACH_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            attempt: ReattachAttempt::mint(),
             close_owed: Some(Arc::clone(&account)),
             account,
             subscriptions: Arc::clone(ctx.subscriptions),
@@ -2010,7 +2055,7 @@ async fn reattach_account_paced(
         // cursor minted by the retired connection into this new topology.
         // The replacement is installed together with its generation, so a
         // worker that loads it can never pair it with the retiring one.
-        let installed_generation = ctx.current.load().generation().saturating_add(1);
+        let installed_generation = ctx.current.load().generation().successor();
         let previous = ctx.current.swap(Arc::new(crate::types::Incarnation::new(
             Arc::clone(&next),
             installed_generation,
@@ -2141,7 +2186,7 @@ async fn reattach_account_paced(
             tracing::warn!(
                 target: "bifrost.sync.recovery",
                 account = ?ctx.account_id,
-                retiring_generation,
+                retiring_generation = ?retiring_generation,
                 "push lanes did not drain within the bound; closing the old account anyway"
             );
         }
@@ -2468,10 +2513,10 @@ async fn run_establish(
     coverage: Arc<PendingCoverage>,
     persist_ready: bool,
     shutdown: &CancellationToken,
-    reattach_attempt: Option<u64>,
+    reattach_attempt: Option<crate::engine::ReattachAttempt>,
     ctx: &RecoveryContext<'_>,
     pacing: &mut RepairPacing,
-    walk_fence: u64,
+    walk_fence: crate::cursor::ScopeFence,
 ) -> Result<EstablishOrigin, Error> {
     pacing.wait(ctx, Some(account), Some(&scope)).await?;
     pacing.failed_keys = crate::recovery::declared_keys(

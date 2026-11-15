@@ -20,7 +20,7 @@ The literal marker parser (`connection/literals.rs`, `literal_marker_at`) is sha
 
 FETCH body and binary fields use `bytes::Bytes`. `WireReader` parses responses smaller than 4096 bytes with owned literals and advances a consumed-prefix offset, reusing its read allocation. It compacts the unread suffix in place only after the consumed prefix exceeds half the buffer capacity, so many co-read small responses do not move the suffix once per response. Larger responses transfer their backing to the parser, copying only when capacity exceeds twice the frame length. Co-read suffix bytes move to a separate read buffer with capacity at least 8 KiB. Literals smaller than 4096 bytes or smaller than one quarter of their frame are copied into independent storage; large proportionate literals retain slices without copying the payload. Standalone parser entry points that receive only `&[u8]` copy literal data because they have no owned backing allocation. The response still has to be fully framed and parsed before it is emitted, so this does not stream a literal incrementally. The literal ceiling still counts declarations before reading payload, and non-literal syntax and parser object overhead remain outside it.
 
-SEARCH-family extension criteria are checked by the encoder using live capabilities, including pipelined commands. The handle scans no criteria capabilities before queuing. The grammar walk skips quoted and literal operands, with literal counts parsed by the same marker parser used for framing and criteria validation.
+SEARCH-family extension criteria contribute requirements through the literal-aware grammar walk in `connection/admission.rs`; the handle checks its snapshot for an early refusal; the driver checks live state before sending, including every command in a pipeline. The walk skips quoted and literal operands, with literal counts parsed by the same marker parser used for framing and criteria validation.
 
 Mailbox decoding keeps a lenient display string and the original wire octets plus
 encoding mode in `MailboxName`. Typed mailbox command arguments replay those
@@ -86,11 +86,13 @@ hierarchy delimiters; unsupported non-ASCII delimiter combinations are refused.
 
 Every IMAP command - APPEND and MULTIAPPEND included - is a `types::Command`, encoded by one encoder (`codec::encode::encode_command`) into one form (`WireCommand`), and written by one sender (`driver::wire_send::send_wire_command`). There is no second payload type, no second encoder and no second send path.
 
-`WireCommand` is a list of segments, each a list of `Bytes` chunks. A segment ends exactly on a synchronizing literal marker; the sender writes every chunk of a segment, flushes once, and waits for `+` before the next segment (RFC 3501 Section 4.3). The boundaries are STRUCTURAL: `CommandWriter` records each one as it emits the marker, so no code rescans encoded bytes to rediscover framing, and marker-shaped bytes inside a literal payload cannot be mistaken for a boundary because nothing looks. `CommandWriter` is the one place literal framing is decided: `string(data, utf8)` makes the quoted-versus-literal choice (NUL is rejected when the whole command is finished, so mailbox and metadata identities are never rewritten; printable ASCII is quoted, plus valid UTF-8 in UTF-8 mode, with control characters and DEL always a literal), and `literal` / `literal_bytes` choose the `+` modifier once, from the live `EncodeOptions` - LITERAL+ any size, LITERAL- and rev2 up to 4096 octets (RFC 7888 Sections 4-5, RFC 9051 Section 4.3) - with the literal8 form (`~{n}`) additionally needing an advertised BINARY on a non-rev2 connection (RFC 7888 Section 6, RFC 9051 Section 9). What a command may CARRY stays with that command's encoder (APPEND's BINARY rule, METADATA's literal8 values); the writer owns marker choice and boundaries and nothing else. `literal_bytes` carries a payload by reference (a reference-count bump), which is how a message body reaches the socket uncopied. `WireCommand`'s `Debug` prints only its shape, and `AppendMessage`'s prints the body's length, so `?cmd` tracing cannot log a message or a credential literal.
+`WireCommand` is a list of segments, each a list of `Bytes` chunks. A segment ends exactly on a synchronizing literal marker; the sender writes every chunk of a segment, flushes once, and waits for `+` before the next segment (RFC 3501 Section 4.3). The boundaries are STRUCTURAL: `CommandWriter` records each one as it emits the marker, so no code rescans encoded bytes to rediscover framing, and marker-shaped bytes inside a literal payload cannot be mistaken for a boundary because nothing looks. `CommandWriter` is the one place literal framing is decided: `string(data, utf8)` makes the quoted-versus-literal choice (NUL is rejected when the whole command is finished, so mailbox and metadata identities are never rewritten; printable ASCII is quoted, plus valid UTF-8 in UTF-8 mode, with control characters and DEL always a literal), and `literal` / `literal_bytes` choose the `+` modifier once, from the live `EncodeOptions` - LITERAL+ any size, LITERAL- and rev2 up to 4096 octets (RFC 7888 Sections 4-5, RFC 9051 Section 4.3) - with the literal8 form (`~{n}`) additionally needing an advertised BINARY on a non-rev2 connection (RFC 7888 Section 6, RFC 9051 Section 9). Admission establishes command capability prerequisites, including MULTIAPPEND and BINARY for NUL-bearing APPEND bodies outside the UTF8 wrapper; the encoder chooses body representation; the writer owns literal markers and segment boundaries. `literal_bytes` carries a payload by reference (a reference-count bump), which is how a message body reaches the socket uncopied. `WireCommand`'s `Debug` prints only its shape, and `AppendMessage`'s prints the body's length, so `?cmd` tracing cannot log a message or a credential literal.
 
 Caller-written literals in SEARCH-family criteria are the one place literal syntax enters from outside the encoder. `validate_search_criteria_crlf` judges the caller's ORIGINAL markers first (a `{n+}` the connection cannot take is `MissingCapability`, never silently rewritten); the walk (`write_criteria`) then copies every non-marker byte and every payload verbatim, skipping each payload by its declared length, and re-emits only the marker through the writer - a `~{n}` as literal8, so the literal8 rule applies. Two spellings can therefore differ from the caller's: a count with leading zeros is written canonically, and a `~{n+}` the connection may not send non-synchronizing loses its `+` and becomes a real segment boundary.
 
-Encoder refusals are the crate's own `Error` variants (`MissingCapability`, worded `<cmd> requires <cap>` for every capability gate; `InvalidInput`; `InvalidAppendDate`; ...), passed to the driver unchanged.
+Command admission belongs to `connection/admission.rs`. The handle reports snapshot refusals before submission (`MissingCapability`, worded `<cmd> requires <cap>` for every capability gate; `InvalidState`; `InvalidInput`; ...). The driver reports changed session or capability prerequisites as `StateChangedBeforeSend`. QRESYNC parameters and VANISHED require confirmed `ENABLE QRESYNC`; advertised-but-disabled modes are sequencing errors (`InvalidState`), not unsupported operations. The encoder validates syntax and chooses wire representation without deciding command availability.
+
+Literal-free pipeline batches coalesce their chunk handles into one unsegmented `WireCommand` (`WireCommand::coalesce_unsegmented`) and pass through `send_wire_command`, preserving one flush without copying payload bytes.
 
 **Session legality** is a property of the command: `CommandKind::legal_states` is the one table (RFC 3501 Section 6 and each extension's section; ID, CAPABILITY, NOOP and LOGOUT in every live state, LOGIN / AUTHENTICATE / STARTTLS in NotAuthenticated, ENABLE in Authenticated only, IDLE and the mailbox, APPEND, METADATA, NOTIFY, QUOTA, ACL, COMPRESS and UNAUTHENTICATE commands in Authenticated or Selected, message commands in Selected; no command in Logout). It is read twice, and the two reads report different facts. The handle reads it to refuse a command the caller should not have issued (`require_state(kind)`, `InvalidState`; `Pipeline::execute_raw` checks every command of a batch at execution and `idle()` checks IDLE). The driver reads it again when the command reaches the head of its queue (`prepare_command`, and `run_pipeline` for every command of a batch before any byte), and a refusal there means the session moved while the command waited: `StateChangedBeforeSend`, or `Closed` with `Unsent` in Logout. The driver's own internal commands (connection setup's CAPABILITY, the STARTTLS and COMPRESS upgrades, and the CAPABILITY refresh after STARTTLS, LOGIN / AUTHENTICATE and UNAUTHENTICATE) run under the stated invariant that their admission follows from state the driver owns; the check still runs for them. Session HISTORY is read beside the table at both sites: RFC 5161 Section 3.1 forbids ENABLE once any mailbox has been selected in the session, even after CLOSE or UNSELECT returns it to Authenticated. `ProtocolState::mailbox_selected` records that a SELECT or EXAMINE has succeeded (a refused one selects nothing), the snapshot publishes it, and `CommandKind::refused_after_selection` names the commands it gates (ENABLE only): the handle refuses with `InvalidState`, the driver with `StateChangedBeforeSend`. UNAUTHENTICATE starts a new session and clears it (RFC 8437 Section 2).
 
@@ -289,8 +291,15 @@ byte, a batch holding a command whose `CommandKind::pipelinable` is false
 (SELECT, EXAMINE, CLOSE, UNSELECT, LOGIN, AUTHENTICATE, LOGOUT, UNAUTHENTICATE,
 STARTTLS, COMPRESS, IDLE, ENABLE, APPEND - an `Internal` error, since only a
 crate bug can build one: the `Pipeline` builder has no method for them), a
-command the live session does not permit (`live_state_refusal`, as for a single
-command), and a command the encoder refuses. EVERY command, of every
+command the live session does not permit (`admit_live`, the shared
+`connection::admission` policy, as for a single command), and a command the
+encoder refuses. `admit_live` reports every head-of-queue refusal as
+`StateChangedBeforeSend`, and that is enforced, not conventional: the handle's
+admission returns a `HandleAdmitted` proof that only `connection::admission`
+can mint, and both doors onto the driver queue (`submit_driver_command` and the
+IDLE send) require one. A live refusal therefore always means the session moved
+after the handle admitted the command, never a permanent refusal the handle
+skipped. EVERY command, of every
 sub-batch, is encoded before the first byte of the first sub-batch, so no
 refusal can land after an earlier sub-batch has run. The batch is encoded and
 admitted against one state snapshot, which holds because no pipelinable command
@@ -674,8 +683,8 @@ it cannot in `excluded()`, and is what `TargetBatch::new` and `subset_uid_set`
 build from. It exists so the lanes that owe no per-id outcome can share one
 definition of "what the operand carries" instead of re-deriving it:
 
-- The PIM primitives (`copy_messages`, `delete_messages`, `set_flag`,
-  `hydrate_decoded`, and the draft `fetch_full_message`) answer
+- The PIM read primitives (`hydrate_decoded` and the draft
+  `fetch_full_message`) answer
   `Result<(), AccountError>` for the whole request, so they have nowhere to
   report a per-id exclusion. `pim_operand` therefore refuses the command with
   `Request(Malformed)` when `excluded()` is non-empty, rather than sending a
@@ -885,7 +894,7 @@ message metadata and parses selected bytes through `bifrost-types::mime`.
 
 - Container membership: `add_to_container` via UID COPY, `remove_from_container` via `+FLAGS.SILENT \Deleted` plus UID EXPUNGE, or the guarded plain-EXPUNGE fallback below; it is advertised on every server. `add_to_container` and `message_hydrate` check their own `pim_methods` flag first and answer `Unsupported` when it is false, like the other primitives.
 
-The per-folder PIM primitives (`copy_messages`, `delete_messages`, `set_flag`, `hydrate_decoded`) stamp failures in the folder's PREPARATION (checkout, SELECT/EXAMINE, UIDVALIDITY read) `Unsent` through `preflight_err`, relative to the operation: the SELECT's own evidence (a tagged NO is `Acknowledged`) is about the SELECT, not the COPY / STORE / FETCH that was never sent, and publishing it would make recovery reconcile a non-idempotent mutation that never reached the server. It speaks for the folder being prepared only; earlier folders of a multi-folder call may already have been mutated. The helpers return FolderProgress carrying those effects, and a preparation failure becomes an effectless primary.
+The per-folder PIM primitives stamp failures in the folder's PREPARATION (checkout, SELECT/EXAMINE, UIDVALIDITY read) `Unsent` - `hydrate_decoded` through `folder_preflight_err`, and `copy_messages`, `delete_messages` and `set_flag` through the shared mutation engine's `mutation_preflight_error` (see "Partial commitment of PIM operations") - relative to the operation: the SELECT's own evidence (a tagged NO is `Acknowledged`) is about the SELECT, not the COPY / STORE / FETCH that was never sent, and publishing it would make recovery reconcile a non-idempotent mutation that never reached the server. It speaks for the folder being prepared only; earlier folders of a multi-folder call may already have been mutated. The helpers return FolderProgress carrying those effects, and a preparation failure becomes an effectless primary.
 
 Every path that removes messages (sync-side `bulk_destroy`, PIM `delete_messages`) goes through `expunge_uids_or_fall_back`. It issues `UID EXPUNGE` (RFC 4315 Section 2), and on `MissingCapability` - a server with neither UIDPLUS nor IMAP4rev2 - falls back to plain `EXPUNGE` only when `UID SEARCH DELETED` shows the mailbox's `\Deleted` set is a subset of the UIDs this batch just marked. Plain EXPUNGE names no messages: running it with a foreign `\Deleted` present would silently destroy another client's mail, so that case keeps the `MissingCapability` failure with the batch left flagged.
 
@@ -1503,7 +1512,7 @@ is conservatively mapped to the full possible UID space.
 
 IMAP diverges from the `MutationSuccess::Skipped` lane other crates use for the engine's "already in this state" short-circuit: the opportunistic MODSEQ cache sends cold-cache STOREs without `UNCHANGEDSINCE`, so "already in state" cannot be observed without a full SELECT+FETCH that defeats the guard. So `STORE UNCHANGEDSINCE <modseq>` rejecting with `MODIFIED` surfaces as `ItemOutcome::Failed { kind: ConcurrencyConflict }` for the conflicting UIDs, never `Succeeded(Skipped)`.
 
-`StoreConsumer::new` takes the command's own `unchanged_since` and has no argument-less form, so how a tagged `NO` is treated is a property of the command rather than a per-call-site choice. Under `UNCHANGEDSINCE` the consumer preserves tagged `NO` as a `StoreResult` with its status, response code and human-readable text (`StoreResult` carries all three for every tagged completion, so a conditional STORE refusal keeps the server's own words), making the legal `NO [MODIFIED ...]` CONDSTORE rejection available to the mutation layer instead of discarding its per-UID conflict evidence. Without `UNCHANGEDSINCE` a tagged `NO` is a plain refusal and stays `Error::No`: the unconditional STORE callers (`delete_messages` marks `\Deleted` and then EXPUNGEs) read `Ok` as acceptance, and a silent success there would expunge messages another client had marked. Tagged `BAD` is a command error on both paths. `StoreWireOutcome::from_store_result` takes the whole result rather than a `(code, tagged_ok)` pair, so the status cannot be dropped on the way to classification. `concurrency_conflict_error` / `store_failed_error` / `uidvalidity_changed_error` each take the caller's `AccountOperation` and produce `ErrorScope::Cursor(Folder(id))`, matching the folder-producer scope contract above. A STORE refusal without a more specific response code is `Server(Error)`, not the client-bug `Request(Malformed)` classification.
+`StoreConsumer::new` takes the command's own `unchanged_since` and has no argument-less form, so how a tagged `NO` is treated is a property of the command rather than a per-call-site choice. Under `UNCHANGEDSINCE` the consumer preserves tagged `NO` as a `StoreResult` with its status, response code and human-readable text (`StoreResult` carries all three for every tagged completion, so a conditional STORE refusal keeps the server's own words), making the legal `NO [MODIFIED ...]` CONDSTORE rejection available to the mutation layer instead of discarding its per-UID conflict evidence. Without `UNCHANGEDSINCE` a tagged `NO` is a plain refusal and stays `Error::No`. Both bulk and PIM deletion use the shared STORE classifier and EXPUNGE only the subset whose STORE applied, so a guarded refusal cannot expunge a conflicting message. Tagged `BAD` is a command error on both paths. `StoreWireOutcome::from_store_result` takes the whole result rather than a `(code, tagged_ok)` pair, so the status cannot be dropped on the way to classification. `concurrency_conflict_error` / `store_failed_error` / `uidvalidity_changed_error` each take the caller's `AccountOperation` and produce `ErrorScope::Cursor(Folder(id))`, matching the folder-producer scope contract above. A STORE refusal without a more specific response code is `Server(Error)`, not the client-bug `Request(Malformed)` classification.
 
 Mutation error lanes follow the primary application: recorded errors read their
 PrimaryLeg; plain leaves use Application::from_leaf. Explicit InFlight or leaf
@@ -1683,8 +1692,25 @@ writes that cannot stick. This bounded futility is accepted.
 
 ## Partial commitment of PIM operations
 
-copy_messages, delete_messages and set_flag retain committed per-folder effects
-and the failing stage in crate-local FolderProgress. Preparation failures are
+`copy_messages`, `delete_messages` and `set_flag` call the same folder mutation
+engine as bulk operations, through `mutate::result_folder_mutation`. There is no
+PIM wire mutation engine: SELECT admission, opportunistic MODSEQ guards,
+MODIFIED attribution, shared-folder quarantine, stale-epoch partitioning and
+guarded EXPUNGE are shared. COPY uses that engine's target admission and
+source/destination error mapping, and leaves the source MODSEQ cache intact.
+Every error keeps the calling PIM operation for recovery classification.
+
+The Result adapter retains committed per-window effects and the failing stage
+in crate-local `FolderProgress`. Windows use `mutation_batch_size` (at least
+one). A stale-epoch target receives the shared `Request(Malformed)` answer;
+valid targets in the same window can still commit. The first failure becomes
+the single Result error, with any additional failures retained as sibling legs
+when a partial-commit record is needed. An Outlook user expects an applied
+change to remain visible when another member conflicts: the adapter retains
+all settled answers in the failing window and stops before the next window or
+folder. Delete's engine supplies the exact selected epoch and marked-deleted
+subset when EXPUNGE fails; attachment is deferred so composed thread operations
+can include earlier copies in one record. Preparation failures are
 effectless; effect-bearing failures use Application::from_leaf. Earlier copies
 are Blocking, deletes and flag updates Repeatable. Delete retains the acknowledged
 MarkedDeleted step if EXPUNGE fails. With nothing committed, only an uncertain

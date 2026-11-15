@@ -959,6 +959,8 @@ pub(crate) enum StateRequirement {
         command: crate::types::CommandKind,
     },
     Enabled(Capability),
+    Unencrypted,
+    Capability(CapabilityFailure),
 }
 
 impl LocalFailure {

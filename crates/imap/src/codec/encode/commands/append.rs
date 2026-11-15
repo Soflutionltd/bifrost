@@ -10,7 +10,6 @@ use super::{
     CommandWriter, encode_mailbox_argument, validate_and_filter_flags, validate_append_datetime,
 };
 use crate::codec::encode::{EncodeOptions, LiteralForm};
-use crate::types::response::Capability;
 use crate::types::{AppendMessage, Flag};
 
 /// Which syntax carries one message body.
@@ -32,12 +31,9 @@ enum BodyForm {
 /// Everything is decided from `opts`, which the driver builds from live
 /// protocol state immediately before sending:
 ///
-/// - **Validation.** MULTIAPPEND requires the MULTIAPPEND capability; the
-///   message list must be non-empty (and a single APPEND carries exactly one);
-///   flags and dates are validated; outside the RFC 6855 wrapper a body
-///   containing NUL requires an advertised BINARY. Failures are the crate's
-///   own [`crate::Error`] variants (`MissingCapability`, `InvalidInput`,
-///   `InvalidAppendDate`, ...), which the account layer maps.
+/// - **Validation.** Admission has checked MULTIAPPEND and BINARY eligibility.
+///   The message list must be non-empty (and a single APPEND carries exactly
+///   one); the encoder validates flags and dates.
 /// - **Mailbox.** INBOX-normalized and modified UTF-7 unless `opts.utf8_mode`
 ///   (`UTF8=ACCEPT` or active `IMAP4rev2`), where the raw UTF-8 name is used
 ///   and quoted-string form is preferred over a literal (RFC 6855 Section 3).
@@ -62,10 +58,6 @@ pub(crate) fn encode_append(
     multi: bool,
     opts: &EncodeOptions,
 ) -> Result<(), crate::Error> {
-    if multi && !opts.has_capability(&Capability::MultiAppend) {
-        // RFC 3502 Section 3.
-        return Err(crate::Error::MissingCapability("MULTIAPPEND".into()));
-    }
     if messages.is_empty() {
         return Err(crate::Error::InvalidInput(
             "MULTIAPPEND requires at least one message".into(),
@@ -113,7 +105,7 @@ pub(crate) fn encode_append(
             w.string(date.as_bytes(), false);
         }
 
-        match body_form(msg, wrapper, opts)? {
+        match body_form(msg, wrapper) {
             BodyForm::Utf8Literal8 => {
                 w.raw(b" UTF8 (");
                 w.literal_bytes(msg.data.clone(), LiteralForm::Literal8);
@@ -140,33 +132,13 @@ pub(crate) fn encode_append(
 }
 
 /// Choose the syntax for one message body.
-fn body_form(
-    msg: &AppendMessage,
-    wrapper: bool,
-    opts: &EncodeOptions,
-) -> Result<BodyForm, crate::Error> {
+fn body_form(msg: &AppendMessage, wrapper: bool) -> BodyForm {
     if wrapper {
-        return Ok(BodyForm::Utf8Literal8);
+        return BodyForm::Utf8Literal8;
     }
     if !msg.data.contains(&0) {
-        return Ok(BodyForm::Classic);
+        return BodyForm::Classic;
     }
-    // RFC 3516 Section 4.4: NUL octets need literal8, which needs BINARY.
-    // Active IMAP4rev2 does not stand in for it: RFC 9051 Appendix B folds
-    // in only the FETCH side of BINARY, not its APPEND extension, and the
-    // capability authority answers BINARY accordingly (advertised only).
-    if opts.has_capability(&Capability::Binary) {
-        Ok(BodyForm::Literal8)
-    } else {
-        // The body is expressible; the server lacks the capability that
-        // would carry it, so this is `Unsupported`, not a malformed request.
-        Err(crate::Error::MissingCapability(
-            crate::error::CapabilityFailure::new(
-                "BINARY".into(),
-                crate::error::CapabilityFailureReason::NotAdvertised,
-                "APPEND data containing NUL requires BINARY literal8 support \
-             (RFC 3516 Section 4.4)",
-            ),
-        ))
-    }
+    // Admission already established BINARY for this NUL-bearing body.
+    BodyForm::Literal8
 }

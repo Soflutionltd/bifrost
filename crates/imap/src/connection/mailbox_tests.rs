@@ -32,7 +32,7 @@ fn qresync_params_require_enable() {
     let without = authed(vec![Capability::QResync]);
     assert!(matches!(
         without.validate_qresync_params(&params),
-        Err(Error::MissingCapability(_))
+        Err(Error::InvalidState(_))
     ));
 
     let with = detached(

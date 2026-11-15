@@ -176,6 +176,7 @@ async fn starttls_upgrade(
     // dropped with old_reader in Step 3 (I10).
     *wire_reader =
         super::super::wire::WireReader::with_metering(ImapStream::Tls(tls_stream), metering);
+    state.set_tls_active(true);
     if let Some(tls_active) = tls_active {
         // Publish the security boundary at the stream swap, not after the
         // later CAPABILITY round trip. A failed refresh retires the driver,

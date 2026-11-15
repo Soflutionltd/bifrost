@@ -391,23 +391,18 @@ pub(crate) enum Error {
     /// Requested object ID not found in a parse or blob-copy response, or in
     /// a fetched object list.
     IdNotFound(String),
-    /// A write-result lookup (`SetResponse::created` / `updated` /
-    /// `destroyed`, and the create maps of `Email/import`, `*/copy` and
-    /// `Blob/upload`) found no answer for this id in either the success or
-    /// the error map. Usually the server omitted it,
-    /// which does not prove the write failed; it is also what a second
-    /// lookup of an already-consumed id returns, so it means "no answer
-    /// available", not proof of omission. Kept distinct from `IdNotFound` so
-    /// the generic translation can classify it as a partial response rather
-    /// than a terminal missing field.
-    SetIdUnanswered(String),
+    /// No answer is available for a submitted id. Request facts survive through
+    /// extraction so account callers never guess the method or conditionality.
+    IdUnanswered {
+        id: String,
+        context: core::answer::AnswerContext,
+    },
     /// Not parsable as the expected format.
     ///
     /// Keep this format-failure meaning separate from malformed provider
     /// contracts. The account layer still constructs this variant for missing
-    /// state and mismatched blob-copy accounts; correcting those producers
-    /// needs their error translation changed together, not a guessed meaning
-    /// inferred from the diagnostic string here.
+    /// state; correcting those producers needs their error translation changed
+    /// together, not a guessed meaning inferred from the diagnostic string here.
     NotParsable(String),
     /// A URL or URL-component value this crate's own caller supplied is
     /// unusable (an empty custom-transport session URL or EventSource type
@@ -606,7 +601,9 @@ impl Display for Error {
                 actual,
             } => write!(f, "Call {call_id} returned {actual}, expected {expected}"),
             Error::IdNotFound(id) => write!(f, "Id {id} not found"),
-            Error::SetIdUnanswered(id) => write!(f, "Id {id} unanswered in set response"),
+            Error::IdUnanswered { id, context } => {
+                write!(f, "Id {id} unanswered in {} response", context.method)
+            }
             Error::NotParsable(id) => write!(f, "{id} is not parsable"),
             Error::InvalidUrl(msg) => write!(f, "Invalid URL: {msg}"),
             Error::MalformedSessionUrl { property, detail } => {

@@ -90,6 +90,11 @@ pub fn cap_status_body(body: Bytes) -> Bytes {
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum Error {
+    /// A protocol hook refused a target before dispatch. The shared attempt
+    /// envelope still retains earlier responses and possible commits.
+    #[error("request hop policy refused the target: {0}")]
+    HopPolicy(Box<bifrost_types::AccountError>),
+
     /// Local refusal before a wire attempt. Prior outcomes are retained in
     /// order; an empty list is the only case with no dispatched attempt.
     #[error("request refused by local hold {key}")]

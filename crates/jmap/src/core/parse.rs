@@ -2,12 +2,12 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use crate::Error;
-
 use super::id::{AccountId, BlobId};
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ParseResponse<T> {
+    #[serde(skip)]
+    pub(crate) answer_context: crate::core::answer::AnswerContext,
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -27,17 +27,19 @@ impl<T> ParseResponse<T> {
     }
 
     pub(crate) fn parsed(&mut self, blob_id: &BlobId) -> crate::Result<T> {
-        if let Some(result) = self.parsed.as_mut().and_then(|r| r.remove(blob_id)) {
-            Ok(result)
-        } else if self
-            .not_parsable
-            .as_ref()
-            .is_some_and(|np| np.iter().any(|id| id == blob_id))
-        {
-            Err(Error::NotParsable(blob_id.to_string()))
-        } else {
-            Err(Error::IdNotFound(blob_id.to_string()))
-        }
+        crate::core::answer::IdAnswer::from_parts(
+            self.parsed
+                .as_mut()
+                .and_then(|values| values.remove(blob_id)),
+            self.not_parsable
+                .as_ref()
+                .filter(|ids| ids.contains(blob_id))
+                .map(|_| crate::Error::NotParsable(blob_id.to_string())),
+            self.not_found
+                .as_ref()
+                .is_some_and(|ids| ids.contains(blob_id)),
+        )
+        .into_result(blob_id.as_str(), self.answer_context)
     }
 
     pub(crate) fn parsed_list(&self) -> Option<impl Iterator<Item = (&BlobId, &T)>> {

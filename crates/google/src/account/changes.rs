@@ -68,15 +68,11 @@ pub(crate) fn changes_stream_cancellable(
         client,
         tally,
         profile,
-        cursor: Some(cursor),
+        phase: ChangePhase::Probe(cursor),
         page_token: None,
-        start_history_id: None,
         walk_history_id: None,
         seen_page_tokens: HashSet::new(),
         pages_walked: 0,
-        finished: false,
-        emitted_done: false,
-        checked_profile: false,
         shutdown,
     };
     stream_from_state(state)
@@ -87,105 +83,74 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
         if state.shutdown.is_cancelled() {
             return None;
         }
-        if state.finished {
-            if state.emitted_done {
-                return None;
-            }
-            state.emitted_done = true;
-            return Some((SyncEvent::Done(None), state));
-        }
-
         let started = Instant::now();
-        if !state.checked_profile {
-            let Some(cursor) = state.cursor.take() else {
-                state.finished = true;
-                state.emitted_done = true;
-                let account_error = account_error::into_account_error(
-                    Error::Local(GmailLocalError::Internal {
-                        detail: "gmail change stream missing cursor".to_string(),
-                    }),
-                    account_error::GmailErrorContext::changes(),
-                );
-                return Some((SyncEvent::Terminated(account_error), state));
-            };
-            let decoded = match decode_gmail_state_for_profile(
-                &cursor.server_state,
-                &state.profile.email_address,
-            ) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    state.finished = true;
-                    state.emitted_done = true;
-                    let account_error = account_error::into_account_error(
-                        error,
-                        account_error::GmailErrorContext::changes(),
-                    );
-                    return Some((SyncEvent::Terminated(account_error), state));
-                }
-            };
-            // One `users.getProfile` per poll, KEPT DELIBERATELY. The cost
-            // objection is correct and has already been answered: it doubles
-            // the request count and the failure surface on a 30-second poll
-            // path. It is also the only thing that catches a rotated token
-            // now pointing at a DIFFERENT Google account before that
-            // account's history is mixed into this cursor's slot, and there
-            // is no token-source identity binding upstream to lean on. It
-            // comes out when that binding exists, not before; do not re-file
-            // it as free savings. See "Per-scope inventory / changes /
-            // hydration" in `reference/google.md`.
-            let profile = tokio::select! {
-                () = state.shutdown.cancelled() => return None,
-                result = state.client.get_profile() => result,
-            };
-            match profile {
-                Ok(current)
-                    if super::mailbox::MailboxAddress::from_provider_value(
-                        &current.email_address,
-                    )
-                    .matches(&decoded.profile_email) =>
-                {
-                    state.start_history_id = Some(crate::types::HistoryId(decoded.history_id));
-                    state.checked_profile = true;
-                }
-                Ok(current) => {
-                    state.finished = true;
-                    state.emitted_done = true;
-                    let account_error = account_error::into_account_error(
-                        Error::Local(GmailLocalError::AccountIdentityMismatch {
-                            cursor_email: decoded.profile_email,
-                            profile_email: current.email_address,
-                        }),
-                        account_error::GmailErrorContext::changes(),
-                    );
-                    return Some((SyncEvent::Terminated(account_error), state));
-                }
-                Err(error) => {
-                    state.finished = true;
-                    state.emitted_done = true;
-                    let account_error = account_error::into_account_error(
-                        error,
-                        account_error::GmailErrorContext::changes(),
-                    );
-                    return Some((SyncEvent::Terminated(account_error), state));
+        // Taking the phase makes the probe cursor and validated walking id
+        // exclusive; a walking stream cannot lack its start history id.
+        let start_history_id = match std::mem::replace(&mut state.phase, ChangePhase::Ended) {
+            ChangePhase::Ended => return None,
+            ChangePhase::Done => return Some((SyncEvent::Done(None), state)),
+            ChangePhase::Walking(start) => start,
+            ChangePhase::Probe(cursor) => {
+                let decoded = match decode_gmail_state_for_profile(
+                    &cursor.server_state,
+                    &state.profile.email_address,
+                ) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        state.phase = ChangePhase::Ended;
+                        let account_error = account_error::into_account_error(
+                            error,
+                            account_error::GmailErrorContext::changes(),
+                        );
+                        return Some((SyncEvent::Terminated(account_error), state));
+                    }
+                };
+                // One `users.getProfile` per poll, KEPT DELIBERATELY. The cost
+                // objection is correct and has already been answered: it doubles
+                // the request count and the failure surface on a 30-second poll
+                // path. It is also the only thing that catches a rotated token
+                // now pointing at a DIFFERENT Google account before that
+                // account's history is mixed into this cursor's slot, and there
+                // is no token-source identity binding upstream to lean on. It
+                // comes out when that binding exists, not before; do not re-file
+                // it as free savings. See "Per-scope inventory / changes /
+                // hydration" in `reference/google.md`.
+                let profile = tokio::select! {
+                    () = state.shutdown.cancelled() => return None,
+                    result = state.client.get_profile() => result,
+                };
+                match profile {
+                    Ok(current)
+                        if super::mailbox::MailboxAddress::from_provider_value(
+                            &current.email_address,
+                        )
+                        .matches(&decoded.profile_email) =>
+                    {
+                        crate::types::HistoryId(decoded.history_id)
+                    }
+                    Ok(current) => {
+                        state.phase = ChangePhase::Ended;
+                        let account_error = account_error::into_account_error(
+                            Error::Local(GmailLocalError::AccountIdentityMismatch {
+                                cursor_email: decoded.profile_email,
+                                profile_email: current.email_address,
+                            }),
+                            account_error::GmailErrorContext::changes(),
+                        );
+                        return Some((SyncEvent::Terminated(account_error), state));
+                    }
+                    Err(error) => {
+                        state.phase = ChangePhase::Ended;
+                        let account_error = account_error::into_account_error(
+                            error,
+                            account_error::GmailErrorContext::changes(),
+                        );
+                        return Some((SyncEvent::Terminated(account_error), state));
+                    }
                 }
             }
-        }
-
-        // Unreachable by construction: the profile check above sets
-        // `start_history_id` in the same arm that sets `checked_profile`.
-        // Reaching it is this crate's bug, never a provider response
-        // lacking a field: `Internal(InvariantViolated)`.
-        let Some(start_history_id) = state.start_history_id else {
-            state.finished = true;
-            state.emitted_done = true;
-            let account_error = account_error::into_account_error(
-                Error::internal(
-                    "gmail change stream has no start history id after its profile check",
-                ),
-                account_error::GmailErrorContext::changes(),
-            );
-            return Some((SyncEvent::Terminated(account_error), state));
         };
+        state.phase = ChangePhase::Walking(start_history_id);
 
         let history = tokio::select! {
             () = state.shutdown.cancelled() => return None,
@@ -207,8 +172,7 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
                     // `startHistoryId` and re-reads it; keeping the page
                     // would buy nothing and risk reading a partial walk as
                     // progress.
-                    state.finished = true;
-                    state.emitted_done = true;
+                    state.phase = ChangePhase::Ended;
                     let account_error = account_error::into_account_error(
                         Error::from(refusal),
                         account_error::GmailErrorContext::changes(),
@@ -225,7 +189,7 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
                 );
                 state.page_token = response.next_page_token;
                 if is_final {
-                    state.finished = true;
+                    state.phase = ChangePhase::Done;
                 }
                 Some((
                     SyncEvent::Batch(Batch {
@@ -243,8 +207,7 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
                 ))
             }
             Err(error) => {
-                state.finished = true;
-                state.emitted_done = true;
+                state.phase = ChangePhase::Ended;
                 let account_error = account_error::into_account_error(
                     error,
                     account_error::GmailErrorContext::changes(),
@@ -322,19 +285,22 @@ fn checkpoint_for_history_page(
     is_final.then(|| Checkpoint::Change(cursor_for_history(history_id, profile_email)))
 }
 
+enum ChangePhase {
+    Probe(bifrost_types::ChangeCursor),
+    Walking(crate::types::HistoryId),
+    Done,
+    Ended,
+}
+
 struct ChangeState {
     client: Arc<GmailClient>,
     tally: crate::client::ByteTally,
     profile: GmailProfile,
-    cursor: Option<bifrost_types::ChangeCursor>,
+    phase: ChangePhase,
     page_token: Option<String>,
-    start_history_id: Option<crate::types::HistoryId>,
     walk_history_id: Option<u64>,
     seen_page_tokens: HashSet<String>,
     pages_walked: usize,
-    finished: bool,
-    emitted_done: bool,
-    checked_profile: bool,
     shutdown: CancellationToken,
 }
 
@@ -597,54 +563,6 @@ mod tests {
             !detail.contains("exceeded"),
             "the budget must not claim a page the repeated-token guard owns: {detail}",
         );
-    }
-
-    /// A walk past its profile check with no start history id is local
-    /// stream state this crate failed to set, not a provider response
-    /// missing a field: it must blame the implementation, and send nothing.
-    #[tokio::test]
-    async fn a_missing_start_history_id_is_an_invariant_violation() {
-        let script = ScriptedDispatch::new(Vec::<Canned>::new());
-        let net = bifrost_net::test_support::scripted_account(
-            &script,
-            NetConfig::default(),
-            Vec::new(),
-            Arc::new(StaticTokenSource::new("token", None)),
-            RetryPolicy::disabled(),
-        );
-        let client = GmailClient::with_account_net("https://gmail.test", net);
-        let (client, tally) = client.metered();
-        let state = ChangeState {
-            client: Arc::new(client),
-            tally,
-            profile: GmailProfile {
-                email_address: "person@example.com".to_string(),
-                history_id: crate::types::HistoryId(100),
-            },
-            cursor: None,
-            page_token: None,
-            start_history_id: None,
-            walk_history_id: None,
-            seen_page_tokens: HashSet::new(),
-            pages_walked: 0,
-            finished: false,
-            emitted_done: false,
-            checked_profile: true,
-            shutdown: CancellationToken::new(),
-        };
-
-        let events = stream_from_state(state).collect::<Vec<_>>().await;
-
-        let [SyncEvent::Terminated(error)] = events.as_slice() else {
-            panic!("the walk must terminate alone, got {} events", events.len());
-        };
-        assert_eq!(
-            error.kind(),
-            &bifrost_types::AccountErrorKind::Internal(
-                bifrost_types::InternalErrorKind::InvariantViolated
-            )
-        );
-        assert!(script.requests().is_empty(), "nothing was sent");
     }
 
     /// A `historyId` that is present but not a number did not parse; it was

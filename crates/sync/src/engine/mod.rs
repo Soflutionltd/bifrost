@@ -38,7 +38,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use bifrost_types::{
     Account, AccountCapabilities, AccountControl, AccountError, AccountFactory, AccountFuture,
-    AccountId, AccountStream, BackfillCheckpoint, BackfillProgress, Batch, ChangeCursor,
+    AccountId, AccountStream, BackfillCheckpoint, Batch, ChangeCursor,
     Checkpoint, CursorEstablishment, CursorScope, DiagnosticText, EngineDirective, ErrorScope,
     InvalidationSink, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
     MutationSuccess, OpenedAccount, PageBoundary, PauseReason, Priority, ReconcileAction,
@@ -79,6 +79,7 @@ mod orphan_teardown;
 mod passthrough;
 mod reattach;
 pub(crate) use reattach::DeferredSchemaReset;
+pub use reattach::{ReattachAttempt, ResetCount};
 #[cfg(test)]
 mod tests;
 
@@ -246,8 +247,8 @@ enum InitialScope {
 
 struct DeferredInventory {
     kind: DeferredKind,
-    fence: u64,
-    epoch: u64,
+    fence: crate::cursor::ScopeFence,
+    epoch: crate::cursor::LifecycleEpoch,
 }
 
 enum DeferredKind {
@@ -1421,9 +1422,29 @@ impl Drop for SyncEngine {
     }
 }
 
-struct TopologyBump<'a>(&'a watch::Sender<u64>);
+/// Notification order for push subscription topology, owned by topology edits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PushTopologyGeneration(u64);
+
+impl PushTopologyGeneration {
+    pub(crate) fn changed(&mut self) {
+        self.0 = self.0.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn plus_for_test(self, bumps: u64) -> Self {
+        Self(self.0 + bumps)
+    }
+}
+
+struct TopologyBump<'a>(&'a watch::Sender<PushTopologyGeneration>);
 impl Drop for TopologyBump<'_> {
     fn drop(&mut self) {
-        self.0.send_modify(|v| *v = v.saturating_add(1));
+        self.0.send_modify(PushTopologyGeneration::changed);
     }
 }

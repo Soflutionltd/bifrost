@@ -150,7 +150,7 @@ async fn repair_declared_hold_blocks_first_attempt_and_clears() {
     fixture.hold(20);
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, 0);
+    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
     tokio::pin!(repair);
     tokio::select! { biased; () = &mut repair => panic!("repair ignored hold"), () = turns() => {} }
     assert_eq!(calls(&account), 0);
@@ -187,7 +187,7 @@ async fn repair_429_is_recorded_for_another_lane() {
     .await;
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, 0);
+    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
     tokio::pin!(repair);
     tokio::select! { biased; () = &mut repair => panic!("repair finished"), () = turns() => {} }
     assert_eq!(calls(&account), 1);
@@ -208,7 +208,7 @@ async fn repair_throttle_wait_replaces_jitter_without_spending_attempts() {
     .await;
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, 0);
+    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
     tokio::pin!(repair);
     for expected in 1..=2 {
         tokio::select! { biased; () = &mut repair => panic!("repair finished early"), () = turns() => {} }
@@ -236,7 +236,7 @@ async fn repair_wait_allowance_expires_without_provider_call() {
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
     let mut events = ctx.changes_tx.subscribe();
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, 0);
+    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
     tokio::pin!(repair);
     tokio::select! { biased; () = &mut repair => panic!("ignored hold"), () = turns() => {} }
     // Poll only after BOTH timers are ready: expiry must still win.
@@ -398,7 +398,7 @@ async fn repair_first_attempt_honours_hold_recorded_by_another_lane() {
     );
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, 0);
+    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
     tokio::pin!(repair);
     tokio::select! { biased; () = &mut repair => panic!("first attempt ignored existing hold"), () = turns() => {} }
     assert_eq!(calls(&account), 0);
@@ -419,7 +419,7 @@ async fn repair_wait_allowance_is_cumulative_across_hold_extensions() {
     fixture.hold(200);
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, 0);
+    let repair = re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0));
     tokio::pin!(repair);
     tokio::select! { biased; () = &mut repair => panic!("ignored hold"), () = turns() => {} }
     step(100).await;
@@ -510,7 +510,7 @@ async fn writer_boundary_case(stored_inventory: bool, exhaust: bool) {
         None,
         &ctx,
         &mut pacing,
-        0,
+        PendingCoverage::initial_fence(),
     );
     tokio::pin!(establish);
     if exhaust {
@@ -576,10 +576,10 @@ async fn unreadable_stored_envelope_returns_error_without_reset_request() {
         Arc::clone(ctx.coverage),
         false,
         ctx.shutdown,
-        Some(44),
+        Some(crate::engine::ReattachAttempt::for_test(44)),
         &ctx,
         &mut pacing,
-        0,
+        PendingCoverage::initial_fence(),
     );
     tokio::pin!(establish);
 
@@ -596,7 +596,10 @@ async fn unreadable_stored_envelope_returns_error_without_reset_request() {
         panic!("establishment starts with the serialized cursor read")
     };
     assert_eq!(scope, SCOPE);
-    assert_eq!(claim_for, Some(44));
+    assert_eq!(
+        claim_for,
+        Some(crate::engine::ReattachAttempt::for_test(44))
+    );
     done.send(Ok(Some(invalid))).expect("answer cursor read");
 
     let result = establish.await;
@@ -1000,7 +1003,7 @@ async fn round2_scope_membership_refresh_records_hold_and_remains_best_effort() 
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
     let mut events = ctx.changes_tx.subscribe();
-    re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, 0).await;
+    re_establish_scope_with_backoff(&ctx, SCOPE, ctx.control, crate::cursor::ScopeFence::for_test(0)).await;
     assert_eq!(
         calls(&account),
         1,
@@ -1030,11 +1033,11 @@ async fn establish_if_absent_skips_a_registered_or_deleted_scope() {
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
     ctx.cursors.put(common::cursor_for(&SCOPE, b"live"));
-    establish_if_absent(&ctx, SCOPE, 0).await;
+    establish_if_absent(&ctx, SCOPE, crate::cursor::LifecycleEpoch::for_test(0)).await;
     assert_eq!(calls(&account), 0);
     ctx.cursors.delete(&SCOPE);
     ctx.cursors.bump_lifecycle_epoch(&SCOPE);
-    establish_if_absent(&ctx, SCOPE, 0).await;
+    establish_if_absent(&ctx, SCOPE, crate::cursor::LifecycleEpoch::for_test(0)).await;
     assert_eq!(calls(&account), 0);
     establish_if_absent(&ctx, SCOPE, ctx.cursors.lifecycle_epoch(&SCOPE)).await;
     assert_eq!(calls(&account), 1);
@@ -1170,7 +1173,7 @@ async fn a_deferred_walk_recovery_is_stamped_with_the_incarnation_it_walked() {
         let slot = handle.get().expect("slot handle set before any walk");
         slot.current.store(Arc::new(crate::types::Incarnation::new(
             Arc::clone(&replacement),
-            1,
+            crate::types::AccountGeneration::for_test(1),
         )));
         vec![bifrost_types::InventoryEvent::Terminated(
             restart_account_error(),
@@ -1214,10 +1217,18 @@ async fn a_deferred_walk_recovery_is_stamped_with_the_incarnation_it_walked() {
 #[test]
 fn a_park_claim_under_a_stale_epoch_takes_nothing() {
     let repairs = DeferredScopeRepairs::new();
-    repairs.parked.lock().expect("parked").insert(SCOPE, 2);
-    repairs.parked.lock().expect("parked").insert(SCOPE, 3);
-    assert!(!repairs.claim(&SCOPE, 2));
-    assert!(repairs.claim(&SCOPE, 3));
+    repairs
+        .parked
+        .lock()
+        .expect("parked")
+        .insert(SCOPE, crate::cursor::LifecycleEpoch::for_test(2));
+    repairs
+        .parked
+        .lock()
+        .expect("parked")
+        .insert(SCOPE, crate::cursor::LifecycleEpoch::for_test(3));
+    assert!(!repairs.claim(&SCOPE, crate::cursor::LifecycleEpoch::for_test(2)));
+    assert!(repairs.claim(&SCOPE, crate::cursor::LifecycleEpoch::for_test(3)));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1234,7 +1245,13 @@ async fn a_declined_schema_reset_keeps_the_scopes_it_owes() {
     fixture.slot.control.pause().await.expect("pause");
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let extra = HashMap::from([(SCOPE, 0), (CursorScope::Account, 0)]);
+    let extra = HashMap::from([
+        (SCOPE, crate::cursor::LifecycleEpoch::for_test(0)),
+        (
+            CursorScope::Account,
+            crate::cursor::LifecycleEpoch::for_test(0),
+        ),
+    ]);
     let lock = ctx.reopen_lock.lock().await;
     let RecoveryFollowUp::ParkSchemaReset(owed) =
         handle_schema_incompatible(&ctx, extra.clone()).await
@@ -1242,7 +1259,10 @@ async fn a_declined_schema_reset_keeps_the_scopes_it_owes() {
         panic!("must park")
     };
     assert_eq!(owed, extra);
-    assert_eq!(ctx.deferred_schema_reset.completed(), 0);
+    assert_eq!(
+        ctx.deferred_schema_reset.completed(),
+        ResetCount::for_test(0)
+    );
     assert!(
         fixture
             .engine
@@ -1323,7 +1343,12 @@ async fn a_parked_schema_reset_after_a_completed_one_only_establishes() {
     let old = ctx.deferred_schema_reset.completed();
     ctx.deferred_schema_reset.reset_completed();
     let _lock = ctx.reopen_lock.lock().await;
-    run_parked_schema_reset(&ctx, HashMap::from([(SCOPE, 0)]), old).await;
+    run_parked_schema_reset(
+        &ctx,
+        HashMap::from([(SCOPE, crate::cursor::LifecycleEpoch::for_test(0))]),
+        old,
+    )
+    .await;
     assert_eq!(calls(&account), 1);
     assert!(
         fixture
@@ -1356,14 +1381,29 @@ fn a_superseded_scope_is_skipped_by_a_reattach_not_failed() {
 #[test]
 fn parked_schema_resets_merge_by_greater_epoch() {
     let mut state = ParkedReset::default();
-    DeferredSchemaReset::merge(&mut state, HashMap::from([(SCOPE, 2)]));
     DeferredSchemaReset::merge(
         &mut state,
-        HashMap::from([(SCOPE, 1), (CursorScope::Account, 0)]),
+        HashMap::from([(SCOPE, crate::cursor::LifecycleEpoch::for_test(2))]),
+    );
+    DeferredSchemaReset::merge(
+        &mut state,
+        HashMap::from([
+            (SCOPE, crate::cursor::LifecycleEpoch::for_test(1)),
+            (
+                CursorScope::Account,
+                crate::cursor::LifecycleEpoch::for_test(0),
+            ),
+        ]),
     );
     assert_eq!(
         state.owed,
-        Some(HashMap::from([(SCOPE, 2), (CursorScope::Account, 0)]))
+        Some(HashMap::from([
+            (SCOPE, crate::cursor::LifecycleEpoch::for_test(2)),
+            (
+                CursorScope::Account,
+                crate::cursor::LifecycleEpoch::for_test(0)
+            )
+        ]))
     );
 }
 
@@ -1377,11 +1417,19 @@ async fn completed_reset_establishments_park_as_scope_repairs_on_a_second_pause(
     let ctx = fixture.ctx(&writer);
     ctx.control.pause().await.expect("pause");
     ctx.deferred_schema_reset.reset_completed();
-    let followup = run_parked_schema_reset(&ctx, HashMap::from([(SCOPE, 0)]), 0).await;
+    let followup = run_parked_schema_reset(
+        &ctx,
+        HashMap::from([(SCOPE, crate::cursor::LifecycleEpoch::for_test(0))]),
+        ResetCount::for_test(0),
+    )
+    .await;
     let RecoveryFollowUp::ParkScopes(scopes) = followup else {
         panic!("completed reset must only owe scope repair");
     };
-    assert_eq!(scopes, HashMap::from([(SCOPE, 0)]));
+    assert_eq!(
+        scopes,
+        HashMap::from([(SCOPE, crate::cursor::LifecycleEpoch::for_test(0))])
+    );
     fixture.engine.detach(&fixture.id).await.expect("detach");
 }
 
@@ -1391,7 +1439,7 @@ async fn a_stale_push_recovery_is_declined_after_its_account_was_replaced() {
         ReopenRequest::PushRecovery {
             scope: None,
             error,
-            generation: 0,
+            generation: crate::types::Incarnation::initial_generation(),
         }
     })
     .await;
@@ -1405,7 +1453,7 @@ async fn a_stale_stamped_recovery_is_declined_after_its_account_was_replaced() {
     stale_requests_are_declined_after_their_account_was_replaced(|error| ReopenRequest::Recovery {
         scope: None,
         error,
-        generation: Some(0),
+        generation: Some(crate::types::Incarnation::initial_generation()),
     })
     .await;
 }
@@ -1440,8 +1488,14 @@ async fn stale_requests_are_declined_after_their_account_was_replaced(
     for _ in 0..200 {
         tokio::task::yield_now().await;
     }
-    assert_eq!(*fixture.slot.account_generation_tx.borrow(), 1);
-    assert_eq!(fixture.slot.current.load().generation(), 1);
+    assert_eq!(
+        *fixture.slot.account_generation_tx.borrow(),
+        crate::types::AccountGeneration::for_test(1)
+    );
+    assert_eq!(
+        fixture.slot.current.load().generation(),
+        crate::types::AccountGeneration::for_test(1)
+    );
     assert_eq!(replacement.closed.load(Ordering::SeqCst), 0);
     fixture.engine.shutdown().await.unwrap();
 }

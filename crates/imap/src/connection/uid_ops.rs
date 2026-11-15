@@ -20,11 +20,6 @@ impl ImapConnection {
         items: &[FetchAttr],
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.validate_requested_fetch_items(items)?;
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         self.fetch_impl(
             Command::UidFetch {
                 sequence_set: sequence_set.clone(),
@@ -49,11 +44,6 @@ impl ImapConnection {
         mod_seq: u64,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.validate_requested_fetch_items(items)?;
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         self.fetch_impl(
             Command::UidFetch {
                 sequence_set: sequence_set.clone(),
@@ -82,12 +72,6 @@ impl ImapConnection {
         ),
         Error,
     > {
-        self.require_state(crate::types::CommandKind::Fetch)?;
-        self.require_condstore()?;
-        self.validate_requested_fetch_items(items)?;
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_FETCH_STREAM_CAPACITY);
         let cmd = Command::UidFetch {
             sequence_set: sequence_set.clone(),
@@ -95,6 +79,7 @@ impl ImapConnection {
             changed_since: Some(mod_seq),
             vanished: false,
         };
+        self.admit_command(&cmd)?;
         let fut = self.fetch_stream_bounded_impl(cmd, tx, timeout);
         Ok((rx, fut))
     }
@@ -106,13 +91,9 @@ impl ImapConnection {
     pub(super) async fn fetch_impl(
         &self,
         cmd: Command,
-        changed_since: Option<u64>,
+        _changed_since: Option<u64>,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.require_state(cmd.kind())?;
-        if changed_since.is_some() {
-            self.require_condstore()?;
-        }
         self.submit_regular(
             cmd,
             dispatch::FetchConsumer::new(),
@@ -145,32 +126,8 @@ impl ImapConnection {
         mod_seq: u64,
         timeout: Duration,
     ) -> Result<(Vec<FetchResponse>, Vec<UidRange>), Error> {
-        self.require_state(crate::types::CommandKind::Fetch)?;
-        self.validate_requested_fetch_items(items)?;
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         // RFC 7162 Section 3.2.6: VANISHED modifier requires QRESYNC to be ENABLEd.
-        {
-            let snap = self.state_rx.borrow();
-            // The ENABLED echo is stored as the server spelled it, and RFC 9051
-            // Section 9 makes the name an atom, so match it case-insensitively
-            // exactly as `ServerProfile::enabled` does.
-            if !snap
-                .enabled
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
-            {
-                return Err(Error::MissingCapability(
-                    crate::error::CapabilityFailure::new(
-                        Capability::QResync,
-                        crate::error::CapabilityFailureReason::NotEnabled,
-                        "QRESYNC (not ENABLEd)",
-                    ),
-                ));
-            }
-        }
+
         // Parse the requested set for defensive filtering of VANISHED (EARLIER)
         // UIDs. Returns None when the set contains `$` (RFC 5182), in which case
         // filtering is skipped inside the consumer.
@@ -208,30 +165,6 @@ impl ImapConnection {
         ),
         Error,
     > {
-        self.require_state(crate::types::CommandKind::Fetch)?;
-        self.validate_requested_fetch_items(items)?;
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
-        {
-            let snap = self.state_rx.borrow();
-            // The ENABLED echo is stored as the server spelled it, and RFC 9051
-            // Section 9 makes the name an atom, so match it case-insensitively
-            // exactly as `ServerProfile::enabled` does.
-            if !snap
-                .enabled
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
-            {
-                return Err(Error::MissingCapability(
-                    crate::error::CapabilityFailure::new(
-                        Capability::QResync,
-                        crate::error::CapabilityFailureReason::NotEnabled,
-                        "QRESYNC (not ENABLEd)",
-                    ),
-                ));
-            }
-        }
         let parsed_set = ParsedUidSet::new(sequence_set);
         let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_FETCH_STREAM_CAPACITY);
         let cmd = Command::UidFetch {
@@ -240,6 +173,7 @@ impl ImapConnection {
             changed_since: Some(mod_seq),
             vanished: true,
         };
+        self.admit_command(&cmd)?;
         let fut = async move {
             self.submit_streaming(
                 cmd,
@@ -313,10 +247,6 @@ impl ImapConnection {
         ),
         Error,
     > {
-        self.validate_requested_fetch_items(items)?;
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
         let cmd = Command::UidFetch {
             sequence_set: sequence_set.clone(),
@@ -324,8 +254,8 @@ impl ImapConnection {
             changed_since: None,
             vanished: false,
         };
+        self.admit_command(&cmd)?;
         let fut = async move {
-            self.require_state(cmd.kind())?;
             self.submit_streaming(
                 cmd,
                 dispatch::BoundedStreamingFetchConsumer::with_budget(tx, budget),
@@ -372,7 +302,6 @@ impl ImapConnection {
         tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.require_state(cmd.kind())?;
         self.submit_streaming(
             cmd,
             dispatch::BoundedStreamingFetchConsumer::new(tx),
@@ -415,7 +344,6 @@ impl ImapConnection {
         _label: &str,
         timeout: Duration,
     ) -> Result<SearchResult, Error> {
-        self.require_state(cmd.kind())?;
         // RFC 6855 Section 6: SEARCH criteria are free-form strings, so a
         // UTF8=ONLY server requires ENABLE UTF8=ACCEPT before SEARCH.
         self.check_utf8_only_enforced()?;
@@ -466,24 +394,14 @@ impl ImapConnection {
         _label: &str,
         timeout: Duration,
     ) -> Result<EsearchResponse, Error> {
-        self.require_state(cmd.kind())?;
         // RFC 6855 Section 6: ESEARCH is an extended SEARCH form and uses the
         // same free-form criteria strings, so it must honor UTF8=ONLY too.
         self.check_utf8_only_enforced()?;
-        {
-            let snap = self.state_rx.borrow();
-            // ESEARCH is a base feature in IMAP4rev2 (RFC 9051 Section 6.4.4).
-            if !super::auth::snapshot_supports(&snap, &Capability::Esearch) {
-                return Err(Error::MissingCapability("ESEARCH".into()));
-            }
-        }
+
         // RFC 5182 Section 2 extends SEARCH RETURN with the SAVE result option.
         // Generic ESEARCH callers can request SAVE through return_opts, so
         // SEARCHRES remains mandatory unless IMAP4rev2 folds it into the base
         // protocol (RFC 9051 Appendix E).
-        if Self::search_return_requests_save(&cmd) {
-            self.require_searchres()?;
-        }
         self.submit_regular(
             cmd,
             dispatch::EsearchConsumer::new(),
@@ -507,10 +425,6 @@ impl ImapConnection {
         unchanged_since: Option<u64>,
         timeout: Duration,
     ) -> Result<StoreResult, Error> {
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         // RFC 3501 Section 2.3.2 / Section 9: \Recent is server-only and \*
         // is not valid in STORE flag lists. Filter them out before encoding,
         // consistent with append() (RFC 3501 Section 6.3.11).
@@ -538,10 +452,6 @@ impl ImapConnection {
         unchanged_since: Option<u64>,
         timeout: Duration,
     ) -> Result<StoreResult, Error> {
-        self.require_state(cmd.kind())?;
-        if unchanged_since.is_some() {
-            self.require_condstore()?;
-        }
         self.submit_regular(
             cmd,
             dispatch::StoreConsumer::new(unchanged_since),
@@ -575,10 +485,6 @@ impl ImapConnection {
     ) -> Result<MoveResult, Error> {
         self.require_state(crate::types::CommandKind::Move)?;
         self.check_utf8_only_enforced()?;
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
 
         // Read capabilities from snapshot to decide which path to take.
         let (has_move, has_uidplus) = {
@@ -684,10 +590,6 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<CopyResult, Error> {
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
         let mbox = mailbox.mailbox_name()?;
         self.copy_impl(
             Command::UidCopy {
@@ -708,7 +610,6 @@ impl ImapConnection {
         cmd: Command,
         timeout: Duration,
     ) -> Result<CopyResult, Error> {
-        self.require_state(cmd.kind())?;
         self.check_utf8_only_enforced()?;
         self.submit_regular(
             cmd,
@@ -753,23 +654,11 @@ impl ImapConnection {
 
     /// The local admission checks for UID EXPUNGE, then the command.
     fn uid_expunge_command(&self, sequence_set: &SequenceSet) -> Result<Command, Error> {
-        self.require_state(crate::types::CommandKind::Expunge)?;
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
-        {
-            let snap = self.state_rx.borrow();
-            // RFC 4315 Section 2: UID EXPUNGE requires the UIDPLUS extension.
-            // RFC 9051 Appendix E item 3: IMAP4rev2 incorporates UIDPLUS into
-            // the base command set, so rev2 servers implicitly support it.
-            if !super::auth::snapshot_supports(&snap, &Capability::UidPlus) {
-                return Err(Error::MissingCapability("UIDPLUS".into()));
-            }
-        }
-        Ok(Command::UidExpunge {
+        let command = Command::UidExpunge {
             sequence_set: sequence_set.clone(),
-        })
+        };
+        self.admit_command(&command)?;
+        Ok(command)
     }
 
     /// EXPUNGE (RFC 3501 Section 6.4.3 / RFC 7162 Section 3.2.10).
@@ -780,7 +669,6 @@ impl ImapConnection {
     /// connection receives for a mailbox with persistent mod-sequences, RFC
     /// 7162 Section 3.2.10).
     pub async fn expunge(&self, timeout: Duration) -> Result<ExpungeResult, Error> {
-        self.require_state(crate::types::CommandKind::Expunge)?;
         self.submit_regular(
             Command::Expunge,
             dispatch::ExpungeConsumer::new(),

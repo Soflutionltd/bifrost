@@ -109,6 +109,7 @@ pub(super) enum MutationKind {
     ConditionalFlags(FlagOp, u64),
     Move(MembershipScope),
     Destroy,
+    Copy(MailboxName),
 }
 
 /// True when a folder-level mutation failure must collapse the entire
@@ -138,6 +139,7 @@ fn mutation_operation(kind: &MutationKind) -> AccountOperation {
         }
         MutationKind::Move(_) => AccountOperation::BulkMove,
         MutationKind::Destroy => AccountOperation::BulkDestroy,
+        MutationKind::Copy(_) => AccountOperation::AddToContainer,
     }
 }
 
@@ -304,15 +306,8 @@ async fn flush_mutation_groups(
                 // to the operation that was never sent. Shared ACL denials
                 // become folder-scoped revocations here, before the
                 // account-wide terminal check below.
-                let entry = account.folders.get(&folder);
-                let shared_owner = entry.as_ref().and_then(|entry| entry.shared_owner.as_ref());
-                let account_err = super::error::shared_folder_error(
-                    (*error).with_attempt(TransmissionState::Unsent),
-                    &folder,
-                    shared_owner,
-                    super::error::ImapErrorContext::operation(mutation_operation(kind))
-                        .with_folder_scope(&folder),
-                );
+                let account_err =
+                    mutation_preflight_error(account, &folder, *error, mutation_operation(kind));
                 if stream_terminating(&account_err) {
                     let _ = tx.send(SyncEvent::Terminated(account_err)).await;
                     return Err(());
@@ -391,6 +386,19 @@ struct FolderMutationFailure {
     bytes_in: u64,
 }
 
+fn mutation_preflight_error(
+    account: &ImapAccount,
+    folder: &MailboxName,
+    error: crate::Error,
+    operation: AccountOperation,
+) -> AccountError {
+    account.folder_error(
+        error.with_attempt(TransmissionState::Unsent),
+        folder,
+        super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
+    )
+}
+
 struct FolderOpenFailure {
     error: crate::Error,
     bytes_in: u64,
@@ -442,6 +450,29 @@ async fn run_folder_mutation(
     kind: &MutationKind,
     move_destination: Option<&MailboxName>,
 ) -> Result<(Vec<ItemOutcome<MutationSuccess>>, u64), FolderMutationFailure> {
+    run_folder_mutation_with(
+        account,
+        folder,
+        ids,
+        kind,
+        move_destination,
+        mutation_operation(kind),
+        None,
+    )
+    .await
+}
+
+// Result callers defer the destroy record until their composed operation has
+// collected earlier effects. The wire engine still decides what committed.
+async fn run_folder_mutation_with(
+    account: &ImapAccount,
+    folder: &MailboxName,
+    ids: Vec<DecodedObjectId>,
+    kind: &MutationKind,
+    move_destination: Option<&MailboxName>,
+    operation: AccountOperation,
+    deferred: Option<&mut Vec<(u32, Vec<u32>)>>,
+) -> Result<(Vec<ItemOutcome<MutationSuccess>>, u64), FolderMutationFailure> {
     let (conn, uidvalidity, previous_bytes_in, has_modseq) =
         match open_folder_for_mutation(account, folder).await {
             Ok(opened) => opened,
@@ -454,10 +485,7 @@ async fn run_folder_mutation(
             }
         };
     let (valid, stale) = split_by_uidvalidity(ids, uidvalidity);
-    let stale_results = failed_all(
-        stale,
-        uidvalidity_changed_error(mutation_operation(kind), folder),
-    );
+    let stale_results = failed_all(stale, uidvalidity_changed_error(operation, folder));
     if matches!(kind, MutationKind::ConditionalFlags(_, _)) && !has_modseq {
         let mut results = stale_results;
         results.extend(failed_all(
@@ -478,8 +506,16 @@ async fn run_folder_mutation(
         };
         let mut results = stale_results;
         results.extend(
-            run_flag_mutation_groups(account, &conn, folder, uidvalidity, valid, op, expected)
-                .await,
+            run_flag_mutation_groups(
+                account,
+                &conn,
+                folder,
+                uidvalidity,
+                valid,
+                op,
+                (expected, operation),
+            )
+            .await,
         );
         let bytes_in = conn
             .connection()
@@ -489,15 +525,24 @@ async fn run_folder_mutation(
     }
     if matches!(kind, MutationKind::Destroy) {
         let mut results = stale_results;
-        results
-            .extend(run_destroy_mutation_groups(account, &conn, folder, uidvalidity, valid).await);
+        results.extend(
+            run_destroy_mutation_groups(
+                account,
+                &conn,
+                folder,
+                uidvalidity,
+                valid,
+                operation,
+                deferred,
+            )
+            .await,
+        );
         let bytes_in = conn
             .connection()
             .bytes_in()
             .saturating_sub(previous_bytes_in);
         return Ok((results, bytes_in));
     }
-    let operation = mutation_operation(kind);
     let target_batch = TargetBatch::new(valid);
     let uids: Vec<u32> = target_batch.uids().to_vec();
     let wire_set = target_batch.uid_set().cloned();
@@ -511,6 +556,15 @@ async fn run_folder_mutation(
             MutationKind::Flags(_) | MutationKind::ConditionalFlags(_, _) => {
                 unreachable!("flags handled above")
             }
+            MutationKind::Copy(destination) => conn
+                .connection()
+                .uid_copy(
+                    uid_set.as_sequence_set(),
+                    destination,
+                    account.command_timeout(),
+                )
+                .await
+                .map(|_| StoreWireOutcome::Applied),
             MutationKind::Move(_) => {
                 let destination =
                     move_destination.expect("bulk-move destination validated before folder loop");
@@ -533,7 +587,9 @@ async fn run_folder_mutation(
     let classified = match outcome {
         None => None,
         Some(Ok(outcome)) => {
-            account.folders.clear_modseqs(folder, uidvalidity, &uids);
+            if !matches!(kind, MutationKind::Copy(_)) {
+                account.folders.clear_modseqs(folder, uidvalidity, &uids);
+            }
             Some(Ok(outcome))
         }
         Some(Err(err)) => {
@@ -551,7 +607,10 @@ async fn run_folder_mutation(
                 if progress.is_some() {
                     None
                 } else {
-                    move_destination
+                    match kind {
+                        MutationKind::Copy(destination) => Some(destination),
+                        _ => move_destination,
+                    }
                 },
                 super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
             );
@@ -621,21 +680,21 @@ async fn run_destroy_mutation_groups(
     folder: &MailboxName,
     uidvalidity: u32,
     ids: Vec<DecodedObjectId>,
+    operation: AccountOperation,
+    mut deferred: Option<&mut Vec<(u32, Vec<u32>)>>,
 ) -> Vec<ItemOutcome<MutationSuccess>> {
     let mut results = Vec::new();
     for (unchanged_since, ids) in partition_by_modseq(account, folder, uidvalidity, ids) {
         let target_batch = TargetBatch::new(ids);
         let uids: Vec<u32> = target_batch.uids().to_vec();
         let Some(uid_set) = target_batch.uid_set().cloned() else {
-            results.extend(target_batch.settle_unsent(AccountOperation::BulkDestroy, folder));
+            results.extend(target_batch.settle_unsent(operation, folder));
             continue;
         };
-        if let Some(error) = unusable_checkout_error(conn, AccountOperation::BulkDestroy, folder) {
-            results.extend(
-                target_batch.settle(AccountOperation::BulkDestroy, folder, |target| {
-                    target.seal(mutation_error_verdict(&error))
-                }),
-            );
+        if let Some(error) = unusable_checkout_error(conn, operation, folder) {
+            results.extend(target_batch.settle(operation, folder, |target| {
+                target.seal(mutation_error_verdict(&error))
+            }));
             continue;
         }
         let store = conn
@@ -650,18 +709,15 @@ async fn run_destroy_mutation_groups(
             .await;
         let outcome = match store {
             Ok(result) => {
-                if let Some(error) = store_permission_error(&result, AccountOperation::BulkDestroy)
-                {
+                if let Some(error) = store_permission_error(&result, operation) {
                     let error = account.folder_error(
                         error,
                         folder,
-                        super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy),
+                        super::error::ImapErrorContext::operation(operation),
                     );
-                    results.extend(target_batch.settle(
-                        AccountOperation::BulkDestroy,
-                        folder,
-                        |target| target.seal(mutation_error_verdict(&error)),
-                    ));
+                    results.extend(target_batch.settle(operation, folder, |target| {
+                        target.seal(mutation_error_verdict(&error))
+                    }));
                     continue;
                 }
                 StoreWireOutcome::from_store_result(&result)
@@ -670,17 +726,12 @@ async fn run_destroy_mutation_groups(
                 let error = account.folder_error(
                     err,
                     folder,
-                    super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
-                        .with_folder_scope(folder),
+                    super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
                 );
-                results.extend(target_batch.settle(
-                    AccountOperation::BulkDestroy,
-                    folder,
-                    |target| {
-                        let verdict = mutation_error_verdict(&error);
-                        target.seal(verdict)
-                    },
-                ));
+                results.extend(target_batch.settle(operation, folder, |target| {
+                    let verdict = mutation_error_verdict(&error);
+                    target.seal(verdict)
+                }));
                 continue;
             }
         };
@@ -700,35 +751,31 @@ async fn run_destroy_mutation_groups(
             // The expunge failure applies only to the UIDs this round
             // actually marked `\Deleted`; the rest keep the STORE's own
             // verdict.
-            let expunge_error = destroy_expunge_error_with_account(account, folder, err);
-            results.extend(
-                target_batch.settle(AccountOperation::BulkDestroy, folder, |target| {
-                    let verdict = if expunge_uids.contains(&target.uid()) {
-                        mutation_error_verdict(&expunge_error)
-                    } else {
-                        mutation_verdict(
-                            target.uid(),
-                            &outcome,
-                            AccountOperation::BulkDestroy,
-                            folder,
-                        )
-                    };
-                    target.seal(verdict)
-                }),
+            let leaf = account.folder_error(
+                err,
+                folder,
+                super::error::ImapErrorContext::operation(operation),
             );
+            let expunge_error = if let Some(records) = deferred.as_deref_mut() {
+                records.push((uidvalidity, expunge_uids.clone()));
+                leaf
+            } else {
+                destroy_expunge_record(folder, leaf)
+            };
+            results.extend(target_batch.settle(operation, folder, |target| {
+                let verdict = if expunge_uids.contains(&target.uid()) {
+                    mutation_error_verdict(&expunge_error)
+                } else {
+                    mutation_verdict(target.uid(), &outcome, operation, folder)
+                };
+                target.seal(verdict)
+            }));
             continue;
         }
-        results.extend(
-            target_batch.settle(AccountOperation::BulkDestroy, folder, |target| {
-                let verdict = mutation_verdict(
-                    target.uid(),
-                    &outcome,
-                    AccountOperation::BulkDestroy,
-                    folder,
-                );
-                target.seal(verdict)
-            }),
-        );
+        results.extend(target_batch.settle(operation, folder, |target| {
+            let verdict = mutation_verdict(target.uid(), &outcome, operation, folder);
+            target.seal(verdict)
+        }));
     }
     results
 }
@@ -740,8 +787,9 @@ async fn run_flag_mutation_groups(
     uidvalidity: u32,
     ids: Vec<DecodedObjectId>,
     op: &FlagOp,
-    expected: Option<u64>,
+    policy: (Option<u64>, AccountOperation),
 ) -> Vec<ItemOutcome<MutationSuccess>> {
+    let (expected, operation) = policy;
     let mut results = Vec::new();
     // A caller guard must never be advanced from a push, SELECT or read cache.
     let groups = match expected {
@@ -752,15 +800,13 @@ async fn run_flag_mutation_groups(
         let target_batch = TargetBatch::new(ids);
         let uids: Vec<u32> = target_batch.uids().to_vec();
         let Some(uid_set) = target_batch.uid_set().cloned() else {
-            results.extend(target_batch.settle_unsent(AccountOperation::UpdateFlags, folder));
+            results.extend(target_batch.settle_unsent(operation, folder));
             continue;
         };
-        if let Some(error) = unusable_checkout_error(conn, AccountOperation::UpdateFlags, folder) {
-            results.extend(
-                target_batch.settle(AccountOperation::UpdateFlags, folder, |target| {
-                    target.seal(mutation_error_verdict(&error))
-                }),
-            );
+        if let Some(error) = unusable_checkout_error(conn, operation, folder) {
+            results.extend(target_batch.settle(operation, folder, |target| {
+                target.seal(mutation_error_verdict(&error))
+            }));
             continue;
         }
         if let FlagOp::Patch { add, remove } = op
@@ -810,33 +856,19 @@ async fn run_flag_mutation_groups(
                 Err(account.folder_error(
                     err,
                     folder,
-                    super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
-                        .with_folder_scope(folder),
+                    super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
                 ))
             }
         };
         match classified {
-            Ok(outcome) => results.extend(target_batch.settle(
-                AccountOperation::UpdateFlags,
-                folder,
-                |target| {
-                    let verdict = mutation_verdict(
-                        target.uid(),
-                        &outcome,
-                        AccountOperation::UpdateFlags,
-                        folder,
-                    );
-                    target.seal(verdict)
-                },
-            )),
-            Err(error) => results.extend(target_batch.settle(
-                AccountOperation::UpdateFlags,
-                folder,
-                |target| {
-                    let verdict = mutation_error_verdict(&error);
-                    target.seal(verdict)
-                },
-            )),
+            Ok(outcome) => results.extend(target_batch.settle(operation, folder, |target| {
+                let verdict = mutation_verdict(target.uid(), &outcome, operation, folder);
+                target.seal(verdict)
+            })),
+            Err(error) => results.extend(target_batch.settle(operation, folder, |target| {
+                let verdict = mutation_error_verdict(&error);
+                target.seal(verdict)
+            })),
         }
     }
     results
@@ -1357,20 +1389,41 @@ pub(super) fn finish_partial(error: AccountError, record: PartialCommitBuilder) 
         .try_build()
         .expect("valid IMAP partial commitment")
 }
-fn destroy_expunge_error_with_account(
+/// Run one bounded Result-lane window through the bulk folder engine. No task
+/// is spawned, so dropping the public future retains its existing cancellation
+/// behavior. Records are deferred only for composition, never re-decided here.
+pub(super) async fn result_folder_mutation(
     account: &ImapAccount,
     folder: &MailboxName,
-    error: crate::Error,
-) -> AccountError {
-    let owner = account
-        .folders
-        .get(folder)
-        .and_then(|entry| entry.shared_owner.clone());
-    destroy_expunge_error(folder, owner.as_ref(), error)
+    ids: Vec<DecodedObjectId>,
+    kind: &MutationKind,
+    operation: AccountOperation,
+) -> Result<(Vec<ItemOutcome<MutationSuccess>>, Vec<(u32, Vec<u32>)>), AccountError> {
+    let mut marked_deleted = Vec::new();
+    match run_folder_mutation_with(
+        account,
+        folder,
+        ids,
+        kind,
+        None,
+        operation,
+        Some(&mut marked_deleted),
+    )
+    .await
+    {
+        Ok((items, _)) => Ok((items, marked_deleted)),
+        Err(failure) => Err(mutation_preflight_error(
+            account,
+            folder,
+            *failure.error,
+            operation,
+        )),
+    }
 }
 
 /// The partial-commit error for an EXPUNGE that failed after its STORE marked
 /// UIDs `\Deleted`, classified through the shared folder-error rule.
+#[cfg(test)]
 fn destroy_expunge_error(
     folder: &MailboxName,
     shared_owner: Option<&bifrost_types::MailboxId>,

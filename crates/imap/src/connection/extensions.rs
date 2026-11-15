@@ -24,15 +24,8 @@ impl ImapConnection {
     ///  -  handled entirely by the driver task.
     pub async fn compress(&self, timeout: Duration) -> Result<(), Error> {
         // RFC 4978 Section 4: COMPRESS is valid in Authenticated and Selected states.
-        self.require_state(crate::types::CommandKind::Compress)?;
 
         // Check COMPRESS=DEFLATE capability from the snapshot.
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::CompressDeflate) {
-                return Err(Error::MissingCapability("COMPRESS=DEFLATE".into()));
-            }
-        }
 
         self.submit_upgrade(
             driver::UpgradePayload::Compress,
@@ -69,7 +62,6 @@ impl ImapConnection {
     ) -> Result<(), Error> {
         // RFC 5465 Section 3: NOTIFY is a `command-auth` extension, valid
         // in Authenticated or Selected state.
-        self.require_state(crate::types::CommandKind::NotifySet)?;
         self.require_notify()?;
 
         // RFC 6855 Section 6: UTF8=ONLY servers reject commands that might
@@ -125,7 +117,6 @@ impl ImapConnection {
     ///   ([`Error::Closed`] once the session is in Logout).
     pub async fn notify_none(&self, timeout: Duration) -> Result<(), Error> {
         // RFC 5465 Section 3: NOTIFY is a `command-auth` extension.
-        self.require_state(crate::types::CommandKind::NotifyNone)?;
         self.require_notify()?;
 
         let cmd = Command::NotifyNone;
@@ -199,13 +190,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<Vec<String>, Error> {
         // RFC 5161 Section 2: ENABLE is only valid in Authenticated state.
-        self.require_state(crate::types::CommandKind::Enable)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Enable) {
-                return Err(Error::MissingCapability("ENABLE".into()));
-            }
-        }
+
         let cmd = Command::Enable {
             capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
         };
@@ -227,13 +212,6 @@ impl ImapConnection {
     /// Requires the `NAMESPACE` capability or an `IMAP4rev2` connection
     /// (RFC 9051 folds NAMESPACE into the base protocol).
     pub async fn namespace(&self, timeout: Duration) -> Result<NamespaceResponse, Error> {
-        self.require_state(crate::types::CommandKind::Namespace)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Namespace) {
-                return Err(Error::MissingCapability("NAMESPACE".into()));
-            }
-        }
         self.submit_regular(
             Command::Namespace,
             super::dispatch::NamespaceConsumer::default(),
@@ -259,12 +237,6 @@ impl ImapConnection {
         params: &[(&str, Option<&str>)],
         timeout: Duration,
     ) -> Result<Vec<(String, Option<String>)>, Error> {
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Id) {
-                return Err(Error::MissingCapability("ID".into()));
-            }
-        }
         let cmd = Command::Id(
             params
                 .iter()
@@ -305,15 +277,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<MetadataResult, Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::GetMetadata)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Metadata)
-                && !super::auth::snapshot_supports(&snap, &Capability::MetadataServer)
-            {
-                return Err(Error::MissingCapability("METADATA".into()));
-            }
-        }
+
         let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::GetMetadata {
             mailbox: mailbox_name.clone(),
@@ -341,15 +305,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<(), Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::SetMetadata)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Metadata)
-                && !super::auth::snapshot_supports(&snap, &Capability::MetadataServer)
-            {
-                return Err(Error::MissingCapability("METADATA".into()));
-            }
-        }
+
         let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::SetMetadata {
             mailbox: mailbox_name,
@@ -381,13 +337,6 @@ impl ImapConnection {
         root: &str,
         timeout: Duration,
     ) -> Result<Vec<QuotaResource>, Error> {
-        self.require_state(crate::types::CommandKind::GetQuota)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Quota) {
-                return Err(Error::MissingCapability("QUOTA".into()));
-            }
-        }
         let cmd = Command::GetQuota {
             root: root.to_owned(),
         };
@@ -409,13 +358,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<QuotaRootResponse, Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::GetQuotaRoot)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Quota) {
-                return Err(Error::MissingCapability("QUOTA".into()));
-            }
-        }
+
         let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::GetQuotaRoot {
             mailbox: mailbox_name.clone(),
@@ -438,13 +381,6 @@ impl ImapConnection {
         resources: &[(&str, u64)],
         timeout: Duration,
     ) -> Result<Vec<QuotaResource>, Error> {
-        self.require_state(crate::types::CommandKind::SetQuota)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::QuotaSet) {
-                return Err(Error::MissingCapability("QUOTASET".into()));
-            }
-        }
         let cmd = Command::SetQuota {
             root: root.to_owned(),
             resources: resources
@@ -477,13 +413,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<(), Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::SetAcl)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
-                return Err(Error::MissingCapability("ACL".into()));
-            }
-        }
+
         let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::SetAcl {
             mailbox: mailbox_name,
@@ -511,13 +441,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<(), Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::DeleteAcl)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
-                return Err(Error::MissingCapability("ACL".into()));
-            }
-        }
+
         let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::DeleteAcl {
             mailbox: mailbox_name,
@@ -543,13 +467,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<Vec<AclEntry>, Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::GetAcl)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
-                return Err(Error::MissingCapability("ACL".into()));
-            }
-        }
+
         let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::GetAcl {
             mailbox: mailbox_name.clone(),
@@ -573,13 +491,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<ListRightsResponse, Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::ListRights)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
-                return Err(Error::MissingCapability("ACL".into()));
-            }
-        }
+
         let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::ListRights {
             mailbox: mailbox_name.clone(),
@@ -603,13 +515,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<String, Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::MyRights)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
-                return Err(Error::MissingCapability("ACL".into()));
-            }
-        }
+
         let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::MyRights {
             mailbox: mailbox_name.clone(),
@@ -621,15 +527,7 @@ impl ImapConnection {
 
     /// Verify that the server advertises the NOTIFY capability (RFC 5465).
     fn require_notify(&self) -> Result<(), Error> {
-        let has_notify = self
-            .state_rx
-            .borrow()
-            .capabilities
-            .contains(&Capability::Notify);
-        if !has_notify {
-            return Err(Error::MissingCapability("NOTIFY".into()));
-        }
-        Ok(())
+        self.admit_command(&Command::NotifyNone).map(drop)
     }
 }
 

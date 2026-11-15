@@ -820,28 +820,6 @@ no per-object evidence variant, so the engine never sees the proof. That needs
 a shared inventory API change in bifrost-types. (Mutation 404 handling stays
 separate on purpose: it proves target absence, not inventory coverage.)
 
-## CON-060 - Two redirect walkers, two 401-refresh-once paths, two deadlines
-
-**Reported by:** net-dav (the copies differ in policy).
-
-`request.rs::send_streaming_inner` (net) and dav-core `DavDispatch::send_raw_until`
-with `RedirectHistory`, `rebase_destination` and `mint_auth_until`. DAV's stated
-reason for a second walker is that net strips `Authorization` on an origin change
-and cannot restore it - a missing hook in net's API, not a reason for two walkers.
-Policy differences: method rewriting (net rewrites 301/302 on unsafe methods and
-every 303 to GET; DAV preserves the method on 301/302/307/308 and refuses to follow
-303); origin comparison (net `same_origin(&Url, &Url)`; DAV `url_origin(&str) ->
-String`; a third rule in `dav_href_key`); the hop cap (kept in step only by both
-naming `DEFAULT_MAX_HOPS`, a constant shared by convention); the deadline (DAV keeps
-its own `Instant + DAV_CLIENT_TIMEOUT`, hand-maps expiry to `NetError::Timeout {
-Unsent }`, and also sets `request_timeout` on the spec, while `RequestDeadline`
-would own it but is `pub(crate)`). Owner: net's walk, parameterized by a per-hop
-policy trait - `admit(prior, next) -> HopDecision` carrying the credential to
-present (re-minted per origin) or a refusal; the method-rewrite mode (RFC 7231
-rewrite, or preserve-and-refuse-303); a header rewrite hook (the DAV `Destination`
-rebase); the dialect target guard. DAV's `send_raw_until`, `RedirectHistory`, its
-401 handling and its deadline then disappear. This is the exchange core of STR-151.
-
 ## CON-061 - Throttle-scope stamping happens at three sites for DAV alone
 
 **Reported by:** net-dav.

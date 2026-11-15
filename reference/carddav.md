@@ -87,22 +87,36 @@ covers the redirect failures `send_raw_request` now classifies through
 malformed-request arm, so reclassifying them without it would have silently
 narrowed the predicate.
 
-The DAV dispatcher bounds a complete logical request to 30 seconds, including
-credential reads, one-shot 401 refresh, retries, admission and redirect hops.
-Wrappers build requests without reading credentials first; the dispatcher mints
-them inside that deadline. Standalone `auth_headers` calls have the same bound.
-Each net send receives only the remaining time; a new hop cannot restart the
-clock. Net owns the in-flight versus pre-admission timeout state, so DAV does not
-stamp a request as sent before admission. Errors after earlier redirect
-responses retain their acknowledged attempt evidence. If an unreplayable request
-may have committed on an earlier hop, a later pre-dispatch failure enters
-`Protocol(PartialResponse)` and requires reconciliation.
-This includes credential lookup and refresh failures without attempt causes;
-the combined history is classified on a fresh error builder, since decorating
-an existing error cannot change its recovery classification.
-The local walk retains DAV's origin gate, dialect target checks and MOVE
-Destination rebasing. A transport credential callback alone would not replace
-those policies.
+DAV sends each logical request through bifrost-net's shared redirect walk with
+one 30-second total deadline. Net bounds credential lookup, the one-shot 401
+refresh, concurrency and rate admission, retries, redirect drains and the final
+body by that same deadline. Standalone `auth_headers` calls retain their own
+30-second bound. No redirect restarts the clock, so an enterprise user gets a
+bounded operation even when a proxy keeps relocating it.
+
+`DavHopPolicy` supplies origin admission and credentials, preserves methods and
+bodies on 301/302/307/308, returns 303 as data, rebases MOVE Destination and
+checks dialect targets before each dispatch. A GET cannot fulfill a DAV query or
+conditional write, which settles the method policy. Origin identity is net's
+`origin_key`: scheme, normalized host and effective port; neither a new port nor
+a downgrade can inherit a credential. The shared ten-hop cap bounds loops while
+allowing ordinary enterprise discovery/proxy chains. DAV overrides an injected
+AccountNet's redirect settings with this policy, keeping its existing behavior.
+
+Every request carrying a `Destination` header (MOVE, COPY, or anything else) has
+that destination checked against the admitted-origin set by
+`DavHopPolicy::check_target`, before each wire hop including the first. The
+gate therefore holds for raw `send_raw_request` callers as well as
+`move_resource`; a destination on an unadmitted origin, or one that is not
+absolute, is a local `Request` refusal with nothing sent.
+
+There is no DAV exchange loop, refresh loop or `RedirectHistory`. Net's
+`AttemptLedger` retains every response and possible commit across hops. A later
+local, credential or unsent failure after an unreplayable possible commit enters
+`Protocol(PartialResponse)` and requires reconciliation. Typed dialect refusals
+travel through `Error::HopPolicy` and the same history envelope. Earlier
+acknowledged responses remain diagnostic evidence, including when a target is
+refused before its dispatch.
 
 Status classification receives the HTTP response headers and uses
 `bifrost_net::request::parse_retry_after_hint`, preserving HTTP dates as
@@ -137,7 +151,7 @@ its scope and action.
   layer"), so DAV legs share the retry budget, per-host rate limiting,
   bandwidth metering and observability with every other HTTP protocol crate;
   scripted transcripts exercise DAV flows at the wire, below all of it, without
-  a listener. DAV still mints its own credentials and walks its own redirects.
+  a listener. DAV supplies credential policy to the shared net walk.
   Every request path classifies a non-2xx status before the body is parsed, so
   an error page can never decode as an authoritative empty report - except the
   `href_query_leg` filtered lane, which reads the raw response through
@@ -158,17 +172,11 @@ its scope and action.
   principal and an address book home on different hosts of one service is a
   real deployment shape. Discovery stages the home without changing trust;
   it is admitted only after the complete authenticated discovery succeeds,
-  before the account is shared or a home request starts. Redirects are
-  disabled in the transport (`FollowRedirects::Disabled`) and EVERY hop,
-  same-origin or not, is walked by `send_raw_request` in `bifrost-dav-core`:
-  each hop re-mints the credential for the origin it is about to address,
-  gated by the same admitted-origin set the credential gate reads, so a
-  `Location` naming an unadmitted origin fails locally without a request
-  going out. Walking same-origin hops too costs nothing (the credential is
-  the same one) and removed the earlier split where reqwest followed those
-  internally, which stripped `Authorization` on any origin change with no
-  way to restore it. A 303 is not followed, and the walk is bounded by
-  bifrost-net's `DEFAULT_MAX_HOPS`. A redirect the walk will not follow (past
+  before the account is shared or a home request starts. Every hop runs in bifrost-net's shared walk with
+  `DavHopPolicy`, re-minting credentials only after the target's complete origin
+  has passed the admitted-origin gate. An unadmitted `Location` fails locally
+  without dispatch. Methods and bodies survive 301/302/307/308; 303 is returned
+  as data. The walk uses bifrost-net's `DEFAULT_MAX_HOPS`. A redirect the walk will not follow (past
   that cap, or a `Location` that will not resolve or is not valid UTF-8) is
   classified through `bifrost_net::into_account_error_with_throttle_scope`
   with DAV's explicit account throttle policy, matching how the transport
@@ -794,8 +802,8 @@ the two dialects reduce to a single
 `every_error_this_crate_mints_is_stamped_carddav`.
 
 `CardDavClient` is a newtype over the shared `DavDispatch`, which owns the HTTP
-client, credentials, the admitted-origin credential gate, the manual
-cross-origin redirect walk and the generic WebDAV verbs. Native-id resolution is
+client, credentials, the admitted-origin credential gate, the per-hop net
+policy and the generic WebDAV verbs. Native-id resolution is
 shared too: `DavDispatch::resolve_url` returns an absolute href verbatim, lets a
 root-relative href replace the base path per RFC 3986, and resolves a relative
 href UNDER the configured base path rather than beside it. `reference/caldav.md`,
@@ -813,8 +821,8 @@ conflict. Self-fetched validators pay the same accepted read-back cost.
 Net narrows possible-commit failures and `dispatch_once` also stamps DAV-minted
 failures. Ambiguous retryable statuses (including 503) stop before another
 write; the proven refusals of `bifrost_net::is_proven_refusal` (401, 429, 405,
-501) are not ambiguous. DAV's all-401 history exception is defensive and
-unreachable with today's outer credential-refresh walk. Relocation returns
+501) are not ambiguous. DAV's all-401 history exception permits a terminal
+status to be consumed after net refreshes a rejected token. Relocation returns
 Before, MovedThenPut or CopiedThenDelete progress. contact_update attaches once:
 committed Moved/Copied steps are Blocking, with source/destination contact
 identities; the Updated/Deleted primary is Repeatable and scoped to its target.
@@ -971,7 +979,7 @@ and stores a `CoordinatedTokenSource`. Clones share one cache, proactive refresh
 opaque-token maximum age and failure backoff; concurrent rejected-token refreshes
 reuse the replacement. Existing coordinating sources retain their policy, and
 `StaticTokenSource` retains live external rotation. Credential-origin admission
-still precedes token lookup, and the DAV deadline bounds lookup and refresh.
+still precedes token lookup, and net's total deadline bounds lookup and refresh.
 This also applies to clients given an existing `AccountNet`: that handle may
 belong to another composed protocol leg, so its bearer source is not the DAV
 credential authority. Separate clients needing shared refresh work should pass

@@ -138,7 +138,7 @@ pub(super) fn encode_search(
     return_opts: Option<&[String]>,
     utf8: bool,
 ) -> Result<(), crate::Error> {
-    validate_search_criteria_crlf(criteria, "SEARCH criteria", w.literal_mode())?;
+    validate_search_criteria_crlf(criteria, "SEARCH criteria", super::LiteralMode::LiteralPlus)?;
     validate_non_empty_search_criteria(criteria, cmd)?;
     // RFC 6855 Section 3: after ENABLE UTF8=ACCEPT, clients MUST NOT issue a
     // SEARCH command that contains a charset specification.

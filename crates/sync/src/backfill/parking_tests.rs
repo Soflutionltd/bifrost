@@ -121,7 +121,8 @@ impl Harness {
             bandwidth_budget: None,
             factory,
             current: Arc::new(ArcSwap::from_pointee(crate::types::Incarnation::new(
-                account, 0,
+                account,
+                crate::types::Incarnation::initial_generation(),
             ))),
             cursors,
             changes_tx,
@@ -132,9 +133,9 @@ impl Harness {
             boundary_tx: boundary.sender(),
             capabilities: Arc::new(std::sync::RwLock::new(caps)),
             subscriptions: Arc::new(SubscriptionRegistry::new()),
-            account_generation_tx: watch::channel(0).0,
-            push_retired: watch::channel(0).0,
-            push_topology: watch::channel(0).0,
+            account_generation_tx: watch::channel(crate::types::AccountGeneration::for_test(0)).0,
+            push_retired: watch::channel(crate::types::AccountGeneration::for_test(0)).0,
+            push_topology: watch::channel(crate::engine::PushTopologyGeneration::for_test(0)).0,
             push_drain_wait: Duration::from_secs(5),
             reopen_lock: Arc::new(AsyncMutex::new(())),
             open_skips: Arc::new(Mutex::new(vec![])),
@@ -230,9 +231,15 @@ async fn parking_fixed_plan_retries_the_pending_partition() {
 #[tokio::test(start_paused = true)]
 async fn parking_page_loss_restarts_without_completion() {
     let mut h = Harness::new().await;
-    assert_eq!(h.ctx.coverage.undelivered_watermark(&scope()), 0);
+    assert_eq!(
+        h.ctx.coverage.undelivered_watermark(&scope()),
+        crate::cursor::UndeliveredMark::for_test(0)
+    );
     drop(h.receiver.take());
-    assert_eq!(h.ctx.coverage.undelivered_watermark(&scope()), 1);
+    assert_eq!(
+        h.ctx.coverage.undelivered_watermark(&scope()),
+        crate::cursor::UndeliveredMark::for_test(1)
+    );
     h.receiver = Some(h.ctx.delivery.subscribe(
         Some(h.ctx.control.clone()),
         Arc::<PendingCoverage>::clone(&h.ctx.coverage),

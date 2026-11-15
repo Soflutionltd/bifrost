@@ -223,85 +223,6 @@ full-resyncs. Owner: the decoder (or the SELECT consumer) turns the wire number
 into `Option<UidValidity>` / `Option<ModSeq>` once, stating the "0 means absent"
 tolerance there; every downstream field is the typed value.
 
-## BUG-029 - IMAP command admission has three front doors and two clocks, and they disagree
-
-**Reported by:** imap-protocol (live), imap-connection (live; its top-ranked finding).
-
-"Which capability (and ENABLE state) does this command need" is answered in the
-encoder's per-arm `missing(..)` gates (`encode/dispatch.rs`) and again,
-separately written, in the connection handle (`extensions.rs`
-ACL/METADATA/QUOTA/NAMESPACE/ID/ENABLE/COMPRESS, `mailbox.rs`,
-`helpers::require_condstore` / `require_searchres`, `uid_ops`, `sort_thread`,
-`auth`) - not one answer re-checked at two chokepoints, but the predicate
-restated, and it differs:
-
-- SELECT/EXAMINE with QRESYNC parameters: the handle requires QRESYNC to be
-  ENABLEd (`validate_qresync_params`, RFC 7162 section 3.2.3 MUST); the encoder,
-  documented as the live authority at the head of the queue, only checks
-  `has_capability(QResync)`, i.e. advertised.
-- UID FETCH ... VANISHED: handle requires ENABLEd (`uid_ops`), encoder checks
-  advertised. UID FETCH is pipelinable, so a pipelined CHANGEDSINCE+VANISHED
-  fetch is gated only by the weaker encoder check.
-- AUTHENTICATE PLAIN: `connection/auth.rs` tests
-  `capabilities.contains(&Capability::Auth("PLAIN"))` directly, not through
-  `supports`.
-
-Owner: `Command::requirements() -> Requirements { capabilities, enabled,
-states, refused_after_selection }` beside `CommandKind::legal_states`, read by
-both handle and encoder against one `ConnectionCaps` (STR-055); search criteria
-contribute through `SearchKey::required_capabilities()` (STR-053).
-
-The imap-connection hunter mapped all four doors. (1) Handle methods, against
-the watch snapshot: `require_state`, `require_condstore`, `require_searchres`,
-`check_utf8_only_enforced`, `require_notify`, `require_auth_mechanism`, five
-hand-coded `state_refusal(.., &[SessionState::NotAuthenticated])` calls in
-`auth.rs` (a second copy of the `CommandKind::legal_states` row for
-LOGIN/AUTHENTICATE), 17 `sequence_set.as_str().contains('$')` scans
-(`uid_ops.rs`, `seq_ops.rs`, `ergonomics.rs`), three QRESYNC-ENABLEd scans,
-`validate_requested_fetch_items`, `validate_requested_status_items`,
-`validate_list_extended_request`, CHECK-on-rev2 in `helpers::check`, STARTTLS,
-COMPRESS, UNAUTHENTICATE, ENABLE, ESEARCH. (2) The driver's
-`live_state_refusal` (state table plus `refused_after_selection`) against live
-state - a deliberate re-check, fine. (3) The encoder's gates, against live
-state. (4) The `Pipeline` builder: `execute_raw` calls `require_state` only.
-Further disagreements it found:
-
-- `$` in a sequence set: only the handle checks it (the encoder checks `$` only
-  inside search criteria), so the pipeline's FETCH/STORE/COPY/MOVE with `$`
-  reach the wire ungated.
-- FETCH item gates (MODSEQ, PREVIEW, SAVEDATE, OBJECTID, X-GM-EXT-1, BINARY):
-  handle-only, against a snapshot the encoder's own comment says "may predate a
-  CAPABILITY/ENABLE update"; the pipeline's `items: String` bypasses them.
-  STATUS item gates, LIST-EXTENDED option gates, CHECK on rev2 and UTF8=ONLY are
-  handle-only and bypassed the same way.
-- STARTTLS availability: three rules, three outcomes - setup's
-  `ensure_starttls_available` (`StartTlsUnavailable`), the handle's raw
-  `Capability::StartTls` scan plus `tls_active` (`StartTlsUnavailable` /
-  `InvalidInput` - `starttls_with_connector` refuses an encrypted connection
-  with `InvalidInput`, a session-state refusal), the encoder
-  (`MissingCapability`).
-- Capability spelling: `snapshot_supports`'s doc says "EVERY handle gate ...
-  goes through here", but `require_notify`, `login`'s LOGINDISABLED scan, the
-  AUTH gates, the STARTTLS gate and the APPENDLIMIT gate use raw
-  `capabilities.contains` / `iter().any` - equivalent today only because none of
-  those is in the rev2 baseline.
-- "Advertised but not ENABLEd" has two error answers:
-  `check_utf8_only_enforced` returns `InvalidState` ("the same request succeeds
-  after the ENABLE"); the QRESYNC-not-ENABLEd gates return `MissingCapability`,
-  which `account/error.rs` maps to `Unsupported(operation)`. Same situation, two
-  recovery classes.
-- Eager vs deferred: `uid_fetch_changed_since_stream` checks `require_state`
-  eagerly; `uid_fetch_stream_budgeted` checks it inside the returned future.
-
-Its owner: one `fn admit(command: &Command, session: &SessionView) -> Result<(),
-Refusal>` (in `types/command.rs` beside `legal_states`, or
-`connection/admission.rs`), `Refusal` carrying a typed reason (STR-057). The
-handle calls it against the snapshot for an early refusal; the driver calls it
-in `prepare_command` against live state as the authority, mapping a refusal it
-alone finds to `StateChangedBeforeSend`; the encoder becomes a pure encoder; the
-pipeline builder gets every gate for free. About 60 inline gate blocks go - "the
-IMAP analogue of the status-line consolidation".
-
 ## BUG-030 - SASL vocabulary, ladders and policy are split across IMAP, ManageSieve and SMTP
 
 **Reported by:** imap-protocol, imap-connection, imap-account, smtp-sasl.
@@ -397,57 +318,6 @@ needs attachment-aware evaluation that composes with boolean filters and
 position paging (for example BODYSTRUCTURE-based post-filtering of the
 candidate set). The defect is now documented at the `pim.rs` arm and in
 `reference/imap.md`.
-
-## BUG-056 - "Was this JMAP id answered?" is decided per response and per caller, and an omitted `Blob/copy` answer is terminal
-
-**Reported by:** jmap-protocol (live; its second-ranked move).
-
-RFC 8620 promises one answer per submitted id; servers omit. What an omission
-means is decided by each response type in `core/` and again by each caller in
-`sync/`:
-
-| Site | Omitted id becomes |
-|---|---|
-| `SetResponse::created` / `updated` / `destroyed` | `Error::SetIdUnanswered(id)` |
-| `CopyResponse::created` (`*/copy`) | `Error::SetIdUnanswered(id)` |
-| `EmailImportResponse::created` | `Error::SetIdUnanswered(id)` |
-| `BlobUploadResponse::created` | `SetIdUnanswered`; a `notCreated` entry becomes `Error::NotParsable(format!("Blob {id} not created: {error:?}"))` |
-| `CopyBlobResponse::copied` (`Blob/copy`) | `Error::IdNotFound(id)` |
-| `ParseResponse::parsed`, `EmailParseResponse::parsed` | `IdNotFound`, or `NotParsable(id)` |
-| `GetResponse` | nothing: `notFound` defaults to empty, and the comment tells every caller to reconcile `list + notFound` against what it submitted |
-
-`sync/error.rs` re-decides: `into_account_error` maps a bare `SetIdUnanswered` to
-`set_id_unanswered("*/set", id, ctx, guarded = true)`, guessing both method and
-guard because the error does not carry them; `set_answer_error(op, method,
-guarded)` exists so callers can re-supply what the error lost, and a caller that
-forgets gets the guess; `get_id_unanswered`, `get_id_unresolved_after_query`,
-`require_created_id` / `created_id_unusable` and `convert_id_not_found` are the
-per-lane classifiers, referenced at roughly forty call sites across `pim.rs`,
-`contacts.rs`, `calendar_ops.rs`, `filters.rs`, `hydrate.rs`, `page_cursor.rs`,
-`discover.rs`.
-
-They already disagree. The `SetIdUnanswered` doc says the create maps of
-"`*/copy` and `Blob/upload`" take the partial-response lane; `Blob/copy` does not:
-an omitted blob becomes `IdNotFound`, which `convert_id_not_found` (no scope on
-the context) turns into terminal `Protocol(MissingField)`, live in production
-through `copy_attachment_blob` in `sync/pim.rs`, while sibling write lookups give
-retryable `Protocol(PartialResponse)`. The same function reports a response
-naming the wrong accounts as `NotParsable` prose (`ParseFailed`) rather than a
-contract violation. A `Blob/upload` refusal (`overQuota`, `tooLarge`,
-`rateLimit`) loses its `SetError` type and classifies as `Protocol(ParseFailed)`,
-a provider-fault class for a quota refusal (latent: `BlobUploadRequest` has no
-production caller).
-
-Owner: one generic in `core/` every response's id lanes decode into
-(`IdAnswers<K, T, E>` with `take(&K) -> Answer<T, E>`, `Answer = Ok(T) |
-Refused(E) | NotFound | Unanswered`, method name and guard stamped on the request
-side). Better, the `Target` permit move: the request builder hands out a
-non-`Clone` permit per submitted id (`SetRequest::update` / `destroy` / `create`,
-`GetRequest::ids`) and the response's only accessor is `settle(permit) ->
-Answer`, making exactly-once accounting a compile-time property; the "reconcile
-yourself" instruction on `GetResponse` disappears, and `SetIdUnanswered` carries
-`{ method: &'static str, id, guarded }`, so `set_answer_error` and the `"*/set"`
-guess go.
 
 ## BUG-057 - What an absent or zero JMAP core limit means is decided in eight places, with live disagreements
 
@@ -695,13 +565,20 @@ no Message-ID, `parse_draft_for_submission` falls back to the constant
 which then becomes the "stable fallback id" on the receipt
 (`append_to_sent_or_fallback`) - not unique by construction.
 
-## BUG-166 - JMAP contact and calendar page cursors decode as each other
+## BUG-170 - Small wave 10 lateral findings across Google, Graph, JMAP and IMAP
 
-**Reported by:** wave 9 fixer (jmap-account, lateral).
+**Reported by:** wave 10 fixers (lateral).
 
-The two PIM page-cursor kinds still share a historical format, so a contacts
-cursor handed to a calendar walk (or the reverse) decodes instead of refusing
-with the restart-paging signal.
+- Google `mutation.rs::has_unresolved_label_id` parses `$gmail-label:` itself
+  instead of going through the flag parser in `account/flags.rs`.
+- Graph etag updates apply every insert before every removal, whatever the wire
+  order of a repeated id, so a delete then re-add of one id within a page can
+  leave the wrong final state.
+- JMAP: a method response omitted entirely from a JMAP reply maps through
+  `CallNotFound` to a terminal `MissingField` outside the send path, where the
+  per-id lanes now report an omission as unanswered (retryable).
+- IMAP: NOTIFY `MessageNew.fetch_attrs` still bypasses FETCH extension admission
+  (`validate_fetch_wire`); its raw items get syntax validation only.
 
 ## BUG-167 - IMAP discovery still advertises DAV scopes that were excluded, and namespace-prefix failures use account scope
 
@@ -711,22 +588,6 @@ Scopes excluded by a DAV collision are now on the skip lane but are still
 advertised by discovery. Separately, a failed `LIST` under a namespace prefix
 is skipped with an account-level `ErrorScope`, because no scope variant names a
 namespace.
-
-## BUG-168 - An empty-string Graph delta id bypasses the id-less checkpoint barrier
-
-**Reported by:** wave 9 fixer (graph, lateral).
-
-The id-less barrier catches a delta item with no id, but an item whose id is
-the empty string passes it and is minted as an object.
-
-## BUG-169 - The coalesced IMAP pipeline writes encoded chunks directly
-
-**Reported by:** wave 9 fixer (imap-connection, lateral).
-
-Every exchange now reads through the one read loop, but the optimized coalesced
-pipeline still writes encoded chunks without going through
-`send_wire_command`, so that function's claim that every command reaches the
-socket through it is still too broad.
 
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 

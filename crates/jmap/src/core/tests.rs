@@ -122,6 +122,10 @@ impl JmapMethod for TestMailGet {
     type Cap = crate::core::capability::Mail;
     type Response = <TestGet as JmapMethod>::Response;
 
+    fn stamp_response(response: &mut Self::Response, context: crate::core::answer::AnswerContext) {
+        response.answer_context = context;
+    }
+
     fn set_account_id(&mut self, account_id: &crate::core::id::AccountId) {
         self.0.set_account_id(account_id);
     }
@@ -130,7 +134,11 @@ impl JmapMethod for TestMailGet {
 fn make_handle<M: JmapMethod>(call_id: &str) -> CallHandle<M> {
     CallHandle {
         call_id: call_id.to_string(),
-        method_name: M::NAME,
+        answer_context: crate::core::answer::AnswerContext {
+            method: M::NAME,
+            guarded: false,
+            write: !M::REPLAY_SAFE,
+        },
         _phantom: PhantomData,
     }
 }
@@ -655,6 +663,65 @@ mod envelope {
     }
 
     crate::define_set_method!(ReplayTestSet, super::TestObj);
+
+    #[test]
+    fn unanswered_set_retains_the_serialized_request_guard() {
+        let stub = stub(mail_primary(), []);
+        for guarded in [false, true] {
+            let mut request = stub.client.build();
+            let mut set = ReplayTestSet::new();
+            if guarded {
+                set = set.if_in_state("s0");
+            }
+            let handle = request.call(set).unwrap();
+            let mut response: crate::core::response::Response = serde_json::from_value(json!({
+                "methodResponses": [["Test/set", {
+                    "accountId": "a", "newState": "s1"
+                }, "s0"]],
+                "sessionState": "session"
+            }))
+            .unwrap();
+            let mut result = response.get(&handle).unwrap();
+            let error = result.updated(&TestObjId::new("missing")).unwrap_err();
+            assert!(matches!(error, crate::Error::IdUnanswered { id, context }
+                if id == "missing" && context.method == "Test/set"
+                    && context.guarded == guarded && context.write));
+        }
+    }
+
+    #[test]
+    fn omitted_blob_copy_is_unanswered_but_a_declared_miss_is_refused() {
+        use crate::blob::copy::CopyBlobRequest;
+        use crate::core::id::BlobId;
+        let stub = stub(mail_primary(), []);
+        for refused in [false, true] {
+            let mut request = stub.client.build();
+            let handle = request
+                .call(CopyBlobRequest::new("source").blob_id("blob"))
+                .unwrap();
+            let not_copied = if refused {
+                json!({"blob": {"type": "notFound"}})
+            } else {
+                json!({})
+            };
+            let mut response: crate::core::response::Response = serde_json::from_value(json!({
+                "methodResponses": [["Blob/copy", {
+                    "fromAccountId": "source", "accountId": "a", "notCopied": not_copied
+                }, "s0"]],
+                "sessionState": "session"
+            }))
+            .unwrap();
+            let mut result = response.get(&handle).unwrap();
+            let error = result.copied(&BlobId::new("blob")).unwrap_err();
+            if refused {
+                assert!(matches!(error, crate::Error::Set(error)
+                    if error.error_type() == &crate::core::set::SetErrorType::NotFound));
+            } else {
+                assert!(matches!(error, crate::Error::IdUnanswered { context, .. }
+                    if context.method == "Blob/copy" && context.write && !context.guarded));
+            }
+        }
+    }
 
     #[test]
     fn request_replay_policy_is_idempotent_only_when_every_call_is_replay_safe() {

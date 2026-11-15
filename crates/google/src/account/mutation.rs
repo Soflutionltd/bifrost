@@ -162,9 +162,7 @@ fn mutation_stream(
         key,
         patch: None,
         pending_target: None,
-        finished: false,
-        emitted_done: false,
-        pending_event: None,
+        phase: MutationPhase::Reading,
         shutdown,
     };
 
@@ -174,17 +172,23 @@ fn mutation_stream(
         // behind the uncertain lanes; testing the token first would
         // swallow it and turn the very evidence this stream owes the
         // engine back into a silent disappearance.
-        if let Some(event) = state.pending_event.take() {
-            return Some((event, state));
+        match std::mem::replace(&mut state.phase, MutationPhase::Ended) {
+            MutationPhase::Pending { event, next } => {
+                state.phase = match next {
+                    MutationResume::Reading => MutationPhase::Reading,
+                    MutationResume::Done => MutationPhase::Done,
+                    MutationResume::Ended => MutationPhase::Ended,
+                };
+                return Some((event, state));
+            }
+            MutationPhase::Ended => return None,
+            phase => state.phase = phase,
         }
         if state.shutdown.is_cancelled() {
             return None;
         }
-        if state.finished {
-            if state.emitted_done {
-                return None;
-            }
-            state.emitted_done = true;
+        if matches!(state.phase, MutationPhase::Done) {
+            state.phase = MutationPhase::Ended;
             return Some((SyncEvent::Done(None), state));
         }
 
@@ -198,8 +202,7 @@ fn mutation_stream(
                     let labels = match labels_result {
                         Ok(labels) => labels,
                         Err(error) => {
-                            state.finished = true;
-                            state.emitted_done = true;
+                            state.phase = MutationPhase::Ended;
                             let account_error = account_error::into_account_error(
                                 error,
                                 GmailErrorContext::mutation(AccountOperation::UpdateFlags),
@@ -216,8 +219,7 @@ fn mutation_stream(
                         let labels = match refreshed {
                             Ok(snapshot) => snapshot.labels,
                             Err(error) => {
-                                state.finished = true;
-                                state.emitted_done = true;
+                                state.phase = MutationPhase::Ended;
                                 let account_error = account_error::into_account_error(
                                     error,
                                     GmailErrorContext::mutation(AccountOperation::UpdateFlags),
@@ -268,8 +270,7 @@ fn mutation_stream(
             }
         }
         if ids.is_empty() {
-            state.finished = true;
-            state.emitted_done = true;
+            state.phase = MutationPhase::Ended;
             return Some((SyncEvent::Done(None), state));
         }
 
@@ -349,7 +350,7 @@ fn mutation_stream(
         match event {
             MutationApply::Batch { items, warning } => {
                 if targets_exhausted {
-                    state.finished = true;
+                    state.phase = MutationPhase::Done;
                 }
                 let batch = SyncEvent::Batch(Batch {
                     items,
@@ -363,15 +364,21 @@ fn mutation_stream(
                     checkpoint: None,
                 });
                 if let Some(warning) = warning {
-                    state.pending_event = Some(batch);
+                    state.phase = MutationPhase::Pending {
+                        event: batch,
+                        next: if targets_exhausted {
+                            MutationResume::Done
+                        } else {
+                            MutationResume::Reading
+                        },
+                    };
                     Some((SyncEvent::Warning(warning), state))
                 } else {
                     Some((batch, state))
                 }
             }
             MutationApply::Terminate { accounted, error } => {
-                state.finished = true;
-                state.emitted_done = true;
+                state.phase = MutationPhase::Ended;
                 if accounted.is_empty() {
                     return Some((terminate_event(error), state));
                 }
@@ -380,7 +387,10 @@ fn mutation_stream(
                 // `Final`: the operation did not complete, and claiming
                 // a final page would tell the engine the remaining
                 // targets were considered.
-                state.pending_event = Some(terminate_event(error));
+                state.phase = MutationPhase::Pending {
+                    event: terminate_event(error),
+                    next: MutationResume::Ended,
+                };
                 Some((
                     SyncEvent::Batch(Batch {
                         items: accounted,
@@ -432,6 +442,24 @@ impl MutationKind {
     }
 }
 
+// Pending output owns its continuation. In particular, cancellation evidence
+// must be delivered before consulting shutdown again.
+enum MutationPhase {
+    Reading,
+    Done,
+    Ended,
+    Pending {
+        event: SyncEvent<ItemOutcome<MutationSuccess>>,
+        next: MutationResume,
+    },
+}
+
+enum MutationResume {
+    Reading,
+    Done,
+    Ended,
+}
+
 struct MutationState {
     client: Arc<GmailClient>,
     tally: crate::client::ByteTally,
@@ -441,9 +469,7 @@ struct MutationState {
     key: IdempotencyKey,
     patch: Option<Result<LabelPatch, MoveRefusal>>,
     pending_target: Option<ObjectId>,
-    finished: bool,
-    emitted_done: bool,
-    pending_event: Option<SyncEvent<ItemOutcome<MutationSuccess>>>,
+    phase: MutationPhase,
     shutdown: CancellationToken,
 }
 

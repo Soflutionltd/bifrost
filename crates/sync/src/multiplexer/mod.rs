@@ -159,7 +159,7 @@ pub struct ChangesReceiver {
     /// only it is keeping open. A failed upgrade means the engine has already
     /// torn the account down, which is exactly the case where there is nothing
     /// left to sweep.
-    subscription: Option<(std::sync::Weak<ChangeDelivery>, u64)>,
+    subscription: Option<(std::sync::Weak<ChangeDelivery>, ReceiverSequence)>,
     /// The account's publication ledger, which is also its backfill capacity
     /// ledger. Needed on the lag and drop paths.
     coverage: Option<Arc<crate::cursor::PendingCoverage>>,
@@ -261,16 +261,41 @@ pub struct ChangeDelivery {
     state: StdMutex<SubscriberState>,
 }
 
-#[derive(Debug, Default)]
+/// Sequence in one delivery gate's subscriber set. Only subscription admission
+/// advances it; coverage may compare snapshots but cannot mint subscribers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReceiverSequence(u64);
+
+impl ReceiverSequence {
+    fn admit(&mut self) {
+        self.0 += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug)]
 struct SubscriberState {
     /// How many consumer receivers this account has ever handed out.
-    next: u64,
+    next: ReceiverSequence,
     /// Bound by the first numbered subscription; this ledger alone owns membership.
     coverage: Option<Arc<crate::cursor::PendingCoverage>>,
 }
 
+impl Default for SubscriberState {
+    fn default() -> Self {
+        Self {
+            next: ReceiverSequence(0),
+            coverage: None,
+        }
+    }
+}
+
 impl SubscriberState {
-    fn min_live(&self) -> Option<u64> {
+    fn min_live(&self) -> Option<ReceiverSequence> {
         self.coverage
             .as_ref()
             .and_then(|coverage| coverage.min_live_receiver())
@@ -425,7 +450,7 @@ impl ChangeDelivery {
         // send could slip between the two and be mis-attributed.
         let inner = self.tx.subscribe();
         let seq = state.next;
-        state.next += 1;
+        state.next.admit();
         coverage.receiver_joined(seq);
         drop(state);
         ChangesReceiver {
@@ -447,7 +472,7 @@ impl ChangeDelivery {
     /// destruction have to be ordered by the same mutex that orders sends.
     ///
     /// Returns how many were retired, for the caller's warning.
-    fn depart(&self, seq: u64, inner: broadcast::Receiver<MultiplexerEvent>) -> usize {
+    fn depart(&self, seq: ReceiverSequence, inner: broadcast::Receiver<MultiplexerEvent>) -> usize {
         let state = self.guard();
         let coverage = state.coverage.as_deref();
         drop(inner);
@@ -499,7 +524,7 @@ impl ChangeDelivery {
     /// The lowest sequence still holding a receiver. Observability; used by
     /// tests.
     #[must_use]
-    pub fn min_live(&self) -> Option<u64> {
+    pub fn min_live(&self) -> Option<ReceiverSequence> {
         self.guard().min_live()
     }
 
@@ -687,7 +712,7 @@ pub enum ReopenRequest {
     PushRecovery {
         scope: Option<CursorScope>,
         error: AccountError,
-        generation: u64,
+        generation: crate::types::AccountGeneration,
     },
     /// Account error observed at the scope's stream terminus, or raised by a
     /// mutation campaign or a cold-start walk.
@@ -704,7 +729,7 @@ pub enum ReopenRequest {
     Recovery {
         scope: Option<CursorScope>,
         error: AccountError,
-        generation: Option<u64>,
+        generation: Option<crate::types::AccountGeneration>,
     },
     /// A provider lifecycle event deleted this scope's folder. The engine
     /// must purge the scope's durable rows - the change cursor AND the
@@ -727,7 +752,10 @@ pub enum ReopenRequest {
     /// deferred inventory worker for a walk a reset or deletion superseded.
     /// The epoch is an engine-internal counter and means nothing to a
     /// consumer.
-    EstablishIfAbsent { scope: CursorScope, epoch: u64 },
+    EstablishIfAbsent {
+        scope: CursorScope,
+        epoch: crate::cursor::LifecycleEpoch,
+    },
     /// Engine plumbing: re-run an account-wide schema reset that was declined
     /// under a pause or exhausted its retry budget, owing re-establishment to
     /// `reestablish` (scope -> lifecycle epoch). `parked_at` is the count of
@@ -735,8 +763,8 @@ pub enum ReopenRequest {
     /// committed since already cleared every row, so the listener then only
     /// establishes the owed scopes.
     SchemaReset {
-        reestablish: HashMap<CursorScope, u64>,
-        parked_at: u64,
+        reestablish: HashMap<CursorScope, crate::cursor::LifecycleEpoch>,
+        parked_at: crate::engine::ResetCount,
     },
 }
 
@@ -818,6 +846,16 @@ fn lifecycle_termination(error: &AccountError) -> LifecycleTermination {
     }
 }
 
+/// Ownership stamp for a spawned poll task; only the token owner mints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScopeTokenGeneration(u64);
+
+impl ScopeTokenGeneration {
+    fn mint() -> Self {
+        Self(SCOPE_TOKEN_GENERATION.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// A per-scope poll task's cancellation token, tagged with the
 /// identity of the task that owns it.
 ///
@@ -833,7 +871,7 @@ fn lifecycle_termination(error: &AccountError) -> LifecycleTermination {
 /// supersession assumes cannot happen.
 #[derive(Debug, Clone)]
 pub struct ScopeToken {
-    generation: u64,
+    generation: ScopeTokenGeneration,
     token: CancellationToken,
     /// The poll task exited on a terminal verdict and left this entry behind
     /// as a tombstone. The 1s scan reads any present entry as "owned", but a
@@ -856,7 +894,7 @@ impl ScopeToken {
     #[must_use]
     pub fn tombstone() -> Self {
         Self {
-            generation: SCOPE_TOKEN_GENERATION.fetch_add(1, Ordering::Relaxed),
+            generation: ScopeTokenGeneration::mint(),
             token: CancellationToken::new(),
             parked: true,
             drive_generation: None,
@@ -885,7 +923,7 @@ static SCOPE_TOKEN_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub struct Multiplexer {
     pub account_id: AccountId,
     pub account: Arc<ArcSwap<crate::types::Incarnation>>,
-    pub account_generation: watch::Receiver<u64>,
+    pub account_generation: watch::Receiver<crate::types::AccountGeneration>,
     pub cursors: Arc<CursorRegistry>,
     pub config: MultiplexerConfig,
     pub boundary: BoundaryView,
@@ -1265,7 +1303,7 @@ fn spawn_and_track_scope_poll(
     scope: CursorScope,
 ) {
     let scope_cancel = shutdown.child_token();
-    let generation = SCOPE_TOKEN_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let generation = ScopeTokenGeneration::mint();
     let drive_generation = cursors.drive_generation(&scope);
     scope_tokens.lock().expect("poisoned").insert(
         scope.clone(),
@@ -1323,7 +1361,7 @@ fn spawn_and_track_scope_poll(
 /// task was on its way out, and evicting it leaves that successor
 /// untracked, so the next scan spawns a second live poll for the same
 /// scope.
-fn retire_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: u64) {
+fn retire_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: ScopeTokenGeneration) {
     let mut g = tokens.lock().expect("poisoned");
     if matches!(g.get(scope), Some(entry) if entry.generation == generation) {
         g.remove(scope);
@@ -1331,7 +1369,7 @@ fn retire_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: u64
 }
 
 /// Mark an exiting task's registration as a terminal tombstone, by identity.
-fn park_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: u64) {
+fn park_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: ScopeTokenGeneration) {
     let mut g = tokens.lock().expect("poisoned");
     if let Some(entry) = g.get_mut(scope)
         && entry.generation == generation
@@ -1779,7 +1817,7 @@ async fn handle_drive_outcome(
     advanced: bool,
     // The generation of the incarnation the drive ran against, stamped on any
     // engine directive so the listener declines it once that account is gone.
-    generation: u64,
+    generation: crate::types::AccountGeneration,
     reopen_tx: &mpsc::Sender<ReopenRequest>,
     account_id: &AccountId,
     throttles: &StdMutex<crate::recovery::ThrottleBucket>,
@@ -2288,7 +2326,8 @@ mod tests {
     /// Ablation: stamping `None` fails the match.
     #[tokio::test(start_paused = true)]
     async fn a_lifecycle_termination_is_stamped_with_its_streams_incarnation() {
-        const GENERATION: u64 = 7;
+        const GENERATION: crate::types::AccountGeneration =
+            crate::types::AccountGeneration::for_test(7);
         let account_id = AccountId("lifecycle-stamp".into());
         let stub = crate::test_common::StubAccount::new(Vec::new());
         stub.lifecycle_scripts
@@ -2451,7 +2490,7 @@ mod tests {
             &scope,
             Ok(ChangesEvent::Terminated(error)),
             false,
-            7,
+            crate::types::AccountGeneration::for_test(7),
             &reopen_tx,
             &AccountId("cancelled".into()),
             &StdMutex::new(crate::recovery::ThrottleBucket::default()),
@@ -2481,7 +2520,7 @@ mod tests {
             &scope,
             Err(Error::Account(error.clone())),
             false,
-            7,
+            crate::types::AccountGeneration::for_test(7),
             &reopen_tx,
             &AccountId("routing".into()),
             &StdMutex::new(crate::recovery::ThrottleBucket::default()),
@@ -2494,8 +2533,8 @@ mod tests {
         let request = reopen_rx.try_recv().expect("engine directive forwarded");
         assert!(matches!(
             request,
-            ReopenRequest::Recovery { error: routed, generation: Some(7), .. }
-                if routed.kind() == error.kind()
+            ReopenRequest::Recovery { error: routed, generation: Some(generation), .. }
+                if routed.kind() == error.kind() && generation == crate::types::AccountGeneration::for_test(7)
         ));
     }
 
@@ -2519,7 +2558,7 @@ mod tests {
                     &CursorScope::Account,
                     Err(Error::Account(error)),
                     false,
-                    7,
+                    crate::types::AccountGeneration::for_test(7),
                     &reopen_tx,
                     &AccountId("parked".into()),
                     &StdMutex::new(crate::recovery::ThrottleBucket::default()),
@@ -2789,7 +2828,10 @@ mod tests {
             ReopenRequest::ScopeDeleted { scope } if scope == new_scope
         ));
         assert!(reopen_rx.try_recv().is_err());
-        assert_eq!(cursors.lifecycle_epoch(&new_scope), epoch_before + 1);
+        assert_eq!(
+            cursors.lifecycle_epoch(&new_scope),
+            epoch_before.after_deletion()
+        );
     }
 
     /// A shape a reattach's replacement topology dropped no longer
@@ -2835,7 +2877,7 @@ mod tests {
             &scope,
             Ok(ChangesEvent::Terminated(error)),
             false,
-            7,
+            crate::types::AccountGeneration::for_test(7),
             &reopen_tx,
             &AccountId("terminal".into()),
             &StdMutex::new(crate::recovery::ThrottleBucket::default()),
@@ -3097,7 +3139,7 @@ mod tests {
         drop(a);
         assert_eq!(
             h.coverage.undelivered_watermark(&CursorScope::Account),
-            2,
+            crate::cursor::UndeliveredMark::for_test(2),
             "read-but-unacknowledged pages leaving with their reader are still a loss"
         );
     }
@@ -3384,7 +3426,7 @@ mod tests {
 
         assert_eq!(
             h.coverage.undelivered_watermark(&CursorScope::Account),
-            0,
+            crate::cursor::UndeliveredMark::for_test(0),
             "pages in a consumer's hands at detach are the consumer's, not a loss"
         );
         assert!(
@@ -3549,8 +3591,8 @@ mod tests {
         drop(sentinel);
     }
 
-    fn track(tokens: &ScopeTokens, scope: &CursorScope) -> u64 {
-        let generation = SCOPE_TOKEN_GENERATION.fetch_add(1, Ordering::Relaxed);
+    fn track(tokens: &ScopeTokens, scope: &CursorScope) -> ScopeTokenGeneration {
+        let generation = ScopeTokenGeneration::mint();
         tokens.lock().expect("poisoned").insert(
             scope.clone(),
             ScopeToken {
@@ -3681,7 +3723,7 @@ mod tests {
         tokens.lock().expect("poisoned").insert(
             scope.clone(),
             ScopeToken {
-                generation: 7,
+                generation: ScopeTokenGeneration(7),
                 token: token.clone(),
                 parked: false,
                 drive_generation: None,
@@ -3706,14 +3748,14 @@ mod tests {
         tokens.lock().expect("poisoned").insert(
             scope.clone(),
             ScopeToken {
-                generation: 9,
+                generation: ScopeTokenGeneration(9),
                 token: CancellationToken::new(),
                 parked: false,
                 drive_generation: None,
             },
         );
 
-        retire_scope_token(&tokens, &scope, 8);
+        retire_scope_token(&tokens, &scope, ScopeTokenGeneration(8));
 
         assert!(
             tokens.lock().expect("poisoned").contains_key(&scope),

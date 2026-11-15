@@ -44,6 +44,7 @@ pub fn into_account_error_with_throttle_scope(
     throttle_scope: Option<ThrottleScope>,
 ) -> AccountError {
     match error {
+        Error::HopPolicy(error) => *error,
         Error::AttemptHistory {
             source,
             attempts,
@@ -60,6 +61,7 @@ pub fn into_account_error_with_throttle_scope(
                     source.as_ref(),
                     Error::Network { .. } | Error::Timeout { .. } | Error::Tls { .. }
                 );
+            let typed_hop_refusal = matches!(source.as_ref(), Error::HopPolicy(_));
             let terminal =
                 into_account_error_with_throttle_scope(*source, ctx.clone(), throttle_scope);
             let previous: Vec<_> = attempts
@@ -86,7 +88,10 @@ pub fn into_account_error_with_throttle_scope(
                     // acknowledged transmission to a later transport retry:
                     // the builder correctly refuses to classify a transport
                     // failure with acknowledged transmission evidence.
-                    if !reclassified && matches!(cause, Cause::Attempt(_)) {
+                    // A DAV target refusal is local, but earlier answered
+                    // hops remain evidence. Transport failures keep their
+                    // terminal attempt state for recovery classification.
+                    if !reclassified && !typed_hop_refusal && matches!(cause, Cause::Attempt(_)) {
                         continue;
                     }
                     builder = builder.push_cause(cause.clone());
@@ -870,7 +875,8 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
             TransportKind::Network,
             Some(DiagnosticText::support_only("request cancelled")),
         ))),
-        Error::LocalHold { .. }
+        Error::HopPolicy(_)
+        | Error::LocalHold { .. }
         | Error::CostExceedsBurst { .. }
         | Error::EncodeBody { .. }
         | Error::InvalidHeader { .. }

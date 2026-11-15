@@ -34,7 +34,7 @@ fn gmail_labels_fetch_requires_x_gm_ext_1() {
     let without = conn(vec![]);
     assert!(matches!(
         without.validate_requested_fetch_items(&[FetchAttr::GmailLabels]),
-        Err(Error::MissingCapability(capability)) if capability == "X-GM-EXT-1"
+        Err(Error::MissingCapability(failure)) if failure.capability == Capability::XGmExt1
     ));
     let with = conn(vec![Capability::XGmExt1]);
     assert!(

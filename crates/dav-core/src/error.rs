@@ -530,9 +530,8 @@ pub fn filter_unsupported(status: StatusCode, body: &str) -> bool {
 ///   fall back through the refused-redirect arm above.
 ///   A well-known that loops is a probe answer nobody can use, the same shape as
 ///   one that will not parse, and the fallback's fresh lookup against the
-///   configured base cannot inherit anything from it. On the probe path nothing
-///   else mints this kind: redirects are disabled in the transport, so its own
-///   redirect loop never runs, and the dispatcher maps an oversized body to
+///   configured base cannot inherit anything from it. Net's shared redirect
+///   walk produces these failures; the dispatcher maps an oversized body to
 ///   `Protocol(PartialResponse)` before the transport's mapping is reached.
 ///
 /// Do NOT narrow the parse-failure arm. ANY `Protocol(ParseFailed)` from the

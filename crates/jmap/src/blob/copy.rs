@@ -1,12 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::{
-    Error,
-    core::{
-        id::{AccountId, BlobId},
-        set::SetError,
-    },
+use crate::core::{
+    id::{AccountId, BlobId},
+    set::SetError,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -21,6 +18,8 @@ pub(crate) struct CopyBlobRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct CopyBlobResponse {
+    #[serde(skip)]
+    pub(crate) answer_context: crate::core::answer::AnswerContext,
     #[serde(rename = "fromAccountId")]
     from_account_id: AccountId,
     #[serde(rename = "accountId")]
@@ -36,6 +35,10 @@ impl crate::core::method::JmapMethod for CopyBlobRequest {
     const NAME: &'static str = "Blob/copy";
     type Cap = crate::core::capability::Core;
     type Response = CopyBlobResponse;
+
+    fn stamp_response(response: &mut Self::Response, context: crate::core::answer::AnswerContext) {
+        response.answer_context = context;
+    }
 
     fn set_account_id(&mut self, account_id: &AccountId) {
         self.account_id = account_id.clone();
@@ -74,13 +77,15 @@ impl CopyBlobResponse {
     }
 
     pub(crate) fn copied(&mut self, id: &BlobId) -> crate::Result<BlobId> {
-        if let Some(result) = self.copied.as_mut().and_then(|r| r.remove(id)) {
-            Ok(result)
-        } else if let Some(error) = self.not_copied.as_mut().and_then(|r| r.remove(id)) {
-            Err(error.to_string_error().into())
-        } else {
-            Err(Error::IdNotFound(id.to_string()))
-        }
+        crate::core::answer::IdAnswer::from_parts(
+            self.copied.as_mut().and_then(|values| values.remove(id)),
+            self.not_copied
+                .as_mut()
+                .and_then(|values| values.remove(id))
+                .map(|error| crate::Error::Set(error.to_string_error())),
+            false,
+        )
+        .into_result(id.as_str(), self.answer_context)
     }
 
     pub(crate) fn copied_ids(&self) -> Option<impl Iterator<Item = &BlobId>> {

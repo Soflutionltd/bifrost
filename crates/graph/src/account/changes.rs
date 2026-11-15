@@ -1,12 +1,9 @@
-use bifrost_types::{
-    AccountOperation, AccountStream, Change, ChangeCursor, Checkpoint, ErrorScope, ObjectChange,
-    ObjectChangeKind, PageBoundary, ScopeChange, ScopeChangeKind, SyncEvent,
-};
+use bifrost_types::{AccountOperation, AccountStream, Change, ChangeCursor, ErrorScope, SyncEvent};
 
 use super::GraphAccount;
-use super::cursor::{CursorError, decode_cursor, encode_cursor};
+use super::cursor::{CursorError, decode_cursor};
 use super::graph_error::{GraphErrorContext, cursor_error_to_account_error};
-use super::inventory::{batch, fetch_delta_page, graph_etag, is_removed, page_marker, removed_id};
+use super::inventory::batch;
 
 /// Refresh a calendarView delta link before its fixed horizon gets close.
 /// Keeping a ninety-day lead preserves the original 365-day forward view
@@ -37,33 +34,27 @@ pub(crate) fn changes_stream_admitted(
     parsed: Result<super::scope::GraphScope, CursorError>,
 ) -> AccountStream<SyncEvent<Change>> {
     Box::pin(async_stream::stream! {
+        let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+            .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
         let parsed = match parsed.and_then(|parsed| parsed.kind().map(|_| parsed)) {
             Ok(parsed) => parsed,
             Err(error) => {
-                let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                    .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
                 yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
                 return;
             }
         };
-        let mut payload = match decode_cursor(&cursor) {
+        let payload = match decode_cursor(&cursor) {
             Ok(payload) => payload,
             Err(error) => {
-                let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                    .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
                 yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                yield SyncEvent::Done(None);
                 return;
             }
         };
         if !parsed.matches_payload(&payload) {
-            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
             yield SyncEvent::Terminated(cursor_error_to_account_error(
                 CursorError::SchemaIncompatible,
                 ctx,
             ));
-            yield SyncEvent::Done(None);
             return;
         }
         // A v4 in-progress inventory cursor carries a next link, not a
@@ -74,23 +65,17 @@ pub(crate) fn changes_stream_admitted(
         // instead, so the engine restarts the scope rather than silently
         // syncing nothing.
         if payload.inventory_in_progress() {
-            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
             yield SyncEvent::Terminated(cursor_error_to_account_error(
                 CursorError::InventoryInProgress,
                 ctx,
             ));
-            yield SyncEvent::Done(None);
             return;
         }
         if calendar_window_needs_reseed(&payload, jiff::Timestamp::now().as_second()) {
-            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
             yield SyncEvent::Terminated(cursor_error_to_account_error(
                 CursorError::CalendarWindowExpired,
                 ctx,
             ));
-            yield SyncEvent::Done(None);
             return;
         }
 
@@ -107,20 +92,13 @@ pub(crate) fn changes_stream_admitted(
         let client = match parsed.client(&account) {
             Ok(client) => client.clone(),
             Err(error) => {
-                let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                    .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
                 yield SyncEvent::Terminated(cursor_error_to_account_error(
                     super::cursor::routing_error(error),
                     ctx,
                 ));
-                yield SyncEvent::Done(None);
                 return;
             }
         };
-
-        // One accumulator for the delta walk; each emitted page takes
-        // and clears it, so consecutive pages partition the traffic.
-        let (client, tally) = client.metered();
 
         let scope = cursor.scope.clone();
         // The persisted link is the consumer's durable state, re-admitted
@@ -128,217 +106,27 @@ pub(crate) fn changes_stream_admitted(
         // does not admit would otherwise be fetched with the account bearer;
         // refusing it as an unreadable cursor reseeds the scope.
         let resume_url = payload.resume_url().ok_or(CursorError::Unsupported);
-        let mut current_url = match resume_url.and_then(|url| super::cursor::admit_resume_url(&client, url)) {
+        let current_url = match resume_url.and_then(|url| super::cursor::admit_resume_url(&client, url)) {
             Ok(url) => url,
             Err(error) => {
-                let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                    .with_scope(ErrorScope::Cursor(scope.clone()));
                 yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                yield SyncEvent::Done(None);
                 return;
             }
         };
-        let mut walk = crate::paging::PageWalk::new("changes delta");
-
-        loop {
-            if let Err(error) = walk.enter(&current_url) {
-                let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                    .with_scope(ErrorScope::Cursor(scope.clone()));
-                let owner = parsed.owner().map(|owner| bifrost_types::MailboxId(owner.to_string()));
-                yield SyncEvent::Terminated(super::graph_error::graph_shared_scope_error(
-                    error, &scope, owner.as_ref(), ctx,
-                ));
-                yield SyncEvent::Done(None);
-                return;
-            }
-            let page = match fetch_delta_page(&client, &current_url, &parsed).await {
-                Ok(page) => page,
-                Err(error) => {
-                    let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                        .with_scope(ErrorScope::Cursor(scope.clone()));
-                    // Foreign-scope permission denial quarantines just
-                    // this scope; primary-scope denial stays terminal.
-                    let owner = parsed.owner().map(|owner| bifrost_types::MailboxId(owner.to_string()));
-                    yield SyncEvent::Terminated(super::graph_error::graph_shared_scope_error(
-                        error,
-                        &scope,
-                        owner.as_ref(),
-                        ctx,
-                    ));
-                    yield SyncEvent::Done(None);
-                    return;
-                }
-            };
-            let mut changes = Vec::new();
-            // Diagnostic page marker only: the last value's id after the
-            // same scope projection used for emitted changes. Resume never
-            // reads it - `next_link` alone drives resumption - but the
-            // persisted field uses one id encoding across inventory and
-            // changes page markers.
-            let mut last_seen_id = None;
-            let mut etags = Vec::new();
-            let mut removed_etag_ids = Vec::new();
-            let mut idless_value = false;
-            for value in page.value {
-                let item = super::wire_item::GraphItem::decode(&value);
-                if let Some(id) = item.id {
-                    last_seen_id = Some(parsed.mint_object_id(id).0);
-                }
-                if is_removed(&value) {
-                    if let Some(id) = removed_id(&value) {
-                        // Encode the removed id the same way the Added /
-                        // Updated ids are encoded, so a foreign item's
-                        // remove carries the same bytes its add did
-                        // (ratatoskr equality-joins on this id).
-                        let id = parsed.mint_object_id(&id.0);
-                        if parsed.etag_cached() {
-                            removed_etag_ids.push(id.0.clone());
-                        }
-                        changes.push(Change::ScopeChange(ScopeChange {
-                            id,
-                            membership: parsed.membership(item.parent_folder),
-                            kind: ScopeChangeKind::Removed,
-                        }));
-                    } else {
-                        idless_value = true;
-                    }
-                    continue;
-                }
-                if item.id.is_none() {
-                    idless_value = true;
-                }
-                if let Some(id) = item.id {
-                    let object_id = parsed.mint_object_id(id);
-                    // Only mail mutations consume this bounded cache.
-                    if parsed.etag_cached()
-                        && let Some(etag) = graph_etag(&value) {
-                        etags.push((object_id.0.clone(), etag));
-                    }
-                    // Graph delta has no created/updated discriminator, and
-                    // this account keeps no complete per-scope id set to diff
-                    // against. Report a refresh as Updated; Added below names
-                    // current membership, not object creation. The engine's
-                    // live changes driver forwards these kinds unchanged, so
-                    // treating Updated for an unknown id as insertion is a
-                    // consumer contract; changing this to Created would also
-                    // misclassify ordinary edits.
-                    changes.push(Change::ObjectChange(ObjectChange {
-                        id: object_id.clone(),
-                        kind: ObjectChangeKind::Updated,
-                    }));
-                    changes.push(Change::ScopeChange(ScopeChange {
-                        id: object_id,
-                        membership: parsed.membership(item.parent_folder),
-                        kind: ScopeChangeKind::Added,
-                    }));
-                }
-            }
-
-            if !etags.is_empty() || !removed_etag_ids.is_empty() {
-                let mut cache = account.etag_index.write().await;
-                for (id, etag) in etags {
-                    cache.insert(id, etag);
-                }
-                for id in removed_etag_ids {
-                    cache.remove(&id);
-                }
-            }
-
-            if idless_value {
-                // An id-less delta value is a checkpoint barrier - the same
-                // rule the inventory walk enforces with a Region obligation.
-                // The changes lane has no obligation vocabulary in
-                // `SyncEvent<Change>`, so the honest fallback is the
-                // neither-link arm's: surface what was decoded, then
-                // terminate WITHOUT emitting the page's checkpoint. Crossing
-                // the page would advance the cursor past a value this stream
-                // could not represent, converting a malformed page into
-                // silent, permanent, unreported loss for the scope.
-                if !changes.is_empty() {
-                    yield batch(changes, PageBoundary::Page, None, tally.take());
-                }
-                yield SyncEvent::Terminated(super::graph_error::protocol_violation(
-                    bifrost_types::ProtocolErrorKind::ContractViolation,
-                    AccountOperation::SyncChanges,
-                    Some(ErrorScope::Cursor(scope.clone())),
-                    "Graph delta page carried a value with no usable id",
-                ));
-                yield SyncEvent::Done(None);
-                return;
-            }
-
-            // Both links are admitted at receipt, before either is followed
-            // or persisted into the checkpoint below.
-            let links = client
-                .admit_next(page.next_link.as_ref())
-                .and_then(|next| Ok((next, client.admit_next(page.delta_link.as_ref())?)));
-            let (next_link, delta_link) = match links {
-                Ok(links) => links,
-                Err(error) => {
-                    let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                        .with_scope(ErrorScope::Cursor(scope.clone()));
-                    let owner = parsed.owner().map(|owner| bifrost_types::MailboxId(owner.to_string()));
-                    if !changes.is_empty() {
-                        yield batch(changes, PageBoundary::Page, None, tally.take());
-                    }
-                    yield SyncEvent::Terminated(super::graph_error::graph_shared_scope_error(
-                        error, &scope, owner.as_ref(), ctx,
-                    ));
-                    yield SyncEvent::Done(None);
-                    return;
-                }
-            };
-            if let Some(next_link) = next_link {
-                payload.set_marker(Some(page_marker(&next_link, last_seen_id))).expect("delta marker");
-                let checkpoint_cursor =
-                    match encode_cursor(scope.clone(), payload.clone()) {
-                        Ok(cursor) => cursor,
-                        Err(error) => {
-                            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                                .with_scope(ErrorScope::Cursor(scope.clone()));
-                            yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                            yield SyncEvent::Done(None);
-                            return;
-                        }
-                    };
-                yield batch(changes, PageBoundary::Page, Some(checkpoint_cursor), tally.take());
-                current_url = next_link;
-            } else if let Some(delta_link) = delta_link {
-                payload.set_delta_link(delta_link.as_str().to_string());
-                let checkpoint_cursor =
-                    match encode_cursor(scope.clone(), payload.clone()) {
-                        Ok(cursor) => cursor,
-                        Err(error) => {
-                            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                                .with_scope(ErrorScope::Cursor(scope.clone()));
-                            yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                            yield SyncEvent::Done(None);
-                            return;
-                        }
-                    };
-                let checkpoint = Checkpoint::Change(checkpoint_cursor.clone());
-                yield batch(changes, PageBoundary::Final, Some(checkpoint_cursor), tally.take());
-                yield SyncEvent::Done(Some(checkpoint));
-                return;
-            } else {
-                // A Graph delta page MUST carry either an `@odata.nextLink`
-                // (more pages) or an `@odata.deltaLink` (end of the walk).
-                // Neither present is a Graph contract violation. Emitting
-                // `Final` + `Done(None)` here would drop the cursor advance,
-                // so the engine would re-issue the same final page on every
-                // poll forever. Terminate with a contract violation instead
-                // so the failure is visible rather than a silent live-lock.
-                if !changes.is_empty() {
-                    yield batch(changes, PageBoundary::Page, None, tally.take());
-                }
-                yield SyncEvent::Terminated(super::graph_error::protocol_violation(
-                    bifrost_types::ProtocolErrorKind::ContractViolation,
-                    AccountOperation::SyncChanges,
-                    Some(ErrorScope::Cursor(scope.clone())),
-                    "Graph delta page carried neither @odata.nextLink nor @odata.deltaLink",
-                ));
-                yield SyncEvent::Done(None);
-                return;
+        use futures::StreamExt;
+        let mut walk = super::delta::walk(
+            account, scope, parsed, client, current_url,
+            super::delta::DeltaLane::Changes(Box::new(payload)),
+        );
+        while let Some(event) = walk.next().await {
+            match event {
+                super::delta::DeltaEvent::Page(page) => yield batch(
+                    page.changes, page.boundary,
+                    if page.coverage.has_barrier() { None } else { page.cursor },
+                    page.bytes_in,
+                ),
+                super::delta::DeltaEvent::Terminated(error) => yield SyncEvent::Terminated(error),
+                super::delta::DeltaEvent::Done(checkpoint, _) => yield SyncEvent::Done(Some(checkpoint)),
             }
         }
     })
@@ -362,6 +150,7 @@ mod tests {
     };
     use super::*;
     use crate::client::{GraphClient, ScriptedRestResponse};
+    use bifrost_types::{Checkpoint, ObjectChange, ObjectChangeKind, ScopeChange, ScopeChangeKind};
 
     fn account() -> GraphAccount {
         GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions)
@@ -519,7 +308,6 @@ mod tests {
             SyncEvent::Terminated(error) => error,
             _ => panic!("expected SyncEvent::Terminated"),
         };
-        assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
         assert!(stream.next().await.is_none());
         error
     }
@@ -911,7 +699,6 @@ mod tests {
             error.kind(),
             AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation)
         ));
-        assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
         assert!(stream.next().await.is_none());
         assert_eq!(
             client.take_rest_requests().len(),
@@ -963,10 +750,6 @@ mod tests {
             error.kind(),
             AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation)
         ));
-        assert!(
-            matches!(stream.next().await, Some(SyncEvent::Done(None))),
-            "no terminal checkpoint may cross the page"
-        );
         assert!(stream.next().await.is_none());
     }
 
@@ -1048,7 +831,7 @@ mod tests {
             error.kind(),
             AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation)
         ));
-        assert!(matches!(events.last(), Some(SyncEvent::Done(None))));
+        assert!(matches!(events.last(), Some(SyncEvent::Terminated(_))));
         assert_eq!(
             client.wire_attempts(),
             1,

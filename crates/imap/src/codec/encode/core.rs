@@ -27,13 +27,12 @@ pub(crate) enum LiteralMode {
 /// Encoding context derived from the current connection state.
 ///
 /// Carries the capability set, enabled extensions, and negotiated literal
-/// mode so the encoder can:
-/// - reject commands whose prerequisite capability is not advertised (I6),
-/// - select the correct wire encoding for mailbox names and literals.
+/// mode so admission can check prerequisites and the encoder can select
+/// the correct wire encoding for mailbox names and literals.
 ///
 /// Constructed in production by the driver from the protocol state it owns
-/// (`connection::driver::build_encode_options`), at the moment a command is
-/// encoded; the connection handle has no builder of its own.
+/// (`connection::admission::encode_options`), at the moment a command is
+/// admitted or encoded.
 #[derive(Debug, Clone)]
 pub(crate) struct EncodeOptions {
     /// RFC 6855 / RFC 9051 `UTF8=ACCEPT` mode.
@@ -54,7 +53,7 @@ impl EncodeOptions {
     /// Check whether the capability is usable on this connection, through the
     /// single authority `crate::types::profile::supports` (advertised, implied
     /// by QRESYNC for CONDSTORE, or folded into active IMAP4rev2).
-    pub(super) fn has_capability(&self, cap: &Capability) -> bool {
+    pub(crate) fn has_capability(&self, cap: &Capability) -> bool {
         crate::types::profile::supports(&self.capabilities, &self.enabled, cap)
     }
 
@@ -64,7 +63,7 @@ impl EncodeOptions {
     /// supports CONDSTORE; the authority carries that rule. The encoder checks
     /// this whenever a CONDSTORE modifier (CHANGEDSINCE, UNCHANGEDSINCE,
     /// VANISHED) is present.
-    pub(super) fn has_condstore(&self) -> bool {
+    pub(crate) fn has_condstore(&self) -> bool {
         self.has_capability(&Capability::Condstore)
     }
 
@@ -145,6 +144,23 @@ impl WireCommand {
         &self.segments
     }
 
+    /// Coalesce commands with no synchronizing boundaries. Only chunk handles
+    /// are cloned; message payloads keep their own allocations. The resulting
+    /// wire uses the ordinary sender and preserves one flush for the batch.
+    pub(crate) fn coalesce_unsegmented(wires: &[Self]) -> Option<Self> {
+        if wires.iter().any(|wire| wire.segments.len() != 1) {
+            return None;
+        }
+        Some(Self {
+            segments: vec![
+                wires
+                    .iter()
+                    .flat_map(|wire| wire.segments[0].iter().cloned())
+                    .collect(),
+            ],
+        })
+    }
+
     /// The whole command as one byte string, as the server receives it.
     #[cfg(test)]
     pub(crate) fn to_vec(&self) -> Vec<u8> {
@@ -198,12 +214,6 @@ impl CommandWriter {
             buf: BytesMut::new(),
             invalid_nul: false,
         }
-    }
-
-    /// The negotiated literal mode, for validators that judge caller-written
-    /// literal markers against it.
-    pub(crate) const fn literal_mode(&self) -> LiteralMode {
-        self.literal_mode
     }
 
     /// Append command syntax verbatim.

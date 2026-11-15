@@ -27,7 +27,8 @@ use tokio_util::sync::CancellationToken;
 use bifrost_types::{ChangeCursor, CursorScope, MembershipScope};
 
 pub use coverage::{
-    ClaimLookup, CoverageClaim, PendingCoverage, PublicationId, PublicationReceipt, Publications,
+    ClaimLookup, CoverageClaim, PendingCoverage, PublicationId, PublicationNumber,
+    PublicationReceipt, Publications, ScopeFence, UndeliveredMark, WalkGeneration,
 };
 pub use envelope::{
     CursorEnvelope, ENGINE_VERSION, EnvelopeKind, MIN_MIGRATABLE, decode_envelope, encode_envelope,
@@ -51,13 +52,13 @@ pub use store::{
 struct RegistryState {
     cursors: HashMap<CursorScope, ChangeCursor>,
     membership_index: HashMap<MembershipScope, Vec<CursorScope>>,
-    incarnations: HashMap<CursorScope, u64>,
+    incarnations: HashMap<CursorScope, ScopeIncarnation>,
     /// Per-scope publication fence, bumped by `delete`. Kept separate
     /// from the account-wide `registry_generation` so deleting one scope
     /// does not invalidate in-flight drives of every OTHER scope, which
     /// would make them discard valid results and repeat their work from
     /// the cursors they started at.
-    scope_generations: HashMap<CursorScope, u64>,
+    scope_generations: HashMap<CursorScope, ScopeDeleteGeneration>,
     /// Per-scope liveness token, minted in `put_locked` in the same branch
     /// that mints the incarnation and cancelled by `delete` under this same
     /// write lock. Token identity therefore IS incarnation identity, and
@@ -128,12 +129,60 @@ impl ScopeShapes {
     }
 }
 
+/// Topology replacement order, minted by the cursor registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TopologyGeneration(u64);
+
+/// Scope deletion order, independent of account topology replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScopeDeleteGeneration(u64);
+
+impl ScopeDeleteGeneration {
+    fn deleted(&mut self) {
+        self.0 += 1;
+    }
+}
+
+/// Registry membership identity. Cursor advancement preserves it; reinsertion
+/// after deletion mints another one, even when the provider reuses the scope id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScopeIncarnation(u64);
+
+#[cfg(test)]
+impl ScopeIncarnation {
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Provider-deletion epoch. Only the cursor registry advances it; resets and
+/// account replacements must not revoke a scope's owed establishment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LifecycleEpoch(u64);
+
+impl LifecycleEpoch {
+    fn deleted(&mut self) {
+        self.0 += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn after_deletion(mut self) -> Self {
+        self.deleted();
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct CursorRegistry {
     state: RwLock<RegistryState>,
     /// Only provider deletion moves this epoch. Drive generations also move on
     /// restart and reset, which must not revoke the repair obligation itself.
-    lifecycle_epochs: std::sync::Mutex<HashMap<CursorScope, u64>>,
+    lifecycle_epochs: std::sync::Mutex<HashMap<CursorScope, LifecycleEpoch>>,
     drive_leases: RwLock<HashMap<CursorScope, Arc<AsyncMutex<()>>>>,
     next_incarnation: AtomicU64,
     registry_generation: AtomicU64,
@@ -146,7 +195,7 @@ pub struct ScopeDriveGuard {
 
 impl ScopeDriveGuard {
     #[must_use]
-    pub fn registry_generation(&self) -> u64 {
+    pub fn registry_generation(&self) -> TopologyGeneration {
         self.generation.registry
     }
 
@@ -166,8 +215,8 @@ impl ScopeDriveGuard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DriveGeneration {
-    pub registry: u64,
-    pub scope: u64,
+    pub registry: TopologyGeneration,
+    pub scope: ScopeDeleteGeneration,
 }
 
 impl DriveGeneration {
@@ -176,7 +225,7 @@ impl DriveGeneration {
     /// takes it, and a caller driving that surface directly needs to be
     /// able to build one.
     #[must_use]
-    pub fn new(registry: u64, scope: u64) -> Self {
+    pub fn new(registry: TopologyGeneration, scope: ScopeDeleteGeneration) -> Self {
         Self { registry, scope }
     }
 }
@@ -199,22 +248,22 @@ impl CursorRegistry {
     }
 
     /// Provider-deletion epoch, independent of ordinary drive resets.
-    pub(crate) fn lifecycle_epoch(&self, scope: &CursorScope) -> u64 {
+    pub(crate) fn lifecycle_epoch(&self, scope: &CursorScope) -> LifecycleEpoch {
         self.lifecycle_epochs
             .lock()
             .expect("poisoned")
             .get(scope)
             .copied()
-            .unwrap_or(0)
+            .unwrap_or(LifecycleEpoch(0))
     }
 
     pub(crate) fn bump_lifecycle_epoch(&self, scope: &CursorScope) {
-        *self
-            .lifecycle_epochs
+        self.lifecycle_epochs
             .lock()
             .expect("poisoned")
             .entry(scope.clone())
-            .or_default() += 1;
+            .or_insert(LifecycleEpoch(0))
+            .deleted();
     }
 
     /// Store the latest cursor for a scope.
@@ -244,7 +293,8 @@ impl CursorRegistry {
         guard.model.record(&cursor.scope);
         guard.reach.record(&cursor.scope);
         if !guard.cursors.contains_key(&cursor.scope) {
-            let incarnation = self.next_incarnation.fetch_add(1, Ordering::Relaxed);
+            let incarnation =
+                ScopeIncarnation(self.next_incarnation.fetch_add(1, Ordering::Relaxed));
             guard.incarnations.insert(cursor.scope.clone(), incarnation);
             // Same branch, same lock: a fresh incarnation gets a fresh,
             // uncancelled token. Minting it anywhere else would let an
@@ -283,11 +333,11 @@ impl CursorRegistry {
     pub fn publish_if_generation<R>(
         &self,
         cursor: Option<ChangeCursor>,
-        generation: u64,
+        generation: TopologyGeneration,
         publish: impl FnOnce() -> R,
     ) -> Option<R> {
         let mut guard = self.state.write().expect("poisoned");
-        if self.registry_generation.load(Ordering::SeqCst) != generation {
+        if TopologyGeneration(self.registry_generation.load(Ordering::SeqCst)) != generation {
             return None;
         }
         let result = publish();
@@ -313,7 +363,11 @@ impl CursorRegistry {
         // Fence any drive already in flight for THIS scope: its
         // publication is refused, and a later incarnation starts from a
         // generation it cannot match. Sibling scopes are untouched.
-        *state.scope_generations.entry(scope.clone()).or_default() += 1;
+        state
+            .scope_generations
+            .entry(scope.clone())
+            .or_insert(ScopeDeleteGeneration(0))
+            .deleted();
         // ...and END any drive already in flight for THIS scope. The fence
         // above only refuses the publication; a drive parked on a provider
         // stream that never yields would otherwise hold the lease forever and
@@ -388,7 +442,7 @@ impl CursorRegistry {
     /// incarnation map is an annotation on `cursors`, and that
     /// direction of dependency is what keeps the two from drifting.
     #[must_use]
-    pub fn all_scope_incarnations(&self) -> Vec<(CursorScope, u64)> {
+    pub fn all_scope_incarnations(&self) -> Vec<(CursorScope, ScopeIncarnation)> {
         let guard = self.state.read().expect("poisoned");
         guard
             .cursors
@@ -399,7 +453,7 @@ impl CursorRegistry {
                     incarnation.is_some(),
                     "every registered cursor carries an incarnation"
                 );
-                (scope.clone(), incarnation.unwrap_or(0))
+                (scope.clone(), incarnation.unwrap_or(ScopeIncarnation(0)))
             })
             .collect()
     }
@@ -430,11 +484,9 @@ impl CursorRegistry {
             }
         }
         for scope in replacement.cursors.keys() {
-            let incarnation = current
-                .incarnations
-                .get(scope)
-                .copied()
-                .unwrap_or_else(|| self.next_incarnation.fetch_add(1, Ordering::Relaxed));
+            let incarnation = current.incarnations.get(scope).copied().unwrap_or_else(|| {
+                ScopeIncarnation(self.next_incarnation.fetch_add(1, Ordering::Relaxed))
+            });
             replacement.incarnations.insert(scope.clone(), incarnation);
             let cancel = current
                 .scope_cancels
@@ -505,8 +557,12 @@ impl CursorRegistry {
     pub fn drive_generation(&self, scope: &CursorScope) -> DriveGeneration {
         let state = self.state.read().expect("poisoned");
         DriveGeneration {
-            registry: self.registry_generation.load(Ordering::SeqCst),
-            scope: state.scope_generations.get(scope).copied().unwrap_or(0),
+            registry: TopologyGeneration(self.registry_generation.load(Ordering::SeqCst)),
+            scope: state
+                .scope_generations
+                .get(scope)
+                .copied()
+                .unwrap_or(ScopeDeleteGeneration(0)),
         }
     }
 
@@ -526,10 +582,18 @@ impl CursorRegistry {
         publish: impl FnOnce() -> R,
     ) -> Option<R> {
         let mut guard = self.state.write().expect("poisoned");
-        if self.registry_generation.load(Ordering::SeqCst) != generation.registry {
+        if TopologyGeneration(self.registry_generation.load(Ordering::SeqCst))
+            != generation.registry
+        {
             return None;
         }
-        if guard.scope_generations.get(scope).copied().unwrap_or(0) != generation.scope {
+        if guard
+            .scope_generations
+            .get(scope)
+            .copied()
+            .unwrap_or(ScopeDeleteGeneration(0))
+            != generation.scope
+        {
             return None;
         }
         let result = publish();
@@ -707,7 +771,9 @@ mod tests {
         live.replace_topology_preserving_cursors(&replacement);
         assert_eq!(live.drive_generation(&scope).scope, generation);
         live.delete(&scope);
-        assert_eq!(live.drive_generation(&scope).scope, generation + 1);
+        let mut expected = generation;
+        expected.deleted();
+        assert_eq!(live.drive_generation(&scope).scope, expected);
     }
 
     #[test]

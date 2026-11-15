@@ -538,49 +538,6 @@ per partition under the receipt bound (the whole scope for `Full` plans) and
 each retained id holds a full receipt and claim, the ledger's main memory
 hazard.
 
-## STR-025 - About ten distinct engine counters travel as bare `u64`s
-
-**Reported by:** sync-engine.
-
-Scope fence (`coverage.scope_fence`, with `0` meaning "attach time" in
-`DeferredInventory { fence: 0 }`); lifecycle epoch (`cursors.lifecycle_epoch`,
-`EstablishIfAbsent { epoch }`, `ParkScope { epoch }`, the owed maps); account
-generation (`Incarnation::generation`, `ReopenRequest::Recovery { generation:
-Option<u64> }`, `PushRecovery { generation: u64 }`); registry generation
-(already typed in `DriveGeneration`); scope-token generation; reattach attempt
-id; completed-reset count (`SchemaReset { parked_at }`); walk generation
-(`coverage.next_generation()`); walk watermark; publication number.
-`run_establish(.., reattach_attempt: Option<u64>, .., walk_fence: u64)` takes
-two adjacent; `establish_if_absent(ctx, scope, epoch)` would accept a fence;
-`plan_requests` mints `RepairAttemptId(coverage.next_generation())`, sharing a
-counter with walk generations by coincidence. Proposal: the `DriveGeneration`
-move for every counter - `ScopeFence`, `LifecycleEpoch`, `AccountGeneration`,
-`ReattachAttempt`, `ResetCount`, `WalkGeneration` - each minted only by its
-owner.
-
-The sync-lanes hunter independently counted about fifteen identities on one
-primitive in the lanes: registry (topology) generation, scope delete generation,
-scope incarnation (every `BackfillScan` key is `(CursorScope, u64)`), lifecycle
-epoch, scope fence (minted by `burn_fence` in publication-id space), backfill
-fence, account fence, publication id (a 32-bit instance segment plus counter,
-bit-packed), receiver sequence, undelivered watermark, walk/proof generation,
-repair attempt id (the same counter), account generation (the reconciler's
-`hold: Option<(u64, Instant)>`), reattach attempt id, walk totals. Swap hazards
-that compile today: `emit_backfill_complete(.., undelivered_before: u64,
-fence_at_walk_start: u64)` beside `total_seen: u64`;
-`SyncControl::publish_walk_marker_if_fence(checkpoint, walk_watermark: u64,
-expected_fence: u64)`; `BackfillRunner::run_partition(.., generation: u64, lane,
-walk_fence: u64, ..)`; `ParkedWalk { fence_at_walk_start: u64,
-undelivered_before: u64 }`; and a fence compared against `PublicationId.0`
-(`claim_in`: `*watermark > id.0`) and handed out by `scope_fence` as a plain
-`u64`, so a fence and a publication id are interchangeable by construction. Its
-list adds `TopologyGen`, `ScopeDeleteGen`, `ScopeFence` (opaque and comparable
-only to `PublicationId`), `PublicationSeq` (segment and counter as fields, and
-with account identity, which would also let `minted_here` tell "a prior
-attachment of this account" from "another account in this process"),
-`ReceiverSeq`, `UndeliveredMark`, `ProofGeneration` (BUG-015), its own
-`RepairAttemptId` counter, and a `ScopeIncarnation { scope, incarnation }` key.
-
 ## STR-027 - Engine failures reach callers only as prose
 
 **Reported by:** sync-engine.
@@ -1665,23 +1622,6 @@ arguably beside `bifrost_types::mime`), `search.rs`, `containers.rs`, roles into
 the registry (BUG-028), and the primitives folded into the mutation engine
 (STR-080).
 
-## STR-080 - IMAP has two mutation engines
-
-**Reported by:** imap-account.
-
-`mutate.rs` is the careful one: per-item three-lane outcomes through
-`TargetBatch` permits, opportunistic `UNCHANGEDSINCE` from the MODSEQ cache with
-`MODIFIED` attribution, stale-epoch partitioning, shared-folder `ScopeRevoked`
-mapping, the guarded EXPUNGE fallback, partial-commit records per group. `pim.rs`
-re-implements STORE, `\Deleted` + EXPUNGE and COPY for the `Result<(),
-AccountError>` lanes (`set_flag`, `delete_messages`, `copy_messages`) with its own
-`FolderProgress` record builder - no MODSEQ guard, no shared mapping (BUG-046), a
-different stale-epoch answer. The primitives could run `mutation_stream` and
-collapse per-item outcomes into one result plus partial-commit record, deleting a
-parallel engine and its divergences. The hunter notes the workspace-wide pattern
-of a `pim` module per provider beside the bulk lane makes the same question worth
-asking in JMAP, Google and Graph.
-
 ## STR-081 - IMAP and JMAP error construction escapes the armed `error.rs` boundary
 
 **Reported by:** imap-account, jmap-account.
@@ -2008,22 +1948,6 @@ ledger); `EtagIndex` (BUG-076's API) and the trash cache. `GraphAccount` compose
 them, and invariants stated in comments become private to the type holding the
 lock. The JMAP twin is STR-097.
 
-## STR-116 - Fold the two Graph delta walks into one driver
-
-**Reported by:** graph.
-
-`inventory::inventory_stream_from` and `changes::changes_stream` are the same loop:
-`PageWalk::enter`, `fetch_delta_page`, admit next and delta links; project each
-value and update the etag cache; branch on next link, delta link, or neither
-(contract violation). Each rebuilds `GraphErrorContext::graph(op).with_scope(ErrorScope::Cursor(scope.clone()))`
-about ten times. They have diverged on the id-less value verdict (BUG-080), and
-their termination sequencing is inconsistent: `changes_stream` yields `Terminated`
-without `Done` on its first refusal and `Terminated` plus `Done(None)` on every
-other path. Proposal: one `DeltaWalk { scope: GraphScope, client, ctx }` driver
-with a `DeltaProjector` per lane (inventory entries, removals and obligations; or
-changes) - the move the JMAP inventory-walk fold made. The public-folder EWS poll
-is a different protocol and stays separate.
-
 ## STR-117 - Graph wire codecs live in the account layer
 
 **Reported by:** graph.
@@ -2128,21 +2052,6 @@ the constant, and parsed in `flags::user_label_id_from_flag`,
 with `parse` and `Display` (`Seen`, `Flagged`, `Draft`, `Important`, `Label { id,
 advisory_name }`, `Unknown(String)`) replaces all four. Related: STR-004, STR-111.
 
-## STR-128 - Google stream state machines as boolean pairs
-
-**Reported by:** google.
-
-`ChangeState`, `HydrateState` and `MutationState` each encode their phase as
-`finished: bool` plus `emitted_done: bool`, plus `checked_profile`,
-`pending_termination`, `pending_event` and `Option` fields whose combinations
-include impossible states; `changes.rs` has an arm minting
-`Internal(InvariantViolated)` for "checked the profile but has no start history
-id", existing only because the state allows it. The doc comment on
-`get_stream_cancellable` argues soundly against a shared driver, but not against a
-per-stream phase enum, e.g. `enum Phase { Probe { cursor }, Walking { start:
-HistoryId, .. }, Terminating(AccountError), Done }`, which makes the
-invariant-violation arm unconstructable.
-
 ## STR-129 - Google's mailbox watch registry is process-global
 
 **Reported by:** google.
@@ -2154,6 +2063,11 @@ offers Net-scoped string-keyed registries (`shared_hold`,
 `shared_concurrency_limit`) for this kind of cross-account coordination; the
 coordinator belongs in one, keyed by the typed mailbox identity (STR-124), so two
 independent `Net`s really are independent.
+
+Blocked on bifrost-net: its hold and concurrency registries cannot store
+arbitrary provider state, and `AccountNet` exposes no Net-owned slot for it. The
+move needs a Net-scoped provider-state store (a typed, keyed slot owned by the
+`Net` and reachable through `AccountNet`) first; the registry site records this.
 
 ## STR-130 - Google `pim.rs` does several unrelated jobs
 

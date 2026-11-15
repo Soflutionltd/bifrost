@@ -86,9 +86,8 @@ The `ContractViolation` arm exists because those redirect failures used to be
 reclassifying them without widening the predicate would have silently narrowed
 it. A well-known that loops is a probe answer nobody can use, the same shape as
 one that will not parse, and the fresh lookup against the configured base
-inherits nothing from it. On the probe path nothing else mints that kind:
-redirects are disabled in the transport, so its own redirect loop never runs,
-and an oversized body is mapped to `Protocol(PartialResponse)` first.
+inherits nothing from it. On the probe path, net's redirect classification produces that kind;
+an oversized body is mapped to `Protocol(PartialResponse)` first.
 
 The principal walk is not this crate's. It is
 `DavDispatch::discover_current_user_principal` in `bifrost-dav-core`
@@ -108,22 +107,36 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
 `a_refused_credential_on_the_probe_fails_the_open` and
 `the_base_leg_fails_on_what_the_probe_would_have_survived`.
 
-The DAV dispatcher bounds a complete logical request to 30 seconds, including
-credential reads, one-shot 401 refresh, retries, admission and redirect hops.
-Wrappers build requests without reading credentials first; the dispatcher mints
-them inside that deadline. Standalone `auth_headers` calls have the same bound.
-Each net send receives only the remaining time; a new hop cannot restart the
-clock. Net owns the in-flight versus pre-admission timeout state, so DAV does not
-stamp a request as sent before admission. Errors after earlier redirect
-responses retain their acknowledged attempt evidence. If an unreplayable request
-may have committed on an earlier hop, a later pre-dispatch failure enters
-`Protocol(PartialResponse)` and requires reconciliation.
-This includes credential lookup and refresh failures without attempt causes;
-the combined history is classified on a fresh error builder, since decorating
-an existing error cannot change its recovery classification.
-The local walk retains DAV's origin gate, dialect target checks and MOVE
-Destination rebasing. A transport credential callback alone would not replace
-those policies.
+DAV sends each logical request through bifrost-net's shared redirect walk with
+one 30-second total deadline. Net bounds credential lookup, the one-shot 401
+refresh, concurrency and rate admission, retries, redirect drains and the final
+body by that same deadline. Standalone `auth_headers` calls retain their own
+30-second bound. No redirect restarts the clock, so an enterprise user gets a
+bounded operation even when a proxy keeps relocating it.
+
+`DavHopPolicy` supplies origin admission and credentials, preserves methods and
+bodies on 301/302/307/308, returns 303 as data, rebases MOVE Destination and
+checks dialect targets before each dispatch. A GET cannot fulfill a DAV query or
+conditional write, which settles the method policy. Origin identity is net's
+`origin_key`: scheme, normalized host and effective port; neither a new port nor
+a downgrade can inherit a credential. The shared ten-hop cap bounds loops while
+allowing ordinary enterprise discovery/proxy chains. DAV overrides an injected
+AccountNet's redirect settings with this policy, keeping its existing behavior.
+
+Every request carrying a `Destination` header (MOVE, COPY, or anything else) has
+that destination checked against the admitted-origin set by
+`DavHopPolicy::check_target`, before each wire hop including the first. The
+gate therefore holds for raw `send_raw_request` callers as well as
+`move_resource`; a destination on an unadmitted origin, or one that is not
+absolute, is a local `Request` refusal with nothing sent.
+
+There is no DAV exchange loop, refresh loop or `RedirectHistory`. Net's
+`AttemptLedger` retains every response and possible commit across hops. A later
+local, credential or unsent failure after an unreplayable possible commit enters
+`Protocol(PartialResponse)` and requires reconciliation. Typed dialect refusals
+travel through `Error::HopPolicy` and the same history envelope. Earlier
+acknowledged responses remain diagnostic evidence, including when a target is
+refused before its dispatch.
 
 Status classification receives the HTTP response headers and uses
 `bifrost_net::request::parse_retry_after_hint`, preserving HTTP dates as
@@ -157,9 +170,8 @@ its scope and action.
   through `bifrost-dav-core`'s `DavDispatch`, so DAV legs share the retry
   budget, per-host rate limiting, bandwidth metering and observability with
   every other HTTP protocol crate; scripted transcripts exercise DAV flows at
-  the wire, below all of it, without a listener. DAV still mints its own
-  credentials and walks its own redirects, for the reasons in "The shared
-  layer" below. Every request path classifies a non-2xx status
+  the wire, below all of it, without a listener. DAV supplies credential policy
+  through the shared net walk. Every request path classifies a non-2xx status
   before the body is parsed, so an error page can never decode as an
   authoritative empty report - except the two that must read a status as data,
   and read the raw response through `report_raw_response` to do it:
@@ -182,17 +194,11 @@ its scope and action.
   principal and a calendar home on different hosts of one service is a real
   deployment shape. Discovery stages these origins without changing trust;
   they are admitted only after the complete authenticated discovery succeeds,
-  before the account is shared or a home request starts. Redirects are
-  disabled in the transport (`FollowRedirects::Disabled`) and EVERY hop,
-  same-origin or not, is walked by `send_raw_request` in `bifrost-dav-core`:
-  each hop re-mints the credential for the origin it is about to address,
-  gated by the same admitted-origin set the credential gate reads, so a
-  `Location` naming an unadmitted origin fails locally without a request
-  going out. Walking same-origin hops too costs nothing (the credential is
-  the same one) and removed the earlier split where reqwest followed those
-  internally, which stripped `Authorization` on any origin change with no
-  way to restore it. A 303 is not followed, and the walk is bounded by
-  bifrost-net's `DEFAULT_MAX_HOPS`.
+  before the account is shared or a home request starts. Every hop runs in bifrost-net's shared walk with
+  `DavHopPolicy`, re-minting credentials only after the target's complete origin
+  has passed the admitted-origin gate. An unadmitted `Location` fails locally
+  without dispatch. Methods and bodies survive 301/302/307/308; 303 is returned
+  as data. The walk uses bifrost-net's `DEFAULT_MAX_HOPS`.
   A redirect the walk will not follow - a chain past that cap, a `Location`
   that will not resolve against the effective URL, or one that is not valid
   UTF-8 - is classified through
@@ -1132,7 +1138,7 @@ the top of this document. Each crate keeps only the step after the principal.
 Then the whole request dispatcher, as `DavDispatch`: the `AccountNet` handle,
 the credential store, the admitted-origin set, the credential gate
 (`auth_headers` / `is_trusted_url` / `admit_discovered_urls`), `resolve_url`,
-the redirect walk in `send_raw_request`, and the generic verbs `propfind_raw`, `report_raw`, `report_raw_response`,
+the hop policy used by `send_raw_request`, and the generic verbs `propfind_raw`, `report_raw`, `report_raw_response`,
 `delete_resource` and `move_resource`. `CalDavClient` is now a newtype over it
 plus the CalDAV-specific bodies and parsers. This was the security-sensitive
 half: the credential gate, the HTTPS-downgrade refusal and the redirect walk
@@ -1229,8 +1235,8 @@ proven refusals, the shared `bifrost_net::is_proven_refusal` rule in
 `crates/net/src/attempt.rs`: 401, 429, 405 and 501. A 503 can follow an
 upstream commit, so it is commit-ambiguous, and any history containing one
 reconciles, as do other ambiguous histories. Redirect walks feed the same rule
-through `AttemptLedger`. The all-401 exception is defensive and unreachable
-today: DAV refreshes outside net, with bearer injection disabled. A lone 501
+through net's `AttemptLedger`. The all-401 history exception permits a
+terminal status to be consumed after the shared walk refreshes a rejected token. A lone 501
 remains data for MOVE fallback; a lone 503 reconciles and cannot consume a
 queued 405. A genuine first-attempt 412 stays a conflict.
 
@@ -1528,7 +1534,7 @@ and stores a `CoordinatedTokenSource`. Clones share one cache, proactive refresh
 opaque-token maximum age and failure backoff; concurrent rejected-token refreshes
 reuse the replacement. Existing coordinating sources retain their policy, and
 `StaticTokenSource` retains live external rotation. Credential-origin admission
-still precedes token lookup, and the DAV deadline bounds lookup and refresh.
+still precedes token lookup, and net's total deadline bounds lookup and refresh.
 This also applies to clients given an existing `AccountNet`: that handle may
 belong to another composed protocol leg, so its bearer source is not the DAV
 credential authority. Separate clients needing shared refresh work should pass

@@ -7,24 +7,9 @@
 //! and the redirect walk included. A divergence here is a credential leak or a
 //! silent downgrade, which is the worst possible place to keep two copies.
 //!
-//! Wire traffic goes through `bifrost-net`, so DAV legs share the retry budget,
-//! per-host rate limiting, bandwidth metering and observability with every other
-//! HTTP protocol crate. Two deliberate departures from the net defaults:
-//!
-//! - Redirects are DISABLED on the account spec and walked here instead. The
-//!   net redirect loop strips `Authorization` on any cross-origin hop and cannot
-//!   restore it, and its allowlist compares hosts where this gate compares
-//!   scheme, host and effective port. Walking here means every hop - same-origin
-//!   or not - is re-credentialed for the origin it actually addresses, and an
-//!   origin discovery never admitted is refused locally.
-//! - Bearer injection is opted out with `without_bearer_auth`. The credential
-//!   has to pass the origin gate before it is minted, which is a decision this
-//!   crate makes and the transport cannot. A 401 is refreshed once here with
-//!   the exact rejected token, under the same total deadline as every hop.
-//!
-//! Keeping this walk local also keeps the dialect target guard and MOVE
-//! Destination rebasing together. A transport credential callback alone would
-//! not replace those policies; adding one is unnecessary for these contracts.
+//! Net owns the redirect, retry, one-shot 401 refresh and total deadline engine.
+//! DAV supplies origin credential admission, method preservation, Destination
+//! rebasing and dialect target checks through a per-request hop policy.
 
 use crate::error::net_account_error as into_account_error;
 use std::sync::Arc;
@@ -33,15 +18,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use base64::Engine as _;
 use bifrost_net::{
     AccessToken, AccountNet, AccountSpec, CoordinatedTokenSource, Error as NetError,
-    FollowRedirects, MalformedRedirectKind, Net, NetErrorContext, TokenSource, coordinate,
+    FollowRedirects, HopCredential, HopPolicy, MethodRewrite, Net, NetErrorContext, TokenSource,
+    coordinate,
 };
-use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, AttemptCause,
-    Cause, DiagnosticText, ProtocolErrorKind, TransmissionState, WireCause,
-};
+use bifrost_types::{AccountError, AccountId, AccountOperation};
 use bytes::Bytes;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
+#[cfg(test)]
 use tokio::time::Instant;
 
 /// The WebDAV `Destination` header, lowercased so it is both a valid
@@ -96,12 +80,11 @@ impl From<DavCredentials> for DispatchCredentials {
 /// the origin gate decides whether a credential may be minted at all, and the
 /// transport cannot make that call. An injected AccountNet can belong to a
 /// different composed leg, so its source must not replace DAV credentials.
-/// DAV stores its own coordinated source instead. Redirects are disabled because the walk
-/// below owns them.
+/// DAV stores its own coordinated source and supplies it through the hop policy.
 fn dav_account_spec() -> AccountSpec {
     let mut spec = AccountSpec::new(None);
     spec.request_timeout = Some(DAV_CLIENT_TIMEOUT);
-    spec.follow_redirects = FollowRedirects::Disabled;
+    spec.follow_redirects = FollowRedirects::default();
     spec
 }
 
@@ -443,24 +426,6 @@ impl DavDispatch {
         Ok((headers, used))
     }
 
-    async fn mint_auth_until(
-        &self,
-        url: &str,
-        operation: AccountOperation,
-        deadline: Instant,
-    ) -> Result<(HeaderMap, Option<AccessToken>), AccountError> {
-        tokio::time::timeout_at(deadline, self.mint_auth(url, operation))
-            .await
-            .unwrap_or_else(|_| {
-                Err(self.redirect_error(
-                    NetError::Timeout {
-                        transmission_state: TransmissionState::Unsent,
-                    },
-                    operation,
-                ))
-            })
-    }
-
     /// Classify a `TokenSource::current()` failure.
     ///
     /// Folding every one of these into `transport_error` was survivable while
@@ -497,23 +462,7 @@ impl DavDispatch {
         )
     }
 
-    /// Classify a redirect this walk will not follow, through the transport's
-    /// own funnel.
-    ///
-    /// Redirects are disabled in `bifrost-net` and walked here, so the
-    /// transport never sees these failures - but they are the same failures its
-    /// own redirect loop reports, and they must classify the same way:
-    /// `Protocol(ContractViolation)` with an ACKNOWLEDGED attempt. Every one is
-    /// raised after the server answered a hop, and every one is about what the
-    /// server answered (a loop past the hop cap, a `Location` that will not
-    /// resolve or will not decode). They used to be `local_error`, which is
-    /// `Request(Malformed)` - `ClientBug`, blaming the caller for the provider's
-    /// redirect, with no transmission evidence at all.
-    ///
-    /// The refused redirect to an unadmitted origin is deliberately NOT here: it
-    /// is this client's own credential-gate decision, raised by the walk before
-    /// the next hop goes out. It stays a local `Request(Malformed)`, carrying
-    /// the `Acknowledged` attempt the answered previous hop earned.
+    /// Use the shared classification funnel for standalone credential timeout.
     fn redirect_error(&self, error: NetError, operation: AccountOperation) -> AccountError {
         into_account_error(
             error,
@@ -548,7 +497,7 @@ impl DavDispatch {
         &self,
         request: &DavRequest,
         operation: AccountOperation,
-        deadline: Instant,
+        timeout: std::time::Duration,
     ) -> Result<DavResponse, AccountError> {
         // A header the record could not carry, and a header value the transport
         // cannot express as text, are the same failure seen one layer apart:
@@ -562,11 +511,19 @@ impl DavDispatch {
                 self.protocol,
             ));
         }
+        self.check_request_targets(request, operation)?;
+        let policy = Arc::new(DavHopPolicy {
+            dispatch: self.clone(),
+            operation,
+            effective_url: std::sync::Mutex::new(request.url.clone()),
+        });
         let mut builder = self
             .net
             .request(request.method.clone(), &request.url)
             .without_bearer_auth()
-            .timeout(deadline.saturating_duration_since(Instant::now()));
+            .follow_redirects(FollowRedirects::default())
+            .hop_policy(Arc::clone(&policy) as Arc<dyn HopPolicy>)
+            .timeout(timeout);
         for (name, value) in &request.headers {
             let Ok(value) = value.to_str() else {
                 return Err(local_error(
@@ -611,7 +568,13 @@ impl DavDispatch {
         if let Some(tally) = &self.byte_tally {
             tally.add(counter.bytes_in());
         }
-        self.wire_outcome(request, operation, outcome)
+        let mut effective_request = request.clone();
+        effective_request.url = policy
+            .effective_url
+            .lock()
+            .expect("DAV effective URL lock")
+            .clone();
+        self.wire_outcome(&effective_request, operation, outcome)
             .map_err(|error| {
                 let error = if matches!(
                     error.kind(),
@@ -660,12 +623,9 @@ impl DavDispatch {
                 // earlier commit can cause, and is the one status DAV needs as
                 // data after a refusal (the MOVE fallback).
                 //
-                // The all-401 clause is defensive and cannot fire today: DAV
-                // builds every net request without bearer auth and refreshes in
-                // `send_raw_until` across separate dispatches, so net never
-                // walks a 401 refresh for DAV. It keeps the rule right if DAV
-                // ever routes auth through net. It needs at least one attempt:
-                // an empty-attempt envelope is net's own ambiguity record.
+                // The shared walk retains the rejected 401 before refreshing.
+                // Such a proven refusal permits DAV to consume the terminal
+                // status as data without losing earlier commit uncertainty.
                 let refused_only = match &error {
                     NetError::AttemptHistory { attempts, .. } => {
                         let status_is = |attempt: &NetError, codes: &[u16]| {
@@ -785,283 +745,14 @@ impl DavDispatch {
         }
     }
 
-    /// Send a request, following every redirect hop by hand.
-    ///
-    /// Redirects are disabled in the transport, so both same-origin and
-    /// cross-origin hops arrive here. Each hop re-mints `auth_headers` for the
-    /// origin it is about to address, which refuses locally when that origin was
-    /// never admitted by discovery. Doing this for same-origin hops too costs
-    /// nothing - the credential is the same one - and removes the previous
-    /// split, where reqwest followed same-origin hops internally and only
-    /// cross-origin hops were walked.
+    /// Send through net's one redirect, refresh and deadline engine.
     pub async fn send_raw_request(
         &self,
         request: DavRequest,
         operation: AccountOperation,
     ) -> Result<DavResponse, AccountError> {
-        let unreplayable = !request.replayable();
-        self.send_raw_until(request, operation, Instant::now() + DAV_CLIENT_TIMEOUT)
+        self.dispatch_once(&request, operation, DAV_CLIENT_TIMEOUT)
             .await
-            .map_err(|error| {
-                if unreplayable {
-                    error
-                        .into_builder()
-                        .idempotency_override(false)
-                        .try_build()
-                        .expect("valid unreplayable DAV request classification")
-                } else {
-                    error
-                }
-            })
-    }
-
-    async fn send_raw_until(
-        &self,
-        request: DavRequest,
-        operation: AccountOperation,
-        deadline: Instant,
-    ) -> Result<DavResponse, AccountError> {
-        // The named shared constant, not `RedirectPolicy::default().max_hops`:
-        // DAV has no per-account redirect config, and laundering the cap
-        // through a type Default hid the coupling (changing the default
-        // silently changed DAV behavior).
-        let max_hops = usize::from(bifrost_net::DEFAULT_MAX_HOPS);
-        // The first hop is gated here, before anything is sent, exactly as
-        // every later hop is gated below. Wrappers build unauthenticated
-        // requests so credential minting happens only here, inside the total
-        // deadline. `DavRequest::new` and this method are public, so callers
-        // can also hand over a URL nobody checked. Checking only the final answer
-        // protected nothing - the request had already gone out - and as a
-        // debug assertion it panicked a downstream debug build while
-        // returning the response silently in release.
-        // Deliberately re-check at the send boundary as well as at credential
-        // minting: dispatch admits request targets; minting protects credentials
-        // for callers that only ask for headers.
-        if !self.is_trusted_url(&request.url) {
-            return Err(local_error(
-                operation,
-                format!(
-                    "refusing to send a DAV request to an untrusted URL: {}",
-                    request.url
-                ),
-                self.protocol,
-            ));
-        }
-        let unreplayable = !request.replayable();
-        let mut history = RedirectHistory::default();
-        let mut request = request;
-        let mut hops = 0usize;
-        let (auth, mut used) = self
-            .mint_auth_until(&request.url, operation, deadline)
-            .await
-            .map_err(|error| history.attach(error, unreplayable, operation, self.protocol))?;
-        request.headers.extend(auth);
-        let mut refreshed = false;
-        loop {
-            // Check both the source and the current Destination on EVERY hop.
-            // Redirect rebasing below has already produced this hop's final
-            // destination, so dialect policy cannot be bypassed by a redirect.
-            self.check_request_targets(&request, operation)
-                .map_err(|error| history.attach(error, unreplayable, operation, self.protocol))?;
-            let response = self
-                .dispatch_once(&request, operation, deadline)
-                .await
-                .map_err(|error| history.attach(error, unreplayable, operation, self.protocol))?;
-            history.record_response(response.status, unreplayable);
-            if response.status == StatusCode::UNAUTHORIZED
-                && !refreshed
-                && let (DispatchCredentials::Bearer { token_source }, Some(token)) =
-                    (&self.credentials, used.take())
-            {
-                // The 401 is a refusal, so replaying the owned byte body is
-                // safe even for MOVE/conditional create. Use the token actually
-                // rejected, not a second current() read that could race rotation.
-                let refreshed_token = match tokio::time::timeout_at(
-                    deadline,
-                    token_source.refresh_if_unchanged(token),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(NetError::Timeout {
-                        transmission_state: TransmissionState::Unsent,
-                    }),
-                };
-                let token = refreshed_token
-                    .map_err(|error| self.token_read_error(error, operation))
-                    .map_err(|error| {
-                        history.attach(error, unreplayable, operation, self.protocol)
-                    })?;
-                let value =
-                    HeaderValue::from_str(&format!("Bearer {}", token.as_str())).map_err(|_| {
-                        history.attach(
-                            local_error(
-                                operation,
-                                "bearer token contains header-invalid bytes",
-                                self.protocol,
-                            ),
-                            unreplayable,
-                            operation,
-                            self.protocol,
-                        )
-                    })?;
-                request.headers.insert(AUTHORIZATION, value);
-                used = Some(token);
-                refreshed = true;
-                continue;
-            }
-            // Preserve DAV methods on endpoint relocation: GET cannot stand
-            // in for a PROPFIND/REPORT XML query or a conditional mutation.
-            // A 303 asks for a different operation, so surface it to the caller
-            // instead of silently accepting a GET representation as DAV data.
-            let redirect = matches!(
-                response.status,
-                StatusCode::MOVED_PERMANENTLY
-                    | StatusCode::FOUND
-                    | StatusCode::TEMPORARY_REDIRECT
-                    | StatusCode::PERMANENT_REDIRECT
-            );
-            let location = match response.headers.get(reqwest::header::LOCATION) {
-                Some(value) if redirect => Some(value.to_str().map_err(|error| {
-                    history.attach(
-                        self.redirect_error(
-                            NetError::MalformedRedirect {
-                                kind: MalformedRedirectKind::InvalidLocationEncoding,
-                                message: format!("Location header was not valid UTF-8: {error}"),
-                            },
-                            operation,
-                        ),
-                        unreplayable,
-                        operation,
-                        self.protocol,
-                    )
-                })?),
-                _ => None,
-            };
-            let Some(location) = location else {
-                return Ok(response);
-            };
-            let next = Url::parse(&response.url)
-                .and_then(|base| base.join(location))
-                .map_err(|error| {
-                    history.attach(
-                        self.redirect_error(
-                            NetError::MalformedRedirect {
-                                kind: MalformedRedirectKind::UnresolvableLocation,
-                                message: format!(
-                                    "Location {location:?} could not be resolved against base: {error}"
-                                ),
-                            },
-                            operation,
-                        ),
-                        unreplayable,
-                        operation,
-                        self.protocol,
-                    )
-                })?;
-            hops += 1;
-            if hops > max_hops {
-                return Err(history.attach(
-                    self.redirect_error(
-                        NetError::RedirectLoop {
-                            hops: u16::try_from(hops).unwrap_or(u16::MAX),
-                        },
-                        operation,
-                    ),
-                    unreplayable,
-                    operation,
-                    self.protocol,
-                ));
-            }
-            // Refused locally when the origin was never admitted by discovery.
-            // The gate is checked here rather than left to `auth_headers`,
-            // whose own refusal is right for a first hop but not for this one:
-            // by now the server has answered the previous hop, and that
-            // response is already in `history` below.
-            if !self.is_trusted_url(next.as_str()) {
-                return Err(history.attach(
-                    local_error(
-                        operation,
-                        format!("refusing to follow a DAV redirect to an untrusted URL: {next}"),
-                        self.protocol,
-                    ),
-                    unreplayable,
-                    operation,
-                    self.protocol,
-                ));
-            }
-            // Fresh credentials for the target origin.
-            let (auth, token) = self
-                .mint_auth_until(next.as_str(), operation, deadline)
-                .await
-                .map_err(|error| history.attach(error, unreplayable, operation, self.protocol))?;
-            used = token;
-            refreshed = false;
-            let mut headers = request.headers.clone();
-            headers.remove(AUTHORIZATION);
-            for (name, value) in &auth {
-                headers.insert(name, value.clone());
-            }
-            // A redirect of the SOURCE relocates the collection namespace, and a
-            // `Destination` still naming the pre-redirect one asks the server to
-            // write where it has just said the source no longer lives: a MOVE of
-            // `/cal/one.ics` redirected to `/dav/cal/one.ics` kept a destination
-            // under `/cal/`. Rebase it on the same hop the source took - express
-            // it relative to the pre-hop request URL, resolve that against the
-            // post-hop one - so a cross-collection move stays cross-collection
-            // inside the new namespace.
-            //
-            // This is inside the credential gate rather than beside it. The
-            // destination is a URL this client asks the server to write to, so
-            // it carries the same admitted-origin requirement `move_resource`
-            // enforced on the caller's value. The rebase happens only after
-            // the gate has admitted `next`, and the rebased URL is
-            // `next`-relative, so the requirement holds by construction; the
-            // check below is the guard that keeps it holding if either half
-            // moves. A destination on a different origin than the source is left
-            // verbatim - the source's hop says nothing about it, and it passed
-            // the gate on the way in.
-            let rebased = headers
-                .get(DESTINATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|destination| rebase_destination(&request.url, &next, destination));
-            if let Some(rebased) = rebased {
-                if !self.is_trusted_url(&rebased) {
-                    return Err(history.attach(
-                        local_error(
-                            operation,
-                            format!(
-                                "refusing to name an untrusted DAV move destination after a redirect: {rebased}"
-                            ),
-                            self.protocol,
-                        ),
-                        unreplayable,
-                        operation,
-                        self.protocol,
-                    ));
-                }
-                let value = HeaderValue::from_str(&rebased).map_err(|error| {
-                    history.attach(
-                        local_error(operation, error.to_string(), self.protocol),
-                        unreplayable,
-                        operation,
-                        self.protocol,
-                    )
-                })?;
-                headers.insert(HeaderName::from_static(DESTINATION), value);
-            }
-            request = DavRequest {
-                method: request.method,
-                url: next.to_string(),
-                headers,
-                body: request.body,
-                replay: request.replay,
-                // Unreachable: the first dispatch already refused a request
-                // carrying one. Carried rather than reset so a future path that
-                // reaches here does not launder the rejection away.
-                invalid_header: request.invalid_header,
-            };
-        }
     }
 
     pub async fn send_body_request(
@@ -1265,85 +956,125 @@ impl DavDispatch {
     }
 }
 
-/// Evidence from responses received before the final DAV hop.
+/// DAV's per-request hop policy for net's shared redirect walk.
 ///
-/// Net aggregates its own retries, but the DAV redirect walk starts a new
-/// `AccountNet` request for each hop. Keep acknowledged responses here so a
-/// later failure cannot erase an earlier non-idempotent commit possibility.
-#[derive(Default)]
-struct RedirectHistory {
-    causes: Vec<Cause>,
-    ledger: bifrost_net::AttemptLedger,
+/// DAV policy has no exchange loop or clock. An enterprise user expects a
+/// relocation to preserve the query/write and its destination namespace, while
+/// credentials reach only explicitly admitted origins. Net owns all evidence.
+struct DavHopPolicy {
+    dispatch: DavDispatch,
+    operation: AccountOperation,
+    effective_url: std::sync::Mutex<String>,
 }
 
-impl RedirectHistory {
-    fn record_response(&mut self, status: StatusCode, unreplayable: bool) {
-        self.causes.push(Cause::Attempt(AttemptCause::new(
-            TransmissionState::Acknowledged,
-        )));
-        // Feed the shared refusal rule; a 503 is not proof that an upstream
-        // write did not commit. Redirect responses retain that possibility.
-        self.ledger
-            .record(bifrost_net::AttemptOutcome::Response(status), !unreplayable);
+impl DavHopPolicy {
+    fn local(&self, message: impl Into<String>) -> NetError {
+        NetError::HopPolicy(Box::new(local_error(
+            self.operation,
+            message,
+            self.dispatch.protocol,
+        )))
+    }
+}
+
+// The shared net error intentionally retains inline response evidence.
+#[allow(clippy::result_large_err)]
+impl HopPolicy for DavHopPolicy {
+    fn method_rewrite(&self) -> MethodRewrite {
+        // A GET representation cannot satisfy a DAV query or conditional write.
+        // Return 303 to the caller rather than reporting that different work as done.
+        MethodRewrite::PreserveAndRefuse303
     }
 
-    fn attach(
+    fn admit(&self, _prior: Option<&Url>, next: &Url) -> Result<HopCredential, NetError> {
+        if !self.dispatch.is_trusted_url(next.as_str()) {
+            return Err(self.local(format!(
+                "refusing to send DAV credentials to untrusted URL: {next}"
+            )));
+        }
+        match &self.dispatch.credentials {
+            DispatchCredentials::Basic { username, password } => {
+                let encoded = base64::engine::general_purpose::STANDARD
+                    .encode(format!("{username}:{password}"));
+                let value = HeaderValue::from_str(&format!("Basic {encoded}"))
+                    .map_err(|_| self.local("Basic credential contains header-invalid bytes"))?;
+                Ok(HopCredential::Header(value))
+            }
+            DispatchCredentials::Bearer { token_source } => {
+                Ok(HopCredential::Bearer(token_source.clone()))
+            }
+        }
+    }
+
+    fn rewrite_headers(
         &self,
-        error: AccountError,
-        unreplayable: bool,
-        operation: AccountOperation,
-        protocol: DavProtocol,
-    ) -> AccountError {
-        if self.causes.is_empty() {
-            return error;
-        }
-        let terminal_state = error.chain().iter().find_map(|cause| match cause {
-            Cause::Attempt(attempt) => Some(attempt.transmission_state),
-            _ => None,
-        });
-        if unreplayable
-            && self.ledger.verdict() == bifrost_net::CommitEvidence::MayHaveCommitted
-            && matches!(terminal_state, None | Some(TransmissionState::Unsent))
-        {
-            // A later hop can fail before dispatch (including while waiting
-            // for admission). Credential errors can omit attempt evidence
-            // entirely. The earlier response still makes the logical
-            // mutation ambiguous, so use the existing partial-response
-            // reconciliation lane and retain the terminal error as evidence.
-            // History appended through into_builder is diagnostic only, so
-            // declare the combined outcome on a fresh builder.
-            let mut builder = AccountErrorBuilder::new(
-                AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-                Cause::Wire(WireCause::MalformedResponse {
-                    protocol: protocol.protocol(),
-                    detail: Some(DiagnosticText::support_only(
-                        "DAV redirect chain failed after an unreplayable request may have committed",
-                    )),
-                }),
-            )
-            .push_cause(Cause::Attempt(AttemptCause::new(
-                TransmissionState::InFlight,
-            )))
-            .protocol(protocol.protocol())
-            .operation(operation)
-            .idempotency_override(false);
-            for cause in &self.causes {
-                builder = builder.push_cause(cause.clone());
+        prior: &Url,
+        next: &Url,
+        headers: &mut HeaderMap,
+    ) -> Result<(), NetError> {
+        // Relocate the destination relative to the source's new namespace.
+        // A destination on another origin is independent and stays verbatim.
+        let rebased = headers
+            .get(DESTINATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|destination| rebase_destination(prior.as_str(), next, destination));
+        if let Some(rebased) = rebased {
+            if !self.dispatch.is_trusted_url(&rebased) {
+                return Err(self.local(format!(
+                    "refusing to name an untrusted DAV move destination after a redirect: {rebased}"
+                )));
             }
-            for cause in error.chain().iter() {
-                builder = builder.push_cause(cause.clone());
+            let value =
+                HeaderValue::from_str(&rebased).map_err(|error| self.local(error.to_string()))?;
+            headers.insert(HeaderName::from_static(DESTINATION), value);
+        }
+        Ok(())
+    }
+
+    fn check_target(
+        &self,
+        method: &Method,
+        url: &Url,
+        headers: &HeaderMap,
+    ) -> Result<(), NetError> {
+        // A Destination header names a second write target (MOVE, COPY). It is
+        // gated by the same admitted-origin set as the request URL, here rather
+        // than in `move_resource`, because every DAV request - wrapper-built or
+        // raw through `send_raw_request` - passes this check before each wire
+        // hop, the first included. A consumer-supplied or redirect-rebased
+        // destination must not steer a write to an origin the credential gate
+        // would refuse. A Destination that is not absolute text names no
+        // origin and is refused the same way.
+        if let Some(destination) = headers.get(DESTINATION) {
+            let trusted = destination
+                .to_str()
+                .is_ok_and(|destination| self.dispatch.is_trusted_url(destination));
+            if !trusted {
+                return Err(self.local(format!(
+                    "refusing to name an untrusted DAV {method} destination: {}",
+                    String::from_utf8_lossy(destination.as_bytes())
+                )));
             }
-            return builder
-                .try_build()
-                .expect("valid DAV redirect-chain partial response");
         }
-        let mut builder = error.into_builder();
-        for cause in &self.causes {
-            builder = builder.push_cause(cause.clone());
+        if let Some(guard) = &self.dispatch.request_guard {
+            guard
+                .check_target(method, url.as_str(), self.operation)
+                .map_err(|error| NetError::HopPolicy(Box::new(error)))?;
+            if let Some(destination) = headers
+                .get(DESTINATION)
+                .and_then(|value| value.to_str().ok())
+            {
+                guard
+                    .check_target(method, destination, self.operation)
+                    .map_err(|error| NetError::HopPolicy(Box::new(error)))?;
+            }
         }
-        builder
-            .try_build()
-            .expect("valid DAV redirect-chain transmission evidence")
+        // A poisoned lock still holds a plain String; overwriting it is sound.
+        *self
+            .effective_url
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = url.to_string();
+        Ok(())
     }
 }
 
@@ -1424,7 +1155,7 @@ fn response_read_error_with_history(
 mod tests {
     use bifrost_net::{NetConfig, RetryPolicy, test_support::Canned};
     use bifrost_types::{
-        AccountErrorKind, AuthErrorKind, ProtocolErrorKind, ReconcileAction, RecoveryClass,
+        AccountErrorKind, AuthErrorKind, Cause, ProtocolErrorKind, ReconcileAction, RecoveryClass,
         TransmissionState,
     };
     use reqwest::header::HeaderMap;
@@ -1636,6 +1367,70 @@ mod tests {
             "a local refusal, not a wire failure: {:?}",
             error.kind()
         );
+    }
+
+    /// A raw MOVE or COPY naming a Destination on an unadmitted origin is
+    /// refused before anything is sent, exactly as `move_resource` refuses it.
+    /// `DavRequest::new` is public, so the Destination gate cannot live only on
+    /// the wrapper. The request URL itself is trusted here; the empty script
+    /// panics if the walk sends.
+    #[tokio::test]
+    async fn a_raw_move_or_copy_to_an_untrusted_destination_is_refused_before_sending() {
+        for method in [b"MOVE".as_slice(), b"COPY".as_slice()] {
+            let script = dav_script_empty();
+            let dispatch = scripted_dispatch(scripted_dav_net(&script));
+            let method = Method::from_bytes(method).unwrap();
+            let error = dispatch
+                .send_raw_request(
+                    DavRequest::new(method.clone(), format!("{BASE}/cal/a/one.ics"))
+                        .header(DESTINATION, "https://elsewhere.example.test/cal/b/one.ics")
+                        .replay(bifrost_net::ReplayPolicy::Never),
+                    AccountOperation::EventUpdate,
+                )
+                .await
+                .expect_err("an untrusted destination must be refused");
+            assert!(
+                transcripts(&script).is_empty(),
+                "{method}: nothing may be sent"
+            );
+            assert!(
+                matches!(error.kind(), AccountErrorKind::Request(_)),
+                "{method}: a local refusal, not a wire failure: {:?}",
+                error.kind()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dav_relocations_preserve_report_and_surface_303_as_data() {
+        for status in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::FOUND,
+            StatusCode::SEE_OTHER,
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let script = dav_script([dav_redirect(status, "/relocated"), answer(StatusCode::OK)]);
+            let dispatch = scripted_dispatch(scripted_dav_net(&script));
+            let method = Method::from_bytes(b"REPORT").unwrap();
+            let response = dispatch
+                .send_raw_request(
+                    DavRequest::new(method.clone(), format!("{BASE}/start")).body("query"),
+                    AccountOperation::EventGet,
+                )
+                .await
+                .unwrap();
+            let sent = transcripts(&script);
+            if status == StatusCode::SEE_OTHER {
+                assert_eq!(response.status, status);
+                assert_eq!(sent.len(), 1);
+            } else {
+                assert_eq!(sent.len(), 2);
+                assert_eq!(sent[1].method, method);
+                assert_eq!(sent[1].body, "query");
+                assert_eq!(response.url, format!("{BASE}/relocated"));
+            }
+        }
     }
 
     /// A redirect of the SOURCE rebases the `Destination` on the same hop.
@@ -1853,9 +1648,8 @@ mod tests {
             } else {
                 1
             };
-            let script = dav_script(
-                (0..replies).map(|_| replay_dav_response(status, "unsupported")),
-            );
+            let script =
+                dav_script((0..replies).map(|_| replay_dav_response(status, "unsupported")));
             let dispatch = scripted_dispatch(scripted_dav_net(&script));
             assert!(
                 !dispatch
@@ -2477,10 +2271,10 @@ mod tests {
         // Model twenty seconds already spent reading credentials or prior hops.
         let remaining = std::time::Duration::from_secs(10);
         dispatch
-            .send_raw_until(
-                DavRequest::new(Method::GET, format!("{BASE}/start")),
+            .dispatch_once(
+                &DavRequest::new(Method::GET, format!("{BASE}/start")),
                 AccountOperation::EventGet,
-                Instant::now() + remaining,
+                remaining,
             )
             .await
             .expect("both hops complete inside the remaining budget");

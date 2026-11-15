@@ -45,7 +45,7 @@ pub struct Reconciler {
     /// terminally failed scope - re-broadcasting `Terminated` and re-running
     /// a wire call that cannot succeed.
     pub scope_tokens: crate::multiplexer::ScopeTokens,
-    pub account_generation: tokio::sync::watch::Receiver<u64>,
+    pub account_generation: tokio::sync::watch::Receiver<crate::types::AccountGeneration>,
     #[cfg(test)]
     pub(crate) attempts: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -53,7 +53,7 @@ pub struct Reconciler {
 #[derive(Default)]
 struct WorkSet {
     intent: super::PendingPush,
-    hold: Option<(u64, tokio::time::Instant)>,
+    hold: Option<(crate::types::AccountGeneration, tokio::time::Instant)>,
 }
 
 impl WorkSet {
@@ -618,7 +618,8 @@ mod tests {
             let reconciler = Reconciler {
                 account_id,
                 account: Arc::new(ArcSwap::from_pointee(crate::types::Incarnation::new(
-                    account, 0,
+                    account,
+                    crate::types::Incarnation::initial_generation(),
                 ))),
                 cursors,
                 delivery: Arc::new(ChangeDelivery::new(tx)),
@@ -629,7 +630,10 @@ mod tests {
                 throttles: Arc::new(std::sync::Mutex::new(crate::recovery::ThrottleBucket::new())),
                 scheduler,
                 scope_tokens: tokens,
-                account_generation: tokio::sync::watch::channel(0).1,
+                account_generation: tokio::sync::watch::channel(
+                    crate::types::Incarnation::initial_generation(),
+                )
+                .1,
                 attempts: Some(Arc::clone(&attempts)),
             };
             let task = tokio::spawn(reconciler.run(Arc::clone(&ingress)));

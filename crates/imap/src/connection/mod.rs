@@ -23,6 +23,7 @@ use crate::types::{
 
 pub(crate) const LOGOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+mod admission;
 mod append;
 mod auth;
 mod config;
@@ -934,3 +935,35 @@ pub(super) fn is_notify_list_event(info: &MailboxInfo, filter_extended_markers: 
 
 #[cfg(test)]
 use dispatch::{build_selected_mailbox, selected_mailbox_effective_responses};
+
+#[cfg(test)]
+pub(crate) fn admit_for_encoding(
+    command: &Command,
+    opts: &crate::codec::encode::EncodeOptions,
+) -> Result<(), Error> {
+    let mut capabilities = opts.capabilities.clone();
+    capabilities.retain(|cap| !matches!(cap, Capability::LiteralPlus | Capability::LiteralMinus));
+    match opts.literal_mode {
+        crate::codec::encode::LiteralMode::LiteralPlus => {
+            capabilities.push(Capability::LiteralPlus);
+        }
+        crate::codec::encode::LiteralMode::LiteralMinus => {
+            capabilities.push(Capability::LiteralMinus);
+        }
+        crate::codec::encode::LiteralMode::Synchronizing => {}
+    }
+    let snapshot = driver::ConnectionStateSnapshot {
+        session_state: command.kind().legal_states()[0],
+        capabilities,
+        enabled: opts.enabled.clone(),
+        mailbox_selected: false,
+        selected: None,
+    };
+    admission::admit(
+        command,
+        &admission::SessionView {
+            snapshot: &snapshot,
+            tls_active: false,
+        },
+    )
+}

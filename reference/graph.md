@@ -100,10 +100,14 @@ readable public folder.
 Crate root: `paging.rs` - `PageWalk`, the shared repeated-link and page-budget
 bound used by Graph collection traversals, plus the search cursor codec that
 resumes within an over-delivered page (see "Bounded `nextLink` traversal").
-- `inventory.rs` - initial delta walk with per-type projections, page
-  pagination, inventory entry projection from Graph JSON.
-- `changes.rs` - delta-token-driven change stream over the
-  cached `@odata.deltaLink`.
+- `delta.rs` - the shared REST delta driver: bounded page traversal, link
+  admission before projection, the id-less verdict, lane projections, mail etag
+  updates, cursor encoding and terminal sequencing. Public-folder EWS polling
+  remains separate.
+- `inventory.rs` - initial/resumed inventory admission and inventory entry
+  projection from Graph JSON, adapting the shared driver's inventory lane.
+- `changes.rs` - delta-cursor admission and calendar horizon checks, adapting
+  the shared driver's changes lane over the cached `@odata.deltaLink`.
 - `get.rs` - `$batch`-backed hydration with per-projection
   `$select` lists.
 - `batch_routing.rs` - `partition_routable`, the pure per-item split every
@@ -2670,8 +2674,10 @@ terminal error, so the engine continues past a referenceAttachment in a batch.
 
 ## An id-less delta value is a checkpoint barrier
 
-A non-removed value in a delta page with no usable `id` cannot become an
-`InventoryEntry` - there is nothing to key it by. It becomes a `Region`
+A live value or tombstone in a delta page with no usable `id` cannot become
+an entry or removal - there is nothing to key it by. Missing, null, non-string
+and empty-string ids all have the same absent identity in `GraphItem`; neither
+lane can mint an empty object id. It becomes a `Region`
 obligation rather than an `Object` one, because an absent id may mean one
 malformed value, a schema mismatch affecting many, a truncated page, or a
 response that cannot be correlated with pagination at all, and calling it a
@@ -2700,13 +2706,28 @@ a waiver cannot silently accept every future id-less value in the scope.
 An earlier revision recorded the page URL as a replay token and let the delta link
 advance regardless, with a test pinning that as correct.
 
-The changes lane (`changes_stream`) enforces the same rule with the tools it
+The shared REST driver enforces this verdict once for both lanes. Inventory
+emits the page's valid siblings and removals with a checkpoint-barrier region
+obligation and a withheld candidate checkpoint, then terminates. The candidate
+retains the existing explicit operator-waiver capability; it is never accepted
+without that waiver. The walk emits no later page or completion. One region
+obligation identifies the page even if multiple values lack ids. An enterprise Outlook user expects the valid siblings to be
+available without silently losing an unidentifiable item on a cursor advance.
+
+The changes lane (`changes_stream`) expresses the same rule with the tools it
 has: `SyncEvent<Change>` carries no obligation vocabulary, so an id-less
 value (removed or not) in a live delta page delivers the page's decoded
 siblings on a checkpoint-less batch and then terminates the stream as a
 `Protocol(ContractViolation)` - the same shape as the neither-link arm -
-instead of emitting the page's checkpoint. Crossing the page would advance
-the cursor past a value the stream could not represent, which is silent
+instead of emitting the page's checkpoint. Both lanes end every failure with
+`Terminated` alone, including scope and cursor refusals before the first fetch;
+there is no `Done(None)` trailer. A successful walk emits a final checkpoint
+batch followed by `Done` carrying that checkpoint. Both links are admitted
+before projection or etag updates; a refused link emits no items from that page.
+A page with neither link delivers valid siblings without a checkpoint, then
+terminates in both lanes. Page markers use the last identified value's projected
+id, including a tombstone; the marker id remains diagnostic only.
+Crossing an id-less page would advance the cursor past a value the stream could not represent, which is silent
 permanent loss. Pinned by
 `an_idless_delta_value_terminates_without_crossing_the_page`.
 
@@ -2921,6 +2942,8 @@ removal state, memberships, thread ids, etags and flag fingerprints, and for
 hydration flag projection. Sparse optional fields retain the existing tolerant
 semantics. Provider flag text remains distinct from canonical writable tokens.
 A present `@removed` marker, including null, retains removal semantics.
+The identity observation rejects an empty id consistently in delta and metadata
+projections; optional flags and other sparse fields retain their tolerance.
 
 Delta envelopes and batch bodies retain JSON until individual items can be
 correlated and classified. They cannot deserialize as one mandatory message

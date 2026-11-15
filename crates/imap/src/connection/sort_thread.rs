@@ -25,13 +25,7 @@ impl ImapConnection {
     ) -> Result<SearchResult, Error> {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::Sort)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Sort) {
-                return Err(Error::MissingCapability("SORT".into()));
-            }
-        }
+
         let cmd = Command::Sort {
             sort_criteria: sort_criteria.to_owned(),
             charset: charset.to_owned(),
@@ -60,13 +54,7 @@ impl ImapConnection {
     ) -> Result<SearchResult, Error> {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::Sort)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !super::auth::snapshot_supports(&snap, &Capability::Sort) {
-                return Err(Error::MissingCapability("SORT".into()));
-            }
-        }
+
         let cmd = Command::UidSort {
             sort_criteria: sort_criteria.to_owned(),
             charset: charset.to_owned(),
@@ -102,18 +90,7 @@ impl ImapConnection {
     ) -> Result<Vec<ThreadNode>, Error> {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::Thread)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !snap
-                .capabilities
-                .contains(&Capability::Thread(algorithm.to_uppercase()))
-            {
-                return Err(Error::MissingCapability(
-                    format!("THREAD={}", algorithm.to_uppercase()).into(),
-                ));
-            }
-        }
+
         let cmd = Command::Thread {
             algorithm: algorithm.to_owned(),
             charset: charset.to_owned(),
@@ -144,18 +121,7 @@ impl ImapConnection {
     ) -> Result<Vec<ThreadNode>, Error> {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
-        self.require_state(crate::types::CommandKind::Thread)?;
-        {
-            let snap = self.state_rx.borrow();
-            if !snap
-                .capabilities
-                .contains(&Capability::Thread(algorithm.to_uppercase()))
-            {
-                return Err(Error::MissingCapability(
-                    format!("THREAD={}", algorithm.to_uppercase()).into(),
-                ));
-            }
-        }
+
         let cmd = Command::UidThread {
             algorithm: algorithm.to_owned(),
             charset: charset.to_owned(),

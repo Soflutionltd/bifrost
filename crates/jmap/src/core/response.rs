@@ -49,7 +49,11 @@ impl Response {
         &mut self,
         handle: &CallHandle<M>,
     ) -> crate::Result<M::Response> {
-        self.get_expected::<M>(&handle.call_id, handle.method_name)
+        self.get_expected::<M>(
+            &handle.call_id,
+            handle.answer_context.method,
+            handle.answer_context,
+        )
     }
 
     /// Extract a response for a method whose call id is known but which
@@ -59,13 +63,22 @@ impl Response {
         &mut self,
         call_id: &str,
     ) -> crate::Result<M::Response> {
-        self.get_expected::<M>(call_id, M::NAME)
+        self.get_expected::<M>(
+            call_id,
+            M::NAME,
+            super::answer::AnswerContext {
+                method: M::NAME,
+                guarded: false,
+                write: !M::REPLAY_SAFE,
+            },
+        )
     }
 
     fn get_expected<M: JmapMethod>(
         &mut self,
         call_id: &str,
         expected_method: &'static str,
+        context: super::answer::AnswerContext,
     ) -> crate::Result<M::Response> {
         let pos = self
             .raw
@@ -84,7 +97,9 @@ impl Response {
                         actual: method_name,
                     });
                 }
-                serde_json::from_str(raw.get()).map_err(crate::Error::from)
+                let mut response = serde_json::from_str(raw.get()).map_err(crate::Error::from)?;
+                M::stamp_response(&mut response, context);
+                Ok(response)
             }
             RawCallResult::Error(e) => Err(e.into()),
         }

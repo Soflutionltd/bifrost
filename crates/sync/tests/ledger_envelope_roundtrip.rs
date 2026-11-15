@@ -279,7 +279,7 @@ fn exhaustive_ledger() -> DebtLedger {
             ),
             vec![object("retrying-object")],
         ),
-        7,
+        walk_generation(7),
         1_000,
     );
 
@@ -292,7 +292,7 @@ fn exhaustive_ledger() -> DebtLedger {
             ),
             vec![object("waived-object")],
         ),
-        7,
+        walk_generation(7),
         1_100,
     );
     assert!(ledger.waive(&key("waived-object"), "operator@example".into(), 1_200));
@@ -309,7 +309,7 @@ fn exhaustive_ledger() -> DebtLedger {
             ),
             vec![object("blocked-object")],
         ),
-        7,
+        walk_generation(7),
         1_300,
     );
     assert!(ledger.block(&key("blocked-object")));
@@ -320,12 +320,12 @@ fn exhaustive_ledger() -> DebtLedger {
             CoverageDomain::full(scope()),
             vec![replayable("repaired-region")],
         ),
-        7,
+        walk_generation(7),
         1_400,
     );
     assert!(ledger.discharge_repaired(
         &key("repaired-region"),
-        7,
+        walk_generation(7),
         DischargeEvidence::RepairedAndPublished {
             attempt: RepairAttemptId(42),
         },
@@ -337,12 +337,12 @@ fn exhaustive_ledger() -> DebtLedger {
             CoverageDomain::full(scope()),
             vec![object("irrelevant-object")],
         ),
-        7,
+        walk_generation(7),
         1_500,
     );
     assert!(ledger.discharge_repaired(
         &key("irrelevant-object"),
-        7,
+        walk_generation(7),
         DischargeEvidence::ProvedIrrelevant {
             detail: "absent under cursor bridge".into(),
         },
@@ -354,7 +354,7 @@ fn exhaustive_ledger() -> DebtLedger {
             CoverageDomain::full(scope()),
             vec![replayable("replaced-parent")],
         ),
-        7,
+        walk_generation(7),
         1_600,
     );
     ledger
@@ -362,7 +362,7 @@ fn exhaustive_ledger() -> DebtLedger {
             &key("replaced-parent"),
             &[],
             &[object("child-one"), object("child-two")],
-            7,
+            walk_generation(7),
             1_700,
         )
         .expect("replacement accepted");
@@ -376,21 +376,21 @@ fn exhaustive_ledger() -> DebtLedger {
     ledger.record_barrier(BarrierIncident {
         key: key("crossed-barrier"),
         domain: CoverageDomain::full(scope()),
-        generation: 7,
+        generation: walk_generation(7),
         failure_label: "unidentifiable-value".into(),
         evidence: auth_error(),
         policy: PolicyStatus::Retrying { attempts: 0 },
         resume_from: None,
     });
     assert!(ledger.waive(&key("crossed-barrier"), "operator@example".into(), 1_800));
-    assert!(ledger.cross_waived_barriers(&crossable, 7, 1_900));
+    assert!(ledger.cross_waived_barriers(&crossable, walk_generation(7), 1_900));
 
     // Two live barriers: one with a resume point, one without, and different
     // policies so both halves of the barrier codec are exercised.
     ledger.record_barrier(BarrierIncident {
         key: key("resumable-barrier"),
         domain: time_domain(0, 500),
-        generation: 8,
+        generation: walk_generation(8),
         failure_label: "page-boundary-lost".into(),
         evidence: decorated_error(),
         policy: PolicyStatus::Retrying { attempts: 3 },
@@ -399,7 +399,7 @@ fn exhaustive_ledger() -> DebtLedger {
     ledger.record_barrier(BarrierIncident {
         key: key("blocked-barrier"),
         domain: CoverageDomain::full(scope()),
-        generation: 8,
+        generation: walk_generation(8),
         failure_label: "unidentifiable-value".into(),
         evidence: auth_error(),
         policy: PolicyStatus::Retrying { attempts: 0 },
@@ -412,12 +412,12 @@ fn exhaustive_ledger() -> DebtLedger {
     // after the round trip.
     ledger.ingest(
         &InventoryCoverageReport::degraded(time_domain(30, 90), vec![object("union-debt")]),
-        9,
+        walk_generation(9),
         2_000,
     );
     ledger.ingest(
         &InventoryCoverageReport::complete(time_domain(7, 60)),
-        10,
+        walk_generation(10),
         2_100,
     );
 
@@ -524,7 +524,7 @@ fn a_spent_retry_budget_survives_a_restart() {
     let mut ledger = DebtLedger::new();
     ledger.ingest(
         &InventoryCoverageReport::degraded(CoverageDomain::full(scope()), vec![object("budgeted")]),
-        1,
+        walk_generation(1),
         100,
     );
     assert!(!ledger.record_attempt(&key("budgeted"), 3));
@@ -561,7 +561,7 @@ fn a_retained_proof_still_completes_a_union_after_a_restart() {
 
     restored.ingest(
         &InventoryCoverageReport::complete(time_domain(60, 180)),
-        11,
+        walk_generation(11),
         3_000,
     );
 
@@ -659,4 +659,13 @@ fn an_out_of_window_version_is_schema_incompatible_and_corruption_is_not() {
         decode_ledger(truncated).is_err(),
         "a truncated ledger must be refused, not silently shortened"
     );
+}
+
+// Mint test proof orders through the same owner as production walks.
+fn walk_generation(value: u64) -> bifrost_sync::cursor::WalkGeneration {
+    let coverage = bifrost_sync::cursor::PendingCoverage::new();
+    for _ in 0..value {
+        let _ = coverage.next_generation();
+    }
+    coverage.next_generation()
 }

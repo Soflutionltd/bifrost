@@ -193,6 +193,33 @@ the submission call id. `Response::get_method` reads that response by its
 method type after the explicit submission result. In-place removal preserves
 order; swapping the tail into the vacated slot reorders later lookups.
 
+Per-id accounting uses `core/answer.rs::IdAnswer<T>` across set, copy,
+import, upload, parse and read responses: `Ok`, `Refused`, `NotFound` or
+`Unanswered`. A refused set's notFound retains its typed SetError for the
+account's absent-target policy. Only explicit notFound entries establish a miss;
+an omitted Blob/copy or parse entry is unanswered, never a terminal missing id.
+A Blob/copy response naming different source or destination accounts is a
+ContractViolation, not a blob-format ParseFailed error.
+An enterprise Outlook user expects uncertain writes to reconcile rather than be
+reported as proven failures. Successful objects still need usable identities:
+`require_created_id` validates a returned object, not whether its request was
+answered, and remains separate.
+
+`Request::call` stamps the method name, read/write kind and serialized state
+guards on its handle. Typed response extraction transfers those facts to the
+response, including HTTP and WebSocket paths. Per-id error translation reads
+them directly; callers no longer restate method names or conditionality in
+a per-caller mapper. Implicit Email/set responses have their own method identity
+and no explicit state guard. Bulk read correlation accepts only submitted identities, keeps the first returned
+object for an id and repeats its observation for repeated submissions. PIM page
+adapters deduplicate requested ids and project their results in query order;
+unrelated or id-less rows cannot create unsolicited contacts or events. Filter
+listings likewise project only their correlated query hits.
+Read consumers use the same answer algebra while
+retaining operation policies: a vanished thread member needs no expunge, and
+an unresolved query hit must not silently truncate a listing. Raw list and
+failure iterators remain available for whole-response processing.
+
 `SetResponse::create_errors()` and `update_errors()` iterate every `notCreated`
 and `notUpdated` entry with its creation id or object id, so a batch caller can
 report each failed object instead of whichever entry hash order surfaced first.
@@ -650,7 +677,7 @@ The crate-internal JMAP error type uses structured variants. No
   status, title and detail.
 - `Method(MethodError)` - JMAP method-level errors. `Set(SetError)` - per-object set errors.
 - Local request refusals: `RequestEncode`, `RequestCallLimit { max }`, `RequestSizeLimit { max, size }`, `NoPrimaryAccount { capability }`.
-- Response-shape failures: `ResponseDecode`, `CallNotFound`, `UnexpectedMethodResponse`, `IdNotFound`, `SetIdUnanswered`, `NotParsable`.
+- Response-shape failures: `ResponseDecode`, `CallNotFound`, `UnexpectedMethodResponse`, `IdNotFound`, `IdUnanswered`, `NotParsable`.
 - `InvalidUrl` - a URL or URL-component value the crate's own caller supplied is unusable. Sources include an empty session URL and an empty EventSource type list.
 - `MalformedSessionUrl { property, detail }` - a URL or URL template the SERVER published in its session is unusable: `apiUrl` and the `uploadUrl`, `downloadUrl` and `eventSourceUrl` templates (an unbalanced or unknown template variable, or not an absolute http or https URL; `uploadUrl` raises only at an upload and `eventSourceUrl` only when EventSource is used) and the WebSocket capability's `url` (an unparseable URI or a non-websocket scheme). The provider described itself wrongly, so this is never the caller's `InvalidUrl`.
 - `MalformedCapability { capability }` - an advertised capability whose object does not parse.
@@ -992,7 +1019,7 @@ short batch cannot be held to end-of-input by a busy one; the wait is capped
 at the same input volume a full batch already accepts. A route holding only
 locally-rejected targets emits them without probing Email state.
 
-`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back observes current state; eligible targets may reassert within bounds). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so unguarded idempotent flag work retries, guarded flag work reconciles with CheckTarget only, and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. `SetResponse::created`/`updated`/`destroyed`, and the create maps of `Email/import`, `*/copy` and `Blob/upload`, report an omission as `Error::SetIdUnanswered`, distinct from the `IdNotFound` that parse and blob-copy lookups still raise: an omitted create may have landed, so it is never the terminal `MissingField` of a create that came back without its id. That second case - a success-map entry whose id is absent or empty - is refused by every create reader through `error::require_created_id`, as `Protocol(MissingField)` with `Attempt(Acknowledged)` evidence (still terminal `ProviderContractViolation`); no create returns an empty `ServerFilterId`, `ContainerId`, `EventId`, `ContactId`, `EmailId` or submission id as success. The single-set filter, mailbox, event and contact creates return that leaf bare, with no committed-unidentified partial-commit record; the multi-step send and draft doors wrap it in theirs. Every direct single-id reader (calendar, contact, filter and mailbox creates, calendar and contact writes, filter update and delete, draft create, update and discard, the send and raw-send Email create, import and submission creates, the draft-send submission, send cleanup, container delete, scheduled-send cancel and both reschedule legs) and the `SetProgress` bulk readers map it through `error::set_answer_error`, which names the method and the guard the request carried. A reader that skips the mapper still gets `Protocol(PartialResponse)` from the generic translation, with idempotency narrowed because its guard is unknown, never the terminal `Protocol(MissingField)`. Send cleanup reports an unanswered destroy as `CompensationOutcome::Unconfirmed`. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through `classify_set_item`. Empty additive/subtractive flag operations, wholly empty patches, and patches naming the same flag in both sets are rejected up front as `Terminated(Request(Malformed))` rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
+`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back observes current state; eligible targets may reassert within bounds). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so unguarded idempotent flag work retries, guarded flag work reconciles with CheckTarget only, and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. `SetResponse::created`/`updated`/`destroyed`, and the create maps of `Email/import`, `*/copy` and `Blob/upload`, report an omission as `Error::IdUnanswered`, as do omitted parse and blob-copy answers; `IdNotFound` is reserved for explicit misses: an omitted create may have landed, so it is never the terminal `MissingField` of a create that came back without its id. That second case - a success-map entry whose id is absent or empty - is refused by every create reader through `error::require_created_id`, as `Protocol(MissingField)` with `Attempt(Acknowledged)` evidence (still terminal `ProviderContractViolation`); no create returns an empty `ServerFilterId`, `ContainerId`, `EventId`, `ContactId`, `EmailId` or submission id as success. The single-set filter, mailbox, event and contact creates return that leaf bare, with no committed-unidentified partial-commit record; the multi-step send and draft doors wrap it in theirs. Every direct single-id reader and the shared mail-set classifier translate the request-stamped answer through the ordinary account error boundary. No caller supplies a substitute method name or guessed guard. Guarded unanswered writes narrow idempotency; unguarded writes retain the operation's recovery advice. Send cleanup reports an unanswered destroy as `CompensationOutcome::Unconfirmed`. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through `classify_set_item`. Empty additive/subtractive flag operations, wholly empty patches, and patches naming the same flag in both sets are rejected up front as `Terminated(Request(Malformed))` rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
 
 ### PIM primitives and conveniences
 
@@ -1053,7 +1080,7 @@ later delivery status.
 
 Container CRUD is `Mailbox/get`/`set`. Rename and move require the requested
 native id in `updated` (including a null value) or surface its `notUpdated`
-error. An id absent from both lanes is mapped through `set_answer_error` as an
+error. An id absent from both lanes retains its request-stamped metadata as an
 unguarded unanswered `Mailbox/set` write; `newState` alone cannot prove that
 folder changed. The mailbox state cache advances only after that per-id check.
 Rename, move and delete select the
@@ -1088,12 +1115,11 @@ An enterprise user expects a broken search to leave durable mail and sync
 checkpoints intact. Moved result sets still use `ConcurrencyConflict`.
 
 The crate has one persisted payload codec in `sync/page_cursor.rs`, with
-anchored and positional variants serving three families of walk. It preserves
-both issued encodings byte for byte: `search-3:` for mail search and `2:` for
-anchored walks. The entry points reject the other variant with
+anchored and positional variants serving three families of walk. It uses `search-3:` for mail search and
+`pim-3:<query method>:` for anchored walks. The entry points reject the other variant with
 `AccountError::invalid_page_cursor`; negative search positions, malformed and
-retired formats use that same restart-paging signal. Contact and calendar walks
-retain their historically shared anchored format.
+retired formats use that same restart-paging signal. Contact and calendar reject each other's query method. The ambiguous legacy `2:` format is retired: an Outlook user
+expects a wrong-collection cursor to restart paging rather than skip objects.
 
 **Mail search (`pim.rs`)** is positional: `search-3:<position>:<queryState>`,
 owner-qualified for a share. It is described under "Known limitations" below.
@@ -1104,7 +1130,8 @@ owner-qualified for a share. It is described under "Known limitations" below.
 `sync/page_cursor.rs`, and differ only in id type, query-builder type and
 diagnostic wording (each supplies them through the `PageKind` trait). They use
 an ANCHORED, state-pinned cursor
-instead. The payload is `2:` followed by a JSON two-element array,
+instead. The payload is `pim-3:ContactCard/query:` or
+`pim-3:CalendarEvent/query:` followed by a JSON two-element array,
 `[anchor, queryState]`. JSON rather than a delimited pair on purpose: a JMAP
 id and a `queryState` are both opaque and either may contain any character a
 delimiter could be, so a delimited pair has no unambiguous split, while JSON
@@ -1131,7 +1158,7 @@ escapes its own contents and both halves round-trip verbatim.
   search's client-side calendar filter, or by `events_in_range`'s local
   overlap predicate, or by hydration, still names where the server continues
   from and the walk goes on correctly.
-- A non-v2 payload is refused `Request(Malformed)` ("restart from
+- A legacy, malformed or wrong-method payload is refused `Request(Malformed)` ("restart from
   the first page"), not reinterpreted: that covers the v1 bare integer (which
   under anchored paging would read as either a stale offset or an id named
   "100") and, just as deliberately, an anchor with no pinned state, since
@@ -1257,7 +1284,7 @@ exposure any consumer of an unbounded query has.
 
 `filters.rs` maps Stage 2 filter primitives onto JMAP Sieve:
 
-- `filters_list` runs `SieveScript/query`, hydrates with `SieveScript/get`, downloads each script's blob, returns `ServerFilter::Script`. The query's id list is however many scripts the account holds, so hydration is BATCHED at the session's `maxObjectsInGet` (`capabilities::max_objects_in_get`, the reader for doors that hold a bare `Account` rather than the `CoreLimits` built at open) - one unbounded `/get` is a call a server may refuse wholesale with `requestTooLarge`. Each answer is then RECONCILED against the ids that batch submitted, the way `reconcile_hydration` and `contacts::get_cards` do. An id the server leaves out of `list` used to vanish from the returned `Vec`, which reads to the consumer as "that filter does not exist" - a deletion the response never claimed, and one an absent `notFound` cannot disprove (see the `/get` leniency rule). This door has no per-item lane, so the whole page fails, retryably: `error::get_id_unresolved_after_query` classifies both an unanswered id and a declared `notFound` as `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, the same class `get_id_unanswered` uses and the same answer `contact_update` gives for an unanswered pre-read id. `notFound` deliberately shares that lane rather than taking the terminal `get_id_not_found` one: at page level the honest reading of a script the query named and the get disclaimed is a delete that raced the two calls, and the retry's fresh `/query` will not name it again. The downloads are independent of each other, so they run CONCURRENTLY under `factory::api_request_concurrency` (the server's `maxConcurrentRequests`, clamped `[1, 8]` - the same reading the open-time foreign probes use, deliberately one function rather than a second bound that could drift). Serially this was N+2 round trips for N scripts. It is `buffered`, never `buffer_unordered`: yielding in submission order is what keeps the error accounting identical to the serial loop's, where the first failing script in list order is the error the whole call returns. Arrival order would report whichever download happened to fail first.
+- `filters_list` runs `SieveScript/query`, hydrates with `SieveScript/get`, downloads each script's blob, returns `ServerFilter::Script`. The query's id list is however many scripts the account holds, so hydration is BATCHED at the session's `maxObjectsInGet` (`capabilities::max_objects_in_get`, the reader for doors that hold a bare `Account` rather than the `CoreLimits` built at open) - one unbounded `/get` is a call a server may refuse wholesale with `requestTooLarge`. Each answer is then RECONCILED against the ids that batch submitted, the way `reconcile_hydration` and `contacts::get_cards` do. An id the server leaves out of `list` used to vanish from the returned `Vec`, which reads to the consumer as "that filter does not exist" - a deletion the response never claimed, and one an absent `notFound` cannot disprove (see the `/get` leniency rule). This door has no per-item lane, so the whole page fails, retryably: `error::query_answer` classifies both an unanswered id and a declared `notFound` as `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, the same class `get_id_unanswered` uses and the same answer `contact_update` gives for an unanswered pre-read id. `notFound` deliberately shares that lane rather than taking the terminal explicit-object-miss one: at page level the honest reading of a script the query named and the get disclaimed is a delete that raced the two calls, and the retry's fresh `/query` will not name it again. The downloads are independent of each other, so they run CONCURRENTLY under `factory::api_request_concurrency` (the server's `maxConcurrentRequests`, clamped `[1, 8]` - the same reading the open-time foreign probes use, deliberately one function rather than a second bound that could drift). Serially this was N+2 round trips for N scripts. It is `buffered`, never `buffer_unordered`: yielding in submission order is what keeps the error accounting identical to the serial loop's, where the first failing script in list order is the error the whole call returns. Arrival order would report whichever download happened to fail first.
 - `filter_create` uploads the body as `application/sieve`, creates a `SieveScript`, and `onSuccessActivateScript` when asked active.
 - `filter_update` patches name/body via `SieveScript/set` (body uploads a fresh blob first); `is_active: true` activates the target via `onSuccessActivateScript`. Deactivation first reads the target's `isActive`; an inactive target leaves activation alone while still applying name/body edits. An active target uses `onSuccessDeactivateScript` guarded by the read's `ifInState`, so a concurrent activation produces a conflict instead of deactivating another script. There is no automatic re-read and retry after `stateMismatch`, including one caused by an unrelated script edit. The patch can also replace name/body; preserving concurrent rule edits, as an enterprise Outlook user expects, takes precedence over silently authorizing the original patch against a newer ruleset. The caller refreshes and explicitly retries the whole patch; deactivation is not split into a second write. A target omitted from both read-result lanes fails retryably as `Protocol(PartialResponse)`; an explicit `notFound` remains `NotFound`.
 - `filter_delete` destroys the id; `filter_validate` uploads then `SieveScript/validate`, mapping set errors to `FilterValidation` diagnostics.
@@ -1441,8 +1468,9 @@ arrived) and, unless its primary cause already is one, the typed
   `CallNotFound` -> `Protocol(MissingField)`, all
   `ProviderContractViolation`. `IdNotFound` -> `NotFound(resource)`
   (`ProviderRefused`) when the scope names a resource, else
-  `Protocol(MissingField)`. `SetIdUnanswered` -> `Protocol(PartialResponse)`
-  with acknowledged evidence and idempotency narrowed (guard unknown).
+  `Protocol(MissingField)`. `IdUnanswered` -> `Protocol(PartialResponse)`
+  with acknowledged evidence. Its request-stamped method, write/read kind and
+  actual guard determine recovery; guarded writes narrow idempotency.
 - Caller faults -> `Request(Malformed)` -> `ClientBug`: `RequestEncode`,
   `RequestCallLimit`, `RequestSizeLimit`, and `InvalidUrl` (field `url`, for
   an empty session URL or an unusable EventSource URL component).
@@ -1623,7 +1651,7 @@ a whole new share still waits for reopen.
   account by another's offsets.
 - The search page cursor payload is versioned: `search-3:<position>:<queryState>`,
   owner-qualified for a share. It is the POSITIONAL encoding; the contact and
-  calendar page walks use the `2:` tag (anchored, see "PIM page
+  calendar page walks use the `pim-3:<query method>:` tag (anchored, see "PIM page
   cursors"), and each decoder rejects the other tag. Old search cursors with
   the shared `2:` tag are refused as `Request(Malformed)` and
   require restarting the search. Two things ride in it because a bare position

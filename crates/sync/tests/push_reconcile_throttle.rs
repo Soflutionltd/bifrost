@@ -86,7 +86,8 @@ async fn sweep(scope_tokens: ScopeTokens) -> Vec<CursorScope> {
     let reconciler = Reconciler {
         account_id,
         account: Arc::new(ArcSwap::from_pointee(bifrost_sync::Incarnation::new(
-            account, 0,
+            account,
+            bifrost_sync::Incarnation::initial_generation(),
         ))),
         cursors,
         delivery: Arc::new(bifrost_sync::multiplexer::ChangeDelivery::new(changes_tx)),
@@ -99,7 +100,10 @@ async fn sweep(scope_tokens: ScopeTokens) -> Vec<CursorScope> {
         )),
         scheduler,
         scope_tokens,
-        account_generation: tokio::sync::watch::channel(0).1,
+        account_generation: tokio::sync::watch::channel(
+            bifrost_sync::Incarnation::initial_generation(),
+        )
+        .1,
     };
 
     let ingress = Arc::new(bifrost_sync::push::PushIngress::new(4));
@@ -160,7 +164,7 @@ struct Harness {
     ingress: Arc<bifrost_sync::push::PushIngress>,
     boundary: Boundary,
     shutdown: CancellationToken,
-    generation: Arc<tokio::sync::watch::Sender<u64>>,
+    generation: Arc<tokio::sync::watch::Sender<bifrost_sync::types::AccountGeneration>>,
     account: Arc<ArcSwap<bifrost_sync::Incarnation>>,
     reopen: mpsc::Receiver<bifrost_sync::ReopenRequest>,
     reopen_tx: mpsc::Sender<bifrost_sync::ReopenRequest>,
@@ -170,9 +174,12 @@ struct Harness {
 
 /// What an engine reattach does to the reconciler's view, in production order:
 /// install the next incarnation, then publish its generation on the watch.
-fn reattach(account: &ArcSwap<bifrost_sync::Incarnation>, watch: &tokio::sync::watch::Sender<u64>) {
+fn reattach(
+    account: &ArcSwap<bifrost_sync::Incarnation>,
+    watch: &tokio::sync::watch::Sender<bifrost_sync::types::AccountGeneration>,
+) {
     let current = account.load_full();
-    let next = current.generation() + 1;
+    let next = current.replacement_generation();
     account.store(Arc::new(bifrost_sync::Incarnation::new(
         Arc::clone(current.account()),
         next,
@@ -206,7 +213,8 @@ impl Harness {
         let scopes = vec![scope("one"), scope("two")];
         let driven = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&driven);
-        let (generation, generation_rx) = tokio::sync::watch::channel(0);
+        let (generation, generation_rx) =
+            tokio::sync::watch::channel(bifrost_sync::Incarnation::initial_generation());
         let generation = Arc::new(generation);
         let slot: Arc<std::sync::OnceLock<Arc<ArcSwap<bifrost_sync::Incarnation>>>> =
             Arc::new(std::sync::OnceLock::new());
@@ -236,7 +244,8 @@ impl Harness {
         }
         let account: Arc<dyn Account> = Arc::new(stub);
         let account = Arc::new(ArcSwap::from_pointee(bifrost_sync::Incarnation::new(
-            account, 0,
+            account,
+            bifrost_sync::Incarnation::initial_generation(),
         )));
         let _ = slot.set(Arc::clone(&account));
         let cursors = Arc::new(CursorRegistry::new());
@@ -333,9 +342,9 @@ async fn an_account_wide_directive_holds_the_remainder_until_the_generation_move
     assert!(matches!(
         harness.reopen.try_recv(),
         Ok(bifrost_sync::ReopenRequest::Recovery {
-            generation: Some(0),
+            generation: Some(generation),
             ..
-        })
+        }) if generation == bifrost_sync::Incarnation::initial_generation()
     ));
     harness.reattach();
     harness.settle().await;
@@ -452,9 +461,9 @@ async fn a_reattach_during_the_failing_drive_releases_the_hold_at_once() {
     assert!(matches!(
         harness.reopen.try_recv(),
         Ok(bifrost_sync::ReopenRequest::Recovery {
-            generation: Some(0),
+            generation: Some(generation),
             ..
-        })
+        }) if generation == bifrost_sync::Incarnation::initial_generation()
     ));
     assert_eq!(
         harness.drives(),

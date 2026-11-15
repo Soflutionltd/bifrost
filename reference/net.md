@@ -57,8 +57,10 @@ transport and registry; a `Net::new` instance otherwise has its own resources.
 CalDAV and CardDAV clients ride `AccountNet` too, through
 `bifrost-dav-core`'s `DavDispatch`: `AccountNet::request(Method, ..)` is what
 carries their WebDAV extension verbs, and they attach with no token source
-because their credential-origin gate mints the `Authorization` header itself and
-every request opts out with `without_bearer_auth`.
+because their per-request `HopPolicy` selects credentials after origin admission.
+Every DAV request opts out of the account's bearer source with
+`without_bearer_auth`; the selected per-hop source still uses net's shared lookup
+and 401-refresh engine.
 
 Every `attach_account` receives a monotone registration token carried
 by its `AccountNet`. `AccountNet::detach()` removes that exact
@@ -648,8 +650,9 @@ an explicit age. `AccountNet` stores this admitted type; `AccountSpec` remains
 the raw provider input boundary. `as_source()` lets other protocol legs share
 that exact cache through existing trait-object APIs. DAV stores the same typed
 handle behind its credential-origin gate, independently of any supplied net
-handle's bearer source. Its request deadlines still bound token lookup and
-refresh, and every HTTP request disables net's automatic bearer injection.
+handle's bearer source. DAV's hop policy selects this source for net's shared
+lookup and refresh engine under the request deadline; account bearer injection
+remains disabled.
 
 `TokenSource::is_coordinating()` defaults to false and is true for
 `OAuthRefresher` and `StaticTokenSource`. `Net::attach_account` retains these
@@ -1208,7 +1211,12 @@ and any caller-set `Authorization` header sitting in the request's
 `HeaderMap` (JMAP Basic-auth, custom HMAC schemes, etc.). The strip
 runs in the redirect loop after `classify_redirect` flags
 `keep_auth: false`, so a credential never travels to a host the
-original request did not target. `max_hops` (default 10) caps the
+original request did not target. The same strip removes every other
+caller-supplied credential header the walk does not re-mint - `Cookie` and
+`Proxy-Authorization` - so a cookie or proxy credential set for one origin
+never follows a redirect to another. It applies with or without a
+`HopPolicy`: a policy re-admits `Authorization` per origin, but nothing else.
+`max_hops` (default 10) caps the
 chain; the pipeline uses a widened counter so even `max_hops = 255`
 terminates on hop 256 with `Error::RedirectLoop`. Each redirect hop
 resets the retry counter to 0 - hops are fresh logical requests, not
@@ -1229,31 +1237,54 @@ than only cross-origin ones, so a populated allowlist that omitted the
 origin's own host stopped a plain same-host redirect there while the
 pipeline followed it), and a reqwest `Policy` could not rewrite methods
 or strip headers anyway. It was deleted on 2026-09-04 on the repository
-owner's ruling; `admits_hop` is now the only implementation. The DAV crates need their redirect gate to
-match their stricter credential gate, which compares scheme, host, and
-effective port - and this crate strips `Authorization` on any origin change
-with no way to restore it, so a followed cross-origin hop would arrive
-unauthenticated. They therefore attach with `FollowRedirects::Disabled` and walk
-every hop themselves in `DavDispatch::send_raw_request`, re-minting credentials
-for each target origin against the set authenticated discovery admitted. The hop
-walk has one 30-second total deadline covering token reads, forced refresh,
-retries and every hop; each `RequestBuilder::timeout` receives only the time
-remaining. DAV wrappers defer credential minting to this timed walk rather than
-reading tokens before it; standalone `auth_headers` calls are bounded too.
-DAV replaces bearer injection's 401 recovery locally by calling
-`refresh_if_unchanged` once with the token actually rejected and replaying its
-owned byte body with the returned token. Its status ladder accepts response
-headers and uses `request::parse_retry_after_hint`, preserving absolute dates
-including elapsed dates; exhausted rate/retry failures retain this
-crate's history-aware error conversion (501 remains data for MOVE fallback).
-The cap they apply is the exported `DEFAULT_MAX_HOPS` constant, read by name rather
-than through `RedirectPolicy::default().max_hops`: DAV carries no per-account
-redirect config, and laundering the cap through a type `Default` hid the
-coupling, so changing that default silently changed DAV behavior.
+owner's ruling; `admits_hop` is now the only implementation.
+
+DAV uses `RequestBuilder::hop_policy(Arc<dyn HopPolicy>)` on this same walk.
+`admit(prior, next)` returns `HopCredential::{None, Header, Bearer}` or a
+refusal; the first target uses `prior == None`. Admission runs before credential
+lookup, and no caller or previous-hop Authorization survives policy selection.
+A Bearer credential names a `CoordinatedTokenSource`; the shared one-shot 401
+path refreshes with the exact rejected token and sends the returned token,
+bound to that source and cleared on relocation. Admission is rechecked before
+each attempt. Protocol hooks are synchronous local policy, never network work.
+
+`MethodRewrite::Http` retains the existing HTTP behavior for all consumers that
+do not supply a hop policy. `PreserveAndRefuse303` preserves method and body on
+301/302/307/308 and returns 303 as data. DAV selects it because an enterprise
+calendar/contact user expects the same query or write after endpoint relocation;
+a GET representation cannot fulfill that request. `rewrite_headers` rebases DAV's
+MOVE Destination after the new origin is admitted, and `check_target` validates
+the complete request before dispatch. The ordinary redirect guard and trust
+allowlist still apply. DAV's stricter complete-origin gate is an additional
+requirement, never an exception to transport admission.
+
+`origin_key` supplies canonical scheme/host/effective-port identity to both net's
+`same_origin` comparison and DAV's credential gate. Explicit default ports and
+host case compare equal; a different port or scheme cannot inherit credentials.
+The shared `DEFAULT_MAX_HOPS` is ten: sufficient for enterprise discovery and
+proxy relocations while bounding loops. DAV uses one 30-second RequestDeadline
+in this walk, including lookup, refresh, admission, retries, redirects and body
+reads. An injected AccountNet cannot restart that clock or disable DAV policy.
+Standalone DAV `auth_headers` calls remain bounded too.
+
+`Error::HopPolicy` retains a dialect's typed local refusal in the shared attempt
+envelope. Account-error conversion preserves earlier acknowledged evidence for
+these refusals, and a possible non-replayable commit still requires reconciliation.
+This holds for a refusal raised at the top of the next hop's loop iteration,
+before its attempt begins: every exit of `send_streaming_inner`, that one
+included, passes through the single `AttemptEvidence::finish` boundary, and the
+answered 3xx was already recorded in the ledger and attempt list (pinned by
+`a_loop_top_hop_refusal_keeps_the_answered_hops_commit_evidence`). `admit` may
+run more than once per hop, so a policy must keep it a pure decision.
+There is no DAV redirect walker, separate refresh-once loop or RedirectHistory.
+DAV's status ladder uses `request::parse_retry_after_hint`, preserving absolute
+HTTP dates; exhausted rate/retry failures retain the history-aware conversion,
+while 501 remains data for MOVE fallback.
 
 ### A 401 on a hop the transport disarmed itself
 
-`keep_auth` ANDs monotonically across the chain (`auth_for_next_hop =
+Without a per-hop credential policy, `keep_auth` ANDs monotonically across the
+chain (`auth_for_next_hop =
 step.keep_auth && auth_for_next_hop`): once a hop leaves the origin the
 credential is gone and is never restored, which is the correct security
 posture. It also means a chain that comes back - `A -> B -> A`, the CDN
@@ -1593,8 +1624,9 @@ directly, without an integer decoding fallback.
 `AttemptOutcome::Transport(TransmissionState)` observations. Its sticky verdict
 is `CommitEvidence::{Unsent, Acknowledged, MayHaveCommitted}`. The send loop feeds
 it with each attempt's resolved replay policy, including across method rewrites.
-DAV's existing redirect walker and `RedirectHistory` feed the same ledger; their
-credential and redirect policies stay local to DAV.
+DAV runs on this same send loop and ledger. Its credential admission, method,
+header and target policies are hooks; no second walker or ledger restates the
+exchange. Earlier DAV redirect evidence survives in the shared AttemptHistory.
 
 `is_proven_refusal` is the shared predicate: 401, 429, 405 and 501 prove refusal.
 503 does not: a gateway can return it after an upstream write committed.

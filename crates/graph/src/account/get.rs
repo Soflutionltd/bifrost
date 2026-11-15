@@ -533,10 +533,12 @@ fn reconstruct_headers(h: &std::collections::HashMap<String, String>) -> HeaderM
 
 fn hydrated_from_value(id: ObjectId, value: &Value, projection: Projection) -> HydratedObject {
     let kind = match projection {
-        Projection::FlagsOnly => HydratedObjectKind::FlagsOnly(
-            decode_complete_flags(value)
-                .map_or_else(|_| flags_from_value(value), super::wire_item::CompleteFlags::tokens),
-        ),
+        Projection::FlagsOnly => {
+            HydratedObjectKind::FlagsOnly(decode_complete_flags(value).map_or_else(
+                |_| flags_from_value(value),
+                super::wire_item::CompleteFlags::tokens,
+            ))
+        }
         // Graph's JSON message resource is not assembled RFC822, so the
         // body-bearing projections cannot honestly produce `RawMime`
         // here (the prior code minted a JSON blob, violating the

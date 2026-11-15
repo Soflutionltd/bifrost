@@ -83,7 +83,7 @@ impl ImapConnection {
         // RFC 2177 / RFC 9051 Section 6.3.13: IDLE is valid in Authenticated
         // and Selected states. Refused here as caller sequencing
         // (`InvalidState`); the driver re-checks at the head of its queue.
-        self.require_state(crate::types::CommandKind::Idle)?;
+        let admitted = self.admit_command(&crate::types::Command::Idle)?;
 
         use super::reply::{Expired, Withdrawal, may_send, on_expiry, reply_channel};
         // Strict admission: the event deadline exists before anything is
@@ -109,7 +109,7 @@ impl ImapConnection {
         }
         let (done_tx, done_rx) = oneshot::channel();
         let (reply, mut pending) = reply_channel(done_rx, &self.abandoned);
-        permit.send(DriverCommand::Idle { reply });
+        permit.send(DriverCommand::Idle { reply, admitted });
         // Submitted, but not yet the driver's: only its commit, just before
         // the IDLE line's first byte, transfers the exchange. Until then every
         // departure

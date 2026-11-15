@@ -18,6 +18,7 @@ pub(super) enum Guard<'a> {
     Replacement,
     Exact(&'a str),
 }
+
 impl Guard<'_> {
     pub(super) fn is_guarded(self) -> bool {
         !matches!(self, Self::Unconditional)
@@ -72,7 +73,6 @@ pub(super) fn classify_set_response(
     raw: crate::Result<()>,
     id: ObjectId,
     operation: AccountOperation,
-    guarded: bool,
 ) -> ItemOutcome<MutationSuccess> {
     match raw {
         Ok(()) => ItemOutcome::Succeeded(BatchSuccess::new(
@@ -86,17 +86,6 @@ pub(super) fn classify_set_response(
             });
             super::error::classify_set_item(set_error, ctx, BatchItemId(id.0.clone()), item_scope)
         }
-        Err(crate::Error::SetIdUnanswered(_)) => ItemOutcome::Failed(BatchFailure::new(
-            BatchItemId(id.0.clone()),
-            super::error::set_id_unanswered(
-                "Email/set",
-                &id.0,
-                super::error::JmapErrorContext::new(operation).with_scope(ErrorScope::Message {
-                    id: (id.0.clone()).into(),
-                }),
-                guarded,
-            ),
-        )),
         Err(err) => ItemOutcome::Failed(BatchFailure::new(
             BatchItemId(id.0.clone()),
             super::error::into_account_error(

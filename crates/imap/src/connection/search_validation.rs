@@ -2,14 +2,11 @@
 use super::*;
 
 impl ImapConnection {
-    // Capability checks belong to the live encoder, including for commands
-    // queued behind CAPABILITY or ENABLE. Keep this test adapter on that same
-    // path rather than a second implementation of the gates.
+    // Tests exercise the same admission policy as live and queued commands.
     #[cfg(test)]
     fn validate_search_criteria_capabilities(&self, criteria: &str) -> Result<(), Error> {
         let snap = self.state_rx.borrow();
-        crate::codec::encode::encode_command(
-            "test",
+        super::admit_for_encoding(
             &Command::Search {
                 criteria: criteria.into(),
             },
@@ -20,7 +17,6 @@ impl ImapConnection {
                 enabled: snap.enabled.clone(),
             },
         )
-        .map(|_| ())
     }
 
     /// Returns `true` when `criteria` contains the given search-key atom

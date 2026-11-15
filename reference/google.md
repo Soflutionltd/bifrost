@@ -1697,9 +1697,8 @@ clock. There is no separate `retry_not_before` side-channel.
   - `PageTokenRepeated` -> `Protocol(ContractViolation)`, acknowledged;
     `PageBudgetExceeded` -> `Internal(LimitExceeded)` (see Paging
     inventory above).
-  - `Internal` (a state this crate believes impossible, such as a change
-    stream with no cursor, or one past its profile check with no start
-    history id) -> `Internal(InvariantViolated)`;
+  - `Internal` (a state this crate believes impossible) ->
+    `Internal(InvariantViolated)`;
     `LimitExceededAfterResponse` (this crate's own limit stopping a
     multi-request exchange after every request sent was answered) ->
     `Internal(LimitExceeded)` with `AttemptCause(Acknowledged)`. Both
@@ -1988,3 +1987,22 @@ obligation keys retain `gmail:message:` plus the whole opaque message id; this
 single-coordinate suffix has no delimiter ambiguity and preserving its bytes
 preserves repair retry identity. Message-list search consumes the typed wire
 response rather than a positional three-tuple.
+
+## Stream phases and watch registry boundary
+
+Changes, hydration and mutation use separate phase enums rather than boolean
+completion pairs. The change probe owns its cursor, and walking owns a validated
+start history id, so a profile-checked walk without that id is unconstructable.
+Hydration owns a deferred termination in its phase. Mutation pending output owns
+its continuation, preserving warning-before-batch ordering and delivery of
+uncertain outcomes followed by termination even after shutdown. Input exhaustion
+still emits exactly one Done; termination never adds Done. The obsolete test
+constructing a walking stream without its start id was removed with that state.
+
+Watch coordination remains process-wide. Net currently exposes concrete hold
+and concurrency registries, neither of which can store the mailbox coordinator.
+Moving it requires a Net-owned shared-state registry accessible through
+AccountNet, with typed provider payloads and keys, shared across accounts on the
+same Net and isolated across independent Nets. A factory-local registry would
+lose coordination between factories sharing a Net; retaining account transports
+in a global registry would pin them. No such substitute is installed here.

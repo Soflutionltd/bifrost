@@ -578,7 +578,7 @@ mod tests {
             Some(&h.control),
             Some(&h.lane.coverage),
             None,
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             Some(&h.lane.gate),
             old,
             &h.delivery,
@@ -593,7 +593,7 @@ mod tests {
         fn emit_marker<'a>(
             &'a self,
             scope: &'a CursorScope,
-            undelivered_before: u64,
+            undelivered_before: crate::cursor::UndeliveredMark,
         ) -> impl std::future::Future<Output = MarkerOutcome> + 'a {
             let fence = self.lane.coverage.scope_fence(scope);
             self.emit_marker_for_walk(scope, undelivered_before, fence)
@@ -605,13 +605,13 @@ mod tests {
         fn emit_marker_for_walk<'a>(
             &'a self,
             scope: &'a CursorScope,
-            undelivered_before: u64,
-            fence_at_walk_start: u64,
+            undelivered_before: crate::cursor::UndeliveredMark,
+            fence_at_walk_start: crate::cursor::ScopeFence,
         ) -> impl std::future::Future<Output = MarkerOutcome> + 'a {
             crate::engine::backfill::emit_backfill_complete(
                 Some(&self.tx),
                 scope,
-                0,
+                crate::backfill::ScopeWalkDriver::fixed(Vec::new()).total_seen(),
                 &self.control,
                 &self.lane.shutdown,
                 &self.lane.gate,
@@ -639,10 +639,11 @@ mod tests {
                 checkpoint.clone(),
                 CoverageClaim {
                     reports: Vec::new(),
-                    generation: 0,
+                    generation: crate::cursor::WalkGeneration::for_test(0),
                 },
             );
-            self.coverage.mark_delivered(&id, seq);
+            self.coverage
+                .mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(seq));
             id
         }
     }
@@ -845,7 +846,7 @@ mod tests {
             page(&scope_a(), "page:10:20", 1),
             CoverageClaim {
                 reports: Vec::new(),
-                generation: 0,
+                generation: crate::cursor::WalkGeneration::for_test(0),
             },
         );
         assert_eq!(h.coverage.backfill_in_flight(), 2);
@@ -853,7 +854,7 @@ mod tests {
         assert_eq!(h.coverage.abandon_checkpoints(), 2, "both are drained");
         assert_eq!(
             h.coverage.undelivered_watermark(&scope_a()),
-            before + 1,
+            before.after_loss(1),
             "and exactly the one that had been sent is recorded as reaching nobody; \
              charging the unsent page too judges the walk holed over a page the \
              consumer is about to receive and acknowledge"
@@ -913,7 +914,7 @@ mod tests {
             page(&scope_a(), "page:0:10", 2),
             CoverageClaim {
                 reports: Vec::new(),
-                generation: 0,
+                generation: crate::cursor::WalkGeneration::for_test(0),
             },
         );
         assert_eq!(
@@ -925,7 +926,7 @@ mod tests {
         assert_eq!(h.coverage.abandon_checkpoints(), 2);
         assert_eq!(
             h.coverage.undelivered_watermark(&scope_a()),
-            before + 1,
+            before.after_loss(1),
             "the SUBSUMED page was delivered and is lost with the abandonment; the \
              unsent survivor is not. Reading the survivor's stamp for both records \
              nothing and lets the marker stand over a page the consumer lost"
@@ -972,7 +973,11 @@ mod tests {
 
         // B is receiver index 1; A (index 0) is gone. The lowest live sequence
         // is 1, which is not below the sequence those pages were sent at.
-        assert_eq!(h.coverage.release_undelivered(Some(1)), 2);
+        assert_eq!(
+            h.coverage
+                .release_undelivered(Some(crate::multiplexer::ReceiverSequence::for_test(1))),
+            2
+        );
         assert_eq!(h.coverage.backfill_in_flight(), 0);
     }
 
@@ -984,7 +989,11 @@ mod tests {
         let h = harness(2);
         // Sent when two receivers had been handed out; receiver 0 is still live.
         h.publish(&page(&scope_a(), "page:0:10", 1), 2);
-        assert_eq!(h.coverage.release_undelivered(Some(0)), 0);
+        assert_eq!(
+            h.coverage
+                .release_undelivered(Some(crate::multiplexer::ReceiverSequence::for_test(0))),
+            0
+        );
         assert_eq!(h.coverage.backfill_in_flight(), 1);
     }
 
@@ -999,7 +1008,7 @@ mod tests {
             page(&scope_a(), "page:0:10", 1),
             CoverageClaim {
                 reports: Vec::new(),
-                generation: 0,
+                generation: crate::cursor::WalkGeneration::for_test(0),
             },
         );
         assert_eq!(
@@ -1011,8 +1020,13 @@ mod tests {
 
         // The replacement subscribes, THEN the send happens and records the
         // sequence that includes it.
-        h.coverage.mark_delivered(&id, 2);
-        assert_eq!(h.coverage.release_undelivered(Some(1)), 0);
+        h.coverage
+            .mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(2));
+        assert_eq!(
+            h.coverage
+                .release_undelivered(Some(crate::multiplexer::ReceiverSequence::for_test(1))),
+            0
+        );
         assert_eq!(h.coverage.backfill_in_flight(), 1);
     }
 
@@ -1144,10 +1158,10 @@ mod tests {
             page(&scope_a(), "page:0:10", 1),
             CoverageClaim {
                 reports: Vec::new(),
-                generation: 0,
+                generation: crate::cursor::WalkGeneration::for_test(0),
             },
         );
-        coverage.mark_delivered(&id, 1);
+        coverage.mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(1));
         let wait = producer.wait_for_capacity_holding_admission();
         tokio::pin!(wait);
         assert!(still_parked(wait.as_mut()).await, "parked at the bound");
@@ -1236,7 +1250,7 @@ mod tests {
                 }),
                 CoverageClaim {
                     reports: Vec::new(),
-                    generation: 0,
+                    generation: crate::cursor::WalkGeneration::for_test(0),
                 },
             );
         }
@@ -1309,7 +1323,8 @@ mod tests {
         h.publish(&page(&scope_a(), "page:0:10", 1), 1);
         assert_eq!(h.coverage.release_undelivered(None), 1);
         assert!(
-            h.coverage.undelivered_watermark(&scope_a()) > 0,
+            h.coverage.undelivered_watermark(&scope_a())
+                > crate::cursor::UndeliveredMark::for_test(0),
             "the sweep must record against the scope whose page it retired"
         );
         assert_eq!(
@@ -1328,7 +1343,10 @@ mod tests {
         );
         // And scope B's own losses are still recorded, on B.
         h.coverage.note_undelivered(&scope_b(), 1);
-        assert_eq!(h.coverage.undelivered_watermark(&scope_b()), b_before + 1);
+        assert_eq!(
+            h.coverage.undelivered_watermark(&scope_b()),
+            b_before.after_loss(1)
+        );
     }
 
     /// FINDING 5. A page that parks on the bound and resumes AFTER its scope was
@@ -1483,26 +1501,39 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_charge_holders_name_the_receiver_that_has_not_read() {
         let h = harness(1);
-        h.coverage.receiver_joined(0);
-        h.coverage.receiver_joined(1);
+        h.coverage
+            .receiver_joined(crate::multiplexer::ReceiverSequence::for_test(0));
+        h.coverage
+            .receiver_joined(crate::multiplexer::ReceiverSequence::for_test(1));
         // Sent when two receivers had been handed out, so both are eligible.
         let id = h.publish(&page(&scope_a(), "page:0:10", 1), 2);
 
         assert_eq!(
             h.coverage.backfill_charge_holders(),
-            (vec![0, 1], vec![scope_a()]),
+            (
+                vec![
+                    crate::multiplexer::ReceiverSequence::for_test(0),
+                    crate::multiplexer::ReceiverSequence::for_test(1)
+                ],
+                vec![scope_a()]
+            ),
             "both eligible receivers are holding the page, and the warning must be \
              able to say which"
         );
 
-        h.coverage.mark_received(&id, 1);
+        h.coverage
+            .mark_received(&id, crate::multiplexer::ReceiverSequence::for_test(1));
         assert_eq!(
             h.coverage.backfill_charge_holders(),
-            (vec![0], vec![scope_a()]),
+            (
+                vec![crate::multiplexer::ReceiverSequence::for_test(0)],
+                vec![scope_a()]
+            ),
             "the fast reader drops out of the list; the slow one is the stall"
         );
 
-        h.coverage.mark_received(&id, 0);
+        h.coverage
+            .mark_received(&id, crate::multiplexer::ReceiverSequence::for_test(0));
         assert_eq!(
             h.coverage.backfill_charge_holders(),
             (Vec::new(), Vec::new()),

@@ -503,7 +503,7 @@ pub(super) async fn run_pipeline(
     // A command that may not ride a batch at all is a crate bug - the
     // `Pipeline` builder has no method for one - so it is `Internal`. A
     // command the live session does not permit is the same head-of-queue
-    // refusal a single command gets (`live_state_refusal`); the handle
+    // refusal a single command gets (`admit_live`); the handle
     // checked every command at execution, so reaching here means the session
     // moved while the batch was queued.
     if let Some(cmd) = commands.iter().find(|cmd| !cmd.kind().pipelinable()) {
@@ -513,7 +513,7 @@ pub(super) async fn run_pipeline(
         )));
     }
     for cmd in &commands {
-        if let Some(refusal) = super::live_state_refusal(state, cmd.kind()) {
+        if let Err(refusal) = super::admit_live(state, cmd) {
             return PipelineEnd::Refused(refusal);
         }
     }
@@ -735,7 +735,7 @@ async fn run_pipeline_batch(
     //    against `baseline`, the counter at the start of the whole pipeline;
     //    how many commands it may have carried is judged from where this
     //    sub-batch, or the command being written, began.
-    if wires.iter().all(|wire| wire.segments().len() == 1) {
+    if let Some(coalesced) = WireCommand::coalesce_unsegmented(&wires) {
         // No synchronizing literal anywhere in the batch (RFC 7888 literals
         // are all `+`, or there are none): the whole batch is one write,
         // flushed once. Which commands a partial write carried is unknown,
@@ -745,11 +745,18 @@ async fn run_pipeline_batch(
             state.framing = super::read_loop::Framing::Desynchronized;
         }
         let start = wire_reader.written();
-        let chunks: Vec<&bytes::Bytes> = wires
-            .iter()
-            .flat_map(|wire| wire.segments().iter().flatten())
-            .collect();
-        if let Err(e) = wire_reader.write_chunks(&chunks).await {
+        if let Err(e) = send_wire_command(
+            wire_reader,
+            state,
+            event_sink,
+            &coalesced,
+            &tags[0],
+            baseline,
+            None,
+            None,
+        )
+        .await
+        {
             let sent = match write_failure_evidence(wire_reader, start) {
                 TransmissionState::Unsent => 0,
                 _ => count,

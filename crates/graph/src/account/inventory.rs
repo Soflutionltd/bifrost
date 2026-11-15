@@ -6,15 +6,13 @@ use bifrost_types::{
 };
 use serde_json::Value;
 
-use crate::client::Resource;
 use crate::etag::GraphETag;
 use crate::origin::AdmittedUrl;
-use crate::types::ODataCollection;
 
 use super::GraphAccount;
+use super::cursor::{GraphCursorPayload, GraphPageMarker};
 #[cfg(test)]
-use super::cursor::kind_for_scope;
-use super::cursor::{GraphCursorPayload, GraphPageMarker, encode_cursor};
+use super::cursor::{encode_cursor, kind_for_scope};
 use super::graph_error::{GraphErrorContext, cursor_error_to_account_error};
 #[cfg(test)]
 use bifrost_types::{FolderId, MembershipScope, ObjectType};
@@ -104,13 +102,6 @@ fn inventory_stream_from(
                 return;
             }
         };
-        // Results this walk could not account for. Every checkpoint from the
-        // first one onward declares the gap.
-        let mut obligations: Vec<bifrost_types::InventoryObligation> = Vec::new();
-
-        // One accumulator for the whole delta walk; each emitted page
-        // takes and clears it, so a page reports the bytes of the
-        // request that produced it rather than a running total.
         let client = match parsed.client(&account) {
             Ok(client) => client.clone(),
             Err(error) => {
@@ -152,222 +143,35 @@ fn inventory_stream_from(
                 Err(error) => Err(error),
             },
         };
-        let (mut current_url, calendar_window_end) = match start {
+        let (current_url, calendar_window_end) = match start {
             Ok(start) => start,
             Err(error) => {
                 yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
                 return;
             }
         };
-        let (client, tally) = client.metered();
-        // A foreign (shared) scope tags every inventory item with its
-        // owning mailbox so the consumer maps the item to its shared
-        // owner and the foreign mailbox's native folder ids cannot be
-        // conflated with the primary's in the membership index (the
-        // A5c-established owner-tag pattern). `None` for a primary scope.
-        let owner = parsed.owner().map(|owner| bifrost_types::MailboxId(owner.to_string()));
-        let kind = match parsed.kind() {
-            Ok(kind) => kind,
-            Err(error) => {
-                let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
-                    .with_scope(ErrorScope::Cursor(scope.clone()));
-                yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                return;
-            }
-        };
-        let mut walk = crate::paging::PageWalk::new("inventory delta");
-
-        loop {
-            if let Err(error) = walk.enter(&current_url) {
-                yield bifrost_types::InventoryEvent::Terminated(super::graph_error::graph_shared_scope_error(
-                    error, &scope, owner.as_ref(), sync_ctx.clone(),
-                ));
-                return;
-            }
-            let page: ODataCollection<Value> = match fetch_page(
-                &client,
-                &current_url,
-                parsed.delta_prefer(),
-            )
-            .await
-            {
-                Ok(page) => page,
-                Err(error) => {
-                    let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
-                        .with_scope(ErrorScope::Cursor(scope.clone()));
-                    // A permission denial on a foreign (shared) scope
-                    // quarantines just this scope; a primary-scope
-                    // denial stays terminal account-wide. `owner` is
-                    // hoisted above the loop (it is scope-invariant).
-                    yield bifrost_types::InventoryEvent::Terminated(super::graph_error::graph_shared_scope_error(
-                        error,
-                        &scope,
-                        owner.as_ref(),
-                        ctx,
+        use futures::StreamExt;
+        let mut walk = super::delta::walk(
+            account, scope, parsed, client, current_url,
+            super::delta::DeltaLane::Inventory { calendar_window_end },
+        );
+        while let Some(event) = walk.next().await {
+            match event {
+                super::delta::DeltaEvent::Page(page) => yield inventory_batch(
+                    page.entries, page.removed, page.boundary, page.cursor,
+                    page.coverage, page.bytes_in,
+                ),
+                super::delta::DeltaEvent::Terminated(error) => {
+                    yield bifrost_types::InventoryEvent::Terminated(error);
+                }
+                super::delta::DeltaEvent::Done(checkpoint, coverage) => {
+                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(
+                        Some(checkpoint), coverage, bifrost_types::PartitionEnd::Exhausted,
                     ));
-                    return;
                 }
-            };
-            // Both links are admitted at receipt, before either is followed
-            // or persisted into a checkpoint. A refused link ends the walk
-            // before this page's entries are emitted, so no checkpoint moves.
-            let links = client
-                .admit_next(page.next_link.as_ref())
-                .and_then(|next| Ok((next, client.admit_next(page.delta_link.as_ref())?)));
-            let (next_link, delta_link) = match links {
-                Ok(links) => links,
-                Err(error) => {
-                    yield bifrost_types::InventoryEvent::Terminated(super::graph_error::graph_shared_scope_error(
-                        error, &scope, owner.as_ref(), sync_ctx.clone(),
-                    ));
-                    return;
-                }
-            };
-            let mut entries = Vec::new();
-            let mut etags = Vec::new();
-            let mut removed_etag_ids = Vec::new();
-            let mut removed = Vec::new();
-            for value in page.value {
-                if is_removed(&value)
-                    && let Some(id) = super::wire_item::GraphItem::decode(&value).id {
-                    let id = parsed.mint_object_id(id);
-                    if parsed.etag_cached() {
-                        removed_etag_ids.push(id.0.clone());
-                    }
-                    removed.push(id);
-                    continue;
-                }
-                // An unidentifiable tombstone needs the same checkpoint
-                // barrier as an unidentifiable live value below.
-                let Some(mut entry) = inventory_entry_from_parsed(&parsed, &value) else {
-                    // A value with no usable `id`. It used to be
-                    // dropped silently while the delta link advanced past it,
-                    // which violates the checkpoint contract: the walk cannot
-                    // name, retry, or later reconcile the thing it skipped.
-                    //
-                    // It becomes a REGION obligation, not an object one, and
-                    // that distinction is the honest part. An absent id may
-                    // mean one malformed value, a schema mismatch affecting
-                    // many, a truncated page, or a response that cannot be
-                    // correlated with pagination at all - calling it a
-                    // single-object loss would claim knowledge the walk does
-                    // not have.
-                    //
-                    // It is a CHECKPOINT BARRIER, not a durable replay. The
-                    // only token available at this granularity is the current
-                    // page URL, which is a continuation of THIS delta session:
-                    // once the walk takes its deltaLink and the cursor
-                    // advances, that skip token is dead. Handing it over as a
-                    // repair capability would record debt nothing can ever
-                    // discharge - silent permanent loss wearing a declared-debt
-                    // costume. Graph publishes no durable snapshot handle for a
-                    // page of a delta enumeration, so the honest answer is that
-                    // the cursor must not cross this page at all.
-                    obligations.push(bifrost_types::InventoryObligation::Region {
-                        // Identity is the page, not the failure class. The
-                        // label alone names every id-less value in the scope
-                        // forever, and an operator waiver keyed on that would
-                        // silently accept all future ones.
-                        key: bifrost_types::ObligationKey(
-                            format!("graph:unidentifiable-value:{}", current_url.as_str()).into_bytes(),
-                        ),
-                        failure_label: format!("{scope:?}:unidentifiable-value"),
-                        error: super::graph_error::protocol_violation(
-                            bifrost_types::ProtocolErrorKind::ContractViolation,
-                            AccountOperation::SyncInventory,
-                            Some(ErrorScope::Cursor(scope.clone())),
-                            "Graph delta page carried a value with no usable id",
-                        ),
-                        recovery: bifrost_types::RegionRecovery::CheckpointBarrier {
-                            transient_replay: Some(bifrost_types::TransientReplayHint {
-                                token: current_url.as_str().as_bytes().to_vec(),
-                                note: "delta-session page link; dies with the enumeration".into(),
-                            }),
-                        },
-                    });
-                    continue;
-                };
-                if parsed.etag_cached()
-                    && let ServerVersion::ETag(etag) = &entry.fingerprint.server_version {
-                    etags.push((entry.id.0.clone(), GraphETag::from_odata_annotation(etag)));
-                }
-                if let Some(owner) = &owner {
-                    entry
-                        .memberships
-                        .push(bifrost_types::MembershipScope::Mailbox(owner.clone()));
-                }
-                entries.push(entry);
-            }
-
-            if !etags.is_empty() || !removed_etag_ids.is_empty() {
-                let mut cache = account.etag_index.write().await;
-                for (id, etag) in etags {
-                    cache.insert(id, etag);
-                }
-                for id in removed_etag_ids {
-                    cache.remove(&id);
-                }
-            }
-
-            if let Some(next_link) = next_link {
-                let checkpoint_cursor = match encode_cursor(
-                    scope.clone(),
-                    GraphCursorPayload::inventory_page(
-                        kind.clone(),
-                        page_marker(&next_link, entries.last().map(|entry| entry.id.0.clone())),
-                        calendar_window_end,
-                    ),
-                ) {
-                    Ok(cursor) => cursor,
-                    Err(error) => {
-                        let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
-                            .with_scope(ErrorScope::Cursor(scope.clone()));
-                        yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                        return;
-                    }
-                };
-                yield inventory_batch(entries, removed, PageBoundary::Page, Some(checkpoint_cursor), coverage_of(&scope, &obligations), tally.take());
-                current_url = next_link;
-            } else if let Some(delta_link) = delta_link {
-                let cursor = match encode_cursor(
-                    scope.clone(),
-                    GraphCursorPayload::new(kind.clone(), &delta_link, None)
-                        .with_calendar_window_end_option(calendar_window_end),
-                ) {
-                    Ok(cursor) => cursor,
-                    Err(error) => {
-                        let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
-                            .with_scope(ErrorScope::Cursor(scope.clone()));
-                        yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                        return;
-                    }
-                };
-                let checkpoint = Checkpoint::Change(cursor.clone());
-                yield inventory_batch(entries, removed, PageBoundary::Final, Some(cursor), coverage_of(&scope, &obligations), tally.take());
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(Some(checkpoint), coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
-                return;
-            } else {
-                // A delta page must advance with either a next link or a
-                // delta link. Completing without a checkpoint would make
-                // the engine restart inventory from page one forever.
-                yield bifrost_types::InventoryEvent::Terminated(super::graph_error::protocol_violation(
-                    bifrost_types::ProtocolErrorKind::ContractViolation,
-                    AccountOperation::SyncInventory,
-                    Some(ErrorScope::Cursor(scope.clone())),
-                    "Graph delta page had neither @odata.nextLink nor @odata.deltaLink",
-                ));
-                return;
             }
         }
     })
-}
-
-pub(crate) async fn fetch_delta_page(
-    client: &crate::client::GraphClient,
-    url: &AdmittedUrl,
-    scope: &super::scope::GraphScope,
-) -> Result<ODataCollection<Value>, crate::error::GraphError> {
-    fetch_page(client, url, scope.delta_prefer()).await
 }
 
 pub(crate) fn inventory_entry_from_value(
@@ -378,7 +182,7 @@ pub(crate) fn inventory_entry_from_value(
     inventory_entry_from_parsed(&parsed, value)
 }
 
-fn inventory_entry_from_parsed(
+pub(super) fn inventory_entry_from_parsed(
     scope: &super::scope::GraphScope,
     value: &Value,
 ) -> Option<InventoryEntry> {
@@ -449,19 +253,6 @@ pub(crate) fn graph_etag(value: &Value) -> Option<GraphETag> {
 /// `If-Match` when the provider omitted its `@odata.etag` annotation.
 pub(crate) fn graph_change_key_etag(change_key: &str) -> GraphETag {
     GraphETag::from_change_key(change_key)
-}
-
-pub(crate) fn is_removed(value: &Value) -> bool {
-    matches!(
-        super::wire_item::GraphItem::decode(value).state,
-        super::wire_item::DeltaState::Removed
-    )
-}
-
-pub(crate) fn removed_id(value: &Value) -> Option<ObjectId> {
-    super::wire_item::GraphItem::decode(value)
-        .id
-        .map(|id| ObjectId(id.to_string()))
 }
 
 /// A `calendarView` window bound, `days` from `now`, in the second-precision
@@ -574,17 +365,6 @@ pub(crate) fn batch<T>(
 #[cfg(test)]
 pub(crate) fn scope_matches_payload(scope: &CursorScope, payload: &GraphCursorPayload) -> bool {
     super::scope::GraphScope::parse(scope).is_ok_and(|parsed| parsed.matches_payload(payload))
-}
-
-async fn fetch_page(
-    client: &crate::client::GraphClient,
-    url: &AdmittedUrl,
-    prefer: Option<&str>,
-) -> Result<ODataCollection<Value>, crate::error::GraphError> {
-    match prefer {
-        Some(prefer) => client.get_prefer(Resource::Outlook, url, prefer).await,
-        None => client.get(Resource::Outlook, url).await,
-    }
 }
 
 fn internet_header(value: &Value, name: &str) -> Option<String> {
@@ -769,6 +549,11 @@ mod tests {
             stream.next().await,
             Some(bifrost_types::InventoryEvent::Batch(_))
         ));
+        let Some(bifrost_types::InventoryEvent::Batch(batch)) = stream.next().await else {
+            panic!("the malformed final page still delivers its sibling");
+        };
+        assert_eq!(batch.items[0].id.0, "two");
+        assert!(batch.checkpoint.accepted(false).is_none());
         let bifrost_types::InventoryEvent::Terminated(error) =
             stream.next().await.expect("neither-link failure")
         else {
@@ -1620,10 +1405,15 @@ mod tests {
     #[test]
     fn removed_tombstones_are_detected_and_keep_their_id() {
         let removed = json!({ "id": "m1", "@removed": { "reason": "deleted" } });
-        assert!(is_removed(&removed));
-        assert_eq!(removed_id(&removed), Some(ObjectId("m1".to_string())));
-        assert!(!is_removed(&json!({ "id": "m1" })));
-        assert_eq!(removed_id(&json!({ "@removed": {} })), None);
+        use super::super::wire_item::{DeltaState, GraphItem};
+        let item = GraphItem::decode(&removed);
+        assert!(matches!(item.state, DeltaState::Removed));
+        assert_eq!(item.id, Some("m1"));
+        assert!(matches!(
+            GraphItem::decode(&json!({ "id": "m1" })).state,
+            DeltaState::Live
+        ));
+        assert_eq!(GraphItem::decode(&json!({ "@removed": {} })).id, None);
     }
 
     #[test]
@@ -1720,18 +1510,18 @@ mod tests {
 
         let events: Vec<_> = inventory_stream(account, scope).collect().await;
 
-        let completion = events
+        let batch = events
             .iter()
             .find_map(|event| match event {
-                bifrost_types::InventoryEvent::Done(completion) => Some(completion),
+                bifrost_types::InventoryEvent::Batch(batch) => Some(batch),
                 _ => None,
             })
-            .expect("the walk must finish");
+            .expect("the walk must deliver its barrier page");
         assert!(
-            !completion.coverage.is_complete(),
+            !batch.coverage.is_complete(),
             "an id-less value must not be reported as complete coverage"
         );
-        let obligations = completion.coverage.obligations();
+        let obligations = batch.coverage.obligations();
         let region = obligations
             .iter()
             .find_map(|obligation| match obligation {
@@ -1748,7 +1538,7 @@ mod tests {
             "a delta-session page link is not durable replay, so the cursor must not cross it"
         );
         assert!(
-            completion.coverage.has_barrier(),
+            batch.coverage.has_barrier(),
             "the report must surface the barrier so the engine can refuse the checkpoint"
         );
         // Identity is the page, not the failure class: a waiver keyed on
@@ -1762,7 +1552,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_idless_inventory_value_reports_a_scoped_contract_violation() {
-        for value in [json!({"changeKey": "ck"}), json!({"@removed": {}})] {
+        for value in [
+            json!({"changeKey": "ck"}),
+            json!({"@removed": {}}),
+            json!({"id": ""}),
+            json!({"id": "", "@removed": {}}),
+        ] {
             let client = GraphClient::new("token");
             client.script_rest([ScriptedRestResponse::json(
                 reqwest::StatusCode::OK,
@@ -1777,14 +1572,14 @@ mod tests {
                 ty: ObjectType::Email,
             };
             let events: Vec<_> = inventory_stream(account, scope.clone()).collect().await;
-            let completion = events
+            let batch = events
                 .iter()
                 .find_map(|event| match event {
-                    bifrost_types::InventoryEvent::Done(completion) => Some(completion),
+                    bifrost_types::InventoryEvent::Batch(batch) => Some(batch),
                     _ => None,
                 })
-                .expect("inventory completion");
-            let error = completion
+                .expect("inventory barrier page");
+            let error = batch
                 .coverage
                 .obligations()
                 .iter()
@@ -1800,7 +1595,7 @@ mod tests {
                 ),
             );
             assert_eq!(error.scope(), Some(&ErrorScope::Cursor(scope)));
-            assert!(completion.coverage.has_barrier());
+            assert!(batch.coverage.has_barrier());
         }
     }
 

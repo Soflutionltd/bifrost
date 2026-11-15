@@ -362,9 +362,9 @@ impl BackfillRunner {
         control: Option<&SyncControl>,
         coverage: Option<&Arc<crate::cursor::PendingCoverage>>,
         writer_tx: Option<&tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>>,
-        generation: u64,
+        generation: crate::cursor::WalkGeneration,
         lane: Option<&crate::engine::lane::LaneGate>,
-        walk_fence: u64,
+        walk_fence: crate::cursor::ScopeFence,
         delivery: &crate::multiplexer::ChangeDelivery,
     ) -> Result<BackfillPartitionOutcome, Error> {
         let _activity = match control {

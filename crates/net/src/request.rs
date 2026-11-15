@@ -28,7 +28,9 @@ use crate::error::{
 };
 use crate::net::{AccountNet, into_byte_stream, wrap_delivery, wrap_metered};
 use crate::rate::{RateGeneration, RateLimitGovernor};
-use crate::redirect::{FollowRedirects, RedirectAction, RedirectPolicy, classify_redirect};
+use crate::redirect::{
+    FollowRedirects, RedirectAction, RedirectPolicy, classify_redirect, classify_redirect_with_mode,
+};
 use crate::retry::RetryPolicy;
 
 /// Whether the transport may send a request again after bytes of an earlier
@@ -424,6 +426,7 @@ struct RequestBuilderInner {
     hold_gate: Option<String>,
     error_observer: Option<ErrorObserver>,
     redirect_guard: Option<RedirectGuard>,
+    hop_policy: Option<Arc<dyn crate::HopPolicy>>,
     /// The request URL is itself a credential: every error this request
     /// returns passes through [`Error::redact_request_text`].
     credential_url: bool,
@@ -455,6 +458,14 @@ impl RequestBuilder {
         guard: impl Fn(&str, &str) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.inner.redirect_guard = Some(Arc::new(guard));
+        self
+    }
+
+    /// Supply protocol admission, credential and header policy to the shared walk.
+    /// A policy replaces automatic account bearer injection and caller Authorization.
+    #[must_use]
+    pub fn hop_policy(mut self, policy: Arc<dyn crate::HopPolicy>) -> Self {
+        self.inner.hop_policy = Some(policy);
         self
     }
 
@@ -501,6 +512,7 @@ impl RequestBuilder {
                 hold_gate: None,
                 error_observer: None,
                 redirect_guard: None,
+                hop_policy: None,
                 credential_url: false,
             },
         }
@@ -1104,6 +1116,7 @@ pub(crate) async fn send_streaming_inner(
         hold_gate,
         error_observer,
         redirect_guard,
+        hop_policy,
         // Applied by `send` and `send_streaming` around this function.
         credential_url: _,
     } = builder.inner;
@@ -1196,9 +1209,33 @@ pub(crate) async fn send_streaming_inner(
     // replaying the original operation.
     let mut ledger = crate::AttemptLedger::default();
     let mut pending_response = None;
+    let mut prior_url = None;
+    let mut refreshed_token = None;
     let outcome = async {
         'outer: loop {
             deadline.remaining()?;
+            let hop_credential = if let Some(policy) = &hop_policy {
+                let parsed = reqwest::Url::parse(&url).map_err(|error| Error::InvalidRequest {
+                    field: "url",
+                    detail: error.to_string(),
+                })?;
+                // Admission precedes token lookup. In particular, a redirect
+                // cannot inherit the previous origin's Authorization header.
+                headers.remove(AUTHORIZATION);
+                let credential = policy.admit(prior_url.as_ref(), &parsed)?;
+                Some(credential)
+            } else {
+                None
+            };
+            let hop_source = match &hop_credential {
+                Some(crate::HopCredential::Bearer(source)) => Some(Arc::clone(source.as_source())),
+                Some(_) => None,
+                None if auth_for_next_hop => account.token_source().cloned(),
+                None => None,
+            };
+            if let Some(crate::HopCredential::Header(value)) = &hop_credential {
+                headers.insert(AUTHORIZATION, value.clone());
+            }
             let attempt = attempts.begin();
             // Resolved per attempt rather than once, because a redirect hop
             // can rewrite the method: RFC 7231 section 6.4 turns a 301/302/303 on a
@@ -1247,21 +1284,36 @@ pub(crate) async fn send_streaming_inner(
             // else. We pass the variant through unchanged so callers can
             // pattern-match for retry-vs-give-up decisions; collapsing
             // every variant into `AuthLost` would discard that signal.
-            let token = if auth_for_next_hop {
-                let source = account
-                    .token_source()
-                    .ok_or_else(|| Error::InvalidRequest {
-                        field: "bearer_auth",
-                        detail: "bearer authentication requires an AccountSpec token source"
-                            .to_owned(),
-                    })?;
-                match deadline.bound(source.current()).await? {
-                    Ok(t) => Some(t),
-                    Err(e) => return Err(e),
+            let token = if let Some(source) = &hop_source {
+                // Use the value returned by refresh even if a coordinating
+                // source exposes a stale current() view. Bind it to the exact
+                // source selected for this origin, and clear it on relocation.
+                match refreshed_token.take() {
+                    Some((refreshed_source, token)) if Arc::ptr_eq(source, &refreshed_source) => {
+                        Some(token)
+                    }
+                    _ => Some(deadline.bound(source.current()).await??),
                 }
             } else {
+                if hop_policy.is_none() && auth_for_next_hop {
+                    return Err(Error::InvalidRequest {
+                        field: "bearer_auth",
+                        detail: "bearer authentication requires an AccountSpec token source".into(),
+                    });
+                }
                 None
             };
+
+            if let Some(policy) = &hop_policy {
+                let parsed = reqwest::Url::parse(&url).map_err(|error| Error::InvalidRequest {
+                    field: "url",
+                    detail: error.to_string(),
+                })?;
+                // Dialect exclusions can change while admission or token
+                // lookup waits. Check the final targets immediately before
+                // dispatch, including on retries of the same hop.
+                policy.check_target(&method, &parsed, &headers)?;
+            }
 
             if let Some(key) = hold_gate.as_ref()
                 && let Some(held) = account.shared_hold(key).current()
@@ -1353,7 +1405,9 @@ pub(crate) async fn send_streaming_inner(
                     error_observer.as_ref(),
                 )
                 .await?;
-                if auth_for_next_hop && status == StatusCode::UNAUTHORIZED {
+                if status == StatusCode::UNAUTHORIZED
+                    && let Some(source) = hop_source.as_ref()
+                {
                     if !auth_budget.take() {
                         pending_response = None;
                         return Err(Error::AuthLost {
@@ -1367,15 +1421,17 @@ pub(crate) async fn send_streaming_inner(
                         debit.refund_acknowledged();
                     }
                     let rejected_token = token.expect("authenticated request minted a token");
-                    let refresh = account
-                        .token_source()
-                        .expect("bearer-authenticated request validated its token source")
-                        .refresh_if_unchanged(rejected_token);
-                    deadline.bound(refresh).await??;
+                    let refresh = source.refresh_if_unchanged(rejected_token);
+                    let replacement = deadline.bound(refresh).await??;
+                    refreshed_token = Some((Arc::clone(source), replacement));
                     attempts.discard_current();
                     continue 'outer;
                 }
-                if status == StatusCode::UNAUTHORIZED && auth_self_stripped && !auth_for_next_hop {
+                if status == StatusCode::UNAUTHORIZED
+                    && hop_policy.is_none()
+                    && auth_self_stripped
+                    && !auth_for_next_hop
+                {
                     pending_response = None;
                     return Err(Error::UnauthenticatedRedirectHop {
                         message: format!(
@@ -1485,13 +1541,19 @@ pub(crate) async fn send_streaming_inner(
                                 field: "url",
                                 detail: format!("could not re-parse request URL for redirect: {e}"),
                             })?;
-                        match classify_redirect(
-                            policy,
-                            &method,
-                            &parsed_url,
-                            status,
-                            &resp_headers,
-                        )? {
+                        let action = if let Some(hop_policy) = &hop_policy {
+                            classify_redirect_with_mode(
+                                policy,
+                                &method,
+                                &parsed_url,
+                                status,
+                                &resp_headers,
+                                hop_policy.method_rewrite(),
+                            )?
+                        } else {
+                            classify_redirect(policy, &method, &parsed_url, status, &resp_headers)?
+                        };
+                        match action {
                             RedirectAction::PassThrough => {
                                 // Hand the body up exactly as the
                                 // redirects-disabled arm above does. A
@@ -1550,6 +1612,21 @@ pub(crate) async fn send_streaming_inner(
                                 if step.next_method != method {
                                     replay = None;
                                 }
+                                if let Some(policy) = &hop_policy {
+                                    let next =
+                                        reqwest::Url::parse(&step.next_url).map_err(|error| {
+                                            Error::InvalidRequest {
+                                                field: "url",
+                                                detail: error.to_string(),
+                                            }
+                                        })?;
+                                    // The gate must admit before a protocol header rewrite can
+                                    // name this namespace as a secondary write target.
+                                    policy.admit(Some(&parsed_url), &next)?;
+                                    policy.rewrite_headers(&parsed_url, &next, &mut headers)?;
+                                }
+                                refreshed_token = None;
+                                prior_url = Some(parsed_url);
                                 method = step.next_method;
                                 url = step.next_url;
                                 if !step.preserve_body {
@@ -1572,6 +1649,16 @@ pub(crate) async fn send_streaming_inner(
                                 // path is suppressed.
                                 if !step.keep_auth {
                                     headers.remove(AUTHORIZATION);
+                                    // Every other caller-supplied credential
+                                    // header goes with it. The walk re-mints
+                                    // only Authorization (through the token
+                                    // source or a HopPolicy admission); a
+                                    // Cookie or Proxy-Authorization set for
+                                    // the prior origin must never reach the
+                                    // next one. This holds on the HopPolicy
+                                    // path too, which re-admits Authorization
+                                    // alone.
+                                    strip_origin_bound_credentials(&mut headers);
                                     // Remember that the credential left the
                                     // request by our own hand, not the
                                     // caller's. A 401 further down the
@@ -2016,6 +2103,15 @@ fn strip_body_headers(headers: &mut HeaderMap) {
     headers.remove(reqwest::header::CONTENT_TYPE);
     headers.remove(reqwest::header::CONTENT_LENGTH);
     headers.remove(reqwest::header::CONTENT_ENCODING);
+}
+
+/// Remove caller-supplied credential headers the redirect walk does not
+/// re-mint. Called on every origin change alongside the Authorization strip:
+/// a credential is bound to the origin it was set for, so a cookie jar value
+/// or proxy credential never follows a redirect to another origin.
+fn strip_origin_bound_credentials(headers: &mut HeaderMap) {
+    headers.remove(reqwest::header::COOKIE);
+    headers.remove(reqwest::header::PROXY_AUTHORIZATION);
 }
 
 /// Exponential backoff with jitter. The base doubles per attempt,
@@ -2959,6 +3055,73 @@ mod tests {
         assert_eq!(requests[1].url.as_str(), "https://target.test/final");
         assert_eq!(requests[1].body, None);
         assert!(!requests[1].headers.contains_key(AUTHORIZATION));
+    }
+
+    /// Cookie and Proxy-Authorization are origin-bound credentials the walk
+    /// never re-mints, so a cross-origin hop strips them exactly as it strips
+    /// Authorization, with or without a HopPolicy. A same-origin hop keeps them.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cross_origin_redirect_strips_cookie_and_proxy_authorization() {
+        struct OpenPolicy;
+        impl crate::HopPolicy for OpenPolicy {
+            fn admit(
+                &self,
+                _prior: Option<&reqwest::Url>,
+                _next: &reqwest::Url,
+            ) -> Result<crate::HopCredential, Error> {
+                Ok(crate::HopCredential::None)
+            }
+        }
+        for with_policy in [false, true] {
+            let redirect = |location: &'static str| {
+                let mut headers = HeaderMap::new();
+                headers.insert(LOCATION, HeaderValue::from_static(location));
+                canned_with_headers(StatusCode::TEMPORARY_REDIRECT, headers, b"")
+            };
+            let script = ScriptedDispatch::new([
+                redirect("https://origin.test/same"),
+                redirect("https://target.test/final"),
+                canned(StatusCode::OK, b"done"),
+            ]);
+            let account = scripted_account(
+                &script,
+                NetConfig::default(),
+                Vec::new(),
+                RetryPolicy::disabled(),
+            );
+            let mut builder = account
+                .get("https://origin.test/start")
+                .header(reqwest::header::COOKIE.as_str(), "session=origin-only")
+                .header(
+                    reqwest::header::PROXY_AUTHORIZATION.as_str(),
+                    "Basic proxy-secret",
+                );
+            if with_policy {
+                builder = builder.hop_policy(Arc::new(OpenPolicy));
+            }
+            builder.send().await.expect("redirect target succeeds");
+            let requests = script.requests();
+            assert_eq!(requests.len(), 3);
+            for same_origin in &requests[..2] {
+                assert!(same_origin.headers.contains_key(reqwest::header::COOKIE));
+                assert!(
+                    same_origin
+                        .headers
+                        .contains_key(reqwest::header::PROXY_AUTHORIZATION)
+                );
+            }
+            assert_eq!(requests[2].url.as_str(), "https://target.test/final");
+            assert!(
+                !requests[2].headers.contains_key(reqwest::header::COOKIE),
+                "policy={with_policy}: cookie crossed origins"
+            );
+            assert!(
+                !requests[2]
+                    .headers
+                    .contains_key(reqwest::header::PROXY_AUTHORIZATION),
+                "policy={with_policy}: proxy credential crossed origins"
+            );
+        }
     }
 
     /// `follow_redirects(Disabled)` hands a 307 back to that one request
@@ -4210,6 +4373,134 @@ mod tests {
             .unwrap();
         assert_eq!(script.requests().len(), 3);
         assert_eq!(script.requests()[1].method, reqwest::Method::GET);
+    }
+
+    #[tokio::test]
+    async fn hop_policy_replaces_credentials_per_origin_and_retains_commit_evidence() {
+        struct Policy;
+        impl crate::HopPolicy for Policy {
+            fn method_rewrite(&self) -> crate::MethodRewrite {
+                crate::MethodRewrite::PreserveAndRefuse303
+            }
+
+            fn admit(
+                &self,
+                _prior: Option<&reqwest::Url>,
+                next: &reqwest::Url,
+            ) -> Result<crate::HopCredential, Error> {
+                let value = match next.host_str() {
+                    Some("first.test") => "Basic first-only",
+                    Some("second.test") => "Basic second-only",
+                    _ => {
+                        return Err(Error::RedirectRejected {
+                            message: "unadmitted origin".into(),
+                        });
+                    }
+                };
+                Ok(crate::HopCredential::Header(HeaderValue::from_static(
+                    value,
+                )))
+            }
+        }
+        let redirect = |location: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                reqwest::header::LOCATION,
+                HeaderValue::from_static(location),
+            );
+            Canned::Response {
+                status: StatusCode::FOUND,
+                headers,
+                body: Bytes::new(),
+            }
+        };
+        let script = ScriptedDispatch::new([
+            redirect("https://second.test/new"),
+            redirect("https://evil.test/steal"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+        let error = account
+            .post("https://first.test/start")
+            .hop_policy(Arc::new(Policy))
+            .body(Bytes::from_static(b"write"))
+            .replay(ReplayPolicy::Never)
+            .send()
+            .await
+            .err()
+            .expect("third origin refused");
+        // `assert_commit_envelope` requires an EMPTY attempt list; this walk
+        // answered two hops, so check the envelope directly below.
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].headers[AUTHORIZATION], "Basic first-only");
+        assert_eq!(requests[1].headers[AUTHORIZATION], "Basic second-only");
+        assert_eq!(requests[1].method, reqwest::Method::POST);
+        assert_eq!(requests[1].body.as_deref(), Some(b"write".as_slice()));
+        assert!(matches!(
+            error,
+            Error::AttemptHistory { attempts, may_have_committed: true, .. } if attempts.len() == 2
+        ));
+    }
+
+    /// A target refusal raised at the TOP of the next hop's loop iteration,
+    /// before `attempts.begin()`, still leaves through the one completion
+    /// boundary: the answered first hop of an unreplayable write is retained
+    /// as possibly committed, never reported as a clean local refusal.
+    #[tokio::test]
+    async fn a_loop_top_hop_refusal_keeps_the_answered_hops_commit_evidence() {
+        struct Policy;
+        impl crate::HopPolicy for Policy {
+            fn method_rewrite(&self) -> crate::MethodRewrite {
+                crate::MethodRewrite::PreserveAndRefuse303
+            }
+
+            fn admit(
+                &self,
+                _prior: Option<&reqwest::Url>,
+                _next: &reqwest::Url,
+            ) -> Result<crate::HopCredential, Error> {
+                Ok(crate::HopCredential::None)
+            }
+
+            fn check_target(
+                &self,
+                _method: &reqwest::Method,
+                url: &reqwest::Url,
+                _headers: &HeaderMap,
+            ) -> Result<(), Error> {
+                if url.path() == "/excluded" {
+                    return Err(Error::RedirectRejected {
+                        message: "excluded target".into(),
+                    });
+                }
+                Ok(())
+            }
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::LOCATION,
+            HeaderValue::from_static("/excluded"),
+        );
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: StatusCode::TEMPORARY_REDIRECT,
+            headers,
+            body: Bytes::new(),
+        }]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+        let error = account
+            .post("https://first.test/start")
+            .hop_policy(Arc::new(Policy))
+            .body(Bytes::from_static(b"write"))
+            .replay(ReplayPolicy::Never)
+            .send()
+            .await
+            .err()
+            .expect("the excluded hop is refused");
+        assert_eq!(script.requests().len(), 1, "the refused hop never goes out");
+        assert!(matches!(
+            &error,
+            Error::AttemptHistory { attempts, may_have_committed: true, .. } if attempts.len() == 1
+        ));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! page walks (`ContactCard/query`, `CalendarEvent/query`).
 //!
 //! Everything here is protocol mechanics that is identical for every object
-//! type: the `2:` payload, anchor paging, the `queryState` pin, the
+//! type: the type-tagged payload, anchor paging, the `queryState` pin, the
 //! termination rules, the `anchorNotFound` mapping and the error
 //! classifications. What varies per object type is a [`PageKind`]: the id
 //! marker, the query-builder type, how a query is pointed at its start or at
@@ -14,32 +14,41 @@
 //! Callers implement `PageKind` on a unit struct and call the provided
 //! associated functions, e.g. `ContactPages::next_cursor(..)`.
 //!
-//! The encoded form is persisted by consumers, so it is frozen: `2:` followed
-//! by a JSON two-element array `[anchor, queryState]`.
+//! Anchored payloads carry their query method and a JSON `[anchor, queryState]` pair.
+//! Ambiguous legacy payloads require restarting the caller-owned walk.
 
 use bifrost_types::{AccountError, AccountOperation, DiagnosticText};
 
 use crate::core::id::Id;
 
 /// Persisted cursor payloads have one codec, with disjoint tags for anchored
-/// PIM walks and positional mail search. Keep the issued formats: consumers
-/// may hold them across an upgrade. Retired or cross-codec payloads use the
+/// PIM walks and positional mail search. Consumers may retain payloads across
+/// upgrades. Retired or cross-codec payloads use the
 /// caller-owned restart-paging signal, never an engine cursor reset.
-/// Contact and calendar deliberately keep their shared historical format;
-/// distinguishing those surfaces needs a versioned format and a legacy policy.
+/// An Outlook user expects a cursor from another collection to restart paging,
+/// never silently skip contacts or events. Legacy untyped anchors cannot be
+/// attributed safely, so they are retired rather than guessed.
 enum CursorPayload {
-    Anchored { anchor: String, query_state: String },
-    Search { position: i32, query_state: String },
+    Anchored {
+        method: String,
+        anchor: String,
+        query_state: String,
+    },
+    Search {
+        position: i32,
+        query_state: String,
+    },
 }
 
 impl CursorPayload {
     fn encode(&self) -> Result<String, serde_json::Error> {
         match self {
             Self::Anchored {
+                method,
                 anchor,
                 query_state,
             } => Ok(format!(
-                "2:{}",
+                "pim-3:{method}:{}",
                 serde_json::to_string(&(anchor, query_state))?
             )),
             Self::Search {
@@ -50,11 +59,15 @@ impl CursorPayload {
     }
 
     fn decode(text: &str, operation: AccountOperation) -> Result<Self, AccountError> {
-        if let Some(payload) = text.strip_prefix("2:") {
+        if let Some((method, payload)) = text
+            .strip_prefix("pim-3:")
+            .and_then(|value| value.split_once(':'))
+        {
             let (anchor, query_state): (String, String) = serde_json::from_str(payload)
                 .map_err(|error| cursor_error(operation, error.to_string()))?;
             if !anchor.is_empty() {
                 return Ok(Self::Anchored {
+                    method: method.to_owned(),
                     anchor,
                     query_state,
                 });
@@ -162,7 +175,7 @@ pub(super) trait PageKind {
     const ITEM: &'static str;
     /// Names an id in the empty-id diagnostic ("card", "event").
     const ID_LABEL: &'static str;
-    /// The JMAP query method, for diagnostics ("ContactCard/query").
+    /// The JMAP query method, for the persisted type tag and diagnostics.
     const METHOD: &'static str;
     /// What the consumer is told to repeat ("listing", "walk").
     const REPEAT: &'static str;
@@ -204,7 +217,7 @@ pub(super) trait PageKind {
 
     /// Decode a page cursor into the continuation it names.
     ///
-    /// Anything that is not a v2 payload is REFUSED, not reinterpreted. That
+    /// Anything without this kind's current method tag is refused. That
     /// covers the v1 bare integer (a position, which under anchored paging
     /// would mean either a stale offset or an id named "100") and, just as
     /// deliberately, an anchor-only payload: a cursor with no pinned
@@ -225,15 +238,16 @@ pub(super) trait PageKind {
             .map_err(|error| cursor_error(operation, error.to_string()))?;
         match CursorPayload::decode(&cursor, operation)? {
             CursorPayload::Anchored {
+                method,
                 anchor,
                 query_state,
-            } => Ok(Some(PageCursor {
+            } if method == Self::METHOD => Ok(Some(PageCursor {
                 anchor,
                 query_state,
             })),
-            CursorPayload::Search { .. } => Err(cursor_error(
+            _ => Err(cursor_error(
                 operation,
-                format!("{} page cursor has a search payload", Self::COLLECTION),
+                format!("{} page cursor belongs to another walk", Self::COLLECTION),
             )),
         }
     }
@@ -413,6 +427,7 @@ pub(super) trait PageKind {
             ));
         }
         let payload = CursorPayload::Anchored {
+            method: Self::METHOD.to_owned(),
             anchor: anchor.to_owned(),
             query_state: query_state.to_owned(),
         }
@@ -672,27 +687,60 @@ mod tests {
         )
     }
 
-    /// The encoded form is persisted by consumers, so a cursor minted by the
-    /// code before this module existed must still decode, and a cursor minted
-    /// now must be byte-identical to it. The literals are the old encoding
-    /// written out by hand on purpose: this is the one place a test may not
-    /// derive the expected bytes from the encoder under test.
+    /// Literal bytes pin the versioned wire format independently of the encoder.
     #[test]
-    fn the_persisted_v2_encoding_is_frozen() {
+    fn typed_encoding_is_stable() {
         assert_eq!(
-            decode(Some(br#"2:["c2","q1"]"#.to_vec())).expect("decodes"),
+            decode(Some(br#"pim-3:Widget/query:["c2","q1"]"#.to_vec())).expect("decodes"),
             Some(cursor("c2", "q1"))
         );
         assert_eq!(
-            decode(Some(br#"2:["a:b\",\"c","[\"q:1\"]"]"#.to_vec())).expect("decodes"),
+            decode(Some(
+                br#"pim-3:Widget/query:["a:b\",\"c","[\"q:1\"]"]"#.to_vec()
+            ))
+            .expect("decodes"),
             Some(cursor("a:b\",\"c", "[\"q:1\"]"))
         );
         assert_eq!(
             mint(0, &ids(&["c1", "c2"]), Some(250), "q1")
                 .expect("valid envelope")
                 .expect("cursor"),
-            br#"2:["c2","q1"]"#.to_vec()
+            br#"pim-3:Widget/query:["c2","q1"]"#.to_vec()
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "contacts", feature = "calendars"))]
+    fn contact_and_calendar_cursors_are_disjoint_and_legacy_cursors_restart() {
+        {
+            use crate::sync::calendar_ops::CalendarPages;
+            use crate::sync::contacts::ContactPages;
+            for method in ["ContactCard/query", "CalendarEvent/query"] {
+                let bytes = format!("pim-3:{method}:[\"same-id\",\"same-state\"]").into_bytes();
+                assert_eq!(
+                    ContactPages::decode_page_cursor(Some(bytes.clone()), OP).is_ok(),
+                    method == "ContactCard/query",
+                );
+                assert_eq!(
+                    CalendarPages::decode_page_cursor(Some(bytes), OP).is_ok(),
+                    method == "CalendarEvent/query",
+                );
+            }
+            for decode in [
+                ContactPages::decode_page_cursor,
+                CalendarPages::decode_page_cursor,
+            ] {
+                let error = decode(Some(br#"2:["same-id","same-state"]"#.to_vec()), OP)
+                    .expect_err("legacy payload has no provable collection");
+                let expected = AccountError::invalid_page_cursor(
+                    OP,
+                    bifrost_types::Protocol::Jmap,
+                    "retired cursor",
+                );
+                assert_eq!(error.kind(), expected.kind());
+                assert_eq!(error.recovery(), expected.recovery());
+            }
+        }
     }
 
     /// The minted cursor names the page's LAST id and pins the state that
@@ -854,7 +902,7 @@ mod tests {
         );
     }
 
-    /// Every payload that is not a v2 anchor-plus-state pair is refused
+    /// Every payload without the matching type tag and anchor-plus-state is refused
     /// rather than reinterpreted. Two cases carry the weight: the v1 bare
     /// position (reading it as an anchor would page from an item named
     /// "100"), and the anchor-ONLY v2 shape - a cursor with no pinned state
@@ -863,10 +911,17 @@ mod tests {
     #[test]
     fn a_page_cursor_refuses_every_shape_without_a_pinned_state() {
         for refused in [
+            "2:[\"c2\",\"q1\"]",
+            "pim-3:ContactCard/query:[\"c2\",\"q1\"]",
+            "pim-3:CalendarEvent/query:[\"c2\",\"q1\"]",
             "100",
             "-1",
             "not-a-number",
             "2:c2",
+            "pim-3:Widget/query:[\"c2\"]",
+            "pim-3:Widget/query:[\"c2\",\"q1\",\"extra\"]",
+            "pim-3:Widget/query:[\"\",\"q1\"]",
+            "pim-3:Widget/query:",
             "2:[\"c2\"]",
             "2:[\"c2\",\"q1\",\"extra\"]",
             "2:[\"\",\"q1\"]",

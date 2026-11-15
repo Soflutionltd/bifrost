@@ -70,7 +70,82 @@ pub struct PublicationReceipt {
     ///
     /// It is only meaningful to the `PendingCoverage` that minted it: see
     /// [`PendingCoverage::walk_watermark`].
-    pub walk_watermark: Option<u64>,
+    pub walk_watermark: Option<crate::cursor::UndeliveredMark>,
+}
+
+/// Coverage proof order, issued by the coverage owner, never by repair ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WalkGeneration(u64);
+
+impl WalkGeneration {
+    // The durable envelope and fingerprint keep the original eight bytes.
+    pub(super) const fn to_le_bytes(self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+
+    pub(super) const fn restore(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Exclusive publication bound, issued only under the coverage ledger lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScopeFence(u64);
+
+impl ScopeFence {
+    fn excludes(self, publication: &PublicationId) -> bool {
+        self.0 > publication.0.0
+    }
+
+    fn after(publication: &PublicationId) -> Self {
+        Self(publication.0.0.saturating_add(1))
+    }
+
+    fn is_raised(self) -> bool {
+        self.0 != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Snapshot of a scope's undelivered-page count, issued by its coverage ledger.
+/// Equality is the walk-completion operation; it is not a publication bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UndeliveredMark(u64);
+
+impl UndeliveredMark {
+    #[cfg(test)]
+    pub(crate) fn after_loss(mut self, count: usize) -> Self {
+        self.record_loss(count);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+
+    fn record_loss(&mut self, count: usize) {
+        self.0 += count as u64;
+    }
+}
+
+/// Compact publication sequence, minted only by the coverage ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PublicationNumber(u64);
+
+impl std::fmt::Display for PublicationNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
 }
 
 /// Engine-issued acknowledgement token.
@@ -100,7 +175,10 @@ pub struct PublicationReceipt {
 /// writer therefore withholds a backfill row whose publication this ledger did
 /// not mint, exactly as it withholds an `Unvouchable` marker.
 #[derive(Debug, Clone)]
-pub struct PublicationId(pub u64, pub std::sync::Arc<PublicationReceipt>);
+pub struct PublicationId(
+    pub PublicationNumber,
+    pub std::sync::Arc<PublicationReceipt>,
+);
 
 impl PartialEq for PublicationId {
     fn eq(&self, other: &Self) -> bool {
@@ -138,12 +216,12 @@ pub struct CoverageClaim {
     /// that keeps partition A's debt alive when B supersedes it.
     pub reports: Vec<InventoryCoverageReport>,
     /// Walk generation, ordering proof events even when cursor bytes repeat.
-    pub generation: u64,
+    pub generation: crate::cursor::WalkGeneration,
 }
 
 impl CoverageClaim {
     #[must_use]
-    pub fn new(report: InventoryCoverageReport, generation: u64) -> Self {
+    pub fn new(report: InventoryCoverageReport, generation: crate::cursor::WalkGeneration) -> Self {
         Self {
             reports: vec![report],
             generation,
@@ -281,10 +359,10 @@ struct SubsumedPage {
     id: PublicationId,
     /// This page's OWN delivery stamp, never the survivor's. See
     /// [`BoundaryEntry::subsumed`].
-    delivered_at: Option<u64>,
+    delivered_at: Option<crate::multiplexer::ReceiverSequence>,
     /// Which numbered receivers have READ this page. See
     /// [`BoundaryEntry::readers`].
-    readers: Vec<u64>,
+    readers: Vec<crate::multiplexer::ReceiverSequence>,
 }
 
 /// One outstanding boundary registration: a batch the engine has published and
@@ -355,7 +433,7 @@ struct BoundaryEntry {
     /// acknowledged is still an unanswered page, so it is still a recorded loss
     /// if its reader departs - see [`PendingCoverage::release_undelivered`],
     /// which does not consult this list.
-    readers: Vec<u64>,
+    readers: Vec<crate::multiplexer::ReceiverSequence>,
     /// Publications this entry SUPERSEDED that the consumer has still not
     /// acknowledged.
     ///
@@ -411,7 +489,7 @@ struct BoundaryEntry {
     /// until the send has actually happened, which is what stops a receiver that
     /// subscribes between the registration and the send from being judged unable
     /// to acknowledge a batch it is in fact about to receive.
-    delivered_at: Option<u64>,
+    delivered_at: Option<crate::multiplexer::ReceiverSequence>,
 }
 
 impl BoundaryEntry {
@@ -422,7 +500,7 @@ impl BoundaryEntry {
     /// Counted per page rather than per entry, because supersession folds a
     /// partition's history into one record and the pages inside it are read at
     /// different moments.
-    fn unread_charge(&self, live: &BTreeSet<u64>) -> usize {
+    fn unread_charge(&self, live: &BTreeSet<crate::multiplexer::ReceiverSequence>) -> usize {
         usize::from(Self::page_unread(self.delivered_at, &self.readers, live))
             + self
                 .subsumed
@@ -446,7 +524,11 @@ impl BoundaryEntry {
     /// until some other path retires it, while a page whose only reader has since
     /// departed has left the ring for good and must free the producer rather than
     /// park it for the life of the attachment.
-    fn page_unread(delivered_at: Option<u64>, readers: &[u64], live: &BTreeSet<u64>) -> bool {
+    fn page_unread(
+        delivered_at: Option<crate::multiplexer::ReceiverSequence>,
+        readers: &[crate::multiplexer::ReceiverSequence],
+        live: &BTreeSet<crate::multiplexer::ReceiverSequence>,
+    ) -> bool {
         // Not sent yet: it will occupy a slot, so it is charged already. Charging
         // it only at the send would let a partition register its whole history
         // between two capacity checks.
@@ -466,11 +548,14 @@ impl BoundaryEntry {
     /// `None` when the account has no real subscriber at all. An entry that has
     /// not been sent yet is never undeliverable - the send may still be about to
     /// reach a receiver that has only just subscribed.
-    fn undeliverable(&self, min_live: Option<u64>) -> bool {
+    fn undeliverable(&self, min_live: Option<crate::multiplexer::ReceiverSequence>) -> bool {
         Self::sent_beyond_reach(self.delivered_at, min_live)
     }
 
-    fn sent_beyond_reach(delivered_at: Option<u64>, min_live: Option<u64>) -> bool {
+    fn sent_beyond_reach(
+        delivered_at: Option<crate::multiplexer::ReceiverSequence>,
+        min_live: Option<crate::multiplexer::ReceiverSequence>,
+    ) -> bool {
         match delivered_at {
             None => false,
             Some(sent_at) => min_live.is_none_or(|min| min >= sent_at),
@@ -487,7 +572,7 @@ impl BoundaryEntry {
 /// in which a second backfill partition of the same scope inserts its own entry
 /// for the same key, and the one-entry-per-key bound - which is what makes a
 /// single acknowledgement discharge the whole lane - silently stops holding.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Ledger {
     /// Publications that have not yet been resolved.
     claims: HashMap<PublicationId, Publication>,
@@ -524,7 +609,7 @@ struct Ledger {
     /// after the reset closed - i.e. by the re-establish that follows - are
     /// at or above the fence and unaffected, so no unfencing step exists to be
     /// forgotten. One entry per scope, so it stays bounded.
-    fenced: HashMap<CursorScope, u64>,
+    fenced: HashMap<CursorScope, ScopeFence>,
     /// Account-wide acknowledgement fence, raised by an account reset.
     /// Exclusive bound over this ledger's ids, like `fenced`; once nonzero it
     /// also refuses every scoped id this ledger did not mint. Segments come
@@ -535,7 +620,7 @@ struct Ledger {
     /// at 0) - which the bound alone would admit. Any foreign id was minted by
     /// an attachment that ended before this reset, so none may land after it.
     /// Repair receipts carry no scope and stay acknowledgeable.
-    fenced_account: u64,
+    fenced_account: ScopeFence,
     /// Highest BACKFILL publication id this ledger has ever minted, per scope.
     ///
     /// Survives the publication itself: the entry is removed on acknowledgement,
@@ -545,13 +630,13 @@ struct Ledger {
     /// rows a whole-scope `delete_backfill` would take with it - and that
     /// question is about what was minted, not about what is still in flight. One
     /// entry per scope, so it stays bounded exactly as `fenced` does.
-    last_backfill_mint: HashMap<CursorScope, u64>,
+    last_backfill_mint: HashMap<CursorScope, PublicationNumber>,
     /// The numbered consumer receivers currently holding a subscription.
     ///
     /// The single membership set, updated under ChangeDelivery's ordering lock.
     /// Delivery queries this ledger rather than maintaining a second copy.
     /// Lock order is delivery -> coverage, never the reverse.
-    live: BTreeSet<u64>,
+    live: BTreeSet<crate::multiplexer::ReceiverSequence>,
     /// The same fence, narrowed to the BACKFILL lane.
     ///
     /// Raised by the discard that follows a walk which lost pages: that walk's
@@ -559,7 +644,24 @@ struct Ledger {
     /// position the discard removed - while the scope's LIVE publications are
     /// untouched by any of it and stay acknowledgeable. One entry per scope, so
     /// it stays bounded exactly as `fenced` does.
-    fenced_backfill: HashMap<CursorScope, u64>,
+    fenced_backfill: HashMap<CursorScope, ScopeFence>,
+}
+
+impl Default for Ledger {
+    fn default() -> Self {
+        Self {
+            claims: HashMap::new(),
+            carried: None,
+            persisted: HashMap::new(),
+            folded: HashMap::new(),
+            boundaries: Vec::new(),
+            fenced: HashMap::new(),
+            fenced_account: PendingCoverage::initial_fence(),
+            last_backfill_mint: HashMap::new(),
+            live: BTreeSet::new(),
+            fenced_backfill: HashMap::new(),
+        }
+    }
 }
 
 /// Hard ceiling on outstanding boundary registrations. Reachable only through a
@@ -591,7 +693,7 @@ pub struct PendingCoverage {
     /// the ledger: `release_undelivered` records after it has dropped the
     /// ledger lock, and giving the counter its own lock keeps that from becoming
     /// a re-entrancy rule somebody has to remember.
-    undelivered: Mutex<HashMap<CursorScope, u64>>,
+    undelivered: Mutex<HashMap<CursorScope, UndeliveredMark>>,
     /// Pulsed whenever backfill capacity is freed, so a producer parked on the
     /// bound wakes without polling. Every path that removes or lightens a
     /// boundary entry pulses it, which is one more thing that comes for free
@@ -621,6 +723,9 @@ impl Default for PendingCoverage {
             delivery_owner: Mutex::new(None),
             next: AtomicU64::new(segment << Self::SEGMENT_SHIFT),
             segment,
+            // Proof order is still attachment-local. Restored durable proof
+            // generations do not seed this counter; typing does not change
+            // that existing cross-attachment ordering policy.
             next_generation: AtomicU64::new(0),
             undelivered: Mutex::new(HashMap::new()),
             discard_requests: Mutex::new(HashSet::new()),
@@ -679,8 +784,8 @@ impl PendingCoverage {
     /// checkpoint to tell "newer" from "older" - but note that generation alone
     /// never PROVES coverage: a newer partial walk is still partial, which is
     /// why discharge requires a covering domain as well.
-    pub fn next_generation(&self) -> u64 {
-        self.next_generation.fetch_add(1, Ordering::Relaxed)
+    pub fn next_generation(&self) -> WalkGeneration {
+        WalkGeneration(self.next_generation.fetch_add(1, Ordering::Relaxed))
     }
 
     fn guard(&self) -> std::sync::MutexGuard<'_, Ledger> {
@@ -694,7 +799,7 @@ impl PendingCoverage {
     /// both retirement passes, stranding the debt in a fenced registration.
     fn mint(&self, _held: &mut Ledger, receipt: PublicationReceipt) -> PublicationId {
         PublicationId(
-            self.next.fetch_add(1, Ordering::Relaxed),
+            PublicationNumber(self.next.fetch_add(1, Ordering::Relaxed)),
             std::sync::Arc::new(receipt),
         )
     }
@@ -706,7 +811,10 @@ impl PendingCoverage {
     /// an enumeration, so it must not touch the coverage lattice - hence the
     /// explicit empty claim rather than an absent entry, which is a different
     /// fact ("the report went missing").
-    pub fn publish_without_report(&self, generation: u64) -> PublicationId {
+    pub fn publish_without_report(
+        &self,
+        generation: crate::cursor::WalkGeneration,
+    ) -> PublicationId {
         self.publish(CoverageClaim {
             reports: Vec::new(),
             generation,
@@ -758,7 +866,7 @@ impl PendingCoverage {
         &self,
         checkpoint: Checkpoint,
         claim: CoverageClaim,
-        walk_watermark: u64,
+        walk_watermark: crate::cursor::UndeliveredMark,
     ) -> PublicationId {
         self.register_in(checkpoint, claim, Some(walk_watermark), None)
             .expect("unconditional registration")
@@ -768,8 +876,8 @@ impl PendingCoverage {
         &self,
         checkpoint: Checkpoint,
         claim: CoverageClaim,
-        walk_watermark: Option<u64>,
-        expected_fence: Option<u64>,
+        walk_watermark: Option<crate::cursor::UndeliveredMark>,
+        expected_fence: Option<crate::cursor::ScopeFence>,
     ) -> Result<PublicationId, CoverageClaim> {
         let lane = Lane::of(&checkpoint);
         self.register_lane_in(checkpoint, claim, walk_watermark, expected_fence, lane)
@@ -779,8 +887,8 @@ impl PendingCoverage {
         &self,
         checkpoint: Checkpoint,
         claim: CoverageClaim,
-        walk_watermark: Option<u64>,
-        expected_fence: Option<u64>,
+        walk_watermark: Option<crate::cursor::UndeliveredMark>,
+        expected_fence: Option<crate::cursor::ScopeFence>,
         lane: Lane,
     ) -> Result<PublicationId, CoverageClaim> {
         let receipt = PublicationReceipt {
@@ -950,10 +1058,28 @@ impl PendingCoverage {
         &self,
         checkpoint: Checkpoint,
         claim: CoverageClaim,
-        expected_fence: u64,
-        walk_watermark: Option<u64>,
+        expected_fence: crate::cursor::ScopeFence,
+        walk_watermark: Option<crate::cursor::UndeliveredMark>,
     ) -> Result<PublicationId, CoverageClaim> {
         self.register_in(checkpoint, claim, walk_watermark, Some(expected_fence))
+    }
+
+    /// Empty-claim proof order before a walk has supplied evidence.
+    #[must_use]
+    pub const fn initial_generation() -> WalkGeneration {
+        WalkGeneration(0)
+    }
+
+    /// Attach-time fence before any reset has revoked a producer.
+    #[must_use]
+    pub const fn initial_fence() -> ScopeFence {
+        ScopeFence(0)
+    }
+
+    /// Baseline before any page has been lost.
+    #[must_use]
+    pub const fn initial_undelivered_mark() -> UndeliveredMark {
+        UndeliveredMark(0)
     }
 
     /// Consume one id so the returned exclusive bound is strictly greater than
@@ -961,16 +1087,16 @@ impl PendingCoverage {
     /// from the counter instead would not move across two resets with nothing
     /// minted between them, and a walk that snapshotted the first would not see
     /// the second. Called only under the ledger lock.
-    fn burn_fence(&self, _held: &mut Ledger) -> u64 {
-        self.next.fetch_add(1, Ordering::Relaxed) + 1
+    fn burn_fence(&self, _held: &mut Ledger) -> ScopeFence {
+        ScopeFence(self.next.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
-    fn scope_fence_in(ledger: &Ledger, scope: &CursorScope) -> u64 {
+    fn scope_fence_in(ledger: &Ledger, scope: &CursorScope) -> ScopeFence {
         ledger
             .fenced
             .get(scope)
             .copied()
-            .unwrap_or(0)
+            .unwrap_or_else(Self::initial_fence)
             .max(ledger.fenced_account)
     }
 
@@ -1009,7 +1135,7 @@ impl PendingCoverage {
             .retain(|entry| entry.lane.scope().is_none());
         let mut debt = ledger.carried.take().unwrap_or(CoverageClaim {
             reports: Vec::new(),
-            generation: 0,
+            generation: crate::cursor::PendingCoverage::initial_generation(),
         });
         let ids: Vec<_> = ledger
             .claims
@@ -1042,7 +1168,7 @@ impl PendingCoverage {
     /// and the answer is `None`: not a marker this attachment can judge, which
     /// refuses NOTHING rather than assuming the worst.
     #[must_use]
-    pub fn walk_watermark(&self, id: &PublicationId) -> Option<u64> {
+    pub fn walk_watermark(&self, id: &PublicationId) -> Option<UndeliveredMark> {
         if !self.minted_here(id) {
             return None;
         }
@@ -1056,7 +1182,7 @@ impl PendingCoverage {
     /// any state about the attachment that minted it.
     #[must_use]
     pub fn minted_here(&self, id: &PublicationId) -> bool {
-        id.0 >> Self::SEGMENT_SHIFT == self.segment
+        id.0.0 >> Self::SEGMENT_SHIFT == self.segment
     }
 
     /// Record that a publication's batch has actually been BROADCAST, and how
@@ -1069,7 +1195,11 @@ impl PendingCoverage {
     /// exactly that reason: a receiver that subscribes between the two really
     /// does receive the batch, and judging it beforehand would retire the
     /// capacity of a page that is about to be delivered.
-    pub fn mark_delivered(&self, id: &PublicationId, subscriber_seq: u64) {
+    pub fn mark_delivered(
+        &self,
+        id: &PublicationId,
+        subscriber_seq: crate::multiplexer::ReceiverSequence,
+    ) {
         let mut ledger = self.guard();
         if let Some(entry) = ledger.boundaries.iter_mut().find(|entry| entry.id == *id) {
             entry.delivered_at = Some(subscriber_seq);
@@ -1094,7 +1224,11 @@ impl PendingCoverage {
     /// consumer is only now reading may already have been folded into a later
     /// publication of its partition, and the page just read is almost always
     /// either the survivor or the most recently folded element.
-    pub fn mark_received(&self, id: &PublicationId, receiver_seq: u64) {
+    pub fn mark_received(
+        &self,
+        id: &PublicationId,
+        receiver_seq: crate::multiplexer::ReceiverSequence,
+    ) {
         let freed = {
             let mut ledger = self.guard();
             let mut freed = false;
@@ -1123,7 +1257,7 @@ impl PendingCoverage {
     }
 
     /// Lowest numbered receiver still subscribed, from the authoritative set.
-    pub(crate) fn min_live_receiver(&self) -> Option<u64> {
+    pub(crate) fn min_live_receiver(&self) -> Option<crate::multiplexer::ReceiverSequence> {
         self.guard().live.iter().next().copied()
     }
 
@@ -1132,7 +1266,7 @@ impl PendingCoverage {
     /// It can never re-charge a page that is already out of the ring: it is
     /// numbered at or above every existing page's `delivered_at`, and only
     /// receivers numbered strictly below one hold it. So this never needs a wake.
-    pub(crate) fn receiver_joined(&self, receiver_seq: u64) {
+    pub(crate) fn receiver_joined(&self, receiver_seq: crate::multiplexer::ReceiverSequence) {
         self.guard().live.insert(receiver_seq);
     }
 
@@ -1144,7 +1278,7 @@ impl PendingCoverage {
     /// of the attachment - the same failure the sweep in
     /// [`PendingCoverage::release_undelivered`] exists to prevent, one step
     /// earlier. Called under the delivery gate's lock, ahead of that sweep.
-    pub(crate) fn receiver_departed(&self, receiver_seq: u64) {
+    pub(crate) fn receiver_departed(&self, receiver_seq: crate::multiplexer::ReceiverSequence) {
         let mut ledger = self.guard();
         let was_live = ledger.live.remove(&receiver_seq);
         drop(ledger);
@@ -1187,7 +1321,9 @@ impl PendingCoverage {
     ///
     /// Both lists are deduplicated and ordered; an entry not yet sent has no
     /// eligible reader and contributes only its scope.
-    pub(crate) fn backfill_charge_holders(&self) -> (Vec<u64>, Vec<CursorScope>) {
+    pub(crate) fn backfill_charge_holders(
+        &self,
+    ) -> (Vec<crate::multiplexer::ReceiverSequence>, Vec<CursorScope>) {
         let ledger = self.guard();
         let mut holders = BTreeSet::new();
         let mut scopes: Vec<CursorScope> = Vec::new();
@@ -1296,7 +1432,10 @@ impl PendingCoverage {
     /// window behave exactly like a drop after it, and `reference/sync.md`
     /// states the contract. Do not re-file the window as a defect; what would
     /// reopen it is a downstream store willing to pay for the row.
-    pub fn release_undelivered(&self, min_live: Option<u64>) -> usize {
+    pub fn release_undelivered(
+        &self,
+        min_live: Option<crate::multiplexer::ReceiverSequence>,
+    ) -> usize {
         if self.tearing_down.load(Ordering::Acquire) {
             return 0;
         }
@@ -1417,12 +1556,12 @@ impl PendingCoverage {
     /// (`take_backfill_discard`), and whatever is left at teardown by `detach`
     /// (`take_backfill_discards`) before the writer goes.
     pub fn note_undelivered(&self, scope: &CursorScope, count: usize) {
-        *self
-            .undelivered
+        self.undelivered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(scope.clone())
-            .or_insert(0) += count as u64;
+            .or_insert_with(Self::initial_undelivered_mark)
+            .record_loss(count);
         self.discard_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1461,13 +1600,13 @@ impl PendingCoverage {
     /// Snapshot of one scope's undelivered counter. A walk compares two
     /// readings.
     #[must_use]
-    pub fn undelivered_watermark(&self, scope: &CursorScope) -> u64 {
+    pub fn undelivered_watermark(&self, scope: &CursorScope) -> UndeliveredMark {
         self.undelivered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(scope)
             .copied()
-            .unwrap_or(0)
+            .unwrap_or_else(Self::initial_undelivered_mark)
     }
 
     /// Move each publication's DEBT into the carry-forward slot and drop its
@@ -1543,7 +1682,7 @@ impl PendingCoverage {
     /// page from is still the live one. Scope resets, provider deletion and
     /// account resets all move it when they revoke the producer's ownership.
     #[must_use]
-    pub fn scope_fence(&self, scope: &CursorScope) -> u64 {
+    pub fn scope_fence(&self, scope: &CursorScope) -> ScopeFence {
         Self::scope_fence_in(&self.guard(), scope)
     }
 
@@ -1734,7 +1873,7 @@ impl PendingCoverage {
         });
         let mut carried = CoverageClaim {
             reports: Vec::new(),
-            generation: 0,
+            generation: crate::cursor::PendingCoverage::initial_generation(),
         };
         for id in &ids {
             if let Some(publication) = ledger.claims.remove(id) {
@@ -1772,10 +1911,7 @@ impl PendingCoverage {
         // The fence is an EXCLUSIVE bound, so a bounded invalidation fences one
         // past the ceiling: everything the old attempt minted, and nothing the
         // retry will.
-        let watermark = through.map_or_else(
-            || self.burn_fence(&mut ledger),
-            |ceiling| ceiling.0.saturating_add(1),
-        );
+        let watermark = through.map_or_else(|| self.burn_fence(&mut ledger), ScopeFence::after);
         match lane_kind {
             // No narrowing: the whole scope is invalidated, every lane with it.
             None | Some(LaneKind::Other) => Self::fence_in(&mut ledger, scope, watermark),
@@ -1786,12 +1922,12 @@ impl PendingCoverage {
         carried
     }
 
-    fn fence_in(ledger: &mut Ledger, scope: &CursorScope, watermark: u64) {
+    fn fence_in(ledger: &mut Ledger, scope: &CursorScope, watermark: ScopeFence) {
         let entry = ledger.fenced.entry(scope.clone()).or_insert(watermark);
         *entry = (*entry).max(watermark);
     }
 
-    fn fence_in_backfill(ledger: &mut Ledger, scope: &CursorScope, watermark: u64) {
+    fn fence_in_backfill(ledger: &mut Ledger, scope: &CursorScope, watermark: ScopeFence) {
         let entry = ledger
             .fenced_backfill
             .entry(scope.clone())
@@ -1872,14 +2008,14 @@ impl PendingCoverage {
             let scope_wide = ledger
                 .fenced
                 .get(scope)
-                .is_some_and(|watermark| *watermark > id.0);
+                .is_some_and(|watermark| watermark.excludes(&id));
             let lane_wide = lane.kind() == LaneKind::Backfill
                 && ledger
                     .fenced_backfill
                     .get(scope)
-                    .is_some_and(|watermark| *watermark > id.0);
-            let account_wide = ledger.fenced_account > id.0
-                || (ledger.fenced_account != 0 && !self.minted_here(&id));
+                    .is_some_and(|watermark| watermark.excludes(&id));
+            let account_wide = ledger.fenced_account.excludes(&id)
+                || (ledger.fenced_account.is_raised() && !self.minted_here(&id));
             account_wide || scope_wide || lane_wide
         });
         if fenced_out {
@@ -1927,7 +2063,7 @@ impl PendingCoverage {
                     .filter(|watermark| mine && **watermark >= id)
                     .map(|_| CoverageClaim {
                         reports: Vec::new(),
-                        generation: 0,
+                        generation: crate::cursor::PendingCoverage::initial_generation(),
                     })
                 {
                     // Superseded, and its coverage moved to a successor that is
@@ -2049,7 +2185,10 @@ impl PendingCoverage {
 /// A `Vec` and a linear scan: the list holds one entry per numbered receiver that
 /// has read this page, and an account with more than a handful of live change
 /// subscribers is not a shape this engine has.
-fn record_reader(readers: &mut Vec<u64>, receiver_seq: u64) -> bool {
+fn record_reader(
+    readers: &mut Vec<crate::multiplexer::ReceiverSequence>,
+    receiver_seq: crate::multiplexer::ReceiverSequence,
+) -> bool {
     if readers.contains(&receiver_seq) {
         return false;
     }
@@ -2104,14 +2243,14 @@ mod tests {
         // Inject its lane into the same registration path instead.
         let result = pending.register_lane_in(
             checkpoint(b"unknown"),
-            CoverageClaim::new(degraded("owed"), 7),
+            CoverageClaim::new(degraded("owed"), crate::cursor::WalkGeneration::for_test(7)),
             None,
-            Some(0),
+            Some(PendingCoverage::initial_fence()),
             Lane::UnkeyedCheckpoint,
         );
         let claim = result.expect_err("an unkeyed lane cannot pass a scope fence");
         assert_eq!(claim.reports.len(), 1);
-        assert_eq!(claim.generation, 7);
+        assert_eq!(claim.generation, crate::cursor::WalkGeneration::for_test(7));
         assert_eq!(pending.outstanding(), 0);
         assert_eq!(pending.pending_checkpoints(), 0);
     }
@@ -2129,7 +2268,10 @@ mod tests {
     #[test]
     fn register_if_fence_refuses_a_stale_fence_and_registers_nothing() {
         let p = PendingCoverage::new();
-        let claim = CoverageClaim::new(degraded("owed"), 42);
+        let claim = CoverageClaim::new(
+            degraded("owed"),
+            crate::cursor::WalkGeneration::for_test(42),
+        );
         let old = p.scope_fence(&scope());
         p.raise_scope_fence(&scope());
         let refused = p
@@ -2169,12 +2311,24 @@ mod tests {
         if let Checkpoint::Change(cursor) = &mut b {
             cursor.scope = CursorScope::Account;
         }
-        let ai = p.register(a.clone(), CoverageClaim::new(degraded("a"), 1));
-        let bi = p.register(b.clone(), CoverageClaim::new(degraded("b"), 1));
+        let ai = p.register(
+            a.clone(),
+            CoverageClaim::new(degraded("a"), crate::cursor::WalkGeneration::for_test(1)),
+        );
+        let bi = p.register(
+            b.clone(),
+            CoverageClaim::new(degraded("b"), crate::cursor::WalkGeneration::for_test(1)),
+        );
         p.raise_account_fence();
         assert!(matches!(p.claim_checkpoint(ai, &a), ClaimLookup::Unknown));
         assert!(matches!(p.claim_checkpoint(bi, &b), ClaimLookup::Unknown));
-        let fresh = p.register(a.clone(), CoverageClaim::new(degraded("fresh"), 2));
+        let fresh = p.register(
+            a.clone(),
+            CoverageClaim::new(
+                degraded("fresh"),
+                crate::cursor::WalkGeneration::for_test(2),
+            ),
+        );
         assert!(matches!(
             p.claim_checkpoint(fresh, &a),
             ClaimLookup::Apply(_)
@@ -2188,7 +2342,10 @@ mod tests {
         let current = PendingCoverage::new();
         let foreign = PendingCoverage::new();
         let cp = checkpoint(b"foreign");
-        let id = foreign.register(cp.clone(), CoverageClaim::new(degraded("owed"), 1));
+        let id = foreign.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("owed"), crate::cursor::WalkGeneration::for_test(1)),
+        );
         assert!(matches!(
             current.claim_checkpoint(id.clone(), &cp),
             ClaimLookup::Apply(_)
@@ -2210,7 +2367,10 @@ mod tests {
             }
             let mut report = degraded(key);
             report.domain.scope = scope;
-            (cp, CoverageClaim::new(report, 1))
+            (
+                cp,
+                CoverageClaim::new(report, crate::cursor::WalkGeneration::for_test(1)),
+            )
         };
         let (cp, claim) = on(CursorScope::Account, "carried");
         p.register(cp, claim);
@@ -2222,7 +2382,7 @@ mod tests {
             let (cp, claim) = on(scope, key);
             p.register(cp, claim);
         }
-        let repair = p.publish_without_report(1);
+        let repair = p.publish_without_report(crate::cursor::WalkGeneration::for_test(1));
         let debt = p.invalidate_account();
         assert_eq!(debt.reports.len(), 3);
         assert_eq!(p.pending_checkpoints(), 0);
@@ -2275,7 +2435,10 @@ mod tests {
     #[test]
     fn a_restart_crossing_acknowledgement_carries_its_claim() {
         let first_writer = PendingCoverage::new();
-        let id = first_writer.publish(CoverageClaim::new(degraded("restart"), 1));
+        let id = first_writer.publish(CoverageClaim::new(
+            degraded("restart"),
+            crate::cursor::WalkGeneration::for_test(1),
+        ));
         let restarted_writer = PendingCoverage::new();
         assert!(matches!(
             restarted_writer.claim_repair(id),
@@ -2289,8 +2452,14 @@ mod tests {
     #[test]
     fn each_publication_keeps_its_own_claim() {
         let pending = PendingCoverage::new();
-        let first = pending.publish(CoverageClaim::new(degraded("a"), 1));
-        let second = pending.publish(CoverageClaim::new(degraded("b"), 1));
+        let first = pending.publish(CoverageClaim::new(
+            degraded("a"),
+            crate::cursor::WalkGeneration::for_test(1),
+        ));
+        let second = pending.publish(CoverageClaim::new(
+            degraded("b"),
+            crate::cursor::WalkGeneration::for_test(1),
+        ));
 
         let ClaimLookup::Apply(claim) = pending.claim(first) else {
             panic!("first publication must yield its own claim");
@@ -2309,7 +2478,10 @@ mod tests {
     fn a_duplicate_acknowledgement_is_idempotent() {
         let pending = PendingCoverage::new();
         let cp = checkpoint(b"a");
-        let id = pending.register(cp.clone(), CoverageClaim::new(degraded("a"), 1));
+        let id = pending.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("a"), crate::cursor::WalkGeneration::for_test(1)),
+        );
 
         assert!(matches!(
             pending.claim_checkpoint(id.clone(), &cp),
@@ -2333,7 +2505,10 @@ mod tests {
     fn duplicate_acknowledgement_survives_many_later_acknowledgements() {
         let pending = PendingCoverage::new();
         let first_cp = checkpoint(b"first");
-        let first = pending.register(first_cp.clone(), CoverageClaim::new(degraded("a"), 1));
+        let first = pending.register(
+            first_cp.clone(),
+            CoverageClaim::new(degraded("a"), crate::cursor::WalkGeneration::for_test(1)),
+        );
         assert!(matches!(
             pending.claim_checkpoint(first.clone(), &first_cp),
             ClaimLookup::Apply(_)
@@ -2342,7 +2517,13 @@ mod tests {
 
         for round in 0..1024u32 {
             let cp = checkpoint(&round.to_be_bytes());
-            let id = pending.register(cp.clone(), CoverageClaim::new(degraded("later"), 2));
+            let id = pending.register(
+                cp.clone(),
+                CoverageClaim::new(
+                    degraded("later"),
+                    crate::cursor::WalkGeneration::for_test(2),
+                ),
+            );
             let _ = pending.claim_checkpoint(id.clone(), &cp);
             pending.settle_checkpoint(id, &cp);
         }
@@ -2368,7 +2549,10 @@ mod tests {
     fn a_failed_write_can_retry_from_its_receipt() {
         let pending = PendingCoverage::new();
         let cp = checkpoint(b"a");
-        let id = pending.register(cp.clone(), CoverageClaim::new(degraded("a"), 1));
+        let id = pending.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("a"), crate::cursor::WalkGeneration::for_test(1)),
+        );
 
         assert!(matches!(
             pending.claim_checkpoint(id.clone(), &cp),
@@ -2408,8 +2592,17 @@ mod tests {
         // P, degraded, then Q on the same lane: Q supersedes P and absorbs its
         // claim.
         let cp = backfill_checkpoint(b"page:0:10");
-        let p = pending.register(cp.clone(), CoverageClaim::new(degraded("owed"), 1));
-        let q = pending.register(cp.clone(), CoverageClaim::new(degraded("later"), 2));
+        let p = pending.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("owed"), crate::cursor::WalkGeneration::for_test(1)),
+        );
+        let q = pending.register(
+            cp.clone(),
+            CoverageClaim::new(
+                degraded("later"),
+                crate::cursor::WalkGeneration::for_test(2),
+            ),
+        );
 
         // The consumer acknowledges P - it really received that batch - which
         // resolves P without touching the debt now riding Q.
@@ -2417,7 +2610,7 @@ mod tests {
             pending.claim_checkpoint(p, &cp),
             ClaimLookup::Apply(_)
         ));
-        pending.mark_delivered(&q, 1);
+        pending.mark_delivered(&q, crate::multiplexer::ReceiverSequence::for_test(1));
 
         // The last receiver goes away. Q can never be acknowledged, so the sweep
         // retires it and its debt moves to the carry slot - the only place it
@@ -2453,8 +2646,11 @@ mod tests {
         let cp = backfill_checkpoint(b"page:0:10");
 
         // P sent when only receiver 0 existed.
-        let p = pending.register(cp.clone(), CoverageClaim::new(degraded("p"), 1));
-        pending.mark_delivered(&p, 1);
+        let p = pending.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("p"), crate::cursor::WalkGeneration::for_test(1)),
+        );
+        pending.mark_delivered(&p, crate::multiplexer::ReceiverSequence::for_test(1));
         // B subscribes (number 1), then Q goes out. Q's report is COMPLETE, and
         // that is what gives the demotion assertion below its bite: a claim built
         // only from degraded reports has nothing to prove and satisfies "no
@@ -2463,15 +2659,15 @@ mod tests {
             cp.clone(),
             CoverageClaim::new(
                 InventoryCoverageReport::complete(CoverageDomain::full(scope())),
-                2,
+                crate::cursor::WalkGeneration::for_test(2),
             ),
         );
-        pending.mark_delivered(&q, 2);
+        pending.mark_delivered(&q, crate::multiplexer::ReceiverSequence::for_test(2));
         assert_eq!(pending.backfill_in_flight(), 2);
 
         // A (number 0) leaves; B (number 1) remains.
         assert_eq!(
-            pending.release_undelivered(Some(1)),
+            pending.release_undelivered(Some(crate::multiplexer::ReceiverSequence::for_test(1))),
             1,
             "exactly P is beyond every live reader; Q is not"
         );
@@ -2509,13 +2705,22 @@ mod tests {
     fn retiring_an_undelivered_page_keeps_the_debt_it_absorbed() {
         let pending = PendingCoverage::new();
         let first = backfill_checkpoint(b"page:0:10");
-        let a = pending.register(first, CoverageClaim::new(degraded("rescued"), 1));
+        let a = pending.register(
+            first,
+            CoverageClaim::new(
+                degraded("rescued"),
+                crate::cursor::WalkGeneration::for_test(1),
+            ),
+        );
         // Nobody received it.
         pending.retire_publication(a);
 
         // The next page absorbs the rescued debt, and also reaches nobody.
         let second = backfill_checkpoint(b"page:10:20");
-        let b = pending.register(second, CoverageClaim::new(degraded("mine"), 2));
+        let b = pending.register(
+            second,
+            CoverageClaim::new(degraded("mine"), crate::cursor::WalkGeneration::for_test(2)),
+        );
         pending.retire_publication(b);
 
         // A reset is the last durable transition. Both obligations have to be in
@@ -2545,8 +2750,14 @@ mod tests {
 
         // Scope A's page reaches nobody; its debt is carried.
         let a_page = backfill_checkpoint(b"page:0:10");
-        let a = pending.register(a_page, CoverageClaim::new(degraded("a-owed"), 1));
-        pending.mark_delivered(&a, 1);
+        let a = pending.register(
+            a_page,
+            CoverageClaim::new(
+                degraded("a-owed"),
+                crate::cursor::WalkGeneration::for_test(1),
+            ),
+        );
+        pending.mark_delivered(&a, crate::multiplexer::ReceiverSequence::for_test(1));
         assert_eq!(pending.release_undelivered(None), 1);
 
         // A publication on a DIFFERENT scope must leave it alone.
@@ -2558,7 +2769,13 @@ mod tests {
             progress: bifrost_types::BackfillProgress::default(),
             envelope_version: 1,
         });
-        pending.register(b_page, CoverageClaim::new(degraded("b-owed"), 2));
+        pending.register(
+            b_page,
+            CoverageClaim::new(
+                degraded("b-owed"),
+                crate::cursor::WalkGeneration::for_test(2),
+            ),
+        );
 
         let carried = pending.invalidate_scope(&scope());
         let keys: Vec<Vec<u8>> = carried
@@ -2580,8 +2797,11 @@ mod tests {
     fn a_reset_leaves_another_scopes_carried_debt_alone() {
         let pending = PendingCoverage::new();
         let cp = backfill_checkpoint(b"page:0:10");
-        let id = pending.register(cp, CoverageClaim::new(degraded("mine"), 1));
-        pending.mark_delivered(&id, 1);
+        let id = pending.register(
+            cp,
+            CoverageClaim::new(degraded("mine"), crate::cursor::WalkGeneration::for_test(1)),
+        );
+        pending.mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(1));
         assert_eq!(pending.release_undelivered(None), 1);
 
         let other = CursorScope::Type(ObjectType::Contact);
@@ -2603,7 +2823,10 @@ mod tests {
     fn scope_invalidation_refuses_a_late_pre_reset_acknowledgement() {
         let pending = PendingCoverage::new();
         let cp = checkpoint(b"stale");
-        let id = pending.register(cp.clone(), CoverageClaim::new(degraded("owed"), 1));
+        let id = pending.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("owed"), crate::cursor::WalkGeneration::for_test(1)),
+        );
 
         let carried = pending.invalidate_scope(&scope());
 
@@ -2627,7 +2850,10 @@ mod tests {
     fn a_repair_acknowledgement_cannot_consume_a_checkpoint_publication() {
         let pending = PendingCoverage::new();
         let cp = checkpoint(b"a");
-        let id = pending.register(cp.clone(), CoverageClaim::new(degraded("a"), 1));
+        let id = pending.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("a"), crate::cursor::WalkGeneration::for_test(1)),
+        );
 
         assert!(matches!(
             pending.claim_repair(id.clone()),
@@ -2644,7 +2870,7 @@ mod tests {
     #[test]
     fn a_checkpoint_acknowledgement_cannot_consume_a_repair_publication() {
         let pending = PendingCoverage::new();
-        let repair = pending.publish_without_report(0);
+        let repair = pending.publish_without_report(crate::cursor::WalkGeneration::for_test(0));
 
         assert!(matches!(
             pending.claim_checkpoint(repair.clone(), &checkpoint(b"a")),
@@ -2663,12 +2889,18 @@ mod tests {
     fn an_id_this_ledger_never_issued_is_unknown() {
         let pending = PendingCoverage::new();
         let cp = checkpoint(b"a");
-        let id = pending.register(cp.clone(), CoverageClaim::new(degraded("a"), 1));
+        let id = pending.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("a"), crate::cursor::WalkGeneration::for_test(1)),
+        );
         let _ = pending.claim_checkpoint(id.clone(), &cp);
         pending.settle_checkpoint(id, &cp);
 
         assert!(matches!(
-            pending.claim_checkpoint(pending.publish_without_report(0), &cp),
+            pending.claim_checkpoint(
+                pending.publish_without_report(crate::cursor::WalkGeneration::for_test(0)),
+                &cp
+            ),
             ClaimLookup::Unknown
         ));
     }
@@ -2688,12 +2920,18 @@ mod tests {
         let cp = checkpoint(b"replayed");
         // The previous attachment mints and hands the id to the consumer.
         let previous = PendingCoverage::new();
-        let replayed = previous.register(cp.clone(), CoverageClaim::new(degraded("owed"), 1));
+        let replayed = previous.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("owed"), crate::cursor::WalkGeneration::for_test(1)),
+        );
 
         // A fresh attachment that has persisted a publication of its OWN on the
         // same lane, which is what moves the watermark past every foreign id.
         let current = PendingCoverage::new();
-        let mine = current.register(cp.clone(), CoverageClaim::new(degraded("mine"), 1));
+        let mine = current.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("mine"), crate::cursor::WalkGeneration::for_test(1)),
+        );
         let _ = current.claim_checkpoint(mine.clone(), &cp);
         current.settle_checkpoint(mine, &cp);
 
@@ -2722,8 +2960,20 @@ mod tests {
     fn completing_one_publication_leaves_an_equal_valued_sibling_registered() {
         let pending = PendingCoverage::new();
         let cp = backfill_checkpoint(b"page-a");
-        let first = pending.register(cp.clone(), CoverageClaim::new(degraded("first"), 1));
-        let second = pending.register(cp.clone(), CoverageClaim::new(degraded("second"), 2));
+        let first = pending.register(
+            cp.clone(),
+            CoverageClaim::new(
+                degraded("first"),
+                crate::cursor::WalkGeneration::for_test(1),
+            ),
+        );
+        let second = pending.register(
+            cp.clone(),
+            CoverageClaim::new(
+                degraded("second"),
+                crate::cursor::WalkGeneration::for_test(2),
+            ),
+        );
         assert_ne!(first, second, "equal values, different publications");
         assert_eq!(pending.pending_checkpoints(), 1);
 
@@ -2748,8 +2998,20 @@ mod tests {
     fn retiring_one_publication_leaves_an_equal_valued_siblings_claim_intact() {
         let pending = PendingCoverage::new();
         let cp = backfill_checkpoint(b"page-a");
-        let first = pending.register(cp.clone(), CoverageClaim::new(degraded("first"), 1));
-        let second = pending.register(cp.clone(), CoverageClaim::new(degraded("second"), 2));
+        let first = pending.register(
+            cp.clone(),
+            CoverageClaim::new(
+                degraded("first"),
+                crate::cursor::WalkGeneration::for_test(1),
+            ),
+        );
+        let second = pending.register(
+            cp.clone(),
+            CoverageClaim::new(
+                degraded("second"),
+                crate::cursor::WalkGeneration::for_test(2),
+            ),
+        );
 
         pending.retire_publication(first);
 
@@ -2772,8 +3034,20 @@ mod tests {
     fn acknowledging_a_superseded_publication_persists_without_reingesting() {
         let pending = PendingCoverage::new();
         let cp = backfill_checkpoint(b"page-a");
-        let first = pending.register(cp.clone(), CoverageClaim::new(degraded("first"), 1));
-        let second = pending.register(cp.clone(), CoverageClaim::new(degraded("second"), 2));
+        let first = pending.register(
+            cp.clone(),
+            CoverageClaim::new(
+                degraded("first"),
+                crate::cursor::WalkGeneration::for_test(1),
+            ),
+        );
+        let second = pending.register(
+            cp.clone(),
+            CoverageClaim::new(
+                degraded("second"),
+                crate::cursor::WalkGeneration::for_test(2),
+            ),
+        );
 
         let ClaimLookup::Apply(claim) = pending.claim_checkpoint(first, &cp) else {
             panic!("a superseded batch the consumer received is still acknowledgeable");
@@ -2804,7 +3078,10 @@ mod tests {
                 for _ in 0..64 {
                     pending.register(
                         backfill_checkpoint(b"page-a"),
-                        CoverageClaim::new(degraded("x"), u64::from(round)),
+                        CoverageClaim::new(
+                            degraded("x"),
+                            crate::cursor::WalkGeneration::for_test(u64::from(round)),
+                        ),
                     );
                 }
             }));
@@ -2830,8 +3107,14 @@ mod tests {
     #[test]
     fn supersession_folds_the_older_claim_into_the_survivor() {
         let pending = PendingCoverage::new();
-        let older = pending.publish(CoverageClaim::new(degraded("a"), 1));
-        let newer = pending.publish(CoverageClaim::new(degraded("b"), 2));
+        let older = pending.publish(CoverageClaim::new(
+            degraded("a"),
+            crate::cursor::WalkGeneration::for_test(1),
+        ));
+        let newer = pending.publish(CoverageClaim::new(
+            degraded("b"),
+            crate::cursor::WalkGeneration::for_test(2),
+        ));
 
         pending.supersede(older.clone(), newer.clone());
 
@@ -2841,15 +3124,20 @@ mod tests {
         };
         assert_eq!(claim.reports.len(), 2, "the superseded report must survive");
         assert_eq!(claim.reports[0].obligations()[0].key().0, b"a".to_vec());
-        assert_eq!(claim.generation, 2);
+        assert_eq!(claim.generation, crate::cursor::WalkGeneration::for_test(2));
     }
 
     #[test]
     fn registering_a_new_checkpoint_folds_the_superseded_claim() {
         let publications = PendingCoverage::new();
-        publications.register(checkpoint(b"old"), CoverageClaim::new(degraded("a"), 1));
-        let survivor =
-            publications.register(checkpoint(b"new"), CoverageClaim::new(degraded("b"), 2));
+        publications.register(
+            checkpoint(b"old"),
+            CoverageClaim::new(degraded("a"), crate::cursor::WalkGeneration::for_test(1)),
+        );
+        let survivor = publications.register(
+            checkpoint(b"new"),
+            CoverageClaim::new(degraded("b"), crate::cursor::WalkGeneration::for_test(2)),
+        );
 
         let ClaimLookup::Apply(claim) = publications.claim(survivor) else {
             panic!("survivor must be acknowledgeable");
@@ -2863,8 +3151,14 @@ mod tests {
     #[test]
     fn supersession_into_a_persisted_survivor_keeps_the_older_claim() {
         let pending = PendingCoverage::new();
-        let older = pending.publish(CoverageClaim::new(degraded("a"), 1));
-        let newer = pending.publish(CoverageClaim::new(degraded("b"), 2));
+        let older = pending.publish(CoverageClaim::new(
+            degraded("a"),
+            crate::cursor::WalkGeneration::for_test(1),
+        ));
+        let newer = pending.publish(CoverageClaim::new(
+            degraded("b"),
+            crate::cursor::WalkGeneration::for_test(2),
+        ));
         let _ = pending.claim(newer.clone());
 
         pending.supersede(older.clone(), newer);
@@ -2878,13 +3172,22 @@ mod tests {
     #[test]
     fn lagged_publication_claims_are_carried_to_the_next_acknowledgeable_batch() {
         let pending = PendingCoverage::new();
-        pending.register(checkpoint(b"lost"), CoverageClaim::new(degraded("lost"), 1));
+        pending.register(
+            checkpoint(b"lost"),
+            CoverageClaim::new(degraded("lost"), crate::cursor::WalkGeneration::for_test(1)),
+        );
 
         assert_eq!(pending.abandon_checkpoints(), 1);
         assert_eq!(pending.outstanding(), 0);
 
         let next = checkpoint(b"retained");
-        let survivor = pending.register(next.clone(), CoverageClaim::new(degraded("retained"), 2));
+        let survivor = pending.register(
+            next.clone(),
+            CoverageClaim::new(
+                degraded("retained"),
+                crate::cursor::WalkGeneration::for_test(2),
+            ),
+        );
         let ClaimLookup::Apply(claim) = pending.claim_checkpoint(survivor, &next) else {
             panic!("next publication must remain acknowledgeable");
         };
@@ -2904,12 +3207,18 @@ mod tests {
     fn a_lagged_complete_report_does_not_discharge_anything() {
         let pending = PendingCoverage::new();
         let clean = InventoryCoverageReport::complete(CoverageDomain::full(scope()));
-        pending.register(checkpoint(b"lost"), CoverageClaim::new(clean, 1));
+        pending.register(
+            checkpoint(b"lost"),
+            CoverageClaim::new(clean, crate::cursor::WalkGeneration::for_test(1)),
+        );
 
         assert_eq!(pending.abandon_checkpoints(), 1);
 
         let next = checkpoint(b"next");
-        let survivor = pending.register(next.clone(), CoverageClaim::new(degraded("owed"), 2));
+        let survivor = pending.register(
+            next.clone(),
+            CoverageClaim::new(degraded("owed"), crate::cursor::WalkGeneration::for_test(2)),
+        );
         let ClaimLookup::Apply(claim) = pending.claim_checkpoint(survivor, &next) else {
             panic!("next publication must remain acknowledgeable");
         };
@@ -2926,7 +3235,7 @@ mod tests {
     #[test]
     fn a_changes_advance_publishes_an_empty_claim() {
         let pending = PendingCoverage::new();
-        let id = pending.publish_without_report(1);
+        let id = pending.publish_without_report(crate::cursor::WalkGeneration::for_test(1));
         let ClaimLookup::Apply(claim) = pending.claim(id) else {
             panic!("an empty claim is still a known publication");
         };
@@ -2938,7 +3247,10 @@ mod tests {
         for door in 0..3 {
             let pending = PendingCoverage::new();
             let cp = backfill_checkpoint(b"page:0:10");
-            let id = pending.register(cp, CoverageClaim::new(degraded("owed"), 1));
+            let id = pending.register(
+                cp,
+                CoverageClaim::new(degraded("owed"), crate::cursor::WalkGeneration::for_test(1)),
+            );
             assert_eq!(pending.pending_checkpoints(), 1);
             match door {
                 0 => pending.retire(id),
@@ -2960,7 +3272,10 @@ mod tests {
     #[test]
     fn retiring_an_unacknowledgeable_publication_frees_it() {
         let pending = PendingCoverage::new();
-        let id = pending.publish(CoverageClaim::new(degraded("a"), 1));
+        let id = pending.publish(CoverageClaim::new(
+            degraded("a"),
+            crate::cursor::WalkGeneration::for_test(1),
+        ));
         assert_eq!(pending.outstanding(), 1);
         pending.retire(id.clone());
         assert_eq!(pending.outstanding(), 0);

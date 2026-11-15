@@ -255,9 +255,10 @@ impl SyncEngine {
         // ArcSwap holds the current `Arc<dyn Account>` so spawned
         // workers see post-reopen handles immediately.
         let current: Arc<ArcSwap<crate::types::Incarnation>> = Arc::new(ArcSwap::from_pointee(
-            crate::types::Incarnation::new(opened, 0),
+            crate::types::Incarnation::new(opened, crate::types::Incarnation::initial_generation()),
         ));
-        let (account_generation_tx, account_generation_rx) = watch::channel(0_u64);
+        let (account_generation_tx, account_generation_rx) =
+            watch::channel(crate::types::Incarnation::initial_generation());
         let reopen_lock = Arc::new(AsyncMutex::new(()));
 
         // Control handle shared between the SyncControl returned to
@@ -402,7 +403,7 @@ impl SyncEngine {
         );
 
         let (push_health_tx, _) = watch::channel(crate::push::health::PushHealth {
-            generation: 0,
+            generation: crate::types::Incarnation::initial_generation(),
             lanes: if current.load().capabilities().push == bifrost_types::PushCapability::None {
                 Vec::new()
             } else {
@@ -418,8 +419,9 @@ impl SyncEngine {
                     .collect()
             },
         });
-        let (push_topology_tx, push_topology_rx) = watch::channel(0_u64);
-        let (push_retired_tx, _) = watch::channel(0_u64);
+        let (push_topology_tx, push_topology_rx) =
+            watch::channel(crate::engine::PushTopologyGeneration::default());
+        let (push_retired_tx, _) = watch::channel(crate::types::Incarnation::initial_generation());
         let push_lanes = crate::push::lanes::PushLanes {
             account_id: account_id.clone(),
             current: Arc::clone(&current),
@@ -775,7 +777,7 @@ impl SyncEngine {
             if classified_as_inventory || has_resume_stream {
                 return Ok(InitialScope::DeferredInventory(DeferredInventory {
                     epoch: cursors.lifecycle_epoch(&scope),
-                    fence: 0,
+                    fence: crate::cursor::PendingCoverage::initial_fence(),
                     kind: DeferredKind::Resume(existing),
                 }));
             }
@@ -794,7 +796,7 @@ impl SyncEngine {
             CursorEstablishment::EstablishViaInventory => {
                 Ok(InitialScope::DeferredInventory(DeferredInventory {
                     epoch: cursors.lifecycle_epoch(&scope),
-                    fence: 0,
+                    fence: crate::cursor::PendingCoverage::initial_fence(),
                     kind: DeferredKind::Start(scope),
                 }))
             }
@@ -989,7 +991,7 @@ pub(super) async fn run_deferred_inventory_establishment(
         // can still reach the listener's arms after a reattach, and must not act
         // on the replacement, whose own reattach discovery establishes the
         // scope afresh.
-        let mut walked_generation: u64;
+        let mut walked_generation: crate::types::AccountGeneration;
         let outcome = loop {
             if !control.wait_until_running(&shutdown).await {
                 return;

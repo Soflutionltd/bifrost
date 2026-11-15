@@ -300,6 +300,7 @@ async fn fetch_batch<T: HttpTransport>(
 
     let state = response.state().to_string();
     let not_found = response.not_found().to_vec();
+    let answer_context = response.answer_context;
     let items = reconcile_hydration(
         &requested,
         response.into_list(),
@@ -307,6 +308,7 @@ async fn fetch_batch<T: HttpTransport>(
         projection,
         &state,
         owner,
+        answer_context,
     );
 
     if items.is_empty() {
@@ -348,6 +350,7 @@ fn reconcile_hydration(
     projection: Projection,
     state: &str,
     owner: Option<&str>,
+    answer_context: crate::core::answer::AnswerContext,
 ) -> Vec<ItemOutcome<HydratedObject>> {
     // Keyed by the exact id that went on the wire (`wire_object_id`):
     // native for the routed foreign owner, literal otherwise - so an
@@ -381,29 +384,28 @@ fn reconcile_hydration(
     // preserving the stream's one-outcome-per-submission contract.
     for id in requested {
         let native = wire_object_id(id, owner);
-        let Some(email) = by_native.get(native).cloned() else {
-            let error = if not_found.contains(native) {
-                super::error::get_id_not_found(
-                    id.0.clone(),
+        let answer = crate::core::answer::IdAnswer::from_parts(
+            by_native.get(native).cloned(),
+            None,
+            not_found.contains(native),
+        )
+        .into_result(&id.0, answer_context);
+        let email = match answer {
+            Ok(email) => email,
+            Err(error) => {
+                let error = super::error::into_account_error(
+                    error,
                     super::error::JmapErrorContext::message(
                         bifrost_types::AccountOperation::Hydrate,
                         id.0.clone(),
                     ),
-                )
-            } else {
-                super::error::get_id_unanswered(
-                    &id.0,
-                    super::error::JmapErrorContext::message(
-                        bifrost_types::AccountOperation::Hydrate,
-                        id.0.clone(),
-                    ),
-                )
-            };
-            items.push(ItemOutcome::Failed(bifrost_types::BatchFailure::new(
-                BatchItemId(id.0.clone()),
-                error,
-            )));
-            continue;
+                );
+                items.push(ItemOutcome::Failed(bifrost_types::BatchFailure::new(
+                    BatchItemId(id.0.clone()),
+                    error,
+                )));
+                continue;
+            }
         };
         if matches!(projection, Projection::FlagsOnly) && !email.has_keywords() {
             items.push(ItemOutcome::Failed(bifrost_types::BatchFailure::new(
@@ -495,6 +497,7 @@ mod tests {
             Projection::FlagsOnly,
             "s1",
             None,
+            crate::core::answer::AnswerContext::default(),
         );
         assert_eq!(items.len(), 2);
         assert!(matches!(&items[0], ItemOutcome::Failed(f) if matches!(
@@ -746,6 +749,7 @@ mod tests {
             Projection::FlagsOnly,
             "s1",
             None,
+            crate::core::answer::AnswerContext::default(),
         );
 
         assert_eq!(reported_ids(&outcomes), vec!["m0", "m1", "m2"]);
@@ -806,6 +810,7 @@ mod tests {
             Projection::FlagsOnly,
             "s1",
             None,
+            crate::core::answer::AnswerContext::default(),
         );
 
         assert_eq!(outcomes.len(), 2);
@@ -832,6 +837,7 @@ mod tests {
             Projection::FlagsOnly,
             "s1",
             Some("acct-9"),
+            crate::core::answer::AnswerContext::default(),
         );
 
         assert_eq!(outcomes.len(), 1);
@@ -871,6 +877,7 @@ mod tests {
             Projection::Metadata,
             "s1",
             Some("acct-9"),
+            crate::core::answer::AnswerContext::default(),
         );
 
         assert_eq!(outcomes.len(), 1);
@@ -931,8 +938,15 @@ mod tests {
             "keywords": {}
         }))
         .expect("email fixture decodes");
-        let outcomes =
-            reconcile_hydration(&bare, vec![answered], &[], Projection::Metadata, "s1", None);
+        let outcomes = reconcile_hydration(
+            &bare,
+            vec![answered],
+            &[],
+            Projection::Metadata,
+            "s1",
+            None,
+            crate::core::answer::AnswerContext::default(),
+        );
         let ItemOutcome::Succeeded(success) = &outcomes[0] else {
             panic!("the primary id hydrated");
         };
@@ -971,6 +985,7 @@ mod tests {
             "s1",
             // Primary route: the account is not registered.
             None,
+            crate::core::answer::AnswerContext::default(),
         );
 
         assert_eq!(outcomes.len(), 1);
@@ -1007,6 +1022,7 @@ mod tests {
             Projection::FlagsOnly,
             "s1",
             None,
+            crate::core::answer::AnswerContext::default(),
         );
 
         assert_eq!(reported_ids(&outcomes), vec!["m0", "m1"]);

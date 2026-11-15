@@ -4149,7 +4149,7 @@ live numbered set the slowest-reader rule is evaluated against),
 `walk_watermark`, `minted_here`, `note_undelivered`, `take_backfill_discard`,
 `take_backfill_discards` and `undelivered_watermark` with the completion
 guarantee. `PublicationReceipt` gained a public field,
-`walk_watermark: Option<u64>`, which is a struct-literal break for any
+`walk_watermark: Option<UndeliveredMark>`, which is a struct-literal break for any
 downstream constructing one. `BackfillConfig` gained `lane_capacity`, and
 `WriterRequest` a `DiscardBackfillProgress` variant. The enum is public and
 re-exported as `bifrost_sync::multiplexer::WriterRequest`; its variants are
@@ -4347,3 +4347,50 @@ proof accepted. An operator must not see a failed repair attempt as progress.
 Maintenance admission releases its scheduler permit before waiting on the
 control boundary after activity registration refuses. It also watches shutdown
 and its own boundary while waiting, so a separate Stop cannot strand that wait.
+
+
+## Counter ownership
+
+Engine ordering values have distinct opaque types with private representations.
+There are no primitive conversions or mixed-type comparisons. Production code
+obtains them from the owner; test-only fixture constructors are not published.
+In particular a scope fence, a walk's loss watermark, a publication number,
+a lifecycle epoch and an account generation cannot be substituted at a call.
+
+| Value | Owner and operations |
+|---|---|
+| `cursor::ScopeFence` | `PendingCoverage` burns exclusive bounds under its ledger lock, compares producer snapshots and tests whether a publication is excluded. Scope, account and backfill fences use the same bound semantics. `initial_fence` supplies the attach-time baseline. |
+| `cursor::PublicationNumber` | `PendingCoverage` mints the compact identity carried by `PublicationId`; display and ordering remain available, with segment extraction confined to coverage. |
+| `cursor::UndeliveredMark` | `PendingCoverage` records scope-local losses and supplies walk snapshots; a walk compares those snapshots for completion. `PublicationReceipt::walk_watermark` carries this type. |
+| `cursor::WalkGeneration` | `PendingCoverage::next_generation` issues coverage proof order. Claims, barriers, retained proofs, repair resolutions and discharge audits carry it throughout the writer path. Empty claims use the owner's initial baseline. |
+| `cursor::LifecycleEpoch` | `CursorRegistry` advances it only on provider deletion; owed establishment maps retain the epoch they observed. |
+| `cursor::TopologyGeneration` and `cursor::ScopeDeleteGeneration` | `CursorRegistry` owns topology replacement and per-scope deletion independently. The two fields of `DriveGeneration` are typed separately. |
+| `cursor::ScopeIncarnation` | `CursorRegistry` mints membership identity on insertion; backfill scan keys pair the scope with this typed identity. Cursor advancement preserves it. |
+| `types::AccountGeneration` | `Incarnation` supplies initial and replacement identities. Recovery requests, push health, lifecycle watches and reconciler holds retain the installed connection's identity. |
+| `engine::ReattachAttempt` | `ReattachGuard` issues process-wide provisional-row ownership ids; writer claims, commit and abort carry them unchanged. |
+| `engine::ResetCount` | `DeferredSchemaReset` counts committed clears and snapshots that count when parking an owed reset. |
+| `multiplexer::ReceiverSequence` | `ChangeDelivery` numbers admitted subscribers. Coverage records delivery and readership against those numbers without issuing them. |
+| `backfill::scope_walk::WalkTotal` | `ScopeWalkDriver` folds observed partition counts; the total supplies completion progress with the established one-past-count marker convention and exposes `count` for reporting. |
+
+Internal `ScopeTokenGeneration`, `PushTopologyGeneration` and
+`CheckpointGeneration` separately represent poll-task ownership, push topology
+notifications and control-boundary observations. Repair request correlation uses
+its own process-wide counter in `repair`, returning the existing protocol
+`RepairAttemptId`; it no longer consumes coverage proof generations. The
+counter restarts with the process, and that is deliberate: an attempt id is
+matched only inside the one repair pass that minted it (its `outstanding` map).
+The ledger persists it solely as audit detail inside
+`DischargeEvidence::RepairedAndPublished`, and neither the discharge fingerprint
+(evidence KIND only) nor any reader compares it across passes or restarts. A
+reused value after a restart therefore cannot pair with a stale attempt. If a
+durable reader ever keys on it, give it an instance segment the way publication
+ids carry one.
+
+These are representation wrappers, not a storage migration. Ledger generation
+fields and discharge fingerprints still use the same eight little-endian bytes;
+the ledger envelope remains version 9. Backfill completion progress still writes
+`items_done = observed + 1` (saturating) and `items_estimated = observed`.
+Publication segments and counters retain their existing packed representation.
+Proof order remains attachment-local: restoring durable proofs does not seed the
+next attachment's walk counter. The types do not change that ordering policy or
+add account identity to publication numbers.

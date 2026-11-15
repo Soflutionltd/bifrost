@@ -41,7 +41,7 @@ use jiff::tz::Offset;
 
 use crate::types::{
     AclRight, FetchAttr, Flag, MailboxAttribute, MailboxName, MailboxRights, SearchCriteria,
-    StatusItem, StoreOperation, ThreadNode,
+    StatusItem, ThreadNode,
 };
 
 use super::targets::UidOperand;
@@ -122,6 +122,7 @@ struct FolderProgress {
     error: AccountError,
     stage: Option<StepEffect>,
     targets: StepTargets,
+    siblings: Vec<(AccountError, StepTargets, Option<StepEffect>)>,
 }
 impl From<AccountError> for FolderProgress {
     fn from(error: AccountError) -> Self {
@@ -130,6 +131,7 @@ impl From<AccountError> for FolderProgress {
             error,
             stage: None,
             targets: StepTargets::unknown(),
+            siblings: Vec::new(),
         }
     }
 }
@@ -166,11 +168,15 @@ fn folder_progress_error(progress: FolderProgress) -> AccountError {
         error,
         stage,
         targets,
+        siblings,
     } = progress;
     // Nothing committed: only an uncertain write leg is worth a record (it
     // may have applied); a refusal or an effectless preflight failure is the
     // plain leaf.
     if done.is_empty()
+        && siblings.iter().all(|(error, _, stage)| {
+            stage.is_none() || Application::from_leaf(error) != Application::Uncertain
+        })
         && (stage.is_none() || Application::from_leaf(&error) != Application::Uncertain)
     {
         return error;
@@ -187,6 +193,19 @@ fn folder_progress_error(progress: FolderProgress) -> AccountError {
         },
     );
     let mut record = PartialCommitBuilder::new(primary);
+    for (error, targets, effect) in siblings {
+        record.failed_sibling(
+            effect,
+            targets,
+            effect.map_or(StepReplay::Repeatable, folder_replay),
+            if effect.is_some() {
+                Application::from_leaf(&error)
+            } else {
+                Application::NotApplicable
+            },
+            error,
+        );
+    }
     for effect in done {
         record.committed(
             effect.effect,
@@ -1687,61 +1706,15 @@ async fn copy_messages(
     destination: &MailboxName,
     op: AccountOperation,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
-    let mut done = Vec::new();
-    for (folder, ids) in group_by_folder(ids) {
-        let err = |error| {
-            account.folder_pair_error(
-                error,
-                &folder,
-                Some(destination),
-                super::error::ImapErrorContext::operation(op),
-            )
-        };
-        let preflight = folder_preflight_err(account, &folder, op);
-        let mut stage = None;
-        let result: Result<(), AccountError> = async {
-            let mut conn = account
-                .checkout_for_folder(&folder)
-                .await
-                .map_err(preflight)?;
-            let selected = account
-                .select_folder(&mut conn, &folder, super::SelectPurpose::Mutate)
-                .await
-                .map_err(preflight)?;
-            let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
-            let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
-            let Some(uid_set) = operand.uid_set() else {
-                return Ok(());
-            };
-            stage = Some(StepEffect::Copied);
-            conn.connection()
-                .uid_copy(
-                    uid_set.as_sequence_set(),
-                    &destination,
-                    account.command_timeout(),
-                )
-                .await
-                .map_err(err)?;
-            done.push(FolderEffect {
-                folder: folder.clone(),
-                uids: operand.uids().to_vec(),
-                uidvalidity,
-                effect: StepEffect::Copied,
-                destination: Some(destination.clone()),
-            });
-            Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            return Err(FolderProgress {
-                done,
-                error,
-                stage,
-                targets: super::mutate::folder_targets(&folder, TargetRole::Subject),
-            });
-        }
-    }
-    Ok(done)
+    result_mutation(
+        account,
+        ids,
+        super::mutate::MutationKind::Copy(destination.clone()),
+        StepEffect::Copied,
+        Some(destination.clone()),
+        op,
+    )
+    .await
 }
 
 async fn delete_messages(
@@ -1749,75 +1722,15 @@ async fn delete_messages(
     ids: Vec<DecodedObjectId>,
     op: AccountOperation,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
-    let mut done = Vec::new();
-    for (folder, ids) in group_by_folder(ids) {
-        let err = folder_err(account, &folder, op);
-        let preflight = folder_preflight_err(account, &folder, op);
-        let mut stage = None;
-        let result: Result<(), AccountError> = async {
-            let mut conn = account
-                .checkout_for_folder(&folder)
-                .await
-                .map_err(preflight)?;
-            let selected = account
-                .select_folder(&mut conn, &folder, super::SelectPurpose::Mutate)
-                .await
-                .map_err(preflight)?;
-            let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
-            let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
-            let Some(uid_set) = operand.uid_set() else {
-                return Ok(());
-            };
-            stage = Some(StepEffect::MarkedDeleted);
-            conn.connection()
-                .uid_store(
-                    uid_set.as_sequence_set(),
-                    StoreOperation::AddSilent,
-                    &[Flag::Deleted],
-                    None,
-                    account.command_timeout(),
-                )
-                .await
-                .map_err(err)?;
-            done.push(FolderEffect {
-                folder: folder.clone(),
-                uids: operand.uids().to_vec(),
-                uidvalidity,
-                effect: StepEffect::MarkedDeleted,
-                destination: None,
-            });
-            stage = Some(StepEffect::Deleted);
-            super::mutate::expunge_uids_or_fall_back(
-                account,
-                &conn,
-                uid_set.as_sequence_set(),
-                operand.uids(),
-            )
-            .await
-            .map_err(err)?;
-            account
-                .folders
-                .clear_modseqs(&folder, uidvalidity, operand.uids());
-            done.push(FolderEffect {
-                folder: folder.clone(),
-                uids: operand.uids().to_vec(),
-                uidvalidity,
-                effect: StepEffect::Deleted,
-                destination: None,
-            });
-            Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            return Err(FolderProgress {
-                done,
-                error,
-                stage,
-                targets: super::mutate::folder_targets(&folder, TargetRole::Subject),
-            });
-        }
-    }
-    Ok(done)
+    result_mutation(
+        account,
+        ids,
+        super::mutate::MutationKind::Destroy,
+        StepEffect::Deleted,
+        None,
+        op,
+    )
+    .await
 }
 
 async fn set_flag(
@@ -1827,61 +1740,146 @@ async fn set_flag(
     value: bool,
     op: AccountOperation,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
-    let operation = if value {
-        StoreOperation::AddSilent
+    let flags = std::collections::HashSet::from([flag.to_string()]);
+    let flags = if value {
+        bifrost_types::FlagOp::Add(flags)
     } else {
-        StoreOperation::RemoveSilent
+        bifrost_types::FlagOp::Remove(flags)
     };
+    result_mutation(
+        account,
+        ids,
+        super::mutate::MutationKind::Flags(flags),
+        StepEffect::Updated,
+        None,
+        op,
+    )
+    .await
+}
+
+/// The engine owns admission and wire truth; this adapter only projects its
+/// per-item answers into the PIM Result and the composed operation's record.
+/// Outlook users expect a partial change to remain visible even when another
+/// member conflicts. Keep every settled answer in the failing window, then
+/// stop before attempting another window or folder.
+async fn result_mutation(
+    account: &ImapAccount,
+    ids: Vec<DecodedObjectId>,
+    kind: super::mutate::MutationKind,
+    effect: StepEffect,
+    destination: Option<MailboxName>,
+    op: AccountOperation,
+) -> Result<Vec<FolderEffect>, FolderProgress> {
+    use bifrost_types::{ItemOutcome, TransmissionState};
     let mut done = Vec::new();
     for (folder, ids) in group_by_folder(ids) {
-        let err = folder_err(account, &folder, op);
-        let preflight = folder_preflight_err(account, &folder, op);
-        let mut stage = None;
-        let result: Result<(), AccountError> = async {
-            let mut conn = account
-                .checkout_for_folder(&folder)
-                .await
-                .map_err(preflight)?;
-            let selected = account
-                .select_folder(&mut conn, &folder, super::SelectPurpose::Mutate)
-                .await
-                .map_err(preflight)?;
-            let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
-            let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
-            let Some(uid_set) = operand.uid_set() else {
-                return Ok(());
+        for window in ids.chunks(account.config.mutation_batch_size.max(1)) {
+            let (outcomes, marked_deleted) = match super::mutate::result_folder_mutation(
+                account,
+                &folder,
+                window.to_vec(),
+                &kind,
+                op,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let mut failure = FolderProgress::from(error);
+                    failure.done = done;
+                    failure.targets = super::mutate::folder_targets(&folder, TargetRole::Subject);
+                    return Err(failure);
+                }
             };
-            stage = Some(StepEffect::Updated);
-            conn.connection()
-                .uid_store(
-                    uid_set.as_sequence_set(),
-                    operation,
-                    std::slice::from_ref(&flag),
-                    None,
-                    account.command_timeout(),
-                )
-                .await
-                .map_err(err)?;
-            account
-                .folders
-                .clear_modseqs(&folder, uidvalidity, operand.uids());
-            done.push(FolderEffect {
-                folder: folder.clone(),
-                uids: operand.uids().to_vec(),
-                uidvalidity,
-                effect: StepEffect::Updated,
-                destination: None,
-            });
-            Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            return Err(FolderProgress {
-                done,
-                error,
-                stage,
-                targets: super::mutate::folder_targets(&folder, TargetRole::Subject),
-            });
+            // The destroy engine supplies exactly the subset whose STORE
+            // landed but EXPUNGE failed. Never infer it from the error kind.
+            for (epoch, uids) in &marked_deleted {
+                done.push(FolderEffect {
+                    folder: folder.clone(),
+                    uids: uids.clone(),
+                    uidvalidity: *epoch,
+                    effect: StepEffect::MarkedDeleted,
+                    destination: None,
+                });
+            }
+            let mut failure: Option<FolderProgress> = None;
+            let mut succeeded = Vec::new();
+            for outcome in outcomes {
+                let (item, error) = match outcome {
+                    ItemOutcome::Succeeded(success) => {
+                        succeeded.push(success.item);
+                        continue;
+                    }
+                    ItemOutcome::Failed(failed) => (failed.item, failed.error),
+                    ItemOutcome::Uncertain(uncertain) => (uncertain.item, uncertain.error),
+                };
+                let id = window
+                    .iter()
+                    .find(|id| id.id.0 == item.0)
+                    .expect("engine answers under submitted identity");
+                let expunge_failed = marked_deleted
+                    .iter()
+                    .any(|(epoch, uids)| *epoch == id.uidvalidity && uids.contains(&id.uid));
+                let stage = if expunge_failed {
+                    Some(StepEffect::Deleted)
+                } else if matches!(
+                    error.chain().iter().find_map(|cause| match cause {
+                        bifrost_types::Cause::Attempt(attempt) => Some(attempt.transmission_state),
+                        _ => None,
+                    }),
+                    Some(TransmissionState::Acknowledged | TransmissionState::InFlight)
+                ) || Application::from_leaf(&error) == Application::Uncertain
+                {
+                    Some(if effect == StepEffect::Deleted {
+                        StepEffect::MarkedDeleted
+                    } else {
+                        effect
+                    })
+                } else {
+                    None
+                };
+                let targets = folder_effect_targets(&FolderEffect {
+                    folder: folder.clone(),
+                    uids: vec![id.uid],
+                    uidvalidity: id.uidvalidity,
+                    effect,
+                    destination: destination.clone(),
+                });
+                if let Some(failure) = &mut failure {
+                    failure.siblings.push((error, targets, stage));
+                } else {
+                    failure = Some(FolderProgress {
+                        done: Vec::new(),
+                        error,
+                        stage,
+                        targets,
+                        siblings: Vec::new(),
+                    });
+                }
+            }
+            // Preserve the selected epoch and aggregate one committed effect
+            // per epoch/window, including successes beside a MODIFIED refusal.
+            let mut epochs: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+            for item in succeeded {
+                let id = window
+                    .iter()
+                    .find(|id| id.id.0 == item.0)
+                    .expect("engine answers under submitted identity");
+                epochs.entry(id.uidvalidity).or_default().push(id.uid);
+            }
+            for (uidvalidity, uids) in epochs {
+                done.push(FolderEffect {
+                    folder: folder.clone(),
+                    uids,
+                    uidvalidity,
+                    effect,
+                    destination: destination.clone(),
+                });
+            }
+            if let Some(mut failure) = failure {
+                failure.done = done;
+                return Err(failure);
+            }
         }
     }
     Ok(done)
@@ -1992,10 +1990,8 @@ fn native_thread_folders(
 /// handle runs one UID SEARCH per folder chosen by `native_thread_folders`
 /// under the epoch SELECT reports now; the handle records no UIDVALIDITY, so
 /// there is no stale epoch to refuse here. An epoch change between this
-/// resolution and the write is refused by `valid_uids` as `Request(Malformed)`,
-/// the existing PIM rule for every IMAP mutation; whether that class should
-/// instead be a retryable conflict is an open ruling item shared by every
-/// PIM primitive, so it is deliberately not changed for threads alone.
+/// resolution and the write receives the shared mutation engine's stale-epoch
+/// answer. Hydration separately validates its read epoch through `valid_uids`.
 async fn resolve_thread_members(
     account: &ImapAccount,
     thread: &ThreadId,
@@ -2113,10 +2109,8 @@ fn valid_uids(
     let mut uids = Vec::new();
     for id in ids {
         if id.uidvalidity != uidvalidity {
-            // Ruling (wave 2): kept as Request(Malformed), the PIM-wide rule
-            // for a stale mailbox epoch, thread handles included. Whether this
-            // class should become a retryable conflict is an open ruling item
-            // shared by every PIM primitive; change it here, for all of them.
+            // This is the hydration read guard. Writes use the shared
+            // mutation engine's per-target stale-epoch classification.
             return Err(pim_malformed(
                 op,
                 "UIDVALIDITY changed before IMAP operation",
@@ -4620,8 +4614,10 @@ body text\r\n";
 
 #[cfg(test)]
 mod partial_commit_tests {
+    use super::super::folder_registry::FolderRegistry;
     use super::super::test_support::scripted_account_parts;
     use super::*;
+    use crate::types::MailboxInfo;
     use crate::connection::test_support::{
         driver_pair, preauth_greeting, read_line, respond, tag_of,
     };
@@ -4767,6 +4763,140 @@ mod partial_commit_tests {
             native_thread_folders(no_all, NativeThreadKind::Gmail, ThreadScope::Account).len(),
             2
         );
+    }
+
+    // These transcripts pin the Result adapter at the actual engine boundary:
+    // a direct unguarded STORE would fail the command assertion, and expunging
+    // the conflicting UID would fail the delete transcript.
+    #[tokio::test]
+    async fn result_mutations_share_modseq_conflicts_and_committed_subsets() {
+        for delete in [false, true] {
+            let (conn, mut server) =
+                driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS CONDSTORE")).await;
+            let mut parts = scripted_account_parts(conn, 1);
+            let folder = MailboxName::new("INBOX").unwrap();
+            parts.folders = std::sync::Arc::new(FolderRegistry::from_lists(
+                vec![MailboxInfo {
+                    name: folder.clone(),
+                    delimiter: Some('/'),
+                    ..Default::default()
+                }],
+                Vec::new(),
+            ));
+            for uid in [1, 2] {
+                parts.folders.record_modseq(&folder, 7, uid, 99).unwrap();
+            }
+            let account = ImapAccount::new(parts);
+            let script = tokio::spawn(async move {
+                let select = read_line(&mut server).await;
+                respond(&mut server, &format!(
+                    "* 2 EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Seen \\Deleted)\r\n* OK [UIDVALIDITY 7] epoch\r\n* OK [HIGHESTMODSEQ 100] modseq\r\n{} OK selected\r\n",
+                    tag_of(&select),
+                )).await;
+                let store = read_line(&mut server).await;
+                assert!(store.contains("UID STORE"), "{store}");
+                assert!(store.contains("UNCHANGEDSINCE 99"), "{store}");
+                respond(
+                    &mut server,
+                    &format!("{} OK [MODIFIED 2] partial\r\n", tag_of(&store),),
+                )
+                .await;
+                if delete {
+                    let expunge = read_line(&mut server).await;
+                    assert!(expunge.contains("UID EXPUNGE 1\r\n"), "{expunge}");
+                    respond(&mut server, &format!("{} OK gone\r\n", tag_of(&expunge))).await;
+                }
+                server
+            });
+            let ids = [1, 2]
+                .into_iter()
+                .map(|uid| DecodedObjectId::canonical(folder.clone(), 7, uid))
+                .collect();
+            let op = if delete {
+                AccountOperation::RemoveFromContainer
+            } else {
+                AccountOperation::SetIsRead
+            };
+            let result = if delete {
+                delete_messages(&account, ids, op).await
+            } else {
+                set_flag(&account, ids, Flag::Seen, true, op).await
+            };
+            let failure = match result {
+                Err(failure) => failure,
+                Ok(_) => panic!("MODIFIED member must fail the Result"),
+            };
+            let error = folder_progress_error(failure);
+            assert_eq!(error.operation(), Some(op));
+            assert!(matches!(
+                error.kind(),
+                AccountErrorKind::ConcurrencyConflict
+            ));
+            let steps = error.partial_commit().unwrap().steps();
+            assert_eq!(steps.len(), 1);
+            assert_eq!(
+                steps[0].effect(),
+                Some(if delete {
+                    StepEffect::Deleted
+                } else {
+                    StepEffect::Updated
+                })
+            );
+            assert_eq!(steps[0].targets().refs.len(), 1);
+            assert_eq!(account.folders.modseq(&folder, 7, 1), None);
+            assert_eq!(account.folders.modseq(&folder, 7, 2), Some(99));
+            let _server = script.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn result_copy_preserves_live_epoch_commit_beside_stale_target() {
+        let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS")).await;
+        let account = ImapAccount::new(scripted_account_parts(conn, 1));
+        let script = tokio::spawn(async move {
+            let select = read_line(&mut server).await;
+            respond(&mut server, &format!(
+                "* 1 EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Seen)\r\n* OK [UIDVALIDITY 7] epoch\r\n{} OK selected\r\n",
+                tag_of(&select),
+            )).await;
+            let copy = read_line(&mut server).await;
+            assert!(copy.contains("UID COPY 2 "), "{copy}");
+            respond(&mut server, &format!("{} OK copied\r\n", tag_of(&copy))).await;
+            server
+        });
+        let folder = MailboxName::new("INBOX").unwrap();
+        let result = copy_messages(
+            &account,
+            vec![
+                DecodedObjectId::canonical(folder.clone(), 6, 1),
+                DecodedObjectId::canonical(folder.clone(), 6, 3),
+                DecodedObjectId::canonical(folder, 7, 2),
+            ],
+            &MailboxName::new("Archive").unwrap(),
+            AccountOperation::AddToContainer,
+        )
+        .await;
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("stale target must fail the Result"),
+        };
+        let error = folder_progress_error(failure);
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+        let record = error.partial_commit().unwrap();
+        assert_eq!(record.primary().effect, None);
+        assert_eq!(record.steps().len(), 2);
+        assert!(
+            record
+                .steps()
+                .iter()
+                .any(|step| step.effect() == Some(StepEffect::Copied))
+        );
+        assert!(record.steps().iter().any(|step| step.effect().is_none()));
+        assert!(error.recovery().requires_reconciliation());
+        let _server = script.await.unwrap();
     }
 
     #[tokio::test]
@@ -4982,6 +5112,7 @@ mod partial_commit_tests {
             error,
             stage,
             targets: super::super::mutate::folder_targets(&folder, TargetRole::Subject),
+            siblings: Vec::new(),
         };
         let leaf = |attempt| {
             super::super::account_error_with(

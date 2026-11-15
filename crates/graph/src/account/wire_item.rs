@@ -54,7 +54,9 @@ impl<'a> GraphItem<'a> {
     pub(super) fn decode(value: &'a Value) -> Self {
         let text = |name| value.get(name).and_then(Value::as_str);
         Self {
-            id: text("id"),
+            // Empty text cannot key an object, just like an absent or invalid
+            // id. Both delta lanes consume this same identity observation.
+            id: text("id").filter(|id| !id.is_empty()),
             parent_folder: text("parentFolderId"),
             conversation: text("conversationId"),
             etag: text("@odata.etag"),

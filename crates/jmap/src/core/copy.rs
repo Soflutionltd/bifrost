@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::Error;
-
 use super::id::AccountId;
 use super::set::{SetError, SetObject};
 
@@ -36,6 +34,8 @@ pub(crate) struct CopyRequest<O: SetObject> {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct CopyResponse<O: SetObject> {
+    #[serde(skip)]
+    pub(crate) answer_context: crate::core::answer::AnswerContext,
     #[serde(rename = "fromAccountId")]
     from_account_id: AccountId,
 
@@ -135,13 +135,15 @@ impl<O: SetObject> CopyResponse<O> {
     }
 
     pub(crate) fn created(&mut self, id: &str) -> crate::Result<O> {
-        if let Some(result) = self.created.as_mut().and_then(|r| r.remove(id)) {
-            Ok(result)
-        } else if let Some(error) = self.not_created.as_mut().and_then(|r| r.remove(id)) {
-            Err(error.to_string_error().into())
-        } else {
-            Err(Error::SetIdUnanswered(id.to_string()))
-        }
+        crate::core::answer::IdAnswer::from_parts(
+            self.created.as_mut().and_then(|values| values.remove(id)),
+            self.not_created
+                .as_mut()
+                .and_then(|values| values.remove(id))
+                .map(|error| crate::Error::Set(error.to_string_error())),
+            false,
+        )
+        .into_result(id, self.answer_context)
     }
 
     pub(crate) fn into_created(self) -> Option<Vec<O>> {

@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[cfg(test)]
 use crate::Error;
 use crate::core::id::{AccountId, BlobId};
 
@@ -81,6 +82,8 @@ pub(crate) struct DataSourceBase64 {
 /// the consumer-provided create-id (e.g. "b1"), not real blob IDs.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct BlobUploadResponse {
+    #[serde(skip)]
+    pub(crate) answer_context: crate::core::answer::AnswerContext,
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -110,6 +113,10 @@ impl crate::core::method::JmapMethod for BlobUploadRequest {
     type Cap = crate::core::capability::Blob;
     type Response = BlobUploadResponse;
 
+    fn stamp_response(response: &mut Self::Response, context: crate::core::answer::AnswerContext) {
+        response.answer_context = context;
+    }
+
     fn set_account_id(&mut self, account_id: &AccountId) {
         self.account_id = account_id.clone();
     }
@@ -121,6 +128,10 @@ impl crate::core::method::JmapMethod for BlobGetRequest {
     type Cap = crate::core::capability::Blob;
     type Response = BlobGetResponse;
 
+    fn stamp_response(response: &mut Self::Response, context: crate::core::answer::AnswerContext) {
+        response.answer_context = context;
+    }
+
     fn set_account_id(&mut self, account_id: &AccountId) {
         self.account_id = account_id.clone();
     }
@@ -131,6 +142,10 @@ impl crate::core::method::JmapMethod for BlobLookupRequest {
     const NAME: &'static str = "Blob/lookup";
     type Cap = crate::core::capability::Blob;
     type Response = BlobLookupResponse;
+
+    fn stamp_response(response: &mut Self::Response, context: crate::core::answer::AnswerContext) {
+        response.answer_context = context;
+    }
 
     fn set_account_id(&mut self, account_id: &AccountId) {
         self.account_id = account_id.clone();
@@ -248,13 +263,15 @@ impl BlobUploadResponse {
 
     /// Look up a successful or failed create by its create-id (e.g. "b1").
     pub(crate) fn created(&mut self, id: &str) -> crate::Result<BlobUploadCreated> {
-        if let Some(result) = self.created.as_mut().and_then(|r| r.remove(id)) {
-            Ok(result)
-        } else if let Some(error) = self.not_created.as_ref().and_then(|r| r.get(id)) {
-            Err(Error::Set(error.clone()))
-        } else {
-            Err(Error::SetIdUnanswered(id.to_string()))
-        }
+        crate::core::answer::IdAnswer::from_parts(
+            self.created.as_mut().and_then(|values| values.remove(id)),
+            self.not_created
+                .as_mut()
+                .and_then(|values| values.remove(id))
+                .map(|error| crate::Error::Set(error.to_string_error())),
+            false,
+        )
+        .into_result(id, self.answer_context)
     }
 
     /// Iterate the create-ids of successful uploads (consumer-provided
@@ -296,6 +313,8 @@ pub(crate) struct BlobGetRequest {
 /// Response for `Blob/get`.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct BlobGetResponse {
+    #[serde(skip)]
+    pub(crate) answer_context: crate::core::answer::AnswerContext,
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -416,6 +435,14 @@ impl BlobGetRequest {
 }
 
 impl BlobGetResponse {
+    pub(crate) fn answer(&self, id: &BlobId) -> crate::core::answer::IdAnswer<&BlobGetResult> {
+        crate::core::answer::IdAnswer::from_parts(
+            self.list.iter().find(|entry| &entry.id == id),
+            None,
+            self.not_found.as_ref().is_some_and(|ids| ids.contains(id)),
+        )
+    }
+
     pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
@@ -456,6 +483,8 @@ pub(crate) struct BlobLookupRequest {
 /// Response for `Blob/lookup`.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct BlobLookupResponse {
+    #[serde(skip)]
+    pub(crate) answer_context: crate::core::answer::AnswerContext,
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -522,6 +551,14 @@ impl BlobLookupRequest {
 }
 
 impl BlobLookupResponse {
+    pub(crate) fn answer(&self, id: &BlobId) -> crate::core::answer::IdAnswer<&BlobLookupResult> {
+        crate::core::answer::IdAnswer::from_parts(
+            self.list.iter().find(|entry| &entry.id == id),
+            None,
+            self.not_found.as_ref().is_some_and(|ids| ids.contains(id)),
+        )
+    }
+
     pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }

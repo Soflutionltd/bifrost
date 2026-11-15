@@ -1654,7 +1654,7 @@ fn mutation_outcome_contract_failure() -> AccountError {
 async fn forward_campaign_directives(
     slot: &AccountSlot,
     directives: Vec<(Option<CursorScope>, AccountError)>,
-    generation: Option<u64>,
+    generation: Option<crate::types::AccountGeneration>,
 ) -> bool {
     for (scope, error) in directives {
         let request = ReopenRequest::Recovery {

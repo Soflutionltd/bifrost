@@ -89,19 +89,19 @@ pub enum RepairResolution {
     Recovered {
         key: ObligationKey,
         attempt: RepairAttemptId,
-        generation: u64,
+        generation: crate::cursor::WalkGeneration,
     },
     /// Proved not owed. Nothing was published, so nothing is awaited.
     Irrelevant {
         key: ObligationKey,
         detail: String,
-        generation: u64,
+        generation: crate::cursor::WalkGeneration,
     },
     /// Split into children. Atomic parent-to-children swap.
     Replaced {
         key: ObligationKey,
         proof: Box<RegionRepairProof>,
-        generation: u64,
+        generation: crate::cursor::WalkGeneration,
     },
     /// This attempt did not resolve it. Costs one attempt against the lineage.
     Deferred { key: ObligationKey },
@@ -152,7 +152,7 @@ pub(crate) async fn run_repair_pass_observed(
     max_requests: usize,
     observe: Option<&(dyn Fn(&bifrost_types::AccountError) + Sync)>,
 ) -> Result<usize, Error> {
-    let planned = plan_requests(ledger, coverage, max_requests);
+    let planned = plan_requests(ledger, max_requests);
     if planned.is_empty() {
         return Ok(0);
     }
@@ -387,14 +387,21 @@ pub(crate) async fn run_repair_pass_observed(
 struct PlannedRequest {
     request: InventoryRepairRequest,
     scope: CursorScope,
-    generation: u64,
+    generation: crate::cursor::WalkGeneration,
 }
 
-fn plan_requests(
-    ledger: &DebtLedger,
-    coverage: &Arc<crate::cursor::PendingCoverage>,
-    max_requests: usize,
-) -> Vec<PlannedRequest> {
+// Repair correlation is independent of proof order. A repair can issue many
+// requests against one walk; consuming walk generations here conflates owners.
+// Restarting at 0 per process is safe: an id is paired only within the pass
+// that minted it (`outstanding`), and the ledger keeps it as audit detail that
+// neither the discharge fingerprint nor any reader compares. A durable reader
+// keyed on it would need an instance segment, like publication ids.
+fn next_repair_attempt() -> RepairAttemptId {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    RepairAttemptId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+fn plan_requests(ledger: &DebtLedger, max_requests: usize) -> Vec<PlannedRequest> {
     ledger
         .repairable()
         .take(max_requests)
@@ -402,7 +409,7 @@ fn plan_requests(
             let target = entry.target.clone()?;
             Some(PlannedRequest {
                 request: InventoryRepairRequest {
-                    attempt: RepairAttemptId(coverage.next_generation()),
+                    attempt: next_repair_attempt(),
                     key: entry.key.clone(),
                     domain: entry.domain.clone(),
                     target,
@@ -462,7 +469,8 @@ fn publish_recovered(
     // Carries no coverage report: a repair proves things about specific
     // obligations, not about a region of an enumeration, so it must not touch
     // the coverage lattice.
-    let publication = coverage.publish_without_report(0);
+    let publication =
+        coverage.publish_without_report(crate::cursor::PendingCoverage::initial_generation());
     let batch = bifrost_types::Batch {
         items: changes,
         page_boundary: bifrost_types::PageBoundary::Final,
@@ -507,7 +515,7 @@ mod tests {
                 target,
             },
             scope: scope(),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
         }
     }
 

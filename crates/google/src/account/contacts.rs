@@ -13,10 +13,9 @@ use std::sync::Arc;
 
 use base64::Engine;
 use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, AddressBook,
-    AddressBookId, ContactCard, ContactCorpus, ContactCreate, ContactEmail, ContactId,
-    ContactOrganization, ContactPatch, ContactPhone, ContactProvenance, ContactSearchRequest,
-    DirectoryCard, Page, ProtocolKind,
+    AccountError, AccountFuture, AccountOperation, AddressBook, AddressBookId, ContactCard,
+    ContactCorpus, ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch,
+    ContactPhone, ContactProvenance, ContactSearchRequest, DirectoryCard, Page, ProtocolKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -1427,8 +1426,8 @@ struct ContactGroupMembership {
 #[cfg(test)]
 mod tests {
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
-    use bifrost_types::{AccessErrorKind, AccountErrorKind};
     use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
+    use bifrost_types::{AccessErrorKind, AccountErrorKind};
     use bytes::Bytes;
     use reqwest::StatusCode;
 

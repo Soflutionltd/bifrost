@@ -66,25 +66,11 @@ impl ImapConnection {
     /// happens, the connection is already in the UTF-8-capable mode that
     /// `UTF8=ONLY` requires.
     pub(super) fn check_utf8_only_enforced(&self) -> Result<(), Error> {
-        let snap = self.state_rx.borrow();
-        let utf8_enabled = snap
-            .enabled
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT"));
-        let needs_utf8 = snap.capabilities.contains(&Capability::Utf8Only)
-            && !utf8_enabled
-            && !super::auth::is_rev2_from_snapshot(&snap);
-        drop(snap);
-        if needs_utf8 {
-            // A mode the caller has not established, not a missing server
-            // capability: the same request succeeds after the ENABLE.
-            return Err(Error::InvalidState(crate::error::LocalFailure::state(
-                crate::error::StateRequirement::Enabled(Capability::Utf8Accept),
-                "server requires ENABLE UTF8=ACCEPT before use \
-                 (UTF8=ONLY advertised, RFC 6855 Section 3)",
-            )));
+        super::admission::SessionView {
+            snapshot: &self.state_rx.borrow(),
+            tls_active: self.is_encrypted(),
         }
-        Ok(())
+        .check_utf8_only_enforced()
     }
 
     /// Ensure the session is in a state `kind` may be sent in (RFC 3501
@@ -100,23 +86,11 @@ impl ImapConnection {
     /// both sites: a command `CommandKind::refused_after_selection` (ENABLE)
     /// is `InvalidState` once any mailbox has been selected in the session.
     pub(super) fn require_state(&self, kind: crate::types::CommandKind) -> Result<(), Error> {
-        let snap = self.state_rx.borrow();
-        let session_state = snap.session_state;
-        let mailbox_selected = snap.mailbox_selected;
-        drop(snap);
-        if let Some(refusal) = state_refusal(session_state, kind.legal_states()) {
-            return Err(refusal);
+        super::admission::SessionView {
+            snapshot: &self.state_rx.borrow(),
+            tls_active: self.is_encrypted(),
         }
-        if kind.refused_after_selection() && mailbox_selected {
-            return Err(Error::InvalidState(crate::error::LocalFailure::state(
-                crate::error::StateRequirement::BeforeFirstSelection { command: kind },
-                format!(
-                    "{kind:?} is not valid once a mailbox has been selected in the session \
-                 (RFC 5161 Section 3.1)"
-                ),
-            )));
-        }
-        Ok(())
+        .require_state(kind)
     }
 
     /// Verify that the server supports CONDSTORE (RFC 7162 Section 3.1).
@@ -124,25 +98,20 @@ impl ImapConnection {
     /// QRESYNC implies CONDSTORE (RFC 7162 Section 3.2.3), so either
     /// capability satisfies the requirement.
     pub(super) fn require_condstore(&self) -> Result<(), Error> {
-        let snap = self.state_rx.borrow();
-        let has_condstore = super::auth::snapshot_supports(&snap, &Capability::Condstore);
-        drop(snap);
-        if !has_condstore {
-            return Err(Error::MissingCapability("CONDSTORE".into()));
+        super::admission::SessionView {
+            snapshot: &self.state_rx.borrow(),
+            tls_active: self.is_encrypted(),
         }
-        Ok(())
+        .require_condstore()
     }
 
     /// Verify that the server advertises the SEARCHRES capability (RFC 5182 Section 2).
     pub(super) fn require_searchres(&self) -> Result<(), Error> {
-        let snap = self.state_rx.borrow();
-        // RFC 9051 Appendix E: IMAP4rev2 folds SEARCHRES into the base protocol.
-        let has_searchres = super::auth::snapshot_supports(&snap, &Capability::SearchRes);
-        drop(snap);
-        if !has_searchres {
-            return Err(Error::MissingCapability("SEARCHRES".into()));
+        super::admission::SessionView {
+            snapshot: &self.state_rx.borrow(),
+            tls_active: self.is_encrypted(),
         }
-        Ok(())
+        .require_searchres()
     }
 
     /// Returns `true` when a generic SEARCH RETURN command requests the SAVE
@@ -160,10 +129,11 @@ impl ImapConnection {
     /// `true` when the server advertises support for the named quota resource
     /// via `QUOTA=RES-<name>` (RFC 9208 Section 3.1.1).
     pub(super) fn has_quota_resource(&self, resource: &str) -> bool {
-        let snap = self.state_rx.borrow();
-        snap.capabilities.iter().any(|cap| {
-            Self::quota_resource_name(cap).is_some_and(|name| name.eq_ignore_ascii_case(resource))
-        })
+        super::admission::SessionView {
+            snapshot: &self.state_rx.borrow(),
+            tls_active: self.is_encrypted(),
+        }
+        .has_quota_resource(resource)
     }
 
     /// Returns the quota resource name from `QUOTA=RES-<name>`
@@ -187,104 +157,11 @@ impl ImapConnection {
         selection_options: &[&str],
         return_options: &[&str],
     ) -> Result<(), Error> {
-        if patterns.is_empty() {
-            return Err(Error::InvalidInput(
-                "LIST-EXTENDED requires at least one mailbox pattern \
-                 (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
-                    .into(),
-            ));
+        super::admission::SessionView {
+            snapshot: &self.state_rx.borrow(),
+            tls_active: self.is_encrypted(),
         }
-
-        {
-            let snap = self.state_rx.borrow();
-
-            if patterns.len() > 1
-                && !super::auth::snapshot_supports(&snap, &Capability::ListExtended)
-            {
-                return Err(Error::MissingCapability("LIST-EXTENDED".into()));
-            }
-
-            // RFC 5258 Section 3 defines selection options and return options as
-            // LIST-EXTENDED syntax on IMAP4rev1, even when the individual option
-            // token comes from another extension such as RFC 6154 SPECIAL-USE or
-            // RFC 5819 LIST-STATUS.
-            let needs_list_extended = !selection_options.is_empty() || !return_options.is_empty();
-
-            if needs_list_extended
-                && !super::auth::snapshot_supports(&snap, &Capability::ListExtended)
-            {
-                return Err(Error::MissingCapability("LIST-EXTENDED".into()));
-            }
-
-            for option in selection_options {
-                let trimmed = option.trim();
-                if trimmed.is_empty() {
-                    return Err(Error::InvalidInput(
-                        "LIST-EXTENDED selection options must not be empty \
-                         (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
-                            .into(),
-                    ));
-                }
-                if trimmed.eq_ignore_ascii_case("SPECIAL-USE")
-                    && !super::auth::snapshot_supports(&snap, &Capability::SpecialUse)
-                {
-                    return Err(Error::MissingCapability("SPECIAL-USE".into()));
-                }
-            }
-        }
-
-        let has_recursivematch = selection_options
-            .iter()
-            .any(|option| option.trim().eq_ignore_ascii_case("RECURSIVEMATCH"));
-        for option in return_options {
-            let trimmed = option.trim();
-            if trimmed.is_empty() {
-                return Err(Error::InvalidInput(
-                    "LIST-EXTENDED return options must not be empty \
-                     (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
-                        .into(),
-                ));
-            }
-
-            {
-                let snap = self.state_rx.borrow();
-                if trimmed.eq_ignore_ascii_case("SPECIAL-USE")
-                    && !super::auth::snapshot_supports(&snap, &Capability::SpecialUse)
-                {
-                    return Err(Error::MissingCapability("SPECIAL-USE".into()));
-                }
-            }
-
-            if let Some(status_items) =
-                Self::list_status_return_option_items(trimmed).transpose()?
-            {
-                {
-                    let snap = self.state_rx.borrow();
-                    if !super::auth::snapshot_supports(&snap, &Capability::ListStatus) {
-                        return Err(Error::MissingCapability("LIST-STATUS".into()));
-                    }
-                }
-                self.validate_requested_status_items(status_items)?;
-            }
-        }
-
-        if has_recursivematch
-            && !selection_options.iter().any(|option| {
-                let trimmed = option.trim();
-                !trimmed.is_empty()
-                    && !trimmed.eq_ignore_ascii_case("RECURSIVEMATCH")
-                    && !trimmed.eq_ignore_ascii_case("REMOTE")
-            })
-        {
-            return Err(Error::InvalidInput(
-                "LIST-EXTENDED selection option RECURSIVEMATCH requires another \
-                 non-REMOTE selection option (RFC 5258 Section 3 / \
-                 RFC 9051 Section 6.3.9)"
-                    .into(),
-            ));
-        }
-
-        Ok(())
+        .validate_list_extended_request(patterns, selection_options, return_options)
     }
 
     /// RFC 5819 Section 2 adds the reserved `STATUS (<items>)` return option
@@ -312,74 +189,11 @@ impl ImapConnection {
     /// `HIGHESTMODSEQ` (RFC 7162 Section 3.1.7), `APPENDLIMIT`
     /// (RFC 7889 Section 3), and `MAILBOXID` (RFC 8474 Section 5.1).
     pub(super) fn validate_requested_status_items(&self, items: &str) -> Result<(), Error> {
-        for item in Self::status_item_tokens(items)? {
-            match item.to_ascii_uppercase().as_str() {
-                "RECENT" => {
-                    if self.is_rev2() {
-                        return Err(Error::MissingCapability(
-                            crate::error::CapabilityFailure::new(
-                                "IMAP4rev2".into(),
-                                crate::error::CapabilityFailureReason::RemovedInRev2,
-                                "STATUS item RECENT was removed in IMAP4rev2 \
-                             (RFC 9051 Section 6.3.11)",
-                            ),
-                        ));
-                    }
-                }
-                "DELETED" => {
-                    // Deliberately NOT `snapshot_supports(StatusDeleted)`. The
-                    // two agree under active rev2; they differ only on rev1,
-                    // where the authority would also accept an advertised
-                    // `STATUS=DELETED` token. No RFC defines that token: RFC
-                    // 9051 Section 6.3.11 makes DELETED a base rev2 item, and
-                    // the only rev1 route is RFC 9208 Section 4.1.4's
-                    // QUOTA=RES-MESSAGE. The gate therefore names exactly
-                    // those two sources.
-                    if !self.is_rev2() && !self.has_quota_resource("MESSAGE") {
-                        return Err(Error::MissingCapability(
-                            crate::error::CapabilityFailure::new(
-                                "QUOTA=RES-MESSAGE".into(),
-                                crate::error::CapabilityFailureReason::Alternatives(vec![
-                                    "IMAP4rev2".into(),
-                                ]),
-                                "STATUS item DELETED requires IMAP4rev2 or \
-                             QUOTA=RES-MESSAGE (RFC 9051 Section 6.3.11 / \
-                             RFC 9208 Section 4.1.4)",
-                            ),
-                        ));
-                    }
-                }
-                "DELETED-STORAGE" => {
-                    if !self.has_quota_resource("STORAGE") {
-                        return Err(Error::MissingCapability("QUOTA=RES-STORAGE".into()));
-                    }
-                }
-                "SIZE" => {
-                    let snap = self.state_rx.borrow();
-                    if !super::auth::snapshot_supports(&snap, &Capability::StatusSize) {
-                        return Err(Error::MissingCapability("STATUS=SIZE".into()));
-                    }
-                }
-                "HIGHESTMODSEQ" => self.require_condstore()?,
-                "APPENDLIMIT" => {
-                    let has_appendlimit = !matches!(
-                        self.server_profile().append_limit,
-                        crate::types::profile::AppendLimitPolicy::NotAdvertised
-                    );
-                    if !has_appendlimit {
-                        return Err(Error::MissingCapability("APPENDLIMIT".into()));
-                    }
-                }
-                "MAILBOXID" => {
-                    let snap = self.state_rx.borrow();
-                    if !super::auth::snapshot_supports(&snap, &Capability::ObjectId) {
-                        return Err(Error::MissingCapability("OBJECTID".into()));
-                    }
-                }
-                _ => {}
-            }
+        super::admission::SessionView {
+            snapshot: &self.state_rx.borrow(),
+            tls_active: self.is_encrypted(),
         }
-        Ok(())
+        .validate_requested_status_items(items)
     }
 
     /// Validate requested FETCH data items against negotiated extensions
@@ -398,57 +212,11 @@ impl ImapConnection {
     /// - `EMAILID` / `THREADID` require OBJECTID (RFC 8474 Sections 4 and 7),
     ///   on rev2 as well.
     pub(super) fn validate_requested_fetch_items(&self, items: &[FetchAttr]) -> Result<(), Error> {
-        let snap = self.state_rx.borrow();
-        let usable = |capability: Capability| super::auth::snapshot_supports(&snap, &capability);
-        for item in items {
-            match item {
-                // RFC 7162 Section 3.1.5: MODSEQ requires CONDSTORE/QRESYNC
-                // (the authority treats QRESYNC as implying CONDSTORE).
-                FetchAttr::ModSeq => {
-                    if !usable(Capability::Condstore) {
-                        return Err(Error::MissingCapability("CONDSTORE".into()));
-                    }
-                }
-                // RFC 8970 Section 4: PREVIEW requires PREVIEW capability.
-                FetchAttr::Preview | FetchAttr::PreviewLazy => {
-                    if !usable(Capability::Preview) {
-                        return Err(Error::MissingCapability("PREVIEW".into()));
-                    }
-                }
-                // RFC 8514 Section 3: SAVEDATE requires SAVEDATE capability.
-                FetchAttr::SaveDate => {
-                    if !usable(Capability::SaveDate) {
-                        return Err(Error::MissingCapability("SAVEDATE".into()));
-                    }
-                }
-                // RFC 8474 Sections 4 and 7: EMAILID/THREADID require OBJECTID.
-                FetchAttr::EmailId | FetchAttr::ThreadId => {
-                    if !usable(Capability::ObjectId) {
-                        return Err(Error::MissingCapability("OBJECTID".into()));
-                    }
-                }
-                FetchAttr::GmailMsgId | FetchAttr::GmailThreadId | FetchAttr::GmailLabels => {
-                    if !usable(Capability::XGmExt1) {
-                        return Err(Error::MissingCapability("X-GM-EXT-1".into()));
-                    }
-                }
-                // RFC 9051 Appendix B: IMAP4rev2 folds the FETCH side of
-                // RFC 3516 into the base protocol, but not its APPEND side,
-                // so the rev2 clause is asked here and NOT through
-                // `supports(Binary)`, which stays advertised-only.
-                FetchAttr::Binary { .. } | FetchAttr::BinarySize { .. }
-                    if !crate::types::profile::binary_fetch_usable(
-                        &snap.capabilities,
-                        &snap.enabled,
-                    ) =>
-                {
-                    return Err(Error::MissingCapability("BINARY".into()));
-                }
-                FetchAttr::Binary { .. } | FetchAttr::BinarySize { .. } => {}
-                _ => {}
-            }
+        super::admission::SessionView {
+            snapshot: &self.state_rx.borrow(),
+            tls_active: self.is_encrypted(),
         }
-        Ok(())
+        .validate_fetch_wire(&format_fetch_attrs(items))
     }
 
     /// Parse a STATUS data item list into individual item atoms.
@@ -569,15 +337,7 @@ impl ImapConnection {
         // `is_rev2_from_snapshot` already handles dual-mode servers: it
         // returns true only after `ENABLE IMAP4rev2` (or on pure-rev2
         // servers). Once rev2 is active, CHECK is undefined.
-        if self.is_rev2() {
-            return Err(Error::MissingCapability(
-                crate::error::CapabilityFailure::new(
-                    "IMAP4rev2".into(),
-                    crate::error::CapabilityFailureReason::RemovedInRev2,
-                    "CHECK is not defined in IMAP4rev2 (RFC 9051); use NOOP instead",
-                ),
-            ));
-        }
+
         self.submit_regular(
             Command::Check,
             super::dispatch::TaggedOkConsumer::default(),

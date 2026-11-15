@@ -181,11 +181,7 @@ pub(crate) fn create<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::EventCreate))?;
         let event = response
             .created(&create_id)
-            .map_err(super::error::set_answer_error(
-                AccountOperation::EventCreate,
-                "CalendarEvent/set",
-                false,
-            ))?;
+            .map_err(super::error::answer_error(AccountOperation::EventCreate))?;
         super::error::require_created_id(
             event.id().as_ref().map(CalendarEventId::as_str),
             AccountOperation::EventCreate,
@@ -236,7 +232,6 @@ pub(crate) fn update<T: HttpTransport>(
         let jmap_patch =
             jmap_patch_from_event_patch(&patch, &context, AccountOperation::EventUpdate)?;
         let mut set = CalendarEventSet::new();
-        let guarded = expected.is_some();
         if let Some(state) = expected {
             set = set.if_in_state(state);
         }
@@ -247,11 +242,7 @@ pub(crate) fn update<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::EventUpdate))?;
         response
             .updated(&id)
-            .map_err(super::error::set_answer_error(
-                AccountOperation::EventUpdate,
-                "CalendarEvent/set",
-                guarded,
-            ))?;
+            .map_err(super::error::answer_error(AccountOperation::EventUpdate))?;
         Ok(())
     })
 }
@@ -276,7 +267,6 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
         let calendars = require_calendars(calendars, AccountOperation::EventDelete)?;
         let id = CalendarEventId::new(event.0);
         let mut set = CalendarEventSet::new().destroy([id.clone()]);
-        let guarded = expected.is_some();
         if let Some(state) = expected {
             set = set.if_in_state(state);
         }
@@ -286,11 +276,7 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::EventDelete))?;
         response
             .destroyed(&id)
-            .map_err(super::error::set_answer_error(
-                AccountOperation::EventDelete,
-                "CalendarEvent/set",
-                guarded,
-            ))
+            .map_err(super::error::answer_error(AccountOperation::EventDelete))
     })
 }
 
@@ -319,7 +305,6 @@ pub(crate) fn rsvp_if_version<T: HttpTransport>(
         let patch = jmap_rsvp_patch_from_participants(current.participants(), &self_emails, status)
             .map_err(|message| unsupported(AccountOperation::EventRsvp, message))?;
         let mut set = CalendarEventSet::new();
-        let guarded = expected.is_some();
         if let Some(state) = expected {
             set = set.if_in_state(state);
         }
@@ -330,11 +315,7 @@ pub(crate) fn rsvp_if_version<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::EventRsvp))?;
         response
             .updated(&id)
-            .map_err(super::error::set_answer_error(
-                AccountOperation::EventRsvp,
-                "CalendarEvent/set",
-                guarded,
-            ))?;
+            .map_err(super::error::answer_error(AccountOperation::EventRsvp))?;
         Ok(())
     })
 }
@@ -479,42 +460,30 @@ fn reconcile_events(
     list: Vec<JmapCalendarEvent>,
     operation: AccountOperation,
 ) -> HydratedEvents {
-    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut failed_ids: Vec<String> = Vec::new();
-    for missing in not_found {
-        let missing = missing.clone().into_string();
-        if answered.insert(missing.clone()) {
-            failed_ids.push(missing);
-        }
-    }
-
-    let mut events = Vec::with_capacity(list.len());
-    for event in list {
-        // An object returned without a usable id is a handle to nothing;
-        // the crate's other walks refuse the shape. Dropping it leaves the
-        // submitted id unanswered, so it still reaches `failed_ids` below.
-        let Some(id) = event.id().map(CalendarEventId::into_string) else {
-            continue;
-        };
-        if id.is_empty() {
-            continue;
-        }
-        match event_from_jmap(event, operation) {
-            Ok(event) => {
-                answered.insert(id);
-                events.push(event);
-            }
-            Err(_) => {
-                if answered.insert(id.clone()) {
-                    failed_ids.push(id);
-                }
-            }
-        }
-    }
-
-    for id in requested {
-        if answered.insert(id.clone()) {
-            failed_ids.push(id);
+    let not_found = not_found
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut seen = std::collections::HashSet::new();
+    let requested = requested
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect::<Vec<_>>();
+    let answers = crate::core::answer::read_answers(&requested, list, &not_found, |object| {
+        object
+            .id()
+            .map(CalendarEventId::into_string)
+            .filter(|id| !id.is_empty())
+    });
+    let mut events = Vec::new();
+    let mut failed_ids = Vec::new();
+    for (id, answer) in answers {
+        match answer {
+            crate::core::answer::IdAnswer::Ok(event) => match event_from_jmap(event, operation) {
+                Ok(event) => events.push(event),
+                Err(_) => failed_ids.push(id),
+            },
+            _ => failed_ids.push(id),
         }
     }
     HydratedEvents { events, failed_ids }
@@ -530,10 +499,12 @@ async fn get_raw_event<T: HttpTransport>(
         .await
         .map_err(to_acct_err(operation))?;
     let not_found = response.not_found().contains(&id);
+    let answer_context = response.answer_context;
     super::single_get::require_one(
         response.into_list(),
         |event| event.id().is_some_and(|returned| returned == id),
         not_found,
+        answer_context,
         id.as_str(),
         operation,
         bifrost_types::ErrorScope::Event {
@@ -2114,7 +2085,7 @@ fn validate_shared_attendees(
 /// The calendar page walk's parameters for the shared anchored, state-pinned
 /// page cursor (`page_cursor`): the id marker, the query builder, and the
 /// wording of its diagnostics. Behaviour is not a parameter.
-struct CalendarPages;
+pub(super) struct CalendarPages;
 
 impl PageKind for CalendarPages {
     type ItemId = CalendarEventId;

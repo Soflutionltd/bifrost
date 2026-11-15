@@ -73,7 +73,7 @@ fn validate_no_crlf(s: &str, context: &str) -> Result<(), crate::Error> {
 /// This validator therefore rejects raw CR/LF bytes except when they are part
 /// of a syntactically valid IMAP literal marker and body, and it rejects
 /// non-synchronizing literal markers that are not permitted by `literal_mode`.
-fn validate_search_criteria_crlf(
+pub(crate) fn validate_search_criteria_crlf(
     criteria: &str,
     context: &str,
     literal_mode: LiteralMode,

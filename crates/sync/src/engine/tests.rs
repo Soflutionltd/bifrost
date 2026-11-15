@@ -123,17 +123,17 @@ fn lane_page(scope: &CursorScope, partition: &str, done: u64) -> bifrost_types::
 fn publish_a_marker(
     coverage: &crate::cursor::PendingCoverage,
     checkpoint: &bifrost_types::Checkpoint,
-    walk_watermark: u64,
+    walk_watermark: crate::cursor::UndeliveredMark,
 ) -> crate::cursor::PublicationId {
     let id = coverage.register_walk_marker(
         checkpoint.clone(),
         crate::cursor::CoverageClaim {
             reports: Vec::new(),
-            generation: 0,
+            generation: crate::cursor::WalkGeneration::for_test(0),
         },
         walk_watermark,
     );
-    coverage.mark_delivered(&id, 1);
+    coverage.mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(1));
     id
 }
 
@@ -143,8 +143,8 @@ fn publish_a_page(
     coverage: &crate::cursor::PendingCoverage,
     checkpoint: &bifrost_types::Checkpoint,
 ) -> crate::cursor::PublicationId {
-    let id = control.publish_checkpoint_without_report(checkpoint.clone(), 0);
-    coverage.mark_delivered(&id, 1);
+    let id = control.publish_checkpoint_without_report(checkpoint.clone());
+    coverage.mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(1));
     id
 }
 
@@ -273,7 +273,7 @@ async fn a_discard_fences_the_backfill_lane_and_leaves_live_acks_alone() {
         envelope_version: 1,
     };
     let live_checkpoint = bifrost_types::Checkpoint::Change(live);
-    let live_publication = control.publish_checkpoint_without_report(live_checkpoint.clone(), 0);
+    let live_publication = control.publish_checkpoint_without_report(live_checkpoint.clone());
     let page = lane_page(&scope, "page:10:20", 5);
     let page_publication = publish_a_page(&control, &coverage, &page);
 
@@ -365,7 +365,7 @@ async fn a_marker_ack_retried_after_a_store_failure_keeps_the_scopes_rows() {
         &page,
         crate::cursor::CoverageClaim {
             reports: Vec::new(),
-            generation: 0,
+            generation: crate::cursor::WalkGeneration::for_test(0),
         },
     );
     ack(&tx, page, Some(page_publication))
@@ -437,7 +437,7 @@ async fn a_marker_ack_retried_after_a_loss_still_discards_the_walks_rows() {
         &page,
         crate::cursor::CoverageClaim {
             reports: Vec::new(),
-            generation: 0,
+            generation: crate::cursor::WalkGeneration::for_test(0),
         },
     );
     ack(&tx, page, Some(page_publication))
@@ -450,10 +450,10 @@ async fn a_marker_ack_retried_after_a_loss_still_discards_the_walks_rows() {
         &backfill_checkpoint(bifrost_types::Partition(b"page:10:20".to_vec())),
         crate::cursor::CoverageClaim {
             reports: Vec::new(),
-            generation: 0,
+            generation: crate::cursor::WalkGeneration::for_test(0),
         },
     );
-    coverage.mark_delivered(&stranded, 1);
+    coverage.mark_delivered(&stranded, crate::multiplexer::ReceiverSequence::for_test(1));
 
     let marker = backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
     let marker_publication =
@@ -522,7 +522,10 @@ async fn a_marker_ack_replayed_after_reattach_leaves_the_durable_marker() {
         )
         .await
         .expect("seed the durable marker an earlier attachment earned");
-    assert_eq!(coverage.undelivered_watermark(&scope), 0);
+    assert_eq!(
+        coverage.undelivered_watermark(&scope),
+        crate::cursor::UndeliveredMark::for_test(0)
+    );
     assert_eq!(
         coverage.walk_watermark(&replayed),
         None,
@@ -792,8 +795,14 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
     // published under, and the scope's has moved - rather than the "no reading at
     // all" arm, which refuses nothing and would leave the charge assertion
     // measuring a discard that never ran.
-    assert_eq!(coverage.walk_watermark(&marker_publication), Some(0));
-    assert_ne!(coverage.undelivered_watermark(&scope), 0);
+    assert_eq!(
+        coverage.walk_watermark(&marker_publication),
+        Some(crate::cursor::UndeliveredMark::for_test(0))
+    );
+    assert_ne!(
+        coverage.undelivered_watermark(&scope),
+        crate::cursor::UndeliveredMark::for_test(0)
+    );
 
     // Now the stale marker is acknowledged. It is refused, and its attempt is
     // discarded.
@@ -913,7 +922,7 @@ async fn open_debt_does_not_mask_the_discard_a_lost_walk_needs() {
                 bifrost_types::CoverageDomain::full(email_scope()),
                 vec![unrepresentable("broken")],
             ),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
         ),
     );
     ack(&tx, page, Some(page_publication))
@@ -1617,7 +1626,7 @@ fn degraded_claim(key: &str) -> crate::cursor::CoverageClaim {
             bifrost_types::CoverageDomain::full(email_scope()),
             vec![unrepresentable(key)],
         ),
-        1,
+        crate::cursor::WalkGeneration::for_test(1),
     )
 }
 
@@ -1716,7 +1725,7 @@ async fn an_acknowledged_degraded_page_persists_its_debt() {
                 bifrost_types::CoverageDomain::full(email_scope()),
                 vec![unrepresentable("broken")],
             ),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
         ),
     );
     ack(&tx, checkpoint, Some(publication))
@@ -1810,7 +1819,11 @@ async fn an_account_schema_reset_deletes_every_scope_and_its_completion_markers(
     let mut ledger = crate::cursor::DebtLedger::default();
     for key in ["old-retrying", "old-waived", "old-blocked"] {
         let claim = degraded_claim(key);
-        ledger.ingest_debt_only(&claim.reports[0], 1, 1);
+        ledger.ingest_debt_only(
+            &claim.reports[0],
+            crate::cursor::WalkGeneration::for_test(1),
+            1,
+        );
     }
     ledger.record_attempt(&bifrost_types::ObligationKey(b"old-retrying".to_vec()), 3);
     ledger.waive(
@@ -1950,7 +1963,7 @@ async fn each_partition_acknowledges_its_own_coverage() {
                 bifrost_types::CoverageDomain::full(email_scope()),
                 vec![unrepresentable("from-partition-a")],
             ),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
         ),
     );
     // Partition B publishes AFTER A, and reports a clean walk.
@@ -1961,7 +1974,7 @@ async fn each_partition_acknowledges_its_own_coverage() {
             bifrost_types::InventoryCoverageReport::complete(bifrost_types::CoverageDomain::full(
                 email_scope(),
             )),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
         ),
     );
 
@@ -1998,7 +2011,7 @@ async fn the_completion_sentinel_is_withheld_over_open_debt() {
                 bifrost_types::CoverageDomain::full(email_scope()),
                 vec![unrepresentable("broken")],
             ),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
         ),
     );
     ack(&tx, page, Some(debt)).await.expect("ack persisted");
@@ -2010,7 +2023,7 @@ async fn the_completion_sentinel_is_withheld_over_open_debt() {
         &completion,
         crate::cursor::CoverageClaim {
             reports: Vec::new(),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
         },
     );
     ack(&tx, completion, Some(sentinel))
@@ -2086,7 +2099,7 @@ async fn a_withheld_completion_sentinel_is_not_announced_durable() {
                 bifrost_types::CoverageDomain::full(email_scope()),
                 vec![unrepresentable("broken")],
             ),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
         ),
     );
     ack(&tx, page.clone(), Some(debt)).await.expect("ack lands");
@@ -2098,7 +2111,7 @@ async fn a_withheld_completion_sentinel_is_not_announced_durable() {
         &completion,
         crate::cursor::CoverageClaim {
             reports: Vec::new(),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
         },
     );
     ack(&tx, completion.clone(), Some(sentinel))
@@ -2139,7 +2152,7 @@ async fn a_waiver_releases_the_sentinel_without_claiming_proof() {
                 bifrost_types::CoverageDomain::full(email_scope()),
                 vec![unrepresentable("broken")],
             ),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
         ),
     );
     ack(&tx, page, Some(debt)).await.expect("ack persisted");
@@ -2189,7 +2202,10 @@ async fn an_unknown_publication_is_refused_rather_than_assumed_complete() {
     let result = ack(
         &tx,
         backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec())),
-        Some(crate::cursor::PendingCoverage::new().publish_without_report(0)),
+        Some(
+            crate::cursor::PendingCoverage::new()
+                .publish_without_report(crate::cursor::WalkGeneration::for_test(0)),
+        ),
     )
     .await;
     assert!(
@@ -2215,7 +2231,7 @@ async fn seed_debt(
                 bifrost_types::CoverageDomain::full(email_scope()),
                 vec![unrepresentable(key)],
             ),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
         ),
     );
     ack(tx, page, Some(publication))
@@ -2259,7 +2275,7 @@ async fn a_recovery_discharges_only_after_the_consumer_acknowledges() {
         vec![crate::repair::RepairResolution::Recovered {
             key: key.clone(),
             attempt: bifrost_types::RepairAttemptId(1),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
         }],
         None,
     )
@@ -2276,13 +2292,13 @@ async fn a_recovery_discharges_only_after_the_consumer_acknowledges() {
     );
 
     // Now with an acknowledgeable publication.
-    let publication = coverage.publish_without_report(0);
+    let publication = coverage.publish_without_report(crate::cursor::WalkGeneration::for_test(0));
     apply_repair(
         &tx,
         vec![crate::repair::RepairResolution::Recovered {
             key: key.clone(),
             attempt: bifrost_types::RepairAttemptId(2),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
         }],
         Some(publication.clone()),
     )
@@ -2346,7 +2362,7 @@ async fn a_repair_acknowledgement_cannot_consume_a_checkpoint_publication() {
                 bifrost_types::CoverageDomain::full(email_scope()),
                 vec![unrepresentable("broken")],
             ),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
         ),
     );
 
@@ -2406,7 +2422,7 @@ async fn definitive_irrelevance_discharges_without_publishing() {
         vec![crate::repair::RepairResolution::Irrelevant {
             key: key.clone(),
             detail: "absent under cursor bridge".into(),
-            generation: 1,
+            generation: crate::cursor::WalkGeneration::for_test(1),
         }],
         None,
     )
@@ -2484,7 +2500,7 @@ async fn repeated_stalled_splits_exhaust_the_lineage() {
                     }],
                     authority: "test".into(),
                 }),
-                generation: 1,
+                generation: crate::cursor::WalkGeneration::for_test(1),
             }],
             None,
         )
@@ -2562,7 +2578,7 @@ async fn an_aborted_reattach_spares_a_cursor_an_ack_has_claimed() {
     for name in ["acked", "orphan"] {
         let (done, wait) = oneshot::channel();
         tx.send(WriterRequest::ReattachInsert {
-            attempt: 1,
+            attempt: crate::engine::ReattachAttempt::for_test(1),
             cursor: cursor(name),
             done,
         })
@@ -2586,9 +2602,12 @@ async fn an_aborted_reattach_spares_a_cursor_an_ack_has_claimed() {
     wait.await.expect("writer answered").expect("ack persisted");
 
     let (done, wait) = oneshot::channel();
-    tx.send(WriterRequest::ReattachAbort { attempt: 1, done })
-        .await
-        .expect("writer alive");
+    tx.send(WriterRequest::ReattachAbort {
+        attempt: crate::engine::ReattachAttempt::for_test(1),
+        done,
+    })
+    .await
+    .expect("writer alive");
     wait.await.expect("abort ran");
 
     assert!(
@@ -2652,7 +2671,7 @@ impl ProvisionalWriter {
         CursorScope::Folder(FolderId(name.into()))
     }
 
-    async fn insert(&self, attempt: u64, name: &str) {
+    async fn insert(&self, attempt: crate::engine::ReattachAttempt, name: &str) {
         use bifrost_types::{ChangeCursor, OpaqueChangeState, ProtocolKind};
         let (done, wait) = oneshot::channel();
         self.tx
@@ -2675,7 +2694,7 @@ impl ProvisionalWriter {
         wait.await.expect("writer answered").expect("insert");
     }
 
-    async fn abort(&self, attempt: u64) {
+    async fn abort(&self, attempt: crate::engine::ReattachAttempt) {
         let (done, wait) = oneshot::channel();
         self.tx
             .send(WriterRequest::ReattachAbort { attempt, done })
@@ -2684,14 +2703,14 @@ impl ProvisionalWriter {
         wait.await.expect("abort ran");
     }
 
-    async fn commit(&self, attempt: u64) {
+    async fn commit(&self, attempt: crate::engine::ReattachAttempt) {
         self.tx
             .send(WriterRequest::ReattachCommit { attempt })
             .await
             .expect("writer alive");
     }
 
-    async fn read(&self, name: &str, claim_for: Option<u64>) -> bool {
+    async fn read(&self, name: &str, claim_for: Option<crate::engine::ReattachAttempt>) -> bool {
         let (done, wait) = oneshot::channel();
         self.tx
             .send(WriterRequest::GetChangeCursor {
@@ -2730,9 +2749,15 @@ impl ProvisionalWriter {
 async fn a_stale_abort_spares_a_later_attempts_rows() {
     let writer = ProvisionalWriter::spawn();
 
-    writer.insert(1, "a-row").await;
-    writer.insert(2, "b-row").await;
-    writer.abort(1).await;
+    writer
+        .insert(crate::engine::ReattachAttempt::for_test(1), "a-row")
+        .await;
+    writer
+        .insert(crate::engine::ReattachAttempt::for_test(2), "b-row")
+        .await;
+    writer
+        .abort(crate::engine::ReattachAttempt::for_test(1))
+        .await;
 
     assert!(!writer.has("a-row").await, "the aborted attempt's row goes");
     assert!(
@@ -2740,9 +2765,13 @@ async fn a_stale_abort_spares_a_later_attempts_rows() {
         "a delayed abort from attempt 1 must not delete attempt 2's row"
     );
 
-    writer.commit(2).await;
+    writer
+        .commit(crate::engine::ReattachAttempt::for_test(2))
+        .await;
     // A later abort naming the committed attempt finds nothing provisional.
-    writer.abort(2).await;
+    writer
+        .abort(crate::engine::ReattachAttempt::for_test(2))
+        .await;
     assert!(
         writer.has("b-row").await,
         "attempt 2's commit must have promoted its row"
@@ -2758,17 +2787,27 @@ async fn a_stale_abort_spares_a_later_attempts_rows() {
 async fn a_reinserting_attempt_takes_ownership_of_the_scope() {
     let writer = ProvisionalWriter::spawn();
 
-    writer.insert(1, "shared").await;
-    writer.insert(2, "shared").await;
-    writer.abort(1).await;
+    writer
+        .insert(crate::engine::ReattachAttempt::for_test(1), "shared")
+        .await;
+    writer
+        .insert(crate::engine::ReattachAttempt::for_test(2), "shared")
+        .await;
+    writer
+        .abort(crate::engine::ReattachAttempt::for_test(1))
+        .await;
     assert!(
         writer.has("shared").await,
         "attempt 1 no longer owns the row attempt 2 re-inserted"
     );
 
     // The earlier attempt's commit is equally inert.
-    writer.commit(1).await;
-    writer.abort(2).await;
+    writer
+        .commit(crate::engine::ReattachAttempt::for_test(1))
+        .await;
+    writer
+        .abort(crate::engine::ReattachAttempt::for_test(2))
+        .await;
     assert!(
         !writer.has("shared").await,
         "the owning attempt's abort still rolls the row back"
@@ -2784,10 +2823,21 @@ async fn a_reinserting_attempt_takes_ownership_of_the_scope() {
 async fn a_resuming_attempt_claims_a_provisional_row_from_a_stale_abort() {
     let writer = ProvisionalWriter::spawn();
 
-    writer.insert(1, "s").await;
-    assert!(writer.read("s", Some(2)).await, "the row resumes as stored");
-    writer.commit(2).await;
-    writer.abort(1).await;
+    writer
+        .insert(crate::engine::ReattachAttempt::for_test(1), "s")
+        .await;
+    assert!(
+        writer
+            .read("s", Some(crate::engine::ReattachAttempt::for_test(2)))
+            .await,
+        "the row resumes as stored"
+    );
+    writer
+        .commit(crate::engine::ReattachAttempt::for_test(2))
+        .await;
+    writer
+        .abort(crate::engine::ReattachAttempt::for_test(1))
+        .await;
 
     assert!(
         writer.has("s").await,
@@ -2804,11 +2854,15 @@ async fn only_a_reattach_resume_of_a_provisional_row_claims_it() {
     let writer = ProvisionalWriter::spawn();
 
     // A plain read (attach, scope restart) must not steal A's row.
-    writer.insert(1, "s").await;
+    writer
+        .insert(crate::engine::ReattachAttempt::for_test(1), "s")
+        .await;
     // An ordinary read of a still-provisional row answers absent (the live
     // scope establishes fresh) rather than resuming an unconfirmed row.
     assert!(!writer.read("s", None).await);
-    writer.abort(1).await;
+    writer
+        .abort(crate::engine::ReattachAttempt::for_test(1))
+        .await;
     assert!(
         !writer.has("s").await,
         "a non-reattach read must leave the row with the attempt that inserted it"
@@ -2816,10 +2870,23 @@ async fn only_a_reattach_resume_of_a_provisional_row_claims_it() {
 
     // A committed row is not provisional: a claiming read leaves it alone, so
     // the claimant's abort cannot delete it.
-    writer.insert(3, "committed").await;
-    writer.commit(3).await;
-    assert!(writer.read("committed", Some(4)).await);
-    writer.abort(4).await;
+    writer
+        .insert(crate::engine::ReattachAttempt::for_test(3), "committed")
+        .await;
+    writer
+        .commit(crate::engine::ReattachAttempt::for_test(3))
+        .await;
+    assert!(
+        writer
+            .read(
+                "committed",
+                Some(crate::engine::ReattachAttempt::for_test(4))
+            )
+            .await
+    );
+    writer
+        .abort(crate::engine::ReattachAttempt::for_test(4))
+        .await;
     assert!(
         writer.has("committed").await,
         "resuming a committed row must not make it rollback-able"
@@ -2837,19 +2904,20 @@ fn backfill_skips_only_the_fusion_owned_incarnation_and_rescans_new_scopes() {
     let coverage = crate::cursor::PendingCoverage::new();
     let now = tokio::time::Instant::now();
 
-    let first = scan.select(vec![(fused.clone(), 1)], &fusion_owned, now, &coverage);
+    let inc = crate::cursor::ScopeIncarnation::for_test;
+    let first = scan.select(vec![(fused.clone(), inc(1))], &fusion_owned, now, &coverage);
     assert!(
         first.is_empty(),
         "fusion's inventory must not be double-walked"
     );
 
     let later = scan.select(
-        vec![(fused.clone(), 2), (created.clone(), 3)],
+        vec![(fused.clone(), inc(2)), (created.clone(), inc(3))],
         &fusion_owned,
         now,
         &coverage,
     );
-    assert_eq!(later, vec![(fused, 2), (created, 3)]);
+    assert_eq!(later, vec![(fused, inc(2)), (created, inc(3))]);
 }
 
 /// A completed walk retires the incarnation; a failed one does not.
@@ -2862,7 +2930,7 @@ async fn a_failed_backfill_incarnation_stays_eligible_for_retry() {
     let fusion_owned = HashSet::new();
     let mut scan = BackfillScan::default();
     let coverage = crate::cursor::PendingCoverage::new();
-    let available = vec![(scope.clone(), 7)];
+    let available = vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(7))];
 
     assert_eq!(
         scan.select(
@@ -2871,9 +2939,12 @@ async fn a_failed_backfill_incarnation_stays_eligible_for_retry() {
             tokio::time::Instant::now(),
             &coverage
         ),
-        vec![(scope.clone(), 7)]
+        vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(7))]
     );
-    scan.record_attempt((scope.clone(), 7), false);
+    scan.record_attempt(
+        (scope.clone(), crate::cursor::ScopeIncarnation::for_test(7)),
+        false,
+    );
     assert!(
         scan.select(
             available.clone(),
@@ -2893,11 +2964,14 @@ async fn a_failed_backfill_incarnation_stays_eligible_for_retry() {
             tokio::time::Instant::now(),
             &coverage
         ),
-        vec![(scope.clone(), 7)],
+        vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(7))],
         "a failed incarnation must come back once its backoff elapses"
     );
 
-    scan.record_attempt((scope.clone(), 7), true);
+    scan.record_attempt(
+        (scope.clone(), crate::cursor::ScopeIncarnation::for_test(7)),
+        true,
+    );
     tokio::time::advance(super::backfill::BACKFILL_RETRY_CAP * 2).await;
     assert!(
         scan.select(
@@ -2926,7 +3000,7 @@ async fn a_departed_incarnation_leaves_no_residue_behind() {
     let mut scan = BackfillScan::default();
     let coverage = crate::cursor::PendingCoverage::new();
     coverage.note_undelivered(&scope, 3);
-    let key = (scope.clone(), 11);
+    let key = (scope.clone(), crate::cursor::ScopeIncarnation::for_test(11));
 
     scan.select(
         vec![key.clone()],
@@ -2936,11 +3010,15 @@ async fn a_departed_incarnation_leaves_no_residue_behind() {
     );
     assert_eq!(
         scan.begin_walk(&key, &coverage),
-        3,
+        crate::cursor::UndeliveredMark::for_test(3),
         "the walk begins under the scope's current reading"
     );
     scan.note_lost_pages(key.clone());
-    assert_eq!(scan.baseline_for(&key), 3, "which the scan holds for it");
+    assert_eq!(
+        scan.baseline_for(&key),
+        crate::cursor::UndeliveredMark::for_test(3),
+        "which the scan holds for it"
+    );
     assert!(scan.restarts_from_scratch(&key));
 
     // The registry no longer carries it.
@@ -2955,7 +3033,7 @@ async fn a_departed_incarnation_leaves_no_residue_behind() {
     );
     assert_eq!(
         scan.baseline_for(&key),
-        0,
+        crate::cursor::UndeliveredMark::for_test(0),
         "a departed incarnation's baseline must not be kept for the life of the attachment"
     );
     assert!(!scan.restarts_from_scratch(&key), "nor its lost-pages mark");
@@ -2978,7 +3056,7 @@ async fn a_loss_after_the_checks_reopens_the_incarnation_it_settled() {
     let fusion_owned = HashSet::new();
     let mut scan = BackfillScan::default();
     let coverage = crate::cursor::PendingCoverage::new();
-    let available = vec![(scope.clone(), 3)];
+    let available = vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(3))];
 
     assert_eq!(
         scan.select(
@@ -2987,17 +3065,26 @@ async fn a_loss_after_the_checks_reopens_the_incarnation_it_settled() {
             tokio::time::Instant::now(),
             &coverage
         ),
-        vec![(scope.clone(), 3)]
+        vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(3))]
     );
     // A loss BEFORE this walk begins belongs to whatever came earlier, and the
     // baseline it starts under has to include it - otherwise every scope after
     // the first in one rescan batch re-walks over its predecessor's losses.
     coverage.note_undelivered(&scope, 4);
-    assert_eq!(scan.begin_walk(&(scope.clone(), 3), &coverage), 4);
+    assert_eq!(
+        scan.begin_walk(
+            &(scope.clone(), crate::cursor::ScopeIncarnation::for_test(3)),
+            &coverage
+        ),
+        crate::cursor::UndeliveredMark::for_test(4)
+    );
     // And the loss that lands after every check this pass made, before the
     // settle, is precisely the interleaving the writer acts on.
     coverage.note_undelivered(&scope, 1);
-    scan.record_attempt((scope.clone(), 3), true);
+    scan.record_attempt(
+        (scope.clone(), crate::cursor::ScopeIncarnation::for_test(3)),
+        true,
+    );
 
     assert_eq!(
         scan.select(
@@ -3006,12 +3093,12 @@ async fn a_loss_after_the_checks_reopens_the_incarnation_it_settled() {
             tokio::time::Instant::now(),
             &coverage
         ),
-        vec![(scope.clone(), 3)],
+        vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(3))],
         "the incarnation must be reopened: its walk was settled on checks made \
          before a page of it reached nobody"
     );
     assert!(
-        scan.restarts_from_scratch(&(scope, 3)),
+        scan.restarts_from_scratch(&(scope, crate::cursor::ScopeIncarnation::for_test(3))),
         "and reopened as a walk that may not trust its stored resume position"
     );
 }
@@ -3034,7 +3121,7 @@ async fn a_loss_after_a_failed_attempt_restarts_the_next_walk_from_scratch() {
     let fusion_owned = HashSet::new();
     let mut scan = BackfillScan::default();
     let coverage = crate::cursor::PendingCoverage::new();
-    let key = (scope.clone(), 7);
+    let key = (scope.clone(), crate::cursor::ScopeIncarnation::for_test(7));
 
     scan.select(
         vec![key.clone()],
@@ -3042,7 +3129,10 @@ async fn a_loss_after_a_failed_attempt_restarts_the_next_walk_from_scratch() {
         tokio::time::Instant::now(),
         &coverage,
     );
-    assert_eq!(scan.begin_walk(&key, &coverage), 0);
+    assert_eq!(
+        scan.begin_walk(&key, &coverage),
+        crate::cursor::UndeliveredMark::for_test(0)
+    );
     // The attempt ends on a transient failure, with every page it published
     // still in a live consumer's hands.
     scan.record_attempt(key.clone(), false);
@@ -3749,11 +3839,11 @@ async fn a_failed_account_clear_keeps_reattach_ownership() {
     let (account, _, tx, writer) = writer_harness_over(store);
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(7, change_cursor(b"provisional"))
+        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"provisional"))
         .await
         .expect("insert");
     assert!(handle.reset_account_for_schema_recovery().await.is_err());
-    handle.reattach_abort(7).await;
+    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
     assert!(
         inner
             .get_change_cursor(&account, &email_scope())
@@ -3775,7 +3865,7 @@ async fn failed_scope_reset_ownership_case(fail_ledger: bool, transfer: bool) {
         writer_harness_over(Arc::clone(&store) as Arc<DynCheckpointStore>);
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(7, change_cursor(b"provisional"))
+        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"provisional"))
         .await
         .expect("insert");
     store
@@ -3796,7 +3886,7 @@ async fn failed_scope_reset_ownership_case(fail_ledger: bool, transfer: bool) {
         let (done, wait) = oneshot::channel();
         tx.send(WriterRequest::GetChangeCursor {
             scope: email_scope(),
-            claim_for: Some(8),
+            claim_for: Some(crate::engine::ReattachAttempt::for_test(8)),
             done,
         })
         .await
@@ -3810,7 +3900,7 @@ async fn failed_scope_reset_ownership_case(fail_ledger: bool, transfer: bool) {
         .fail_delete
         .store(false, std::sync::atomic::Ordering::SeqCst);
     store.release.add_permits(2);
-    handle.reattach_abort(7).await;
+    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
     if transfer {
         assert!(
             inner
@@ -3820,7 +3910,7 @@ async fn failed_scope_reset_ownership_case(fail_ledger: bool, transfer: bool) {
                 .is_some(),
             "the stale abort must respect the resuming attempt's claim"
         );
-        handle.reattach_abort(8).await;
+        handle.reattach_abort(crate::engine::ReattachAttempt::for_test(8)).await;
     }
     assert!(
         inner
@@ -3859,7 +3949,7 @@ async fn a_failed_scope_reset_backfill_delete_preserves_reattach_ownership() {
     let (account, _, tx, writer) = writer_harness_over(store);
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(7, change_cursor(b"provisional"))
+        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"provisional"))
         .await
         .expect("insert");
     assert!(
@@ -3875,7 +3965,7 @@ async fn a_failed_scope_reset_backfill_delete_preserves_reattach_ownership() {
             .expect("read")
             .is_some()
     );
-    handle.reattach_abort(7).await;
+    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
     assert!(
         inner
             .get_change_cursor(&account, &email_scope())
@@ -3895,7 +3985,7 @@ async fn a_successful_scope_reset_releases_ownership_before_reestablishment() {
     let (account, store, _, tx, writer) = writer_harness();
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(7, change_cursor(b"provisional"))
+        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"provisional"))
         .await
         .expect("insert");
     handle
@@ -3910,7 +4000,7 @@ async fn a_successful_scope_reset_releases_ownership_before_reestablishment() {
     .await
     .expect("writer alive");
     wait.await.expect("answered").expect("persisted");
-    handle.reattach_abort(7).await;
+    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
     assert_eq!(
         store
             .get_change_cursor(&account, &email_scope())
@@ -3992,7 +4082,7 @@ async fn the_detach_race_cleanup_bumps_the_push_topology_after_its_delete() {
     settle(|| !log.unsubscribed().is_empty()).await;
     assert_eq!(
         *topology.borrow(),
-        before + 1,
+        before.plus_for_test(1),
         "only the subscribe has bumped; the cleanup delete is still in flight"
     );
 
@@ -4005,7 +4095,7 @@ async fn the_detach_race_cleanup_bumps_the_push_topology_after_its_delete() {
     assert_eq!(log.unsubscribed().len(), 1);
     assert_eq!(
         *topology.borrow(),
-        before + 2,
+        before.plus_for_test(2),
         "the cleanup delete bumps the topology once it completes"
     );
 }
@@ -4021,7 +4111,7 @@ async fn mismatched_ack_scopes_preserve_provisional_ownership_and_checkpoint_row
         let provisional_cursor = change_cursor(b"provisional");
         let (done, wait) = oneshot::channel();
         tx.send(WriterRequest::ReattachInsert {
-            attempt: 1,
+            attempt: crate::engine::ReattachAttempt::for_test(1),
             cursor: provisional_cursor.clone(),
             done,
         })
@@ -4074,9 +4164,12 @@ async fn mismatched_ack_scopes_preserve_provisional_ownership_and_checkpoint_row
         }
 
         let (done, wait) = oneshot::channel();
-        tx.send(WriterRequest::ReattachAbort { attempt: 1, done })
-            .await
-            .expect("writer alive");
+        tx.send(WriterRequest::ReattachAbort {
+            attempt: crate::engine::ReattachAttempt::for_test(1),
+            done,
+        })
+        .await
+        .expect("writer alive");
         wait.await.expect("abort ran");
         assert!(
             store
@@ -4115,13 +4208,13 @@ async fn failed_rollback_ownership_case(transfer: bool) {
         writer_harness_over(Arc::clone(&store) as Arc<DynCheckpointStore>);
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(7, change_cursor(b"provisional"))
+        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"provisional"))
         .await
         .expect("insert");
     store
         .fail_delete
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    handle.reattach_abort(7).await;
+    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
     assert!(
         inner
             .get_change_cursor(&account, &email_scope())
@@ -4133,7 +4226,7 @@ async fn failed_rollback_ownership_case(transfer: bool) {
         let (done, wait) = oneshot::channel();
         tx.send(WriterRequest::GetChangeCursor {
             scope: email_scope(),
-            claim_for: Some(8),
+            claim_for: Some(crate::engine::ReattachAttempt::for_test(8)),
             done,
         })
         .await
@@ -4144,7 +4237,7 @@ async fn failed_rollback_ownership_case(transfer: bool) {
         .fail_delete
         .store(false, std::sync::atomic::Ordering::SeqCst);
     store.release.add_permits(2);
-    handle.reattach_abort(7).await;
+    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
     if transfer {
         assert!(
             inner
@@ -4153,7 +4246,7 @@ async fn failed_rollback_ownership_case(transfer: bool) {
                 .expect("read")
                 .is_some()
         );
-        handle.reattach_abort(8).await;
+        handle.reattach_abort(crate::engine::ReattachAttempt::for_test(8)).await;
     }
     assert!(
         inner
@@ -4188,7 +4281,7 @@ async fn an_already_persisted_change_ack_promotes_a_provisional_row() {
         &checkpoint,
         crate::cursor::CoverageClaim {
             reports: Vec::new(),
-            generation: 0,
+            generation: crate::cursor::WalkGeneration::for_test(0),
         },
     );
     ack(&tx, checkpoint.clone(), Some(publication.clone()))
@@ -4196,13 +4289,13 @@ async fn an_already_persisted_change_ack_promotes_a_provisional_row() {
         .expect("first ack");
     let handle = WriterHandle::new(tx.clone());
     handle
-        .reattach_insert(7, change_cursor(b"acked"))
+        .reattach_insert(crate::engine::ReattachAttempt::for_test(7),change_cursor(b"acked"))
         .await
         .expect("insert");
     ack(&tx, checkpoint, Some(publication))
         .await
         .expect("duplicate ack");
-    handle.reattach_abort(7).await;
+    handle.reattach_abort(crate::engine::ReattachAttempt::for_test(7)).await;
     assert_eq!(
         store
             .get_change_cursor(&account, &email_scope())
@@ -4267,7 +4360,7 @@ async fn departed_writer_is_shutdown_for_reads_and_writes() {
         Err(Error::ShuttingDown)
     ));
     assert!(matches!(
-        writer.reattach_commit(0).await,
+        writer.reattach_commit(crate::engine::ReattachAttempt::for_test(0)).await,
         Err(Error::ShuttingDown)
     ));
 }

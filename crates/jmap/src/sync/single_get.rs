@@ -2,12 +2,13 @@
 
 use bifrost_types::{AccountError, AccountOperation, ErrorScope};
 
-use super::error::{JmapErrorContext, get_id_unanswered, into_account_error};
+use super::error::{JmapErrorContext, into_account_error};
 
 pub(super) fn require_one<T>(
     items: Vec<T>,
     matches_id: impl Fn(&T) -> bool,
     not_found: bool,
+    answer_context: crate::core::answer::AnswerContext,
     id: &str,
     operation: AccountOperation,
     scope: ErrorScope,
@@ -16,16 +17,9 @@ pub(super) fn require_one<T>(
     // An unrelated object is not evidence about the requested identity.
     // Only an explicit notFound answer establishes absence; an omitted
     // answer remains retryable and must not masquerade as a deletion.
-    if let Some(item) = items.into_iter().find(matches_id) {
-        Ok(item)
-    } else if not_found {
-        Err(into_account_error(
-            crate::Error::IdNotFound(id.to_string()),
-            context,
-        ))
-    } else {
-        Err(get_id_unanswered(id, context))
-    }
+    crate::core::answer::IdAnswer::from_parts(items.into_iter().find(matches_id), None, not_found)
+        .into_result(id, answer_context)
+        .map_err(|error| into_account_error(error, context))
 }
 
 #[cfg(test)]
@@ -71,6 +65,7 @@ mod tests {
                         items.clone(),
                         |item| *item == "wanted",
                         not_found,
+                        crate::core::answer::AnswerContext::default(),
                         "wanted",
                         operation,
                         scope.clone(),
@@ -95,6 +90,7 @@ mod tests {
             vec!["unrelated", "wanted"],
             |item| *item == "wanted",
             false,
+            crate::core::answer::AnswerContext::default(),
             "wanted",
             AccountOperation::ContactGet,
             ErrorScope::Contact {

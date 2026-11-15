@@ -120,10 +120,12 @@ pub(crate) fn get<T: HttpTransport>(
             .await
             .map_err(to_acct_err(operation))?;
         let not_found = response.not_found().contains(&id);
+        let answer_context = response.answer_context;
         let card = super::single_get::require_one(
             response.into_list(),
             |card| card.id().is_some_and(|returned| returned == id),
             not_found,
+            answer_context,
             &contact.0,
             operation,
             bifrost_types::ErrorScope::Contact {
@@ -148,11 +150,7 @@ pub(crate) fn create<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::ContactCreate))?;
         let card = response
             .created(&create_id)
-            .map_err(super::error::set_answer_error(
-                AccountOperation::ContactCreate,
-                "ContactCard/set",
-                false,
-            ))?;
+            .map_err(super::error::answer_error(AccountOperation::ContactCreate))?;
         super::error::require_created_id(
             card.id().as_ref().map(ContactCardId::as_str),
             AccountOperation::ContactCreate,
@@ -190,10 +188,12 @@ pub(crate) fn update<T: HttpTransport>(
                 .await
                 .map_err(to_acct_err(operation))?;
             let not_found = response.not_found().contains(&id);
+            let answer_context = response.answer_context;
             let card = super::single_get::require_one(
                 response.into_list(),
                 |card| card.id().is_some_and(|returned| returned == id),
                 not_found,
+                answer_context,
                 id.as_str(),
                 operation,
                 bifrost_types::ErrorScope::Contact {
@@ -205,7 +205,6 @@ pub(crate) fn update<T: HttpTransport>(
             None
         };
         let mut set = ContactCardSet::new();
-        let guarded = expected.is_some();
         if let Some(state) = expected {
             set = set.if_in_state(state);
         }
@@ -219,11 +218,7 @@ pub(crate) fn update<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::ContactUpdate))?;
         response
             .updated(&id)
-            .map_err(super::error::set_answer_error(
-                AccountOperation::ContactUpdate,
-                "ContactCard/set",
-                guarded,
-            ))?;
+            .map_err(super::error::answer_error(AccountOperation::ContactUpdate))?;
         Ok(())
     })
 }
@@ -248,7 +243,6 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
         let contacts = require_contacts(contacts, AccountOperation::ContactDelete)?;
         let id = ContactCardId::new(contact.0);
         let mut set = ContactCardSet::new().destroy([id.clone()]);
-        let guarded = expected.is_some();
         if let Some(state) = expected {
             set = set.if_in_state(state);
         }
@@ -258,11 +252,7 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::ContactDelete))?;
         response
             .destroyed(&id)
-            .map_err(super::error::set_answer_error(
-                AccountOperation::ContactDelete,
-                "ContactCard/set",
-                guarded,
-            ))
+            .map_err(super::error::answer_error(AccountOperation::ContactDelete))
     })
 }
 
@@ -381,35 +371,29 @@ fn reconcile_cards(
     list: Vec<JmapContactCard>,
     operation: AccountOperation,
 ) -> Result<(Vec<ContactCard>, Vec<String>), AccountError> {
-    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut failed_ids: Vec<String> = Vec::new();
-    for missing in not_found {
-        let missing = missing.clone().into_string();
-        if answered.insert(missing.clone()) {
-            failed_ids.push(missing);
-        }
-    }
-
-    let mut cards = Vec::with_capacity(list.len());
-    for card in list {
-        // An object the server returned without a usable id is not a card:
-        // `ContactId("")` is a handle to nothing, and the crate's other
-        // walks (inventory, hydration, container discovery) already refuse
-        // the shape. Dropping it leaves the submitted id unanswered, so it
-        // still reaches `failed_ids` below instead of vanishing.
-        let Some(id) = card.id().map(ContactCardId::into_string) else {
-            continue;
-        };
-        if id.is_empty() {
-            continue;
-        }
-        answered.insert(id);
-        cards.push(contact_from_jmap(card, operation)?);
-    }
-
-    for id in requested {
-        if answered.insert(id.clone()) {
-            failed_ids.push(id);
+    let not_found = not_found
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut seen = std::collections::HashSet::new();
+    let requested = requested
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect::<Vec<_>>();
+    let answers = crate::core::answer::read_answers(&requested, list, &not_found, |object| {
+        object
+            .id()
+            .map(ContactCardId::into_string)
+            .filter(|id| !id.is_empty())
+    });
+    let mut cards = Vec::new();
+    let mut failed_ids = Vec::new();
+    for (id, answer) in answers {
+        match answer {
+            crate::core::answer::IdAnswer::Ok(card) => {
+                cards.push(contact_from_jmap(card, operation)?);
+            }
+            _ => failed_ids.push(id),
         }
     }
     Ok((cards, failed_ids))
@@ -1007,7 +991,7 @@ fn first_feature(value: Option<&Value>) -> Option<String> {
 /// The contact page walk's parameters for the shared anchored, state-pinned
 /// page cursor (`page_cursor`): the id marker, the query builder, and the
 /// wording of its diagnostics. Behaviour is not a parameter.
-struct ContactPages;
+pub(super) struct ContactPages;
 
 impl PageKind for ContactPages {
     type ItemId = ContactCardId;

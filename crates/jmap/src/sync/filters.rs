@@ -64,7 +64,6 @@ pub(crate) fn list<T: HttpTransport>(
         // `maxObjectsInGet`.
         let batch = super::capabilities::max_objects_in_get(&account.client().session());
         let mut listed = Vec::new();
-        let mut not_found: Vec<String> = Vec::new();
         for chunk in ids.chunks(batch) {
             let response = account
                 .call(SieveScriptGet::new().ids(chunk.to_vec()).properties([
@@ -75,31 +74,15 @@ pub(crate) fn list<T: HttpTransport>(
                 ]))
                 .await
                 .map_err(to_acct_err(AccountOperation::FiltersList))?;
-            not_found.extend(response.not_found().iter().map(ToString::to_string));
-            listed.extend(response.into_list());
-        }
-
-        // Reconcile the answer against the SUBMITTED ids, the way
-        // `hydrate::reconcile_hydration` and `contacts::get_cards` do.
-        // Without this a script the server omits from `list` just
-        // disappears from the returned Vec, and the consumer cannot tell
-        // that from "the filter was deleted" - `notFound` decodes as
-        // empty when absent (see the `/get` leniency rule), so absence
-        // proves nothing on its own. This door has no per-item lane, so
-        // the whole call fails, retryably.
-        for id in &ids {
-            let id = id.as_str();
-            if listed
-                .iter()
-                .any(|script| script.id().is_some_and(|got| got.as_str() == id))
-            {
-                continue;
+            for id in chunk {
+                let script = super::error::query_answer(
+                    response.answer(id, |script| script.id() == Some(id)),
+                    id.as_str(),
+                    response.answer_context,
+                    super::error::JmapErrorContext::new(AccountOperation::FiltersList),
+                )?;
+                listed.push(script.clone());
             }
-            return Err(super::error::get_id_unresolved_after_query(
-                id,
-                not_found.iter().any(|gone| gone == id),
-                super::error::JmapErrorContext::new(AccountOperation::FiltersList),
-            ));
         }
 
         // One `SieveScript/get` describes every script, but each body
@@ -200,11 +183,7 @@ pub(crate) fn create<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::FilterCreate))?;
         let created = response
             .created(&create_id)
-            .map_err(super::error::set_answer_error(
-                AccountOperation::FilterCreate,
-                "SieveScript/set",
-                false,
-            ))?;
+            .map_err(super::error::answer_error(AccountOperation::FilterCreate))?;
         super::error::require_created_id(
             created.id().map(crate::sieve::SieveScriptId::as_str),
             AccountOperation::FilterCreate,
@@ -251,17 +230,14 @@ pub(crate) fn update<T: HttpTransport>(
                 )
                 .await
                 .map_err(to_acct_err(AccountOperation::FilterUpdate))?;
-            let target = response
-                .list()
-                .iter()
-                .find(|script| script.id() == Some(&id));
-            let Some(target) = target else {
-                let context = super::error::JmapErrorContext::new(AccountOperation::FilterUpdate);
-                return Err(if response.not_found().contains(&id) {
-                    super::error::get_filter_not_found(id.as_str(), context)
-                } else {
-                    super::error::get_id_unanswered(id.as_str(), context)
-                });
+            let context = super::error::JmapErrorContext::new(AccountOperation::FilterUpdate);
+            let target = match response.answer(&id, |script| script.id() == Some(&id)) {
+                crate::core::answer::IdAnswer::NotFound(_) => {
+                    return Err(super::error::get_filter_not_found(id.as_str(), context));
+                }
+                answer => answer
+                    .into_result(id.as_str(), response.answer_context)
+                    .map_err(|error| super::error::into_account_error(error, context))?,
             };
             if target.is_active() {
                 set = set.if_in_state(response.state());
@@ -309,11 +285,7 @@ pub(crate) fn update<T: HttpTransport>(
         if has_patch {
             response
                 .updated(&id)
-                .map_err(super::error::set_answer_error(
-                    AccountOperation::FilterUpdate,
-                    "SieveScript/set",
-                    deactivate,
-                ))?;
+                .map_err(super::error::answer_error(AccountOperation::FilterUpdate))?;
         } else {
             response
                 .unwrap_update_errors()
@@ -336,11 +308,7 @@ pub(crate) fn delete<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::FilterDelete))?;
         response
             .destroyed(&id)
-            .map_err(super::error::set_answer_error(
-                AccountOperation::FilterDelete,
-                "SieveScript/set",
-                false,
-            ))
+            .map_err(super::error::answer_error(AccountOperation::FilterDelete))
     })
 }
 

@@ -29,6 +29,31 @@ enum PartitionSource {
     OpenPages { from: u32, chunk: u32 },
 }
 
+/// Entries and explicit removals accumulated by one scope walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkTotal(u64);
+
+impl WalkTotal {
+    /// Observed entries and explicit removals, for progress reporting.
+    #[must_use]
+    pub const fn count(self) -> u64 {
+        self.0
+    }
+
+    fn observe(&mut self, outcome: &BackfillPartitionOutcome) {
+        self.0 = self.0.saturating_add(outcome.seen);
+    }
+
+    /// Completion retains the existing marker encoding: one past the observed
+    /// count, with the observed count as its estimate.
+    pub(crate) fn completion_progress(self) -> bifrost_types::BackfillProgress {
+        bifrost_types::BackfillProgress {
+            items_done: self.0.saturating_add(1),
+            items_estimated: Some(self.0),
+        }
+    }
+}
+
 /// Drives one scope's partition sequence and carries the walk's verdict.
 pub struct ScopeWalkDriver {
     source: PartitionSource,
@@ -36,7 +61,7 @@ pub struct ScopeWalkDriver {
     /// Set once the source can produce nothing further, for any reason.
     exhausted: bool,
     completed: bool,
-    total_seen: u64,
+    total_seen: WalkTotal,
     /// The window most recently handed out, so an open-ended walk knows where
     /// the next one begins only AFTER its outcome is folded in.
     pending_to: Option<u32>,
@@ -67,7 +92,7 @@ impl ScopeWalkDriver {
             walk: BackfillScopeWalk::new(),
             exhausted: false,
             completed: true,
-            total_seen: 0,
+            total_seen: WalkTotal(0),
             pending_to: None,
         }
     }
@@ -93,7 +118,7 @@ impl ScopeWalkDriver {
     /// Returns the scope-level verdict, though callers driving the loop through
     /// `next_partition` do not need to inspect it: a stop is already recorded.
     pub fn fold(&mut self, outcome: &BackfillPartitionOutcome) -> ScopeWalkStep {
-        self.total_seen = self.total_seen.saturating_add(outcome.seen);
+        self.total_seen.observe(outcome);
         if !outcome.complete {
             // The partition finished but left coverage obligations open.
             // Completion is about the enumeration space being exhausted, and it
@@ -155,7 +180,7 @@ impl ScopeWalkDriver {
     /// Inventory entries and explicit removals observed across every
     /// partition walked.
     #[must_use]
-    pub fn total_seen(&self) -> u64 {
+    pub fn total_seen(&self) -> WalkTotal {
         self.total_seen
     }
 }
@@ -309,7 +334,7 @@ mod tests {
         let _ = driver.fold(&exhausted(3));
         assert!(driver.next_partition().is_none());
         assert!(driver.completed(), "a declared exhaustion is a clean end");
-        assert_eq!(driver.total_seen(), 10);
+        assert_eq!(driver.total_seen(), super::WalkTotal(10));
     }
 
     /// A partition stream that ended without any completion declared nothing.

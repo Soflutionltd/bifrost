@@ -264,13 +264,13 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         .try_build()
         .expect("valid account error classification"),
         crate::Error::IdNotFound(id) => convert_id_not_found(id, ctx),
-        // A reader that skipped `set_answer_error` still gets a partial
-        // response, never the terminal `MissingField`. Whether the set carried
-        // `ifInState` is unknown here, so idempotency is narrowed as if it
-        // had: a same-request retry is never advised for a write that may
-        // have landed under a guard. `set_answer_error` supplies the real
-        // method and guard for every reader in this crate.
-        crate::Error::SetIdUnanswered(id) => set_id_unanswered("*/set", &id, ctx, true),
+        crate::Error::IdUnanswered { id, context } => {
+            if context.write {
+                set_id_unanswered(context.method, &id, ctx, context.guarded)
+            } else {
+                get_id_unanswered(context.method, &id, ctx)
+            }
+        }
         crate::Error::NotParsable(detail) => build(
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
             Cause::Wire(WireCause::MalformedResponse {
@@ -1501,15 +1501,6 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
         .expect("valid account error classification")
 }
 
-/// An id the server listed in a `/get` response's `notFound`: the object
-/// is gone, or this account cannot reach it. Terminal for the id, which
-/// is the honest answer - re-requesting it will produce the same
-/// `notFound`.
-#[must_use]
-pub(crate) fn get_id_not_found(id: impl Into<String>, ctx: JmapErrorContext) -> AccountError {
-    convert_id_not_found(id.into(), ctx)
-}
-
 /// A server-side filter (SieveScript) id that a `/get` reported in
 /// `notFound`. `ErrorScope` has no filter variant, so the resource is
 /// named directly instead of through the scope.
@@ -1543,13 +1534,13 @@ pub(crate) fn get_filter_not_found(id: &str, ctx: JmapErrorContext) -> AccountEr
 /// This is the same shape `bifrost-graph` uses for a `$batch` request
 /// that comes back with fewer responses than it submitted.
 #[must_use]
-pub(crate) fn get_id_unanswered(id: &str, ctx: JmapErrorContext) -> AccountError {
+fn get_id_unanswered(method: &str, id: &str, ctx: JmapErrorContext) -> AccountError {
     build(
         AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
         Cause::Wire(WireCause::MalformedResponse {
             protocol: Protocol::Jmap,
             detail: Some(DiagnosticText::support_only(format!(
-                "requested id {id} appeared in neither `list` nor `notFound`"
+                "requested {method} id {id} appeared in neither `list` nor `notFound`"
             ))),
         }),
         &ctx,
@@ -1597,21 +1588,26 @@ pub(crate) fn missing_property(
 /// transmission) is the same class `get_id_unanswered` uses and the same
 /// answer `contact_update` gives when a read it depends on materializes
 /// nothing. `notFound` deliberately shares it rather than taking the
-/// terminal `get_id_not_found` lane: at page level the honest reading of
+/// terminal explicit-object-miss lane: at page level the honest reading of
 /// a script that the query named and the get disclaimed is a delete that
 /// raced the two calls, and the retry's fresh `/query` will not name it
 /// again.
-#[must_use]
-pub(crate) fn get_id_unresolved_after_query(
+pub(crate) fn query_answer<T>(
+    answer: crate::core::answer::IdAnswer<T>,
     id: &str,
-    declared_not_found: bool,
+    request: crate::core::answer::AnswerContext,
     ctx: JmapErrorContext,
-) -> AccountError {
-    let lane = if declared_not_found {
-        "declared notFound by"
-    } else {
-        "answered in neither `list` nor `notFound` by"
+) -> Result<T, AccountError> {
+    let crate::core::answer::IdAnswer::NotFound(_) = answer else {
+        return answer
+            .into_result(id, request)
+            .map_err(|error| into_account_error(error, ctx));
     };
+    let lane = "declared notFound by";
+    Err(query_miss(id, lane, ctx))
+}
+
+fn query_miss(id: &str, lane: &str, ctx: JmapErrorContext) -> AccountError {
     build(
         AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
         Cause::Wire(WireCause::MalformedResponse {
@@ -1673,31 +1669,21 @@ pub(crate) fn set_id_unanswered(
         .expect("valid account error classification")
 }
 
-/// The error mapper for a direct single-id write-result lookup
-/// (`SetResponse::created` / `updated` / `destroyed`,
-/// `EmailImportResponse::created`): an omitted id is
-/// [`set_id_unanswered`] naming the method and the guard the request actually
-/// carried, never the terminal `Protocol(MissingField)`, because the omission
-/// does not prove the write failed. Every other error takes the ordinary
-/// translation.
-pub(crate) fn set_answer_error(
+/// Adapt a protocol error after per-id extraction. The request already stamped
+/// the method and guard, so callers supply only their account operation.
+pub(crate) fn answer_error(
     operation: AccountOperation,
-    method: &'static str,
-    guarded: bool,
 ) -> impl Fn(crate::Error) -> AccountError + Send + 'static {
-    move |error| match error {
-        crate::Error::SetIdUnanswered(id) => {
-            set_id_unanswered(method, &id, JmapErrorContext::new(operation), guarded)
-        }
-        other => into_account_error(other, JmapErrorContext::new(operation)),
-    }
+    move |error| into_account_error(error, JmapErrorContext::new(operation))
 }
 
 /// The refusal for a write whose `method` answered a create in its success
 /// map but without a usable server id (absent or empty). The success entry
 /// proves the response arrived, so the leaf carries acknowledged evidence;
 /// the kind stays the terminal `Protocol(MissingField)`, since an empty id
-/// handed back as success would be a handle that names nothing. Single-set
+/// handed back as success would be a handle that names nothing. IdAnswer
+/// already proved this request was answered; validating the resulting handle
+/// is a separate invariant and must not be collapsed into Unanswered. Single-set
 /// doors (filter, mailbox, event, contact creates) return it bare: whether
 /// an acknowledged create without identity should also carry a
 /// committed-unidentified partial-commit record is an open cross-provider
@@ -3248,13 +3234,19 @@ mod replay_tests {
             }
         }
     }
-    /// A set reader that skipped `set_answer_error` cannot know whether its
-    /// request was guarded, so the generic translation never advises a
-    /// same-request retry for an unanswered id.
+    /// The generic translation reads the actual request guard even when
+    /// extraction uses no operation-specific mapper.
     #[test]
     fn an_unanswered_set_id_without_a_mapper_reconciles() {
         let error = into_account_error(
-            crate::Error::SetIdUnanswered("m1".into()),
+            crate::Error::IdUnanswered {
+                id: "m1".into(),
+                context: crate::core::answer::AnswerContext {
+                    method: "Email/set",
+                    guarded: true,
+                    write: true,
+                },
+            },
             JmapErrorContext::new(AccountOperation::UpdateFlags),
         );
         assert_eq!(

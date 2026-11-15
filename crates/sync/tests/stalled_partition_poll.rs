@@ -83,9 +83,9 @@ async fn a_cancelled_partition_walk_fails_rather_than_reporting_completion() {
             Some(&control),
             None,
             None,
-            0,
+            walk_generation(0),
             Some(&gate),
-            0,
+            bifrost_sync::cursor::PendingCoverage::initial_fence(),
             &delivery,
         )
         .await
@@ -108,4 +108,13 @@ async fn a_cancelled_partition_walk_fails_rather_than_reporting_completion() {
          completion: {outcome:?}"
     );
     release.notify_waiters();
+}
+
+// Mint test proof orders through the same owner as production walks.
+fn walk_generation(value: u64) -> bifrost_sync::cursor::WalkGeneration {
+    let coverage = bifrost_sync::cursor::PendingCoverage::new();
+    for _ in 0..value {
+        let _ = coverage.next_generation();
+    }
+    coverage.next_generation()
 }

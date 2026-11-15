@@ -22,8 +22,8 @@ use tokio_util::sync::CancellationToken;
 struct Fixture {
     stub: Arc<StubAccount>,
     ingress: Arc<PushIngress>,
-    generation: watch::Sender<u64>,
-    topology: watch::Sender<u64>,
+    generation: watch::Sender<crate::types::AccountGeneration>,
+    topology: watch::Sender<crate::engine::PushTopologyGeneration>,
     boundary: watch::Sender<BoundaryRequest>,
     health: watch::Receiver<health::PushHealth>,
     recovery: mpsc::Receiver<ReopenRequest>,
@@ -67,12 +67,13 @@ impl Fixture {
         stub.push_sessions = Mutex::new(scripts.into());
         let stub = Arc::new(stub);
         let account: Arc<dyn Account> = Arc::<StubAccount>::clone(&stub);
+        let generation_value = crate::types::AccountGeneration::for_test(generation_value);
         let current = Arc::new(ArcSwap::from_pointee(crate::types::Incarnation::new(
             account,
             generation_value,
         )));
         let (generation, gen_rx) = watch::channel(generation_value);
-        let (topology, topo_rx) = watch::channel(0);
+        let (topology, topo_rx) = watch::channel(crate::engine::PushTopologyGeneration::default());
         let (b, boundary_view) = Boundary::new();
         let boundary = b.sender();
         if paused {
@@ -109,7 +110,7 @@ impl Fixture {
             boundary: boundary_view,
             shutdown: shutdown.clone(),
             health: health_tx,
-            retired: watch::channel(0).0,
+            retired: watch::channel(crate::types::Incarnation::initial_generation()).0,
             drain_bound: Duration::from_secs(2),
         };
         let task = tokio::spawn(lanes.run());
@@ -181,7 +182,7 @@ async fn a_lane_failing_restart_account_through_a_long_pause_submits_one_request
     settle().await;
     assert!(matches!(
         f.recovery.try_recv(),
-        Ok(ReopenRequest::PushRecovery { generation: 0, .. })
+        Ok(ReopenRequest::PushRecovery { generation, .. }) if generation == crate::types::Incarnation::initial_generation()
     ));
     assert!(f.recovery.try_recv().is_err());
     f.finish().await;
@@ -269,7 +270,8 @@ async fn a_terminal_parked_connection_lane_owes_a_reconcile_on_restart() {
     )
     .await;
     assert!(!f.ingress.take().full);
-    f.topology.send_modify(|n| *n += 1);
+    f.topology
+        .send_modify(crate::engine::PushTopologyGeneration::changed);
     settle().await;
     assert!(f.ingress.take().full);
     f.finish().await;
@@ -288,7 +290,8 @@ async fn a_topology_bump_during_the_failing_session_prevents_parking() {
         false,
     )
     .await;
-    f.topology.send_modify(|n| *n += 1);
+    f.topology
+        .send_modify(crate::engine::PushTopologyGeneration::changed);
     release.notify_one();
     settle().await;
     assert_eq!(f.opens(), 2);
@@ -364,7 +367,8 @@ async fn restart_account_waits_for_the_generation_before_backing_off() {
     tokio::time::advance(Duration::from_secs(29)).await;
     settle().await;
     assert_eq!(f.opens(), 1);
-    f.generation.send_replace(1);
+    f.generation
+        .send_replace(crate::types::AccountGeneration::for_test(1));
     settle().await;
     tokio::time::advance(Duration::from_secs(5)).await;
     settle().await;
@@ -420,10 +424,14 @@ async fn a_parked_lane_restarts_on_a_new_generation() {
         false,
     )
     .await;
-    f.generation.send_replace(1);
+    f.generation
+        .send_replace(crate::types::AccountGeneration::for_test(1));
     settle().await;
     assert_eq!(f.opens(), 2);
-    assert_eq!(f.health.borrow().generation, 1);
+    assert_eq!(
+        f.health.borrow().generation,
+        crate::types::AccountGeneration::for_test(1)
+    );
     f.finish().await;
 }
 #[tokio::test(start_paused = true)]
@@ -437,7 +445,8 @@ async fn a_healthy_lane_reopens_at_once_on_a_new_generation() {
     )
     .await;
     let instant = tokio::time::Instant::now();
-    f.generation.send_replace(1);
+    f.generation
+        .send_replace(crate::types::AccountGeneration::for_test(1));
     settle().await;
     assert_eq!(f.opens(), 2);
     assert_eq!(f.stub.push_session_log.lock().unwrap()[1].opened, instant);
@@ -507,14 +516,19 @@ async fn a_retiring_generation_cannot_mutate_the_replacement_lane() {
         S::Park(Arc::clone(&gate)),
         S::Emit(E::Failed(restart())),
     ]);
-    f.generation.send_replace(1);
+    f.generation
+        .send_replace(crate::types::AccountGeneration::for_test(1));
     settle().await;
-    f.generation.send_replace(2);
+    f.generation
+        .send_replace(crate::types::AccountGeneration::for_test(2));
     settle().await;
     gate.notify_one();
     settle().await;
     assert!(f.recovery.try_recv().is_err());
-    assert_eq!(f.health.borrow().generation, 2);
+    assert_eq!(
+        f.health.borrow().generation,
+        crate::types::AccountGeneration::for_test(2)
+    );
     assert!(matches!(
         f.health.borrow().lanes[0].state,
         health::PushLaneState::Starting

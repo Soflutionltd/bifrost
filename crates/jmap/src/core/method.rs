@@ -19,6 +19,8 @@ pub(crate) trait JmapMethod: Serialize + Send {
 
     fn set_account_id(&mut self, _account_id: &AccountId) {}
 
+    fn stamp_response(_response: &mut Self::Response, _context: super::answer::AnswerContext) {}
+
     /// Capabilities selected by method arguments in addition to `Cap`.
     fn additional_capabilities(&self) -> Vec<&'static str> {
         Vec::new()
@@ -88,6 +90,13 @@ macro_rules! define_get_method {
             const REPLAY_SAFE: bool = true;
             type Cap = <$obj as $crate::core::Object>::Cap;
             type Response = $crate::core::get::GetResponse<$obj>;
+
+            fn stamp_response(
+                response: &mut Self::Response,
+                context: $crate::core::answer::AnswerContext,
+            ) {
+                response.answer_context = context;
+            }
 
             fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
                 self.inner.account_id(account_id.clone());
@@ -174,6 +183,13 @@ macro_rules! define_set_method {
             const REPLAY_SAFE: bool = false;
             type Cap = <$obj as $crate::core::Object>::Cap;
             type Response = $crate::core::set::SetResponse<$obj>;
+
+            fn stamp_response(
+                response: &mut Self::Response,
+                context: $crate::core::answer::AnswerContext,
+            ) {
+                response.answer_context = context;
+            }
 
             fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
                 self.inner.account_id(account_id.clone());
@@ -499,6 +515,13 @@ macro_rules! define_copy_method {
             type Cap = <$obj as $crate::core::Object>::Cap;
             type Response = $crate::core::copy::CopyResponse<$obj>;
 
+            fn stamp_response(
+                response: &mut Self::Response,
+                context: $crate::core::answer::AnswerContext,
+            ) {
+                response.answer_context = context;
+            }
+
             fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
                 self.inner.account_id(account_id.clone());
             }
@@ -667,6 +690,13 @@ macro_rules! define_parse_method {
             const REPLAY_SAFE: bool = true;
             type Cap = $cap;
             type Response = $response;
+
+            fn stamp_response(
+                response: &mut Self::Response,
+                context: $crate::core::answer::AnswerContext,
+            ) {
+                response.answer_context = context;
+            }
 
             fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
                 self.account_id = account_id.clone();

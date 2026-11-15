@@ -260,7 +260,7 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
     }
     let mut proved = Vec::with_capacity(proof_count.min(1024));
     for _ in 0..proof_count {
-        let generation = reader.u64()?;
+        let generation = crate::cursor::WalkGeneration::restore(reader.u64()?);
         proved.push((generation, decode_domain(&mut reader)?));
     }
 
@@ -273,7 +273,7 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
             DischargeAudit {
                 count: reader.u64()?,
                 root: reader.digest32()?,
-                latest_generation: reader.u64()?,
+                latest_generation: crate::cursor::WalkGeneration::restore(reader.u64()?),
             },
         ));
     }
@@ -365,7 +365,7 @@ fn encode_entry(out: &mut Vec<u8>, entry: &LedgerEntry) {
 fn decode_entry(reader: &mut Reader<'_>) -> Result<LedgerEntry, Error> {
     let key = ObligationKey(reader.bytes()?);
     let domain = decode_domain(reader)?;
-    let generation = reader.u64()?;
+    let generation = crate::cursor::WalkGeneration::restore(reader.u64()?);
     let proof = decode_proof(reader)?;
     let policy = decode_policy(reader)?;
     let target = match reader.u8()? {
@@ -429,7 +429,7 @@ fn encode_barrier(out: &mut Vec<u8>, barrier: &BarrierIncident) {
 fn decode_barrier(reader: &mut Reader<'_>) -> Result<BarrierIncident, Error> {
     let key = ObligationKey(reader.bytes()?);
     let domain = decode_domain(reader)?;
-    let generation = reader.u64()?;
+    let generation = crate::cursor::WalkGeneration::restore(reader.u64()?);
     let failure_label = reader.string()?;
     let evidence = decode_error(reader)?;
     let policy = decode_policy(reader)?;
@@ -1681,13 +1681,19 @@ mod tests {
                 bifrost_types::CoverageDomain::full(CursorScope::Account),
                 vec![replayable("root")],
             ),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             100,
         );
         let root = bifrost_types::ObligationKey(b"root".to_vec());
         let a = bifrost_types::ObligationKey(b"a".to_vec());
         ledger
-            .replace_obligation(&root, &[], &[replayable("a"), replayable("b")], 1, 200)
+            .replace_obligation(
+                &root,
+                &[],
+                &[replayable("a"), replayable("b")],
+                crate::cursor::WalkGeneration::for_test(1),
+                200,
+            )
             .expect("replacement accepted");
         assert!(!ledger.record_attempt(&a, 2));
 
@@ -1713,7 +1719,7 @@ mod tests {
                 bifrost_types::CoverageDomain::full(CursorScope::Account),
                 vec![replayable("root")],
             ),
-            1,
+            crate::cursor::WalkGeneration::for_test(1),
             100,
         );
         let mut bytes = encode_ledger(&ledger);
@@ -1732,7 +1738,7 @@ mod tests {
         let mut audit = DischargeAudit::default();
         audit.fold(
             &bifrost_types::ObligationKey(b"gone".to_vec()),
-            9,
+            crate::cursor::WalkGeneration::for_test(9),
             &DischargeEvidence::ProvedIrrelevant {
                 detail: "out of scope".into(),
             },

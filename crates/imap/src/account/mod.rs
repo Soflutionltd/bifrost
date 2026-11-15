@@ -1161,14 +1161,18 @@ pub(crate) fn terminated_event<T, E: Into<TerminatedCause>>(cause: E) -> SyncEve
 /// crate-private `crate::Error` plus the calling context to classify.
 pub(crate) enum TerminatedCause {
     Account(AccountError),
-    Classify(Error, error::ImapErrorContext),
+    // Boxed: the classify pair is much larger than a structured AccountError.
+    Classify(Box<(Error, error::ImapErrorContext)>),
 }
 
 impl TerminatedCause {
     fn into_account_error(self) -> AccountError {
         match self {
             Self::Account(err) => err,
-            Self::Classify(err, ctx) => error::into_account_error(err, ctx),
+            Self::Classify(pair) => {
+                let (err, ctx) = *pair;
+                error::into_account_error(err, ctx)
+            }
         }
     }
 }
@@ -1181,7 +1185,7 @@ impl From<AccountError> for TerminatedCause {
 
 impl From<(Error, error::ImapErrorContext)> for TerminatedCause {
     fn from((err, ctx): (Error, error::ImapErrorContext)) -> Self {
-        Self::Classify(err, ctx)
+        Self::Classify(Box::new((err, ctx)))
     }
 }
 

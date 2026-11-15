@@ -681,8 +681,8 @@ const BACKFILL_BACKOFF: bifrost_types::BackoffPolicy =
 struct ParkedWalk {
     driver: crate::backfill::ScopeWalkDriver,
     pending: InventoryPartition,
-    fence_at_walk_start: u64,
-    undelivered_before: u64,
+    fence_at_walk_start: crate::cursor::ScopeFence,
+    undelivered_before: crate::cursor::UndeliveredMark,
     labels: &'static WalkLabels,
     until: tokio::time::Instant,
 }
@@ -700,14 +700,18 @@ pub(super) struct BackfillScan {
     /// never re-walked for the rest of the attachment. Comparing this reading on
     /// every rescan is what reopens it, using the same evidence the writer acted
     /// on rather than a second notification path.
-    settled: HashMap<(CursorScope, u64), u64>,
+    settled:
+        HashMap<(CursorScope, crate::cursor::ScopeIncarnation), crate::cursor::UndeliveredMark>,
     /// Fusion-owned scopes whose cold-start incarnation the fusion
     /// worker already published. Only the first sighting is fusion's;
     /// a later incarnation of the same scope is a genuine
     /// re-establishment and gets its own pass.
     fusion_skipped: HashSet<CursorScope>,
     /// Failure count plus earliest next attempt, per incarnation.
-    failed: HashMap<(CursorScope, u64), (crate::backoff::ReconnectBackoff, tokio::time::Instant)>,
+    failed: HashMap<
+        (CursorScope, crate::cursor::ScopeIncarnation),
+        (crate::backoff::ReconnectBackoff, tokio::time::Instant),
+    >,
     /// The undelivered reading each incarnation's walk BEGAN under, recorded by
     /// [`BackfillScan::begin_walk`].
     ///
@@ -719,7 +723,8 @@ pub(super) struct BackfillScan {
     /// rescan then records as the baseline, so it compares that reading against
     /// itself for ever and never reopens. Owning the reading here makes the wrong
     /// one unavailable rather than merely discouraged.
-    baseline: HashMap<(CursorScope, u64), u64>,
+    baseline:
+        HashMap<(CursorScope, crate::cursor::ScopeIncarnation), crate::cursor::UndeliveredMark>,
     /// Incarnations whose last attempt published pages that reached nobody.
     ///
     /// Their durable checkpoint is no longer a safe resume position: a
@@ -727,15 +732,15 @@ pub(super) struct BackfillScan {
     /// receive, and those sit past the pages it did not, so a positional resume
     /// walks over the hole and settles the scope having never re-offered them.
     /// The next attempt starts the walk over instead.
-    lost_pages: HashSet<(CursorScope, u64)>,
+    lost_pages: HashSet<(CursorScope, crate::cursor::ScopeIncarnation)>,
     /// Incarnations whose walk was NOT started because a scope-local throttle
     /// (a key the account declares for this scope alone) was pending, with the
     /// instant that hold expires. Kept apart from `failed`: nothing failed, so
     /// the retry ramp must not grow, and the scope is due again exactly when
     /// its hold lifts rather than on the next exponential step.
-    held: HashMap<(CursorScope, u64), tokio::time::Instant>,
+    held: HashMap<(CursorScope, crate::cursor::ScopeIncarnation), tokio::time::Instant>,
     /// Walks suspended between partitions, keyed by their original incarnation.
-    parked: HashMap<(CursorScope, u64), ParkedWalk>,
+    parked: HashMap<(CursorScope, crate::cursor::ScopeIncarnation), ParkedWalk>,
 }
 
 impl BackfillScan {
@@ -755,17 +760,21 @@ impl BackfillScan {
 
     /// Do not start this incarnation's walk before `until`: a scope-local
     /// throttle holds it. The other scopes of the scan carry on meanwhile.
-    pub(super) fn defer_until(&mut self, key: (CursorScope, u64), until: tokio::time::Instant) {
+    pub(super) fn defer_until(
+        &mut self,
+        key: (CursorScope, crate::cursor::ScopeIncarnation),
+        until: tokio::time::Instant,
+    ) {
         self.held.insert(key, until);
     }
 
     pub(super) fn select(
         &mut self,
-        available: Vec<(CursorScope, u64)>,
+        available: Vec<(CursorScope, crate::cursor::ScopeIncarnation)>,
         fusion_owned: &HashSet<CursorScope>,
         now: tokio::time::Instant,
         coverage: &PendingCoverage,
-    ) -> Vec<(CursorScope, u64)> {
+    ) -> Vec<(CursorScope, crate::cursor::ScopeIncarnation)> {
         // Forget everything about incarnations the registry no longer carries.
         // A scope that is deleted, re-established, or simply never returns leaves
         // a retry deadline, a lost-pages mark and a baseline behind it otherwise,
@@ -775,7 +784,8 @@ impl BackfillScan {
         // NOT pruned: it is the memory that stops a concluded incarnation being
         // walked again, and incarnation numbers only ever move forward, so an
         // entry there can never be mistaken for a later one.
-        let live: HashSet<(CursorScope, u64)> = available.iter().cloned().collect();
+        let live: HashSet<(CursorScope, crate::cursor::ScopeIncarnation)> =
+            available.iter().cloned().collect();
         self.parked.retain(|key, _| live.contains(key));
         self.baseline.retain(|key, _| live.contains(key));
         self.failed.retain(|key, _| live.contains(key));
@@ -862,16 +872,19 @@ impl BackfillScan {
     /// that lands after those checks reopens it on the next rescan. An unknown
     /// baseline reads as 0, which reopens on the first loss the scope ever
     /// records: the conservative direction, costing a re-walk.
-    pub(super) fn settled(&mut self, key: (CursorScope, u64)) {
+    pub(super) fn settled(&mut self, key: (CursorScope, crate::cursor::ScopeIncarnation)) {
         self.failed.remove(&key);
         self.lost_pages.remove(&key);
-        let baseline = self.baseline.remove(&key).unwrap_or(0);
+        let baseline = self
+            .baseline
+            .remove(&key)
+            .unwrap_or_else(PendingCoverage::initial_undelivered_mark);
         self.settled.insert(key, baseline);
     }
 
     /// The last attempt on this incarnation published pages that reached
     /// nobody, so its durable checkpoint may not be used as a resume position.
-    pub(super) fn note_lost_pages(&mut self, key: (CursorScope, u64)) {
+    pub(super) fn note_lost_pages(&mut self, key: (CursorScope, crate::cursor::ScopeIncarnation)) {
         self.lost_pages.insert(key);
     }
 
@@ -890,9 +903,9 @@ impl BackfillScan {
     /// a number nothing validated.
     pub(super) fn begin_walk(
         &mut self,
-        key: &(CursorScope, u64),
+        key: &(CursorScope, crate::cursor::ScopeIncarnation),
         coverage: &PendingCoverage,
-    ) -> u64 {
+    ) -> crate::cursor::UndeliveredMark {
         let watermark = coverage.undelivered_watermark(&key.0);
         self.baseline.insert(key.clone(), watermark);
         watermark
@@ -905,18 +918,31 @@ impl BackfillScan {
     /// Production reads it through `begin_walk`'s return value; this exists so a
     /// test can observe that a departed incarnation's entry is pruned.
     #[cfg(test)]
-    pub(super) fn baseline_for(&self, key: &(CursorScope, u64)) -> u64 {
-        self.baseline.get(key).copied().unwrap_or(0)
+    pub(super) fn baseline_for(
+        &self,
+        key: &(CursorScope, crate::cursor::ScopeIncarnation),
+    ) -> crate::cursor::UndeliveredMark {
+        self.baseline
+            .get(key)
+            .copied()
+            .unwrap_or_else(PendingCoverage::initial_undelivered_mark)
     }
 
     /// Must the next walk of this incarnation start from the beginning rather
     /// than from its durable checkpoint?
-    pub(super) fn restarts_from_scratch(&self, key: &(CursorScope, u64)) -> bool {
+    pub(super) fn restarts_from_scratch(
+        &self,
+        key: &(CursorScope, crate::cursor::ScopeIncarnation),
+    ) -> bool {
         self.lost_pages.contains(key)
     }
 
     /// Record the outcome of a walk we actually ran.
-    pub(super) fn record_attempt(&mut self, key: (CursorScope, u64), completed: bool) {
+    pub(super) fn record_attempt(
+        &mut self,
+        key: (CursorScope, crate::cursor::ScopeIncarnation),
+        completed: bool,
+    ) {
         if completed {
             self.settled(key);
             return;
@@ -955,9 +981,9 @@ async fn run_backfill_partition_at_boundary(
     writer_tx: &mpsc::Sender<WriterRequest>,
     lane: &LaneGate,
     delivery: &crate::multiplexer::ChangeDelivery,
-    fence_at_walk_start: u64,
+    fence_at_walk_start: crate::cursor::ScopeFence,
     cursors: &CursorRegistry,
-    incarnation: u64,
+    incarnation: crate::cursor::ScopeIncarnation,
     // Report a scope-local hold without retaining admission or a provider stream.
     held: &mut Option<std::time::Duration>,
 ) -> Option<Result<crate::backfill::BackfillPartitionOutcome, Error>> {
@@ -1163,13 +1189,13 @@ pub(super) fn open_pages_resume(checkpoint: Option<&BackfillCheckpoint>) -> Open
 pub(super) async fn emit_backfill_complete(
     changes_tx: Option<&broadcast::Sender<MultiplexerEvent>>,
     scope: &CursorScope,
-    total_seen: u64,
+    total_seen: crate::backfill::scope_walk::WalkTotal,
     control: &SyncControl,
     shutdown: &CancellationToken,
     lane: &LaneGate,
     delivery: &crate::multiplexer::ChangeDelivery,
-    undelivered_before: u64,
-    fence_at_walk_start: u64,
+    undelivered_before: crate::cursor::UndeliveredMark,
+    fence_at_walk_start: crate::cursor::ScopeFence,
 ) -> MarkerOutcome {
     if changes_tx.is_none() {
         return MarkerOutcome::Published;
@@ -1186,10 +1212,7 @@ pub(super) async fn emit_backfill_complete(
         scope: scope.clone(),
         partition: crate::backfill::partitioner::completion_partition(),
         progress_marker: None,
-        progress: BackfillProgress {
-            items_done: total_seen.saturating_add(1),
-            items_estimated: Some(total_seen),
-        },
+        progress: total_seen.completion_progress(),
         envelope_version: crate::cursor::ENGINE_VERSION,
     };
     let batch: Batch<bifrost_types::Change> = Batch {

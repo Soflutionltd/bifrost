@@ -302,31 +302,6 @@ impl ImapConnection {
         // Validate state and capabilities from the driver's snapshot.
         {
             let snap = self.state_rx.borrow();
-            // RFC 3501 Section 6.2.3: LOGIN is only valid in
-            // NotAuthenticated state.
-            if let Some(refusal) =
-                super::helpers::state_refusal(snap.session_state, &[SessionState::NotAuthenticated])
-            {
-                return Err(refusal);
-            }
-            // RFC 3501 Section 6.2.3: "If the server advertises the
-            // LOGINDISABLED capability [...] the LOGIN command MUST NOT
-            // be used."
-            if snap
-                .capabilities
-                .iter()
-                .any(|c| matches!(c, Capability::LoginDisabled))
-            {
-                return Err(Error::MissingCapability(
-                    crate::error::CapabilityFailure::new(
-                        "LOGINDISABLED".into(),
-                        crate::error::CapabilityFailureReason::ProhibitedByServer,
-                        "LOGIN disabled by server (LOGINDISABLED capability \
-                     advertised, RFC 3501 Section 6.2.3)",
-                    ),
-                ));
-            }
-
             // RFC 9051 Section 2.2: warn when a better alternative
             // exists. Use the broader check (raw capability presence)
             // rather than is_rev2 so that dual-mode servers that
@@ -383,22 +358,10 @@ impl ImapConnection {
         use super::dispatch::AuthenticatePlainConsumer;
         use base64::Engine;
 
+        self.require_auth_mechanism("PLAIN")?;
         // Validate state and build SASL payload from the snapshot.
         let (encoded, has_sasl_ir) = {
             let snap = self.state_rx.borrow();
-            if let Some(refusal) =
-                super::helpers::state_refusal(snap.session_state, &[SessionState::NotAuthenticated])
-            {
-                return Err(refusal);
-            }
-            // RFC 3501 Section 6.2.2: verify the server advertises
-            // AUTH=PLAIN before sending credentials.
-            if !snap
-                .capabilities
-                .contains(&Capability::Auth("PLAIN".into()))
-            {
-                return Err(Error::MissingCapability("AUTH=PLAIN".into()));
-            }
 
             // Refuse embedded delimiters before submitting any AUTHENTICATE bytes.
             let payload = bifrost_sasl::plain_payload("", user, pass)?;
@@ -439,22 +402,10 @@ impl ImapConnection {
         use super::dispatch::AuthenticateXoauth2Consumer;
         use base64::Engine;
 
+        self.require_auth_mechanism("XOAUTH2")?;
         // Validate state and build XOAUTH2 payload from the snapshot.
         let (encoded, has_sasl_ir) = {
             let snap = self.state_rx.borrow();
-            if let Some(refusal) =
-                super::helpers::state_refusal(snap.session_state, &[SessionState::NotAuthenticated])
-            {
-                return Err(refusal);
-            }
-            // RFC 3501 Section 6.2.2: verify the server advertises
-            // AUTH=XOAUTH2 before sending credentials.
-            if !snap
-                .capabilities
-                .contains(&Capability::Auth("XOAUTH2".into()))
-            {
-                return Err(Error::MissingCapability("AUTH=XOAUTH2".into()));
-            }
 
             // Build XOAUTH2 payload via the shared bifrost-sasl builder, then
             // base64-frame it for AUTHENTICATE. The raw token-bearing Secret is
@@ -510,22 +461,10 @@ impl ImapConnection {
         use super::dispatch::AuthenticateXoauth2Consumer;
         use base64::Engine;
 
+        self.require_auth_mechanism("OAUTHBEARER")?;
         // Validate state and build the OAUTHBEARER payload from the snapshot.
         let (encoded, has_sasl_ir) = {
             let snap = self.state_rx.borrow();
-            if let Some(refusal) =
-                super::helpers::state_refusal(snap.session_state, &[SessionState::NotAuthenticated])
-            {
-                return Err(refusal);
-            }
-            // RFC 3501 Section 6.2.2: verify the server advertises
-            // AUTH=OAUTHBEARER before sending credentials.
-            if !snap
-                .capabilities
-                .contains(&Capability::Auth("OAUTHBEARER".into()))
-            {
-                return Err(Error::MissingCapability("AUTH=OAUTHBEARER".into()));
-            }
 
             // Build the OAUTHBEARER payload via the shared bifrost-sasl builder,
             // then base64-frame it for AUTHENTICATE. The raw token-bearing
@@ -741,19 +680,11 @@ impl ImapConnection {
     }
 
     fn require_auth_mechanism(&self, mechanism: &str) -> Result<(), Error> {
-        let snap = self.state_rx.borrow();
-        if let Some(refusal) =
-            super::helpers::state_refusal(snap.session_state, &[SessionState::NotAuthenticated])
-        {
-            return Err(refusal);
-        }
-        if !snap
-            .capabilities
-            .contains(&Capability::Auth(mechanism.to_owned()))
-        {
-            return Err(Error::MissingCapability(format!("AUTH={mechanism}").into()));
-        }
-        Ok(())
+        self.admit_command(&Command::Authenticate {
+            mechanism: mechanism.to_owned(),
+            initial_response: None,
+        })
+        .map(drop)
     }
 
     /// UNAUTHENTICATE  -  reset to unauthenticated state (RFC 8437 Section 2).
@@ -785,17 +716,6 @@ impl ImapConnection {
     /// - [`Error::MissingCapability`] if `UNAUTHENTICATE` is not advertised.
     /// - [`Error::InvalidState`] if called in Not Authenticated state.
     pub async fn unauthenticate(&self, timeout: Duration) -> Result<(), Error> {
-        // RFC 8437 Section2: valid in Authenticated or Selected state.
-        self.require_state(crate::types::CommandKind::Unauthenticate)?;
-
-        // Connection-level capability check.
-        {
-            let snap = self.state_rx.borrow();
-            if !snapshot_supports(&snap, &Capability::Unauthenticate) {
-                return Err(Error::MissingCapability("UNAUTHENTICATE".into()));
-            }
-        }
-
         let deadline = tokio::time::Instant::now() + timeout;
 
         self.submit_regular(
@@ -857,8 +777,10 @@ impl ImapConnection {
     where
         C::Output: 'static,
     {
+        let admitted = self.admit_command(&cmd)?;
         let result = self
             .submit_driver_command(
+                admitted,
                 (cmd, driver::DriverConsumer::Regular(Box::new(consumer))),
                 deadline,
                 |reply| driver::DriverCommand::Run { reply },
@@ -884,8 +806,10 @@ impl ImapConnection {
     where
         C::Output: 'static,
     {
+        let admitted = self.admit_command(&cmd)?;
         let result = self
             .submit_driver_command(
+                admitted,
                 (
                     cmd,
                     driver::DriverConsumer::StreamingRegular(Box::new(consumer)),
@@ -917,8 +841,10 @@ impl ImapConnection {
     where
         C::Output: 'static,
     {
+        let admitted = self.admit_command(&cmd)?;
         let result = self
             .submit_driver_command(
+                admitted,
                 (
                     cmd,
                     driver::DriverConsumer::WithContinuations(Box::new(consumer)),
@@ -945,8 +871,12 @@ impl ImapConnection {
         payload: driver::UpgradePayload,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), Error> {
-        self.submit_driver_command(payload, deadline, |reply| driver::DriverCommand::Upgrade {
-            reply,
+        let admitted = self.admit_command(&match &payload {
+            driver::UpgradePayload::StartTls { .. } => Command::StartTls,
+            driver::UpgradePayload::Compress => Command::Compress,
+        })?;
+        self.submit_driver_command(admitted, payload, deadline, |reply| {
+            driver::DriverCommand::Upgrade { reply }
         })
         .await?;
         Ok(())
@@ -969,8 +899,13 @@ impl ImapConnection {
     /// driver dropped is a driver death stamped `Unsent` when it was never
     /// committed and `InFlight` once it was. `Unsent` is never inferred from the
     /// timer alone after admission: only a won withdrawal earns it.
+    ///
+    /// `_admitted` is the handle-snapshot admission proof. Requiring it here,
+    /// at the one door every submission passes, is what lets the driver read
+    /// a head-of-queue refusal as `StateChangedBeforeSend` (see `admit_live`).
     pub(super) async fn submit_driver_command<P: Send, T>(
         &self,
+        _admitted: super::admission::HandleAdmitted,
         payload: P,
         deadline: Option<tokio::time::Instant>,
         command: impl FnOnce(super::reply::Reply<P, Result<T, Error>>) -> driver::DriverCommand,

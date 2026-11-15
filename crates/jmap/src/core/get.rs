@@ -36,6 +36,8 @@ pub(crate) struct GetRequest<O: GetObject> {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct GetResponse<O: Object> {
+    #[serde(skip)]
+    pub(crate) answer_context: crate::core::answer::AnswerContext,
     #[serde(rename = "accountId")]
     account_id: Option<AccountId>,
 
@@ -43,16 +45,8 @@ pub(crate) struct GetResponse<O: Object> {
 
     list: Vec<O>,
 
-    // RFC 8620 s5.1 makes `notFound` mandatory, but implementations omit
-    // it when empty often enough that rejecting the body would take down
-    // every sibling call in the same request over one absent empty array.
-    // Decoding an absent list as empty is therefore leniency, NOT proof
-    // that every requested id was answered: a caller with a closed
-    // per-item accounting contract must reconcile `list` + `not_found`
-    // against the ids it submitted and classify the remainder itself
-    // (`sync::error::get_id_unanswered`). Reconciling also covers the
-    // conforming-server case where `notFound` is present and empty but an
-    // object is still missing from `list`.
+    // Missing notFound is tolerated as an empty lane, never as evidence that
+    // all submitted ids were answered. `answer` reconciles each requested id.
     #[serde(rename = "notFound")]
     #[serde(default)]
     not_found: Vec<O::Id>,
@@ -124,6 +118,18 @@ impl<O: GetObject> Default for GetRequest<O> {
 }
 
 impl<O: Object> GetResponse<O> {
+    pub(crate) fn answer(
+        &self,
+        id: &O::Id,
+        matches_id: impl Fn(&O) -> bool,
+    ) -> super::answer::IdAnswer<&O> {
+        super::answer::IdAnswer::from_parts(
+            self.list.iter().find(|object| matches_id(object)),
+            None,
+            self.not_found.contains(id),
+        )
+    }
+
     pub(crate) fn account_id(&self) -> Option<&AccountId> {
         self.account_id.as_ref()
     }
