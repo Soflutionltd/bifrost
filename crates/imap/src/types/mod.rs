@@ -20,6 +20,7 @@ mod ids;
 pub(crate) mod mailbox;
 pub(crate) mod notify;
 pub(crate) mod profile;
+pub(crate) mod request;
 pub(crate) mod response;
 pub(crate) mod search;
 mod secret;
@@ -36,7 +37,7 @@ pub(crate) use envelope::{Envelope, EnvelopeAddress};
 pub(crate) use fetch::format_fetch_attrs;
 pub(crate) use fetch::{AppendMessage, FetchAttr, FetchResponse, StoreOperation, StoreResult};
 pub(crate) use flag::Flag;
-pub(crate) use ids::{ModSeq, SeqSet, Uid, UidSet, UidValidity};
+pub(crate) use ids::{ModSeq, ModSeqValzer, SeqSet, Uid, UidSet, UidValidity};
 pub(crate) use mailbox::{
     MailboxAttribute, MailboxInfo, SelectedMailbox, StatusItem, StatusResult,
 };
@@ -44,20 +45,21 @@ pub(crate) use notify::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetP
 pub(crate) use profile::ServerProfile;
 pub(crate) use response::{
     AclEntry, Capability, CopyResult, EsearchResponse, ExpungeResult, ListRightsResponse,
-    ListStatusEntry, MetadataResult, MoveResult, NamespaceResponse, QresyncParams,
-    QuotaResource, QuotaRootResponse, Response, ResponseCode, SelectOptions, SeqBound, ThreadNode,
-    UidRange, UntaggedResponse,
+    ListStatusEntry, MetadataResult, MoveResult, NamespaceResponse, QuotaResource,
+    QuotaRootResponse, Response, ResponseCode, SeqBound, ThreadNode, UidRange, UntaggedResponse,
 };
 #[cfg(test)]
 pub(crate) use response::{MetadataEntry, UntaggedStatus};
 pub(crate) use search::SearchCriteria;
 pub(crate) use secret::SecretString;
-pub(crate) use sync::{
-    QresyncOutcome, SyncFetchRequest, SyncFetchResult, SyncSelectOptions, SyncSelectResult,
-};
+pub(crate) use sync::{QresyncOutcome, SyncFetchResult, SyncSelectResult};
 pub(crate) use validated::{
     MailboxArgument, MailboxInput, MailboxName, SequenceSet, ValidationError,
 };
 
 // Re-export command types for internal use only.
 pub(crate) use command::{Command, CommandKind};
+
+pub(crate) use request::{
+    FetchChanges, QresyncParams, SelectAccess, SelectOptions, SyncFetchRequest,
+};

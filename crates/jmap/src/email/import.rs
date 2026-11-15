@@ -1,3 +1,4 @@
+use crate::core::id::ObjectState;
 use crate::{
     core::{
         id::{AccountId, BlobId},
@@ -19,7 +20,7 @@ pub(crate) struct EmailImportRequest {
 
     #[serde(rename = "ifInState")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    if_in_state: Option<String>,
+    if_in_state: Option<ObjectState<Email>>,
 
     emails: HashMap<String, EmailImport>,
 }
@@ -57,10 +58,10 @@ pub(crate) struct EmailImportResponse {
     account_id: AccountId,
 
     #[serde(rename = "oldState")]
-    old_state: Option<String>,
+    old_state: Option<ObjectState<Email>>,
 
     #[serde(rename = "newState")]
-    new_state: String,
+    new_state: ObjectState<Email>,
 
     #[serde(rename = "created")]
     created: Option<HashMap<String, Email>>,
@@ -108,7 +109,7 @@ impl EmailImportRequest {
     }
 
     #[must_use]
-    pub(crate) fn if_in_state(mut self, if_in_state: impl Into<String>) -> Self {
+    pub(crate) fn if_in_state(mut self, if_in_state: impl Into<ObjectState<Email>>) -> Self {
         self.if_in_state = Some(if_in_state.into());
         self
     }
@@ -179,15 +180,15 @@ impl EmailImportResponse {
         &self.account_id
     }
 
-    pub(crate) fn old_state(&self) -> Option<&str> {
-        self.old_state.as_deref()
+    pub(crate) fn old_state(&self) -> Option<&ObjectState<Email>> {
+        self.old_state.as_ref()
     }
 
-    pub(crate) fn new_state(&self) -> &str {
+    pub(crate) fn new_state(&self) -> &ObjectState<Email> {
         &self.new_state
     }
 
-    pub(crate) fn into_new_state(self) -> String {
+    pub(crate) fn into_new_state(self) -> ObjectState<Email> {
         self.new_state
     }
 

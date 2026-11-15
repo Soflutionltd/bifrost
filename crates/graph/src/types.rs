@@ -156,6 +156,9 @@ inferenceClassification,isReadReceiptRequested,internetMessageHeaders,internetMe
 /// The `$select` fields we request for contact sync.
 pub(crate) const CONTACT_SELECT: &str = "id,displayName,emailAddresses,parentFolderId";
 
+// These are wire DTOs, not replay declarations. account::batch decodes typed
+// method/header evidence and owns the envelope policy. URLs are built by the
+// owner-aware routing helpers; an etag stays a GraphETag until wire encoding.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BatchRequestItem {
     pub(crate) id: String,
@@ -172,6 +175,9 @@ pub(crate) struct BatchRequest {
     pub(crate) requests: Vec<BatchRequestItem>,
 }
 
+// Keep decoding per-answer evidence after correlation: rejecting an entire
+// envelope for one invalid status would discard successful write siblings.
+// account::batch owns HTTP conversion; graph_error validates numeric statuses.
 #[derive(Debug, Deserialize)]
 pub(crate) struct BatchResponseItem {
     pub(crate) id: String,

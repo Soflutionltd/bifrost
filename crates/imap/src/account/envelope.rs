@@ -17,8 +17,7 @@ pub(crate) enum FolderCursor {
     QResync {
         uidvalidity: u32,
         modseq: u64,
-        known_uids: CompactUidSet,
-        known_uids_complete: bool,
+        baseline: UidBaseline,
     },
     Condstore {
         uidvalidity: u32,
@@ -32,6 +31,23 @@ pub(crate) enum FolderCursor {
     },
 }
 
+/// Completeness is retained with the cached set, including legacy partial
+/// sets for lossless cursor round-trips. Only Complete can enter QRESYNC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) enum UidBaseline {
+    Complete(CompactUidSet),
+    Legacy(CompactUidSet),
+}
+
+impl UidBaseline {
+    fn uids(&self) -> &CompactUidSet {
+        match self {
+            Self::Complete(uids) | Self::Legacy(uids) => uids,
+        }
+    }
+}
+
 impl FolderCursor {
     pub(crate) fn uidvalidity(&self) -> u32 {
         match self {
@@ -43,9 +59,8 @@ impl FolderCursor {
 
     pub(crate) fn known_uids(&self) -> &CompactUidSet {
         match self {
-            Self::QResync { known_uids, .. }
-            | Self::Condstore { known_uids, .. }
-            | Self::Basic { known_uids, .. } => known_uids,
+            Self::QResync { baseline, .. } => baseline.uids(),
+            Self::Condstore { known_uids, .. } | Self::Basic { known_uids, .. } => known_uids,
         }
     }
 }
@@ -95,14 +110,13 @@ fn encode_folder_cursor(cursor: &FolderCursor) -> Vec<u8> {
         FolderCursor::QResync {
             uidvalidity,
             modseq,
-            known_uids,
-            known_uids_complete,
+            baseline,
         } => {
             out.push(1);
             push_u32(&mut out, *uidvalidity);
             push_u64(&mut out, *modseq);
-            encode_uid_set(&mut out, known_uids);
-            out.push(u8::from(*known_uids_complete));
+            encode_uid_set(&mut out, baseline.uids());
+            out.push(u8::from(matches!(baseline, UidBaseline::Complete(_))));
         }
         FolderCursor::Condstore {
             uidvalidity,
@@ -158,8 +172,11 @@ fn decode_folder_cursor(bytes: &[u8]) -> Result<FolderCursor, AccountError> {
             Ok(FolderCursor::QResync {
                 uidvalidity,
                 modseq,
-                known_uids,
-                known_uids_complete,
+                baseline: if known_uids_complete {
+                    UidBaseline::Complete(known_uids)
+                } else {
+                    UidBaseline::Legacy(known_uids)
+                },
             })
         }
         2 => Ok(FolderCursor::Condstore {
@@ -681,8 +698,9 @@ mod tests {
             FolderCursor::QResync {
                 uidvalidity: 7,
                 modseq: 99,
-                known_uids: CompactUidSet::from_uids([1, 2]),
-                known_uids_complete: true,
+                baseline: crate::account::envelope::UidBaseline::Complete(
+                    CompactUidSet::from_uids([1, 2]),
+                ),
             },
             FolderCursor::Condstore {
                 uidvalidity: 7,
@@ -709,8 +727,7 @@ mod tests {
             &FolderCursor::QResync {
                 uidvalidity: 1,
                 modseq: 2,
-                known_uids: CompactUidSet::default(),
-                known_uids_complete: true,
+                baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::default()),
             },
         );
         change.server_state.envelope_version =
@@ -740,8 +757,7 @@ mod tests {
             FolderCursor::QResync {
                 uidvalidity: 7,
                 modseq: 99,
-                known_uids: CompactUidSet::default(),
-                known_uids_complete: false,
+                baseline: crate::account::envelope::UidBaseline::Legacy(CompactUidSet::default()),
             }
         );
     }
@@ -761,8 +777,9 @@ mod tests {
             FolderCursor::QResync {
                 uidvalidity: 7,
                 modseq: 99,
-                known_uids: CompactUidSet::from_uids([1, 2]),
-                known_uids_complete: true,
+                baseline: crate::account::envelope::UidBaseline::Complete(
+                    CompactUidSet::from_uids([1, 2])
+                ),
             }
         );
     }
@@ -772,8 +789,7 @@ mod tests {
         let cursor = FolderCursor::QResync {
             uidvalidity: 7,
             modseq: 99,
-            known_uids: CompactUidSet::default(),
-            known_uids_complete: false,
+            baseline: crate::account::envelope::UidBaseline::Legacy(CompactUidSet::default()),
         };
         let change = encode_cursor(CursorScope::Account, &cursor);
         assert_eq!(decode_cursor(&change).expect("decode"), cursor);

@@ -47,7 +47,7 @@ const PEOPLE_API_BASE: &str = "https://people.googleapis.com/v1";
 const CALENDAR_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 // Gmail meters per-user traffic in QUOTA UNITS, not requests: the
 // published per-user limit is 250 units/second, and each method has its
-// own unit cost (see `gmail_quota_cost`). We register a deliberately
+// own unit cost (see `GmailEndpoint::quota_cost`). We register a deliberately
 // conservative 100 units/second so a full backfill leaves headroom for
 // the interactive traffic sharing the same per-user budget, rather than
 // spending the whole allowance on hydration and driving the 429 backoff
@@ -155,9 +155,7 @@ impl GmailClient {
 
     pub(crate) fn with_quota_project(&self, id: String) -> Self {
         let mut client = self.clone();
-        client.quota_project = Some(bifrost_types::ThrottleBudget::new(format!(
-            "gmail-project|{id}"
-        )));
+        client.quota_project = Some(crate::quota::project_budget(&id));
         client
     }
 
@@ -356,8 +354,13 @@ impl GmailClient {
 
     pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = self.api_url(path);
-        self.request::<T, ()>(&url, "GET", None, bifrost_net::ReplayPolicy::Idempotent)
-            .await
+        self.request::<T, ()>(
+            &url,
+            reqwest::Method::GET,
+            None,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
+        .await
     }
 
     pub(crate) async fn post<T: DeserializeOwned, B: Serialize>(
@@ -367,7 +370,8 @@ impl GmailClient {
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<T> {
         let url = self.api_url(path);
-        self.request(&url, "POST", Some(body), replay).await
+        self.request(&url, reqwest::Method::POST, Some(body), replay)
+            .await
     }
 
     pub(crate) async fn put<T: DeserializeOwned, B: Serialize>(
@@ -377,7 +381,8 @@ impl GmailClient {
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<T> {
         let url = self.api_url(path);
-        self.request(&url, "PUT", Some(body), replay).await
+        self.request(&url, reqwest::Method::PUT, Some(body), replay)
+            .await
     }
 
     pub(crate) async fn patch<T: DeserializeOwned, B: Serialize>(
@@ -387,7 +392,8 @@ impl GmailClient {
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<T> {
         let url = self.api_url(path);
-        self.request(&url, "PATCH", Some(body), replay).await
+        self.request(&url, reqwest::Method::PATCH, Some(body), replay)
+            .await
     }
 
     pub(crate) async fn delete(&self, path: &str, replay: bifrost_net::ReplayPolicy) -> Result<()> {
@@ -402,7 +408,9 @@ impl GmailClient {
         service: crate::quota::ApiSurface,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<()> {
-        let response = self.execute(url, "DELETE", None::<&()>, replay).await?;
+        let response = self
+            .execute(url, reqwest::Method::DELETE, None::<&()>, replay)
+            .await?;
         check_response_status(response, service).await
     }
 
@@ -413,7 +421,9 @@ impl GmailClient {
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<()> {
         let url = self.api_url(path);
-        let response = self.execute(&url, "POST", Some(body), replay).await?;
+        let response = self
+            .execute(&url, reqwest::Method::POST, Some(body), replay)
+            .await?;
         check_response_status(response, self.surface_for_url(&url)).await
     }
 
@@ -430,7 +440,7 @@ impl GmailClient {
     async fn request<T: DeserializeOwned, B: Serialize>(
         &self,
         url: &str,
-        method: &str,
+        method: reqwest::Method,
         body: Option<&B>,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<T> {
@@ -441,7 +451,7 @@ impl GmailClient {
     pub(crate) async fn execute<B: Serialize>(
         &self,
         url: &str,
-        method: &str,
+        method: reqwest::Method,
         body: Option<&B>,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<Response> {
@@ -451,7 +461,7 @@ impl GmailClient {
     pub(crate) async fn execute_if_match<B: Serialize>(
         &self,
         url: &str,
-        method: &str,
+        method: reqwest::Method,
         body: Option<&B>,
         expected: Option<&str>,
         replay: bifrost_net::ReplayPolicy,
@@ -460,30 +470,12 @@ impl GmailClient {
         // needs none: the caller knows the request and its payload and
         // declares its replay policy (applied below). POST covers reads,
         // actions and creates alike, so no verb-level default would do.
-        let mut builder = match method {
-            "GET" => self.account_net().get(url),
-            "POST" => self.account_net().post(url),
-            "PUT" => self.account_net().put(url),
-            "PATCH" => self.account_net().patch(url),
-            "DELETE" => self.account_net().delete(url),
-            // Every internal caller routes through the typed
-            // `get` / `post` / `put` / `patch` / `delete` wrappers, so
-            // this branch is unreachable; the panic gives a future
-            // caller that adds a new method a hard failure instead of
-            // misclassified telemetry.
-            other => unreachable!("GmailClient::execute called with unsupported method {other}"),
-        };
-
-        if let Some(cost) = self.gmail_quota_cost(url, method) {
-            builder = builder.cost(cost);
-            let path = url
-                .strip_prefix(self.api_base())
-                .expect("Gmail base matched");
-            if method != "POST" || !matches!(path, "/watch" | "/stop") {
+        let mut builder = self.account_net().request(method.clone(), url);
+        if let Some(endpoint) = self.gmail_endpoint(url, &method) {
+            builder = builder.cost(endpoint.quota_cost());
+            if endpoint.uses_data_concurrency() {
                 builder = builder.concurrency_limit(self.gmail_data_limit());
             }
-            // Watch renewal and stop are independent of the Gmail concurrency
-            // queue. Rate admission, token refresh and retries still apply.
         }
 
         // `json` sets `Content-Type: application/json` itself, so the
@@ -509,7 +501,10 @@ impl GmailClient {
                     |_| self.api_base().to_string(),
                     |url| url.origin().ascii_serialization(),
                 );
-                let key = format!("gmail:{:?}", (&self.account_net().account().0, origin));
+                let key = bifrost_net::LimitKey::namespaced(
+                    "google.gmail",
+                    &[&self.account_net().account().0, &origin],
+                );
                 self.account_net()
                     .shared_concurrency_limit(key, GMAIL_DATA_CONCURRENCY)
             })
@@ -520,12 +515,18 @@ impl GmailClient {
     /// base. `None` for anything else (Calendar, Drive, People), which
     /// keeps that surface's `cost_default`. Raw Gmail builders must apply
     /// this cost explicitly; production Gmail mutations use the typed funnel.
-    pub(crate) fn gmail_quota_cost(&self, url: &str, method: &str) -> Option<u32> {
+    #[cfg(test)]
+    pub(crate) fn gmail_quota_cost(&self, url: &str, method: reqwest::Method) -> Option<u32> {
+        self.gmail_endpoint(url, &method)
+            .map(GmailEndpoint::quota_cost)
+    }
+
+    fn gmail_endpoint(&self, url: &str, method: &reqwest::Method) -> Option<GmailEndpoint> {
         if self.surface_for_url(url) != crate::quota::ApiSurface::Gmail {
             return None;
         }
         let path = url.strip_prefix(self.api_base())?;
-        Some(gmail_quota_cost(path, method))
+        Some(GmailEndpoint::from_request(path, method))
     }
 
     pub(crate) async fn execute_builder(
@@ -609,9 +610,10 @@ impl GmailClient {
             .as_ref()
             .filter(|_| surface == crate::quota::ApiSurface::Gmail)
             .cloned();
-        let gate = project
-            .as_ref()
-            .map(|budget| self.account_net().shared_hold(budget.as_str()));
+        let gate = project.as_ref().map(|budget| {
+            self.account_net()
+                .shared_hold(crate::quota::project_hold_key(budget))
+        });
         if let Some(gate) = gate.as_ref() {
             builder = builder.hold_gate(gate.key());
         }
@@ -714,8 +716,17 @@ pub(crate) async fn check_response_status(
 }
 
 /// Stable account-and-surface identity shared by registration and dispatch.
-fn surface_quota_scope(account: &AccountId, surface: crate::quota::ApiSurface) -> String {
-    format!("google:{:?}:{surface:?}", account.0)
+fn surface_quota_scope(
+    account: &AccountId,
+    surface: crate::quota::ApiSurface,
+) -> bifrost_net::QuotaScope {
+    let surface = match surface {
+        crate::quota::ApiSurface::Gmail => "gmail",
+        crate::quota::ApiSurface::People => "people",
+        crate::quota::ApiSurface::Calendar => "calendar",
+        crate::quota::ApiSurface::Drive => "drive",
+    };
+    bifrost_net::QuotaScope::namespaced("google.quota", &[&account.0, surface])
 }
 
 fn default_account_net(
@@ -784,46 +795,133 @@ fn default_account_net(
 /// billed like a `messages.get` until someone looks it up. Requests that
 /// do not resolve against the Gmail base at all - Calendar, Drive and
 /// People - keep their separate surface's `cost_default` of one request.
-fn gmail_quota_cost(path: &str, method: &str) -> u32 {
-    /// Charged to any Gmail method not in the table below.
-    const UNLISTED_METHOD_COST: u32 = 20;
+///
+/// One Gmail request identity owns quota, control admission and cursor semantics.
+/// Resolve at the common builder boundary: absolute URLs can select another
+/// configured API surface, so a relative-path annotation alone is insufficient.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GmailEndpoint {
+    Profile,
+    History,
+    Watch,
+    Stop,
+    LabelsGet,
+    LabelsCreate,
+    LabelsWrite,
+    ThreadsList,
+    ThreadsGet,
+    ThreadsModify,
+    ThreadsDelete,
+    MessagesList,
+    AttachmentGet,
+    MessagesGet,
+    MessagesSend,
+    MessagesModify,
+    MessagesDelete,
+    MessagesBatchWrite,
+    DraftsList,
+    DraftsCreate,
+    DraftsGet,
+    DraftsUpdate,
+    DraftsDelete,
+    DraftsSend,
+    SettingsGet,
+    FiltersWrite,
+    SendAsUpdate,
+    VacationUpdate,
+    Unlisted,
+}
 
-    let path = path.split('?').next().unwrap_or(path);
-    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+impl GmailEndpoint {
+    pub(crate) fn from_request(path: &str, method: &reqwest::Method) -> Self {
+        let path = path.split('?').next().unwrap_or(path);
+        let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
 
-    match (method, segments.as_slice()) {
-        ("GET", ["profile"]) => 1,
-        ("GET", ["history"]) => 2,
-        ("POST", ["watch"]) => 100,
-        ("POST", ["stop"]) => 50,
-        ("GET", ["labels"] | ["labels", _]) => 1,
-        ("POST", ["labels"]) => 5,
-        ("PATCH", ["labels", _]) | ("DELETE", ["labels", _]) => 5,
-        ("GET", ["threads"]) => 10,
-        ("GET", ["threads", _]) => 40,
-        ("POST", ["threads", _, "modify"]) => 10,
-        ("DELETE", ["threads", _]) => 20,
-        ("GET", ["messages"]) => 5,
-        ("GET", ["messages", _, "attachments", _]) => 20,
-        ("GET", ["messages", _]) => 20,
-        ("POST", ["messages", "send"]) => 100,
-        ("POST", ["messages", _, "modify"]) => 5,
-        ("DELETE", ["messages", _]) => 10,
-        ("POST", ["messages", "batchModify"] | ["messages", "batchDelete"]) => 50,
-        ("GET", ["drafts"]) => 5,
-        ("POST", ["drafts"]) => 10,
-        ("GET", ["drafts", _]) => 20,
-        ("PUT", ["drafts", _]) => 15,
-        ("DELETE", ["drafts", _]) => 10,
-        ("POST", ["drafts", "send"]) => 100,
-        ("GET", ["settings", "filters"] | ["settings", "sendAs"])
-        | ("GET", ["settings", "vacation"])
-        | ("GET", ["settings", "filters", _] | ["settings", "sendAs", _]) => 1,
-        ("POST", ["settings", "filters"]) | ("DELETE", ["settings", "filters", _]) => 5,
-        ("PATCH", ["settings", "sendAs", _]) => 100,
-        ("PUT", ["settings", "vacation"]) => 5,
-        _ => UNLISTED_METHOD_COST,
+        match (method.as_str(), segments.as_slice()) {
+            ("GET", ["profile"]) => Self::Profile,
+            ("GET", ["history"]) => Self::History,
+            ("POST", ["watch"]) => Self::Watch,
+            ("POST", ["stop"]) => Self::Stop,
+            ("GET", ["labels"] | ["labels", _]) => Self::LabelsGet,
+            ("POST", ["labels"]) => Self::LabelsCreate,
+            ("PATCH", ["labels", _]) | ("DELETE", ["labels", _]) => Self::LabelsWrite,
+            ("GET", ["threads"]) => Self::ThreadsList,
+            ("GET", ["threads", _]) => Self::ThreadsGet,
+            ("POST", ["threads", _, "modify"]) => Self::ThreadsModify,
+            ("DELETE", ["threads", _]) => Self::ThreadsDelete,
+            ("GET", ["messages"]) => Self::MessagesList,
+            ("GET", ["messages", _, "attachments", _]) => Self::AttachmentGet,
+            ("GET", ["messages", _]) => Self::MessagesGet,
+            ("POST", ["messages", "send"]) => Self::MessagesSend,
+            ("POST", ["messages", _, "modify"]) => Self::MessagesModify,
+            ("DELETE", ["messages", _]) => Self::MessagesDelete,
+            ("POST", ["messages", "batchModify"] | ["messages", "batchDelete"]) => {
+                Self::MessagesBatchWrite
+            }
+            ("GET", ["drafts"]) => Self::DraftsList,
+            ("POST", ["drafts"]) => Self::DraftsCreate,
+            ("GET", ["drafts", _]) => Self::DraftsGet,
+            ("PUT", ["drafts", _]) => Self::DraftsUpdate,
+            ("DELETE", ["drafts", _]) => Self::DraftsDelete,
+            ("POST", ["drafts", "send"]) => Self::DraftsSend,
+            ("GET", ["settings", "filters"] | ["settings", "sendAs"])
+            | ("GET", ["settings", "vacation"])
+            | ("GET", ["settings", "filters", _] | ["settings", "sendAs", _]) => Self::SettingsGet,
+            ("POST", ["settings", "filters"]) | ("DELETE", ["settings", "filters", _]) => {
+                Self::FiltersWrite
+            }
+            ("PATCH", ["settings", "sendAs", _]) => Self::SendAsUpdate,
+            ("PUT", ["settings", "vacation"]) => Self::VacationUpdate,
+            _ => Self::Unlisted,
+        }
     }
+
+    pub(crate) fn quota_cost(self) -> u32 {
+        match self {
+            Self::Profile => 1,
+            Self::History => 2,
+            Self::Watch => 100,
+            Self::Stop => 50,
+            Self::LabelsGet => 1,
+            Self::LabelsCreate => 5,
+            Self::LabelsWrite => 5,
+            Self::ThreadsList => 10,
+            Self::ThreadsGet => 40,
+            Self::ThreadsModify => 10,
+            Self::ThreadsDelete => 20,
+            Self::MessagesList => 5,
+            Self::AttachmentGet => 20,
+            Self::MessagesGet => 20,
+            Self::MessagesSend => 100,
+            Self::MessagesModify => 5,
+            Self::MessagesDelete => 10,
+            Self::MessagesBatchWrite => 50,
+            Self::DraftsList => 5,
+            Self::DraftsCreate => 10,
+            Self::DraftsGet => 20,
+            Self::DraftsUpdate => 15,
+            Self::DraftsDelete => 10,
+            Self::DraftsSend => 100,
+            Self::SettingsGet => 1,
+            Self::FiltersWrite => 5,
+            Self::SendAsUpdate => 100,
+            Self::VacationUpdate => 5,
+            Self::Unlisted => 20,
+        }
+    }
+
+    pub(crate) fn is_history(self) -> bool {
+        self == Self::History
+    }
+
+    fn uses_data_concurrency(self) -> bool {
+        !matches!(self, Self::Watch | Self::Stop)
+    }
+}
+
+#[cfg(test)]
+fn gmail_quota_cost(path: &str, method: reqwest::Method) -> u32 {
+    GmailEndpoint::from_request(path, &method).quota_cost()
 }
 
 #[cfg(test)]
@@ -869,7 +967,7 @@ mod tests {
                     client
                         .execute(
                             "https://gmail.test/messages/m",
-                            "GET",
+                            reqwest::Method::GET,
                             None::<&()>,
                             bifrost_net::ReplayPolicy::Idempotent,
                         )
@@ -889,7 +987,7 @@ mod tests {
         assert_eq!(script.requests().len(), 32);
         let mut typed = Box::pin(client.execute(
             "https://gmail.test/profile",
-            "GET",
+            reqwest::Method::GET,
             None::<&()>,
             bifrost_net::ReplayPolicy::Idempotent,
         ));
@@ -976,16 +1074,31 @@ mod tests {
 
     #[test]
     fn gmail_method_costs_match_the_published_quota_table() {
-        assert_eq!(gmail_quota_cost("/profile", "GET"), 1);
-        assert_eq!(gmail_quota_cost("/history?startHistoryId=1", "GET"), 2);
-        assert_eq!(gmail_quota_cost("/messages", "GET"), 5);
-        assert_eq!(gmail_quota_cost("/messages/m1?format=metadata", "GET"), 20);
-        assert_eq!(gmail_quota_cost("/messages/m1/attachments/a1", "GET"), 20);
-        assert_eq!(gmail_quota_cost("/threads/t1", "GET"), 40);
-        assert_eq!(gmail_quota_cost("/messages/send", "POST"), 100);
-        assert_eq!(gmail_quota_cost("/messages/batchModify", "POST"), 50);
-        assert_eq!(gmail_quota_cost("/watch", "POST"), 100);
-        assert_eq!(gmail_quota_cost("/stop", "POST"), 50);
+        assert_eq!(gmail_quota_cost("/profile", reqwest::Method::GET), 1);
+        assert_eq!(
+            gmail_quota_cost("/history?startHistoryId=1", reqwest::Method::GET),
+            2
+        );
+        assert_eq!(gmail_quota_cost("/messages", reqwest::Method::GET), 5);
+        assert_eq!(
+            gmail_quota_cost("/messages/m1?format=metadata", reqwest::Method::GET),
+            20
+        );
+        assert_eq!(
+            gmail_quota_cost("/messages/m1/attachments/a1", reqwest::Method::GET),
+            20
+        );
+        assert_eq!(gmail_quota_cost("/threads/t1", reqwest::Method::GET), 40);
+        assert_eq!(
+            gmail_quota_cost("/messages/send", reqwest::Method::POST),
+            100
+        );
+        assert_eq!(
+            gmail_quota_cost("/messages/batchModify", reqwest::Method::POST),
+            50
+        );
+        assert_eq!(gmail_quota_cost("/watch", reqwest::Method::POST), 100);
+        assert_eq!(gmail_quota_cost("/stop", reqwest::Method::POST), 50);
     }
 
     /// No single method may cost more than the bucket can ever hold, or
@@ -995,14 +1108,14 @@ mod tests {
     #[test]
     fn no_method_costs_more_than_the_burst_ceiling() {
         for (path, method) in [
-            ("/messages/send", "POST"),
-            ("/drafts/send", "POST"),
-            ("/watch", "POST"),
-            ("/settings/sendAs/a", "PATCH"),
-            ("/unlisted", "POST"),
+            ("/messages/send", reqwest::Method::POST),
+            ("/drafts/send", reqwest::Method::POST),
+            ("/watch", reqwest::Method::POST),
+            ("/settings/sendAs/a", reqwest::Method::PATCH),
+            ("/unlisted", reqwest::Method::POST),
         ] {
             assert!(
-                gmail_quota_cost(path, method) <= GOOGLE_API_BURST,
+                gmail_quota_cost(path, method.clone()) <= GOOGLE_API_BURST,
                 "{method} {path} cannot be admitted by a {GOOGLE_API_BURST}-unit bucket",
             );
         }
@@ -1012,13 +1125,19 @@ mod tests {
     /// like a message fetch until someone checks the published table.
     #[test]
     fn unlisted_gmail_methods_are_billed_conservatively() {
-        assert_eq!(gmail_quota_cost("/messages/m1/unknownVerb", "POST"), 20);
-        assert_eq!(gmail_quota_cost("/somethingNew", "GET"), 20);
+        assert_eq!(
+            gmail_quota_cost("/messages/m1/unknownVerb", reqwest::Method::POST),
+            20
+        );
+        assert_eq!(gmail_quota_cost("/somethingNew", reqwest::Method::GET), 20);
         // Cheap reads this crate actually issues stay at their real cost
         // rather than being swept into the conservative default.
-        assert_eq!(gmail_quota_cost("/labels/Label_1", "GET"), 1);
-        assert_eq!(gmail_quota_cost("/drafts", "GET"), 5);
-        assert_eq!(gmail_quota_cost("/settings/sendAs/a%40b.test", "GET"), 1);
+        assert_eq!(gmail_quota_cost("/labels/Label_1", reqwest::Method::GET), 1);
+        assert_eq!(gmail_quota_cost("/drafts", reqwest::Method::GET), 5);
+        assert_eq!(
+            gmail_quota_cost("/settings/sendAs/a%40b.test", reqwest::Method::GET),
+            1
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1054,7 +1173,7 @@ mod tests {
         client
             .execute(
                 "https://gmail.test/messages/send",
-                "POST",
+                reqwest::Method::POST,
                 Some(&serde_json::json!({})),
                 bifrost_net::ReplayPolicy::Never,
             )
@@ -1065,7 +1184,7 @@ mod tests {
             second_client
                 .execute(
                     "https://gmail.test/profile",
-                    "GET",
+                    reqwest::Method::GET,
                     None::<&()>,
                     bifrost_net::ReplayPolicy::Idempotent,
                 )
@@ -1113,7 +1232,7 @@ mod tests {
         let result = client
             .execute(
                 "https://gmail.test/messages/batchModify",
-                "POST",
+                reqwest::Method::POST,
                 Some(&serde_json::json!({})),
                 bifrost_net::ReplayPolicy::Never,
             )

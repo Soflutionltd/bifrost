@@ -443,12 +443,7 @@ fn encode_select_qresync() {
     let cmd = Command::Select {
         mailbox: MailboxName::new("INBOX").unwrap(),
         condstore: false,
-        qresync: Some(QresyncParams {
-            uid_validity: 67890,
-            mod_seq: 12345,
-            known_uids: None,
-            seq_match_data: None,
-        }),
+        qresync: Some(QresyncParams::from_raw(67890, 12345, None, None).unwrap()),
     };
     encode_command_to_buf(&mut buf, "A005", &cmd, &default_opts()).unwrap();
     assert_eq!(
@@ -463,12 +458,7 @@ fn encode_select_qresync_with_known_uids() {
     let cmd = Command::Select {
         mailbox: MailboxName::new("INBOX").unwrap(),
         condstore: false,
-        qresync: Some(QresyncParams {
-            uid_validity: 67890,
-            mod_seq: 12345,
-            known_uids: Some("1:500".into()),
-            seq_match_data: None,
-        }),
+        qresync: Some(QresyncParams::from_raw(67890, 12345, Some("1:500".into()), None).unwrap()),
     };
     encode_command_to_buf(&mut buf, "A006", &cmd, &default_opts()).unwrap();
     assert_eq!(
@@ -483,12 +473,7 @@ fn encode_examine_qresync() {
     let cmd = Command::Examine {
         mailbox: MailboxName::new("INBOX").unwrap(),
         condstore: false,
-        qresync: Some(QresyncParams {
-            uid_validity: 100,
-            mod_seq: 50,
-            known_uids: None,
-            seq_match_data: None,
-        }),
+        qresync: Some(QresyncParams::from_raw(100, 50, None, None).unwrap()),
     };
     encode_command_to_buf(&mut buf, "A007", &cmd, &default_opts()).unwrap();
     assert_eq!(&buf[..], b"A007 EXAMINE \"INBOX\" (QRESYNC (100 50))\r\n");
@@ -498,44 +483,14 @@ fn encode_examine_qresync() {
 /// RFC 7162 Section 3.2.5.2: QRESYNC takes uidvalidity.
 #[test]
 fn encode_select_qresync_rejects_zero_uid_validity() {
-    let cmd = Command::Select {
-        mailbox: MailboxName::new("INBOX").unwrap(),
-        condstore: false,
-        qresync: Some(QresyncParams {
-            uid_validity: 0,
-            mod_seq: 1,
-            known_uids: None,
-            seq_match_data: None,
-        }),
-    };
-    let mut buf = BytesMut::new();
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
-    assert!(
-        result.is_err(),
-        "QRESYNC uid_validity=0 must be rejected per RFC 3501 Section 9 (nz-number)"
-    );
+    assert!(crate::types::QresyncParams::from_raw(0, 1, None, None).is_err());
 }
 
 /// RFC 3501 Section 9: uidvalidity = nz-number, so 0 is invalid.
 /// RFC 7162 Section 3.2.5.2: QRESYNC takes uidvalidity.
 #[test]
 fn encode_examine_qresync_rejects_zero_uid_validity() {
-    let cmd = Command::Examine {
-        mailbox: MailboxName::new("INBOX").unwrap(),
-        condstore: false,
-        qresync: Some(QresyncParams {
-            uid_validity: 0,
-            mod_seq: 1,
-            known_uids: None,
-            seq_match_data: None,
-        }),
-    };
-    let mut buf = BytesMut::new();
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
-    assert!(
-        result.is_err(),
-        "QRESYNC uid_validity=0 must be rejected per RFC 3501 Section 9 (nz-number)"
-    );
+    assert!(crate::types::QresyncParams::from_raw(0, 1, None, None).is_err());
 }
 
 #[test]
@@ -2473,12 +2428,15 @@ fn encode_select_qresync_seq_match_data() {
     let cmd = Command::Select {
         mailbox: MailboxName::new("INBOX").unwrap(),
         condstore: false,
-        qresync: Some(QresyncParams {
-            uid_validity: 67890,
-            mod_seq: 12345,
-            known_uids: Some("1:500".into()),
-            seq_match_data: Some(("1:3".into(), "100:102".into())),
-        }),
+        qresync: Some(
+            QresyncParams::from_raw(
+                67890,
+                12345,
+                Some("1:500".into()),
+                Some(("1:3".into(), "100:102".into())),
+            )
+            .unwrap(),
+        ),
     };
     encode_command_to_buf(&mut buf, "A008", &cmd, &default_opts()).unwrap();
     assert_eq!(
@@ -2914,43 +2872,29 @@ fn rev2_does_not_imply_binary_for_append() {
 /// provided without `known_uids`  -  it must return an error.
 #[test]
 fn audit_finding3_qresync_rejects_seq_match_without_known_uids() {
-    use crate::types::response::QresyncParams;
-
-    let params = QresyncParams {
-        uid_validity: 67890,
-        mod_seq: 12345,
-        known_uids: None,
-        seq_match_data: Some(("1:100".into(), "1:100".into())),
-    };
-    let mut buf = BytesMut::new();
-    // Must return Err because seq_match_data is present without known_uids.
-    let result = push_select_or_examine(
-        &mut buf,
-        "A001",
-        "SELECT",
-        "INBOX",
-        false,
-        Some(&params),
-        false,
-        LiteralMode::Synchronizing,
-    );
     assert!(
-        result.is_err(),
-        "seq-match-data without known-uids must return Err (RFC 7162 Section 3.2.5.2)"
+        crate::types::QresyncParams::from_raw(
+            67890,
+            12345,
+            None,
+            Some(("1:100".into(), "1:100".into()))
+        )
+        .is_err()
     );
 }
 
 /// QRESYNC with valid `known_uids` + `seq_match_data` encodes correctly.
 #[test]
 fn audit_finding3_qresync_valid_known_uids_with_seq_match() {
-    use crate::types::response::QresyncParams;
+    use crate::types::QresyncParams;
 
-    let params = QresyncParams {
-        uid_validity: 67890,
-        mod_seq: 12345,
-        known_uids: Some("1:500".into()),
-        seq_match_data: Some(("1:100".into(), "1:100".into())),
-    };
+    let params = QresyncParams::from_raw(
+        67890,
+        12345,
+        Some("1:500".into()),
+        Some(("1:100".into(), "1:100".into())),
+    )
+    .unwrap();
     let mut buf = BytesMut::new();
     push_select_or_examine(
         &mut buf,
@@ -2983,14 +2927,9 @@ fn audit_finding3_qresync_valid_known_uids_with_seq_match() {
 /// QRESYNC with `known_uids` but no `seq_match_data` encodes correctly.
 #[test]
 fn audit_finding3_qresync_known_uids_without_seq_match() {
-    use crate::types::response::QresyncParams;
+    use crate::types::QresyncParams;
 
-    let params = QresyncParams {
-        uid_validity: 67890,
-        mod_seq: 12345,
-        known_uids: Some("1:500".into()),
-        seq_match_data: None,
-    };
+    let params = QresyncParams::from_raw(67890, 12345, Some("1:500".into()), None).unwrap();
     let mut buf = BytesMut::new();
     push_select_or_examine(
         &mut buf,
@@ -3632,21 +3571,14 @@ fn regression_getmetadata_both_options_before_mailbox() {
 /// must return a proper error rather than relying on `debug_assert`.
 #[test]
 fn regression_qresync_seq_match_without_known_uids_returns_err() {
-    let mut buf = BytesMut::new();
-    let cmd = Command::Select {
-        mailbox: MailboxName::new("INBOX").unwrap(),
-        condstore: false,
-        qresync: Some(QresyncParams {
-            uid_validity: 67890,
-            mod_seq: 12345,
-            known_uids: None,
-            seq_match_data: Some(("1:100".into(), "1:100".into())),
-        }),
-    };
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
-        result.is_err(),
-        "seq-match-data without known-uids must return Err (RFC 7162 Section 3.2.5.2)"
+        crate::types::QresyncParams::from_raw(
+            67890,
+            12345,
+            None,
+            Some(("1:100".into(), "1:100".into()))
+        )
+        .is_err()
     );
 }
 
@@ -3690,63 +3622,34 @@ fn regression_sequence_set_dollar_in_comma_list() {
 /// must return an error rather than silently producing invalid output.
 #[test]
 fn regression_qresync_known_uids_rejects_wildcard() {
-    let mut buf = BytesMut::new();
-    let cmd = Command::Select {
-        mailbox: MailboxName::new("INBOX").unwrap(),
-        condstore: false,
-        qresync: Some(QresyncParams {
-            uid_validity: 67890,
-            mod_seq: 12345,
-            known_uids: Some("1:*".into()),
-            seq_match_data: None,
-        }),
-    };
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
-    assert!(
-        result.is_err(),
-        "known-uids containing '*' must return Err (RFC 7162 Section 3.2.5.2)"
-    );
+    assert!(crate::types::QresyncParams::from_raw(67890, 12345, Some("1:*".into()), None).is_err());
 }
 
 /// QRESYNC seq-match-data known-sequence-set must reject `*`.
 #[test]
 fn regression_qresync_seq_match_data_rejects_wildcard_in_seq_set() {
-    let mut buf = BytesMut::new();
-    let cmd = Command::Select {
-        mailbox: MailboxName::new("INBOX").unwrap(),
-        condstore: false,
-        qresync: Some(QresyncParams {
-            uid_validity: 67890,
-            mod_seq: 12345,
-            known_uids: Some("1:500".into()),
-            seq_match_data: Some(("1:*".into(), "1:100".into())),
-        }),
-    };
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
-        result.is_err(),
-        "known-sequence-set containing '*' must return Err (RFC 7162 Section 3.2.5.2)"
+        crate::types::QresyncParams::from_raw(
+            67890,
+            12345,
+            Some("1:500".into()),
+            Some(("1:*".into(), "1:100".into()))
+        )
+        .is_err()
     );
 }
 
 /// QRESYNC seq-match-data known-uid-set must reject `*`.
 #[test]
 fn regression_qresync_seq_match_data_rejects_wildcard_in_uid_set() {
-    let mut buf = BytesMut::new();
-    let cmd = Command::Select {
-        mailbox: MailboxName::new("INBOX").unwrap(),
-        condstore: false,
-        qresync: Some(QresyncParams {
-            uid_validity: 67890,
-            mod_seq: 12345,
-            known_uids: Some("1:500".into()),
-            seq_match_data: Some(("1:100".into(), "1:*".into())),
-        }),
-    };
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
-        result.is_err(),
-        "known-uid-set containing '*' must return Err (RFC 7162 Section 3.2.5.2)"
+        crate::types::QresyncParams::from_raw(
+            67890,
+            12345,
+            Some("1:500".into()),
+            Some(("1:100".into(), "1:*".into()))
+        )
+        .is_err()
     );
 }
 
@@ -4730,22 +4633,7 @@ fn getmetadata_maxsize_u64_max_rejected() {
 /// RFC 7162 Section 3.2.5.2: QRESYNC `mod_seq` is mod-sequence-value (>= 1).
 #[test]
 fn encode_select_qresync_rejects_zero_modseq() {
-    let cmd = Command::Select {
-        mailbox: MailboxName::new("INBOX").unwrap(),
-        condstore: false,
-        qresync: Some(crate::types::QresyncParams {
-            uid_validity: 1,
-            mod_seq: 0,
-            known_uids: None,
-            seq_match_data: None,
-        }),
-    };
-    let mut buf = BytesMut::new();
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
-    assert!(
-        result.is_err(),
-        "QRESYNC mod_seq 0 must be rejected per RFC 7162 Section 7"
-    );
+    assert!(crate::types::QresyncParams::from_raw(1, 0, None, None).is_err());
 }
 
 /// SETQUOTA resource name containing a space must be rejected.

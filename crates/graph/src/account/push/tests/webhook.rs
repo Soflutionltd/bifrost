@@ -524,7 +524,7 @@ async fn a_received_subscribe_is_not_torn_down() {
     let subscription = push_subscribe(account.clone(), vec![email_scope("inbox")])
         .await
         .expect("subscribe succeeds");
-    let handle = subscription.handle.clone().expect("a handle");
+    let handle = subscription.handle().cloned().expect("a handle");
     for _ in 0..200 {
         tokio::task::yield_now().await;
     }
@@ -630,7 +630,7 @@ async fn a_subscribed_handle_embeds_its_account_and_the_created_server_ids() {
     let subscription = push_subscribe(account.clone(), vec![email_scope("inbox")])
         .await
         .expect("subscribe");
-    let handle = subscription.handle.expect("a handle");
+    let handle = subscription.handle().cloned().expect("a handle");
     assert_eq!(
         decode_handle(&handle),
         DecodedHandle::Graph {

@@ -76,11 +76,16 @@ Keying on the exact token is what makes this safe when two live handles
 share an `AccountId`: a stale Drop cannot detach the replacement.
 `detach_registration` returns before touching the meter or the governor
 once its token is absent, so a Drop after an explicit `detach()`, or
-after a cross-id `retag()` moved the token, is a complete no-op. A
+after a cross-id `retag()` retired the token, is a complete no-op. A
 SAME-id `retag` returns the receiver itself rather than minting a
 second `AccountNetInner` over one token - two owners of one
 registration is ambiguous, and whichever dropped first would release
-what the other still depends on.
+what the other still depends on. A cross-id retag that cannot find its source
+token returns an inert meter and no registration ownership. Repeating a retag
+on a stale source therefore cannot give an inert handle the successful
+retag's live destination token. Its detach and Drop do nothing. Successful
+cross-id retags also mint a fresh token, so an A-to-B-to-A cycle cannot restore a stale A
+handle's teardown authority.
 `Net::detach_account(id)` remains the ID-only compatibility entry point
 and removes one registration. Host buckets and meter counters are
 reclaimed only after their final matching detach.
@@ -90,8 +95,9 @@ engine `AccountId`. Used by protocol-crate factories whose
 `open(account_id)` needs to honor an engine-minted id when the
 consumer built the `AccountNet` ahead of time via
 `*Client::with_account_net` and the parent `Net` is no longer
-reachable through the client. The exact token's per-account host entry
-moves under `new_id`, and the meter transfers one attachment count from
+reachable through the client. The source token is retired and its per-account
+host entry moves under `new_id` with a fresh token, and the meter transfers
+one attachment count from
 the old id to the new one (it does not separately register the new id,
 so a retag never inflates the total attach count). The new handle
 inherits token
@@ -100,7 +106,7 @@ destination id budget from the registry; outstanding source grants retain
 the source budget, even after the old handle is dropped.
 Governor refcounts are per-host and not touched. The old handle keeps
 working for in-flight clones; its old-id teardown is a no-op because
-the token moved.
+the old token was retired.
 
 ## Request flow
 
@@ -136,7 +142,7 @@ Outlook audience selection and provider upload sequencing remain provider-owned.
 ### Shared provider holds and error observation
 
 `Net::shared_hold(key)` and `AccountNet::shared_hold(key)` open a `SharedHold`
-against the same string-keyed registry on that Net. The registry owns its
+against the same `HoldKey`-keyed registry on that Net. The registry owns its
 entries until their monotonic expiry; dropping every account and hold handle
 cannot erase an unexpired hold. Expired entries are pruned opportunistically.
 Handles look up the key again on every access, so an old handle still shares
@@ -714,8 +720,9 @@ rotation means the next call sees the swapped-in token.
 
 ## Rate-limit governor (`RateLimitGovernor`)
 
-Buckets are keyed by `(host, quota_scope)`. `RateLimit::new` leaves the scope
-empty for host-only compatibility; provider clients use `with_quota_scope` for
+Buckets are keyed by `(host, QuotaScope)`. `RateLimit::new` selects
+`QuotaScope::HostOnly` for host-only compatibility; provider clients use
+`with_quota_scope` for
 tenant or user quotas. `acquire(host, cost)` remains the empty-scope
 compatibility path.
 
@@ -840,7 +847,30 @@ JMAP gates its API POSTs by the session's `maxConcurrentRequests` using one
 per-request weight-1 claim and no account claim, so its behavior is unchanged.
 Uploads and downloads remain separately scoped per RFC 8620.
 
+## Registry identities
+
+`HoldKey`, `LimitKey` and `QuotaScope` distinguish hold, concurrency and rate
+bucket identities. `QuotaScope::HostOnly` explicitly selects the compatibility
+bucket. String inputs remain accepted at the public boundaries; an empty quota
+string is normalized to `HostOnly`. `namespaced(namespace, components)` encodes
+component byte lengths, preventing delimiter collisions without relying on Debug
+formatting. Google and Graph mint provider-specific quota and concurrency keys.
+Holds retain their provider throttle-budget identity for error attribution.
+
+The registries have different lifetimes: registration tokens own host references
+and meter attachment counts, holds survive until expiry, concurrency claims own
+permits, and bandwidth grants can outlive retag. Detach does not erase the latter
+three domains. Token removal or movement and meter-count changes serialize under
+the registration lock, always acquired before the meter lock. A concurrent detach
+cannot miss a retagged meter attachment.
+
 ## Bandwidth meter
+
+`Net::meter()` returns a clone of its `Arc<BandwidthMeter>`. Pass this handle to
+`SyncEngineBuilder::with_bandwidth_meter`, `ImapAccountFactory::with_bandwidth_meter`
+and `MeterSinkHandle::from_meter` to observe HTTP and socket traffic together.
+The bandwidth admission registry is still shared separately; counters and
+admission grants have independent lifetimes.
 
 `BandwidthMeter` holds one `AccountCounters` per account; each
 counter wraps a `RateWindow` (10 one-second buckets, ring buffer).

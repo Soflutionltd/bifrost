@@ -151,7 +151,8 @@ fn bulk_mutation_stream(
     kind: MutationKind,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     Box::pin(async_stream::stream! {
-        let max_items = account.capabilities.batching_policy.max_items.max(1);
+        let max_items = account.capabilities.batching_policy.max_items
+            .clamp(1, super::batch::LIMIT);
         let mut chunk = Vec::with_capacity(max_items);
         while let Some(id) = targets.next().await {
             chunk.push(id);
@@ -374,18 +375,11 @@ async fn submit_batch_with_version(
         assign_batch_ids(&mut requests);
         let replayable: Vec<_> = requests
             .iter()
-            .map(super::graph_error::subrequest_replayable)
+            .map(super::batch::subrequest_replayable)
             .collect();
         let response = match account.batch_resource(&request_ids) {
             Ok(resource) => {
-                account
-                    .client
-                    .post_batch(
-                        resource,
-                        &BatchRequest { requests },
-                        bifrost_net::ReplayPolicy::Never,
-                    )
-                    .await
+                super::batch::submit(&account.client, resource, &BatchRequest { requests }).await
             }
             Err(error) => Err(error),
         };
@@ -568,31 +562,16 @@ fn reconcile_mutation_responses(
         let scope = ErrorScope::Message {
             id: (id.0.clone()).into(),
         };
-        let headers = item
-            .headers
-            .map(|h| {
-                let mut hm = reqwest::header::HeaderMap::new();
-                for (k, v) in h {
-                    if let (Ok(name), Ok(val)) = (
-                        reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                        reqwest::header::HeaderValue::from_str(&v),
-                    ) {
-                        hm.insert(name, val);
-                    }
-                }
-                hm
-            })
-            .unwrap_or_default();
-        let body = item
-            .body
-            .as_ref()
-            .map(|v| bytes::Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
-            .unwrap_or_default();
+        let (headers, body) = super::batch::response_parts(&item);
         item_outcomes.push(mutation_item_outcome(
             item.status,
             headers,
             body,
-            matches!(kind, MutationKind::Destroy),
+            if matches!(kind, MutationKind::Destroy) {
+                crate::account::batch::AbsentMeans::Success
+            } else {
+                crate::account::batch::AbsentMeans::Failure
+            },
             BatchItemId(id.0.clone()),
             operation_for_kind(kind),
             scope,

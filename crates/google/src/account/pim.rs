@@ -1935,7 +1935,7 @@ mod tests {
         };
         let container = container_from_label(&label);
         assert_eq!(container.role, Some(FolderRole::Inbox));
-        assert_eq!(container.native_id, LABEL_INBOX);
+        assert_eq!(container.native_id(), LABEL_INBOX);
         assert!(matches!(container.kind, ContainerKind::Label));
         let lower = GmailLabel {
             id: "inbox".into(),

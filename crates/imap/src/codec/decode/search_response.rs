@@ -61,11 +61,21 @@ fn parse_number_list_with_modseq<'a>(
 /// Parse optional `search-sort-mod-seq` suffix and consume trailing content
 /// through CRLF (RFC 7162 Section 3.1.6).
 fn parse_optional_modseq_and_crlf(input: &[u8]) -> IResult<&[u8], Option<u64>> {
+    // A malformed or overflowing MODSEQ is discarded rather than committed:
+    // `number64` reports overflow as a Failure, which `opt` would propagate
+    // and so lose the already-parsed result numbers. Demote it to a plain
+    // error here so the suffix is skipped and the numbers survive.
+    fn soft_nz_number64(i: &[u8]) -> IResult<&[u8], u64> {
+        nz_number64(i).map_err(|e| match e {
+            nom::Err::Failure(inner) => nom::Err::Error(inner),
+            other => other,
+        })
+    }
     let (input, mod_seq) = opt(preceded(
         sp,
         delimited(
             (char('('), tag_no_case(&b"MODSEQ"[..]), sp),
-            nz_number64,
+            soft_nz_number64,
             char(')'),
         ),
     ))

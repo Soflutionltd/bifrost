@@ -422,7 +422,7 @@ pub(crate) struct AccountSlot {
     /// provider deadlines cross accounts). Recovery paths record waits
     /// keyed by `ThrottleKey`; the per-scope poll loop and the push
     /// reconciler consult it before driving work.
-    pub throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
+    pub throttles: Arc<crate::recovery::ThrottleBucket>,
     /// The `OpenedAccount::skipped_scopes` lane from the most recent
     /// successful `factory.open` (attach or reopen swap): the parts of
     /// the account surface the protocol crate discovered but could not

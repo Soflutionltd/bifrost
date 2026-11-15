@@ -43,9 +43,6 @@ use crate::types::{BatchRequest, BatchRequestItem, BatchResponseItem};
 /// `singleValueExtendedProperties` ids Graph filters on.
 const REACTIONS_GUID: &str = "{41F28F13-83F4-4114-A584-EEDB5A6B0BFF}";
 
-/// Graph's `$batch` request limit.
-const BATCH_LIMIT: usize = 20;
-
 #[derive(Debug, Deserialize)]
 struct SingleValueExtendedProperty {
     id: String,
@@ -102,7 +99,7 @@ pub(crate) async fn message_reactions(
     let filter = format!("$filter=id eq '{owner_id}' or id eq '{count_id}'");
 
     let suffix = format!("/singleValueExtendedProperties?{filter}");
-    for chunk in supported.chunks(BATCH_LIMIT) {
+    for chunk in supported.chunks(super::batch::LIMIT) {
         // An id whose shared mailbox is no longer configured has no URL to
         // build. It fails in the FAILED LANE, like the public-folder ids
         // above, and for a second reason on top of the per-item one: past
@@ -135,18 +132,16 @@ pub(crate) async fn message_reactions(
             .collect();
         let replayable: Vec<_> = requests
             .iter()
-            .map(super::graph_error::subrequest_replayable)
+            .map(super::batch::subrequest_replayable)
             .collect();
-        match account
-            .client
-            .post_batch(
-                account
-                    .batch_resource(&chunk)
-                    .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?,
-                &BatchRequest { requests },
-                bifrost_net::ReplayPolicy::Idempotent,
-            )
-            .await
+        match super::batch::submit(
+            &account.client,
+            account
+                .batch_resource(&chunk)
+                .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?,
+            &BatchRequest { requests },
+        )
+        .await
         {
             Ok(response) => classify_chunk(
                 &chunk,
@@ -227,12 +222,7 @@ fn classify_chunk(
                 reaction_state(message_id, item.body.as_ref()),
             );
         } else {
-            let headers = header_map(item.headers);
-            let body = item
-                .body
-                .as_ref()
-                .map(|v| bytes::Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
-                .unwrap_or_default();
+            let (headers, body) = super::batch::response_parts(&item);
             let ctx = GraphErrorContext::graph(operation).with_scope(ErrorScope::Message {
                 id: (message_id.0.clone()).into(),
             });
@@ -303,21 +293,6 @@ fn reaction_state(message_id: &ObjectId, body: Option<&Value>) -> MessageReactio
         owner_reaction,
         reactions_count,
     }
-}
-
-fn header_map(
-    headers: Option<std::collections::HashMap<String, String>>,
-) -> reqwest::header::HeaderMap {
-    let mut map = reqwest::header::HeaderMap::new();
-    for (name, value) in headers.unwrap_or_default() {
-        if let (Ok(name), Ok(value)) = (
-            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-            reqwest::header::HeaderValue::from_str(&value),
-        ) {
-            map.insert(name, value);
-        }
-    }
-    map
 }
 
 #[cfg(test)]

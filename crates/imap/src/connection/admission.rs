@@ -854,14 +854,9 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
 impl SessionView<'_> {
     pub(super) fn validate_qresync_params(
         &self,
-        params: &crate::types::QresyncParams,
+        _params: &crate::types::QresyncParams,
     ) -> Result<(), Error> {
         self.require_enabled(Capability::QResync)?;
-        if params.seq_match_data.is_some() && params.known_uids.is_none() {
-            return Err(Error::InvalidInput(
-                "QRESYNC seq-match-data requires known-uids".into(),
-            ));
-        }
         Ok(())
     }
 
@@ -1011,12 +1006,7 @@ mod tests {
         let select = Command::Select {
             mailbox: crate::types::MailboxName::new("INBOX").unwrap(),
             condstore: false,
-            qresync: Some(QresyncParams {
-                uid_validity: 1,
-                mod_seq: 2,
-                known_uids: None,
-                seq_match_data: None,
-            }),
+            qresync: Some(QresyncParams::from_raw(1, 2, None, None).unwrap()),
         };
         let vanished = Command::UidFetch {
             sequence_set: SequenceSet::new("1").unwrap(),

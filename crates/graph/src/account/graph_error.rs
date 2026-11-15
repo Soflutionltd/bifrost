@@ -1549,32 +1549,8 @@ pub(crate) fn batch_response_missing(
         .expect("valid account error classification")
 }
 
-/// Resolve a batch leg using the same declaration rule as top-level requests:
-/// a PATCH subrequest is an absolute write by id, declared
-/// `IdempotentUnlessConditional`; every other method takes its method
-/// default. Fails closed: an unparseable method or any header that does not
-/// convert answers `false`, because silently dropping an unconvertible
-/// `If-Match` would let a guarded leg read as replayable.
-pub(crate) fn subrequest_replayable(item: &crate::types::BatchRequestItem) -> bool {
-    let Ok(method) = reqwest::Method::from_bytes(item.method.as_bytes()) else {
-        return false;
-    };
-    let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(entries) = &item.headers {
-        for (name, value) in entries {
-            let (Ok(name), Ok(value)) = (
-                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-                reqwest::header::HeaderValue::from_str(value),
-            ) else {
-                return false;
-            };
-            headers.insert(name, value);
-        }
-    }
-    let declared = (method == reqwest::Method::PATCH)
-        .then_some(bifrost_net::ReplayPolicy::IdempotentUnlessConditional);
-    bifrost_net::request_is_replayable(declared, &method, &headers)
-}
+// Replay declarations and header decoding belong to account::batch. This
+// classifier receives the resolved leg verdict for missing-answer recovery.
 
 /// Invalid numeric statuses are malformed provider answers, never synthetic 500s.
 pub(crate) fn batch_status_error(
@@ -1607,7 +1583,7 @@ pub(crate) fn mutation_item_outcome(
     status: u16,
     headers: HeaderMap,
     body: bytes::Bytes,
-    destroy: bool,
+    absent: crate::account::batch::AbsentMeans,
     item_id: bifrost_types::BatchItemId,
     operation: AccountOperation,
     scope: ErrorScope,
@@ -1621,7 +1597,7 @@ pub(crate) fn mutation_item_outcome(
     if (200..300).contains(&status) {
         return ItemOutcome::Succeeded(BatchSuccess::new(item_id, MutationSuccess::Applied));
     }
-    if status == 404 && destroy {
+    if status == 404 && matches!(absent, crate::account::batch::AbsentMeans::Success) {
         return ItemOutcome::Succeeded(BatchSuccess::new(item_id, MutationSuccess::Skipped));
     }
     let mut ctx = GraphErrorContext::graph(operation).with_scope(scope);
@@ -2468,7 +2444,7 @@ mod tests {
                 status,
                 HeaderMap::new(),
                 Bytes::new(),
-                false,
+                crate::account::batch::AbsentMeans::Failure,
                 bifrost_types::BatchItemId("m1".into()),
                 AccountOperation::UpdateFlags,
                 ErrorScope::Message { id: "m1".into() },
@@ -2485,7 +2461,7 @@ mod tests {
             204,
             HeaderMap::new(),
             Bytes::new(),
-            false,
+            crate::account::batch::AbsentMeans::Failure,
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::UpdateFlags,
             ErrorScope::Message {
@@ -2505,7 +2481,7 @@ mod tests {
             404,
             HeaderMap::new(),
             Bytes::new(),
-            true,
+            crate::account::batch::AbsentMeans::Success,
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::BulkDestroy,
             ErrorScope::Message {
@@ -2525,7 +2501,7 @@ mod tests {
             404,
             HeaderMap::new(),
             Bytes::new(),
-            false,
+            crate::account::batch::AbsentMeans::Failure,
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::SetIsRead,
             ErrorScope::Message {
@@ -2550,7 +2526,7 @@ mod tests {
             412,
             HeaderMap::new(),
             Bytes::new(),
-            false,
+            crate::account::batch::AbsentMeans::Failure,
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::UpdateFlags,
             ErrorScope::Message {
@@ -2575,7 +2551,7 @@ mod tests {
             429,
             headers(&[("retry-after", "10")]),
             Bytes::new(),
-            false,
+            crate::account::batch::AbsentMeans::Failure,
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::BulkMove,
             ErrorScope::Message {
@@ -2610,7 +2586,7 @@ mod tests {
             429,
             HeaderMap::new(),
             Bytes::new(),
-            false,
+            crate::account::batch::AbsentMeans::Failure,
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::BulkMove,
             ErrorScope::Message {
@@ -3029,6 +3005,7 @@ mod unsupported_constructor_tests {
 #[cfg(test)]
 mod replay_tests {
     use super::*;
+    use crate::account::batch::subrequest_replayable;
     #[test]
     fn a_missing_conditional_subresponse_reconciles() {
         for (op, safe) in [

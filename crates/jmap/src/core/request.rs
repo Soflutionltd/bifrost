@@ -204,8 +204,7 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         method.set_account_id(&self.account_id);
 
         // Serialize method arguments once as raw JSON. This is an
-        // outbound encode; classify as RequestEncode rather than the
-        // default ResponseDecode conversion.
+        // outbound encode; preserve its local request provenance.
         let arguments =
             serde_json::value::to_raw_value(&method).map_err(crate::Error::RequestEncode)?;
 

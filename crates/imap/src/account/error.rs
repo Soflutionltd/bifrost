@@ -193,6 +193,14 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
     }
     let attempt = error.attempt().or(ctx.transmission_state);
     let translation = classify(&error, &ctx);
+    finish_translation(translation, attempt, ctx)
+}
+
+fn finish_translation(
+    translation: Translation,
+    attempt: Option<TransmissionState>,
+    ctx: ImapErrorContext,
+) -> AccountError {
     let Translation {
         kind,
         primary_cause,
@@ -274,6 +282,37 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
     builder
         .try_build()
         .expect("valid account error classification")
+}
+
+/// Adapt the sibling protocol without putting its status vocabulary in IMAP errors.
+pub(crate) fn sieve_account_error(
+    error: crate::sieve::Error,
+    ctx: ImapErrorContext,
+) -> AccountError {
+    use crate::sieve::Error as Se;
+    let common = match error {
+        Se::Sieve { code, message } => {
+            return finish_translation(
+                classify_sieve(code.as_ref(), &message, &ctx),
+                ctx.transmission_state,
+                ctx,
+            );
+        }
+        Se::Io { source } => Error::Io {
+            source,
+            attempt: None,
+        },
+        Se::Timeout => Error::Timeout { attempt: None },
+        Se::StartTlsUnavailable => Error::StartTlsUnavailable,
+        Se::Internal(message) => Error::Internal(message),
+        Se::Parse(message) => Error::Parse(message),
+        Se::InvalidInput(message) => Error::InvalidInput(message.into()),
+        Se::AuthPolicy(failure) => Error::AuthPolicy(failure),
+        Se::Auth { message, mechanism } => Error::auth_with_mechanism(message, None, mechanism),
+        Se::OAuthToken(error) => oauth_token_error(error),
+        Se::Sasl(error) => Error::from(error),
+    };
+    into_account_error(common, ctx)
 }
 
 /// Build an `AccountError` for a locally detected `Unsupported` PIM
@@ -592,7 +631,6 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
         Error::Bye { text, code, .. } => {
             classify_status(text, code.as_ref(), StatusFallback::Bye, ctx)
         }
-        Error::Sieve { code, message } => classify_sieve(code.as_ref(), message, ctx),
         Error::Protocol(msg) => Translation::new(
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
@@ -728,11 +766,11 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
 /// why". The point of the table is the codes where that default is
 /// actively wrong.
 fn classify_sieve(
-    code: Option<&crate::account::sieve::SieveResponseCode>,
+    code: Option<&crate::sieve::SieveResponseCode>,
     message: &str,
     ctx: &ImapErrorContext,
 ) -> Translation {
-    use crate::account::sieve::SieveResponseCode as Sc;
+    use crate::sieve::SieveResponseCode as Sc;
 
     let mut t = match code {
         // Explicitly transient: the server asked to be retried. Deriving

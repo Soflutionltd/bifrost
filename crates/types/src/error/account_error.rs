@@ -15,6 +15,22 @@ use super::recovery::{
 };
 use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
 
+/// The one wait for a throttle or retryable failure that carries no provider
+/// timing. `AccountError::throttle_holds` stamps it on hintless holds, and the
+/// engine's hintless retry sleep is the same value, so a sibling declaring a
+/// held budget is paced exactly as the observer paces itself.
+pub const HINTLESS_HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A throttle target before the observing account identity is supplied.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum HoldTarget {
+    Account,
+    Mailbox(crate::MailboxId),
+    Budget(ThrottleBudget),
+    CurrentOperation,
+}
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct AccountError {
@@ -216,6 +232,54 @@ impl AccountError {
             }
         }
         observations
+    }
+
+    /// Holds across primary, sibling and cleanup failures, with budget precedence.
+    #[must_use]
+    pub fn throttle_holds(&self) -> Vec<(HoldTarget, super::RetryHint)> {
+        let mut holds = Vec::new();
+        for (error, recovery) in self.throttle_observations() {
+            let (scope, hint, throttled) = match recovery {
+                RecoveryClass::Retry(a) => (
+                    a.throttle_scope,
+                    a.retry_hint,
+                    matches!(a.reason, RetryReason::RateLimited),
+                ),
+                RecoveryClass::Reconcile(a) => (
+                    a.throttle_scope,
+                    a.retry_hint,
+                    matches!(a.reason, ReconcileReason::ThrottledMidFlight),
+                ),
+                _ => continue,
+            };
+            let fallback = super::RetryHint::After(HINTLESS_HOLD_WAIT);
+            if !error.throttle_budgets().is_empty() {
+                holds.extend(
+                    error
+                        .throttle_budgets()
+                        .iter()
+                        .cloned()
+                        .map(|b| (HoldTarget::Budget(b), hint.unwrap_or(fallback))),
+                );
+                continue;
+            }
+            // Enterprise users expect one throttled folder to pause without
+            // stalling sibling folders, including when timing is omitted.
+            let target = match scope {
+                Some(ThrottleScope::Account) if hint.is_some() => HoldTarget::Account,
+                Some(ThrottleScope::Mailbox) => match error.scope() {
+                    Some(ErrorScope::Mailbox { id }) => HoldTarget::Mailbox(id.clone()),
+                    Some(ErrorScope::Cursor(crate::CursorScope::Folder(id))) => {
+                        HoldTarget::Mailbox(crate::MailboxId(id.0.clone()))
+                    }
+                    _ => HoldTarget::CurrentOperation,
+                },
+                _ if scope.is_some() || hint.is_some() || throttled => HoldTarget::CurrentOperation,
+                _ => continue,
+            };
+            holds.push((target, hint.unwrap_or(fallback)));
+        }
+        holds
     }
 
     #[must_use]

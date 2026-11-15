@@ -22,6 +22,23 @@ pub(crate) struct ProjectObservation {
     pub(crate) deadline: HoldDeadline,
 }
 
+/// Sole constructor for the declared and stamped Gmail project budget.
+pub(crate) fn project_budget(project: &str) -> ThrottleBudget {
+    ThrottleBudget::new(format!("gmail-project|{project}"))
+}
+
+/// Sole constructor for the transport hold that gates a project budget. The
+/// hold key IS the budget's identity, so `project_budget_from_hold` can stamp
+/// a `LocalHold` refusal with exactly the budget the account declared.
+pub(crate) fn project_hold_key(budget: &ThrottleBudget) -> bifrost_net::HoldKey {
+    bifrost_net::HoldKey::from(budget.as_str())
+}
+
+/// A local hold may only stamp a budget from this provider's project namespace.
+pub(crate) fn project_budget_from_hold(key: &str) -> Option<ThrottleBudget> {
+    key.strip_prefix("gmail-project|").map(project_budget)
+}
+
 pub(crate) fn project_kind(status: u16, body: &[u8]) -> Option<HoldKind> {
     let envelope = parse_gmail_envelope(body)?;
     // A concurrent-request 429 is explicitly per user, including when the
@@ -350,7 +367,11 @@ mod tests {
             ),
             _ => unreachable!(),
         };
-        assert!(client.gmail_quota_cost(&url, "GET").is_none());
+        assert!(
+            client
+                .gmail_quota_cost(&url, reqwest::Method::GET)
+                .is_none()
+        );
         let error = into_account_error(
             client.get::<serde_json::Value>(&url).await.err().unwrap(),
             ctx.clone(),

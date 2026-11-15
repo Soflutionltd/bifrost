@@ -40,17 +40,17 @@ async fn an_unresolvable_scope_is_reported_and_not_covered_by_the_handle() {
         .await
         .expect("an unresolvable scope does not sink its resolvable sibling");
 
-    assert!(result.handle.is_some(), "the inbox scope did subscribe");
+    assert!(result.handle().is_some(), "the inbox scope did subscribe");
     assert_eq!(
         result
-            .outcomes
+            .outcomes()
             .succeeded()
             .iter()
             .map(|success| success.output.clone())
             .collect::<Vec<_>>(),
         vec![inbox]
     );
-    let failed = result.outcomes.failed();
+    let failed = result.outcomes().failed();
     assert_eq!(failed.len(), 1);
     assert!(matches!(
         failed[0].error.kind(),
@@ -106,12 +106,12 @@ async fn a_poll_only_public_folder_does_not_sink_its_valid_siblings() {
         .await
         .expect("a poll-only scope is a per-scope refusal");
 
-    assert!(result.handle.is_some());
-    assert_eq!(result.outcomes.succeeded().len(), 1);
-    assert_eq!(result.outcomes.succeeded()[0].output, inbox);
-    assert_eq!(result.outcomes.failed().len(), 1);
+    assert!(result.handle().is_some());
+    assert_eq!(result.outcomes().succeeded().len(), 1);
+    assert_eq!(result.outcomes().succeeded()[0].output, inbox);
+    assert_eq!(result.outcomes().failed().len(), 1);
     assert!(matches!(
-        result.outcomes.failed()[0].error.scope(),
+        result.outcomes().failed()[0].error.scope(),
         Some(ErrorScope::Cursor(scope)) if *scope == public
     ));
 }
@@ -156,16 +156,19 @@ async fn an_unsubscribable_ews_scope_does_not_sink_its_valid_siblings() {
         .await
         .expect("an unsubscribable scope is a per-scope refusal");
 
-    let handle = result.handle.expect("the primary folder did subscribe");
+    let handle = result
+        .handle()
+        .cloned()
+        .expect("the primary folder did subscribe");
     assert_eq!(
-        result.outcomes.succeeded().len(),
+        result.outcomes().succeeded().len(),
         1,
         "only the inbox scope is covered"
     );
-    assert_eq!(result.outcomes.succeeded()[0].output, inbox);
-    assert_eq!(result.outcomes.failed().len(), 1);
+    assert_eq!(result.outcomes().succeeded()[0].output, inbox);
+    assert_eq!(result.outcomes().failed().len(), 1);
     assert!(matches!(
-        result.outcomes.failed()[0].error.scope(),
+        result.outcomes().failed()[0].error.scope(),
         Some(ErrorScope::Cursor(CursorScope::Account))
     ));
     let registered = account.ews_subscriptions.read().await;

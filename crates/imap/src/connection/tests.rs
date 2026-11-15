@@ -2485,9 +2485,11 @@ async fn a_queued_command_is_refused_when_the_session_left_its_legal_states() {
 }
 
 /// A SELECT refused before the first byte arms nothing. The pending-selection
-/// flag used to be set before encoding, so an encoder refusal left it behind
+/// flag used to be set before encoding, so a pre-wire refusal left it behind
 /// and the NEXT command's tagged OK completed a selection the server never
-/// made, flipping the session to Selected.
+/// made, flipping the session to Selected. QRESYNC operands are now validated
+/// at construction, so the SELECT encoder has no refusal left; the pre-wire
+/// refusal exercised here is the admission check for an un-ENABLEd QRESYNC.
 #[tokio::test(start_paused = true)]
 async fn a_refused_select_leaves_no_pending_selection_behind() {
     let (conn, mut server) = crate::connection::test_support::driver_pair(&preauth_greeting(
@@ -2495,20 +2497,6 @@ async fn a_refused_select_leaves_no_pending_selection_behind() {
     ))
     .await;
     let script = tokio::spawn(async move {
-        // QRESYNC parameters need a confirmed ENABLE (an unconfirmed one is an
-        // InvalidState sequencing refusal at admission), so confirm it first;
-        // the zero uidvalidity must then be refused by the encoder.
-        let enable = read_line(&mut server).await;
-        assert!(
-            enable.contains(" ENABLE QRESYNC"),
-            "expected ENABLE, got {enable:?}"
-        );
-        let tag = tag_of(&enable).to_owned();
-        respond(
-            &mut server,
-            &format!("* ENABLED QRESYNC\r\n{tag} OK enabled\r\n"),
-        )
-        .await;
         let next = read_line(&mut server).await;
         assert!(
             next.ends_with(" NOOP\r\n"),
@@ -2518,30 +2506,21 @@ async fn a_refused_select_leaves_no_pending_selection_behind() {
         respond(&mut server, &format!("{tag} OK NOOP completed\r\n")).await;
         server
     });
-    conn.enable(&["QRESYNC"], Duration::from_secs(5))
-        .await
-        .expect("ENABLE QRESYNC");
-
-    // RFC 3501 Section 9: a QRESYNC uidvalidity is nz-number, so the encoder
-    // refuses 0 before writing anything.
+    // QRESYNC is advertised but never ENABLEd, so admission refuses the
+    // SELECT before writing anything.
     let refused = conn
         .submit_regular(
             Command::Select {
                 mailbox: MailboxName::new("INBOX").unwrap(),
                 condstore: false,
-                qresync: Some(QresyncParams {
-                    uid_validity: 0,
-                    mod_seq: 1,
-                    known_uids: None,
-                    seq_match_data: None,
-                }),
+                qresync: Some(QresyncParams::from_raw(1, 1, None, None).unwrap()),
             },
             super::dispatch::TaggedOkConsumer::default(),
             None,
         )
         .await
-        .expect_err("a zero uidvalidity is refused");
-    assert!(matches!(refused, Error::InvalidInput(_)), "{refused:?}");
+        .expect_err("an un-ENABLEd QRESYNC SELECT is refused");
+    assert!(matches!(refused, Error::InvalidState(_)), "{refused:?}");
 
     conn.noop(Duration::from_secs(5)).await.expect("NOOP");
     assert_eq!(

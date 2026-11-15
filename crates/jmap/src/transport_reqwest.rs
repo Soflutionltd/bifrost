@@ -295,7 +295,7 @@ impl ReqwestTransport {
             // than discarding it, so a `Location`-less redirect carrying
             // an explanatory document arrives here intact and is
             // preserved on the error.
-            Err(TransportError::with_body(format!("HTTP {status}"), body))
+            Err(TransportError::with_body(status, body))
         }
     }
 }

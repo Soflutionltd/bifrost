@@ -1637,7 +1637,7 @@ async fn non_notify_push_reports_the_folder_beyond_its_budget_as_poll_only() {
         .await
         .expect("a refused scope is a failed item, never a whole-request Err");
     let succeeded: Vec<_> = result
-        .outcomes
+        .outcomes()
         .succeeded()
         .iter()
         .map(|item| item.item.0.clone())
@@ -1647,21 +1647,21 @@ async fn non_notify_push_reports_the_folder_beyond_its_budget_as_poll_only() {
         vec!["0", "1"],
         "every folder up to and including the budget is pushed",
     );
-    assert_eq!(result.outcomes.failed().len(), 1);
+    assert_eq!(result.outcomes().failed().len(), 1);
     assert_eq!(
-        result.outcomes.failed()[0].item.0,
+        result.outcomes().failed()[0].item.0,
         "2",
         "the first folder past the budget, and only it, is rejected",
     );
     assert!(
-        result.outcomes.failed()[0]
+        result.outcomes().failed()[0]
             .error
             .user_safe_text()
             .any(|text| text.contains("budget")),
         "a capacity refusal must not read as an unsupported scope shape",
     );
     assert!(
-        result.handle.is_some(),
+        result.handle().is_some(),
         "accepted scopes retain one subscription handle"
     );
     // Workers are capacity-many, not folder-many: the pool is started once
@@ -1698,7 +1698,7 @@ async fn a_folder_scope_with_an_unsendable_name_is_refused_not_misreported() {
         .await
         .expect("an invalid folder name is a failed item, never a whole-request Err");
     let succeeded: Vec<_> = result
-        .outcomes
+        .outcomes()
         .succeeded()
         .iter()
         .map(|item| item.item.0.clone())
@@ -1708,10 +1708,10 @@ async fn a_folder_scope_with_an_unsendable_name_is_refused_not_misreported() {
         vec!["1"],
         "the invalid name must not be reported as pushed, and must not block the valid sibling",
     );
-    assert_eq!(result.outcomes.failed().len(), 1);
-    assert_eq!(result.outcomes.failed()[0].item.0, "0");
+    assert_eq!(result.outcomes().failed().len(), 1);
+    assert_eq!(result.outcomes().failed()[0].item.0, "0");
     assert!(
-        result.outcomes.failed()[0]
+        result.outcomes().failed()[0]
             .error
             .user_safe_text()
             .any(|text| text.contains("invalid mailbox name")),
@@ -1749,7 +1749,7 @@ async fn a_composed_dav_collection_scope_is_refused_by_push_admission() {
         .await
         .expect("a refused scope is a failed item, never a whole-request Err");
     let succeeded: Vec<_> = result
-        .outcomes
+        .outcomes()
         .succeeded()
         .iter()
         .map(|item| item.item.0.clone())
@@ -1759,8 +1759,8 @@ async fn a_composed_dav_collection_scope_is_refused_by_push_admission() {
         vec!["1"],
         "the DAV collection must not be reported as pushed, and must not block the mail sibling",
     );
-    assert_eq!(result.outcomes.failed().len(), 1);
-    assert_eq!(result.outcomes.failed()[0].item.0, "0");
+    assert_eq!(result.outcomes().failed().len(), 1);
+    assert_eq!(result.outcomes().failed()[0].item.0, "0");
     drop(server);
     account.close().await.unwrap();
 }
@@ -2279,8 +2279,9 @@ async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
         cursor_for(&FolderCursor::QResync {
             uidvalidity: 5,
             modseq: 100,
-            known_uids: CompactUidSet::from_uids([1, 2, 3]),
-            known_uids_complete: true,
+            baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::from_uids([
+                1, 2, 3,
+            ])),
         }),
     )
     .await;
@@ -2305,12 +2306,10 @@ async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
         FolderCursor::QResync {
             uidvalidity,
             modseq,
-            known_uids,
-            known_uids_complete,
+            baseline: crate::account::envelope::UidBaseline::Complete(known_uids),
         } => {
             assert_eq!((uidvalidity, modseq), (5, 200));
             assert_eq!(known_uids.to_uids(), vec![2, 3]);
-            assert!(known_uids_complete);
         }
         other => panic!("QRESYNC must checkpoint a QRESYNC cursor, got {other:?}"),
     }
@@ -2355,8 +2354,7 @@ async fn qresync_delivery_transcript(expunge: bool, search_fails: bool) {
     let baseline = FolderCursor::QResync {
         uidvalidity: 5,
         modseq: 100,
-        known_uids: CompactUidSet::from_uids([1, 2]),
-        known_uids_complete: true,
+        baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::from_uids([1, 2])),
     };
     account.folders.set_cursor(&inbox(), baseline.clone());
     let script = tokio::spawn(async move {
@@ -2415,14 +2413,12 @@ async fn qresync_delivery_transcript(expunge: bool, search_fails: bool) {
         match done_cursor(&events) {
             FolderCursor::QResync {
                 modseq,
-                known_uids,
-                known_uids_complete,
+                baseline: crate::account::envelope::UidBaseline::Complete(known_uids),
                 ..
             } => {
                 assert_eq!(modseq, 200);
                 let expected_uids = if expunge { vec![2, 3] } else { vec![1, 2, 3] };
                 assert_eq!(known_uids.to_uids(), expected_uids);
-                assert!(known_uids_complete);
             }
             other => panic!("expected QRESYNC checkpoint, got {other:?}"),
         }
@@ -2449,8 +2445,9 @@ async fn incomplete_qresync_baseline_requests_inventory_restart_without_wire_io(
         cursor_for(&FolderCursor::QResync {
             uidvalidity: 5,
             modseq: 100,
-            known_uids: CompactUidSet::from_uids([1, 2]),
-            known_uids_complete: false,
+            baseline: crate::account::envelope::UidBaseline::Legacy(CompactUidSet::from_uids([
+                1, 2,
+            ])),
         }),
     )
     .await;
@@ -2705,8 +2702,9 @@ async fn a_qresync_run_on_a_member_without_qresync_continues_as_condstore_on_the
         cursor_for(&FolderCursor::QResync {
             uidvalidity: 7,
             modseq: 50,
-            known_uids: CompactUidSet::from_uids([1, 2, 3]),
-            known_uids_complete: true,
+            baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::from_uids([
+                1, 2, 3,
+            ])),
         }),
     )
     .await;
@@ -2733,12 +2731,10 @@ async fn a_qresync_run_on_a_member_without_qresync_continues_as_condstore_on_the
         FolderCursor::QResync {
             uidvalidity,
             modseq,
-            known_uids,
-            known_uids_complete,
+            baseline: crate::account::envelope::UidBaseline::Complete(known_uids),
         } => {
             assert_eq!((uidvalidity, modseq), (7, 60));
             assert_eq!(known_uids.to_uids(), vec![2, 3, 4]);
-            assert!(known_uids_complete);
         }
         other => panic!("expected a policy-minted QRESYNC checkpoint, got {other:?}"),
     }
@@ -2823,8 +2819,9 @@ async fn a_qresync_run_on_a_member_that_already_selected_never_issues_enable() {
         cursor_for(&FolderCursor::QResync {
             uidvalidity: 7,
             modseq: 50,
-            known_uids: CompactUidSet::from_uids([1, 2, 3]),
-            known_uids_complete: true,
+            baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::from_uids([
+                1, 2, 3,
+            ])),
         }),
     )
     .await;
@@ -3164,8 +3161,7 @@ async fn describe_cursor_reports_the_strategy_the_run_will_actually_use() {
     let qresync_cursor = cursor_for(&FolderCursor::QResync {
         uidvalidity: 1,
         modseq: 1,
-        known_uids: CompactUidSet::default(),
-        known_uids_complete: true,
+        baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::default()),
     });
     let condstore_cursor = cursor_for(&FolderCursor::Condstore {
         uidvalidity: 1,
@@ -3206,8 +3202,7 @@ async fn describe_cursor_reports_the_strategy_the_run_will_actually_use() {
     let incomplete = cursor_for(&FolderCursor::QResync {
         uidvalidity: 1,
         modseq: 1,
-        known_uids: CompactUidSet::default(),
-        known_uids_complete: false,
+        baseline: crate::account::envelope::UidBaseline::Legacy(CompactUidSet::default()),
     });
     for account in [enabled, disabled] {
         let described = super::changes::describe_cursor(&account, &incomplete);
@@ -3918,7 +3913,7 @@ async fn a_raw_message_read_stops_at_its_byte_budget() {
             7,
             bifrost_types::AccountOperation::OpenRawRfc822,
             3,
-            false,
+            super::blob::UidPersistence::Session,
             &tx,
         ),
     )
@@ -3980,7 +3975,7 @@ async fn a_uid_the_operand_cannot_carry_never_reaches_the_fetch() {
             0,
             bifrost_types::AccountOperation::OpenRawRfc822,
             1024,
-            false,
+            super::blob::UidPersistence::Session,
             &tx,
         ),
     )
@@ -4663,8 +4658,9 @@ async fn mutation_select_omits_qresync_baseline_and_keeps_cached_store_guard() {
     entry.set_cursor(FolderCursor::QResync {
         uidvalidity: 5,
         modseq: 100,
-        known_uids: CompactUidSet::from_ranges(vec![crate::types::UidRange::range(1, 4000000000)]),
-        known_uids_complete: true,
+        baseline: crate::account::envelope::UidBaseline::Complete(CompactUidSet::from_ranges(
+            vec![crate::types::UidRange::range(1, 4000000000)],
+        )),
     });
     entry.record_modseq(5, 2, 100).unwrap();
     let script = tokio::spawn(async move {
@@ -4945,9 +4941,9 @@ async fn push_is_refused_entirely_when_pool_cap_leaves_no_room() {
             .push_subscribe(&[push_folder("INBOX"), push_folder("Archive")])
             .await
             .unwrap();
-        assert_eq!(result.outcomes.failed().len(), 2);
-        assert!(result.outcomes.succeeded().is_empty());
-        assert!(result.handle.is_none());
+        assert_eq!(result.outcomes().failed().len(), 2);
+        assert!(result.outcomes().succeeded().is_empty());
+        assert!(result.handle().is_none());
         assert!(account.push_lanes().is_empty());
         assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         drop(peer);
@@ -4966,8 +4962,8 @@ async fn a_notify_account_admits_every_folder_on_one_lane() {
         .map(push_folder)
         .collect();
     let result = account.push_subscribe(&scopes).await.unwrap();
-    assert_eq!(result.outcomes.succeeded().len(), 5);
-    assert!(result.outcomes.failed().is_empty());
+    assert_eq!(result.outcomes().succeeded().len(), 5);
+    assert!(result.outcomes().failed().is_empty());
     assert_eq!(account.push_lanes().len(), 1);
     drop(peer);
     account.close().await.unwrap();
@@ -5016,7 +5012,8 @@ async fn a_subscription_change_mid_dial_keeps_the_pending_session() {
             .push_subscribe(&[push_folder("INBOX")])
             .await
             .unwrap()
-            .handle
+            .handle()
+            .cloned()
             .unwrap();
         let driver = drive_push_until_shutdown(&account);
         let mut push_peer = dials.servers.recv().await.unwrap();
@@ -5647,7 +5644,7 @@ async fn a_non_notify_worker_does_not_warn_about_folders_other_workers_cover() {
         .push_subscribe(&[push_folder("INBOX"), push_folder("Archive")])
         .await
         .unwrap();
-    assert_eq!(result.outcomes.succeeded().len(), 2);
+    assert_eq!(result.outcomes().succeeded().len(), 2);
     assert_eq!(account.push_lanes().len(), 2);
     let mut session = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
     let setup = async {

@@ -80,7 +80,7 @@ impl Fixture {
         }
     }
     fn hold(&self, seconds: u64) {
-        self.slot.throttles.lock().expect("bucket").record(
+        self.slot.throttles.record(
             key(),
             tokio::time::Instant::now() + Duration::from_secs(seconds),
         );
@@ -671,7 +671,7 @@ async fn lock_boundary_case(exhaust: bool) {
     tokio::pin!(restart);
     tokio::select! { biased; _ = &mut restart => panic!("restart must queue on lock"), () = turns() => {} }
     assert_eq!(factory.opens.load(Ordering::SeqCst), 1);
-    ctx.throttles.lock().expect("bucket").record(
+    ctx.throttles.record(
         ThrottleKey::Account(fixture.id.clone()),
         tokio::time::Instant::now() + Duration::from_secs(if exhaust { 600 } else { 20 }),
     );
@@ -745,7 +745,7 @@ fn subscription(handle: &str, unconfirmed: bool) -> RegisteredSubscription {
 #[tokio::test(start_paused = true)]
 async fn round1_teardown_records_every_refusal_before_next_call() {
     let bucket = Arc::new(std::sync::Mutex::new(
-        None::<Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>>,
+        None::<Arc<crate::recovery::ThrottleBucket>>,
     ));
     let observed_bucket = Arc::clone(&bucket);
     let mut initial = account();
@@ -884,7 +884,7 @@ fn peer_hold(ctx: &RecoveryContext<'_>, budget: &str) -> Option<Duration> {
 
 #[tokio::test(start_paused = true)]
 async fn round2_unwind_records_every_refusal_and_preserves_original_error() {
-    type Bucket = Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>;
+    type Bucket = Arc<crate::recovery::ThrottleBucket>;
     let bucket = Arc::new(std::sync::OnceLock::<Bucket>::new());
     let observed_bucket = Arc::clone(&bucket);
     let immediate = Arc::new(std::sync::atomic::AtomicBool::new(false));

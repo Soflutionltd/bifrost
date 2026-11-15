@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::Object;
-use super::id::AccountId;
+use super::id::{AccountId, ObjectState};
 use super::request::ResultReference;
 
 pub(crate) trait GetObject: Object {
@@ -41,7 +41,7 @@ pub(crate) struct GetResponse<O: Object> {
     #[serde(rename = "accountId")]
     account_id: Option<AccountId>,
 
-    state: String,
+    state: ObjectState<O>,
 
     list: Vec<O>,
 
@@ -134,11 +134,11 @@ impl<O: Object> GetResponse<O> {
         self.account_id.as_ref()
     }
 
-    pub(crate) fn state(&self) -> &str {
+    pub(crate) fn state(&self) -> &ObjectState<O> {
         &self.state
     }
 
-    pub(crate) fn into_state(self) -> String {
+    pub(crate) fn into_state(self) -> ObjectState<O> {
         self.state
     }
 

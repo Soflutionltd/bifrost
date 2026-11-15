@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::Object;
-use super::id::AccountId;
+use super::id::{AccountId, ObjectState};
 
 pub(crate) trait ChangesObject: Object {
     type ChangesResponse: DeserializeOwned;
@@ -21,16 +21,18 @@ pub(crate) trait ChangesObject: Object {
 /// supplying the diagnostic method name the forward-progress guard
 /// reports.
 pub(crate) trait ChangesMethod: super::method::JmapMethod {
-    fn since(since_state: String, max_changes: NonZeroUsize) -> Self;
+    type Object: ChangesObject;
+
+    fn since(since_state: ObjectState<Self::Object>, max_changes: NonZeroUsize) -> Self;
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct ChangesRequest {
+pub(crate) struct ChangesRequest<O: Object> {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
     #[serde(rename = "sinceState")]
-    since_state: String,
+    since_state: ObjectState<O>,
 
     #[serde(rename = "maxChanges")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,10 +45,10 @@ pub(crate) struct ChangesResponse<O: ChangesObject> {
     account_id: AccountId,
 
     #[serde(rename = "oldState")]
-    old_state: String,
+    old_state: ObjectState<O>,
 
     #[serde(rename = "newState")]
-    new_state: String,
+    new_state: ObjectState<O>,
 
     #[serde(rename = "hasMoreChanges")]
     has_more_changes: bool,
@@ -61,8 +63,8 @@ pub(crate) struct ChangesResponse<O: ChangesObject> {
     arguments: O::ChangesResponse,
 }
 
-impl ChangesRequest {
-    pub(crate) fn new(since_state: impl Into<String>) -> Self {
+impl<O: Object> ChangesRequest<O> {
+    pub(crate) fn new(since_state: impl Into<ObjectState<O>>) -> Self {
         ChangesRequest {
             account_id: AccountId::new(""),
             since_state: since_state.into(),
@@ -90,15 +92,15 @@ impl<O: ChangesObject> ChangesResponse<O> {
         self.account_id
     }
 
-    pub(crate) fn old_state(&self) -> &str {
+    pub(crate) fn old_state(&self) -> &ObjectState<O> {
         &self.old_state
     }
 
-    pub(crate) fn new_state(&self) -> &str {
+    pub(crate) fn new_state(&self) -> &ObjectState<O> {
         &self.new_state
     }
 
-    pub(crate) fn into_new_state(self) -> String {
+    pub(crate) fn into_new_state(self) -> ObjectState<O> {
         self.new_state
     }
 

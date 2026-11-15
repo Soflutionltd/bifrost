@@ -232,9 +232,11 @@ impl Serialize for DataType {
 #[non_exhaustive]
 pub(crate) enum PushObject {
     StateChange {
+        // Object states are heterogeneous here: DataType is their runtime
+        // discriminator. They require explicit decoding before typed requests.
         changed: HashMap<String, HashMap<DataType, String>>,
         #[serde(rename = "pushState", default)]
-        push_state: Option<String>,
+        push_state: Option<crate::core::id::PushState>,
     },
     #[cfg(feature = "mail")]
     EmailPush {
@@ -254,7 +256,7 @@ pub(crate) enum PushObject {
 pub(crate) struct PushStateChange {
     pub(crate) changed: HashMap<String, HashMap<DataType, String>>,
     #[serde(rename = "pushState", default)]
-    pub(crate) push_state: Option<String>,
+    pub(crate) push_state: Option<crate::core::id::PushState>,
 }
 
 /// One wire block: token-free notifications precede its merged state.
@@ -365,7 +367,14 @@ pub(crate) enum Error {
     /// server's reply or session document cannot be parsed as the
     /// expected shape. Maps to `Protocol(ParseFailed)` /
     /// `ProviderContractViolation`.
-    ResponseDecode(serde_json::Error),
+    EnvelopeDecode(serde_json::Error),
+    /// A successful method result failed typed extraction.
+    ResultDecode {
+        call_id: String,
+        source: serde_json::Error,
+    },
+    /// The provider omitted a required response property.
+    MissingResponseField(&'static str),
     /// Server returned an RFC 7807 problem details response. Carries
     /// the parsed `ProblemDetails` plus, when the failure flowed
     /// through the default reqwest transport, the originating
@@ -399,10 +408,7 @@ pub(crate) enum Error {
     },
     /// Not parsable as the expected format.
     ///
-    /// Keep this format-failure meaning separate from malformed provider
-    /// contracts. The account layer still constructs this variant for missing
-    /// state; correcting those producers needs their error translation changed
-    /// together, not a guessed meaning inferred from the diagnostic string here.
+    /// Missing provider properties use MissingResponseField instead.
     NotParsable(String),
     /// A URL or URL-component value this crate's own caller supplied is
     /// unusable (an empty custom-transport session URL or EventSource type
@@ -506,19 +512,6 @@ impl From<core::transport::TransportError> for Error {
     }
 }
 
-// This legacy conversion cannot establish response provenance. Replacing it
-// requires the account error boundary and send partial-commit predicates to
-// distinguish envelope, method-result and session decoding together; changing
-// only the producer would silently alter retry and transmission evidence.
-// Default JSON-error conversion treats failures as response decoding.
-// Outbound request encoding sites must use Error::RequestEncode
-// explicitly rather than relying on `?`.
-impl From<serde_json::Error> for Error {
-    fn from(e: serde_json::Error) -> Self {
-        Error::ResponseDecode(e)
-    }
-}
-
 impl From<MethodError> for Error {
     fn from(e: MethodError) -> Self {
         Error::Method(e)
@@ -590,7 +583,11 @@ impl Display for Error {
             Error::UploadSizeLimit { max, size } => {
                 write!(f, "Upload of {size} bytes exceeds maxSizeUpload ({max})")
             }
-            Error::ResponseDecode(e) => write!(f, "Response decode error: {e}"),
+            Error::EnvelopeDecode(e) => write!(f, "Envelope decode error: {e}"),
+            Error::ResultDecode { call_id, source } => {
+                write!(f, "Call {call_id} result decode error: {source}")
+            }
+            Error::MissingResponseField(field) => write!(f, "Response omitted {field}"),
             Error::Problem { details, .. } => write!(f, "Problem: {details}"),
             Error::Method(e) => write!(f, "Method error: {e}"),
             Error::Set(e) => write!(f, "Set error: {e}"),

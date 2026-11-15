@@ -154,7 +154,7 @@ pub(crate) async fn delete_thread(
                         &account,
                         requests,
                         &targets,
-                        true,
+                        crate::account::batch::AbsentMeans::Success,
                         AccountOperation::BulkDestroy,
                     )
                     .await

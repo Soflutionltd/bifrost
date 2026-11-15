@@ -55,7 +55,8 @@ visible to spawned tasks immediately: every iteration calls
   protocol legs. Without a registry, cap forwarding behaves as before. The
   payload smoothing bound is defined in `reference/net.md`.
 - `with_bandwidth_meter(Arc<bifrost_net::BandwidthMeter>)` -
-  wires the meter; when unset, `Control::bandwidth_observed`
+  accepts `net.meter()` to share the HTTP counters with the engine and the IMAP
+  factory. When unset, `Control::bandwidth_observed`
   returns 0 for every account.
 - `build()` - validates the budget, constructs the scheduler
   with the configured lane capacity, returns `SyncEngine`.
@@ -1380,10 +1381,21 @@ streams get the declaration from `lift_complete_walk`, the one place that
 still infers it (see `reference/types.md`).
 
 Resume: the `BackfillRegistry` (`BackfillState::Pending/Running/Completed`)
-is an engine-wide observability index keyed by `(AccountId, CursorScope)`.
-Account rows are removed on detach, so the registry cannot merge
-identically-shaped scopes from different accounts or carry completion
-across an attach -> detach -> re-attach cycle. The sole durable record is
+is an engine-wide read-only projection of each account's `BackfillScan`.
+The scan owns one record per `(CursorScope, ScopeIncarnation)`, with exclusive
+fresh, running, parked, held, failed and settled phases. Retry history and loss
+evidence survive holds and parked partitions in that record. One retain removes
+all departed incarnations, including settled ones. Fusion's first-sighting scope
+history remains attachment-wide so re-establishment cannot skip inventory again.
+`SyncEngine::backfill_registry` still exposes the registry handle;
+`snapshot(account, scope)` resolves the current live incarnation and
+`snapshot_incarnation(account, scope, incarnation)` refuses a departed identity.
+A newly established incarnation reads Pending before the next scan. Settled
+status projects Completed only while its original loss watermark still agrees.
+This gives an enterprise mail user current progress rather than stale completion
+from a deleted folder. Consumers cannot write a second completion verdict.
+Account projections are removed on detach, so identically-shaped scopes from
+different accounts and later attachments cannot share completion. The sole durable record is
 the consumer-acked `BackfillCheckpoint` in the `CheckpointStore`. On
 completion the orchestrator broadcasts a durable completion marker - a
 synthetic empty `Batch` whose `BackfillCheckpoint` sits on the
@@ -1432,8 +1444,8 @@ Both decisions land in `BackfillPlan::resume`, which returns a
 `ScopeResume` of either `Skip` or `Walk(ScopeWalkDriver)`. That is the
 only place the two plan shapes differ: the orchestrator's walk loop
 below it is written once, so barrier handling, completion-marker
-withholding and `BackfillRegistry` bookkeeping cannot drift apart
-between them. A read failure routes through `walk_from_scratch`, which
+withholding and the scan state projected by `BackfillRegistry` cannot drift
+apart between them. A read failure routes through `walk_from_scratch`, which
 is defined as the no-checkpoint answer rather than a second code path.
 
 Pause and checkpoint waiters observe backfill boundaries through the
@@ -1890,9 +1902,8 @@ both can land afterwards, so `BackfillScan::settled` records the walk's
 baseline and `select` compares it on every rescan: a moved reading unsettles
 the incarnation as `lost_pages`. A retry that restarts from scratch discards
 BEFORE it walks, since a loss landing after the marker's acknowledgement
-leaves a durable marker that nothing else removes. `select` prunes the
-baseline, retry deadline and lost-pages mark of any incarnation the registry
-no longer carries.
+leaves a durable marker that nothing else removes. `select` prunes the entire state record, including settled state, of any
+incarnation the cursor registry no longer carries.
 
 The comparison covers a FAILED attempt too, and the baseline survives the
 failure for that purpose. `note_lost_pages` runs at a walk's end, so a departure
@@ -2103,7 +2114,7 @@ of effects that must survive a dropped stream.
 
 `SubscriptionRegistry` (per-engine `DashMap<AccountId,
 Vec<RegisteredSubscription>>`) stashes each returned handle together
-with only the scopes in `PushSubscription.outcomes`' succeeded lane. Failed
+with only the scopes in `PushSubscription::outcomes()`' succeeded lane. Failed
 scopes remain polling-only and are never recorded as covered. The validated
 three-lane outcome accounts for every requested scope, and an all-rejected
 request returns no handle. That accepted-scope snapshot lets account
@@ -3911,8 +3922,7 @@ guard absorbs as uncertain, through the crate-internal
 run_object_readback path, plus a returned stream-level termination) funnel through
 `recovery::dispatch_stream_failure` (classified failures) or
 `recovery::observe_failure_throttles` (observation only), which record every
-primary, sibling and cleanup leg via `recovery::record_throttle` or
-`recovery::record_reconcile_throttle`, and the local sleep those arms
+primary, sibling and cleanup leg via `ThrottleBucket::observe`, and the local sleep those arms
 observe comes from `recovery::retry_delay` /
 `recovery::reconcile_delay`, which honor the carried `RetryHint` and
 otherwise fall back to one second. An error that stamps throttle budgets
@@ -3957,10 +3967,10 @@ not, and the re-check loop then re-derives the full wait after every sleep and
 spins without progress - which is why the deferral had no hermetic test until
 the bucket moved. `tokio::time::Instant::now()` falls back to the system clock
 when no tokio clock is in force, so production behaviour is unchanged. Nothing
-persists a throttle deadline (the bucket is one in-memory `Arc<Mutex<_>>` per
+persists a throttle deadline (the bucket is one in-memory `Arc<ThrottleBucket>` per
 engine, never serialized), so a monotonic instant never has to survive a
 process. The wall-clock-to-monotonic conversion happens at exactly one
-boundary, `record_throttle_parts`: a provider `RetryHint` - a duration
+boundary, `ThrottleBucket::observe`: a provider `RetryHint` - a duration
 (`After`) or an absolute HTTP date (`At`) - is resolved through `min_delay`
 against `SystemTime::now()` and immediately anchored to `Instant::now()`.
 `account_throttle_wait` takes no `now` for the same reason: there is one
@@ -4088,7 +4098,7 @@ crates/sync/src/
     fusion.rs             // InventoryFusion::run_with_broadcast
     poll.rs               // adaptive cadence helper
   backfill/
-    mod.rs                // account-keyed BackfillRegistry,
+    mod.rs                // account-keyed read-only BackfillRegistry projection,
                           // BackfillPolicy / Strategy
     runner.rs             // BackfillRunner::run_partition,
                           // LiveSupersedes (ring-evicting, default
@@ -4471,3 +4481,23 @@ The storage codec explicitly extracts and reconstructs numeric values without
 changing their little-endian wire representation. Protocol-owned payload opening
 and decode-fault recovery belong to bifrost-types (`OpaqueChangeState::open`
 and `CursorDecodeFault::builder`), rather than provider-specific recovery tables.
+
+`ThrottleBucket` owns its mutex. `observe(account, error)` is the single
+observation implementation: it consumes `AccountError::throttle_holds()`,
+records shareable targets and returns the longest local deadline, including
+operation-only holds. Repair uses that same deadline; dispatch retains its
+one-second hintless retry and reconcile pacing. Existing recorder functions
+are forwarding entry points for their callers.
+
+
+Ledger mutations in the account writer have two persistence disciplines.
+`DebtLedger::accrue` exposes only debt ingestion and barrier recording: these
+remain in memory after a failed store write so later requests cannot forget
+unresolved work. `DebtLedger::stage` creates a `StagedLedger` for proof,
+operator policy and repair outcomes; the writer commits it only after the
+corresponding store operation succeeds. A failed acknowledgement therefore
+retains its debt but cannot discharge debt through a later unrelated write.
+Completion eligibility reads the candidate. A refusal that discards an
+incomplete walk uses the live debt ledger, withholding the rejected walk's
+proof throughout the discard's intermediate writes. Reset and discard fences
+and their second debt collection passes remain in effect.

@@ -592,16 +592,9 @@ impl CommandKind {
     ///   (RFC 5819 Section 2), so all three share one key.
     /// * `VANISHED (EARLIER)` by FETCH and EXPUNGE (RFC 7162 Section 3.2.10).
     ///
-    /// The classifier is the authority; this is a summary of it, and a test
-    /// checks every pair of pipelinable kinds with distinct keys against it.
-    pub(crate) const fn untagged_routing_key(self) -> Self {
-        match self {
-            Self::GetQuotaRoot | Self::SetQuota => Self::GetQuota,
-            Self::SearchReturn | Self::SearchSave => Self::Search,
-            Self::ListStatus | Self::Status => Self::List,
-            Self::Expunge => Self::Fetch,
-            other => other,
-        }
+    /// The classifier derives this key from its solicited-response owner sets.
+    pub(crate) fn untagged_routing_key(self) -> Self {
+        crate::codec::classification::untagged_routing_key(self)
     }
 
     /// Whether a command of this kind may ride a pipelined batch

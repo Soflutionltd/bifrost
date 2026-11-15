@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use serde::{Deserialize, Serialize};
 
 use super::Object;
-use super::id::AccountId;
+use super::id::{AccountId, QueryState};
 use super::query::{Comparator, Filter, QueryObject};
 
 #[derive(Debug, Clone, Serialize)]
@@ -20,7 +20,7 @@ pub(crate) struct QueryChangesRequest<O: QueryObject> {
     sort: Option<Vec<Comparator<O::Sort>>>,
 
     #[serde(rename = "sinceQueryState")]
-    since_query_state: String,
+    since_query_state: QueryState<O>,
 
     #[serde(rename = "maxChanges")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,9 +42,9 @@ pub(crate) struct QueryChangesResponse<O: Object> {
     #[serde(rename = "accountId")]
     account_id: AccountId,
     #[serde(rename = "oldQueryState")]
-    old_query_state: String,
+    old_query_state: QueryState<O>,
     #[serde(rename = "newQueryState")]
-    new_query_state: String,
+    new_query_state: QueryState<O>,
     #[serde(rename = "total")]
     total: Option<usize>,
     #[serde(rename = "removed")]
@@ -64,7 +64,7 @@ impl<O: QueryObject> QueryChangesRequest<O> {
     /// the account ID is filled in by
     /// [`crate::core::request::Request::call`] when the method is
     /// added to a request batch.
-    pub(crate) fn new(since_query_state: impl Into<String>) -> Self {
+    pub(crate) fn new(since_query_state: impl Into<QueryState<O>>) -> Self {
         QueryChangesRequest {
             account_id: AccountId::new(""),
             filter: None,
@@ -123,11 +123,11 @@ impl<O: Object> QueryChangesResponse<O> {
         &self.account_id
     }
 
-    pub(crate) fn old_query_state(&self) -> &str {
+    pub(crate) fn old_query_state(&self) -> &QueryState<O> {
         &self.old_query_state
     }
 
-    pub(crate) fn new_query_state(&self) -> &str {
+    pub(crate) fn new_query_state(&self) -> &QueryState<O> {
         &self.new_query_state
     }
 

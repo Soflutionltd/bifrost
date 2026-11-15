@@ -53,13 +53,13 @@ impl ImapConnection {
     pub async fn select_for_sync(
         &self,
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
-        options: &crate::types::SyncSelectOptions,
+        options: &crate::types::SelectOptions,
         timeout: Duration,
     ) -> Result<crate::types::SyncSelectResult, Error> {
         use crate::types::QresyncOutcome;
 
         let profile = self.server_profile();
-        let qresync = options.qresync_params();
+        let qresync = options.qresync.clone();
         let outcome = match qresync {
             None => QresyncOutcome::NotRequested,
             Some(_) if profile.enabled("QRESYNC") => QresyncOutcome::Used,
@@ -76,7 +76,7 @@ impl ImapConnection {
             SelectOptions::default()
         };
 
-        let mailbox = if options.read_only {
+        let mailbox = if options.access == crate::types::SelectAccess::ReadOnly {
             self.examine_with(mailbox, &select_options, timeout).await?
         } else {
             self.select_with(mailbox, &select_options, timeout).await?
@@ -99,17 +99,12 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<crate::types::SyncFetchResult, Error> {
         let sequence_set = request.uids.as_sequence_set();
-        if request.include_vanished {
-            let Some(mod_seq) = request.changed_since else {
-                return Err(Error::InvalidInput(
-                    "include_vanished requires changed_since for UID FETCH".into(),
-                ));
-            };
+        if let crate::types::FetchChanges::SinceWithVanished(mod_seq) = request.changes {
             let (fetches, vanished) = self
                 .uid_fetch_vanished(sequence_set, &request.attrs, mod_seq.get(), timeout)
                 .await?;
             Ok(crate::types::SyncFetchResult { fetches, vanished })
-        } else if let Some(mod_seq) = request.changed_since {
+        } else if let crate::types::FetchChanges::Since(mod_seq) = request.changes {
             let fetches = self
                 .uid_fetch_changed_since(sequence_set, &request.attrs, mod_seq.get(), timeout)
                 .await?;

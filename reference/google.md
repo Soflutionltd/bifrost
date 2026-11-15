@@ -46,6 +46,20 @@ quota-consuming Cloud project identity and rejects empty or whitespace-only
 input. Use the project NUMBER everywhere, consistently across factories.
 This is a grouping identity only: no billing or quota-project header is sent.
 The budget identity and net gate key are both `gmail-project|ID`.
+`quota::project_budget` constructs that identity for client declarations and
+local-hold error stamps, and `quota::project_hold_key` derives the net
+`HoldKey` from that budget; local-hold decoding accepts only the Gmail project
+namespace. Other provider holds cannot invent a Gmail project budget.
+
+The shared request funnel accepts `reqwest::Method`, with no string-method
+panic. After API surface selection, `client::GmailEndpoint` resolves the Gmail
+path once and owns its quota units and data-concurrency admission. Watch and
+stop identities bypass the data queue, including when query parameters are
+present. History error contexts carry the same endpoint identity instead of a
+separate boolean. Endpoint resolution stays at the common builder boundary
+because the generic builders also accept absolute Calendar and People URLs;
+a relative-path annotation cannot establish their API surface.
+
 
 Error contexts explicitly distinguish Gmail, Calendar, People and Drive.
 Only the Gmail surface can select the project budget. On Gmail,
@@ -296,8 +310,9 @@ walk previously peaked near 64 data requests.
 
 Each Gmail data request adds a weight-1 `RequestBuilder::concurrency_limit`
 claim. `AccountNet::shared_concurrency_limit` supplies the handle from its
-per-Net registry, keyed by `gmail:` plus the debug-formatted tuple of engine
-account id and Gmail API base origin (scheme, host and effective port).
+per-Net registry, keyed by `LimitKey::namespaced("google.gmail", components)`
+with engine account id and Gmail API base origin (scheme, host and effective
+port) as separate length-prefixed components.
 The client retains the handle, so overlapping clients for that key share it.
 Typed requests and raw-builder Gmail mutations are covered. `users.watch`
 renewal and `users.stop` are independent of this concurrency queue; rate

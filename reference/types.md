@@ -380,6 +380,14 @@ choose the correct primitive:
   membership;
 - keyword-like shapes route through keyword mutation.
 
+`Container::native_id()` borrows the native string from its private
+provenance, so there is no independently mutable duplicate. `provenance()`
+reads the metadata and `with_provenance` replaces it together with the native
+id. The public `kind` remains a presentation classification, independent of
+`provenance().kind`, which records the wire classification. A consumer can
+present a native label as a folder without changing its protocol identity.
+`Container::new` retains its existing arguments and every metadata builder.
+
 The `"$flagged"` category sentinel is reserved by the convenience
 dispatch contract for providers whose starred state is represented by
 a category.
@@ -528,6 +536,12 @@ Its const constructor preserves the one-millisecond floor and raises a smaller
 maximum to the initial delay.
 
 ## Push sessions
+
+`PushSubscription` keeps its handle and outcome ledger private. `new` validates
+that a handle exists exactly when the succeeded lane is nonempty;
+`all_succeeded` uses the same gate. `handle()` and `outcomes()` borrow the
+values, and `into_parts()` returns both owned values. Rebuilding a modified
+result goes through `new`, so coverage cannot drift from the handle.
 
 `Account::push_lanes` declares independent Connection or Registration slots.
 `push_stream(lane, stop, gate)` drives one re-runnable session: establishment

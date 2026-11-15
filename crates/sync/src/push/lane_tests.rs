@@ -28,7 +28,7 @@ struct Fixture {
     health: watch::Receiver<health::PushHealth>,
     recovery: mpsc::Receiver<ReopenRequest>,
     events: tokio::sync::broadcast::Receiver<crate::multiplexer::MultiplexerEvent>,
-    throttles: Arc<Mutex<ThrottleBucket>>,
+    throttles: Arc<ThrottleBucket>,
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<()>,
 }
@@ -96,7 +96,7 @@ impl Fixture {
             generation: generation_value,
             lanes: Vec::new(),
         });
-        let throttles = Arc::new(Mutex::new(ThrottleBucket::default()));
+        let throttles = Arc::new(ThrottleBucket::default());
         let shutdown = CancellationToken::new();
         let lanes = PushLanes {
             account_id: bifrost_types::AccountId("lanes".into()),
@@ -341,7 +341,7 @@ async fn a_hold_recorded_after_establishment_holds_the_next_maintenance_request(
         false,
     )
     .await;
-    f.throttles.lock().unwrap().record(
+    f.throttles.record(
         bifrost_types::ThrottleKey::Account(bifrost_types::AccountId("lanes".into())),
         tokio::time::Instant::now() + Duration::from_secs(20),
     );

@@ -28,7 +28,7 @@ async fn drain() {
 impl Harness {
     async fn new() -> Self {
         let account_id = AccountId("parking".into());
-        let throttles = Arc::new(Mutex::new(crate::recovery::ThrottleBucket::new()));
+        let throttles = Arc::new(crate::recovery::ThrottleBucket::new());
         let held = ThrottleKey::Budget(bifrost_types::ThrottleBudget::new("parking-budget"));
         let bucket = Arc::clone(&throttles);
         let key = held.clone();
@@ -50,7 +50,7 @@ impl Harness {
                 && *p == (InventoryPartition::Page { from: 0, to: 1 })
                 && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
             {
-                bucket.lock().unwrap().record(
+                bucket.record(
                     held.clone(),
                     tokio::time::Instant::now() + Duration::from_secs(60),
                 );
@@ -292,7 +292,7 @@ async fn parking_resume_preserves_the_original_fence() {
 #[tokio::test(start_paused = true)]
 async fn parking_resume_rechecks_a_longer_hold() {
     let h = Harness::new().await;
-    h.ctx.throttles.lock().unwrap().record(
+    h.ctx.throttles.record(
         ThrottleKey::Budget(bifrost_types::ThrottleBudget::new("parking-budget")),
         tokio::time::Instant::now() + Duration::from_secs(120),
     );

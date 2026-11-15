@@ -476,16 +476,6 @@ places the message by `containers: Vec<ContainerId>` while inventory uses
 provider knowledge (Gmail fills the former with label ids, the latter with
 `MembershipScope::Label`).
 
-## STR-021 - Public-field invariants that nothing re-checks
-
-**Reported by:** types.
-
-`PushSubscription` validates handle/lane agreement in constructors but keeps
-public fields, so the invariant is advisory; unlike `Batch` (accepted with an
-engine-side check), no consumer re-checks. `Container` carries `kind` and
-`provenance.kind`, `native_id` and `provenance.native`: duplicated public fields
-with no check that they agree.
-
 ## STR-023 - The acknowledgement is assembled from loose parts the consumer must keep in step
 
 **Reported by:** sync-engine.
@@ -895,20 +885,6 @@ typed key of BUG-016), `backfill/scan.rs` (`BackfillScan`), with
 `engine/backfill.rs` keeping only the async loop, admission and wiring; tests
 move with what they test.
 
-## STR-044 - `BackfillScan` is one state machine spread across seven parallel maps
-
-**Reported by:** sync-lanes.
-
-`settled`, `failed`, `baseline`, `lost_pages`, `held`, `parked` (all keyed
-`(CursorScope, u64)`) and `fusion_skipped` (keyed by scope). `select` spends its
-first block pruning six of them in step, and `settled` is deliberately never
-pruned, so it grows by one entry per incarnation for the life of the
-attachment. Proposal: `HashMap<ScopeIncarnation, IncarnationState>` with `enum
-IncarnationState { Fresh, Running { baseline }, Parked(ParkedWalk), Held { until
-}, Failed { count, until, baseline }, Settled { watermark } }` and `lost_pages`
-a flag on the non-settled states; pruning becomes one `retain`, exclusivity is
-structural, and `BackfillRegistry` becomes a projection (CON-026).
-
 ## STR-045 - Codecs for `bifrost-types` vocabulary live in `bifrost-sync`, where their matches cannot be exhaustive
 
 **Reported by:** sync-lanes.
@@ -1110,32 +1086,6 @@ cursors, `imappart2`/`3` part handles, the `imapmsgid1` correlation token,
 `DraftHandle` ("an object id in a costume"), `imap-idle-N` subscription handles;
 `ImapMessageRef` a thin public wrapper over it; `FolderCursor` fields typed.
 
-## STR-052 - IMAP QRESYNC parameters are typed, stringified, then re-validated
-
-**Reported by:** imap-protocol.
-
-`SyncSelectOptions { uid_validity: Option<UidValidity>, mod_seq:
-Option<ModSeq>, known_uids: Option<UidSet>, seq_match_data: Option<(SeqSet,
-UidSet)> }` is converted by `qresync_params()` into `QresyncParams {
-uid_validity: u32, mod_seq: u64, known_uids: Option<String>, seq_match_data:
-Option<(String, String)> }`; the handle checks "seq-match requires known-uids",
-and the encoder checks it again, plus non-zero uidvalidity, the modseq range,
-CRLF in the set strings, and re-runs `SequenceSet::new_known`. Proposal:
-`Command::Select` carries `Qresync { validity: UidValidity, modseq: ModSeq,
-known: Option<KnownUids { uids: UidSet, seq_match: Option<(SeqNumSet, UidSet)>
-}> }`, making seq-match without known-uids unrepresentable and collapsing the
-stringly `QresyncParams` and the `SelectOptions`/`SyncSelectOptions` pair. The
-mod-sequence range is a constant in two places and a type in none (`MOD_SEQ_MAX
-= i64::MAX as u64` in the encoder's `validate_mod_sequence_value` / `_valzer`, a
-literal in the decoder's `response_code_has_overflow`, `ModSeq(u64)` with no
-constraint, `changed_since` / `unchanged_since: Option<u64>`): a `ModSeq`
-constructor enforcing 1..=2^63-1 plus a `ModSeqValzer` admitting 0 for
-UNCHANGEDSINCE owns it. Command parameters also live in the wrong file:
-`QresyncParams` and `SelectOptions` sit in `types/response.rs`, and
-`types/sync.rs` defines `SyncSelectOptions` / `SyncFetchRequest` as
-"higher-level" duplicates; one typed request per command, in a `request`
-module.
-
 ## STR-053 - IMAP `Command` is stringly typed, so the encoder re-parses the builder's output
 
 **Reported by:** imap-protocol.
@@ -1261,24 +1211,6 @@ give ManageSieve its own error mapped at the account boundary. The
 imap-connection hunter reported the same four `codec`/`types` -> `connection`
 edges independently; `literals.rs` is a pure literal-marker scanner also used by
 `connection/wire.rs`.
-
-## STR-060 - ManageSieve is a second protocol hidden in IMAP's `account/`
-
-**Reported by:** imap-protocol, imap-account.
-
-The imap-account hunter adds that it also does TCP connect, implicit TLS and
-STARTTLS, line and literal framing, read timeouts and bandwidth metering,
-sharing nothing with the IMAP driver, and that its failures are
-`crate::Error::Sieve` (an IMAP error enum carrying another protocol's codes)
-classified in `account/error.rs::classify_sieve`; it should expose a client the
-account composes the way it composes SMTP.
-
-`account/sieve.rs` (about 1,300 lines) is a full RFC 5804 client: its own
-response reader, quoting, response-code enum, SASL negotiation and payloads. It
-is not account logic, and its error variant leaks into the crate's root
-`Error`. It belongs beside `codec`/`connection` as a sibling protocol module (or
-its own crate, as SMTP is), consuming `bifrost-sasl` for every payload
-(BUG-030), with `account/` only adapting it to the filter lane.
 
 ## STR-061 - The IMAP crate-root `allow(dead_code)` hides dead copies of live decisions
 
@@ -1488,21 +1420,6 @@ protocol crates have nowhere else to put these. Proposal: `PayloadTooLarge`,
 `PreconditionFailed` (or reuse `ConcurrencyConflict` for the not-empty/active
 cases), so a UI can say something true.
 
-## STR-076 - IMAP boolean parameters that name modes
-
-**Reported by:** imap-account.
-
-- `select_folder(conn, folder, cursor, read_only: bool)`: every call reads `...,
-  None, true)`; with the cursor argument it is really a `SelectPurpose`
-  (BUG-050).
-- `FolderCursor::QResync { known_uids_complete: bool }`: "baseline complete" vs
-  "legacy, must re-inventory" is a state, special-cased in `run_changes` before
-  dispatch; `Baseline::{Complete(CompactUidSet), Legacy}` makes the incomplete
-  cursor impossible to hand to `run_qresync`, which `debug_assert!`s it today
-  (BUG-049).
-- `blob::run_fetch(.., refuse_not_sticky: bool, ..)`, whose `NotSticky` outcome is
-  `unreachable!` on one caller.
-
 ## STR-078 - Credentials and TLS mode, three copies each
 
 **Reported by:** imap-account, smtp-sasl, net-dav.
@@ -1588,23 +1505,6 @@ designed with IMAP in mind (`types.md` says as much), and the bounded backfill
 lane depends on partitions, but no production crate mints a `Uid` partition.
 Related: STR-046.
 
-## STR-086 - JMAP states are all `String`; the typed `State` alias is dead
-
-**Reported by:** jmap-protocol.
-
-`core/id.rs` defines `pub(crate) type State = Id<marker::State>`, used nowhere.
-Object state (`ChangesRequest::since_state`, `SetRequest::if_in_state`,
-`GetResponse::state`), query state (`since_query_state`,
-`QueryResponse::query_state`), session state (`Response::session_state`) and push
-state (`PushObject::StateChange::push_state`, `WebSocketPushEnable::push_state`)
-are bare `String`, so passing a `queryState` as `sinceState`, or an `Email` state as
-`ifInState` on `Mailbox/set`, compiles. The sync layer stores them as
-`HashMap<String, Option<String>>` (`email_states`, `mailbox_states`,
-`lifecycle_mailbox_states`). Proposal: `ObjectState<O>` (phantom on the object),
-`QueryState<O>`, `SessionState`, `PushState` in `core/id.rs`, with
-`ChangesMethod::since` and `define_set_method!`'s `if_in_state` taking the
-object-typed state.
-
 ## STR-087 - A capability-scoped JMAP account forgets its capability
 
 **Reported by:** jmap-protocol.
@@ -1660,29 +1560,6 @@ it wants a fixer owning both halves of the crate:
   for an out-of-range input; the Email setters no longer use it, but filters,
   vacation dates and push-subscription expiry still do and can fabricate a
   1970 date.
-
-## STR-090 - JMAP failures that reach the caller as prose, or with the wrong provenance
-
-**Reported by:** jmap-protocol.
-
-A `Blob/upload` refusal now keeps its typed `SetError`, and full create and
-update failure iterators exist. The rest needs the protocol layer and
-`sync/error.rs` changed together:
-
-- `Error::NotParsable(String)` is still overloaded: an unparsable blob id
-  (`ParseResponse`), the `Blob/copy` response naming the wrong accounts (a
-  provider contract violation, which should classify as one), and, in
-  `sync/pim.rs`, a missing Email state; all classify as `Protocol(ParseFailed)`.
-- `From<serde_json::Error> for Error` maps every stray `?` to `ResponseDecode`;
-  the `RequestContract::Send` contract compensates. Decode provenance is a fact at the source and should be a variant:
-  `EnvelopeDecode` (from `Client::send_request` / the WS frame), `ResultDecode {
-  call_id }` (from `Response::get`), and no blanket `From`.
-- `SetResponse::unwrap_update_errors` / `unwrap_create_errors` still return the
-  first error from a `HashMap` iteration; their sync callers should move to the
-  new full-failure iterators.
-- `TransportError { message: String, .. }` with `TransportError::new(message)`
-  and no `net` evidence classifies as a generic network fault (STR-091); the
-  message is the only carrier.
 
 ## STR-091 - Delete JMAP's `HttpTransport` generic; it is a test seam above `AccountNet`
 
@@ -1811,36 +1688,6 @@ mapping module, and the parts restating shared-vocabulary rules (window overlap,
 recurrence validation) belong in `bifrost-types` (BUG-001). Same question for IMAP:
 STR-079.
 
-## STR-108 - One Graph `$batch` engine with typed legs and answers
-
-**Reported by:** graph.
-
-`types::BatchRequestItem { method: String, headers: Option<HashMap<String, String>>
-}`. A leg's replay decision is made after construction by
-`graph_error::subrequest_replayable`, which re-parses the method string and every
-header and re-derives "a PATCH is `IdempotentUnlessConditional`". The outer
-`$batch` POST's policy is written by hand at each submission site
-(`get::fetch_batch` uses `Idempotent`; `mutate::submit_batch_with_version`,
-`pim::messages::submit_write_batch_resource` and `reactions` each choose their own),
-with nothing tying it to the legs. On the response side, `BatchResponseItem {
-status: u16, headers, body: Option<Value> }` is re-converted at every consumer:
-headers rebuilt into a `HeaderMap` in four places (`get::reconstruct_headers`,
-inline in `mutate::reconcile_mutation_responses`, inline in
-`submit_write_batch_resource`, `reactions::header_map`), the body re-serialized in
-three, the status through `from_u16(..).unwrap_or(500)` in two (BUG-081). And
-`destroy: bool` on `mutation_item_outcome` / `submit_write_batch_resource` carries
-two meanings ("a 404 on this leg is success" and "evict the cached etag on
-success"); `pim::messages::delete_extended_property` passes `true` purely for the
-404 absorption and passes no targets so the second meaning does not fire.
-Proposal: one module owning `struct BatchLeg { method: Method, url: AdmittedPath,
-precondition: Option<GraphETag>, replay: ReplayPolicy, absent: AbsentMeans }` and
-`struct BatchAnswer { status: StatusCode, headers: HeaderMap, body: Bytes }`,
-chunking at 20, the outer replay as the meet of the legs' policies (computed,
-never written by hand), response resolution, the absent-leg policy (Uncertain for
-writes, `PartialResponse` for reads), and etag observation (BUG-076). Hydration,
-bulk mutation, PIM writes and reactions become thin front ends; about 600 lines
-across four files answer these questions slightly differently today.
-
 ## STR-112 - The recurrence rule is a `String` that three crates each parse
 
 **Reported by:** graph (cross-crate).
@@ -1949,22 +1796,6 @@ and `account/contacts.rs`, mixed with the `Account` mapping; only Gmail has an
 three. Two pairs of duplicate Gmail wire types exist: `inventory.rs` defines its own
 `ListMessagesResponse` and `GmailMessageStub` beside the ones in `types.rs`, and its
 own `list_messages_page` beside `api::list_messages`.
-
-## STR-122 - Google HTTP method and endpoint identity travel as strings
-
-**Reported by:** google.
-
-`execute` and `execute_if_match` take `method: &str` and `unreachable!()` on
-anything not one of five strings; `gmail_quota_cost(path, method)` is keyed on the
-string, and `post_empty_json` passes the literal `"POST"` back in to look up its own
-cost. "Which Gmail endpoint is this" is answered from three representations: the
-quota table re-parses the URL into segments, the concurrency bypass in
-`execute_if_match` string-matches `"/watch" | "/stop"`, and error classification
-keys on `GmailErrorContext.history_endpoint: bool` (the five `if
-ctx.history_endpoint` arms in `classify_response` and `classify_by_status`).
-Proposal: a `GmailEndpoint { Profile, History, Watch, Stop, MessagesGet,
-BatchModify, .. }` minted by the `api.rs` method building the request, owning the
-unit cost, the concurrency class and the history-endpoint classification.
 
 ## STR-129 - Google's mailbox watch registry is process-global
 
@@ -2183,23 +2014,6 @@ lossy), `RefreshFailed.retry_after: Option<SystemTime>`, and
 the stored durations lost the HTTP-date form. Store `RetryHint` at observation time
 and derive the capped wait from it. `HoldKind { RateLimited, QuotaExhausted }` also
 restates two `ServerErrorKind` variants that the `LocalHold` arm re-maps.
-
-## STR-145 - bifrost-net registry keys are unnamespaced strings
-
-**Reported by:** net-dav.
-
-`Net` holds three registries keyed by bare strings, and the rate governor adds a
-fourth key space on top of the host: quota scope
-(`RequestBuilder::quota_scope(String)`, `RateLimit::with_quota_scope(String)`, where
-an empty string means "the host-only compatibility bucket"); holds
-(`hold_gate(String)`, `shared_hold(String)`); concurrency limits
-(`shared_concurrency_limit(String, usize)`). Google builds one key as
-`format!("gmail:{:?}", (account, origin))`, so the `Debug` output of a tuple became a
-registry key; Graph uses the raw account id as its quota scope. Type fix:
-`QuotaScope` (with an explicit `HostOnly` variant), `HoldKey` and `LimitKey` newtypes
-- or better, one provider-minted `BudgetKey` naming the quota, the hold and the
-concurrency scope together, a fact Google spells as three strings today. Related:
-CON-009, CON-013, STR-129.
 
 ## STR-146 - URLs travel as `String` through every net and DAV layer
 

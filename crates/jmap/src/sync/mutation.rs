@@ -553,7 +553,8 @@ async fn apply_batch_with_version<T: HttpTransport>(
     // path report its real cost instead of only the last call's.
     let (mail, tally) = mail.metered();
     let mail = &mail;
-    let guard = match expected {
+    let expected = expected.map(crate::core::id::ObjectState::<crate::email::Email>::new);
+    let guard = match expected.as_ref() {
         Some(state) => super::mail_set::Guard::Exact(state),
         None if uses_if_in_state(kind) => super::mail_set::Guard::Replacement,
         None => super::mail_set::Guard::Unconditional,
@@ -1122,10 +1123,10 @@ mod tests {
                 accept: false,
                 requests: Arc::clone(&requests),
             });
-            let states = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            let states = crate::sync::state_cache::seeded(HashMap::from([(
                 "primary".into(),
                 Some("cache-new".into()),
-            )])));
+            )]));
             let events = versioned_stream(
                 primary,
                 foreign,
@@ -1168,10 +1169,10 @@ mod tests {
         let (primary, foreign) = mutation_accounts(SuccessfulSetTransport {
             requests: Arc::clone(&requests),
         });
-        let states = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+        let states = crate::sync::state_cache::seeded(HashMap::from([(
             "primary".to_string(),
-            Some("state-7".to_string()),
-        )])));
+            Some("state-7".into()),
+        )]));
         let input: AccountStream<ObjectId> =
             Box::pin(futures::stream::iter(vec![ObjectId("m1".to_string())]));
 
@@ -1471,9 +1472,9 @@ mod tests {
         let (primary, foreign) = mutation_accounts(FailingSetTransport);
         let foreign_id = ObjectId(super::super::foreign::encode_object("shared", "M9"));
         let mut states = HashMap::new();
-        states.insert("primary".to_string(), Some("primary-state".to_string()));
-        states.insert("shared".to_string(), Some("shared-state".to_string()));
-        let states = Arc::new(tokio::sync::Mutex::new(states));
+        states.insert("primary".to_string(), Some("primary-state".into()));
+        states.insert("shared".to_string(), Some("shared-state".into()));
+        let states = crate::sync::state_cache::seeded(states);
         let input: AccountStream<ObjectId> = Box::pin(futures::stream::iter(vec![
             ObjectId("m1".to_string()),
             ObjectId("m2".to_string()),

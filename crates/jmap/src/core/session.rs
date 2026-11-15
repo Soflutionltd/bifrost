@@ -1,3 +1,4 @@
+use crate::core::id::SessionState as SessionStateToken;
 #[cfg(feature = "mail")]
 use crate::email::{MailCapabilities, SubmissionCapabilities};
 use serde::{Deserialize, Serialize};
@@ -35,7 +36,7 @@ pub(crate) struct Session {
     event_source_url: String,
 
     #[serde(rename = "state")]
-    state: String,
+    state: SessionStateToken,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -710,7 +711,7 @@ impl Session {
         &self.event_source_url
     }
 
-    pub(crate) fn state(&self) -> &str {
+    pub(crate) fn state(&self) -> &SessionStateToken {
         &self.state
     }
 }

@@ -110,32 +110,51 @@ pub(super) fn parse_untagged_with_backing<'a>(
     backing: Option<&Bytes>,
 ) -> IResult<&'a [u8], UntaggedResponse> {
     let (input, _) = tag(&b"* "[..]).parse(input)?;
+    let keyword_end = input
+        .iter()
+        .position(|b| matches!(*b, b' ' | b'\r' | b'\n'))
+        .unwrap_or(input.len());
+    let keyword = &input[..keyword_end];
+    // Recognition and parser ownership live in the same dispatch row. A known
+    // direct response cannot fall back to Unknown after its parser fails.
+    macro_rules! direct {
+        ($($name:literal => $parser:expr),+ $(,)?) => {
+            $(if keyword.eq_ignore_ascii_case($name) {
+                return ($parser)(input).map_err(|err| match err {
+                    nom::Err::Error(err) => nom::Err::Failure(err),
+                    other => other,
+                });
+            })+
+        };
+    }
+    direct! {
+        b"OK" => parse_untagged_status,
+        b"NO" => parse_untagged_status,
+        b"BAD" => parse_untagged_status,
+        b"BYE" => parse_untagged_status,
+        b"CAPABILITY" => parse_untagged_capability,
+        b"FLAGS" => parse_untagged_flags,
+        b"LIST" => |i| parse_untagged_list(i, utf8_mode),
+        b"LSUB" => |i| parse_untagged_lsub(i, utf8_mode),
+        b"ESEARCH" => parse_untagged_esearch,
+        b"SEARCH" => parse_untagged_search,
+        b"SORT" => parse_untagged_sort,
+        b"STATUS" => |i| parse_untagged_status_mailbox(i, utf8_mode),
+        b"ENABLED" => parse_untagged_enabled,
+        b"VANISHED" => parse_untagged_vanished,
+        b"ID" => parse_untagged_id,
+        b"NAMESPACE" => |i| parse_untagged_namespace(i, utf8_mode),
+        b"QUOTAROOT" => |i| parse_untagged_quotaroot(i, utf8_mode),
+        b"QUOTA" => parse_untagged_quota,
+        b"ACL" => |i| parse_untagged_acl(i, utf8_mode),
+        b"MYRIGHTS" => |i| parse_untagged_myrights(i, utf8_mode),
+        b"LISTRIGHTS" => |i| parse_untagged_listrights(i, utf8_mode),
+        b"METADATA" => |i| parse_untagged_metadata(i, utf8_mode),
+        b"THREAD" => parse_untagged_thread,
+    }
     alt((
-        alt((
-            parse_untagged_status,
-            |i| parse_untagged_numbered_with_backing(i, utf8_mode, backing),
-            parse_untagged_capability,
-            parse_untagged_flags,
-            |i| parse_untagged_list(i, utf8_mode),
-            |i| parse_untagged_lsub(i, utf8_mode),
-            parse_untagged_esearch,
-            parse_untagged_search,
-            parse_untagged_sort,
-            |i| parse_untagged_status_mailbox(i, utf8_mode),
-        )),
-        alt((
-            parse_untagged_enabled,
-            parse_untagged_vanished,
-            parse_untagged_id,
-            |i| parse_untagged_namespace(i, utf8_mode),
-            |i| parse_untagged_quotaroot(i, utf8_mode),
-            parse_untagged_quota,
-            |i| parse_untagged_acl(i, utf8_mode),
-            |i| parse_untagged_myrights(i, utf8_mode),
-            |i| parse_untagged_listrights(i, utf8_mode),
-            |i| parse_untagged_metadata(i, utf8_mode),
-        )),
-        alt((parse_untagged_thread, parse_untagged_unknown)),
+        |i| parse_untagged_numbered_with_backing(i, utf8_mode, backing),
+        parse_untagged_unknown,
     ))
     .parse(input)
 }

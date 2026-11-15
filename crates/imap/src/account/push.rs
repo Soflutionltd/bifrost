@@ -1195,8 +1195,8 @@ mod assignment_tests {
             .push_subscribe(&[CursorScope::Folder(bifrost_types::FolderId("INBOX".into()))])
             .await
             .unwrap();
-        assert_eq!(result.outcomes.succeeded().len(), 0);
-        assert_eq!(result.outcomes.failed().len(), 1);
+        assert_eq!(result.outcomes().succeeded().len(), 0);
+        assert_eq!(result.outcomes().failed().len(), 1);
     }
 
     #[tokio::test]
@@ -1227,7 +1227,7 @@ mod assignment_tests {
             .push_subscribe(&[CursorScope::Account])
             .await
             .unwrap();
-        assert!(result.handle.is_none());
+        assert!(result.handle().is_none());
         assert_eq!(*account.push.assignment.borrow(), before);
         account
             .push_subscribe(&[CursorScope::Folder(bifrost_types::FolderId("INBOX".into()))])

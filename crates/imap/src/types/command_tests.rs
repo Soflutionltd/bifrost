@@ -162,12 +162,10 @@ fn command_select_qresync() {
     let cmd = Command::Select {
         mailbox: MailboxName::new("INBOX").unwrap(),
         condstore: false,
-        qresync: Some(super::super::QresyncParams {
-            uid_validity: 67890,
-            mod_seq: 12345,
-            known_uids: Some("1:500".into()),
-            seq_match_data: None,
-        }),
+        qresync: Some(
+            super::super::QresyncParams::from_raw(67890, 12345, Some("1:500".into()), None)
+                .unwrap(),
+        ),
     };
     match &cmd {
         Command::Select {
@@ -177,9 +175,9 @@ fn command_select_qresync() {
         } => {
             assert_eq!(mailbox.as_str(), "INBOX");
             let q = qresync.as_ref().unwrap();
-            assert_eq!(q.uid_validity, 67890);
-            assert_eq!(q.mod_seq, 12345);
-            assert_eq!(q.known_uids.as_deref(), Some("1:500"));
+            assert_eq!(q.uid_validity.get(), 67890);
+            assert_eq!(q.mod_seq.get(), 12345);
+            assert_eq!(q.known().map(|known| known.uids.as_str()), Some("1:500"));
         }
         _ => panic!("expected Select"),
     }

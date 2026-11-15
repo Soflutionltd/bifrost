@@ -113,6 +113,19 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   the shared driver's changes lane over the cached `@odata.deltaLink`.
 - `get.rs` - `$batch`-backed hydration with per-projection
   `$select` lists.
+- `batch.rs` - shared envelope submission and replay-policy meet, typed
+  method/header replay evidence, response header/body conversion, the 20-leg
+  streaming limit, and `AbsentMeans`. All four batch front ends use it.
+  Wire DTOs remain in `types.rs`; owner-aware URL construction and GraphETag
+  validation precede wire encoding. Numeric statuses remain per-answer evidence
+  until classification so one malformed status cannot discard valid siblings.
+  Chunk progress stays with each operation owner: hiding multiple write chunks
+  behind a transport Result would lose earlier commits on a later failure.
+  Correlation and projection remain separate because hydration, reaction reads
+  and partial-commit writes expose different outcome contracts. Absence policy
+  controls 404 success only; every successful targeted write invalidates its
+  cached validator independently. Outer replay is Idempotent only when every
+  leg permits replay, otherwise Never, including guarded writes and moves.
 - `batch_routing.rs` - `partition_routable`, the pure per-item split every
   `$batch` chunk builder runs before it sends: ids whose subrequest was
   built, and ids whose subrequest could not be built at all (a stale
@@ -938,7 +951,7 @@ mailboxes always install.
   - **Per-request surfaces** (single-message `pim` writes and blobs), per
     call: the call fails, carrying the scope of the offending id.
   - **Push subscription**, per scope in BOTH push modes:
-    `PushSubscription.outcomes` uses the shared three-lane batch contract, and
+    `PushSubscription::outcomes()` uses the shared three-lane batch contract, and
     its optional handle covers only the succeeded scopes. Every per-scope
     refusal routes through that lane - a poll-only public folder, a scope with
     no Graph subscription resource, a foreign-mailbox or non-`FolderType` EWS
@@ -1048,7 +1061,8 @@ own.
 
 One batch is many requests here: a mutation chunk is the `$batch` submission
 plus one etag GET per id the preflight had to re-read, and a delta walk pages.
-The declaration also carries the engine `AccountId` as its `quota_scope`, so the
+The declaration also carries a `graph.quota` namespaced `QuotaScope` with the
+engine `AccountId` as its component, so the
 Graph per-tenant bucket is per account rather than pooled process-wide.
 
 `EwsClient` composes `AccountNet` directly rather than routing through a Graph
@@ -2580,10 +2594,13 @@ the engine then records ALONE.
   per app per mailbox. `AccountNet::shared_concurrency_limit` shares the
   registry within one `Net`. The primary key is fixed at construction with
   an injected account or first attachment:
-  `graph-outlook|ORIGIN|primary|ACCOUNT_ID`. Learning the primary address
+  `LimitKey::namespaced("graph.outlook", &[ORIGIN, "primary|ACCOUNT_ID"])`.
+  Component lengths are encoded, so delimiter characters in an account id
+  cannot change the key boundaries. Learning the primary address
   never changes it. Shared clients read the primary's shared address slot:
   a case-insensitive match resolves to the primary key, otherwise the key is
-  `graph-outlook|ORIGIN|mailbox:LOWERCASED_ID`. ORIGIN excludes the API path,
+  `LimitKey::namespaced("graph.outlook", &[ORIGIN, "mailbox:LOWERCASED_ID"])`.
+  ORIGIN excludes the API path,
   so v1.0 and beta share a budget. These concurrency keys are separate from
   throttle budget strings. One `MailboxIdentity` derives both views from the
   canonical owner, primary address and fixed account. Both use the first attached account identity for
@@ -3042,3 +3059,11 @@ to rebuild without blaming the provider or silently missing mail.
 Payload versions use `PayloadVersion`; change and backfill outer versions use
 `TraitEnvelopeVersion`. These are separate types with explicit numeric access
 for storage; existing wire values are unchanged.
+
+## Mailbox budget ownership
+
+`client::mailbox_identity` remains the sole mailbox budget constructor.
+`mailbox_budget` supplies both account throttle declarations and response error
+stamps from that identity. Registry keys and budget keys are constructed at
+that same identity boundary; neither error translation nor account declaration
+reconstructs a mailbox budget string.

@@ -275,7 +275,7 @@ async fn write_batch_drains_past_a_failure_to_evict_a_later_destroy_etag() {
         &account,
         requests,
         &[failed, destroyed.clone()],
-        true,
+        crate::account::batch::AbsentMeans::Success,
         AccountOperation::BulkDestroy,
     )
     .await
@@ -439,13 +439,13 @@ fn shared_mailbox_folder_projects_as_shared_namespaced_container() {
     // `native_id` is the foreign-encoded form; `owner_local_id` is the
     // bare Graph folder id, never the encoded one.
     assert_eq!(
-        container.native_id,
+        container.native_id(),
         encode_foreign("shared@contoso.com", "AAMkChild").0
     );
     assert_eq!(container.owner_local_id.as_deref(), Some("AAMkChild"));
     assert_ne!(
         container.owner_local_id.as_deref(),
-        Some(container.native_id.as_str())
+        Some(container.native_id())
     );
     // The parent is encoded in the same namespace.
     assert_eq!(
@@ -479,7 +479,7 @@ fn shared_mailbox_folder_projects_as_shared_namespaced_container() {
     assert!(primary.owner.is_none());
     assert!(primary.owner_local_id.is_none());
     assert!(primary.owner_email.is_none());
-    assert_eq!(primary.native_id, "AAMkChild");
+    assert_eq!(primary.native_id(), "AAMkChild");
 }
 
 /// A shared mailbox's well-known folder roles are resolved on its own client,
@@ -578,7 +578,7 @@ fn shared_container_native_id_matches_discovered_cursor_scope() {
     assert_eq!(
         scope,
         CursorScope::FolderType {
-            folder: bifrost_types::FolderId(container.native_id.clone()),
+            folder: bifrost_types::FolderId(container.native_id().to_string()),
             ty: ObjectType::Email,
         },
     );
@@ -634,7 +634,7 @@ async fn public_folders_project_with_content_class_and_rights() {
     assert_eq!(containers.len(), 2);
     let calendar = containers
         .iter()
-        .find(|c| c.native_id == "AAMkCal=")
+        .find(|c| c.native_id() == "AAMkCal=")
         .expect("calendar public folder");
     assert_eq!(calendar.namespace, ContainerNamespace::Public);
     // A public folder has no owning principal.
@@ -650,7 +650,7 @@ async fn public_folders_project_with_content_class_and_rights() {
     // A read-only public folder is distinguishable from a writable one.
     let mail = containers
         .iter()
-        .find(|c| c.native_id == "AAMkPF=")
+        .find(|c| c.native_id() == "AAMkPF=")
         .expect("mail public folder");
     assert_eq!(mail.content_class, Some(ContainerContentClass::Mail));
     let read_only = mail.rights.as_ref().expect("rights projected");
@@ -2315,7 +2315,7 @@ async fn partial_commit_batch_keeps_success_refusal_and_missing_siblings() {
         &account,
         requests,
         &ids,
-        false,
+        crate::account::batch::AbsentMeans::Failure,
         AccountOperation::AddToContainer,
     )
     .await

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
-use super::id::AccountId;
+use super::id::{AccountId, ObjectState};
 use super::{Object, SetCreate, request::ResultReference};
 
 /// Escape one token of an RFC 8620 s5.3 patch path (a JSON Pointer,
@@ -39,7 +39,7 @@ pub(crate) struct SetRequest<O: SetObject> {
 
     #[serde(rename = "ifInState")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    if_in_state: Option<String>,
+    if_in_state: Option<ObjectState<O>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     create: Option<HashMap<String, O::Create>>,
@@ -67,10 +67,10 @@ pub(crate) struct SetResponse<O: SetObject> {
     account_id: Option<AccountId>,
 
     #[serde(rename = "oldState")]
-    old_state: Option<String>,
+    old_state: Option<ObjectState<O>>,
 
     #[serde(rename = "newState")]
-    new_state: Option<String>,
+    new_state: Option<ObjectState<O>>,
 
     /// Successful creates, keyed by the consumer-provided create-id
     /// (e.g. "c1"). Create-ids are not real server IDs and stay
@@ -209,7 +209,7 @@ impl<O: SetObject> SetRequest<O> {
         self
     }
 
-    pub(crate) fn if_in_state(&mut self, if_in_state: impl Into<String>) -> &mut Self {
+    pub(crate) fn if_in_state(&mut self, if_in_state: impl Into<ObjectState<O>>) -> &mut Self {
         self.if_in_state = Some(if_in_state.into());
         self
     }
@@ -301,8 +301,8 @@ impl<O: SetObject> SetResponse<O> {
         self.account_id.as_ref()
     }
 
-    pub(crate) fn old_state(&self) -> Option<&str> {
-        self.old_state.as_deref()
+    pub(crate) fn old_state(&self) -> Option<&ObjectState<O>> {
+        self.old_state.as_ref()
     }
 
     /// The `newState` the server reported, or `None` when it sent none.
@@ -316,11 +316,11 @@ impl<O: SetObject> SetResponse<O> {
     /// fabricated `""` therefore poisoned a cache entry with a value no
     /// server had ever sent. Callers decide what absence costs them; the
     /// accessor does not decide for them by inventing a value.
-    pub(crate) fn new_state(&self) -> Option<&str> {
-        self.new_state.as_deref()
+    pub(crate) fn new_state(&self) -> Option<&ObjectState<O>> {
+        self.new_state.as_ref()
     }
 
-    pub(crate) fn into_new_state(self) -> Option<String> {
+    pub(crate) fn into_new_state(self) -> Option<ObjectState<O>> {
         self.new_state
     }
 
@@ -421,29 +421,6 @@ impl<O: SetObject> SetResponse<O> {
     /// All failed creates with their request-owned creation identities.
     pub(crate) fn create_errors(&self) -> impl Iterator<Item = (&String, &SetError<O::Property>)> {
         self.not_created.iter().flat_map(|errors| errors.iter())
-    }
-
-    // These legacy single-error helpers cannot represent a batch failure.
-    // Keep their shape until the account boundary can translate an aggregate
-    // of (object id, SetError) entries; dropping all but one entry there would
-    // still hide failed objects from an enterprise user's mutation results.
-    // Per-id callers should use updated()/created() to retain their identity.
-    pub(crate) fn unwrap_update_errors(&self) -> crate::Result<()> {
-        if let Some(errors) = &self.not_updated
-            && let Some(err) = errors.values().next()
-        {
-            return Err(err.to_string_error().into());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn unwrap_create_errors(&self) -> crate::Result<()> {
-        if let Some(errors) = &self.not_created
-            && let Some(err) = errors.values().next()
-        {
-            return Err(err.to_string_error().into());
-        }
-        Ok(())
     }
 }
 

@@ -116,14 +116,8 @@ pub(crate) struct JmapAccount {
     /// the primary and each foreign account hold distinct state - a
     /// single `Option<String>` would clobber one with the other.
     pub(crate) email_states: StateMap,
-    // This map records observations, not mutation guards, so deleting it does
-    // not fix Email guard continuity. Keep that cleanup separate from the fix.
-    // It must never replace lifecycle progress: a local write must not skip
-    // sidebar changes that only the lifecycle walk delivers.
-    pub(crate) mailbox_states: StateMap,
-    /// Private Mailbox/changes position for scope lifecycle polling. This is
-    /// deliberately separate from `mailbox_states`, whose consumers may
-    /// fast-forward it after a delta pass or local Mailbox/set.
+    // Mailbox observations are not mutation guards. Only the lifecycle walk
+    // owns sidebar progress; a local write must never fast-forward it.
     pub(crate) lifecycle_topology: Arc<Mutex<discover::LifecycleTopology>>,
 }
 
@@ -147,9 +141,11 @@ impl JmapAccount {
         seed_states: HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
         ws: push::WsState,
         shutdown: CancellationToken,
-        email_states: HashMap<String, Option<String>>,
-        mailbox_states: HashMap<String, Option<String>>,
-        lifecycle_mailbox_states: HashMap<String, Option<String>>,
+        email_states: HashMap<String, Option<crate::core::id::ObjectState<crate::email::Email>>>,
+        lifecycle_mailbox_states: HashMap<
+            String,
+            Option<crate::core::id::ObjectState<crate::mailbox::Mailbox>>,
+        >,
         mailbox_names: HashMap<String, String>,
     ) -> Self {
         Self {
@@ -174,8 +170,7 @@ impl JmapAccount {
             closed: Arc::new(AtomicBool::new(false)),
             close_completion: Arc::new(std::sync::OnceLock::new()),
             subscription_seq: AtomicU64::new(1),
-            email_states: Arc::new(Mutex::new(email_states)),
-            mailbox_states: Arc::new(Mutex::new(mailbox_states)),
+            email_states: state_cache::seeded(email_states),
             lifecycle_topology: Arc::new(Mutex::new(discover::LifecycleTopology {
                 positions: lifecycle_mailbox_states,
                 names: mailbox_names,
@@ -331,29 +326,28 @@ async fn fresh_cursor_establishment<T: HttpTransport>(
     mail: MailAccount<T>,
     scope: CursorScope,
     email_states: StateMap,
-    mailbox_states: StateMap,
 ) -> Result<CursorEstablishment, AccountError> {
     let data_type = state::JmapScopeRepr::from_cursor_scope(&scope)
         .ok()
         .and_then(|scope| scope.data_type());
-    let (states, account_id) = match &data_type {
-        Some(crate::DataType::Email) => (&email_states, mail.id_str().to_string()),
-        Some(crate::DataType::Mailbox) => (&mailbox_states, mail.id_str().to_string()),
+    let account_id = mail.id_str().to_string();
+    match &data_type {
+        Some(crate::DataType::Email | crate::DataType::Mailbox) => {}
         _ => return Err(unseeded_scope_error(scope)),
     };
     // Capture the cache value before the network read. If a concurrent
     // mutation advances it while the probe is in flight, the CAS below keeps
     // that newer state instead of replacing it with this probe's older one.
-    let cached_before_probe = state_cache::get(states, &account_id).await;
+    let cached_before_probe = state_cache::guard(&email_states, &account_id).await;
     let state_string = match data_type {
         Some(crate::DataType::Email) => mail
             .call(crate::email::EmailGet::new().ids(Vec::<crate::email::EmailId>::new()))
             .await
-            .map(crate::core::get::GetResponse::<crate::email::Email>::into_state),
+            .map(|response| response.into_state().into_string()),
         Some(crate::DataType::Mailbox) => mail
             .call(crate::mailbox::MailboxGet::new().ids(Vec::<crate::mailbox::MailboxId>::new()))
             .await
-            .map(crate::core::get::GetResponse::<crate::mailbox::Mailbox>::into_state),
+            .map(|response| response.into_state().into_string()),
         _ => unreachable!("scope kind was checked above"),
     }
     .map_err(|error| {
@@ -365,13 +359,15 @@ async fn fresh_cursor_establishment<T: HttpTransport>(
             ),
         )
     })?;
-    state_cache::advance(
-        states,
-        &account_id,
-        cached_before_probe.as_deref(),
-        state_string.clone(),
-    )
-    .await;
+    if matches!(data_type, Some(crate::DataType::Email)) {
+        state_cache::observe_probe(
+            &email_states,
+            &account_id,
+            cached_before_probe.as_ref(),
+            state_string.clone().into(),
+        )
+        .await;
+    }
     Ok(cursor_from_state(scope, state_string))
 }
 
@@ -548,7 +544,6 @@ impl Account for JmapAccount {
             mail,
             scope,
             Arc::clone(&self.email_states),
-            Arc::clone(&self.mailbox_states),
         ))
     }
 
@@ -644,7 +639,6 @@ impl Account for JmapAccount {
             cursor,
             owner,
             Arc::clone(&self.email_states),
-            Arc::clone(&self.mailbox_states),
         )
     }
 
@@ -1304,7 +1298,6 @@ impl Account for JmapAccount {
         });
         pim::container_create(
             mail.clone(),
-            Arc::clone(&self.mailbox_states),
             mail.id_str().to_string(),
             kind,
             name,
@@ -1322,7 +1315,6 @@ impl Account for JmapAccount {
         let mail = route_object_id(&container.0, &self.mail, &self.foreign_mail);
         pim::container_rename(
             mail.clone(),
-            Arc::clone(&self.mailbox_states),
             mail.id_str().to_string(),
             container,
             name,
@@ -1338,7 +1330,6 @@ impl Account for JmapAccount {
         let mail = route_object_id(&container.0, &self.mail, &self.foreign_mail);
         pim::container_move(
             mail.clone(),
-            Arc::clone(&self.mailbox_states),
             mail.id_str().to_string(),
             container,
             new_parent,
@@ -1347,12 +1338,7 @@ impl Account for JmapAccount {
 
     fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
         let mail = route_object_id(&container.0, &self.mail, &self.foreign_mail);
-        pim::container_delete(
-            mail.clone(),
-            Arc::clone(&self.mailbox_states),
-            mail.id_str().to_string(),
-            container,
-        )
+        pim::container_delete(mail.clone(), mail.id_str().to_string(), container)
     }
 
     fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
@@ -2126,15 +2112,10 @@ mod tests {
         )
         .expect("client builds");
         let email_states: super::super::state_cache::StateMap =
-            Arc::new(tokio::sync::Mutex::new(HashMap::from([
-                ("primary".to_string(), Some("open-email".to_string())),
-                ("shared".to_string(), Some("open-shared-email".to_string())),
-            ])));
-        let mailbox_states: super::super::state_cache::StateMap =
-            Arc::new(tokio::sync::Mutex::new(HashMap::from([(
-                "primary".to_string(),
-                Some("open-mailbox".to_string()),
-            )])));
+            crate::sync::state_cache::seeded(HashMap::from([
+                ("primary".to_string(), Some("open-email".into())),
+                ("shared".to_string(), Some("open-shared-email".into())),
+            ]));
         let cases = [
             (
                 crate::account::Account::new(client.clone(), "primary"),
@@ -2157,14 +2138,10 @@ mod tests {
         ];
 
         for (mail, scope, expected_state, account_id) in cases {
-            let established = fresh_cursor_establishment(
-                mail,
-                scope.clone(),
-                Arc::clone(&email_states),
-                Arc::clone(&mailbox_states),
-            )
-            .await
-            .expect("a seeded cursor is re-probed");
+            let established =
+                fresh_cursor_establishment(mail, scope.clone(), Arc::clone(&email_states))
+                    .await
+                    .expect("a seeded cursor is re-probed");
             let bifrost_types::CursorEstablishment::Ready(cursor) = established else {
                 panic!("seeded cursor is Ready");
             };
@@ -2176,12 +2153,10 @@ mod tests {
                 cursor.envelope_version.get(),
                 state::OUTER_CURSOR_ENVELOPE_VERSION
             );
-            let cached = if matches!(scope, CursorScope::Type(ObjectType::Mailbox)) {
-                super::super::state_cache::get(&mailbox_states, account_id).await
-            } else {
-                super::super::state_cache::get(&email_states, account_id).await
-            };
-            assert_eq!(cached.as_deref(), Some(expected_state));
+            if !matches!(scope, CursorScope::Type(ObjectType::Mailbox)) {
+                let cached = super::super::state_cache::guard(&email_states, account_id).await;
+                assert_eq!(cached.as_deref(), Some(expected_state));
+            }
         }
 
         let calls = transport.calls.lock().expect("calls").clone();

@@ -234,23 +234,6 @@ already acted on the session unvalidated; they belong in `core/session.rs` as
 `SessionState::derive -> ValidatedSession`, with `sync/capabilities.rs` keeping
 only the mapping.
 
-## BUG-068 - The JMAP state cache advances from its cached state instead of `oldState`, laundering concurrent changes into the next guard
-
-**Reported by:** jmap-account (latent, P2).
-
-The laundering defect is fixed: Email cache advances now require the response's
-`oldState -> newState` continuity. Residue, structural: `state_cache::StateMap =
-Arc<Mutex<HashMap<String, Option<String>>>>` documents a tri-state (absent /
-probed-empty / known) and `get` flattens it, and about fifteen writer sites each
-still choose their own transition. Also `mailbox_states` is
-write-only: container create/rename/move/delete, the Mailbox changes walk,
-establishment and the factory maintain it, nothing reads it to decide anything
-(establishment reads it only to CAS against itself; the lifecycle poller has its
-own `lifecycle_mailbox_states`), and the shared accounts' entries are seeded for a
-scope type (shared Mailbox) that does not exist. Owner: a `StateCell` per `(Slot,
-ObjectType)` owning `observe_set(old, new)`, `observe_changes(since, new)`,
-`observe_probe(s)`, `guard() -> Option<IfInState>`; delete `mailbox_states`.
-
 ## BUG-070 - The same JMAP `notFound` is success through `bulk_set_flags` and terminal through `set_keyword`; providers disagree on vanished targets
 
 **Reported by:** jmap-account (live, P2).
@@ -456,6 +439,49 @@ SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
 - SMTP `TooManyFrom` is now unused (multiple From with one Sender is accepted)
   but is still a public error variant.
 
+## BUG-173 - Small wave 13 lateral findings across sync, IMAP, Graph and JMAP
+
+**Reported by:** wave 13 fixers (lateral).
+
+- Sync `backfill/scope_walk.rs`: `ScopeWalkDriver::completed()` returns true
+  before enumeration begins, so a caller can mistake eligibility for finished
+  enumeration.
+- Graph `pim/messages.rs` `patch_messages` and `move_messages` can build a
+  `$batch` envelope with more than 20 legs, over Graph's per-request limit.
+- IMAP `codec/decode/envelope_fetch.rs::gmail_id` documents unsigned 64-bit
+  ids but parses with `number64`, which rejects values above the signed
+  63-bit ceiling.
+- IMAP `account/envelope.rs` cursor decoding still accepts a zero or oversized
+  persisted MODSEQ, although request construction now refuses those values
+  through the bounded `ModSeq`.
+- JMAP `sync/mutation.rs` labels an unsupported `FlagOp` as `NotParsable`.
+- JMAP state cache: an empty probe state can become an `ifInState` guard while
+  set continuity rejects empty endpoints; the existing policy was preserved.
+- Net and engine hold stores: the engine records a second hold for a net
+  `LocalHold` error because nothing in `AccountError` marks local-hold
+  provenance; removing it needs a provenance marker set by net and every
+  provider error path. Harmless today (same deadline, same budget).
+- bifrost-net `HoldKey`, `LimitKey` and `QuotaScope` lack `Ord`, so Graph turns
+  its concurrency `LimitKey` back into a `String`; `QuotaScope` has both
+  `Deref<Target = str>` and `as_str`, inviting cross-domain string comparisons.
+- Sync `engine/ack.rs` `persist_ack_request`: on a `WalkNotWhole` completion
+  refusal the claim's proof now lands only in the uncommitted staged candidate
+  and is dropped by `discard_backfill`; debt is kept. Probably intended for a
+  walk that was not whole, but not recorded as a decision at the code.
+- Graph `account/batch.rs` computes the outer `$batch` replay policy from its
+  legs, so unconditional PATCH and DELETE envelopes (bulk flags, extended
+  property clears, thread deletes) moved from `ReplayPolicy::Never` to
+  `Idempotent` and may now be resent by net when uncertain.
+- IMAP `account/mod.rs::select_options` has an `.expect` on
+  `QresyncParams::with_known` that would panic in production if a cached set
+  were ever refused; returning the error is safer.
+- IMAP `codec/classification.rs::untagged_routing_key` allocates and runs a
+  fixed-point loop per pipelined command although the answer depends only on
+  the `CommandKind`; a const table or `OnceLock` would remove it.
+- JMAP `decode_error` now stamps `unreadable_success`
+  (Acknowledged) on every decode failure at every operation, where only the
+  Send boundary did before; this changes retry evidence for reads.
+
 ## BUG-167 - IMAP discovery still advertises DAV scopes that were excluded, and namespace-prefix failures use account scope
 
 **Reported by:** wave 9 fixer (imap-account, lateral).
@@ -480,25 +506,4 @@ say so. It cannot be built inside IMAP alone: it needs a shared
 repeated authoritative inventory (today `NoCursor` schedules no further poll),
 plus safe hydration and mutation semantics for UID handles that do not survive
 a re-SELECT. A wave of one owning types, sync and imap.
-
-## BUG-116 - The HTTP bandwidth meter cannot be handed to the engine or IMAP
-
-**Reported by:** net-dav (likely live wiring defect; verify before acting).
-
-The bandwidth registry can be injected (`Net::with_bandwidth_registry`), but the
-meter cannot: `Net::new` always builds a private one, `Net::meter()` returns
-`&BandwidthMeter`, and `BandwidthMeter` is not `Clone`, while
-`SyncEngineBuilder::with_bandwidth_meter`, `ImapAccountFactory::with_bandwidth_meter`
-and `MeterSinkHandle::from_meter` all require an `Arc<BandwidthMeter>`. As far as the
-hunter can see, no consumer can hand the engine (or IMAP) the meter HTTP traffic is
-recorded into, so `Control::bandwidth_observed` reads zero for JMAP, Graph, Google
-and DAV accounts. More broadly, per-account state on `Net` is split across separately
-keyed registries (the meter map refcounted per id, the bandwidth registry with weak
-entries per id, `account_hosts` per id and per registration token, the concurrency
-and hold registries by string key), and `attach_account`, `detach_registration` and
-`retag` must each touch all of them correctly. Owner: one injected `BandwidthPlane {
-registry, meter }` (or `NetResources`) shared by Net, the engine and the IMAP
-factory, and behind it an `AccountRegistration` value owning every per-account
-entry, so detach and retag are one operation each. The string-keyed registries are
-STR-145.
 

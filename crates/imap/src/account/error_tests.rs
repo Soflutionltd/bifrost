@@ -16,7 +16,7 @@ use bifrost_types::{
 
 use super::{ImapErrorContext, into_account_error, shared_folder_error, strategy_failure};
 use crate::Error;
-use crate::account::sieve::SieveResponseCode;
+use crate::sieve::SieveResponseCode;
 use crate::types::{MailboxName, ResponseCode};
 
 fn mailbox(name: &str) -> MailboxName {
@@ -133,8 +133,8 @@ fn sieve_error(
     code: Option<SieveResponseCode>,
     op: AccountOperation,
 ) -> bifrost_types::AccountError {
-    into_account_error(
-        Error::Sieve {
+    super::sieve_account_error(
+        crate::sieve::Error::Sieve {
             code,
             message: "sieve says no".into(),
         },

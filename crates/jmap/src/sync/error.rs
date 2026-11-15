@@ -212,29 +212,20 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         )
         .try_build()
         .expect("valid account error classification"),
-        crate::Error::ResponseDecode(err) => {
-            let builder = build(
-                AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-                Cause::Wire(WireCause::MalformedResponse {
-                    protocol: Protocol::Jmap,
-                    detail: Some(DiagnosticText::support_only(err.to_string())),
-                }),
-                &ctx,
-            );
-            // Only a send boundary knows this came from the received envelope:
-            // `From<serde_json::Error>` makes any stray `?` on a serde error a
-            // `ResponseDecode`, so elsewhere it is no evidence of an answer.
-            let builder = if matches!(ctx.contract, RequestContract::Send) {
-                builder.push_cause(Cause::Attempt(AttemptCause::new(
-                    TransmissionState::Acknowledged,
-                )))
-            } else {
-                builder
-            };
-            builder
-                .try_build()
-                .expect("valid account error classification")
-        }
+        crate::Error::EnvelopeDecode(err) => decode_error(err, None, &ctx),
+        crate::Error::ResultDecode { call_id, source } => decode_error(source, Some(call_id), &ctx),
+        crate::Error::MissingResponseField(field) => build(
+            AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(format!(
+                    "response omitted {field}"
+                ))),
+            }),
+            &ctx,
+        )
+        .try_build()
+        .expect("valid account error classification"),
         crate::Error::CallNotFound(id) => build(
             AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
             Cause::Wire(WireCause::MalformedResponse {
@@ -1047,6 +1038,30 @@ fn build_with(
     builder
 }
 
+// Provenance is stamped where JSON is decoded, never inferred from operation
+// context. An unreadable success may hide an accepted enterprise mail write.
+fn decode_error(
+    error: serde_json::Error,
+    call_id: Option<String>,
+    ctx: &JmapErrorContext,
+) -> AccountError {
+    let detail = match call_id {
+        Some(id) => format!("call {id}: {error}"),
+        None => error.to_string(),
+    };
+    build(
+        AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(detail)),
+        }),
+        ctx,
+    )
+    .push_cause(Cause::Attempt(AttemptCause::unreadable_success()))
+    .try_build()
+    .expect("valid account error classification")
+}
+
 fn convert_transport(
     transport: crate::core::transport::TransportError,
     ctx: JmapErrorContext,
@@ -1083,6 +1098,11 @@ fn convert_transport(
             Some(ThrottleScope::Account),
         )
     } else {
+        // The shared transport vocabulary cannot represent unknown provenance:
+        // its kinds are Network, Timeout and Tls. Keep the legacy fallback
+        // until that owner can express the uncertainty; the message is never
+        // parsed for evidence. Removing HttpTransport would also remove an
+        // independent capability and is outside this provenance change.
         // Custom transport without bifrost-net evidence: no wire-level signal
         // about transmission, so no attempt cause - except at a send
         // boundary, which knows the transport was already handed the
@@ -2500,7 +2520,7 @@ mod tests {
     fn response_decode_maps_protocol_parse_failed() {
         let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
         let err = into_account_error(
-            crate::Error::ResponseDecode(json_err),
+            crate::Error::EnvelopeDecode(json_err),
             JmapErrorContext::new(AccountOperation::SyncInventory),
         );
         assert_eq!(
@@ -2513,14 +2533,40 @@ mod tests {
                 _ => None,
             })
         };
-        // Outside a send boundary a `ResponseDecode` is no evidence that a
-        // response arrived: `From<serde_json::Error>` produces it for any
-        // serde failure.
-        assert_eq!(attempt(&err), None);
+        // Decode provenance proves an answer at every operation boundary.
+        assert_eq!(attempt(&err), Some(TransmissionState::Acknowledged));
         let ctx = JmapErrorContext::send(AccountOperation::Send);
         let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
-        let err = into_account_error(crate::Error::ResponseDecode(json_err), ctx);
+        let err = into_account_error(crate::Error::EnvelopeDecode(json_err), ctx);
         assert_eq!(attempt(&err), Some(TransmissionState::Acknowledged));
+    }
+
+    #[test]
+    fn result_decode_retains_call_identity_and_missing_fields_are_distinct() {
+        let error = into_account_error(
+            crate::Error::ResultDecode {
+                call_id: "call-7".to_string(),
+                source: serde_json::from_str::<serde_json::Value>("bad json").unwrap_err(),
+            },
+            JmapErrorContext::new(AccountOperation::SyncInventory),
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
+        );
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            Cause::Wire(WireCause::MalformedResponse { detail: Some(detail), .. })
+                if detail.as_str().contains("call-7")
+        )));
+        let missing = into_account_error(
+            crate::Error::MissingResponseField("Email/get.state"),
+            JmapErrorContext::new(AccountOperation::SyncInventory),
+        );
+        assert_eq!(
+            missing.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::MissingField)
+        );
     }
 
     #[test]

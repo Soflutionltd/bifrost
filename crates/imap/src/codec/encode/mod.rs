@@ -314,26 +314,24 @@ fn validate_sasl_initial_response(ir: &str) -> Result<(), crate::Error> {
 
 /// Maximum value for `mod-sequence-value` and `mod-sequence-valzer`
 /// (RFC 7162 Section 7): a positive unsigned 63-bit integer.
-const MOD_SEQ_MAX: u64 = i64::MAX as u64;
+const MOD_SEQ_MAX: u64 = crate::types::ModSeq::MAX;
 
 /// Validates a `mod-sequence-value` per RFC 7162 Section 7:
 /// `mod-sequence-value = 1*DIGIT` where `1 <= n <= 9,223,372,036,854,775,807`.
 ///
-/// Used for CHANGEDSINCE (RFC 7162 Section 3.1.4.1) and QRESYNC `mod_seq`
-/// (RFC 7162 Section 3.2.5.2).
+/// Raw CHANGEDSINCE entry points validate through the same owner as QRESYNC.
 fn validate_mod_sequence_value(val: u64, context: &str) -> Result<(), crate::Error> {
-    if val == 0 {
-        return Err(crate::Error::InvalidInput(
-            format!("{context} mod-sequence-value must be >= 1 per RFC 7162 Section 7, got 0")
-                .into(),
-        ));
+    if crate::types::ModSeq::new(val).is_some() {
+        return Ok(());
     }
-    if val > MOD_SEQ_MAX {
-        return Err(crate::Error::InvalidInput(format!(
+    let detail = if val == 0 {
+        format!("{context} mod-sequence-value must be >= 1 per RFC 7162 Section 7, got 0")
+    } else {
+        format!(
             "{context} mod-sequence-value must be <= {MOD_SEQ_MAX} per RFC 7162 Section 7, got {val}"
-        ).into()));
-    }
-    Ok(())
+        )
+    };
+    Err(crate::Error::InvalidInput(detail.into()))
 }
 
 /// Validates a `mod-sequence-valzer` per RFC 7162 Section 7:
@@ -341,7 +339,7 @@ fn validate_mod_sequence_value(val: u64, context: &str) -> Result<(), crate::Err
 ///
 /// Used for UNCHANGEDSINCE (RFC 7162 Section 3.1.3).
 fn validate_mod_sequence_valzer(val: u64, context: &str) -> Result<(), crate::Error> {
-    if val > MOD_SEQ_MAX {
+    if crate::types::ModSeqValzer::new(val).is_none() {
         return Err(crate::Error::InvalidInput(format!(
             "{context} mod-sequence-valzer must be <= {MOD_SEQ_MAX} per RFC 7162 Section 7, got {val}"
         ).into()));

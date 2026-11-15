@@ -196,14 +196,21 @@ pub(super) async fn delete_extended_property(
             headers: None,
         });
     }
-    // `destroy` buys 404 tolerance for an already absent property. A successful
+    // Absence is successful for an already cleared property. A successful
     // clear can change the parent message's validator, so retain its target
     // for cache eviction as well as error correlation.
     let resource = account
         .batch_resource(ids)
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?;
-    let progress =
-        submit_write_batch_resource(account, resource, requests, ids, true, operation).await?;
+    let progress = submit_write_batch_resource(
+        account,
+        resource,
+        requests,
+        ids,
+        crate::account::batch::AbsentMeans::Success,
+        operation,
+    )
+    .await?;
     batch_progress_error(progress, ids, StepEffect::Updated, StepReplay::Repeatable)
 }
 
@@ -528,8 +535,14 @@ pub(super) async fn patch_messages(
         });
         targets.push(patch.id.clone());
     }
-    let progress =
-        submit_write_batch_with_targets(account, requests, &targets, false, operation).await?;
+    let progress = submit_write_batch_with_targets(
+        account,
+        requests,
+        &targets,
+        crate::account::batch::AbsentMeans::Failure,
+        operation,
+    )
+    .await?;
     // Repeatable: each public call refetches the etag it patches under.
     batch_progress_error(
         progress,
@@ -612,8 +625,14 @@ pub(super) async fn move_messages(
         });
         targets.push(id.clone());
     }
-    let progress =
-        submit_write_batch_with_targets(account, requests, &targets, false, operation).await?;
+    let progress = submit_write_batch_with_targets(
+        account,
+        requests,
+        &targets,
+        crate::account::batch::AbsentMeans::Failure,
+        operation,
+    )
+    .await?;
     // Blocking: Graph assigns a moved message a new id, so a replay addresses
     // a source id that no longer exists.
     batch_progress_error(progress, &targets, StepEffect::Moved, StepReplay::Blocking)
@@ -640,13 +659,13 @@ pub(super) async fn submit_write_batch_with_targets(
     account: &GraphAccount,
     requests: Vec<BatchRequestItem>,
     targets: &[ObjectId],
-    destroy: bool,
+    absent: crate::account::batch::AbsentMeans,
     operation: AccountOperation,
 ) -> Result<BatchProgress, AccountError> {
     let resource = account
         .batch_resource(targets)
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?;
-    submit_write_batch_resource(account, resource, requests, targets, destroy, operation).await
+    submit_write_batch_resource(account, resource, requests, targets, absent, operation).await
 }
 
 async fn submit_write_batch_resource(
@@ -654,7 +673,7 @@ async fn submit_write_batch_resource(
     resource: Resource,
     requests: Vec<BatchRequestItem>,
     targets: &[ObjectId],
-    destroy: bool,
+    absent: crate::account::batch::AbsentMeans,
     operation: AccountOperation,
 ) -> Result<BatchProgress, AccountError> {
     if requests.is_empty() {
@@ -673,25 +692,15 @@ async fn submit_write_batch_resource(
     // runs of a reproducible failure.
     let replayable: std::collections::HashMap<_, _> = requests
         .iter()
-        .map(|r| {
-            (
-                r.id.clone(),
-                super::super::graph_error::subrequest_replayable(r),
-            )
-        })
+        .map(|r| (r.id.clone(), super::super::batch::subrequest_replayable(r)))
         .collect();
     let expected_ids: Vec<String> = requests.iter().map(|r| r.id.clone()).collect();
     let mut seen_ids = std::collections::HashSet::new();
     let mut progress = BatchProgress::default();
-    let response: BatchResponse = account
-        .client
-        .post_batch(
-            resource,
-            &BatchRequest { requests },
-            bifrost_net::ReplayPolicy::Never,
-        )
-        .await
-        .map_err(|e| into_account_error(e, ctx.clone()))?;
+    let response: BatchResponse =
+        super::super::batch::submit(&account.client, resource, &BatchRequest { requests })
+            .await
+            .map_err(|e| into_account_error(e, ctx.clone()))?;
     // The loop DRAINS every subresponse rather than stopping at the first bad
     // item. `$batch` response order is Graph's, not the caller's: stopping
     // early once left the etag of a message that demonstrably WAS destroyed
@@ -720,26 +729,7 @@ async fn submit_write_batch_resource(
         // scope translation. Per-item 2xx and destroy-404 short-
         // circuit as `Succeeded`; everything else surfaces as a failed
         // entry carrying its own classified error.
-        let headers = item
-            .headers
-            .map(|h| {
-                let mut hm = reqwest::header::HeaderMap::new();
-                for (k, v) in h {
-                    if let (Ok(name), Ok(val)) = (
-                        reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                        reqwest::header::HeaderValue::from_str(&v),
-                    ) {
-                        hm.insert(name, val);
-                    }
-                }
-                hm
-            })
-            .unwrap_or_default();
-        let body = item
-            .body
-            .as_ref()
-            .map(|v| bytes::Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
-            .unwrap_or_default();
+        let (headers, body) = super::super::batch::response_parts(&item);
         // Per-item failures carry `ErrorScope::Message { id }` when
         // the caller provided a parallel `targets` slice; otherwise
         // we fall back to `ErrorScope::Account` (graph-F3 done for
@@ -771,7 +761,7 @@ async fn submit_write_batch_resource(
             item.status,
             headers,
             body,
-            destroy,
+            absent,
             bifrost_types::BatchItemId(item.id.clone()),
             operation,
             scope,
@@ -988,7 +978,7 @@ mod replay_tests {
                     body: Some(json!({"isRead": true})),
                 }],
                 &[ObjectId("m1".into())],
-                false,
+                crate::account::batch::AbsentMeans::Failure,
                 AccountOperation::SetCategory,
             )
             .await

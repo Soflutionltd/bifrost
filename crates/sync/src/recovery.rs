@@ -37,20 +37,22 @@ use std::time::{Duration, SystemTime};
 /// deferral. `tokio::time::Instant::now()` falls back to the system clock
 /// when no tokio clock is in force, so production behaviour is unchanged.
 ///
-/// Nothing here is durable: the bucket is one in-memory `Arc<Mutex<_>>` per
+/// Nothing here is durable: the bucket is one in-memory `Arc<ThrottleBucket>` per
 /// `SyncEngine`, never serialized, never checkpointed, and dropped with the
 /// engine. A monotonic instant is therefore safe - it never has to survive a
-/// process. [`record_throttle_parts`] resolves a provider `RetryHint` to a
+/// process. [`ThrottleBucket::observe`] resolves a provider `RetryHint` to a
 /// remaining duration and immediately anchors it to `Instant::now()`.
 /// Recovery repairs also retain a local deadline: [`record_repair_throttle`]
-/// resolves an absolute hint once, anchors the local deadline, and passes an
-/// equivalent duration hint to the shared recorder.
+/// uses the same observation deadline for its local wait and shared holds.
 use tokio::time::Instant;
+
+#[cfg(test)]
+use bifrost_types::ThrottleScope;
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, Cause,
     CursorScope, EngineDirective, ErrorScope, Fatal, ReconcileAdvice, RecoveryClass, RetryAdvice,
-    StateCause, SyncStateErrorKind, ThrottleKey, ThrottleScope,
+    StateCause, SyncStateErrorKind, ThrottleKey,
 };
 
 #[cfg(test)]
@@ -109,7 +111,7 @@ pub(crate) fn plan_recovery(error: AccountError) -> RecoveryPlan {
 /// The engine's one wait for a retryable or reconcilable failure that carries
 /// no provider timing: long enough that a failed read cannot spin, short
 /// enough that a transient outage recovers promptly. Provider hints override it.
-pub(crate) const HINTLESS_RETRY_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const HINTLESS_RETRY_WAIT: Duration = bifrost_types::HINTLESS_HOLD_WAIT;
 
 /// Shared bound for waiting on a replacement connection. A queued repair can
 /// be paused or exhaust its budget without changing the incarnation.
@@ -140,7 +142,7 @@ pub(crate) const REOPEN_WAIT: Duration = Duration::from_secs(30);
 /// generation change is expected; only its timed dispatch records effects.
 pub(crate) fn dispatch_stream_failure(
     error: AccountError,
-    bucket: &std::sync::Mutex<ThrottleBucket>,
+    bucket: &ThrottleBucket,
     account: &AccountId,
 ) -> RecoveryPlan {
     observe_failure_throttles(bucket, account, &error);
@@ -181,19 +183,11 @@ pub(crate) fn dispatch_stream_failure(
 
 /// Observe primary, sibling and cleanup throttles through the same owner.
 pub(crate) fn observe_failure_throttles(
-    bucket: &std::sync::Mutex<ThrottleBucket>,
+    bucket: &ThrottleBucket,
     account: &AccountId,
     error: &AccountError,
 ) {
-    for (source, recovery) in error.throttle_observations() {
-        match recovery {
-            RecoveryClass::Retry(advice) => record_throttle(bucket, account, advice, source),
-            RecoveryClass::Reconcile(advice) => {
-                record_reconcile_throttle(bucket, account, advice, source);
-            }
-            _ => {}
-        }
-    }
+    bucket.observe(account, error);
 }
 
 /// Resolve the effective sleep an engine path should observe before
@@ -487,7 +481,7 @@ fn checkpoint_protocol(checkpoint: Option<&bifrost_types::Checkpoint>) -> bifros
 /// this module. They are in-memory only; nothing persists a throttle wait.
 #[derive(Debug, Default)]
 pub struct ThrottleBucket {
-    waits: HashMap<ThrottleKey, Instant>,
+    waits: std::sync::Mutex<HashMap<ThrottleKey, Instant>>,
 }
 
 impl ThrottleBucket {
@@ -496,11 +490,31 @@ impl ThrottleBucket {
         Self::default()
     }
 
+    /// Observe every error leg and return the longest local pacing deadline.
+    pub fn observe(&self, account: &AccountId, error: &AccountError) -> Option<Instant> {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        error
+            .throttle_holds()
+            .into_iter()
+            .map(|(target, hint)| {
+                let deadline = now + hint.min_delay(wall);
+                if let Some(key) = hold_key(target, account) {
+                    self.record(key, deadline);
+                }
+                deadline
+            })
+            .max()
+    }
+
     /// Record a wait-until deadline for `key`. If a wait already
     /// exists, the later of the two deadlines wins (a stricter throttle
     /// from a parallel response should not shorten an earlier one).
-    pub fn record(&mut self, key: ThrottleKey, wait_until: Instant) {
-        self.waits
+    pub fn record(&self, key: ThrottleKey, wait_until: Instant) {
+        let Ok(mut waits) = self.waits.lock() else {
+            return;
+        };
+        waits
             .entry(key)
             .and_modify(|existing| {
                 if wait_until > *existing {
@@ -514,7 +528,7 @@ impl ThrottleBucket {
     /// records either embeds its account (`Account`, `Mailbox`) or is
     /// declared by the accounts that consume it (`Budget`), so the
     /// observing account needs no enrollment and this is `record`.
-    pub fn record_for(&mut self, _account: &AccountId, key: ThrottleKey, wait_until: Instant) {
+    pub fn record_for(&self, _account: &AccountId, key: ThrottleKey, wait_until: Instant) {
         self.record(key, wait_until);
     }
 
@@ -522,7 +536,7 @@ impl ThrottleBucket {
     /// throttle applies (or the recorded deadline has expired).
     #[must_use]
     pub fn wait_for(&self, key: &ThrottleKey, now: Instant) -> Option<Duration> {
-        let until = *self.waits.get(key)?;
+        let until = *self.waits.lock().ok()?.get(key)?;
         until.checked_duration_since(now).filter(|d| !d.is_zero())
     }
 
@@ -538,8 +552,10 @@ impl ThrottleBucket {
 
     /// Drop expired entries. Called opportunistically by the engine
     /// (e.g. between work items) to keep the map small.
-    pub fn cleanup_expired(&mut self, now: Instant) {
-        self.waits.retain(|_, until| *until > now);
+    pub fn cleanup_expired(&self, now: Instant) {
+        if let Ok(mut waits) = self.waits.lock() {
+            waits.retain(|_, until| *until > now);
+        }
     }
 
     /// Called at detach. The bucket holds no per-account state beyond
@@ -547,7 +563,7 @@ impl ThrottleBucket {
     /// account's own key are left to expire on their own - they are
     /// per-account facts a reattach of the same account may still want to
     /// honor.
-    pub fn forget_account(&mut self, _account: &AccountId) {}
+    pub fn forget_account(&self, _account: &AccountId) {}
 }
 
 /// Resolve the `ThrottleKey` a `ThrottleScope` maps to, given the
@@ -565,7 +581,7 @@ impl ThrottleBucket {
 ///
 /// A throttle that spans accounts is a stamped and declared budget, never a
 /// scope. An error that stamps budgets never reaches here:
-/// `record_throttle_parts` records exactly the stamped budgets instead.
+/// `AccountError::throttle_holds` records exactly the stamped budgets instead.
 ///
 /// The mailbox rule is deliberate. Widening a per-mailbox 429 to the account
 /// key converts one mailbox's
@@ -578,38 +594,35 @@ impl ThrottleBucket {
 /// incarnation, so clearing them on detach would let a detach-plus-reattach
 /// bypass a provider wait. Growth is bounded by expiry pruning.
 #[must_use]
+#[cfg(test)]
 pub(crate) fn resolve_throttle_key(
     scope: ThrottleScope,
     account: &AccountId,
     error: &AccountError,
 ) -> Option<ThrottleKey> {
-    let account_key = || ThrottleKey::Account(account.clone());
-    match scope {
-        ThrottleScope::CurrentOperation => None,
-        // BOTH mailbox shapes must be accepted here. Folder producers build
-        // `ErrorScope::Cursor(Folder(id))`, not `ErrorScope::Mailbox { id }` -
-        // and IMAP's `mailbox_throttle`, the only production emitter of
-        // `ThrottleScope::Mailbox` in the workspace, fires for either. Matching
-        // only the latter made `ThrottleKey::Mailbox` unreachable in
-        // production: every real per-folder `[LIMIT]` recorded no deadline at
-        // all, so the poll loop, push reconciler and backfill runner kept
-        // driving that folder at full cadence and re-earned the 429. The
-        // synthetic `Mailbox { .. }` shape is built only by tests.
-        ThrottleScope::Mailbox => match error.scope() {
-            Some(ErrorScope::Mailbox { id }) => Some(ThrottleKey::Mailbox {
-                account: account.clone(),
-                mailbox: id.clone(),
-            }),
-            Some(ErrorScope::Cursor(CursorScope::Folder(folder))) => Some(ThrottleKey::Mailbox {
-                account: account.clone(),
-                mailbox: bifrost_types::MailboxId(folder.0.clone()),
-            }),
-            _ => None,
-        },
-        ThrottleScope::Account => Some(account_key()),
-        // ThrottleScope is #[non_exhaustive]; new variants default to
-        // "no bucket entry" (the conservative classification) and
-        // require explicit handling here.
+    let error = error
+        .clone()
+        .into_builder()
+        .throttle_scope(scope)
+        .try_build()
+        .unwrap();
+    error
+        .throttle_holds()
+        .into_iter()
+        .find_map(|(target, _)| hold_key(target, account))
+}
+
+/// The one mapping from a provider-side hold target to the engine bucket key.
+/// `CurrentOperation` (and any future target) paces only the observer, so it
+/// enters no shared bucket.
+fn hold_key(target: bifrost_types::HoldTarget, account: &AccountId) -> Option<ThrottleKey> {
+    match target {
+        bifrost_types::HoldTarget::Account => Some(ThrottleKey::Account(account.clone())),
+        bifrost_types::HoldTarget::Mailbox(mailbox) => Some(ThrottleKey::Mailbox {
+            account: account.clone(),
+            mailbox,
+        }),
+        bifrost_types::HoldTarget::Budget(budget) => Some(ThrottleKey::Budget(budget)),
         _ => None,
     }
 }
@@ -619,158 +632,42 @@ pub(crate) fn resolve_throttle_key(
 /// advice carries no throttle scope or no retry hint, and when the
 /// bucket mutex is poisoned (a throttle wait is advisory; panicking a
 /// worker over it would trade a pause for an outage).
+#[cfg(test)]
 pub(crate) fn record_throttle(
-    bucket: &std::sync::Mutex<ThrottleBucket>,
+    bucket: &ThrottleBucket,
     account: &AccountId,
-    advice: &RetryAdvice,
+    _advice: &RetryAdvice,
     error: &AccountError,
 ) {
-    record_throttle_parts(
-        bucket,
-        account,
-        advice.throttle_scope,
-        advice.retry_hint,
-        error,
-    );
+    bucket.observe(account, error);
 }
 
+#[cfg(test)]
 pub(crate) fn record_reconcile_throttle(
-    bucket: &std::sync::Mutex<ThrottleBucket>,
+    bucket: &ThrottleBucket,
     account: &AccountId,
-    advice: &ReconcileAdvice,
+    _advice: &ReconcileAdvice,
     error: &AccountError,
 ) {
-    record_throttle_parts(
-        bucket,
-        account,
-        advice.throttle_scope,
-        advice.retry_hint,
-        error,
-    );
+    bucket.observe(account, error);
 }
 
-/// Record a recovery establishment failure and capture its local hold once.
-/// Resolve absolute hints before recording so the local and shared waits use
-/// the same duration, even under a paused monotonic clock.
+/// Record every leg and capture the same monotonic deadline for repair pacing.
 pub(crate) fn record_repair_throttle(
-    bucket: &std::sync::Mutex<ThrottleBucket>,
+    bucket: &ThrottleBucket,
     account: &AccountId,
     error: &AccountError,
 ) -> Option<Instant> {
-    let now = Instant::now();
-    match plan_recovery(error.clone()) {
-        RecoveryPlan::Retry(mut advice) => {
-            let signal = advice.throttle_scope.is_some()
-                || advice.retry_hint.is_some()
-                || !error.throttle_budgets().is_empty()
-                || matches!(advice.reason, bifrost_types::RetryReason::RateLimited);
-            if !signal {
-                return None;
-            }
-            let delay = retry_delay(&advice, SystemTime::now(), HINTLESS_RETRY_WAIT);
-            advice.retry_hint = advice
-                .retry_hint
-                .map(|_| bifrost_types::RetryHint::After(delay));
-            record_throttle(bucket, account, &advice, error);
-            Some(now + delay)
-        }
-        RecoveryPlan::Reconcile(mut advice) => {
-            let signal = advice.throttle_scope.is_some()
-                || advice.retry_hint.is_some()
-                || !error.throttle_budgets().is_empty()
-                || matches!(
-                    advice.reason,
-                    bifrost_types::ReconcileReason::ThrottledMidFlight
-                );
-            if !signal {
-                return None;
-            }
-            let delay = reconcile_delay(&advice, SystemTime::now(), HINTLESS_RETRY_WAIT);
-            advice.retry_hint = advice
-                .retry_hint
-                .map(|_| bifrost_types::RetryHint::After(delay));
-            record_reconcile_throttle(bucket, account, &advice, error);
-            Some(now + delay)
-        }
-        _ => None,
-    }
+    bucket.observe(account, error)
 }
 
-/// The hold recorded for a STAMPED budget whose response carried no retry
-/// hint. Equal to the fallback every engine retry path sleeps locally
-/// (`retry_delay` / `reconcile_delay` callers pass one second), so a sibling
-/// declaring the budget is paced exactly as the observer paces itself. An
-/// unstamped error without a hint still records nothing, as it always has:
-/// there the key is lifted from a coarse `ThrottleScope`, and a guessed
-/// deadline on an account or provider key would pause far more than one
-/// request's worth of work.
-const STAMPED_BUDGET_FALLBACK: Duration = Duration::from_secs(1);
-
-fn record_throttle_parts(
-    bucket: &std::sync::Mutex<ThrottleBucket>,
-    account: &AccountId,
-    throttle_scope: Option<ThrottleScope>,
-    retry_hint: Option<bifrost_types::RetryHint>,
-    error: &AccountError,
-) {
-    // Precedence: a producer that stamped budgets has named exactly what the
-    // response says to hold, so those are recorded and NOTHING is lifted from
-    // the `ThrottleScope`. Recording the lifted account key as well would put
-    // the hold back on every sibling mailbox the budget exists to keep
-    // running.
-    let budgets = error.throttle_budgets();
-    if !budgets.is_empty() {
-        let delay = retry_hint.map_or(STAMPED_BUDGET_FALLBACK, |hint| {
-            hint.min_delay(SystemTime::now())
-        });
-        let wait_until = Instant::now() + delay;
-        if let Ok(mut guard) = bucket.lock() {
-            for budget in budgets {
-                guard.record_for(account, ThrottleKey::Budget(budget.clone()), wait_until);
-            }
-        }
-        return;
-    }
-    let Some(scope) = throttle_scope else {
-        return;
-    };
-    let Some(key) = resolve_throttle_key(scope, account, error) else {
-        return;
-    };
-    // A hintless lifted throttle records nothing, EXCEPT on a `Mailbox`
-    // key: that key is as narrow as a stamped budget, so a guessed
-    // fallback hold there costs one mailbox's work the same second the
-    // observer sleeps anyway. IMAP's folder-scoped `[LIMIT]` carries no
-    // hint at all, so without this its mailbox hold was never recorded and
-    // the keys IMAP declares never saw it. A wider key (account, provider)
-    // still needs the provider's own timing before it pauses anything.
-    let hint = match retry_hint {
-        Some(hint) => hint,
-        None if matches!(key, ThrottleKey::Mailbox { .. }) => {
-            bifrost_types::RetryHint::After(STAMPED_BUDGET_FALLBACK)
-        }
-        None => return,
-    };
-    // The shared bucket's clock boundary. A provider hint arrives as evidence -
-    // either a bare duration (`After`) or an absolute HTTP date (`At`). It is
-    // resolved to a REMAINING DURATION against the wall clock here, once, and
-    // immediately anchored to the monotonic clock the wait sites sleep on.
-    // `min_delay` is the right resolver for both shapes: it returns the
-    // duration verbatim for `After` and the wall-clock delta for `At`,
-    // saturating at zero for a date already past. Recovery repairs normalize
-    // an absolute hint before this call when capturing their local deadline,
-    // so this recorder receives the equivalent duration in that case.
-    // Never retain an absolute hint for re-resolution after a monotonic sleep.
-    let wait_until = Instant::now() + hint.min_delay(SystemTime::now());
-    if let Ok(mut guard) = bucket.lock() {
-        guard.record_for(account, key, wait_until);
-    }
-}
+#[cfg(test)]
+const STAMPED_BUDGET_FALLBACK: Duration = bifrost_types::HINTLESS_HOLD_WAIT;
 
 /// Longest account-wide throttle wait currently pending for `account`,
 /// pruning expired deadlines on the way. `None` when the account may
 /// drive work now (including when the mutex is poisoned - see
-/// [`record_throttle`]).
+/// `record_throttle`).
 ///
 /// Deliberately takes no `now`: there is exactly one correct answer for an
 /// engine wait site - the timer clock's notion of now - and letting each
@@ -779,7 +676,7 @@ fn record_throttle_parts(
 /// directly.
 #[must_use]
 pub(crate) fn account_throttle_wait(
-    bucket: &std::sync::Mutex<ThrottleBucket>,
+    bucket: &ThrottleBucket,
     account: &AccountId,
 ) -> Option<Duration> {
     throttle_wait(bucket, account, &[])
@@ -794,12 +691,12 @@ pub(crate) fn account_throttle_wait(
 /// exist. Same clock and poison rules as [`account_throttle_wait`].
 #[must_use]
 pub(crate) fn throttle_wait(
-    bucket: &std::sync::Mutex<ThrottleBucket>,
+    bucket: &ThrottleBucket,
     account: &AccountId,
     declared: &[ThrottleKey],
 ) -> Option<Duration> {
     let now = Instant::now();
-    let mut guard = bucket.lock().ok()?;
+    let guard = bucket;
     guard.cleanup_expired(now);
     let declared_wait = declared.iter().filter_map(|key| guard.wait_for(key, now));
     guard
@@ -974,7 +871,7 @@ mod tests {
 
     #[test]
     fn stream_dispatch_supplies_one_second_without_provider_timing() {
-        let bucket = std::sync::Mutex::new(ThrottleBucket::new());
+        let bucket = ThrottleBucket::new();
         let account = AccountId("a".into());
         let now = SystemTime::UNIX_EPOCH;
         match dispatch_stream_failure(build_retry(), &bucket, &account) {
@@ -1000,7 +897,7 @@ mod tests {
 
     #[test]
     fn stream_dispatch_preserves_engine_and_terminal_decisions() {
-        let bucket = std::sync::Mutex::new(ThrottleBucket::new());
+        let bucket = ThrottleBucket::new();
         let account = AccountId("a".into());
         assert!(matches!(
             dispatch_stream_failure(build_engine(), &bucket, &account),
@@ -1205,7 +1102,7 @@ mod tests {
 
     #[test]
     fn throttle_bucket_records_and_expires() {
-        let mut bucket = ThrottleBucket::new();
+        let bucket = ThrottleBucket::new();
         // A bucket instant is monotonic now; anchor the test at a fixed
         // point on that clock rather than on the wall clock.
         let now = Instant::now();
@@ -1219,7 +1116,7 @@ mod tests {
 
     #[test]
     fn throttle_bucket_take_max_of_overlapping_records() {
-        let mut bucket = ThrottleBucket::new();
+        let bucket = ThrottleBucket::new();
         // A bucket instant is monotonic now; anchor the test at a fixed
         // point on that clock rather than on the wall clock.
         let now = Instant::now();
@@ -1231,7 +1128,7 @@ mod tests {
 
     #[test]
     fn throttle_bucket_cleanup_drops_expired() {
-        let mut bucket = ThrottleBucket::new();
+        let bucket = ThrottleBucket::new();
         // A bucket instant is monotonic now; anchor the test at a fixed
         // point on that clock rather than on the wall clock.
         let now = Instant::now();
@@ -1248,7 +1145,7 @@ mod tests {
     fn wait_for_account_reads_only_the_account_key() {
         // A budget the account recorded holds the work that declares it,
         // not the whole account.
-        let mut bucket = ThrottleBucket::new();
+        let bucket = ThrottleBucket::new();
         // A bucket instant is monotonic now; anchor the test at a fixed
         // point on that clock rather than on the wall clock.
         let now = Instant::now();
@@ -1272,7 +1169,7 @@ mod tests {
     #[test]
     fn wait_for_account_excludes_mailbox_keys() {
         // A per-mailbox throttle must not pause the whole account.
-        let mut bucket = ThrottleBucket::new();
+        let bucket = ThrottleBucket::new();
         // A bucket instant is monotonic now; anchor the test at a fixed
         // point on that clock rather than on the wall clock.
         let now = Instant::now();
@@ -1288,10 +1185,13 @@ mod tests {
         assert_eq!(bucket.wait_for_account(&a, now), None);
     }
 
+    // A hintless rate limit: `resolve_throttle_key` stamps a throttle scope on
+    // it, and the builder admits a throttle scope only on rate-limit or quota
+    // kinds, so a transport fixture would fail to build.
     fn throttled_error(scope: Option<ErrorScope>) -> AccountError {
         let mut builder = AccountErrorBuilder::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
         )
         .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
         .operation(AccountOperation::SyncChanges);
@@ -1320,7 +1220,7 @@ mod tests {
         let RecoveryClass::Reconcile(advice) = error.recovery() else {
             panic!("in-flight send must reconcile");
         };
-        let bucket = std::sync::Mutex::new(ThrottleBucket::new());
+        let bucket = ThrottleBucket::new();
 
         record_reconcile_throttle(&bucket, &account, advice, &error);
 
@@ -1360,7 +1260,7 @@ mod tests {
         let RecoveryClass::Retry(advice) = error.recovery() else {
             panic!("an unsent rate limit retries");
         };
-        let bucket = std::sync::Mutex::new(ThrottleBucket::new());
+        let bucket = ThrottleBucket::new();
 
         record_throttle(&bucket, &account, advice, &error);
 
@@ -1395,14 +1295,14 @@ mod tests {
             }
             builder.try_build().expect("valid")
         };
-        let record = |bucket: &std::sync::Mutex<ThrottleBucket>, error: &AccountError| {
+        let record = |bucket: &ThrottleBucket, error: &AccountError| {
             let RecoveryClass::Retry(advice) = error.recovery() else {
                 panic!("an unsent rate limit retries");
             };
             record_throttle(bucket, &account, advice, error);
         };
 
-        let bucket = std::sync::Mutex::new(ThrottleBucket::new());
+        let bucket = ThrottleBucket::new();
         record(
             &bucket,
             &build(
@@ -1421,7 +1321,7 @@ mod tests {
                 .is_some_and(|wait| wait <= STAMPED_BUDGET_FALLBACK)
         );
 
-        let bucket = std::sync::Mutex::new(ThrottleBucket::new());
+        let bucket = ThrottleBucket::new();
         record(&bucket, &build(ThrottleScope::Account, None));
         assert_eq!(account_throttle_wait(&bucket, &account), None);
     }
@@ -1434,8 +1334,8 @@ mod tests {
         let recorder = AccountId("recorder".into());
         let bystander = AccountId("bystander".into());
         let key = ThrottleKey::Budget(bifrost_types::ThrottleBudget::new("test|mailbox:x"));
-        let bucket = std::sync::Mutex::new(ThrottleBucket::new());
-        bucket.lock().expect("bucket").record_for(
+        let bucket = ThrottleBucket::new();
+        bucket.record_for(
             &recorder,
             key.clone(),
             Instant::now() + Duration::from_secs(30),
@@ -1514,14 +1414,17 @@ mod tests {
     fn a_mailbox_throttle_naming_no_mailbox_never_widens_to_the_account() {
         let account = AccountId("a".into());
         let bare = throttled_error(None);
-        let account_key = Some(ThrottleKey::Account(account.clone()));
         assert_eq!(
             resolve_throttle_key(ThrottleScope::Mailbox, &account, &bare),
             None
         );
+        // `throttled_error` carries no provider timing, and an account-wide
+        // hold requires a hint (`AccountError::throttle_holds`): a guessed
+        // deadline on the account key would pause every folder. The hinted
+        // account case is pinned by `reconcile_throttle_is_recorded_for_the_account`.
         assert_eq!(
             resolve_throttle_key(ThrottleScope::Account, &account, &bare),
-            account_key
+            None
         );
     }
 }

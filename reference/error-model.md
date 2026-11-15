@@ -862,3 +862,11 @@ identity mismatch clears account state because none of its retained scopes can
 safely consume another account's token. These are local durable-state faults,
 never provider protocol faults. Provider-native expired tokens retain their
 existing scope-restart policy.
+
+`AccountError::throttle_holds()` owns hold extraction across primary, sibling
+and cleanup legs. It returns `(HoldTarget, RetryHint)` pairs. Budgets suppress
+scope lifting; hintless budgets and mailbox holds get `HINTLESS_HOLD_WAIT`
+(one second), the same constant the engine's hintless retry sleep uses. Account
+holds require a hint. Unresolved mailbox identities and operation-only advice
+remain `CurrentOperation`, which paces repair without widening shared holds.
+The engine supplies account identity and anchors hints on its monotonic clock.

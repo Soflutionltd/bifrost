@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::id::AccountId;
+use super::id::{AccountId, ObjectState};
 use super::set::{SetError, SetObject};
 
 #[derive(Debug, Clone, Serialize)]
@@ -11,14 +11,14 @@ pub(crate) struct CopyRequest<O: SetObject> {
 
     #[serde(rename = "ifFromInState")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    if_from_in_state: Option<String>,
+    if_from_in_state: Option<ObjectState<O>>,
 
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
     #[serde(rename = "ifInState")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    if_in_state: Option<String>,
+    if_in_state: Option<ObjectState<O>>,
 
     /// Create entries keyed by consumer-provided create-id (e.g. "c1").
     #[serde(rename = "create")]
@@ -29,7 +29,7 @@ pub(crate) struct CopyRequest<O: SetObject> {
 
     #[serde(rename = "destroyFromIfInState")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    destroy_from_if_in_state: Option<String>,
+    destroy_from_if_in_state: Option<ObjectState<O>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,10 +43,10 @@ pub(crate) struct CopyResponse<O: SetObject> {
     account_id: AccountId,
 
     #[serde(rename = "oldState")]
-    old_state: Option<String>,
+    old_state: Option<ObjectState<O>>,
 
     #[serde(rename = "newState")]
-    new_state: String,
+    new_state: ObjectState<O>,
 
     /// Successful copies, keyed by the consumer-provided create-id.
     #[serde(rename = "created")]
@@ -75,12 +75,15 @@ impl<O: SetObject> CopyRequest<O> {
         self
     }
 
-    pub(crate) fn if_from_in_state(&mut self, if_from_in_state: impl Into<String>) -> &mut Self {
+    pub(crate) fn if_from_in_state(
+        &mut self,
+        if_from_in_state: impl Into<ObjectState<O>>,
+    ) -> &mut Self {
         self.if_from_in_state = Some(if_from_in_state.into());
         self
     }
 
-    pub(crate) fn if_in_state(&mut self, if_in_state: impl Into<String>) -> &mut Self {
+    pub(crate) fn if_in_state(&mut self, if_in_state: impl Into<ObjectState<O>>) -> &mut Self {
         self.if_in_state = Some(if_in_state.into());
         self
     }
@@ -95,7 +98,7 @@ impl<O: SetObject> CopyRequest<O> {
 
     pub(crate) fn destroy_from_if_in_state(
         &mut self,
-        destroy_from_if_in_state: impl Into<String>,
+        destroy_from_if_in_state: impl Into<ObjectState<O>>,
     ) -> &mut Self {
         self.destroy_from_if_in_state = Some(destroy_from_if_in_state.into());
         self
@@ -126,11 +129,11 @@ impl<O: SetObject> CopyResponse<O> {
         &self.account_id
     }
 
-    pub(crate) fn old_state(&self) -> Option<&str> {
-        self.old_state.as_deref()
+    pub(crate) fn old_state(&self) -> Option<&ObjectState<O>> {
+        self.old_state.as_ref()
     }
 
-    pub(crate) fn new_state(&self) -> &str {
+    pub(crate) fn new_state(&self) -> &ObjectState<O> {
         &self.new_state
     }
 

@@ -228,14 +228,14 @@ impl<T: HttpTransport + SseTransport> Client<T> {
                                             yield Ok(notification);
                                         }
                                     }
-                                    Err(err) => { yield Err(err.into()); break 'events; }
+                                    Err(err) => { yield Err(crate::Error::EnvelopeDecode(err)); break 'events; }
                                 }
                             }
                             #[cfg(feature = "calendars")]
                             EventType::CalendarAlert => {
                                 match serde_json::from_slice::<CalendarAlert>(&event.data) {
                                     Ok(alert) => { yield Ok(PushNotification::CalendarAlert(alert)); }
-                                    Err(err) => { yield Err(err.into()); }
+                                    Err(err) => { yield Err(crate::Error::EnvelopeDecode(err)); }
                                 }
                             }
                             EventType::Ping | EventType::Unknown => {}

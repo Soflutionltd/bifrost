@@ -71,7 +71,7 @@ impl<Tr: HttpTransport> Client<Tr> {
             .upload(&upload_url, data, content_type)
             .await
             .map_err(crate::Error::from)?;
-        serde_json::from_slice::<UploadResponse>(&bytes).map_err(std::convert::Into::into)
+        serde_json::from_slice::<UploadResponse>(&bytes).map_err(crate::Error::EnvelopeDecode)
     }
 }
 

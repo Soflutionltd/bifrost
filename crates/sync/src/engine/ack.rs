@@ -231,7 +231,7 @@ pub(super) async fn ack_writer(
             match store.get_ledger(&account_id).await {
                 Ok(mut ledger) => {
                     for (report, generation) in pending_debt.drain(..) {
-                        ledger.ingest_debt_only(
+                        ledger.accrue().ingest_debt_only(
                             &report,
                             generation,
                             jiff::Timestamp::now().as_second(),
@@ -293,7 +293,7 @@ pub(super) async fn ack_writer(
                 continue;
             }
             WriterRequest::RecordBarrier { incident, done } => {
-                ledger.record_barrier(incident);
+                ledger.accrue().record_barrier(incident);
                 // No checkpoint advanced, so there is nothing to write
                 // alongside it. The ledger still has to reach disk, or the
                 // barrier is forgotten on restart and no operator can act on
@@ -307,7 +307,7 @@ pub(super) async fn ack_writer(
                 generation,
                 done,
             } => {
-                let mut crossed = ledger.clone();
+                let mut crossed = ledger.stage();
                 if !crossed.cross_waived_barriers(
                     &report,
                     generation,
@@ -318,7 +318,7 @@ pub(super) async fn ack_writer(
                 }
                 let result = persist_ledger_only(&account_id, &store, &crossed).await;
                 if result.is_ok() {
-                    *ledger = crossed;
+                    crossed.commit(ledger);
                 }
                 let _ = done.send(result.map(|()| true));
                 continue;
@@ -406,7 +406,11 @@ pub(super) async fn ack_writer(
                 generation,
                 done,
             } => {
-                ledger.ingest_debt_only(&report, generation, jiff::Timestamp::now().as_second());
+                ledger.accrue().ingest_debt_only(
+                    &report,
+                    generation,
+                    jiff::Timestamp::now().as_second(),
+                );
                 let result = persist_ledger_only(&account_id, &store, ledger).await;
                 let _ = done.send(result);
                 continue;
@@ -419,7 +423,7 @@ pub(super) async fn ack_writer(
                 // Operator policy takes effect only after persistence succeeds.
                 // In particular, a failed waiver must not become accepted loss
                 // through a later unrelated checkpoint write.
-                let mut decided = ledger.clone();
+                let mut decided = ledger.stage();
                 let changed = match decision {
                     OperatorDecision::Waive {
                         by,
@@ -430,7 +434,7 @@ pub(super) async fn ack_writer(
                 let result = if changed {
                     let result = persist_ledger_only(&account_id, &store, &decided).await;
                     if result.is_ok() {
-                        *ledger = decided;
+                        decided.commit(ledger);
                     }
                     result.map(|()| true)
                 } else {
@@ -586,7 +590,9 @@ pub(super) async fn ack_writer(
                 let debt = coverage.invalidate_account();
                 let now = jiff::Timestamp::now().as_second();
                 for report in &debt.reports {
-                    ledger.ingest_debt_only(report, debt.generation, now);
+                    ledger
+                        .accrue()
+                        .ingest_debt_only(report, debt.generation, now);
                 }
                 let cleared = store
                     .clear_account_checkpoints(&account_id, ledger.clone())
@@ -603,7 +609,9 @@ pub(super) async fn ack_writer(
                 let carried = !debt.reports.is_empty();
                 let now = jiff::Timestamp::now().as_second();
                 for report in &debt.reports {
-                    ledger.ingest_debt_only(report, debt.generation, now);
+                    ledger
+                        .accrue()
+                        .ingest_debt_only(report, debt.generation, now);
                 }
                 // Written after a FAILED clear too: pass 1 already removed its
                 // debt from the coverage ledger, so without this write it would
@@ -652,7 +660,9 @@ pub(super) async fn ack_writer(
                 let mut debt = coverage.invalidate_scope(&scope);
                 let now = jiff::Timestamp::now().as_second();
                 for report in &debt.reports {
-                    ledger.ingest_debt_only(report, debt.generation, now);
+                    ledger
+                        .accrue()
+                        .ingest_debt_only(report, debt.generation, now);
                 }
                 let result = async {
                     persist_ledger_only(&account_id, &store, ledger).await?;
@@ -688,7 +698,9 @@ pub(super) async fn ack_writer(
                 if !debt.reports.is_empty() {
                     let now = jiff::Timestamp::now().as_second();
                     for report in &debt.reports {
-                        ledger.ingest_debt_only(report, debt.generation, now);
+                        ledger
+                            .accrue()
+                            .ingest_debt_only(report, debt.generation, now);
                     }
                     if let Err(error) = persist_ledger_only(&account_id, &store, ledger).await {
                         tracing::warn!(
@@ -1012,7 +1024,9 @@ async fn discard_backfill(
     let mut debt = coverage.invalidate_scope_backfill(scope, through);
     let now = jiff::Timestamp::now().as_second();
     for report in &debt.reports {
-        ledger.ingest_debt_only(report, debt.generation, now);
+        ledger
+            .accrue()
+            .ingest_debt_only(report, debt.generation, now);
     }
     let result = async {
         persist_ledger_only(account_id, store, ledger).await?;
@@ -1034,7 +1048,9 @@ async fn discard_backfill(
     if !debt.reports.is_empty() {
         let now = jiff::Timestamp::now().as_second();
         for report in &debt.reports {
-            ledger.ingest_debt_only(report, debt.generation, now);
+            ledger
+                .accrue()
+                .ingest_debt_only(report, debt.generation, now);
         }
         if let Err(error) = persist_ledger_only(account_id, store, ledger).await {
             tracing::warn!(
@@ -1181,7 +1197,7 @@ async fn apply_repair_resolutions(
     // Keep the authoritative in-memory ledger aligned with durable state. A
     // failed write must not leave a discharge or attempt available to a later
     // unrelated writer request.
-    let mut candidate = ledger.clone();
+    let mut candidate = ledger.stage();
 
     for resolution in resolutions {
         match resolution {
@@ -1242,7 +1258,7 @@ async fn apply_repair_resolutions(
     }
 
     persist_ledger_only(account_id, store, &candidate).await?;
-    *ledger = candidate;
+    candidate.commit(ledger);
     Ok(())
 }
 
@@ -1549,6 +1565,7 @@ async fn persist_ack_request(
             .map_err(AckFailure::Store)?;
         return Ok(AckPersistOutcome::Withheld);
     }
+    let mut candidate = ledger.stage();
     match req
         .publication
         .clone()
@@ -1557,7 +1574,15 @@ async fn persist_ack_request(
         Some(ClaimLookup::Apply(claim)) => {
             let now = jiff::Timestamp::now().as_second();
             for report in &claim.reports {
-                ledger.ingest(report, claim.generation, now);
+                // Enterprise users expect a failed save to retry owed work,
+                // never to report coverage progress through an unrelated save.
+                // Keep debt sticky, but apply proof only to the candidate.
+                ledger
+                    .accrue()
+                    .ingest_debt_only(report, claim.generation, now);
+            }
+            for report in &claim.reports {
+                candidate.ingest(report, claim.generation, now);
             }
         }
         // Already persisted by an earlier acknowledgement of this exact
@@ -1582,7 +1607,7 @@ async fn persist_ack_request(
 
     if let Checkpoint::Backfill(b) = &req.checkpoint
         && crate::backfill::partitioner::is_completion_partition(&b.partition)
-        && let Some(reason) = completion_refusal(coverage, ledger, b, req.publication.as_ref())
+        && let Some(reason) = completion_refusal(coverage, &candidate, b, req.publication.as_ref())
     {
         tracing::warn!(
             target: "bifrost.sync.backfill",
@@ -1617,9 +1642,10 @@ async fn persist_ack_request(
             .map_err(AckFailure::Store)?;
             return Ok(AckPersistOutcome::Withheld);
         }
-        persist_ledger_only(account_id, store, ledger)
+        persist_ledger_only(account_id, store, &candidate)
             .await
             .map_err(AckFailure::Store)?;
+        candidate.commit(ledger);
         return Ok(AckPersistOutcome::Withheld);
     }
 
@@ -1628,11 +1654,12 @@ async fn persist_ack_request(
             account_id,
             CheckpointTransition {
                 checkpoint: req.checkpoint.clone(),
-                ledger: ledger.clone(),
+                ledger: (*candidate).clone(),
             },
         )
         .await
         .map_err(AckFailure::Store)?;
+    candidate.commit(ledger);
     Ok(AckPersistOutcome::Durable)
 }
 
@@ -1957,7 +1984,9 @@ mod tests {
             vec![unrepresentable("owed")],
         );
         let mut ledger = crate::cursor::DebtLedger::default();
-        ledger.ingest_debt_only(&report, crate::cursor::WalkGeneration::for_test(1), 1);
+        ledger
+            .accrue()
+            .ingest_debt_only(&report, crate::cursor::WalkGeneration::for_test(1), 1);
         store
             .inner
             .put_ledger(&AccountId("acct".into()), ledger)
@@ -2324,6 +2353,64 @@ mod tests {
             drop(tx);
             task.await.expect("writer exits");
         }
+    }
+
+    #[tokio::test]
+    async fn failed_ack_proof_does_not_leak_into_an_unrelated_write() {
+        let store = seeded_store().await;
+        let account = AccountId("acct".into());
+        let mut ledger = store.inner.get_ledger(&account).await.expect("seeded");
+        let coverage = PendingCoverage::new();
+        let checkpoint = Checkpoint::Change(change_cursor(b"proof"));
+        let publication = coverage.register(
+            checkpoint.clone(),
+            crate::cursor::CoverageClaim::new(
+                bifrost_types::InventoryCoverageReport::complete(
+                    bifrost_types::CoverageDomain::full(email_scope()),
+                ),
+                crate::cursor::WalkGeneration::for_test(2),
+            ),
+        );
+        let request = AckRequest {
+            scope: email_scope(),
+            checkpoint,
+            publication: Some(publication),
+            auto: false,
+            complete: None,
+        };
+        let shared = Arc::clone(&store);
+        let erased: Arc<DynCheckpointStore> = shared;
+        store
+            .fail_transitions
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            super::persist_ack_request(&account, &erased, &coverage, &mut ledger, &request)
+                .await
+                .is_err()
+        );
+        assert_eq!(ledger.open_debt().count(), 1);
+        super::persist_ledger_only(&account, &erased, &ledger)
+            .await
+            .expect("unrelated ledger write");
+        assert_eq!(
+            store
+                .inner
+                .get_ledger(&account)
+                .await
+                .expect("read")
+                .open_debt()
+                .count(),
+            1
+        );
+        store
+            .fail_transitions
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            super::persist_ack_request(&account, &erased, &coverage, &mut ledger, &request)
+                .await
+                .is_ok()
+        );
+        assert_eq!(ledger.open_debt().count(), 0);
     }
 
     #[tokio::test]

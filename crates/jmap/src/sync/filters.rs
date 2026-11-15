@@ -287,9 +287,24 @@ pub(crate) fn update<T: HttpTransport>(
                 .updated(&id)
                 .map_err(super::error::answer_error(AccountOperation::FilterUpdate))?;
         } else {
-            response
-                .unwrap_update_errors()
-                .map_err(to_acct_err(AccountOperation::FilterUpdate))?;
+            // Activation-only sends no update map. A notUpdated entry cannot
+            // be a refusal of a submitted update; retain every unexpected id
+            // in the contract diagnostic instead of choosing a hash winner.
+            let mut unexpected = response
+                .update_errors()
+                .map(|(id, error)| format!("{id}: {error}"))
+                .collect::<Vec<_>>();
+            if !unexpected.is_empty() {
+                unexpected.sort();
+                return Err(super::error::contract_violation(
+                    AccountOperation::FilterUpdate,
+                    None,
+                    format!(
+                        "activation-only SieveScript/set returned notUpdated: {}",
+                        unexpected.join(", ")
+                    ),
+                ));
+            }
         }
         Ok(())
     })

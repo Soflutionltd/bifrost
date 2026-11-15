@@ -1,4 +1,5 @@
 mod autodiscover;
+mod batch;
 mod batch_routing;
 mod blob;
 mod calendar;

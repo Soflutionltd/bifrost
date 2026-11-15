@@ -204,7 +204,10 @@ macro_rules! define_set_method {
             }
 
             #[must_use]
-            pub(crate) fn if_in_state(mut self, if_in_state: impl Into<String>) -> Self {
+            pub(crate) fn if_in_state(
+                mut self,
+                if_in_state: impl Into<$crate::core::id::ObjectState<$obj>>,
+            ) -> Self {
                 self.inner.if_in_state(if_in_state);
                 self
             }
@@ -256,7 +259,7 @@ macro_rules! define_changes_method {
         #[derive(Debug, Clone, serde::Serialize)]
         pub(crate) struct $name {
             #[serde(flatten)]
-            inner: $crate::core::changes::ChangesRequest,
+            inner: $crate::core::changes::ChangesRequest<$obj>,
         }
 
         impl $crate::core::method::JmapMethod for $name {
@@ -271,7 +274,7 @@ macro_rules! define_changes_method {
         }
 
         impl $name {
-            pub(crate) fn new(since_state: impl Into<String>) -> Self {
+            pub(crate) fn new(since_state: impl Into<$crate::core::id::ObjectState<$obj>>) -> Self {
                 Self {
                     inner: $crate::core::changes::ChangesRequest::new(since_state),
                 }
@@ -285,13 +288,18 @@ macro_rules! define_changes_method {
         }
 
         impl $crate::core::changes::ChangesMethod for $name {
-            fn since(since_state: String, max_changes: std::num::NonZeroUsize) -> Self {
+            type Object = $obj;
+
+            fn since(
+                since_state: $crate::core::id::ObjectState<$obj>,
+                max_changes: std::num::NonZeroUsize,
+            ) -> Self {
                 Self::new(since_state).max_changes(max_changes)
             }
         }
 
         impl std::ops::Deref for $name {
-            type Target = $crate::core::changes::ChangesRequest;
+            type Target = $crate::core::changes::ChangesRequest<$obj>;
             fn deref(&self) -> &Self::Target {
                 &self.inner
             }
@@ -429,7 +437,9 @@ macro_rules! define_query_changes_method {
         }
 
         impl $name {
-            pub(crate) fn new(since_query_state: impl Into<String>) -> Self {
+            pub(crate) fn new(
+                since_query_state: impl Into<$crate::core::id::QueryState<$obj>>,
+            ) -> Self {
                 Self {
                     inner: $crate::core::query_changes::QueryChangesRequest::new(since_query_state),
                 }
@@ -535,13 +545,19 @@ macro_rules! define_copy_method {
             }
 
             #[must_use]
-            pub(crate) fn if_from_in_state(mut self, if_from_in_state: impl Into<String>) -> Self {
+            pub(crate) fn if_from_in_state(
+                mut self,
+                if_from_in_state: impl Into<$crate::core::id::ObjectState<$obj>>,
+            ) -> Self {
                 self.inner.if_from_in_state(if_from_in_state);
                 self
             }
 
             #[must_use]
-            pub(crate) fn if_in_state(mut self, if_in_state: impl Into<String>) -> Self {
+            pub(crate) fn if_in_state(
+                mut self,
+                if_in_state: impl Into<$crate::core::id::ObjectState<$obj>>,
+            ) -> Self {
                 self.inner.if_in_state(if_in_state);
                 self
             }
@@ -555,7 +571,7 @@ macro_rules! define_copy_method {
             #[must_use]
             pub(crate) fn destroy_from_if_in_state(
                 mut self,
-                destroy_from_if_in_state: impl Into<String>,
+                destroy_from_if_in_state: impl Into<$crate::core::id::ObjectState<$obj>>,
             ) -> Self {
                 self.inner
                     .destroy_from_if_in_state(destroy_from_if_in_state);

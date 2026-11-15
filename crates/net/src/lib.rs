@@ -34,6 +34,7 @@ pub mod pagination;
 pub mod proxy;
 pub mod rate;
 pub mod redirect;
+mod registry_key;
 pub mod request;
 pub mod resumable;
 pub mod retry;
@@ -82,6 +83,7 @@ pub use redirect::{
     CrossOrigin, DEFAULT_MAX_HOPS, FollowRedirects, HopCredential, HopPolicy, MethodRewrite,
     RedirectAction, RedirectPolicy, RedirectStep, origin_key, same_origin,
 };
+pub use registry_key::{HoldKey, LimitKey, QuotaScope};
 pub use request::{
     ByteStream, ReplayPolicy, RequestBuilder, RequestByteCounter, Response, StreamingResponse,
     request_is_replayable,

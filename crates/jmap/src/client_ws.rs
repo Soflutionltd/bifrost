@@ -2,6 +2,8 @@
 // engine does not read.
 #![allow(dead_code)]
 
+use crate::core::id::{PushState, SessionState as SessionStateToken};
+
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -80,7 +82,7 @@ pub(crate) struct WebSocketResponse {
     created_ids: Option<HashMap<String, String>>,
 
     #[serde(rename = "sessionState")]
-    session_state: String,
+    session_state: SessionStateToken,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,7 +95,7 @@ struct WebSocketPushEnable {
 
     #[serde(rename = "pushState")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    push_state: Option<String>,
+    push_state: Option<PushState>,
 }
 
 #[derive(Debug, Serialize)]
@@ -696,7 +698,7 @@ impl Client {
     pub(crate) async fn enable_push_ws(
         &self,
         data_types: Option<impl IntoIterator<Item = DataType>>,
-        push_state: Option<impl Into<String>>,
+        push_state: Option<impl Into<PushState>>,
     ) -> crate::Result<()> {
         let frame = serde_json::to_string(&WebSocketPushEnable {
             _type: WebSocketPushEnableType::WebSocketPushEnable,
@@ -804,7 +806,7 @@ where
                                     response.created_ids,
                                     response.session_state,
                                 )
-                                .map_err(crate::Error::ResponseDecode);
+                                .map_err(crate::Error::EnvelopeDecode);
                                 // Route to the caller waiting on this id, if
                                 // any. A decode failure goes to the waiter too:
                                 // the frame WAS its answer, and yielding the
@@ -823,7 +825,7 @@ where
                                             request_id,
                                             response,
                                         }),
-                                        Err(crate::Error::ResponseDecode(_)) => {
+                                        Err(crate::Error::EnvelopeDecode(_)) => {
                                             invalid_data = true;
                                             break;
                                         }
@@ -1611,7 +1613,7 @@ mod tests {
         );
         assert!(matches!(
             waiter.response().await.expect_err("waiter failed"),
-            crate::Error::ResponseDecode(_)
+            crate::Error::EnvelopeDecode(_)
         ));
     }
 

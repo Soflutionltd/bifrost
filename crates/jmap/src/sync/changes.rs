@@ -26,7 +26,6 @@ pub(crate) fn stream<T: HttpTransport>(
     cursor: ChangeCursor,
     owner: Option<TypesMailboxId>,
     email_states: StateMap,
-    mailbox_states: StateMap,
 ) -> AccountStream<SyncEvent<Change>> {
     let decoded = state::decode_cursor(&cursor);
     let (scope, state_string) = match decoded {
@@ -63,20 +62,20 @@ pub(crate) fn stream<T: HttpTransport>(
             account_id,
             limits,
             cursor.scope.clone(),
-            state_string,
+            state_string.into(),
             None,
-            email_states,
+            Some(email_states),
         ),
         JmapScopeRepr::Mailbox => changes_walk::<T, MailboxChanges, Mailbox>(
             mail,
             account_id,
             limits,
             cursor.scope.clone(),
-            state_string,
+            state_string.into(),
             // A Mailbox scope is never foreign: shared-account mailboxes
             // are reached through the account-level `Folder` scope below.
             None,
-            mailbox_states,
+            None,
         ),
         // Thread cursor inventory is derived from Email inventory and is
         // deliberately not exposed. Old opaque Thread cursors must fail
@@ -102,9 +101,9 @@ pub(crate) fn stream<T: HttpTransport>(
             account_id,
             limits,
             cursor.scope.clone(),
-            state_string,
+            state_string.into(),
             owner,
-            email_states,
+            Some(email_states),
         ),
     }
 }
@@ -126,9 +125,8 @@ pub(crate) fn stream<T: HttpTransport>(
 ///   quarantine of this scope alone instead of a terminal account error.
 ///   With `owner: None` the error lane is exactly `into_account_error`,
 ///   which is what the primary walks always did;
-/// - the per-`accountId` state cache (`states`) the scope advances -
-///   Email and Mailbox states are separate JMAP `(accountId, type)`
-///   positions and must not share a map.
+/// - an optional per-account Email guard cache. Mailbox changes have no
+///   mutation-guard consumer and do not update a redundant observation cache.
 ///
 /// `ChangesWalk` owns the shared progress guard and state-aware error context.
 /// Its policy keeps the different recovery obligations explicit: the engine
@@ -140,9 +138,9 @@ fn changes_walk<T, M, O>(
     account_id: String,
     limits: CoreLimits,
     scope: CursorScope,
-    mut since_state: String,
+    mut since_state: crate::core::id::ObjectState<O>,
     owner: Option<TypesMailboxId>,
-    states: StateMap,
+    states: Option<StateMap<O>>,
 ) -> AccountStream<SyncEvent<Change>>
 where
     T: HttpTransport,
@@ -152,7 +150,7 @@ where
     // `Sync` is not implied by `JmapMethod`: `Request::send_single` holds
     // a `&CallHandle<M>` across its await, so the call future is only
     // `Send` when `M` is `Sync`. Every generated `*/changes` struct is.
-    M: ChangesMethod<Response = ChangesResponse<O>> + Sync + 'static,
+    M: ChangesMethod<Object = O, Response = ChangesResponse<O>> + Sync + 'static,
 {
     Box::pin(async_stream::stream! {
         // One accumulator for the whole paged walk; each emitted page
@@ -182,7 +180,7 @@ where
                 }
             };
 
-            let new_state = response.new_state().to_string();
+            let new_state = response.new_state().clone();
             if let Some(fault) = walk.observe_changes_page(
                 &since_state,
                 &new_state,
@@ -205,7 +203,7 @@ where
                     qualify.as_deref(),
                 ))
                 .collect::<Vec<_>>();
-            let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
+            let checkpoint = checkpoint_for(scope.clone(), new_state.to_string());
             // This cache is a hint for later mutation `ifInState` calls, not
             // the durable engine cursor. Advance it before yield so a
             // concurrent mutation can use the newest state this account has
@@ -213,7 +211,9 @@ where
             // persisting the checkpoint, its older cursor still replays this
             // page. A stale cached state only causes a server-side
             // `stateMismatch` and refresh, never a skipped change page.
-            state_cache::advance(&states, &account_id, Some(&since_state), new_state.clone()).await;
+            if let Some(states) = &states {
+                state_cache::observe_changes(states, &account_id, &since_state, new_state.clone()).await;
+            }
 
             yield SyncEvent::Batch(Batch {
                 items: changes,
@@ -588,7 +588,6 @@ mod tests {
             cursor,
             owner,
             empty_states(),
-            empty_states(),
         )
         .collect::<Vec<_>>()
         .await;
@@ -688,7 +687,6 @@ mod tests {
                 cursor,
                 None,
                 empty_states(),
-                empty_states(),
             )
             .collect::<Vec<_>>()
             .await;
@@ -743,7 +741,6 @@ mod tests {
                 limits(),
                 cursor,
                 None,
-                empty_states(),
                 empty_states(),
             )
             .collect::<Vec<_>>()

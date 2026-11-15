@@ -288,6 +288,7 @@ fn partial_commit_throttle_observations_cover_every_leg() {
         .try_build()
         .unwrap();
     assert_eq!(error.throttle_observations().len(), 3);
+    assert_eq!(error.throttle_holds().len(), 3);
     assert_eq!(error.support_internal().partial_commit_chains.len(), 2);
 }
 #[test]

@@ -3283,7 +3283,7 @@ fn a_downgraded_mutation_keeps_its_bucket_and_is_not_retried_or_read_back() {
     let mut outcomes = std::collections::HashMap::new();
     let mut retry = Vec::new();
     let mut dedupe = 0;
-    let throttles = std::sync::Mutex::new(crate::recovery::ThrottleBucket::new());
+    let throttles = crate::recovery::ThrottleBucket::new();
     let account = bifrost_types::AccountId("acc".into());
 
     let forwarded = classify_item_outcome(
@@ -3328,7 +3328,7 @@ fn per_item_engine_failure_returns_the_directive_for_forwarding() {
     let mut retry = Vec::new();
     let mut dedupe = 0;
 
-    let throttles = std::sync::Mutex::new(crate::recovery::ThrottleBucket::new());
+    let throttles = crate::recovery::ThrottleBucket::new();
     let account = bifrost_types::AccountId("acc".into());
     let (directive, forwarded) = classify_item_outcome(
         item,

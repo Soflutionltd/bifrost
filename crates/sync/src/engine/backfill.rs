@@ -58,6 +58,13 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
         fusion_owned_scopes,
         changes_tx,
     } = wiring;
+    let mut scan = BackfillScan::default();
+    scan.publish(
+        &registry,
+        account_id.clone(),
+        Arc::clone(&cursors),
+        Arc::clone(&coverage),
+    );
     // Cold-start backfill pages broadcast onto the per-account channel
     // during `attach`, but a consumer can only call
     // `account_changes_stream` after `attach` inserts the slot into
@@ -82,7 +89,6 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
     // Keep scanning for new scope incarnations for the lifetime of the
     // attach so lifecycle creation and explicit re-establishment receive
     // their own cold-start pass.
-    let mut scan = BackfillScan::default();
     loop {
         let scopes = scan.select(
             cursors.all_scope_incarnations(),
@@ -118,7 +124,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             if !cursors.all_scope_incarnations().contains(&incarnation_key) {
                 continue;
             }
-            let parked = scan.parked.remove(&incarnation_key);
+            let parked = scan.take_parked(&incarnation_key);
             let (
                 mut driver,
                 mut pending_partition,
@@ -128,7 +134,6 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             ) = if let Some(parked) = parked {
                 if coverage.undelivered_watermark(&scope) != parked.undelivered_before {
                     scan.note_lost_pages(incarnation_key.clone());
-                    registry.mark(account_id.clone(), scope.clone(), BackfillState::Pending);
                     if discard_backfill_progress(&writer_tx, &account_id, &scope).await {
                         coverage.take_backfill_discard(&scope);
                     }
@@ -326,7 +331,6 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                 // consumer-acked checkpoints, so this never skips a window the
                 // consumer has not durably persisted.
                 let ScopeResume::Walk(driver) = resume else {
-                    registry.mark(account_id.clone(), scope.clone(), BackfillState::Completed);
                     scan.settled(incarnation_key);
                     continue;
                 };
@@ -378,7 +382,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     labels,
                 )
             };
-            registry.mark(account_id.clone(), scope.clone(), BackfillState::Running);
+
             while let Some(partition) = pending_partition.take().or_else(|| driver.next_partition())
             {
                 if shutdown.is_cancelled() {
@@ -407,8 +411,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                 .await
                 else {
                     if let Some(wait) = held {
-                        registry.mark(account_id.clone(), scope.clone(), BackfillState::Pending);
-                        scan.parked.insert(
+                        scan.park(
                             incarnation_key.clone(),
                             ParkedWalk {
                                 driver,
@@ -562,20 +565,6 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                 }
             }
             let concluded = settle && walk_reached_someone;
-            // Marked AFTER the re-read, on the same answer the scan records.
-            // Marking before it let the registry report `Completed` for a walk
-            // the scan had just put back on the retry ramp - one observable
-            // saying finished while the other says pending, for the life of the
-            // attachment. One value feeds both, so they cannot disagree.
-            registry.mark(
-                account_id.clone(),
-                scope.clone(),
-                if concluded {
-                    BackfillState::Completed
-                } else {
-                    BackfillState::Pending
-                },
-            );
             // The settle baseline is NOT passed in: `BackfillScan` holds the
             // reading `begin_walk` took as this walk started, so a loss landing
             // between the checks above and this line cannot be adopted as the
@@ -687,176 +676,206 @@ struct ParkedWalk {
     until: tokio::time::Instant,
 }
 
+type ScanKey = (CursorScope, crate::cursor::ScopeIncarnation);
+
+/// Scheduling phases are exclusive; retry history and loss evidence survive
+/// holds and parked partitions because neither starts a new attempt.
+#[derive(Default)]
+enum ScanPhase {
+    #[default]
+    Fresh,
+    Running,
+    Parked(Box<ParkedWalk>),
+    Held(tokio::time::Instant),
+    Failed(tokio::time::Instant),
+    Settled,
+}
+
+#[derive(Default)]
+struct IncarnationState {
+    phase: ScanPhase,
+    baseline: Option<crate::cursor::UndeliveredMark>,
+    lost_pages: bool,
+    retry: Option<crate::backoff::ReconnectBackoff>,
+}
+
+impl IncarnationState {
+    fn baseline(&self) -> crate::cursor::UndeliveredMark {
+        self.baseline
+            .unwrap_or_else(PendingCoverage::initial_undelivered_mark)
+    }
+
+    fn projection(&self, watermark: crate::cursor::UndeliveredMark) -> BackfillState {
+        match &self.phase {
+            ScanPhase::Settled if self.baseline() == watermark => BackfillState::Completed,
+            ScanPhase::Running => BackfillState::Running,
+            _ => BackfillState::Pending,
+        }
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        match &self.phase {
+            ScanPhase::Parked(walk) => Some(walk.until),
+            ScanPhase::Held(until) | ScanPhase::Failed(until) => Some(*until),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ScanState {
+    incarnations: HashMap<ScanKey, IncarnationState>,
+    // This is attachment history, not scheduling state. Only the first sighting
+    // of a fusion-owned scope is already inventoried by fusion; pruning it on
+    // deletion would incorrectly skip the replacement incarnation too.
+    fusion_skipped: HashSet<CursorScope>,
+}
+
 #[derive(Default)]
 pub(super) struct BackfillScan {
-    /// Incarnations that reached a durable conclusion, each recorded with the
-    /// scope's undelivered watermark AS OF the settle.
-    ///
-    /// The watermark is what makes the settle revocable, and it has to be: the
-    /// completion marker is published and the incarnation settled in the same
-    /// step, while the loss that invalidates them can land afterwards. A
-    /// receiver holding an earlier page departs, the sweep strands it, the ack
-    /// writer refuses the marker - and nothing in memory knew, so the scope was
-    /// never re-walked for the rest of the attachment. Comparing this reading on
-    /// every rescan is what reopens it, using the same evidence the writer acted
-    /// on rather than a second notification path.
-    settled:
-        HashMap<(CursorScope, crate::cursor::ScopeIncarnation), crate::cursor::UndeliveredMark>,
-    /// Fusion-owned scopes whose cold-start incarnation the fusion
-    /// worker already published. Only the first sighting is fusion's;
-    /// a later incarnation of the same scope is a genuine
-    /// re-establishment and gets its own pass.
-    fusion_skipped: HashSet<CursorScope>,
-    /// Failure count plus earliest next attempt, per incarnation.
-    failed: HashMap<
-        (CursorScope, crate::cursor::ScopeIncarnation),
-        (crate::backoff::ReconnectBackoff, tokio::time::Instant),
-    >,
-    /// The undelivered reading each incarnation's walk BEGAN under, recorded by
-    /// [`BackfillScan::begin_walk`].
-    ///
-    /// The settle baseline is taken from here rather than from a number the call
-    /// site supplies, and that is the whole point: a caller reading the watermark
-    /// afresh at settle time can adopt a loss it never checked - a receiver
-    /// departing between the walk's own comparison and the settle makes the
-    /// writer refuse the marker and discard the rows on exactly the event the
-    /// rescan then records as the baseline, so it compares that reading against
-    /// itself for ever and never reopens. Owning the reading here makes the wrong
-    /// one unavailable rather than merely discouraged.
-    baseline:
-        HashMap<(CursorScope, crate::cursor::ScopeIncarnation), crate::cursor::UndeliveredMark>,
-    /// Incarnations whose last attempt published pages that reached nobody.
-    ///
-    /// Their durable checkpoint is no longer a safe resume position: a
-    /// replacement consumer legitimately acknowledges the windows it DID
-    /// receive, and those sit past the pages it did not, so a positional resume
-    /// walks over the hole and settles the scope having never re-offered them.
-    /// The next attempt starts the walk over instead.
-    lost_pages: HashSet<(CursorScope, crate::cursor::ScopeIncarnation)>,
-    /// Incarnations whose walk was NOT started because a scope-local throttle
-    /// (a key the account declares for this scope alone) was pending, with the
-    /// instant that hold expires. Kept apart from `failed`: nothing failed, so
-    /// the retry ramp must not grow, and the scope is due again exactly when
-    /// its hold lifts rather than on the next exponential step.
-    held: HashMap<(CursorScope, crate::cursor::ScopeIncarnation), tokio::time::Instant>,
-    /// Walks suspended between partitions, keyed by their original incarnation.
-    parked: HashMap<(CursorScope, crate::cursor::ScopeIncarnation), ParkedWalk>,
+    state: Arc<std::sync::Mutex<ScanState>>,
 }
 
 impl BackfillScan {
+    // The registry retains the same state until detach; it owns no second
+    // completion map and cannot independently change a scan verdict.
+    fn publish(
+        &self,
+        registry: &BackfillRegistry,
+        account: AccountId,
+        cursors: Arc<crate::cursor::CursorRegistry>,
+        coverage: Arc<PendingCoverage>,
+    ) {
+        let state = Arc::clone(&self.state);
+        registry.observe(
+            account,
+            Arc::new(move |scope, expected| {
+                let key = cursors.all_scope_incarnations().into_iter().find(
+                    |(candidate, incarnation)| {
+                        candidate == scope
+                            && expected.is_none_or(|expected| expected == *incarnation)
+                    },
+                )?;
+                let state = state.lock().expect("backfill scan poisoned");
+                // Newly established scopes are pending even before the next scan.
+                let projected = state
+                    .incarnations
+                    .get(&key)
+                    .map_or(BackfillState::Pending, |entry| {
+                        entry.projection(coverage.undelivered_watermark(scope))
+                    });
+                // Topology may have changed while waiting for the scan lock. Never
+                // publish the old incarnation's completion as its replacement's.
+                cursors
+                    .all_scope_incarnations()
+                    .contains(&key)
+                    .then_some(projected)
+            }),
+        );
+    }
+
     fn next_wake(&self) -> tokio::time::Instant {
+        let state = self.state.lock().expect("backfill scan poisoned");
         let now = tokio::time::Instant::now();
-        if self.parked.values().any(|walk| walk.until <= now) {
+        if state
+            .incarnations
+            .values()
+            .any(|entry| matches!(&entry.phase, ScanPhase::Parked(walk) if walk.until <= now))
+        {
             return now;
         }
-        self.held
+        state
+            .incarnations
             .values()
-            .copied()
-            .chain(self.parked.values().map(|walk| walk.until))
-            .chain(self.failed.values().map(|(_, until)| *until))
+            .filter_map(IncarnationState::deadline)
             .filter(|until| *until > now)
             .fold(now + Duration::from_secs(1), std::cmp::min)
     }
 
-    /// Do not start this incarnation's walk before `until`: a scope-local
-    /// throttle holds it. The other scopes of the scan carry on meanwhile.
-    pub(super) fn defer_until(
-        &mut self,
-        key: (CursorScope, crate::cursor::ScopeIncarnation),
-        until: tokio::time::Instant,
-    ) {
-        self.held.insert(key, until);
+    pub(super) fn defer_until(&mut self, key: ScanKey, until: tokio::time::Instant) {
+        self.state
+            .lock()
+            .expect("backfill scan poisoned")
+            .incarnations
+            .entry(key)
+            .or_default()
+            .phase = ScanPhase::Held(until);
+    }
+
+    fn take_parked(&mut self, key: &ScanKey) -> Option<ParkedWalk> {
+        let mut state = self.state.lock().expect("backfill scan poisoned");
+        let entry = state.incarnations.get_mut(key)?;
+        if !matches!(entry.phase, ScanPhase::Parked(_)) {
+            return None;
+        }
+        match std::mem::replace(&mut entry.phase, ScanPhase::Running) {
+            ScanPhase::Parked(walk) => Some(*walk),
+            _ => unreachable!(),
+        }
+    }
+
+    fn park(&mut self, key: ScanKey, walk: ParkedWalk) {
+        self.state
+            .lock()
+            .expect("backfill scan poisoned")
+            .incarnations
+            .entry(key)
+            .or_default()
+            .phase = ScanPhase::Parked(Box::new(walk));
     }
 
     pub(super) fn select(
         &mut self,
-        available: Vec<(CursorScope, crate::cursor::ScopeIncarnation)>,
+        available: Vec<ScanKey>,
         fusion_owned: &HashSet<CursorScope>,
         now: tokio::time::Instant,
         coverage: &PendingCoverage,
-    ) -> Vec<(CursorScope, crate::cursor::ScopeIncarnation)> {
-        // Forget everything about incarnations the registry no longer carries.
-        // A scope that is deleted, re-established, or simply never returns leaves
-        // a retry deadline, a lost-pages mark and a baseline behind it otherwise,
-        // one set per incarnation, for the life of the attachment - and the
-        // `continue` below, which drops an incarnation that vanished during the
-        // subscriber wait, adds one every time it fires. `settled` is deliberately
-        // NOT pruned: it is the memory that stops a concluded incarnation being
-        // walked again, and incarnation numbers only ever move forward, so an
-        // entry there can never be mistaken for a later one.
-        let live: HashSet<(CursorScope, crate::cursor::ScopeIncarnation)> =
-            available.iter().cloned().collect();
-        self.parked.retain(|key, _| live.contains(key));
-        self.baseline.retain(|key, _| live.contains(key));
-        self.failed.retain(|key, _| live.contains(key));
-        self.lost_pages.retain(|key| live.contains(key));
-        self.held
-            .retain(|key, until| live.contains(key) && *until > now);
+    ) -> Vec<ScanKey> {
+        let mut state = self.state.lock().expect("backfill scan poisoned");
+        let live: HashSet<ScanKey> = available.iter().cloned().collect();
+        // Incarnation identities are never reused: departed settled entries
+        // cannot prevent any future walk, and must leave with the other residue.
+        state.incarnations.retain(|key, _| live.contains(key));
         let mut pending = Vec::new();
-        for (scope, incarnation) in available {
-            let key = (scope, incarnation);
-            if let Some(parked) = self.parked.get(&key) {
-                if parked.until <= now {
+        for key in available {
+            let ScanState {
+                incarnations,
+                fusion_skipped,
+            } = &mut *state;
+            let entry = incarnations.entry(key.clone()).or_default();
+            if let ScanPhase::Parked(walk) = &entry.phase {
+                if walk.until <= now {
                     pending.push(key);
                 }
                 continue;
             }
-            if let Some(settled_at) = self.settled.get(&key).copied() {
-                if coverage.undelivered_watermark(&key.0) == settled_at {
+            let watermark = coverage.undelivered_watermark(&key.0);
+            if matches!(entry.phase, ScanPhase::Settled) {
+                if entry.baseline() == watermark {
                     continue;
                 }
-                // A page of that walk reached nobody AFTER it settled, so the
-                // conclusion it settled on is void: the ack writer refuses the
-                // marker on the same evidence and drops the rows, and this is
-                // the half that lets the walk actually happen again.
-                tracing::warn!(
-                    target: "bifrost.sync.backfill",
-                    scope = ?key.0,
-                    "a page of a settled backfill walk has since reached no consumer; \
-                     reopening the incarnation so it is walked again"
-                );
-                self.settled.remove(&key);
-                self.lost_pages.insert(key.clone());
+                entry.phase = ScanPhase::Fresh;
+                entry.lost_pages = true;
+                tracing::warn!(target: "bifrost.sync.backfill", scope = ?key.0,
+                    "a settled backfill walk lost pages; reopening the incarnation");
             }
-            // A loss recorded against an incarnation whose last attempt FAILED,
-            // after that attempt's own comparison had already been made.
-            //
-            // The settled arm above reopens a concluded walk on the same
-            // evidence; this is the other half, and without it the request the
-            // loss raised has no repair to reach. `note_lost_pages` runs at a
-            // walk's END, so a departure sweep landing after a transient failure
-            // is seen by nobody: the next attempt RESUMES (its baseline is the
-            // moved reading, so it judges itself whole), earns a durable marker,
-            // and the discard request sits outstanding until `detach` acts on it
-            // and deletes the marker that walk legitimately earned - a full
-            // re-walk on the next attach, once per flaky partition. Marking the
-            // incarnation here makes the retry start from scratch, and its
-            // pre-retry discard is what settles the request.
-            if let Some(baseline) = self.baseline.get(&key).copied()
-                && coverage.undelivered_watermark(&key.0) != baseline
-                && self.lost_pages.insert(key.clone())
-            {
-                tracing::warn!(
-                    target: "bifrost.sync.backfill",
-                    scope = ?key.0,
-                    "a page reached no consumer after this incarnation's last attempt ended; \
-                     its next walk starts from the beginning"
-                );
+            // A failed attempt retains its original baseline too: a receiver
+            // can depart after failure, before the next attempt begins.
+            if entry.baseline.is_some_and(|baseline| baseline != watermark) && !entry.lost_pages {
+                entry.lost_pages = true;
+                tracing::warn!(target: "bifrost.sync.backfill", scope = ?key.0,
+                    "a previous backfill attempt lost pages; restarting from the beginning");
             }
             if fusion_owned.contains(&key.0)
-                && !self.failed.contains_key(&key)
-                && self.fusion_skipped.insert(key.0.clone())
+                && entry.retry.is_none()
+                && fusion_skipped.insert(key.0.clone())
             {
-                // Fusion owns this incarnation's cold-start inventory;
-                // walking it here would double-publish the same scope.
-                let watermark = coverage.undelivered_watermark(&key.0);
-                self.settled.insert(key, watermark);
+                entry.baseline = Some(watermark);
+                entry.phase = ScanPhase::Settled;
+                entry.lost_pages = false;
                 continue;
             }
-            if self.failed.get(&key).is_some_and(|(_, at)| *at > now) {
-                continue;
-            }
-            if self.held.contains_key(&key) {
+            if entry.deadline().is_some_and(|until| until > now) {
                 continue;
             }
             pending.push(key);
@@ -864,105 +883,75 @@ impl BackfillScan {
         pending
     }
 
-    /// The incarnation reached a durable conclusion with no walk of our
-    /// own (completion marker already present, or fusion owns it).
-    ///
-    /// The settle is recorded against the reading this incarnation's walk BEGAN
-    /// under - the one every check of this pass was made against - so a loss
-    /// that lands after those checks reopens it on the next rescan. An unknown
-    /// baseline reads as 0, which reopens on the first loss the scope ever
-    /// records: the conservative direction, costing a re-walk.
-    pub(super) fn settled(&mut self, key: (CursorScope, crate::cursor::ScopeIncarnation)) {
-        self.failed.remove(&key);
-        self.lost_pages.remove(&key);
-        let baseline = self
-            .baseline
-            .remove(&key)
-            .unwrap_or_else(PendingCoverage::initial_undelivered_mark);
-        self.settled.insert(key, baseline);
+    /// Settle against the walk's original baseline, never a fresh loss reading.
+    /// An unknown baseline is conservative and reopens on any recorded loss.
+    pub(super) fn settled(&mut self, key: ScanKey) {
+        let mut state = self.state.lock().expect("backfill scan poisoned");
+        let entry = state.incarnations.entry(key).or_default();
+        entry.phase = ScanPhase::Settled;
+        entry.retry = None;
+        entry.lost_pages = false;
     }
 
-    /// The last attempt on this incarnation published pages that reached
-    /// nobody, so its durable checkpoint may not be used as a resume position.
-    pub(super) fn note_lost_pages(&mut self, key: (CursorScope, crate::cursor::ScopeIncarnation)) {
-        self.lost_pages.insert(key);
+    pub(super) fn note_lost_pages(&mut self, key: ScanKey) {
+        self.state
+            .lock()
+            .expect("backfill scan poisoned")
+            .incarnations
+            .entry(key)
+            .or_default()
+            .lost_pages = true;
     }
 
-    /// Take this incarnation's baseline as its walk BEGINS, and hand it back.
-    ///
-    /// At the start of the walk, not when the batch was selected: one rescan
-    /// hands out several scopes and they are walked one after another, so a
-    /// baseline taken for all of them up front is stale for every scope but the
-    /// first. A sweep during scope X's walk moves scope Y's reading too - Y's
-    /// pages are swept with X's when a receiver departs - and Y would then judge
-    /// itself holed on a loss that happened before it published anything, and
-    /// re-walk from scratch for nothing.
-    ///
-    /// The scan still OWNS the reading, which is the point: the settle is
-    /// recorded against the value taken here, so no call site can settle against
-    /// a number nothing validated.
+    /// Snapshot at walk start, rather than selection of a batch of scopes.
+    /// Loss during an earlier scope must not count against this scope's walk.
     pub(super) fn begin_walk(
         &mut self,
-        key: &(CursorScope, crate::cursor::ScopeIncarnation),
+        key: &ScanKey,
         coverage: &PendingCoverage,
     ) -> crate::cursor::UndeliveredMark {
         let watermark = coverage.undelivered_watermark(&key.0);
-        self.baseline.insert(key.clone(), watermark);
+        let mut state = self.state.lock().expect("backfill scan poisoned");
+        let entry = state.incarnations.entry(key.clone()).or_default();
+        entry.baseline = Some(watermark);
+        entry.phase = ScanPhase::Running;
         watermark
     }
 
-    /// The reading this incarnation's walk began under, which is the ONE baseline
-    /// it is judged against. Unknown reads as 0, so any loss the scope has ever
-    /// recorded counts against it: the conservative direction, costing a re-walk.
-    ///
-    /// Production reads it through `begin_walk`'s return value; this exists so a
-    /// test can observe that a departed incarnation's entry is pruned.
     #[cfg(test)]
-    pub(super) fn baseline_for(
-        &self,
-        key: &(CursorScope, crate::cursor::ScopeIncarnation),
-    ) -> crate::cursor::UndeliveredMark {
-        self.baseline
+    pub(super) fn baseline_for(&self, key: &ScanKey) -> crate::cursor::UndeliveredMark {
+        self.state
+            .lock()
+            .expect("backfill scan poisoned")
+            .incarnations
             .get(key)
-            .copied()
-            .unwrap_or_else(PendingCoverage::initial_undelivered_mark)
+            .map_or_else(
+                PendingCoverage::initial_undelivered_mark,
+                IncarnationState::baseline,
+            )
     }
 
-    /// Must the next walk of this incarnation start from the beginning rather
-    /// than from its durable checkpoint?
-    pub(super) fn restarts_from_scratch(
-        &self,
-        key: &(CursorScope, crate::cursor::ScopeIncarnation),
-    ) -> bool {
-        self.lost_pages.contains(key)
+    pub(super) fn restarts_from_scratch(&self, key: &ScanKey) -> bool {
+        self.state
+            .lock()
+            .expect("backfill scan poisoned")
+            .incarnations
+            .get(key)
+            .is_some_and(|entry| entry.lost_pages)
     }
 
-    /// Record the outcome of a walk we actually ran.
-    pub(super) fn record_attempt(
-        &mut self,
-        key: (CursorScope, crate::cursor::ScopeIncarnation),
-        completed: bool,
-    ) {
+    pub(super) fn record_attempt(&mut self, key: ScanKey, completed: bool) {
         if completed {
             self.settled(key);
             return;
         }
-        // The baseline STAYS on a failed attempt, and that is the point: it is
-        // the reading the attempt was judged against, so a loss recorded after
-        // the walk ended - a departure sweep firing between attempts - is still
-        // detectable at the next rescan (`select`). Dropping it here made the
-        // scope's own history unreadable and left the discard request that loss
-        // raised with nothing to repair it. It is pruned with the rest when the
-        // incarnation leaves the registry, and overwritten by `begin_walk` when
-        // the retry starts.
-        let (backoff, until) = self.failed.entry(key).or_insert_with(|| {
-            (
-                crate::backoff::ReconnectBackoff::new(BACKFILL_BACKOFF),
-                tokio::time::Instant::now(),
-            )
-        });
+        let mut state = self.state.lock().expect("backfill scan poisoned");
+        let entry = state.incarnations.entry(key).or_default();
+        let backoff = entry
+            .retry
+            .get_or_insert_with(|| crate::backoff::ReconnectBackoff::new(BACKFILL_BACKOFF));
         let delay = backoff.record_failure(crate::backoff::jitter_seed());
-        *until = tokio::time::Instant::now() + delay;
+        entry.phase = ScanPhase::Failed(tokio::time::Instant::now() + delay);
     }
 }
 
@@ -976,7 +965,7 @@ async fn run_backfill_partition_at_boundary(
     changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
     control: &SyncControl,
     shutdown: &CancellationToken,
-    throttles: &std::sync::Mutex<crate::recovery::ThrottleBucket>,
+    throttles: &crate::recovery::ThrottleBucket,
     coverage: &Arc<PendingCoverage>,
     writer_tx: &mpsc::Sender<WriterRequest>,
     lane: &LaneGate,
@@ -1507,3 +1496,118 @@ fn backfill_plan_for(
 #[cfg(test)]
 #[path = "../backfill/parking_tests.rs"]
 mod parking_tests;
+
+#[cfg(test)]
+mod scan_projection_tests {
+    use super::*;
+
+    fn cursor(scope: CursorScope) -> ChangeCursor {
+        ChangeCursor {
+            scope,
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Jmap,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
+                bytes: vec![1],
+            },
+            advanced_through: None,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
+        }
+    }
+
+    #[test]
+    fn registry_projects_live_incarnation_and_loss_without_another_scan() {
+        let registry = BackfillRegistry::new();
+        let account = AccountId("projection".into());
+        let cursors = Arc::new(crate::cursor::CursorRegistry::new());
+        let coverage = Arc::new(PendingCoverage::new());
+        let scope = CursorScope::Account;
+        cursors.put(cursor(scope.clone()));
+        let key = cursors.all_scope_incarnations().remove(0);
+        let mut scan = BackfillScan::default();
+        scan.publish(
+            &registry,
+            account.clone(),
+            Arc::clone(&cursors),
+            Arc::clone(&coverage),
+        );
+        assert_eq!(
+            registry.snapshot(&account, &scope),
+            Some(BackfillState::Pending)
+        );
+        scan.begin_walk(&key, &coverage);
+        assert_eq!(
+            registry.snapshot(&account, &scope),
+            Some(BackfillState::Running)
+        );
+        scan.record_attempt(key.clone(), true);
+        assert_eq!(
+            registry.snapshot(&account, &scope),
+            Some(BackfillState::Completed)
+        );
+        coverage.note_undelivered(&scope, 1);
+        assert_eq!(
+            registry.snapshot(&account, &scope),
+            Some(BackfillState::Pending)
+        );
+        // Re-establishment must not inherit even a loss-free completion.
+        scan.begin_walk(&key, &coverage);
+        scan.record_attempt(key.clone(), true);
+        cursors.delete(&scope);
+        assert_eq!(registry.snapshot(&account, &scope), None);
+        cursors.put(cursor(scope.clone()));
+        assert_eq!(
+            registry.snapshot(&account, &scope),
+            Some(BackfillState::Pending)
+        );
+        assert_eq!(registry.snapshot_incarnation(&account, &scope, key.1), None);
+        let replacement = cursors.all_scope_incarnations()[0].1;
+        assert_eq!(
+            registry.snapshot_incarnation(&account, &scope, replacement),
+            Some(BackfillState::Pending)
+        );
+        registry.forget_account(&account);
+        assert_eq!(registry.snapshot(&account, &scope), None);
+    }
+
+    #[test]
+    fn settled_incarnations_are_pruned_with_their_other_state() {
+        let mut scan = BackfillScan::default();
+        let coverage = PendingCoverage::new();
+        let scope = CursorScope::Account;
+        let key = (scope.clone(), crate::cursor::ScopeIncarnation::for_test(1));
+        scan.begin_walk(&key, &coverage);
+        scan.record_attempt(key.clone(), true);
+        assert!(
+            scan.select(
+                vec![key],
+                &HashSet::new(),
+                tokio::time::Instant::now(),
+                &coverage
+            )
+            .is_empty()
+        );
+        scan.select(
+            Vec::new(),
+            &HashSet::new(),
+            tokio::time::Instant::now(),
+            &coverage,
+        );
+        assert!(
+            scan.state
+                .lock()
+                .expect("scan poisoned")
+                .incarnations
+                .is_empty()
+        );
+        let replacement = (scope, crate::cursor::ScopeIncarnation::for_test(2));
+        assert_eq!(
+            scan.select(
+                vec![replacement.clone()],
+                &HashSet::new(),
+                tokio::time::Instant::now(),
+                &coverage
+            ),
+            vec![replacement]
+        );
+    }
+}

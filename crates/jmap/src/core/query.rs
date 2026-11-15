@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::Object;
-use super::id::AccountId;
+use super::id::{AccountId, QueryState};
 
 pub(crate) trait QueryObject: Object {
     type QueryArguments: Default + Serialize;
@@ -89,7 +89,7 @@ pub(crate) struct QueryResponse<O: Object> {
     account_id: AccountId,
 
     #[serde(rename = "queryState")]
-    query_state: String,
+    query_state: QueryState<O>,
 
     #[serde(rename = "canCalculateChanges")]
     can_calculate_changes: Option<bool>,
@@ -212,11 +212,11 @@ impl<O: Object> QueryResponse<O> {
         self.position
     }
 
-    pub(crate) fn into_query_state(self) -> String {
+    pub(crate) fn into_query_state(self) -> QueryState<O> {
         self.query_state
     }
 
-    pub(crate) fn query_state(&self) -> &str {
+    pub(crate) fn query_state(&self) -> &QueryState<O> {
         &self.query_state
     }
 

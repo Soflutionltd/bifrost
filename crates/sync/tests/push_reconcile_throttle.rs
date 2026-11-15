@@ -95,9 +95,7 @@ async fn sweep(scope_tokens: ScopeTokens) -> Vec<CursorScope> {
         shutdown: CancellationToken::new(),
         control,
         reopen_tx,
-        throttles: Arc::new(std::sync::Mutex::new(
-            bifrost_sync::recovery::ThrottleBucket::new(),
-        )),
+        throttles: Arc::new(bifrost_sync::recovery::ThrottleBucket::new()),
         scheduler,
         scope_tokens,
         account_generation: tokio::sync::watch::channel(
@@ -272,7 +270,7 @@ impl Harness {
             shutdown: shutdown.clone(),
             control,
             reopen_tx: reopen_tx.clone(),
-            throttles: Arc::new(Mutex::new(bifrost_sync::ThrottleBucket::new())),
+            throttles: Arc::new(bifrost_sync::ThrottleBucket::new()),
             scheduler: Scheduler::new(SchedulerConfig::default(), gate),
             scope_tokens: empty_tokens(),
             account_generation: generation_rx,

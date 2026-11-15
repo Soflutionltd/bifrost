@@ -175,7 +175,6 @@ fn account_with(submission_available: bool, foreign_submission_id: Option<&str>)
         HashMap::new(),
         HashMap::new(),
         HashMap::new(),
-        HashMap::new(),
     )
 }
 

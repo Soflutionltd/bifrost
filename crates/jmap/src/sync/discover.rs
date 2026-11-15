@@ -20,7 +20,8 @@ use super::state_walk::ChangesWalk;
 /// stream replays the unfinished page rather than hiding sidebar changes.
 #[derive(Default)]
 pub(crate) struct LifecycleTopology {
-    pub(crate) positions: HashMap<String, Option<String>>,
+    pub(crate) positions:
+        HashMap<String, Option<crate::core::id::ObjectState<crate::mailbox::Mailbox>>>,
     pub(crate) names: HashMap<String, String>,
 }
 
@@ -377,7 +378,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                     {
                         let mut published = topology.lock().await;
                         published.names = names;
-                        published.positions.insert(account_id.clone(), Some(new_state.clone()));
+                        published.positions.insert(account_id.clone(), Some(new_state.clone().into()));
                     }
 
                     if !response.has_more_changes() {
@@ -419,7 +420,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                                 // before this point leaves both facts replayable.
                                 let mut published = topology.lock().await;
                                 published.names = names;
-                                published.positions.insert(account_id.clone(), Some(state.clone()));
+                                published.positions.insert(account_id.clone(), Some(state.clone().into()));
                                 state_walk.reset_changes_burst(&state);
                             }
                             Err(err) => {
@@ -744,7 +745,7 @@ mod tests {
         .expect("client builds");
         let mail = crate::account::Account::new(client.clone(), "primary");
         let states = Arc::new(Mutex::new(LifecycleTopology {
-            positions: HashMap::from([("primary".to_string(), Some("mbx-1".to_string()))]),
+            positions: HashMap::from([("primary".to_string(), Some("mbx-1".into()))]),
             names,
         }));
         let shutdown = CancellationToken::new();
@@ -1007,7 +1008,7 @@ mod tests {
         .expect("client builds");
         let mail = crate::account::Account::new(client.clone(), "primary");
         let states = Arc::new(Mutex::new(LifecycleTopology {
-            positions: HashMap::from([("primary".to_string(), Some("mbx-1".to_string()))]),
+            positions: HashMap::from([("primary".to_string(), Some("mbx-1".into()))]),
             names: HashMap::new(),
         }));
         let shutdown = CancellationToken::new();
@@ -1084,7 +1085,7 @@ mod tests {
         .expect("client builds");
         let mail = crate::account::Account::new(client.clone(), "primary");
         let states = Arc::new(Mutex::new(LifecycleTopology {
-            positions: HashMap::from([("primary".to_string(), Some("mbx-1".to_string()))]),
+            positions: HashMap::from([("primary".to_string(), Some("mbx-1".into()))]),
             names: HashMap::from([
                 ("a-new".into(), "Old".into()),
                 ("b-new".into(), "Old".into()),
@@ -1200,7 +1201,7 @@ mod tests {
         .to_string();
         let (mut stream, shutdown, _) = lifecycle_stream_with_names(
             [changes, mailbox_get_reply("session-1", "mbx-1", "Renamed")],
-            HashMap::from([("mbx-1".to_string(), "Old".to_string())]),
+            HashMap::from([("mbx-1".into(), "Old".to_string())]),
         );
 
         match stream.next().await {
@@ -1310,7 +1311,7 @@ mod tests {
                 .get("primary")
                 .cloned()
                 .flatten(),
-            Some("mbx-2".to_string()),
+            Some("mbx-2".into()),
             "the state still advances; the vanished create is not replayable"
         );
     }
@@ -1378,7 +1379,7 @@ mod tests {
                 .get("primary")
                 .cloned()
                 .flatten(),
-            Some("mbx-1".to_string()),
+            Some("mbx-1".into()),
             "the refused page is not committed; the state never moved"
         );
         // The count is the load-bearing half: an unguarded loop polls
@@ -1549,9 +1550,8 @@ mod tests {
         );
         // The poller committed its OWN position, and only after every
         // follow-up describing that response succeeded. Nothing else
-        // writes this map, which is the whole reason it is separate from
-        // the shared `mailbox_states` cache that a delta pass or a local
-        // `Mailbox/set` may fast-forward past unseen lifecycle events.
+        // writes these positions. Delta passes and local Mailbox/set calls
+        // must not fast-forward past unseen lifecycle events.
         assert_eq!(
             states
                 .lock()
@@ -1560,7 +1560,7 @@ mod tests {
                 .get("primary")
                 .cloned()
                 .flatten(),
-            Some("mbx-2".to_string()),
+            Some("mbx-2".into()),
             "the lifecycle poller advances the map it was handed"
         );
     }

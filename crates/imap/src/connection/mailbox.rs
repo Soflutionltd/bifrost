@@ -258,9 +258,7 @@ impl ImapConnection {
 
     /// Validate QRESYNC parameters before SELECT/EXAMINE (RFC 7162 Section 3.2.5.2).
     ///
-    /// Ensures QRESYNC has been `ENABLE`d and that seq-match-data is only
-    /// present when known-uids is also present (per the ABNF in RFC 7162
-    /// Section 3.2.5.2).
+    /// Checks live ENABLE state. Request construction owns operand validity.
     pub(super) fn validate_qresync_params(&self, params: &QresyncParams) -> Result<(), Error> {
         super::admission::SessionView {
             snapshot: &self.state_rx.borrow(),

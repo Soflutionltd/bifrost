@@ -26,6 +26,7 @@ pub mod account;
 mod codec;
 mod connection;
 mod error;
+mod sieve;
 mod types;
 
 pub use account::{

@@ -1493,7 +1493,7 @@ pub(super) fn classify_item_outcome(
     outcomes: &mut HashMap<bifrost_types::ObjectId, MutationBucket>,
     retry_ids: &mut Vec<bifrost_types::ObjectId>,
     dedupe_count: &mut u64,
-    throttles: &std::sync::Mutex<crate::recovery::ThrottleBucket>,
+    throttles: &crate::recovery::ThrottleBucket,
     account_id: &AccountId,
     // The retry advice of the per-item failures that were QUEUED for
     // resubmission, folded to the longest delay. A stream that ends `Done`
@@ -1904,7 +1904,7 @@ mod campaign_tests {
                 &mut outcomes,
                 &mut retry,
                 &mut dedupe,
-                &std::sync::Mutex::new(crate::recovery::ThrottleBucket::default()),
+                &crate::recovery::ThrottleBucket::default(),
                 &AccountId("test".into()),
                 &mut advice,
             );
@@ -1928,7 +1928,7 @@ mod campaign_tests {
         let mut outcomes = HashMap::new();
         let mut retries = Vec::new();
         let mut dedupe = 0;
-        let throttles = std::sync::Mutex::new(crate::recovery::ThrottleBucket::new());
+        let throttles = crate::recovery::ThrottleBucket::new();
         let item = ItemOutcome::Succeeded(BatchSuccess::new(
             BatchItemId(id.0.clone()),
             MutationSuccess::Downgraded {
@@ -2140,10 +2140,9 @@ mod partial_commit_throttle_tests {
         .try_build()
         .unwrap();
         assert!(error.recovery().is_terminal());
-        let bucket = std::sync::Mutex::new(crate::recovery::ThrottleBucket::default());
+        let bucket = crate::recovery::ThrottleBucket::default();
         let account = AccountId("account".into());
         crate::recovery::observe_failure_throttles(&bucket, &account, &error);
-        let bucket = bucket.lock().unwrap();
         let now = tokio::time::Instant::now();
         assert_eq!(
             bucket.wait_for(

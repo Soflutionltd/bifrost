@@ -94,7 +94,51 @@ macro_rules! u64_id {
     };
 }
 
-u64_id!(ModSeq, "A CONDSTORE/QRESYNC modification sequence value.");
+/// A positive RFC 7162 modification sequence, bounded to 63 bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModSeq(u64);
+
+impl ModSeq {
+    /// Shared wire ceiling for mod-sequence-value and mod-sequence-valzer.
+    pub const MAX: u64 = i64::MAX as u64;
+
+    pub const fn new(value: u64) -> Option<Self> {
+        if value > 0 && value <= Self::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ModSeq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// UNCHANGEDSINCE additionally admits zero (RFC 7162 Section 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModSeqValzer(u64);
+
+impl ModSeqValzer {
+    pub const fn new(value: u64) -> Option<Self> {
+        if value <= ModSeq::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 // protocol-specific: X-GM-MSGID is a Gmail IMAP extension value, not a shared object id.
 u64_id!(GmailMessageId, "A Gmail X-GM-MSGID value.");
 // protocol-specific: X-GM-THRID is exposed through IMAP as u64, not bifrost_types::ThreadId.

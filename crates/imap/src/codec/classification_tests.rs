@@ -360,14 +360,14 @@ fn invariant_i5_classify_exhaustive_extensions() {
     }
 }
 
-/// `CommandKind::untagged_routing_key` is a summary of this classifier: two
+/// `CommandKind::untagged_routing_key` is derived from this classifier: two
 /// pipelinable kinds with DISTINCT keys may share a pipelined sub-batch, so
 /// no untagged response may be `OnlySolicited` for both, under any NOTIFY
 /// registration. Otherwise head routing hands one command's answer to the
 /// other.
 ///
-/// A new `OnlySolicited` row shared by two kinds fails this until the key
-/// groups them. Mapping every kind to itself fails it on QUOTA, SEARCH,
+/// This checks the derived grouping at the pipeline boundary. Mapping every
+/// kind to itself fails it on QUOTA, SEARCH,
 /// ESEARCH, LIST, STATUS and VANISHED (EARLIER).
 #[test]
 fn distinct_routing_keys_never_share_a_solicited_response() {

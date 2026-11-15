@@ -436,7 +436,7 @@ impl ModSeqSupport {
 impl SelectedMailbox {
     pub fn modseq(&self) -> Option<super::ModSeq> {
         match self.modseq_support {
-            ModSeqSupport::Highest(value) => Some(super::ModSeq::new(value.get())),
+            ModSeqSupport::Highest(value) => super::ModSeq::new(value.get()),
             ModSeqSupport::Unknown | ModSeqSupport::NoModSeq => None,
         }
     }

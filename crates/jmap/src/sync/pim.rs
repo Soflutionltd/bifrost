@@ -489,7 +489,10 @@ fn send_boundary_error(
     subject: Option<EmailId>,
 ) -> impl FnOnce(crate::Error) -> AccountError {
     move |error| {
-        let unreadable = matches!(error, crate::Error::ResponseDecode(_));
+        let unreadable = matches!(
+            error,
+            crate::Error::EnvelopeDecode(_) | crate::Error::ResultDecode { .. }
+        );
         let ctx = super::error::JmapErrorContext::send(op);
         let error = super::error::into_account_error(error, ctx);
         if unreadable {
@@ -548,6 +551,12 @@ enum ImplicitOutcome {
     Unknown(crate::Error),
 }
 
+/// An `Email/set` oldState -> newState transition.
+type EmailStateTransition = (
+    crate::core::id::ObjectState<Email>,
+    crate::core::id::ObjectState<Email>,
+);
+
 /// Read the implicit `Email/set` RFC 8621 s7.5 appends under the submission
 /// call id, after the explicit submission response has been consumed (so the
 /// first remaining response under that id is the implicit one). Returns its
@@ -558,7 +567,7 @@ fn take_implicit_email_set(
     call_id: &str,
     email: &EmailId,
     on_success: OnSuccess,
-) -> (Option<(String, String)>, ImplicitOutcome) {
+) -> (Option<EmailStateTransition>, ImplicitOutcome) {
     let mut result = match response.get_method::<EmailSet>(call_id) {
         Ok(result) => result,
         Err(error) => {
@@ -1292,7 +1301,7 @@ pub(crate) fn draft_send<T: HttpTransport>(
         submission_set
             .on_success_update_email(SUBMISSION_CREATE_ID)
             .submitted_to_sent(&sent_mailbox, draft_mailbox.as_ref());
-        let prior_state = state_cache::get(&email_states, &account_id).await;
+        let prior_state = state_cache::guard(&email_states, &account_id).await;
         let mut request = mail.build();
         let submission_handle = request
             .call(submission_set)
@@ -1327,7 +1336,8 @@ pub(crate) fn draft_send<T: HttpTransport>(
         if implicit_state.is_some() {
             state_cache::observe_set(&email_states, &account_id, implicit_state).await;
         } else if let Ok(fresh) = super::mail_set::probe_email_state(&mail).await {
-            state_cache::advance(&email_states, &account_id, prior_state.as_deref(), fresh).await;
+            state_cache::observe_probe(&email_states, &account_id, prior_state.as_ref(), fresh)
+                .await;
         }
         let id = ObjectId(draft_id.into_string());
         let sent_copy = implicit_sent_copy(implicit, OnSuccess::File, id.clone());
@@ -1644,7 +1654,6 @@ fn container_wire_id(id: &ContainerId, account_id: &str) -> MailboxId {
 
 pub(crate) fn container_create<T: HttpTransport>(
     mail: MailAccount<T>,
-    mailbox_states: StateMap,
     account_id: String,
     kind: ContainerKind,
     name: String,
@@ -1677,15 +1686,11 @@ pub(crate) fn container_create<T: HttpTransport>(
             .call(set)
             .await
             .map_err(to_acct_err(AccountOperation::ContainerCreate))?;
-        if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
-            state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
-        }
         let mailbox = response
             .created(&create_id)
             .map_err(answer_error(AccountOperation::ContainerCreate))?;
         // An id-less success entry is refused, never handed back as an empty
-        // ContainerId; the state cache above still advances, since the set
-        // reported its new state either way.
+        // ContainerId.
         super::error::require_created_id(
             mailbox.id().map(MailboxId::as_str),
             AccountOperation::ContainerCreate,
@@ -1697,7 +1702,6 @@ pub(crate) fn container_create<T: HttpTransport>(
 
 pub(crate) fn container_rename<T: HttpTransport>(
     mail: MailAccount<T>,
-    mailbox_states: StateMap,
     account_id: String,
     container: ContainerId,
     name: String,
@@ -1717,16 +1721,12 @@ pub(crate) fn container_rename<T: HttpTransport>(
         response
             .updated(&mailbox)
             .map_err(answer_error(AccountOperation::ContainerRename))?;
-        if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
-            state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
-        }
         Ok(())
     })
 }
 
 pub(crate) fn container_move<T: HttpTransport>(
     mail: MailAccount<T>,
-    mailbox_states: StateMap,
     account_id: String,
     container: ContainerId,
     new_parent: Option<ContainerId>,
@@ -1756,16 +1756,12 @@ pub(crate) fn container_move<T: HttpTransport>(
         response
             .updated(&mailbox)
             .map_err(answer_error(AccountOperation::ContainerMove))?;
-        if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
-            state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
-        }
         Ok(())
     })
 }
 
 pub(crate) fn container_delete<T: HttpTransport>(
     mail: MailAccount<T>,
-    mailbox_states: StateMap,
     account_id: String,
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -1784,9 +1780,6 @@ pub(crate) fn container_delete<T: HttpTransport>(
             .map_err(super::error::answer_error(
                 AccountOperation::ContainerDelete,
             ))?;
-        if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
-            state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
-        }
         Ok(())
     })
 }
@@ -2137,8 +2130,8 @@ pub(crate) fn thread_hydrate<T: HttpTransport>(
         let order = thread_object
             .email_ids()
             .ok_or_else(|| {
-                to_acct_err(AccountOperation::HydrateThread)(crate::Error::NotParsable(
-                    "Thread/get response omitted requested emailIds".to_string(),
+                to_acct_err(AccountOperation::HydrateThread)(crate::Error::MissingResponseField(
+                    "Thread/get.emailIds",
                 ))
             })?
             .to_vec();
@@ -2481,7 +2474,7 @@ async fn resolve_thread_emails_in_mailbox<T: HttpTransport>(
     ids: &[EmailId],
     mailbox: &MailboxId,
     op: AccountOperation,
-) -> Result<(Vec<EmailId>, Option<String>), AccountError> {
+) -> Result<(Vec<EmailId>, Option<crate::core::id::ObjectState<Email>>), AccountError> {
     if ids.is_empty() {
         return Ok((Vec::new(), None));
     }
@@ -2502,7 +2495,7 @@ async fn resolve_thread_emails_in_mailbox<T: HttpTransport>(
             .await
             .map_err(to_acct_err(op))?;
         if read_state.is_none() {
-            read_state = Some(response.state().to_string());
+            read_state = Some(response.state().clone());
         }
 
         let requested = chunk.iter().cloned().collect::<HashSet<_>>();
@@ -2550,17 +2543,14 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
     account_id: &str,
     owner: Option<String>,
     ids: Vec<EmailId>,
-    read_state: Option<String>,
+    read_state: Option<crate::core::id::ObjectState<Email>>,
     op: AccountOperation,
 ) -> Result<SetProgress, AccountError> {
     if ids.is_empty() {
         return Ok(SetProgress::default().with_owner(owner));
     }
-    let read_state = read_state.ok_or_else(|| {
-        to_acct_err(op)(crate::Error::NotParsable(
-            "Trash membership read returned no Email state".to_string(),
-        ))
-    })?;
+    let read_state = read_state
+        .ok_or_else(|| to_acct_err(op)(crate::Error::MissingResponseField("Email/get.state")))?;
     let batch_size = super::capabilities::max_objects_in_set(&mail.client().session());
     let mut if_in_state = read_state;
     // The owner must be known before the first item is classified: each
@@ -2587,7 +2577,7 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
         let new_state = response
             .new_state()
             .filter(|state| !state.is_empty())
-            .map(str::to_string);
+            .cloned();
         for id in chunk {
             progress.item(id, response.destroyed(id), op);
         }
@@ -2596,9 +2586,8 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
         }
         if index + 1 < ids.len().div_ceil(batch_size) {
             let Some(new_state) = new_state else {
-                let error = to_acct_err(op)(crate::Error::NotParsable(
-                    "Email/set omitted newState before the next guarded destroy batch".to_string(),
-                ));
+                let error =
+                    to_acct_err(op)(crate::Error::MissingResponseField("Email/set.newState"));
                 progress.after_chunk = Some(error);
                 break;
             };
@@ -2728,9 +2717,7 @@ async fn resolve_target<T: HttpTransport>(
             thread
                 .email_ids()
                 .ok_or_else(|| {
-                    to_acct_err(op)(crate::Error::NotParsable(
-                        "Thread/get response omitted requested emailIds".to_string(),
-                    ))
+                    to_acct_err(op)(crate::Error::MissingResponseField("Thread/get.emailIds"))
                 })
                 .map(ToOwned::to_owned)
         }
@@ -3793,7 +3780,7 @@ async fn apply_draft_patch_to_email_patch<T: HttpTransport>(
             Some(value) => {
                 email_patch
                     .raw_property("from", &vec![address_to_jmap(value)])
-                    .map_err(crate::Error::from)
+                    .map_err(crate::Error::RequestEncode)
                     .map_err(to_acct_err(op))?;
             }
             None => {
@@ -3843,7 +3830,7 @@ async fn apply_draft_patch_to_email_patch<T: HttpTransport>(
         if let Some(in_reply_to) = in_reply_to {
             email_patch
                 .raw_property("inReplyTo", &vec![in_reply_to])
-                .map_err(crate::Error::from)
+                .map_err(crate::Error::RequestEncode)
                 .map_err(to_acct_err(op))?;
         } else {
             email_patch.null_property("inReplyTo");
@@ -3872,7 +3859,7 @@ async fn apply_draft_patch_to_email_patch<T: HttpTransport>(
         if let Some(structure) = body.body_structure {
             email_patch
                 .raw_property("bodyStructure", &structure)
-                .map_err(crate::Error::from)
+                .map_err(crate::Error::RequestEncode)
                 .map_err(to_acct_err(op))?;
         }
         email_patch
@@ -4244,7 +4231,8 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
         let replacement_error = |error: crate::Error| {
             let raisable = matches!(
                 &error,
-                crate::Error::ResponseDecode(_)
+                crate::Error::EnvelopeDecode(_)
+                    | crate::Error::ResultDecode { .. }
                     | crate::Error::IdUnanswered { .. }
                     | crate::Error::CallNotFound(_)
             ) || matches!(&error, crate::Error::Transport(transport) if transport.local.is_none());
@@ -4490,7 +4478,7 @@ fn collect_body_values(parts: Option<&[EmailBodyPart]>, email: &Email) -> Option
 fn attachment_from_part(part: &EmailBodyPart) -> Option<MessageAttachment> {
     let id = part.blob_id()?.to_string();
     let size = u64::try_from(part.size()).ok();
-    let content_type = part.content_type().map(str::to_string);
+    let content_type = part.content_type().map(ToString::to_string);
     Some(MessageAttachment {
         filename: part.name().map(str::to_string),
         content_type: content_type.clone(),
@@ -4828,11 +4816,9 @@ mod tests {
             )
             .expect("client builds");
             let mail = crate::account::Account::new(client, "primary");
-            let states = send_state_map();
             let result = if rename {
                 container_rename(
                     mail,
-                    std::sync::Arc::clone(&states),
                     "primary".to_string(),
                     ContainerId("mbx".into()),
                     "Renamed".to_string(),
@@ -4840,14 +4826,7 @@ mod tests {
                 )
                 .await
             } else {
-                container_move(
-                    mail,
-                    std::sync::Arc::clone(&states),
-                    "primary".to_string(),
-                    ContainerId("mbx".into()),
-                    None,
-                )
-                .await
+                container_move(mail, "primary".to_string(), ContainerId("mbx".into()), None).await
             };
             let error = result.expect_err("newState alone does not acknowledge this id");
             assert_eq!(
@@ -4877,7 +4856,6 @@ mod tests {
         .expect("client builds");
         let error = container_move(
             crate::account::Account::new(client, "shared"),
-            send_state_map(),
             "shared".to_string(),
             ContainerId(super::super::foreign::encode_foreign("shared", "mbx").0),
             Some(ContainerId("parent".into())),
@@ -4902,7 +4880,6 @@ mod tests {
         .expect("client builds");
         let child = container_create(
             crate::account::Account::new(client, "shared"),
-            send_state_map(),
             "shared".to_string(),
             ContainerKind::Folder,
             "new".to_string(),
@@ -4965,19 +4942,13 @@ mod tests {
             bifrost_types::RecoveryClass::Reconcile(_)
         ));
 
-        let delete = container_delete(
-            mail(),
-            states(),
-            "primary".to_string(),
-            ContainerId("mbx".into()),
-        )
-        .await
-        .unwrap_err();
+        let delete = container_delete(mail(), "primary".to_string(), ContainerId("mbx".into()))
+            .await
+            .unwrap_err();
         assert_eq!(delete.kind(), &partial, "{delete:?}");
 
         let create = container_create(
             mail(),
-            states(),
             "primary".to_string(),
             ContainerKind::Folder,
             "new".to_string(),
@@ -5009,21 +4980,18 @@ mod tests {
                 "https://example.test/.well-known/jmap",
             )
             .expect("client builds");
-            let states = send_state_map();
-            let result = container_create(
+            container_create(
                 crate::account::Account::new(client, "primary"),
-                std::sync::Arc::clone(&states),
                 "primary".to_string(),
                 ContainerKind::Folder,
                 "new".to_string(),
                 None,
                 None,
             )
-            .await;
-            (result, state_cache::get(&states, "primary").await)
+            .await
         };
         for entry in [serde_json::json!({}), serde_json::json!({"id": ""})] {
-            let (result, state) = run(serde_json::json!({"c0": entry})).await;
+            let result = run(serde_json::json!({"c0": entry})).await;
             let error = result.unwrap_err();
             assert_eq!(
                 error.kind(),
@@ -5032,9 +5000,8 @@ mod tests {
                 ),
                 "{error:?}"
             );
-            assert_eq!(state.as_deref(), Some("s2"));
         }
-        let (result, _) = run(serde_json::json!({"c0": {"id": "mbx-1"}})).await;
+        let result = run(serde_json::json!({"c0": {"id": "mbx-1"}})).await;
         assert_eq!(
             result.expect("a usable created id"),
             ContainerId("mbx-1".into())
@@ -6411,7 +6378,7 @@ mod tests {
         // `native_id` is the per-account namespaced form (what the cursor
         // scope keys on); `owner_local_id` is the bare mailbox id.
         assert_eq!(
-            container.native_id,
+            container.native_id(),
             super::super::foreign::encode_foreign("acct-9", "mbx-12").0
         );
         assert_eq!(container.owner_local_id.as_deref(), Some("mbx-12"));
@@ -6455,10 +6422,10 @@ mod tests {
         );
         assert!(
             memberships.contains(&bifrost_types::MembershipScope::Folder(
-                bifrost_types::FolderId(container.native_id.clone())
+                bifrost_types::FolderId(container.native_id().to_string())
             )),
             "container {:?} does not join the qualified memberships {memberships:?}",
-            container.native_id
+            container.native_id()
         );
     }
 
@@ -6474,7 +6441,7 @@ mod tests {
         assert!(container.owner.is_none());
         assert!(container.owner_email.is_none());
         assert!(container.owner_local_id.is_none());
-        assert_eq!(container.native_id, "mbx-12");
+        assert_eq!(container.native_id(), "mbx-12");
         assert_eq!(container.parent, Some(ContainerId("mbx-1".to_string())));
     }
 
@@ -7366,7 +7333,7 @@ mod tests {
     async fn keyword_patch_avoids_an_account_wide_state_probe_and_precondition() {
         let transport = SendTransport::new(false, false, false, false);
         let states = send_state_map();
-        state_cache::set(&states, "primary", "cached-state".to_string()).await;
+        state_cache::set(&states, "primary", "cached-state".into()).await;
 
         set_keyword(
             send_account(transport.clone()),
@@ -7385,7 +7352,7 @@ mod tests {
         assert!(sets[0].get("ifInState").is_none());
         assert_eq!(sets[0]["update"]["email-old"]["keywords/$seen"], true);
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            state_cache::guard(&states, "primary").await.as_deref(),
             Some("cached-state")
         );
     }
@@ -7407,7 +7374,7 @@ mod tests {
         .await
         .expect("submission succeeds independently of the cached guard");
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            state_cache::guard(&states, "primary").await.as_deref(),
             Some("unobserved-predecessor")
         );
     }
@@ -7417,7 +7384,7 @@ mod tests {
         let mut transport = SendTransport::new(false, false, false, false);
         transport.implicit_email_state = Some("email-after-send");
         let states = send_state_map();
-        state_cache::set(&states, "primary", "email-state-before-create".to_string()).await;
+        state_cache::set(&states, "primary", "email-state-before-create".into()).await;
 
         let sent = send_message(
             send_account(transport.clone()),
@@ -7436,7 +7403,7 @@ mod tests {
             bifrost_types::SentCopy::Filed { id: Some(ref id) } if id.0 == "email-created"
         ));
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            state_cache::guard(&states, "primary").await.as_deref(),
             Some("email-after-send")
         );
         assert_eq!(
@@ -7450,7 +7417,7 @@ mod tests {
         let mut transport = SendTransport::new(false, false, false, false);
         transport.implicit_email_state = Some("email-after-raw-send");
         let states = send_state_map();
-        state_cache::set(&states, "primary", "email-state-before-import".to_string()).await;
+        state_cache::set(&states, "primary", "email-state-before-import".into()).await;
 
         send_raw_message(
             send_account(transport.clone()),
@@ -7463,7 +7430,7 @@ mod tests {
         .expect("submission succeeds");
 
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            state_cache::guard(&states, "primary").await.as_deref(),
             Some("email-after-raw-send")
         );
         assert_eq!(
@@ -7477,7 +7444,7 @@ mod tests {
         let mut transport = SendTransport::new(false, false, true, false);
         transport.implicit_email_state = Some("email-after-draft-send");
         let states = send_state_map();
-        state_cache::set(&states, "primary", "email-created-state".to_string()).await;
+        state_cache::set(&states, "primary", "email-created-state".into()).await;
 
         let sent = draft_send(
             send_account(transport.clone()),
@@ -7494,7 +7461,7 @@ mod tests {
             bifrost_types::SentCopy::Filed { id: Some(ref id) } if id.0 == "email-old"
         ));
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            state_cache::guard(&states, "primary").await.as_deref(),
             Some("email-after-draft-send")
         );
         assert_eq!(
@@ -7721,7 +7688,7 @@ mod tests {
     async fn draft_send_keeps_success_when_the_post_send_state_probe_fails() {
         let transport = SendTransport::new(false, false, true, false);
         let states = send_state_map();
-        state_cache::set(&states, "primary", "email-before-send".to_string()).await;
+        state_cache::set(&states, "primary", "email-before-send".into()).await;
         let result = draft_send(
             send_account(transport.clone()),
             Arc::clone(&states),
@@ -7739,7 +7706,7 @@ mod tests {
             vec!["Mailbox/get", "EmailSubmission/set", "Email/get"]
         );
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            state_cache::guard(&states, "primary").await.as_deref(),
             Some("email-before-send")
         );
         let sets = transport.calls("EmailSubmission/set");
@@ -7856,7 +7823,7 @@ mod tests {
     async fn failed_send_message_submission_best_effort_destroys_created_email() {
         let transport = SendTransport::new(true, false, false, false);
         let states = send_state_map();
-        state_cache::set(&states, "primary", "email-state-before-create".to_string()).await;
+        state_cache::set(&states, "primary", "email-state-before-create".into()).await;
         let result = send_message(
             send_account(transport.clone()),
             Arc::clone(&states),
@@ -7884,7 +7851,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            state_cache::guard(&states, "primary").await.as_deref(),
             Some("email-deleted-state")
         );
     }
@@ -7981,7 +7948,7 @@ mod tests {
     async fn failed_raw_send_submission_best_effort_destroys_imported_email() {
         let transport = SendTransport::new(true, false, false, false);
         let states = send_state_map();
-        state_cache::set(&states, "primary", "email-state-before-import".to_string()).await;
+        state_cache::set(&states, "primary", "email-state-before-import".into()).await;
         let result = send_raw_message(
             send_account(transport.clone()),
             Arc::clone(&states),
@@ -8009,7 +7976,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
+            state_cache::guard(&states, "primary").await.as_deref(),
             Some("email-deleted-state")
         );
     }

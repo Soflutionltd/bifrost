@@ -9,94 +9,156 @@
 //! (`self.mail.id_str()`); there is no primary-vs-foreign branch in the
 //! cache itself, only in *which* key a call site looks up.
 //!
-//! The inner `Option<String>` preserves the tri-state the scalar form
-//! had: an absent key means "never probed"; `Some(None)` means "probed,
-//! empty"; `Some(Some(s))` means "known state".
+//! Unknown and unavailable observations supply no guard. StateCell owns every
+//! transition; seeds are the only observations installed before concurrency.
 
+use crate::core::id::ObjectState;
+use crate::email::Email;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-/// Per-`accountId` state cache for one JMAP object type.
-pub(crate) type StateMap = Arc<Mutex<HashMap<String, Option<String>>>>;
-
-/// The current cached state for an account, or `None` when the account
-/// has never been probed (absent key) or was probed empty (`Some(None)`).
-/// Both cases intentionally supply no mutation guard; provenance is not a
-/// usable server state. Set observations never initialize either case.
-pub(crate) async fn get(map: &StateMap, account_id: &str) -> Option<String> {
-    let guard = map.lock().await;
-    guard.get(account_id).cloned().flatten()
+/// One account's observed object state. Unknown and unavailable observations both supply
+/// no guard, so there is no distinct empty provenance to maintain.
+pub(crate) struct StateCell<O> {
+    state: Option<ObjectState<O>>,
 }
 
-/// Unconditionally set the cached state for an account.
-pub(crate) async fn set(map: &StateMap, account_id: &str, state: String) {
-    let mut guard = map.lock().await;
-    guard.insert(account_id.to_string(), Some(state));
-}
-
-/// Publish a probe only if the cache still matches its pre-probe snapshot.
-/// Return the current winner under the same lock. Outlook users expect a
-/// concurrent edit to remain visible to guards, not be hidden by an older probe.
-pub(crate) async fn publish_probe(
-    map: &StateMap,
-    account_id: &str,
-    expected: Option<&str>,
-    probed: String,
-) -> String {
-    let mut guard = map.lock().await;
-    let entry = guard.entry(account_id.to_string()).or_default();
-    if entry.as_deref() == expected {
-        *entry = Some(probed.clone());
+impl<O> Default for StateCell<O> {
+    fn default() -> Self {
+        Self { state: None }
     }
-    entry.clone().unwrap_or(probed)
 }
 
-/// Advance the cached state for an account to `state`, but only when the
-/// current value exactly matches `expected` (last-writer-wins guard against
-/// a concurrent advance racing ahead). `None` matches only an absent or
-/// explicitly empty entry.
-pub(crate) async fn advance(
-    map: &StateMap,
-    account_id: &str,
-    expected: Option<&str>,
-    state: String,
-) {
-    let mut guard = map.lock().await;
-    match guard.get(account_id).and_then(|entry| entry.as_deref()) {
-        current if current == expected => {
-            guard.insert(account_id.to_string(), Some(state));
+impl<O> StateCell<O> {
+    fn guard(&self) -> Option<ObjectState<O>> {
+        self.state.clone()
+    }
+
+    fn replace_if(&mut self, expected: Option<&ObjectState<O>>, new: ObjectState<O>) {
+        if self.state.as_ref() == expected {
+            self.state = Some(new);
         }
-        _ => {}
     }
+
+    fn observe_changes(&mut self, since: &ObjectState<O>, new: ObjectState<O>) {
+        self.replace_if(Some(since), new);
+    }
+
+    fn observe_probe(
+        &mut self,
+        expected: Option<&ObjectState<O>>,
+        probed: ObjectState<O>,
+    ) -> ObjectState<O> {
+        self.replace_if(expected, probed.clone());
+        self.guard().unwrap_or(probed)
+    }
+
+    fn observe_set(&mut self, transition: Option<(ObjectState<O>, ObjectState<O>)>) {
+        if let Some((old, new)) = transition {
+            self.observe_changes(&old, new);
+        }
+    }
+}
+
+/// Per-account cells for Email. Mailbox lifecycle positions have a separate
+/// owner because only delivered lifecycle pages may publish sidebar progress.
+pub(crate) type StateMap<O = Email> = Arc<Mutex<HashMap<String, StateCell<O>>>>;
+
+pub(crate) fn seeded<O>(states: HashMap<String, Option<ObjectState<O>>>) -> StateMap<O> {
+    Arc::new(Mutex::new(
+        states
+            .into_iter()
+            .map(|(account, state)| (account, StateCell { state }))
+            .collect(),
+    ))
+}
+
+pub(crate) async fn guard<O>(map: &StateMap<O>, account_id: &str) -> Option<ObjectState<O>> {
+    map.lock().await.get(account_id).and_then(StateCell::guard)
+}
+
+#[cfg(test)]
+pub(crate) async fn set<O>(map: &StateMap<O>, account_id: &str, state: ObjectState<O>) {
+    map.lock()
+        .await
+        .insert(account_id.to_string(), StateCell { state: Some(state) });
+}
+
+/// Return the winning observation under the publication lock. Network probes
+/// hold no lock and cannot replace a concurrent advance.
+pub(crate) async fn observe_probe<O>(
+    map: &StateMap<O>,
+    account_id: &str,
+    expected: Option<&ObjectState<O>>,
+    probed: ObjectState<O>,
+) -> ObjectState<O> {
+    map.lock()
+        .await
+        .entry(account_id.to_string())
+        .or_default()
+        .observe_probe(expected, probed)
+}
+
+pub(crate) async fn observe_changes<O>(
+    map: &StateMap<O>,
+    account_id: &str,
+    since: &ObjectState<O>,
+    state: ObjectState<O>,
+) {
+    map.lock()
+        .await
+        .entry(account_id.to_string())
+        .or_default()
+        .observe_changes(since, state);
 }
 
 /// A set response proves only its own oldState -> newState transition.
 /// Missing/empty endpoints prove no continuity with our observed changes.
-pub(crate) fn set_transition(old: Option<&str>, new: Option<&str>) -> Option<(String, String)> {
+pub(crate) fn set_transition<O>(
+    old: Option<&ObjectState<O>>,
+    new: Option<&ObjectState<O>>,
+) -> Option<(ObjectState<O>, ObjectState<O>)> {
     Some((
-        old.filter(|s| !s.is_empty())?.to_string(),
-        new.filter(|s| !s.is_empty())?.to_string(),
+        old.map(ObjectState::as_str)
+            .filter(|s| !s.is_empty())?
+            .into(),
+        new.map(ObjectState::as_str)
+            .filter(|s| !s.is_empty())?
+            .into(),
     ))
 }
 
 /// Preserve unobserved concurrent changes for the next whole-property guard.
 /// An Outlook user expects a concurrent edit to conflict rather than have a
 /// later unrelated write silently bless it as already observed.
-pub(crate) async fn observe_set(
-    map: &StateMap,
+pub(crate) async fn observe_set<O>(
+    map: &StateMap<O>,
     account_id: &str,
-    transition: Option<(String, String)>,
+    transition: Option<(ObjectState<O>, ObjectState<O>)>,
 ) {
     if let Some((old, new)) = transition {
-        advance(map, account_id, Some(&old), new).await;
+        map.lock()
+            .await
+            .entry(account_id.to_string())
+            .or_default()
+            .observe_set(Some((old, new)));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transition(
+        old: Option<&str>,
+        new: Option<&str>,
+    ) -> Option<(ObjectState<Email>, ObjectState<Email>)> {
+        let old = old.map(ObjectState::new);
+        let new = new.map(ObjectState::new);
+        set_transition(old.as_ref(), new.as_ref())
+    }
 
     fn map() -> StateMap {
         Arc::new(Mutex::new(HashMap::new()))
@@ -108,21 +170,21 @@ mod tests {
         // An initial probe began with no state; changes published before it ended.
         set(&m, "acct-a", "newer".into()).await;
         assert_eq!(
-            publish_probe(&m, "acct-a", None, "older".into()).await,
+            observe_probe(&m, "acct-a", None, "older".into()).await,
             "newer"
         );
         // A refusal refresh also must not overwrite a concurrent cache advance.
         assert_eq!(
-            publish_probe(&m, "acct-a", Some("before"), "older".into()).await,
+            observe_probe(&m, "acct-a", Some(&"before".into()), "older".into()).await,
             "newer"
         );
-        assert_eq!(get(&m, "acct-a").await.as_deref(), Some("newer"));
+        assert_eq!(guard(&m, "acct-a").await.as_deref(), Some("newer"));
         assert_eq!(
-            publish_probe(&m, "acct-a", Some("newer"), "fresh".into()).await,
+            observe_probe(&m, "acct-a", Some(&"newer".into()), "fresh".into()).await,
             "fresh"
         );
         assert_eq!(
-            publish_probe(&m, "acct-b", None, "initial".into()).await,
+            observe_probe(&m, "acct-b", None, "initial".into()).await,
             "initial"
         );
     }
@@ -131,63 +193,63 @@ mod tests {
     async fn set_observation_requires_continuous_server_states() {
         let m = map();
         set(&m, "acct-a", "s1".into()).await;
-        observe_set(&m, "acct-a", set_transition(Some("unobserved"), Some("s3"))).await;
-        assert_eq!(get(&m, "acct-a").await.as_deref(), Some("s1"));
-        observe_set(&m, "acct-a", set_transition(Some("s1"), Some("s2"))).await;
-        observe_set(&m, "acct-a", set_transition(Some("s2"), Some("s3"))).await;
-        assert_eq!(get(&m, "acct-a").await.as_deref(), Some("s3"));
+        observe_set(&m, "acct-a", transition(Some("unobserved"), Some("s3"))).await;
+        assert_eq!(guard(&m, "acct-a").await.as_deref(), Some("s1"));
+        observe_set(&m, "acct-a", transition(Some("s1"), Some("s2"))).await;
+        observe_set(&m, "acct-a", transition(Some("s2"), Some("s3"))).await;
+        assert_eq!(guard(&m, "acct-a").await.as_deref(), Some("s3"));
         for (old, new) in [
             (None, Some("s4")),
             (Some(""), Some("s4")),
             (Some("s3"), None),
             (Some("s3"), Some("")),
         ] {
-            observe_set(&m, "acct-a", set_transition(old, new)).await;
-            observe_set(&m, "absent", set_transition(old, new)).await;
+            observe_set(&m, "acct-a", transition(old, new)).await;
+            observe_set(&m, "absent", transition(old, new)).await;
         }
-        observe_set(&m, "absent", set_transition(Some("s3"), Some("s4"))).await;
-        assert_eq!(get(&m, "acct-a").await.as_deref(), Some("s3"));
-        assert_eq!(get(&m, "absent").await, None);
+        observe_set(&m, "absent", transition(Some("s3"), Some("s4"))).await;
+        assert_eq!(guard(&m, "acct-a").await.as_deref(), Some("s3"));
+        assert_eq!(guard(&m, "absent").await, None);
     }
 
     #[tokio::test]
     async fn absent_account_reads_none() {
         let m = map();
-        assert_eq!(get(&m, "acct-a").await, None);
+        assert_eq!(guard(&m, "acct-a").await, None);
     }
 
     #[tokio::test]
     async fn set_and_get_round_trip_per_account() {
         let m = map();
-        set(&m, "acct-a", "s-a".to_string()).await;
-        set(&m, "acct-b", "s-b".to_string()).await;
-        assert_eq!(get(&m, "acct-a").await, Some("s-a".to_string()));
-        assert_eq!(get(&m, "acct-b").await, Some("s-b".to_string()));
+        set(&m, "acct-a", "s-a".into()).await;
+        set(&m, "acct-b", "s-b".into()).await;
+        assert_eq!(guard(&m, "acct-a").await, Some("s-a".into()));
+        assert_eq!(guard(&m, "acct-b").await, Some("s-b".into()));
     }
 
     #[tokio::test]
     async fn advance_respects_expected_guard() {
         let m = map();
-        set(&m, "acct-a", "s1".to_string()).await;
+        set(&m, "acct-a", "s1".into()).await;
         // Expected mismatch: do not advance.
-        advance(&m, "acct-a", Some("other"), "s2".to_string()).await;
-        assert_eq!(get(&m, "acct-a").await, Some("s1".to_string()));
+        observe_changes(&m, "acct-a", &"other".into(), "s2".into()).await;
+        assert_eq!(guard(&m, "acct-a").await, Some("s1".into()));
         // Expected match: advance.
-        advance(&m, "acct-a", Some("s1"), "s2".to_string()).await;
-        assert_eq!(get(&m, "acct-a").await, Some("s2".to_string()));
+        observe_changes(&m, "acct-a", &"s1".into(), "s2".into()).await;
+        assert_eq!(guard(&m, "acct-a").await, Some("s2".into()));
     }
 
     #[tokio::test]
     async fn advance_with_expected_state_does_not_initialize_absent_entry() {
         let m = map();
-        advance(&m, "acct-a", Some("ignored"), "s1".to_string()).await;
-        assert_eq!(get(&m, "acct-a").await, None);
+        observe_changes(&m, "acct-a", &"ignored".into(), "s1".into()).await;
+        assert_eq!(guard(&m, "acct-a").await, None);
     }
 
     #[tokio::test]
-    async fn advance_without_expected_state_initializes_absent_entry() {
+    async fn probe_without_expected_state_initializes_absent_entry() {
         let m = map();
-        advance(&m, "acct-a", None, "s1".to_string()).await;
-        assert_eq!(get(&m, "acct-a").await, Some("s1".to_string()));
+        observe_probe(&m, "acct-a", None, "s1".into()).await;
+        assert_eq!(guard(&m, "acct-a").await, Some("s1".into()));
     }
 }

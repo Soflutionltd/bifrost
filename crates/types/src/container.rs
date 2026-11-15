@@ -218,9 +218,8 @@ impl From<ContainerId> for ObjectId {
 /// `kind` is the folder/label classification. `role` is the canonical
 /// ratatoskr role when the protocol claims one. `provenance` is the
 /// wire-level metadata so the consumer can round-trip back to the
-/// protocol without ambiguity. `native_id` is the same string that
-/// `provenance.native` carries; surfaced separately for ergonomic
-/// access without descending into the provenance.
+/// protocol without ambiguity. `native_id()` borrows `provenance.native`
+/// rather than storing a second copy that could disagree.
 ///
 /// Deliberately NOT `#[non_exhaustive]`: protocol Account impls and the
 /// downstream consumer both construct `Container` values directly, via
@@ -234,16 +233,15 @@ impl From<ContainerId> for ObjectId {
 pub struct Container {
     /// Engine-facing identifier.
     pub id: ContainerId,
-    /// Folder versus label.
+    /// Folder versus label for presentation. This need not equal the wire
+    /// classification in provenance: consumers can present a native label as
+    /// a folder. Keep both choices expressible rather than silently changing
+    /// the protocol primitive used to round-trip its identity.
     pub kind: ContainerKind,
     /// Canonical role, when the container plays one.
     pub role: Option<FolderRole>,
     /// Wire-level provenance.
-    pub provenance: Provenance,
-    /// Native id string, duplicated from `provenance.native` for
-    /// callers that already have a `Container` and would rather not
-    /// descend.
-    pub native_id: String,
+    provenance: Provenance,
     /// Display name as the protocol surfaces it.
     pub name: String,
     /// Parent container, when nested (Graph mail folders, IMAP
@@ -306,6 +304,23 @@ pub struct Container {
 }
 
 impl Container {
+    /// Wire metadata, including the native id.
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
+    }
+
+    /// Native id, always read from the wire metadata.
+    pub fn native_id(&self) -> &str {
+        &self.provenance.native
+    }
+
+    /// Replace the wire metadata and its native id together.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
     /// Construct a container with the system defaults
     /// (`style = None`, `system = false`). Additive fields land here
     /// with sensible defaults so call sites do not break when the
@@ -320,13 +335,11 @@ impl Container {
         name: String,
         parent: Option<ContainerId>,
     ) -> Self {
-        let native_id = provenance.native.clone();
         Self {
             id,
             kind,
             role,
             provenance,
-            native_id,
             name,
             parent,
             style: None,
@@ -586,7 +599,7 @@ mod tests {
         assert!(c.owner_local_id.is_none());
         assert!(c.content_class.is_none());
         // native_id mirrors provenance.native.
-        assert_eq!(c.native_id, "Label_42");
+        assert_eq!(c.native_id(), "Label_42");
     }
 
     #[test]
@@ -612,7 +625,7 @@ mod tests {
         // `owner_local_id` is the bare owner-namespace id, never the
         // foreign-encoded `native_id`.
         assert_eq!(c.owner_local_id.as_deref(), Some("AAMk"));
-        assert_ne!(c.owner_local_id.as_deref(), Some(c.native_id.as_str()));
+        assert_ne!(c.owner_local_id.as_deref(), Some(c.native_id()));
         assert_eq!(c.content_class, Some(ContainerContentClass::Mail));
     }
 

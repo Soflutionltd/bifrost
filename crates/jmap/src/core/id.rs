@@ -102,16 +102,52 @@ impl<T: ?Sized> From<Id<T>> for String {
 }
 
 /// Per-object phantom marker types. The module is private to the
-/// crate; only the typedefs below (`AccountId`, `BlobId`, `State`) are
+/// crate; only the typedefs below (`AccountId`, `BlobId`, and state tokens) are
 /// part of the public API. Per-object typedefs (`EmailId`,
 /// `MailboxId`, etc.) live in their own modules under the same
 /// "marker private, typedef public" pattern.
 mod marker {
     pub(crate) enum Account {}
     pub(crate) enum Blob {}
-    pub(crate) enum State {}
+    pub(crate) struct ObjectState<O: ?Sized>(std::marker::PhantomData<fn() -> O>);
+    pub(crate) struct QueryState<O: ?Sized>(std::marker::PhantomData<fn() -> O>);
+    pub(crate) enum SessionState {}
+    pub(crate) enum PushState {}
 }
 
 pub(crate) type AccountId = Id<marker::Account>;
 pub(crate) type BlobId = Id<marker::Blob>;
-pub(crate) type State = Id<marker::State>;
+/// State tokens are opaque, but their protocol domains are not interchangeable.
+/// Construct from strings only at wire/persistence boundaries; keep the domain
+/// through request construction so a query or another object's state cannot guard
+/// a write by accident.
+pub(crate) type ObjectState<O> = Id<marker::ObjectState<O>>;
+pub(crate) type QueryState<O> = Id<marker::QueryState<O>>;
+pub(crate) type SessionState = Id<marker::SessionState>;
+pub(crate) type PushState = Id<marker::PushState>;
+
+impl<T: ?Sized> std::ops::Deref for Id<T> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<T: ?Sized> PartialEq<str> for Id<T> {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl<T: ?Sized> PartialEq<&str> for Id<T> {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl<T: ?Sized> PartialEq<Id<T>> for str {
+    fn eq(&self, other: &Id<T>) -> bool {
+        self == other.as_str()
+    }
+}

@@ -17,7 +17,7 @@ pub(crate) struct RecoveryContext<'a> {
     pub account_id: &'a AccountId,
     pub control: &'a SyncControl,
     pub account_control_tx: &'a broadcast::Sender<AccountControl>,
-    pub throttles: &'a Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
+    pub throttles: &'a Arc<crate::recovery::ThrottleBucket>,
     pub capabilities: &'a Arc<std::sync::RwLock<AccountCapabilities>>,
     pub subscriptions: &'a Arc<SubscriptionRegistry>,
     pub account_generation_tx: &'a watch::Sender<crate::types::AccountGeneration>,
@@ -1877,7 +1877,7 @@ async fn reattach_account_paced(
             match next.push_subscribe(&scopes).await {
                 Ok(result) => {
                     let covered = accepted_push_scopes(&result);
-                    if let Some(handle) = result.handle {
+                    if let Some(handle) = result.handle().cloned() {
                         // Straight into the guard: no await between the provider
                         // answering and the handle being owned by something a
                         // drop will clean up.
@@ -2218,7 +2218,7 @@ async fn reattach_account_paced(
 
 pub(super) fn accepted_push_scopes(result: &bifrost_types::PushSubscription) -> Vec<CursorScope> {
     result
-        .outcomes
+        .outcomes()
         .succeeded()
         .iter()
         .map(|success| success.output.clone())

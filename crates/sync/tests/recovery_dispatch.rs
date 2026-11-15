@@ -119,7 +119,7 @@ fn schema_incompatible_account_error_derives_engine_directive() {
 
 #[test]
 fn throttle_bucket_account_does_not_cross_accounts() {
-    let mut bucket = ThrottleBucket::new();
+    let bucket = ThrottleBucket::new();
     let now = Instant::now();
     let a = ThrottleKey::Account(AccountId("acc-1".into()));
     let b = ThrottleKey::Account(AccountId("acc-2".into()));
@@ -130,7 +130,7 @@ fn throttle_bucket_account_does_not_cross_accounts() {
 
 #[test]
 fn throttle_bucket_mailbox_does_not_cross_accounts() {
-    let mut bucket = ThrottleBucket::new();
+    let bucket = ThrottleBucket::new();
     let now = Instant::now();
     let mb_a = ThrottleKey::Mailbox {
         account: AccountId("a".into()),

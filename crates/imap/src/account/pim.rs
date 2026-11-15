@@ -3318,7 +3318,7 @@ mod tests {
             container.owner_local_id.as_deref(),
             Some("Shared/alice/Reports")
         );
-        assert_eq!(container.native_id, "Shared/alice/Reports");
+        assert_eq!(container.native_id(), "Shared/alice/Reports");
         // No provider types IMAP folders, so `content_class` stays None.
         assert!(container.content_class.is_none());
 
@@ -3383,7 +3383,7 @@ mod tests {
             assert_eq!(
                 scope,
                 bifrost_types::CursorScope::Folder(bifrost_types::FolderId(
-                    container.native_id.clone()
+                    container.native_id().to_string()
                 )),
                 "container native_id must equal the emitted cursor scope string",
             );

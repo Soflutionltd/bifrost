@@ -810,7 +810,7 @@ const LIFECYCLE_BACKOFF: bifrost_types::BackoffPolicy =
 fn lifecycle_retry_wait(
     error: &AccountError,
     fallback: Duration,
-    throttles: &StdMutex<crate::recovery::ThrottleBucket>,
+    throttles: &crate::recovery::ThrottleBucket,
     account_id: &AccountId,
 ) -> Duration {
     use crate::recovery::RecoveryPlan;
@@ -941,7 +941,7 @@ pub struct Multiplexer {
     /// drive so a tenant- or account-wide `Retry-After` recorded by one
     /// scope (or a sibling account) pauses the others; the Retry arm
     /// records deadlines it observes.
-    pub throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
+    pub throttles: Arc<crate::recovery::ThrottleBucket>,
     pub scheduler: crate::scheduler::Scheduler,
 }
 
@@ -1297,7 +1297,7 @@ fn spawn_and_track_scope_poll(
     shutdown: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
     scope_tokens: ScopeTokens,
-    throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
+    throttles: Arc<crate::recovery::ThrottleBucket>,
     scheduler: crate::scheduler::Scheduler,
     scope: CursorScope,
 ) {
@@ -1467,7 +1467,7 @@ fn spawn_missing_scope_polls(
     shutdown: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
     scope_tokens: ScopeTokens,
-    throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
+    throttles: Arc<crate::recovery::ThrottleBucket>,
     scheduler: crate::scheduler::Scheduler,
 ) {
     for scope in cursors.all_scopes() {
@@ -1519,7 +1519,7 @@ async fn spawn_scope_poll_inner(
     shutdown: CancellationToken,
     scope_cancel: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
-    throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
+    throttles: Arc<crate::recovery::ThrottleBucket>,
     scheduler: crate::scheduler::Scheduler,
     scope: CursorScope,
 ) -> PollExit {
@@ -1819,7 +1819,7 @@ async fn handle_drive_outcome(
     generation: crate::types::AccountGeneration,
     reopen_tx: &mpsc::Sender<ReopenRequest>,
     account_id: &AccountId,
-    throttles: &StdMutex<crate::recovery::ThrottleBucket>,
+    throttles: &crate::recovery::ThrottleBucket,
     // Detach and scope deletion must interrupt a recovery delay, not wait it
     // out. A provider `Retry-After` of minutes otherwise kept a deleted scope
     // or a detaching account parked for the full hint, and detach then burned
@@ -2377,7 +2377,7 @@ mod tests {
             shutdown: shutdown.clone(),
             reopen_tx,
             scope_tokens: Arc::default(),
-            throttles: Arc::new(StdMutex::new(crate::recovery::ThrottleBucket::new())),
+            throttles: Arc::new(crate::recovery::ThrottleBucket::new()),
             scheduler: crate::scheduler::Scheduler::new(
                 crate::types::SchedulerConfig::default(),
                 gate,
@@ -2498,7 +2498,7 @@ mod tests {
             crate::types::AccountGeneration::for_test(7),
             &reopen_tx,
             &AccountId("cancelled".into()),
-            &StdMutex::new(crate::recovery::ThrottleBucket::default()),
+            &crate::recovery::ThrottleBucket::default(),
             &CancellationToken::new(),
             &scope_cancel,
         )
@@ -2528,7 +2528,7 @@ mod tests {
             crate::types::AccountGeneration::for_test(7),
             &reopen_tx,
             &AccountId("routing".into()),
-            &StdMutex::new(crate::recovery::ThrottleBucket::default()),
+            &crate::recovery::ThrottleBucket::default(),
             &CancellationToken::new(),
             &CancellationToken::new(),
         )
@@ -2566,7 +2566,7 @@ mod tests {
                     crate::types::AccountGeneration::for_test(7),
                     &reopen_tx,
                     &AccountId("parked".into()),
-                    &StdMutex::new(crate::recovery::ThrottleBucket::default()),
+                    &crate::recovery::ThrottleBucket::default(),
                     &shutdown,
                     &CancellationToken::new(),
                 )
@@ -2885,7 +2885,7 @@ mod tests {
             crate::types::AccountGeneration::for_test(7),
             &reopen_tx,
             &AccountId("terminal".into()),
-            &StdMutex::new(crate::recovery::ThrottleBucket::default()),
+            &crate::recovery::ThrottleBucket::default(),
             &CancellationToken::new(),
             &CancellationToken::new(),
         )
@@ -3771,7 +3771,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn lifecycle_retry_records_hold_and_honours_hint_without_shortening_backoff() {
         let account = AccountId("lifecycle".into());
-        let throttles = StdMutex::new(crate::recovery::ThrottleBucket::default());
+        let throttles = crate::recovery::ThrottleBucket::default();
         for (hint, expected) in [(600, 600), (1, 30)] {
             let error = AccountErrorBuilder::new(
                 AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),

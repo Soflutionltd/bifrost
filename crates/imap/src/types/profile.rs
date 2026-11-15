@@ -204,24 +204,62 @@ impl ServerProfile {
 /// is entitled to reject. The FETCH half has its own question,
 /// [`binary_fetch_usable`].
 fn rev2_baseline_includes(capability: &Capability) -> bool {
-    matches!(
-        capability,
+    match capability {
         Capability::Enable
-            | Capability::Esearch
-            | Capability::Idle
-            | Capability::ListExtended
-            | Capability::ListStatus
-            | Capability::LiteralMinus
-            | Capability::Move
-            | Capability::Namespace
-            | Capability::SaslIr
-            | Capability::SearchRes
-            | Capability::SpecialUse
-            | Capability::StatusDeleted
-            | Capability::StatusSize
-            | Capability::UidPlus
-            | Capability::Unselect
-    )
+        | Capability::Esearch
+        | Capability::Idle
+        | Capability::ListExtended
+        | Capability::ListStatus
+        | Capability::LiteralMinus
+        | Capability::Move
+        | Capability::Namespace
+        | Capability::SaslIr
+        | Capability::SearchRes
+        | Capability::SpecialUse
+        | Capability::StatusDeleted
+        | Capability::StatusSize
+        | Capability::UidPlus
+        | Capability::Unselect => true,
+        // RFC 9051 Appendix E folds in LITERAL-, not LITERAL+.
+        Capability::LiteralPlus
+        // RFC 9051 Appendix B: only the FETCH side of BINARY is base
+        // rev2, not its APPEND extension, so the token is not implied.
+        | Capability::Binary
+        // Nothing of RFC 8474 or RFC 8514 is in RFC 9051.
+        | Capability::ObjectId
+        | Capability::SaveDate
+        | Capability::Imap4Rev1
+        | Capability::Imap4Rev2
+        | Capability::Acl
+        | Capability::AppendLimit(_)
+        | Capability::Children
+        | Capability::CompressDeflate
+        | Capability::Condstore
+        | Capability::CreateSpecialUse
+        | Capability::Id
+        | Capability::LoginDisabled
+        | Capability::Metadata
+        | Capability::MetadataServer
+        | Capability::MultiAppend
+        | Capability::Notify
+        | Capability::QResync
+        | Capability::Quota
+        | Capability::QuotaResource(_)
+        | Capability::QuotaSet
+        | Capability::Rights(_)
+        | Capability::Preview
+        | Capability::Sort
+        | Capability::SortDisplay
+        | Capability::StartTls
+        | Capability::Thread(_)
+        | Capability::Unauthenticate
+        | Capability::Utf8Accept
+        | Capability::Utf8Only
+        | Capability::Within
+        | Capability::XGmExt1
+        | Capability::Auth(_)
+        | Capability::Other(_) => false,
+    }
 }
 
 /// Whether `capability` is usable on a connection with these advertised
@@ -301,14 +339,13 @@ pub(crate) fn imap4rev2_active(capabilities: &[Capability], enabled: &[String]) 
 /// Shared oracle for tests of every view over [`supports`] (the profile, the
 /// encoder options and the connection snapshot).
 ///
-/// `expected_usable` is written from RFC 9051 Appendix E and RFC 7162 Section
-/// 3.2.3 with an EXHAUSTIVE match over [`Capability`], so adding a variant does
-/// not compile until someone has decided whether the rev2 baseline folds it in.
-/// That is the guard against the failure this authority exists to prevent: a
-/// capability added to one list and silently missing from another.
+/// `expected_usable` combines advertised support and the QRESYNC implication
+/// with the production rev2 baseline decision. The exhaustive Capability match
+/// belongs to `rev2_baseline_includes`, so a new variant requires a production
+/// decision even when no capability-matrix test runs.
 #[cfg(test)]
 pub(crate) mod capability_matrix {
-    use super::{Capability, imap4rev2_active};
+    use super::{Capability, imap4rev2_active, rev2_baseline_includes};
 
     /// One sample of every [`Capability`] variant (parameterised variants get a
     /// representative payload).
@@ -368,67 +405,6 @@ pub(crate) mod capability_matrix {
         ]
     }
 
-    /// Whether the RFC 9051 Appendix E baseline folds the capability in. Kept
-    /// as an exhaustive match, deliberately independent of the production list.
-    fn in_rev2_baseline(capability: &Capability) -> bool {
-        match capability {
-            Capability::Enable
-            | Capability::Esearch
-            | Capability::Idle
-            | Capability::ListExtended
-            | Capability::ListStatus
-            | Capability::LiteralMinus
-            | Capability::Move
-            | Capability::Namespace
-            | Capability::SaslIr
-            | Capability::SearchRes
-            | Capability::SpecialUse
-            | Capability::StatusDeleted
-            | Capability::StatusSize
-            | Capability::UidPlus
-            | Capability::Unselect => true,
-            // RFC 9051 Appendix E folds in LITERAL-, not LITERAL+.
-            Capability::LiteralPlus
-            // RFC 9051 Appendix B: only the FETCH side of BINARY is base
-            // rev2, not its APPEND extension, so the token is not implied.
-            | Capability::Binary
-            // Nothing of RFC 8474 or RFC 8514 is in RFC 9051.
-            | Capability::ObjectId
-            | Capability::SaveDate
-            | Capability::Imap4Rev1
-            | Capability::Imap4Rev2
-            | Capability::Acl
-            | Capability::AppendLimit(_)
-            | Capability::Children
-            | Capability::CompressDeflate
-            | Capability::Condstore
-            | Capability::CreateSpecialUse
-            | Capability::Id
-            | Capability::LoginDisabled
-            | Capability::Metadata
-            | Capability::MetadataServer
-            | Capability::MultiAppend
-            | Capability::Notify
-            | Capability::QResync
-            | Capability::Quota
-            | Capability::QuotaResource(_)
-            | Capability::QuotaSet
-            | Capability::Rights(_)
-            | Capability::Preview
-            | Capability::Sort
-            | Capability::SortDisplay
-            | Capability::StartTls
-            | Capability::Thread(_)
-            | Capability::Unauthenticate
-            | Capability::Utf8Accept
-            | Capability::Utf8Only
-            | Capability::Within
-            | Capability::XGmExt1
-            | Capability::Auth(_)
-            | Capability::Other(_) => false,
-        }
-    }
-
     /// The expected answer for `capability` given the pair, from first
     /// principles: advertised, or QRESYNC for CONDSTORE, or baseline under
     /// active rev2.
@@ -440,7 +416,7 @@ pub(crate) mod capability_matrix {
         capabilities.contains(capability)
             || (matches!(capability, Capability::Condstore)
                 && capabilities.contains(&Capability::QResync))
-            || (in_rev2_baseline(capability) && imap4rev2_active(capabilities, enabled))
+            || (rev2_baseline_includes(capability) && imap4rev2_active(capabilities, enabled))
     }
 
     /// Connection states that exercise every branch of the rev2-ACTIVE rule.

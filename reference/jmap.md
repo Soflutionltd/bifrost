@@ -96,6 +96,16 @@ CalendarEvent and ContactCard create membership setters build complete
 that id from the local create set. Patch membership setters instead emit escaped
 JSON Pointer paths with `null` for removal, preserving unrelated memberships.
 
+State tokens in `core/id.rs` distinguish `ObjectState<O>`, `QueryState<O>`,
+`SessionState`, and `PushState`. Get, set, changes, query, queryChanges,
+copy and Email import preserve these domains in their fields and accessors;
+generated state-bearing request builders accept the corresponding typed token.
+Object states cannot be passed across object types or used as query states.
+String conversion remains explicit at persisted cursor boundaries and when
+reading caller-owned `ServerVersion` values. Push `changed` maps are the
+intentional heterogeneous boundary: each object state retains its runtime
+`DataType` key, while the resumable `pushState` token has its own static type.
+
 ## Internal method dispatch
 
 Every JMAP method is a self-describing struct implementing `JmapMethod`:
@@ -227,9 +237,9 @@ failure iterators remain available for whole-response processing.
 `SetResponse::create_errors()` and `update_errors()` iterate every `notCreated`
 and `notUpdated` entry with its creation id or object id, so a batch caller can
 report each failed object instead of whichever entry hash order surfaced first.
-The older `unwrap_*_errors` helpers still return a single error and are kept
-only until the account boundary can translate an aggregate; per-id callers use
-`created()` / `updated()`.
+Per-id callers use `created()` / `updated()`. There are no first-error helpers.
+An activation-only Sieve request submits no update map, so any `notUpdated`
+entries are a contract violation; its diagnostic retains all unexpected ids.
 
 A `Blob/upload` `notCreated` entry decodes as a typed `SetError` and surfaces
 as `Error::Set`, so its `type` (`overQuota`, `tooLarge`, a vendor type kept as
@@ -512,7 +522,7 @@ object's vocabulary; the two JSON-backed objects retain extension round-trip tes
 - `Id<T>` - phantom-typed string ID: `AccountId`, `BlobId`, `State`. Available for incremental adoption.
 - `Account<Tr>` - internal account-scoped view of `Client`. Use `account.build()` for scoped requests inside the crate.
 - `Capability` trait - typed URIs with associated `Config` type.
-- `TransportError` - crate-owned, `#[non_exhaustive]`, carries response body (`Bytes`) for ProblemDetails parsing. A local failure is marked explicitly (the private `LocalFailure`, set only by the dedicated constructors) and classifies as `Internal(_)` before the net evidence or the no-evidence `Transport(Network)` fallback is consulted; an unmarked error with no net evidence (for example, an in-crate test stub) keeps the fallback. A passed-through 3xx from the default streamed transport currently carries net `Status` evidence and is classified as a terminal HTTP failure (see HTTP redirect handling below). Two marks exist. `LocalFailure::InvariantViolated` (`TransportError::invariant` / `invariant_with_source`) is a state impossible by construction, raised before anything was sent, and classifies `Internal(InvariantViolated)`. `LocalFailure::LimitExceeded` (`TransportError::limit_exceeded`) is a bound this crate imposes on a response the protocol leaves unbounded - today only the EventSource over-long block cap - and classifies `Internal(LimitExceeded)`. The central mapping never retries an `Internal` kind. Without the mark, impossible-by-construction states (an unsupported method, an invalid default header, missing credentials) were retried as network faults forever, and a tripped EventSource cap classified as a retryable network fault too.
+- `TransportError` - crate-owned, `#[non_exhaustive]`, carries response body (`Bytes`) for ProblemDetails parsing. A local failure is marked explicitly (the private `LocalFailure`, set only by the dedicated constructors) and classifies as `Internal(_)` before the net evidence or the no-evidence `Transport(Network)` fallback is consulted; an unmarked error with no net evidence (for example, an in-crate test stub) keeps the fallback. The shared transport kind vocabulary has no unknown-provenance variant, so this legacy custom-transport fallback remains; classification never parses its message. A passed-through 3xx from either default transport door carries net `Status` evidence and is classified as a terminal HTTP failure (see HTTP redirect handling below). Two marks exist. `LocalFailure::InvariantViolated` (`TransportError::invariant` / `invariant_with_source`) is a state impossible by construction, raised before anything was sent, and classifies `Internal(InvariantViolated)`. `LocalFailure::LimitExceeded` (`TransportError::limit_exceeded`) is a bound this crate imposes on a response the protocol leaves unbounded - today only the EventSource over-long block cap - and classifies `Internal(LimitExceeded)`. The central mapping never retries an `Internal` kind. Without the mark, impossible-by-construction states (an unsupported method, an invalid default header, missing credentials) were retried as network faults forever, and a tripped EventSource cap classified as a retryable network fault too.
 
 ## Capabilities
 
@@ -687,7 +697,7 @@ The crate-internal JMAP error type uses structured variants. No
   status, title and detail.
 - `Method(MethodError)` - JMAP method-level errors. `Set(SetError)` - per-object set errors.
 - Local request refusals: `RequestEncode`, `RequestCallLimit { max }`, `RequestSizeLimit { max, size }`, `NoPrimaryAccount { capability }`.
-- Response-shape failures: `ResponseDecode`, `CallNotFound`, `UnexpectedMethodResponse`, `IdNotFound`, `IdUnanswered`, `NotParsable`.
+- Response-shape failures: `EnvelopeDecode`, `ResultDecode { call_id, source }`, `MissingResponseField`, `CallNotFound`, `UnexpectedMethodResponse`, `IdNotFound`, `IdUnanswered`, `NotParsable`.
 - `InvalidUrl` - a URL or URL-component value the crate's own caller supplied is unusable. Sources include an empty session URL and an empty EventSource type list.
 - `MalformedSessionUrl { property, detail }` - a URL or URL template the SERVER published in its session is unusable: `apiUrl` and the `uploadUrl`, `downloadUrl` and `eventSourceUrl` templates (an unbalanced or unknown template variable, or not an absolute http or https URL; `uploadUrl` raises only at an upload and `eventSourceUrl` only when EventSource is used) and the WebSocket capability's `url` (an unparseable URI or a non-websocket scheme). The provider described itself wrongly, so this is never the caller's `InvalidUrl`.
 - `MalformedCapability { capability }` - an advertised capability whose object does not parse.
@@ -724,7 +734,7 @@ crates/jmap/src/sync/
   factory.rs       - JmapAccountFactory + builder + JmapCredentials
   capabilities.rs  - AccountCapabilities builder, CoreLimits
   state.rs         - cursor envelope (V1 tag/length format)
-  state_cache.rs   - per-accountId Email/Mailbox state maps
+  state_cache.rs   - per-accountId typed Email StateCell observations
   foreign.rs       - foreign-account codec: mailbox (encode_foreign/parse_foreign/owner_tag)
                      and object ids (encode_object/parse_object/native_object)
   discover.rs      - cursor_scopes / memberships / scope_lifecycle_stream
@@ -792,7 +802,7 @@ foreign-account skip lane; see Foreign accounts below).
 
 The batch is conditional on the session's own numbers. `maxCallsInRequest` and `maxSizeRequest` are hard limits (RFC 8620 §2) the server enforces by rejecting the whole request with a request-level `limit` error, and the commonly quoted 16 calls is the minimum a server is *recommended* to support, never a floor a client may assume. So `batched_open_probes` sends the two-call batch only when the advertised call count allows it and `Request::send_methods_within` finds the encoded request inside `maxSizeRequest`; otherwise nothing is sent and the probes go out one request each. `send_methods_within` takes the size limit as a required argument (and returns `Ok(None)` without sending when the batch does not fit) precisely so a future batching call site cannot forget the question.
 
-`JmapAccount` (`pub(crate)`) owns the `Client`, the primary `Mail` `Account` handle, a `foreign_mail: Arc<HashMap<String, MailAccount>>` of shared/delegate-account handles keyed by JMAP `accountId`, optional `Submission`/`VacationResponse`/`Quota`/`Sieve` handles, the built capabilities, per-scope cursor seed states, the `WsState`, a subscription registry, and per-`accountId` Email/Mailbox state caches (each `Arc<Mutex<HashMap<String, Option<String>>>>` via `state_cache.rs`). The maps are keyed by accountId because JMAP state is per-`(accountId, type)`; the primary account's id is one ordinary key. Scope lifecycle has a separate primary-only Mailbox state map: delta polling and local `Mailbox/set` may fast-forward the general cache, but neither consumes the lifecycle poller's window. This lifecycle position is open-time process state, not an engine change cursor, so it does not enter the cursor envelope or alter its schema/version. `set_priority`/`set_bandwidth_cap` delegate to `bifrost-net::AccountNet`. The account also holds a shared close completion: the first polled `close()` starts teardown in a spawned task, and all later callers await that same result.
+`JmapAccount` (`pub(crate)`) owns the `Client`, the primary `Mail` `Account` handle, a `foreign_mail: Arc<HashMap<String, MailAccount>>` of shared/delegate-account handles keyed by JMAP `accountId`, optional `Submission`/`VacationResponse`/`Quota`/`Sieve` handles, the built capabilities, per-scope cursor seed states, the `WsState`, a subscription registry, and a per-`accountId` Email guard cache (`StateMap`, holding `StateCell` entries in `state_cache.rs`). Cells hold typed Email object states; the primary account's id is one ordinary key. Unknown and unavailable observations both provide no guard. Each cell owns set continuity, changes continuity, and compare-and-replace probe publication. There is no general Mailbox observation cache: its only reader compared it against itself for publication, and no decision consumed it. Scope lifecycle alone owns primary Mailbox positions, typed as Mailbox object states; delta polling and local `Mailbox/set` cannot consume the lifecycle poller's window. This lifecycle position is open-time process state, not an engine change cursor, so it does not enter the cursor envelope or alter its schema/version. `set_priority`/`set_bandwidth_cap` delegate to `bifrost-net::AccountNet`. The account also holds a shared close completion: the first polled `close()` starts teardown in a spawned task, and all later callers await that same result.
 
 `Client` carries an optional `ByteTally`; `Client::metered()` / `Account::metered()` hand back a handle over the same transport and session state that reports inbound request bytes into a fresh accumulator, which each sync stream takes at construction and each emitted batch `take`s. `Client::metered_into(&tally)` / `Account::metered_into(&tally)` report into an existing accumulator when one batch crosses differently scoped handles. The tally lives outside `ClientInner` deliberately: forking the inner would fork the session-state mutex, and two clients with independent session state is a correctness bug rather than an accounting detail.
 
@@ -850,7 +860,7 @@ Validation rules in `state::decode`:
 - Any decode failure (unknown state tag, unknown scope tag, truncated payload, trailing bytes, non-UTF-8 string) returns `Error::SchemaIncompatible`.
 - `decode_cursor` additionally rejects a payload whose embedded scope does not match the `ChangeCursor.scope`, returning `Error::Other`.
 
-`open()` probes and records which cursor scopes this account can drive. `establish_initial_cursor(scope)` uses that seed only as a membership gate, then probes a fresh `Email/get ids: []` state for Email and foreign `Folder` scopes or `Mailbox/get ids: []` for Mailbox immediately before returning `CursorEstablishment::Ready`. The per-account state cache advances compare-and-swap from the value captured before the probe, so a concurrent writer cannot be replaced by a stale probe result. Re-probing matters after `RestartScope`: returning an open-time state that may have expired can make `cannotCalculateChanges` restart the same scope against the same expired state indefinitely. Unseeded scopes return `Error::Unsupported` rather than a cursor over an empty state, which would present as a working cursor that returns nothing forever. `describe_cursor` reports `Cheap`/`ServerCursor` only for decodable cursors on scopes the change stream drives (Email, Mailbox, foreign `Folder`); legacy Thread/Query cursors still decode but terminate unsupported, so they - like undecodable cursors - report `Expensive`/`None` rather than promising a strategy that dies on its first poll.
+`open()` probes and records which cursor scopes this account can drive. `establish_initial_cursor(scope)` uses that seed only as a membership gate, then probes a fresh `Email/get ids: []` state for Email and foreign `Folder` scopes or `Mailbox/get ids: []` for Mailbox immediately before returning `CursorEstablishment::Ready`. For Email scopes, the per-account guard cache publishes the probe compare-and-swap from the value captured before the probe, so a concurrent writer cannot be replaced by a stale probe result. Re-probing matters after `RestartScope`: returning an open-time state that may have expired can make `cannotCalculateChanges` restart the same scope against the same expired state indefinitely. Unseeded scopes return `Error::Unsupported` rather than a cursor over an empty state, which would present as a working cursor that returns nothing forever. `describe_cursor` reports `Cheap`/`ServerCursor` only for decodable cursors on scopes the change stream drives (Email, Mailbox, foreign `Folder`); legacy Thread/Query cursors still decode but terminate unsupported, so they - like undecodable cursors - report `Expensive`/`None` rather than promising a strategy that dies on its first poll.
 
 ### Per-scope inventory, changes, hydration
 
@@ -908,7 +918,7 @@ boundary remain outside the plaintext smoothing guarantee described in
 - The id counter is on the client-owned `WsConnection` (in `client_ws.rs`), not on the per-connection `WsStream`, so ids do not restart at 0 on reconnect. A per-connection counter meant a late response from the dropped connection carried an id the new connection was about to reuse - correlation that is actively worse than none.
 - `WebSocketResponse` decodes `requestId` (RFC 8887 s4.3.4) and `WebSocketMessage::Response` carries it, so a reader can match a response frame to the request it answers. It was previously dropped at decode, which made two in-flight WebSocket requests indistinguishable on the read stream.
 - `frame_stream` runs the session-divergence comparison on every response frame's `sessionState`, through the same `Client::note_session_state` the HTTP door uses - including on a frame whose method responses fail to decode, whose session state was still truthful. The WS door previously handed responses up without ever looking, losing staleness detection on the connection that stays open longest.
-- A `Response` frame decodes in a single pass. The frame is not an HTTP response body - it carries `@type` and `requestId` beside the envelope fields - so `WebSocketResponse` keeps `methodResponses` as a raw JSON slice and hands it to `Response::from_frame_parts`, which runs the same per-call success/`MethodError` split (`split_call_results`) the HTTP envelope deserializer runs. It previously decoded the array into a `serde_json::Value` tree, rebuilt a `json!` envelope from it, and deserialized that a second time, re-allocating every method response on every frame. The frame dispatch is hand-written (`decode_frame` reads the `@type` discriminator by itself, then deserializes the variant from the same bytes) rather than `#[serde(tag = "@type")]`, because an internally-tagged enum buffers the frame into serde's private `Content` tree before selecting a variant and a `RawValue` cannot survive that buffer - it re-emerges as the newtype token. The same trap applies to every `#[serde(tag)]` / `#[serde(untagged)]` type in this crate: none can hold a `RawValue`, and the failure is a runtime decode error, not a compile error. Unknown `@type` values are ignored for forward compatibility. A malformed known push payload is converted to an `UnknownFrame` notification, which the push session turns into a broad invalidation so the bad frame cannot hide a state change or terminate the connection. Malformed text envelopes, unclaimed method-response decode failures, and binary frames close the current WebSocket as `WebSocketClosed`, which ends the push session `Failed` with a retryable class; a correlated method-response decode failure still fails its waiter. Session divergence is still checked on the frame's own `sessionState` before the method responses are touched, so a frame whose method responses fail to decode still reports its truthful session state and still fails its own waiter with `ResponseDecode`.
+- A `Response` frame decodes in a single pass. The frame is not an HTTP response body - it carries `@type` and `requestId` beside the envelope fields - so `WebSocketResponse` keeps `methodResponses` as a raw JSON slice and hands it to `Response::from_frame_parts`, which runs the same per-call success/`MethodError` split (`split_call_results`) the HTTP envelope deserializer runs. It previously decoded the array into a `serde_json::Value` tree, rebuilt a `json!` envelope from it, and deserialized that a second time, re-allocating every method response on every frame. The frame dispatch is hand-written (`decode_frame` reads the `@type` discriminator by itself, then deserializes the variant from the same bytes) rather than `#[serde(tag = "@type")]`, because an internally-tagged enum buffers the frame into serde's private `Content` tree before selecting a variant and a `RawValue` cannot survive that buffer - it re-emerges as the newtype token. The same trap applies to every `#[serde(tag)]` / `#[serde(untagged)]` type in this crate: none can hold a `RawValue`, and the failure is a runtime decode error, not a compile error. Unknown `@type` values are ignored for forward compatibility. A malformed known push payload is converted to an `UnknownFrame` notification, which the push session turns into a broad invalidation so the bad frame cannot hide a state change or terminate the connection. Malformed text envelopes, unclaimed method-response decode failures, and binary frames close the current WebSocket as `WebSocketClosed`, which ends the push session `Failed` with a retryable class; a correlated method-response decode failure still fails its waiter. Session divergence is still checked on the frame's own `sessionState` before the method responses are touched, so a frame whose method responses fail to decode still reports its truthful session state and still fails its own waiter with `EnvelopeDecode`.
 
 - A `maxSizeRequest` guard (RFC 8620 s2) on the encoded frame, matching the HTTP door's refusal to send an oversized batch. It is measured on the FRAME, envelope and `requestId` included, because over WebSocket the frame is the request. Only an advertised, non-zero limit is enforced, for the same reason `CallLimit` refuses to enforce its two unusable states - and since the limit is an `Option`, an omitted `maxSizeRequest` declines to enforce without being confused for an advertised zero, which the session validator refuses separately. Over-limit raises `Error::RequestSizeLimit { max, size }` -> `Request(Malformed)` / `ClientBug`; the HTTP door can answer `Ok(None)` against a caller-supplied bound instead because `send_methods_within` has that contract, and `send_ws` has none - it either writes the frame or it does not.
 
@@ -1092,7 +1102,7 @@ Container CRUD is `Mailbox/get`/`set`. Rename and move require the requested
 native id in `updated` (including a null value) or surface its `notUpdated`
 error. An id absent from both lanes retains its request-stamped metadata as an
 unguarded unanswered `Mailbox/set` write; `newState` alone cannot prove that
-folder changed. The mailbox state cache advances only after that per-id check.
+folder changed. These writes do not alter lifecycle positions; only the lifecycle walk publishes the sidebar changes it delivered.
 Rename, move and delete select the
 registered owner from the qualified container id; child creation selects its
 parent's owner. Wire ids are stripped only for that selected owner, and a
@@ -1474,7 +1484,8 @@ arrived) and, unless its primary cause already is one, the typed
   `MalformedCapability` (the capability URI). `UnexpectedMethodResponse` takes
   the same kind.
 - Response-shape errors are the provider's, not the caller's:
-  `ResponseDecode` and `NotParsable` -> `Protocol(ParseFailed)`,
+  `EnvelopeDecode`, `ResultDecode` and `NotParsable` -> `Protocol(ParseFailed)`;
+  `MissingResponseField` -> `Protocol(MissingField)`,
   `CallNotFound` -> `Protocol(MissingField)`, all
   `ProviderContractViolation`. `IdNotFound` -> `NotFound(resource)`
   (`ProviderRefused`) when the scope names a resource, else
@@ -1744,10 +1755,12 @@ progress. Primary application comes from Application::from_leaf. An unreadable
 send envelope or missing/malformed submission result raises application to
 Uncertain, preserving the protocol leaf and recording the observation barrier.
 Custom transports lacking net evidence are marked InFlight only at the invoked
-send/raw-send/draft-send boundaries, and an envelope ResponseDecode carries
-acknowledged response evidence only there too: elsewhere `From<serde_json::Error>`
-can produce a ResponseDecode for any serde failure, so it proves no answer
-arrived and carries no attempt cause. A reschedule replacement failure raises
+send/raw-send/draft-send boundaries. Decode provenance is explicit at the
+source: `EnvelopeDecode` covers HTTP envelopes, session/upload documents and
+correlated WebSocket envelopes; `ResultDecode` retains the call id from typed
+method extraction. Both carry acknowledged unreadable-success evidence at every
+operation boundary. There is no blanket `From<serde_json::Error>`; outbound
+serialization explicitly uses `RequestEncode`. A reschedule replacement failure raises
 to Uncertain only for an undecodable or missing result or an evidence-less
 network transport failure, never over explicit Unsent evidence.
 

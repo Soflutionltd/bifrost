@@ -85,11 +85,11 @@ pub(crate) struct GmailErrorContext {
     pub(crate) resource: Option<GmailResource>,
     pub(crate) throttle_scope: Option<ThrottleScope>,
     pub(crate) idempotency_override: Option<bool>,
-    /// True when the failing request targets `users.history.list`. The
+    /// Endpoint identity when the failing request targets `users.history.list`. The
     /// 404/410/`historyNotFound`/`failedPrecondition` mappings need
     /// this signal to route to `SyncState(CursorInvalid)` rather than
     /// `NotFound` or a generic provider refusal.
-    pub(crate) history_endpoint: bool,
+    pub(crate) endpoint: Option<crate::client::GmailEndpoint>,
     /// Optional secondary diagnostic identifier (currently
     /// the Gmail attachment / blob id) that the central error model
     /// does not represent as an `ErrorScope`. Surfaced as
@@ -107,7 +107,7 @@ impl GmailErrorContext {
             resource: None,
             throttle_scope: Some(ThrottleScope::Account),
             idempotency_override: None,
-            history_endpoint: false,
+            endpoint: None,
             diagnostic_id: None,
         }
     }
@@ -144,7 +144,7 @@ impl GmailErrorContext {
     pub(crate) fn changes() -> Self {
         let mut ctx = Self::base(AccountOperation::SyncChanges);
         ctx.scope = Some(ErrorScope::Cursor(CursorScope::Account));
-        ctx.history_endpoint = true;
+        ctx.endpoint = Some(crate::client::GmailEndpoint::History);
         ctx
     }
 
@@ -596,7 +596,8 @@ fn scope_for(ctx: &GmailErrorContext) -> &'static str {
 fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -> AccountError {
     if let bifrost_net::Error::LocalHold { ref key, .. } = net_error {
         let budget = (ctx.surface == crate::quota::ApiSurface::Gmail)
-            .then(|| bifrost_types::ThrottleBudget::new(key.clone()));
+            .then(|| crate::quota::project_budget_from_hold(key))
+            .flatten();
         let error = bifrost_net::into_account_error_with_throttle_scope(
             net_error,
             bifrost_net::NetErrorContext {
@@ -862,7 +863,11 @@ fn classify_response(
                 Cause::Server(ServerCause::Unavailable { retry_hint }),
             );
         }
-        GmailSignal::FailedPrecondition if ctx.history_endpoint => {
+        GmailSignal::FailedPrecondition
+            if ctx
+                .endpoint
+                .is_some_and(crate::client::GmailEndpoint::is_history) =>
+        {
             return (
                 AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
                 Cause::State(StateCause::CursorInvalid),
@@ -877,7 +882,11 @@ fn classify_response(
                 Cause::State(StateCause::ConcurrencyConflict),
             );
         }
-        GmailSignal::HistoryNotFound if ctx.history_endpoint => {
+        GmailSignal::HistoryNotFound
+            if ctx
+                .endpoint
+                .is_some_and(crate::client::GmailEndpoint::is_history) =>
+        {
             return (
                 AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
                 Cause::State(StateCause::CursorInvalid),
@@ -887,7 +896,11 @@ fn classify_response(
         // HTTP classification: users must not lose sync progress because an
         // unrelated endpoint returned a misplaced history reason.
         GmailSignal::HistoryNotFound => {}
-        GmailSignal::NotFound if ctx.history_endpoint => {
+        GmailSignal::NotFound
+            if ctx
+                .endpoint
+                .is_some_and(crate::client::GmailEndpoint::is_history) =>
+        {
             return (
                 AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
                 Cause::State(StateCause::CursorInvalid),
@@ -965,10 +978,15 @@ fn classify_by_status(
     retry_hint: Option<RetryHint>,
 ) -> (AccountErrorKind, Cause) {
     match status {
-        400 if ctx.history_endpoint => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-        ),
+        400 if ctx
+            .endpoint
+            .is_some_and(crate::client::GmailEndpoint::is_history) =>
+        {
+            (
+                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+                Cause::State(StateCause::CursorInvalid),
+            )
+        }
         400 | 422 => malformed_kind_cause(format!("HTTP {status}")),
         401 => (
             AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
@@ -980,15 +998,25 @@ fn classify_by_status(
                 resource: ctx.resource.and_then(GmailResource::to_resource_kind),
             }),
         ),
-        404 if ctx.history_endpoint => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-        ),
+        404 if ctx
+            .endpoint
+            .is_some_and(crate::client::GmailEndpoint::is_history) =>
+        {
+            (
+                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+                Cause::State(StateCause::CursorInvalid),
+            )
+        }
         404 => not_found_kind_cause(ctx),
-        410 if ctx.history_endpoint => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-        ),
+        410 if ctx
+            .endpoint
+            .is_some_and(crate::client::GmailEndpoint::is_history) =>
+        {
+            (
+                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+                Cause::State(StateCause::CursorInvalid),
+            )
+        }
         412 => (
             AccountErrorKind::ConcurrencyConflict,
             Cause::State(StateCause::ConcurrencyConflict),

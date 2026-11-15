@@ -308,7 +308,7 @@ impl Dispatch for ReqwestDispatch {
 struct RateDebit {
     governor: RateLimitGovernor,
     host: String,
-    quota_scope: String,
+    quota_scope: crate::QuotaScope,
     cost: u32,
     generation: Option<RateGeneration>,
     armed: bool,
@@ -318,7 +318,7 @@ impl RateDebit {
     fn new(
         governor: RateLimitGovernor,
         host: String,
-        quota_scope: String,
+        quota_scope: crate::QuotaScope,
         cost: u32,
         generation: Option<RateGeneration>,
     ) -> Self {
@@ -390,7 +390,7 @@ struct RequestBuilderInner {
     /// declare several `(host, quota_scope)` buckets on one host, and
     /// the declaration order alone cannot say which one a given request
     /// belongs in; this is how the caller says.
-    quota_scope: Option<String>,
+    quota_scope: Option<crate::QuotaScope>,
     /// Optional per-request retry policy override.
     retry: Option<RetryPolicy>,
     /// Optional per-request timeout override.
@@ -423,7 +423,7 @@ struct RequestBuilderInner {
     bytes_in: Option<RequestByteCounter>,
     /// Additional concurrency claims, composed with the account claim.
     concurrency: Vec<(ConcurrencyLimit, usize)>,
-    hold_gate: Option<String>,
+    hold_gate: Option<crate::HoldKey>,
     error_observer: Option<ErrorObserver>,
     redirect_guard: Option<RedirectGuard>,
     hop_policy: Option<Arc<dyn crate::HopPolicy>>,
@@ -471,7 +471,7 @@ impl RequestBuilder {
 
     /// Refuse each wire attempt while this key is held on the parent Net.
     #[must_use]
-    pub fn hold_gate(mut self, key: impl Into<String>) -> Self {
+    pub fn hold_gate(mut self, key: impl Into<crate::HoldKey>) -> Self {
         self.inner.hold_gate = Some(key.into());
         self
     }
@@ -654,7 +654,7 @@ impl RequestBuilder {
     /// bucket. The scope is re-evaluated per redirect hop, since a hop
     /// may land on a different host.
     #[must_use]
-    pub fn quota_scope(mut self, scope: impl Into<String>) -> Self {
+    pub fn quota_scope(mut self, scope: impl Into<crate::QuotaScope>) -> Self {
         self.inner.quota_scope = Some(scope.into());
         self
     }
@@ -1168,7 +1168,7 @@ pub(crate) async fn send_streaming_inner(
     let mut auth_self_stripped = false;
     let mut host = host_from_url(&url);
     let mut quota_scope =
-        resolve_quota_scope(&account, host.as_deref(), quota_scope_override.as_deref());
+        resolve_quota_scope(&account, host.as_deref(), quota_scope_override.as_ref());
     let mut cost_units = recompute_cost_units(
         account.net().governor(),
         host.as_deref(),
@@ -1319,7 +1319,7 @@ pub(crate) async fn send_streaming_inner(
                 && let Some(held) = account.shared_hold(key).current()
             {
                 return Err(Error::LocalHold {
-                    key: key.clone(),
+                    key: key.as_str().to_owned(),
                     held,
                     attempts: std::mem::take(&mut prior_attempts),
                     may_have_committed: ledger.verdict() == crate::CommitEvidence::MayHaveCommitted,
@@ -1692,7 +1692,7 @@ pub(crate) async fn send_streaming_inner(
                                 quota_scope = resolve_quota_scope(
                                     &account,
                                     host.as_deref(),
-                                    quota_scope_override.as_deref(),
+                                    quota_scope_override.as_ref(),
                                 );
                                 cost_units = recompute_cost_units(
                                     account.net().governor(),
@@ -2026,10 +2026,10 @@ fn host_from_url(url: &str) -> Option<String> {
 fn resolve_quota_scope(
     account: &AccountNet,
     host: Option<&str>,
-    override_: Option<&str>,
-) -> String {
+    override_: Option<&crate::QuotaScope>,
+) -> crate::QuotaScope {
     match override_ {
-        Some(scope) => scope.to_owned(),
+        Some(scope) => scope.clone(),
         None => {
             // Only an unscoped request to a multi-scope host is ambiguous.
             // Warn here, per request, rather than at attach: an operator
@@ -2046,8 +2046,9 @@ fn resolve_quota_scope(
                      first-declared scope",
                 );
             }
-            host.map_or("", |host| account.rate_scope_for(host))
-                .to_owned()
+            host.map_or(crate::QuotaScope::HostOnly, |host| {
+                account.rate_scope_for(host).clone()
+            })
         }
     }
 }
@@ -2218,7 +2219,7 @@ mod tests {
             NetConfig::default(),
             vec![RateLimit {
                 host: "retry.test".to_string(),
-                quota_scope: String::new(),
+                quota_scope: crate::QuotaScope::HostOnly,
                 quota_per_second: 0.0001,
                 cost_default: 1,
                 burst: 1,
@@ -3303,7 +3304,7 @@ mod tests {
         let governor = RateLimitGovernor::new();
         governor.register(RateLimit {
             host: "cancel.test".to_string(),
-            quota_scope: String::new(),
+            quota_scope: crate::QuotaScope::HostOnly,
             quota_per_second: 0.0001,
             cost_default: 1,
             burst: 1,
@@ -3315,7 +3316,7 @@ mod tests {
         drop(RateDebit::new(
             governor.clone(),
             "cancel.test".to_string(),
-            String::new(),
+            crate::QuotaScope::HostOnly,
             1,
             generation,
         ));
@@ -3334,7 +3335,7 @@ mod tests {
             NetConfig::default(),
             vec![RateLimit {
                 host: "cancel.test".to_string(),
-                quota_scope: String::new(),
+                quota_scope: crate::QuotaScope::HostOnly,
                 quota_per_second: 0.0001,
                 cost_default: 1,
                 burst: 1,
@@ -3582,7 +3583,7 @@ mod tests {
         let governor = RateLimitGovernor::new();
         governor.register(RateLimit {
             host: "cost.test".to_owned(),
-            quota_scope: String::new(),
+            quota_scope: crate::QuotaScope::HostOnly,
             quota_per_second: 10.0,
             cost_default: 5,
             burst: 50,
@@ -3807,14 +3808,14 @@ mod tests {
             vec![
                 RateLimit {
                     host: "big.test".to_owned(),
-                    quota_scope: String::new(),
+                    quota_scope: crate::QuotaScope::HostOnly,
                     quota_per_second: 1000.0,
                     cost_default: 1,
                     burst: 100,
                 },
                 RateLimit {
                     host: "small.test".to_owned(),
-                    quota_scope: String::new(),
+                    quota_scope: crate::QuotaScope::HostOnly,
                     quota_per_second: 1000.0,
                     cost_default: 1,
                     burst: 5,

@@ -35,7 +35,7 @@ pub struct Reconciler {
     /// Engine-wide throttle bucket. The reconciler honors account-wide
     /// deadlines before driving a hinted scope and records deadlines
     /// its own Retry outcomes carry.
-    pub throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
+    pub throttles: Arc<crate::recovery::ThrottleBucket>,
     pub scheduler: crate::scheduler::Scheduler,
     /// The multiplexer's per-scope poll tokens, shared rather than copied.
     ///
@@ -618,7 +618,7 @@ mod tests {
                 shutdown: shutdown.clone(),
                 control,
                 reopen_tx,
-                throttles: Arc::new(std::sync::Mutex::new(crate::recovery::ThrottleBucket::new())),
+                throttles: Arc::new(crate::recovery::ThrottleBucket::new()),
                 scheduler,
                 scope_tokens: tokens,
                 account_generation: tokio::sync::watch::channel(

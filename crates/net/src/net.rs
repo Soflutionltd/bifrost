@@ -67,6 +67,12 @@ pub(crate) struct NetInner {
     bandwidth_registry: Arc<BandwidthRegistry>,
     /// Successfully registered hosts, indexed first by `AccountId`
     /// and then by the exact attachment token.
+    // Registration owns host references and one meter attachment only. Holds
+    // survive all account handles until expiry, concurrency claims own permits,
+    // and bandwidth grants can outlive retag. Releasing those registries here
+    // would erase provider throttles or invalidate outstanding admissions.
+    // The account_hosts lock orders token changes with meter-count changes;
+    // their nested lock order is always account_hosts then meter.
     pub(crate) account_hosts: Mutex<HashMap<AccountId, HashMap<u64, Vec<RateKey>>>>,
     /// Monotone identity for each `attach_account` registration.
     /// AccountNet carries this token so teardown targets the exact
@@ -74,14 +80,14 @@ pub(crate) struct NetInner {
     /// older handle drops.
     pub(crate) next_registration_id: AtomicU64,
     /// Keyed concurrency scopes shared only by accounts on this Net.
-    concurrency_limits: Mutex<HashMap<String, WeakLimit>>,
+    concurrency_limits: Mutex<HashMap<crate::LimitKey, WeakLimit>>,
     holds: Arc<crate::hold::HoldRegistry>,
 }
 
 impl Net {
     /// Open a provider hold shared by every account on this transport.
     #[must_use]
-    pub fn shared_hold(&self, key: impl Into<String>) -> crate::SharedHold {
+    pub fn shared_hold(&self, key: impl Into<crate::HoldKey>) -> crate::SharedHold {
         crate::SharedHold::new(Arc::clone(&self.inner.holds), key.into())
     }
 
@@ -302,7 +308,7 @@ impl Net {
         // the warning fires only when a request actually reaches such a host
         // WITHOUT an explicit scope - the one case that silently debits the
         // first-declared bucket. See `resolve_quota_scope`.
-        let mut rate_scopes: HashMap<String, String> = HashMap::new();
+        let mut rate_scopes: HashMap<String, crate::QuotaScope> = HashMap::new();
         let mut ambiguous_scope_hosts: HashSet<String> = HashSet::new();
         for key in &registered_hosts {
             match rate_scopes.get(&key.host) {
@@ -334,7 +340,7 @@ impl Net {
                 net: self.clone(),
                 bandwidth_budget: self.inner.bandwidth_registry.budget(id.clone()),
                 account: id,
-                registration_id,
+                registration_id: Some(registration_id),
                 meter: account_meter,
                 token_source: spec
                     .token_source
@@ -390,9 +396,10 @@ impl Net {
             if registrations.is_empty() {
                 map.remove(id);
             }
+            // Keep token removal and meter release ordered against retag.
+            self.inner.meter.forget_account(id);
             hosts
         };
-        self.inner.meter.forget_account(id);
         for key in hosts {
             self.inner
                 .governor
@@ -403,8 +410,10 @@ impl Net {
     /// Process-wide bandwidth meter handle. Per-account readings go
     /// through `AccountNet::meter`.
     #[must_use]
-    pub fn meter(&self) -> &BandwidthMeter {
-        &self.inner.meter
+    pub fn meter(&self) -> Arc<BandwidthMeter> {
+        // Export the existing owner so HTTP, the engine and socket transports
+        // observe the same counters rather than separate empty meters.
+        Arc::clone(&self.inner.meter)
     }
 
     /// Per-host rate-limit governor.
@@ -448,8 +457,8 @@ pub(crate) struct AccountNetInner {
     pub(crate) net: Net,
     /// Account identity for metering and tracing.
     pub(crate) account: AccountId,
-    /// Exact attach registration owned by this handle.
-    pub(crate) registration_id: u64,
+    /// Exact attach registration owned by this handle, absent for an inert retag.
+    pub(crate) registration_id: Option<u64>,
     /// Cached meter handle. Constructed once at attach/retag time so
     /// the request hot path does not clone the account id or lock the
     /// meter map per attempt.
@@ -457,7 +466,7 @@ pub(crate) struct AccountNetInner {
     /// Provider of OAuth bearer tokens for this account.
     pub(crate) token_source: Option<CoordinatedTokenSource>,
     /// Quota discriminator selected for each registered request host.
-    pub(crate) rate_scopes: HashMap<String, String>,
+    pub(crate) rate_scopes: HashMap<String, crate::QuotaScope>,
     /// Hosts this account declared more than one quota scope for. A request
     /// to one of them without an explicit `RequestBuilder::quota_scope` is
     /// the only ambiguous case, and is the one that warns.
@@ -500,11 +509,12 @@ pub(crate) struct AccountNetInner {
 /// the replacement" true rather than aspirational. `detach_registration`
 /// returns before touching the meter or the governor when that token is
 /// no longer present, so a Drop after an explicit `detach()`, or after
-/// `retag()` moved the token to another id, is a complete no-op.
+/// `retag()` retired the token to another id, is a complete no-op.
 impl Drop for AccountNetInner {
     fn drop(&mut self) {
-        self.net
-            .detach_registration(&self.account, Some(self.registration_id));
+        if let Some(token) = self.registration_id {
+            self.net.detach_registration(&self.account, Some(token));
+        }
     }
 }
 
@@ -547,12 +557,15 @@ impl AccountNet {
 
     /// Open a provider hold in the parent transport's registry.
     #[must_use]
-    pub fn shared_hold(&self, key: impl Into<String>) -> crate::SharedHold {
+    pub fn shared_hold(&self, key: impl Into<crate::HoldKey>) -> crate::SharedHold {
         self.net().shared_hold(key)
     }
 
-    pub(crate) fn rate_scope_for(&self, host: &str) -> &str {
-        self.inner.rate_scopes.get(host).map_or("", String::as_str)
+    pub(crate) fn rate_scope_for(&self, host: &str) -> &crate::QuotaScope {
+        self.inner
+            .rate_scopes
+            .get(host)
+            .unwrap_or(&crate::QuotaScope::HostOnly)
     }
 
     /// Whether this account declared several quota scopes on `host`, so a
@@ -784,9 +797,11 @@ impl AccountNet {
     /// Detach this exact account registration. Idempotent across
     /// cloned handles.
     pub fn detach(&self) {
-        self.inner
-            .net
-            .detach_registration(&self.inner.account, Some(self.inner.registration_id));
+        if let Some(token) = self.inner.registration_id {
+            self.inner
+                .net
+                .detach_registration(&self.inner.account, Some(token));
+        }
     }
 
     /// Default retry policy applied to requests on this account.
@@ -818,7 +833,7 @@ impl AccountNet {
     #[must_use]
     pub fn shared_concurrency_limit(
         &self,
-        key: impl Into<String>,
+        key: impl Into<crate::LimitKey>,
         limit: usize,
     ) -> ConcurrencyLimit {
         let key = key.into();
@@ -887,7 +902,7 @@ impl AccountNet {
     ///
     /// - The bandwidth meter transfers one attachment count from the
     ///   old id to the new id.
-    /// - The exact token's host registrations move from the old id to
+    /// - The source token is retired and its host registrations move from the old id to
     ///   the new id. Governor refcounts are unchanged by the rename.
     /// - The old `AccountNet` clone the caller holds keeps working
     ///   for in-flight requests but no longer owns the host
@@ -910,31 +925,35 @@ impl AccountNet {
             return self.clone();
         }
         let net_inner = &self.inner.net.inner;
-        let mut moved = false;
+        let mut new_registration = None;
         {
             let mut map = net_inner
                 .account_hosts
                 .lock()
                 .expect("net account_hosts lock poisoned");
-            let hosts = map
-                .get_mut(&self.inner.account)
-                .and_then(|registrations| registrations.remove(&self.inner.registration_id));
+            let hosts = self.inner.registration_id.and_then(|token| {
+                map.get_mut(&self.inner.account)
+                    .and_then(|registrations| registrations.remove(&token))
+            });
             if map.get(&self.inner.account).is_some_and(HashMap::is_empty) {
                 map.remove(&self.inner.account);
             }
             if let Some(hosts) = hosts {
-                map.entry(new_id.clone())
-                    .or_default()
-                    .insert(self.inner.registration_id, hosts);
-                moved = true;
+                // Retag burns the old token permanently. Reusing it would let
+                // an old A handle detach the new owner after A -> B -> A.
+                let token = net_inner
+                    .next_registration_id
+                    .fetch_add(1, Ordering::Relaxed);
+                map.entry(new_id.clone()).or_default().insert(token, hosts);
+                // Transfer before publishing the unlocked registration map:
+                // a concurrent detach must not release a not-yet-moved count.
+                net_inner
+                    .meter
+                    .retag_account(&self.inner.account, new_id.clone());
+                new_registration = Some(token);
             }
         }
-        if moved {
-            net_inner
-                .meter
-                .retag_account(&self.inner.account, new_id.clone());
-        }
-        let account_meter = if moved {
+        let account_meter = if new_registration.is_some() {
             net_inner.meter.account(new_id.clone())
         } else {
             BandwidthMeter::inert_account(new_id.clone())
@@ -944,7 +963,10 @@ impl AccountNet {
                 net: self.inner.net.clone(),
                 bandwidth_budget: net_inner.bandwidth_registry.budget(new_id.clone()),
                 account: new_id,
-                registration_id: self.inner.registration_id,
+                // A repeated retag of a stale source must not borrow the live
+                // destination's token: dropping this inert handle would then
+                // detach the first successful retag's registration.
+                registration_id: new_registration,
                 meter: account_meter,
                 token_source: self.inner.token_source.clone(),
                 rate_scopes: self.inner.rate_scopes.clone(),
@@ -1651,7 +1673,7 @@ mod tests {
         AccountSpec {
             hosts: vec![RateLimit {
                 host: host.to_string(),
-                quota_scope: String::new(),
+                quota_scope: crate::QuotaScope::HostOnly,
                 quota_per_second: 1.0,
                 cost_default: 1,
                 burst: 1,
@@ -1737,7 +1759,7 @@ mod tests {
         assert!(account_hosts_snapshot(&net, &id).is_none());
     }
 
-    /// A cross-id retag moves the token, so the old handle's Drop finds
+    /// A cross-id retag retires the token, so the old handle's Drop finds
     /// nothing under the old id and must leave the renamed registration
     /// alone.
     #[test]
@@ -1919,7 +1941,7 @@ mod tests {
             AccountSpec {
                 hosts: vec![RateLimit {
                     host: "shared.example".to_string(),
-                    quota_scope: String::new(),
+                    quota_scope: crate::QuotaScope::HostOnly,
                     quota_per_second: f64::NAN,
                     cost_default: 1,
                     burst: 1,

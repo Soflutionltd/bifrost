@@ -92,3 +92,15 @@ fn gmail_ids_require_explicit_constructors() {
     assert_eq!(u64::from(message_id), 1);
     assert_eq!(u64::from(thread_id), 1);
 }
+
+#[test]
+fn modseq_owns_the_positive_63_bit_range() {
+    assert!(ModSeq::new(0).is_none());
+    assert_eq!(ModSeq::new(1).unwrap().get(), 1);
+    assert_eq!(ModSeq::new(ModSeq::MAX).unwrap().get(), ModSeq::MAX);
+    assert!(ModSeq::new(ModSeq::MAX + 1).is_none());
+    assert!(ModSeq::new(u64::MAX).is_none());
+    assert!(ModSeqValzer::new(0).is_some());
+    assert!(ModSeqValzer::new(ModSeq::MAX).is_some());
+    assert!(ModSeqValzer::new(ModSeq::MAX + 1).is_none());
+}

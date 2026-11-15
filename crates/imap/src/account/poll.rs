@@ -424,7 +424,7 @@ impl ImapPoller {
                 message.uid.get(),
                 op,
                 RAW_FETCH_BUDGET,
-                true,
+                super::blob::UidPersistence::Sticky,
                 &tx,
             )
             .await

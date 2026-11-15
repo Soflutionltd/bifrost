@@ -575,8 +575,9 @@ impl GraphClient {
             let token_source = Arc::clone(&self.inner.token_source);
             let mut spec = AccountSpec::new(Some(token_source));
             spec.hosts = vec![
-                RateLimit::new(self.inner.rate_limit_host.clone(), 10.0, 1, 10)
-                    .with_quota_scope(account_id.0.clone()),
+                RateLimit::new(self.inner.rate_limit_host.clone(), 10.0, 1, 10).with_quota_scope(
+                    bifrost_net::QuotaScope::namespaced("graph.quota", &[&account_id.0]),
+                ),
             ];
             let account_net = net.attach_account(account_id, spec);
             // Install the replacement first, then tear down whatever
@@ -834,6 +835,9 @@ impl GraphClient {
         slot.get_or_insert_with(|| account.to_owned());
     }
 
+    // Both throttle declarations and response stamps call mailbox_budget,
+    // which mints only here. Keep this ownership with the registry identity:
+    // an Outlook user expects a shared mailbox refusal to hold that mailbox.
     fn mailbox_identity(&self) -> MailboxIdentity {
         // Retagging changes transport accounting, not mailbox identity. Both
         // admission and throttle fallback retain the first attached account.
@@ -869,7 +873,11 @@ impl GraphClient {
             budget: bifrost_types::ThrottleBudget::new(format!(
                 "graph-outlook|{origin}|{budget_owner}"
             )),
-            concurrency_key: format!("graph-outlook|{origin}|{concurrency_owner}"),
+            concurrency_key: bifrost_net::LimitKey::namespaced(
+                "graph.outlook",
+                &[&origin, &concurrency_owner],
+            )
+            .to_string(),
         }
     }
 
@@ -2824,7 +2832,7 @@ mod tests {
         for _ in 0..3 {
             client.attach_account(id.clone());
         }
-        bifrost_net::MeterSink::record_bytes_in(net.meter(), &id, 5);
+        bifrost_net::MeterSink::record_bytes_in(net.meter().as_ref(), &id, 5);
         assert_eq!(net.meter().account(id.clone()).bytes_in(), 5);
 
         client.account_net().expect("account net attached").detach();

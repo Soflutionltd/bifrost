@@ -9,9 +9,9 @@
 use super::{
     CommandWriter, QresyncParams, encode_changedsince_modifier,
     search_criteria_starts_with_charset, validate_and_filter_flags, validate_append_datetime,
-    validate_atom, validate_login_credential_ascii, validate_mod_sequence_value,
-    validate_mod_sequence_valzer, validate_no_crlf, validate_sasl_initial_response,
-    validate_search_criteria_crlf, validate_sort_thread_charset, write_criteria,
+    validate_atom, validate_login_credential_ascii, validate_mod_sequence_valzer, validate_no_crlf,
+    validate_sasl_initial_response, validate_search_criteria_crlf, validate_sort_thread_charset,
+    write_criteria,
 };
 use crate::types::validated::MailboxName;
 
@@ -660,49 +660,20 @@ pub(super) fn encode_select_or_examine(
         // RFC 7162 Section 3.2.5.2:
         // SELECT mailbox (QRESYNC (uidvalidity modseq [known-uids [seq-match-data]]))
         // seq-match-data = "(" known-sequence-set SP known-uid-set ")"
-        // RFC 3501 Section 9: uidvalidity = nz-number (must be non-zero).
-        if params.uid_validity == 0 {
-            return Err(crate::Error::InvalidInput(
-                "QRESYNC uid_validity must be non-zero (nz-number per RFC 3501 Section 9)".into(),
-            ));
-        }
-        // mod_seq is mod-sequence-value per RFC 7162 Section 7 (>= 1, <= i64::MAX)
-        validate_mod_sequence_value(params.mod_seq, "QRESYNC mod_seq")?;
         w.raw(b" (QRESYNC (");
         w.raw(params.uid_validity.to_string().as_bytes());
         w.raw(b" ");
         w.raw(params.mod_seq.to_string().as_bytes());
-        if let Some(known_uids) = &params.known_uids {
-            // Reject CRLF to prevent command injection (RFC 3501 Section 2.2).
-            validate_no_crlf(known_uids, "QRESYNC known-uids")?;
-            // RFC 7162 Section 3.2.5.2: "*" and "$" are not allowed in known-uids.
-            // Validate via SequenceSet::new_known() which enforces this.
-            crate::types::SequenceSet::new_known(known_uids.as_str())?;
+        if let Some(known) = params.known() {
             w.raw(b" ");
-            w.raw(known_uids.as_bytes());
-        }
-        if let Some((seq_set, uid_set)) = &params.seq_match_data {
-            // RFC 7162 Section 7: The ABNF places [SP known-uids] and
-            // [SP seq-match-data] at the same nesting level, but
-            // seq-match-data is semantically meaningless without known-uids
-            // (it maps message numbers to UIDs), so we require it.
-            if params.known_uids.is_none() {
-                return Err(crate::Error::InvalidInput(
-                    "seq-match-data requires known-uids (RFC 7162 Section 3.2.5.2)".into(),
-                ));
+            w.raw(known.uids.as_str().as_bytes());
+            if let Some((seqs, uids)) = &known.seq_match {
+                w.raw(b" (");
+                w.raw(seqs.as_str().as_bytes());
+                w.raw(b" ");
+                w.raw(uids.as_str().as_bytes());
+                w.raw(b")");
             }
-            // Reject CRLF to prevent command injection (RFC 3501 Section 2.2).
-            validate_no_crlf(seq_set, "QRESYNC seq-match-data sequence set")?;
-            validate_no_crlf(uid_set, "QRESYNC seq-match-data UID set")?;
-            // RFC 7162 Section 3.2.5.2: "*" and "$" are not allowed in
-            // known-sequence-set or known-uid-set.
-            crate::types::SequenceSet::new_known(seq_set.as_str())?;
-            crate::types::SequenceSet::new_known(uid_set.as_str())?;
-            w.raw(b" (");
-            w.raw(seq_set.as_bytes());
-            w.raw(b" ");
-            w.raw(uid_set.as_bytes());
-            w.raw(b")");
         }
         w.raw(b"))");
     }

@@ -1211,12 +1211,14 @@ mod tests {
         let first = push_subscribe(Arc::clone(&control), vec![CursorScope::Account])
             .await
             .expect("first watch succeeds")
-            .handle
+            .handle()
+            .cloned()
             .expect("first subscription has a handle");
         let second = push_subscribe(Arc::clone(&control), vec![CursorScope::Account])
             .await
             .expect("second watch succeeds")
-            .handle
+            .handle()
+            .cloned()
             .expect("second subscription has a handle");
         assert_ne!(
             first, second,
@@ -1259,34 +1261,35 @@ mod tests {
         .await
         .expect("supported account scope is still subscribed");
         let handle = subscription
-            .handle
+            .handle()
+            .cloned()
             .expect("successful account scope has a watch handle");
         assert_eq!(
             script.requests().len(),
             1,
             "one account watch covers the scope"
         );
-        assert_eq!(subscription.outcomes.succeeded().len(), 1);
+        assert_eq!(subscription.outcomes().succeeded().len(), 1);
         assert_eq!(
-            subscription.outcomes.succeeded()[0].item,
+            subscription.outcomes().succeeded()[0].item,
             BatchItemId("0".to_owned())
         );
         assert_eq!(
-            subscription.outcomes.succeeded()[0].output,
+            subscription.outcomes().succeeded()[0].output,
             CursorScope::Account
         );
-        assert_eq!(subscription.outcomes.failed().len(), 1);
+        assert_eq!(subscription.outcomes().failed().len(), 1);
         assert_eq!(
-            subscription.outcomes.failed()[0].item,
+            subscription.outcomes().failed()[0].item,
             BatchItemId("1".to_owned())
         );
         assert_eq!(
-            subscription.outcomes.failed()[0].error.scope(),
+            subscription.outcomes().failed()[0].error.scope(),
             Some(&ErrorScope::Cursor(folder)),
             "the refusal names the exact unsupported scope",
         );
         assert!(matches!(
-            subscription.outcomes.failed()[0].error.kind(),
+            subscription.outcomes().failed()[0].error.kind(),
             bifrost_types::AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
         ));
 
@@ -1983,12 +1986,14 @@ mod tests {
         let old_handle = push_subscribe(Arc::clone(&old), vec![CursorScope::Account])
             .await
             .expect("old account subscribes")
-            .handle
+            .handle()
+            .cloned()
             .expect("old account subscription has a handle");
         let new_handle = push_subscribe(Arc::clone(&replacement), vec![CursorScope::Account])
             .await
             .expect("replacement subscribes")
-            .handle
+            .handle()
+            .cloned()
             .expect("replacement subscription has a handle");
 
         push_unsubscribe(Arc::clone(&old), old_handle)

@@ -214,7 +214,7 @@ impl GmailClient {
         let response = self
             .execute(
                 &url,
-                "GET",
+                reqwest::Method::GET,
                 None::<&()>,
                 bifrost_net::ReplayPolicy::Idempotent,
             )

@@ -801,9 +801,9 @@ recovery open is a fresh connection, which is safe whatever this one reached.
 
 `SelectConsumer` partitions the SELECT/EXAMINE responses once, at the last `* OK [CLOSED]` marker (RFC 7162 Section 3.2.11): everything before it belongs to the previously selected mailbox and becomes events, and the marker itself is dropped. After it, only the solicited types are consumed into the `SelectedMailbox`; among coded untagged statuses that means only a successful (`OK`) status carrying recognized selection metadata (UIDVALIDITY, UIDNEXT, PERMANENTFLAGS, HIGHESTMODSEQ, NOMODSEQ, UNSEEN, MAILBOXID, UIDNOTSTICKY). A NO/BAD status or an unrecognized code stays an event, so a warning or extension signal that arrived while the folder was opening is not swallowed. Validation and construction read the same partition. A successful selection requires a nonzero UIDVALIDITY, read from the tagged response code when present and otherwise from the last untagged one; a missing or zero value is `ProtocolMissing`. On a validation failure every response is returned as an event in its original order.
 
-`SyncSelectOptions` / `SyncSelectResult` wrap SELECT/EXAMINE with CONDSTORE and QRESYNC parameters (UIDVALIDITY, last-known MODSEQ, known UIDs, VANISHED parsed off the SELECT response).
+`select_for_sync()` takes the same `SelectOptions` (`types/request.rs`) as direct SELECT/EXAMINE, with `SelectAccess` choosing EXAMINE, and returns a `SyncSelectResult` carrying the QRESYNC outcome and the VANISHED ranges parsed off the SELECT response.
 
-`SyncFetchRequest` / `SyncFetchResult` wrap UID FETCH with `CHANGEDSINCE` and `VANISHED`; `sync_fetch()` surfaces both VANISHED ranges and per-UID FETCH responses.
+`SyncFetchRequest` / `SyncFetchResult` wrap UID FETCH; `FetchChanges::{All, Since, SinceWithVanished}` makes VANISHED without CHANGEDSINCE unrepresentable, and `sync_fetch()` surfaces both VANISHED ranges and per-UID FETCH responses.
 
 Inventory and the three change strategies deliberately do NOT refuse a
 UIDNOTSTICKY folder (only the poller does). Refusing would hide that folder's
@@ -846,7 +846,7 @@ Submodules:
 - `envelope.rs` - `FolderCursor` (QResync/Condstore/Basic) plus `encode_cursor`/`decode_cursor` over `OpaqueChangeState`.
 - `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group. `mod.rs` holds `route_scope`/`ScopeHandler`; typed legacy DAV scopes dispatch by object type, while per-collection DAV folder scopes dispatch through `DavScopeIndex`. `FolderId` carries no protocol namespace and IMAP mailbox names are arbitrary strings, so the index is built once at open and made unambiguous there: a collection href equal to a known IMAP mailbox name is not indexed (the mailbox keeps its scope), and a href claimed by both sub-accounts is not indexed (the tie is never resolved silently in favour of contacts). Both exclusions are reported as classified open-time skips, so a dropped entry routes to IMAP or to `Unsupported` rather than syncing the wrong collection quietly. Push admission consults the same index: an indexed DAV collection scope is a syntactically valid mailbox name but names no mailbox, so it is refused per-item (the DAV sub-accounts have no push lane) instead of being reported as pushed and burning a push slot on a folder no worker can SELECT. `scopes.rs` holds the discovery fan-in.
 - `pim.rs` - Stage 1 mail actions: container membership, keyword/read mutations, search, folder CRUD, quota, draft create/discard, message/thread hydration, IMAP-specific thread move/delete conveniences.
-- `sieve.rs` - optional ManageSieve client plus Stage 2 literal script filter list/create/update/delete/validate.
+- `sieve.rs` - Stage 2 literal script filter list/create/update/delete/validate adapter for the sibling `crate::sieve` protocol client.
 
 ### CONDSTORE / QRESYNC strategy
 
@@ -883,7 +883,7 @@ Runtime downgrades:
 
 - A QResync-cursor run whose SELECT did not use QRESYNC (`QresyncOutcome` other than `Used`) is validated as usual (UIDVALIDITY, NOMODSEQ, MODSEQ reset) and continues as CONDSTORE on the SAME checkout (`run_condstore_from_selected`), with one `StrategyDowngraded` warning naming the reason. The policy is not withdrawn for one member's shortfall. Every CONDSTORE run mints its next cursor through `cursor_from_select`, the policy-based rule inventory uses, so a member that could not do QRESYNC never demotes the folder for good: with the policy set and persistent MODSEQ, the checkpoint is a QResync cursor at the SELECT's HIGHESTMODSEQ over the complete UID SEARCH snapshot.
 - A QRESYNC SELECT response that fails to parse calls `disable_qresync_for_session()` (one-shot), discards the suspect pooled connection, and retries on CONDSTORE.
-- A legacy QRESYNC cursor lacking a complete UID baseline (`known_uids_complete == false`) cannot be diffed against consumer state. It terminates with `CursorInvalid`, deriving `RestartScope`, so bifrost-sync deletes the cursor and re-establishes exact membership through inventory. Current server membership is never substituted for the missing historical baseline.
+- A legacy QRESYNC cursor lacking a complete UID baseline (`UidBaseline::Legacy`) cannot be diffed against consumer state. It terminates with `CursorInvalid`, deriving `RestartScope`, so bifrost-sync deletes the cursor and re-establishes exact membership through inventory. Current server membership is never substituted for the missing historical baseline.
 - A mailbox that answers a QRESYNC or CONDSTORE SELECT with `[NOMODSEQ]` finishes as Basic on the connection it already holds. That SELECT carried changed-message FETCH data, so the Basic run consumes it under the classification above rather than discarding the flag updates it describes.
 - VANISHED and FETCH may report the same UID on non-conformant servers; the change stream de-duplicates so a message never surfaces as both expunge and update.
 
@@ -1083,7 +1083,7 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
 `bifrost-imap` depends on `bifrost-smtp` (feature `tokio`; `account-error` is a
 default feature). SMTP has no path back to IMAP, so this is acyclic.
 
-With `ImapAccountConfig::with_manage_sieve(ManageSieveConfig)`, IMAP advertises `filter_rule_shape: Scripts` and all five filter flags true; `sieve.rs` speaks ManageSieve over implicit TLS / STARTTLS / plaintext, reuses the account credentials with SASL PLAIN or XOAUTH2, and maps scripts to `FilterScript { language: Sieve }`. Without it, filter flags stay false and calls return `Unsupported`.
+With `ImapAccountConfig::with_manage_sieve(ManageSieveConfig)`, IMAP advertises `filter_rule_shape: Scripts` and all five filter flags true; `crate::sieve` speaks ManageSieve over implicit TLS / STARTTLS / plaintext, reuses the account credentials with SASL PLAIN or XOAUTH2, and maps scripts to `FilterScript { language: Sieve }`. Without it, filter flags stay false and calls return `Unsupported`.
 
 With `with_carddav(CardDavConfig)` / `with_caldav(CalDavConfig)`, IMAP opens a sibling `bifrost-carddav` / `bifrost-caldav` account at factory open and delegates the contact / calendar PIM primitives to it. Directory lookup and
 its `directory_search` / `directory_enumerate` capabilities forward from the
@@ -1422,7 +1422,14 @@ The scope readers inside `classify_response_code` (`resource_from_scope`, `id_fr
 
 The engine records a folder-scoped `[LIMIT]` as `ThrottleKey::Mailbox { account, mailbox }` over the folder's name, and reaches the work it should hold only through `Account::throttle_keys`: `ImapAccount` declares that same key for a folder scope (`ThrottleWork::Scope`, routed through `route_scope`, so a composed DAV collection answers for its sub-account and never as a mailbox), for each object in the folder (`ThrottleWork::Objects`, the folder decoded from the versioned object id) and for a folder membership that is not DAV-owned (`ThrottleWork::Membership`, a move destination or source). Every arm builds the key from the same `MailboxName::account_id()` `with_folder_scope` scopes the error with, so the recorded hold and the held work meet; `every_work_shape_on_a_folder_declares_the_key_its_limit_records` pins it. Before this declaration existed, the engine had no scope-to-mailbox mapping and a recorded per-folder hold reached no wait site at all.
 
-ManageSieve carries its own response-code vocabulary (RFC 5804 1.3), parsed into `SieveResponseCode` and surfaced as `Error::Sieve { code, message }` - deliberately NOT folded into the IMAP `ResponseCode`, since recording a code the server never sent would corrupt the wire evidence support exports exist to preserve. The code rides out as `native_code`. `split_response_code` lifts the parenthesized code off the status line BEFORE the human-readable string, which is the ordering RFC 5804 specifies and the step whose absence caused the original defect: the code stayed inside the message as opaque text, so every rejection reached `fallback_status` and derived terminal `ProviderRefused`.
+ManageSieve carries its own response-code vocabulary (RFC 5804 1.3), parsed into `SieveResponseCode` and surfaced as `sieve::Error::Sieve { code, message }` - deliberately NOT folded into the IMAP `ResponseCode`, since recording a code the server never sent would corrupt the wire evidence support exports exist to preserve. The code rides out as `native_code`. `split_response_code` lifts the parenthesized code off the status line BEFORE the human-readable string, which is the ordering RFC 5804 specifies and the step whose absence caused the original defect: the code stayed inside the message as opaque text, so every rejection reached `fallback_status` and derived terminal `ProviderRefused`.
+
+`account::error::sieve_account_error` maps the sibling protocol error at the
+account boundary. Its own error enum retains transport, token lookup, SASL and
+mechanism evidence; the IMAP root error enum carries no ManageSieve status.
+The shared account translation finalizer applies the same context and attempt
+rules to both protocols. The filter adapter keeps all five operations and
+the existing CHECKSCRIPT diagnostics behavior.
 
 `classify_sieve` overrides that default only where it is actively wrong: `TRYLATER` -> `Server(Unavailable)` (retryable - it explicitly asks to be retried, and was previously permanent), `QUOTA[/MAXSCRIPTS|/MAXSIZE]` -> `Server(QuotaExhausted)` + account throttle, `NONEXISTENT` -> `NotFound(Filter)`, `ALREADYEXISTS` -> `ConcurrencyConflict`, `ACTIVE` -> `Request(Malformed)` (a precondition the caller must satisfy), `AUTH-TOO-WEAK` / `ENCRYPT-NEEDED` -> `Authorization(PolicyBlocked)`, `TRANSITION-NEEDED` / `SASL` -> `Authentication(ReauthorizationRequired)`, `REFERRAL` -> `Unsupported(op)`. An absent, advisory (`WARNINGS`, `TAG`), or unmodelled extension code keeps the terminal default - "the server refused and did not say why" - and `Other(_)` preserves the raw spelling for diagnostics.
 
@@ -1479,7 +1486,7 @@ Push always dials fresh and never adopts or parks a data member. A previously se
 
 Acquisition has two phases. During the capacity wait, subscription changes re-choose the assignment while preserving the same pending reservation, or drop it if no folder remains. During dial and authentication, only shutdown and cancellation interrupt; a subscription change never wastes a dial, and the assignment is re-chosen before SELECT. A session that waited for either a push slot or shared capacity publishes a per-folder invalidation after SELECT and NOTIFY handling for its selected folder and, if registration succeeded, every other watched folder. Immediate acquisition emits no coverage invalidation. The invalidation compensates for the latency window the wait stretched (polling already covers it; bifrost-sync never suppresses polling on push coverage); same-session re-IDLE does not emit it. A wait, and so this invalidation, is routine in two accepted places: a reassignment redial usually waits for its own previous session's LOGOUT tail and publishes right after the account-wide `Unknown` of the interrupt (redundant, harmless), and a first push session opened while discovery and inventory hold every data session publishes right after subscribe.
 
-Admission is per scope, under the same lock as the insert, so two concurrent subscribes cannot both take the last slot. A folder already pushed costs no new session and is always admitted; without NOTIFY, a new distinct folder is admitted in request order while `covered.len() < push_capacity`; nothing is admitted at zero push capacity. Admission accepts exactly what worker assignment can watch: a folder scope whose name fails `MailboxName::new` (NUL/CR/LF) is refused into the failed lane, because `subscribed_idle_folders` drops such names and admitting one would report it as pushed while burning a slot on a mailbox no worker can SELECT. Every admitted folder always has a worker, because without NOTIFY admission caps the admitted set at the push capacity, which is also the worker count - but the folder-to-slot *index* is recomputed lexically from the whole subscribed set on every wake, so a folder's slot number is not stable across subscription changes even though its coverage is. When push capacity is exhausted, `push_subscribe` puts excess scopes in `PushSubscription.outcomes.failed` as `Unsupported(PushSubscribe)` carrying budget-specific diagnostic text; a subscribe that accepts nothing returns no handle. bifrost-sync records only the succeeded scopes and keeps the rest in the polling lane - it never suppresses polling on push coverage, which is what keeps a refused folder visible. Unsubscribe frees a folder slot once its last handle leaves.
+Admission is per scope, under the same lock as the insert, so two concurrent subscribes cannot both take the last slot. A folder already pushed costs no new session and is always admitted; without NOTIFY, a new distinct folder is admitted in request order while `covered.len() < push_capacity`; nothing is admitted at zero push capacity. Admission accepts exactly what worker assignment can watch: a folder scope whose name fails `MailboxName::new` (NUL/CR/LF) is refused into the failed lane, because `subscribed_idle_folders` drops such names and admitting one would report it as pushed while burning a slot on a mailbox no worker can SELECT. Every admitted folder always has a worker, because without NOTIFY admission caps the admitted set at the push capacity, which is also the worker count - but the folder-to-slot *index* is recomputed lexically from the whole subscribed set on every wake, so a folder's slot number is not stable across subscription changes even though its coverage is. When push capacity is exhausted, `push_subscribe` puts excess scopes in `PushSubscription::outcomes().failed()` as `Unsupported(PushSubscribe)` carrying budget-specific diagnostic text; a subscribe that accepts nothing returns no handle. bifrost-sync records only the succeeded scopes and keeps the rest in the polling lane - it never suppresses polling on push coverage, which is what keeps a refused folder visible. Unsubscribe frees a folder slot once its last handle leaves.
 
 Assignment changes use a latched watch version marked seen before choosing,
 so changes during setup remain visible to the first IDLE round. Capacity
@@ -1646,8 +1653,9 @@ crates/imap/src/
 |   |-- pim.rs             - unified PIM primitives + conveniences
 |   |-- pool.rs            - per-folder connection checkout
 |   |-- push.rs            - IDLE-driven push sessions
-|   |-- sieve.rs           - ManageSieve script filters
+|   |-- sieve.rs           - account filter adapter
 |   `-- scopes.rs          - folder discovery, lifecycle stream
+|-- sieve.rs         - ManageSieve client, framing, transport, SASL and own Error
 |-- types/           - internal protocol types plus public Credentials / AuthPolicy
 `-- error.rs         - internal Error, ErrorCategory, Recovery
 ```
@@ -1945,3 +1953,55 @@ names only for support diagnostics. No SCRAM token is recovered from prose and
 no IMAP response code is fabricated for a SCRAM refusal. The cancellation drain
 preserves a typed SCRAM refusal rather than replacing it with a generic tagged
 NO. OAuth token lookup classification remains owned by bifrost-net.
+
+## Decoder ownership and routing tables
+
+Direct untagged response dispatch in `codec/decode/response.rs` owns both
+keyword recognition and parser commitment. Numbered responses retain a separate
+open FETCH path. Each FETCH attribute parser chooses its failure policy at its
+own match arm; ENVELOPE and BODYSTRUCTURE retain fixed-prefix validation and
+unknown attributes retain the extension skip path. FETCH MODSEQ deliberately
+keeps malformed numeric values absent while preserving UID and FLAGS: an
+enterprise user expects usable message observations to survive optional
+concurrency metadata. Broken MODSEQ delimiters still fail the recognized parse.
+
+Numeric parsers report committed `TooLarge` failures for overflow, so list
+combinators cannot hide an overflowing later member. Response-code recovery uses
+that parser evidence to retain the opaque code instead of maintaining a second
+list of code names and widths. The number64 ceiling uses `ModSeq::MAX`.
+
+`codec/classification.rs` owns solicited response owner sets. Classification
+and pipeline routing keys consume the same sets; keys are connected components
+restricted to pipelinable commands. STATUS still correlates mailbox identity.
+Both owner selection and unsolicited classification exhaustively match response
+variants. `types/profile.rs::rev2_baseline_includes` exhaustively classifies
+capabilities; the capability matrix tests consume that production decision.
+
+## Validated sync requests
+
+`types/request.rs` owns SELECT options and QRESYNC operands, plus the sync UID
+FETCH request. Account and direct selection share `SelectOptions`; `SelectAccess`
+names SELECT versus EXAMINE. Account callers still choose `SelectPurpose`, so
+only changes reads attach cached QRESYNC state.
+
+`QresyncParams` retains `UidValidity` and `ModSeq` through encoding. Its private
+known-UID payload contains finite validated sets; sequence-match data can only
+be attached after known UIDs. Validation happens at request construction rather
+than by reparsing generated command operands in admission and encoding. Live
+ENABLE state remains an admission check. `FetchChanges` carries All, Since, or
+SinceWithVanished, so VANISHED cannot lack its modification sequence.
+
+`ModSeq::new` admits only 1 through `ModSeq::MAX` (the RFC 7162 63-bit ceiling).
+`ModSeqValzer` owns the same ceiling with zero admitted for UNCHANGEDSINCE.
+Selected-mailbox `modseq()` refuses observations outside that positive range.
+Raw response observations and persisted cursor numeric layout are unchanged.
+
+QRESYNC cursor baselines are `UidBaseline::Complete(set)` or `Legacy(set)`.
+Legacy sets are retained for lossless cursor round-trips but refused before
+checkout; only an extracted complete set enters the QRESYNC runner. The current
+completeness byte and both historical cursor layouts retain their meaning.
+Enterprise users need re-inventory when historical membership is unavailable,
+rather than a comparison against invented history.
+
+Raw reads name their UID policy with `blob::UidPersistence`: Session for account
+reads and Sticky for polling references retained across selections.

@@ -209,7 +209,6 @@ impl AccountFactory for JmapAccountFactory {
             let SeededOpenState {
                 seed_states,
                 email_states,
-                mailbox_states,
                 lifecycle_mailbox_states,
                 mailbox_names,
                 primary_id,
@@ -271,7 +270,6 @@ impl AccountFactory for JmapAccountFactory {
                 ws,
                 shutdown,
                 email_states,
-                mailbox_states,
                 lifecycle_mailbox_states,
                 mailbox_names,
             );
@@ -289,9 +287,9 @@ impl AccountFactory for JmapAccountFactory {
 /// (shared/delegate) mail account.
 struct SeededOpenState<Tr: HttpTransport> {
     seed_states: HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
-    email_states: HashMap<String, Option<String>>,
-    mailbox_states: HashMap<String, Option<String>>,
-    lifecycle_mailbox_states: HashMap<String, Option<String>>,
+    email_states: HashMap<String, Option<crate::core::id::ObjectState<crate::email::Email>>>,
+    lifecycle_mailbox_states:
+        HashMap<String, Option<crate::core::id::ObjectState<crate::mailbox::Mailbox>>>,
     mailbox_names: HashMap<String, String>,
     primary_id: String,
     foreign_mail: HashMap<String, JmapMailAccount<Tr>>,
@@ -330,14 +328,17 @@ async fn validate_and_seed<Tr: HttpTransport>(
     let mut seed_states = HashMap::new();
     seed_states.insert(
         CursorScope::Type(ObjectType::Email),
-        state::encode_for_scope(&CursorScope::Type(ObjectType::Email), email_state.clone())
-            .expect("static email cursor scope is supported"),
+        state::encode_for_scope(
+            &CursorScope::Type(ObjectType::Email),
+            email_state.clone().into_string(),
+        )
+        .expect("static email cursor scope is supported"),
     );
     seed_states.insert(
         CursorScope::Type(ObjectType::Mailbox),
         state::encode_for_scope(
             &CursorScope::Type(ObjectType::Mailbox),
-            mailbox_state.clone(),
+            mailbox_state.clone().into_string(),
         )
         .expect("static mailbox cursor scope is supported"),
     );
@@ -346,10 +347,11 @@ async fn validate_and_seed<Tr: HttpTransport>(
     // the same maps every foreign account does - no primary-vs-
     // foreign branch in the cache itself.
     let primary_id = mail.id_str().to_string();
-    let mut email_states: HashMap<String, Option<String>> = HashMap::new();
-    let mut mailbox_states: HashMap<String, Option<String>> = HashMap::new();
+    let mut email_states: HashMap<
+        String,
+        Option<crate::core::id::ObjectState<crate::email::Email>>,
+    > = HashMap::new();
     email_states.insert(primary_id.clone(), Some(email_state.clone()));
-    mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
     let mut lifecycle_mailbox_states = HashMap::new();
     lifecycle_mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
 
@@ -402,13 +404,7 @@ async fn validate_and_seed<Tr: HttpTransport>(
     for (foreign_id, foreign_account, result) in foreign_results {
         match result {
             Ok(seed) => {
-                apply_foreign_seed(
-                    &foreign_id,
-                    seed,
-                    &mut seed_states,
-                    &mut email_states,
-                    &mut mailbox_states,
-                );
+                apply_foreign_seed(&foreign_id, seed, &mut seed_states, &mut email_states);
                 if account_advertises_submission(&session, &foreign_id) {
                     foreign_submission.insert(foreign_id.clone());
                 }
@@ -427,7 +423,6 @@ async fn validate_and_seed<Tr: HttpTransport>(
     Ok(SeededOpenState {
         seed_states,
         email_states,
-        mailbox_states,
         lifecycle_mailbox_states,
         mailbox_names,
         primary_id,
@@ -710,8 +705,7 @@ fn foreign_mail_account_ids(
 struct ForeignSeed {
     /// The foreign account's `Email/changes` state: the seed for its one
     /// account-level `Folder` cursor scope.
-    email_state: String,
-    mailbox_state: String,
+    email_state: crate::core::id::ObjectState<crate::email::Email>,
 }
 
 /// Probe one foreign account's `Email` / `Mailbox` states. Mirrors the
@@ -720,15 +714,12 @@ struct ForeignSeed {
 async fn seed_foreign_account<T: HttpTransport>(
     mail: &JmapMailAccount<T>,
 ) -> crate::Result<ForeignSeed> {
-    let (email_state, mailbox_state, _mailbox_names) = seed_account_state(mail).await?;
-    Ok(ForeignSeed {
-        email_state,
-        mailbox_state,
-    })
+    let (email_state, _mailbox_state, _mailbox_names) = seed_account_state(mail).await?;
+    Ok(ForeignSeed { email_state })
 }
 
 /// Register one successfully probed foreign account: its per-accountId
-/// state-cache entries plus exactly ONE seeded cursor scope - the
+/// Email state-cache entry plus exactly ONE seeded cursor scope - the
 /// account-level `Folder` scope, seeded from the account's Email state.
 ///
 /// One scope per account, never one per mailbox: `Email/changes` is
@@ -739,15 +730,13 @@ fn apply_foreign_seed(
     foreign_id: &str,
     seed: ForeignSeed,
     seed_states: &mut HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
-    email_states: &mut HashMap<String, Option<String>>,
-    mailbox_states: &mut HashMap<String, Option<String>>,
+    email_states: &mut HashMap<String, Option<crate::core::id::ObjectState<crate::email::Email>>>,
 ) {
     let scope = CursorScope::Folder(foreign::encode_foreign_account(foreign_id));
-    let encoded = state::encode_for_scope(&scope, seed.email_state.clone())
+    let encoded = state::encode_for_scope(&scope, seed.email_state.clone().into_string())
         .expect("the account-level foreign scope always carries the codec separator");
     seed_states.insert(scope, encoded);
     email_states.insert(foreign_id.to_string(), Some(seed.email_state));
-    mailbox_states.insert(foreign_id.to_string(), Some(seed.mailbox_state));
 }
 
 /// Seed one foreign account, or turn its probe failure into the
@@ -857,11 +846,15 @@ async fn batched_open_probes<T: HttpTransport>(
 /// shared-account paths use exactly the same request shape.
 async fn seed_account_state<T: HttpTransport>(
     mail: &JmapMailAccount<T>,
-) -> crate::Result<(String, String, HashMap<String, String>)> {
+) -> crate::Result<(
+    crate::core::id::ObjectState<crate::email::Email>,
+    crate::core::id::ObjectState<crate::mailbox::Mailbox>,
+    HashMap<String, String>,
+)> {
     let (email, mailboxes) = open_probes(mail).await?;
 
     let email_state = email.into_state();
-    let mailbox_state = mailboxes.state().to_string();
+    let mailbox_state = mailboxes.state().clone();
     let mut mailbox_names = HashMap::new();
     for mut mailbox in mailboxes.into_list() {
         let id = mailbox.take_id();
@@ -1098,7 +1091,7 @@ mod tests {
                 return Ok(body);
             }
             if status.is_redirection() {
-                return Err(TransportError::with_body(format!("HTTP {status}"), body));
+                return Err(TransportError::with_body(status, body));
             }
             let final_response = bifrost_net::FinalResponse {
                 status,
@@ -1354,12 +1347,12 @@ mod tests {
     }
 
     fn state_map(entries: &[(&str, &str)]) -> crate::sync::state_cache::StateMap {
-        Arc::new(tokio::sync::Mutex::new(
+        crate::sync::state_cache::seeded(
             entries
                 .iter()
-                .map(|(account, state)| ((*account).to_string(), Some((*state).to_string())))
+                .map(|(account, state)| ((*account).to_string(), Some((*state).into())))
                 .collect(),
-        ))
+        )
     }
 
     fn idempotency_key() -> IdempotencyKey {
@@ -1935,14 +1928,7 @@ mod tests {
 
         let mut seed_states = HashMap::new();
         let mut email_states = HashMap::new();
-        let mut mailbox_states = HashMap::new();
-        apply_foreign_seed(
-            "shared",
-            seed,
-            &mut seed_states,
-            &mut email_states,
-            &mut mailbox_states,
-        );
+        apply_foreign_seed("shared", seed, &mut seed_states, &mut email_states);
 
         assert_eq!(
             seed_states.len(),
@@ -1967,14 +1953,7 @@ mod tests {
             seeded_state, "email-s",
             "the account scope is seeded from the account's Email state"
         );
-        assert_eq!(
-            email_states.get("shared"),
-            Some(&Some("email-s".to_string()))
-        );
-        assert_eq!(
-            mailbox_states.get("shared"),
-            Some(&Some("mailbox-s".to_string()))
-        );
+        assert_eq!(email_states.get("shared"), Some(&Some("email-s".into())));
     }
 
     /// The account-level foreign scope inventories the WHOLE account: one
@@ -2487,10 +2466,10 @@ mod tests {
             .expect("primary mail account");
         let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
         let foreign_id = ObjectId(foreign::encode_object("shared", "M9"));
-        let states = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+        let states = crate::sync::state_cache::seeded(HashMap::from([(
             "shared".to_string(),
-            Some("shared-state".to_string()),
-        )])));
+            Some("shared-state".into()),
+        )]));
         let targets = Box::pin(futures::stream::iter([foreign_id.clone()]));
         let mut stream = crate::sync::mutation::set_flags(
             primary,
@@ -2571,10 +2550,10 @@ mod tests {
         )]);
         let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
         let foreign_id = ObjectId(foreign::encode_object("shared", "M9"));
-        let states = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+        let states = crate::sync::state_cache::seeded(HashMap::from([(
             "shared".to_string(),
-            Some("shared-state".to_string()),
-        )])));
+            Some("shared-state".into()),
+        )]));
 
         crate::sync::pim::set_keyword(
             shared,
@@ -3344,7 +3323,6 @@ mod tests {
             cursor,
             None,
             state_map(&[("primary", "s1")]),
-            state_map(&[("primary", "s1")]),
         );
 
         match stream.next().await {
@@ -3412,7 +3390,6 @@ mod tests {
                 limits,
                 cursor,
                 None,
-                state_map(&[("primary", "s1")]),
                 state_map(&[("primary", "s1")]),
             );
             match stream.next().await {

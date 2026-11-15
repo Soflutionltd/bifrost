@@ -21,8 +21,8 @@ pub(crate) struct TransportError {
     /// limit tripped while reading a response. Authoritative over the
     /// no-`net` fallback: without it, a local failure fell through to
     /// `Transport(Network)` and was retried as a network fault forever.
-    /// Only the dedicated constructors set it, so a passed-through 3xx
-    /// (`with_body`) or a test stub's missing reply keeps the fallback.
+    /// Only the dedicated constructors set it. HTTP refusals retain net
+    /// status evidence; a test stub's missing reply keeps the fallback.
     pub(crate) local: Option<LocalFailure>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
@@ -60,7 +60,10 @@ impl TransportError {
     // No status or transmission evidence can be inferred from this message.
     // Preserve this custom-transport door until the account error boundary
     // supports an explicit unknown-provenance failure; inventing net evidence
-    // here would mislead retry and partial-commit decisions.
+    // here would mislead retry and partial-commit decisions. The shared
+    // TransportErrorKind and TransportKind vocabularies have only Network,
+    // Timeout and Tls; none represents unknown provenance. Replacing this
+    // fallback requires that shared owner, not message parsing in JMAP.
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -84,14 +87,13 @@ impl TransportError {
         }
     }
 
-    pub(crate) fn with_body(message: impl Into<String>, body: impl Into<Bytes>) -> Self {
-        Self {
-            message: message.into(),
-            body: Some(body.into()),
-            net: None,
-            local: None,
-            source: None,
-        }
+    /// A received HTTP refusal, with its status retained as evidence.
+    pub(crate) fn with_body(status: reqwest::StatusCode, body: impl Into<Bytes>) -> Self {
+        Self::from_net(bifrost_net::Error::Status {
+            code: status,
+            body: body.into(),
+            headers: reqwest::header::HeaderMap::new(),
+        })
     }
 
     /// A local state this crate believes impossible by construction, raised

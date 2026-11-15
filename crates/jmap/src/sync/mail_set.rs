@@ -16,7 +16,7 @@ type MailAccount<T> = crate::account::Account<T>;
 pub(super) enum Guard<'a> {
     Unconditional,
     Replacement,
-    Exact(&'a str),
+    Exact(&'a crate::core::id::ObjectState<Email>),
 }
 
 impl Guard<'_> {
@@ -34,12 +34,12 @@ pub(super) async fn execute<T: HttpTransport>(
 ) -> crate::Result<crate::core::set::SetResponse<Email>> {
     let state = match guard {
         Guard::Unconditional => None,
-        Guard::Exact(state) => Some(state.to_owned()),
+        Guard::Exact(state) => Some(state.clone()),
         Guard::Replacement => Some(current_or_probe_state(mail, email_states, account_id).await?),
     };
     let set = make_set()?;
-    let set = match state.as_deref() {
-        Some(state) => set.if_in_state(state.to_owned()),
+    let set = match state {
+        Some(state) => set.if_in_state(state),
         None => set,
     };
     let first = mail.call(set).await;
@@ -47,10 +47,10 @@ pub(super) async fn execute<T: HttpTransport>(
         Err(error)
             if matches!(guard, Guard::Replacement) && super::error::is_state_mismatch(&error) =>
         {
-            let expected = state_cache::get(email_states, account_id).await;
+            let expected = state_cache::guard(email_states, account_id).await;
             let fresh = probe_email_state(mail).await?;
             let fresh =
-                state_cache::publish_probe(email_states, account_id, expected.as_deref(), fresh)
+                state_cache::observe_probe(email_states, account_id, expected.as_ref(), fresh)
                     .await;
             mail.call(make_set()?.if_in_state(fresh)).await?
         }
@@ -102,17 +102,17 @@ async fn current_or_probe_state<T: HttpTransport>(
     mail: &MailAccount<T>,
     email_states: &StateMap,
     account_id: &str,
-) -> crate::Result<String> {
-    if let Some(state) = state_cache::get(email_states, account_id).await {
+) -> crate::Result<crate::core::id::ObjectState<Email>> {
+    if let Some(state) = state_cache::guard(email_states, account_id).await {
         return Ok(state);
     }
     let state = probe_email_state(mail).await?;
-    Ok(state_cache::publish_probe(email_states, account_id, None, state).await)
+    Ok(state_cache::observe_probe(email_states, account_id, None, state).await)
 }
 
 pub(crate) async fn probe_email_state<T: HttpTransport>(
     mail: &MailAccount<T>,
-) -> crate::Result<String> {
+) -> crate::Result<crate::core::id::ObjectState<Email>> {
     Ok(mail
         .call(EmailGet::new().ids(Vec::<EmailId>::new()))
         .await?

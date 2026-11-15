@@ -1,3 +1,4 @@
+use crate::core::id::SessionState as SessionStateToken;
 use std::collections::HashMap;
 
 use serde::Deserialize;
@@ -11,7 +12,7 @@ use super::request::CallHandle;
 #[derive(Debug)]
 pub(crate) struct Response {
     raw: Vec<(String, RawCallResult, String)>,
-    session_state: String,
+    session_state: SessionStateToken,
     created_ids: Option<HashMap<String, String>>,
 }
 
@@ -97,7 +98,8 @@ impl Response {
                         actual: method_name,
                     });
                 }
-                let mut response = serde_json::from_str(raw.get()).map_err(crate::Error::from)?;
+                let mut response = serde_json::from_str(raw.get())
+                    .map_err(|source| crate::Error::ResultDecode { call_id, source })?;
                 M::stamp_response(&mut response, context);
                 Ok(response)
             }
@@ -105,7 +107,7 @@ impl Response {
         }
     }
 
-    pub(crate) fn session_state(&self) -> &str {
+    pub(crate) fn session_state(&self) -> &SessionStateToken {
         &self.session_state
     }
 
@@ -128,7 +130,7 @@ impl Response {
     pub(crate) fn from_frame_parts(
         method_responses: &serde_json::value::RawValue,
         created_ids: Option<HashMap<String, String>>,
-        session_state: String,
+        session_state: SessionStateToken,
     ) -> Result<Self, serde_json::Error> {
         let calls: Vec<(String, Box<serde_json::value::RawValue>, String)> =
             serde_json::from_str(method_responses.get())?;
@@ -174,7 +176,7 @@ impl<'de> Deserialize<'de> for Response {
             #[serde(rename = "createdIds")]
             created_ids: Option<HashMap<String, String>>,
             #[serde(rename = "sessionState")]
-            session_state: String,
+            session_state: SessionStateToken,
         }
 
         let envelope = RawEnvelope::deserialize(deserializer)?;

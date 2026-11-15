@@ -98,15 +98,15 @@ async fn run_raw(
         decoded.uid,
         AccountOperation::OpenRawRfc822,
         RAW_FETCH_BUDGET,
-        false,
+        UidPersistence::Session,
         tx,
     )
     .await?;
     match outcome {
         RawFetchOutcome::Delivered => Ok(()),
-        RawFetchOutcome::NotSticky => {
-            unreachable!("this lane passes refuse_not_sticky = false")
-        }
+        RawFetchOutcome::NotSticky => Err(BlobError::Imap(crate::Error::Protocol(
+            "raw read unexpectedly refused session-local UIDs".into(),
+        ))),
         // The server completed the FETCH without answering for the UID: the
         // message was expunged after the caller learned its id. Completing
         // the stream with zero batches presented that as an empty message.
@@ -164,6 +164,15 @@ pub(super) enum RawFetchOutcome {
     NotSticky,
 }
 
+/// Polling retains references between selections and therefore needs sticky
+/// UIDs. A raw account read can use the current selection's UID epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(super) enum UidPersistence {
+    Session,
+    Sticky,
+}
+
 fn missing_body(uid: u32) -> crate::Error {
     crate::Error::Protocol(format!(
         "FETCH answered for UID {uid} without its whole BODY[] section"
@@ -190,7 +199,7 @@ pub(super) async fn run_fetch(
     uid: u32,
     op: AccountOperation,
     budget: usize,
-    refuse_not_sticky: bool,
+    persistence: UidPersistence,
     tx: &tokio::sync::mpsc::Sender<SyncEvent<Bytes>>,
 ) -> Result<RawFetchOutcome, BlobError> {
     let attr = FetchAttr::BodySection {
@@ -229,7 +238,7 @@ pub(super) async fn run_fetch(
         }
         Err(err) => return Err(err.into()),
     };
-    if refuse_not_sticky && selected.mailbox.uid_not_sticky {
+    if persistence == UidPersistence::Sticky && selected.mailbox.uid_not_sticky {
         return Ok(RawFetchOutcome::NotSticky);
     }
     let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;

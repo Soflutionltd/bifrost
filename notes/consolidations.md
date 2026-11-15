@@ -209,16 +209,6 @@ the canonical refusal (`caps.pim_methods.gate(AccountOperation::X)?`,
 method once and generating the flag field, the operation variant and the
 default refusal.
 
-## CON-009 - Which throttle budget does this work consume, and which does this error stamp?
-
-**Reported by:** types.
-
-An implementation must declare in `throttle_keys` every budget its errors
-stamp. Google mints the same budget at `client.rs` (quota project) and again in
-`error.rs::translate_net_error` from the `LocalHold` key string; Graph mints in
-`client.rs`. Owner: a per-crate budget constructor used by both the declaration
-and the stamp, so the pairing is structural.
-
 ## CON-010 - How are a composite account's capabilities merged?
 
 **Reported by:** types.
@@ -260,24 +250,17 @@ rule.
 
 **Reported by:** sync-engine (sites already disagree).
 
-Recorders: `recovery::record_throttle_parts` (budgets win, mailbox gets a 1s
-fallback, otherwise a hint is required); `recovery::record_repair_throttle`
-(also fires on `RetryReason::RateLimited` or `ReconcileReason::ThrottledMidFlight`
-with no scope or hint, returns a local deadline with a 1s fallback);
-`bulk.rs::record_error_throttle` (walks `error.throttle_observations()` per leg,
-while `classify_item_outcome` separately records the primary leg - "max
-deadlines make that duplicate harmless"); the push lanes and lifecycle reader
-through `record_throttle`. So whether a partial commit's sibling-leg throttle is
-honoured depends on which lane saw the error: campaigns record every leg; the
-poll loop, reconciler, repair and push lanes only the primary.
+The engine half landed in wave 13: `AccountError::throttle_holds()` and
+`HoldTarget` in bifrost-types cover every leg, and `ThrottleBucket::observe()`
+(which owns its lock) is the one engine recorder. Residue is the cross-crate
+bridge. The wave 13 fixer's reading, with evidence: bifrost-net should own HTTP
+provider holds (Google records through `shared_hold` and installs `hold_gate`,
+and net gates requests before the engine observes the error), while the engine
+keeps account, mailbox and non-HTTP holds. The bridge between them is not
+built, so a net local-hold error is still recorded into the engine bucket a
+second time.
 
-Owner: `bifrost-types`, `AccountError::throttle_holds() -> Vec<(HoldTarget,
-RetryHint)>` covering every leg, budgets and scope lifting, reducing the engine
-to `ThrottleBucket::observe(account, &error) -> Option<Instant>`. Also make
-`ThrottleBucket` own its lock instead of free functions over
-`&std::sync::Mutex<ThrottleBucket>`.
-
-Cross-crate question to settle: `bifrost-net` has its own hold store
+The original question: `bifrost-net` has its own hold store
 (`SharedHold` and `hold_gate`, string-keyed, `HoldKind::{RateLimited,
 QuotaExhausted}`, used by Google), and the engine has `ThrottleBucket` (keyed by
 `ThrottleKey`, used through stamped budgets by Graph and IMAP). Both answer "is
@@ -404,21 +387,6 @@ becomes an orphan, and log. Only the unwind path records throttle holds
 `SubscriptionTeardown` service on the registry, with "delete, settle or orphan,
 record holds" as one operation.
 
-## CON-022 - Ledger mutation: apply then persist, or persist then commit?
-
-**Reported by:** sync-engine.
-
-Inside `ack_writer` the in-memory ledger is mutated two ways. Mutated in place
-and kept even if `put_ledger` fails: `RecordDebt`, `RecordBarrier`, `ResetScope`,
-`ResetAccountForSchemaRecovery`, the discard passes. Cloned, persisted, and
-replaced only on success: `CrossWaivedBarriers`, `OperatorDecision`,
-`ApplyRepair`. The split is defensible (debt is monotone and must not be lost;
-policy must not take effect unpersisted), but each arm decides it independently,
-and `persist_ack_request` mutates in place before an `apply_transition` that can
-fail. Owner: make the rule a type - `ledger.accrue(..)` for monotone, sticky
-debt; `ledger.stage(..) -> Staged` for policy and proof, committed by the
-successful write. The read-side divergence this causes is BUG-008.
-
 ## CON-024 - What does an inventory front end do with one page?
 
 **Reported by:** sync-lanes (sites already disagree).
@@ -454,53 +422,6 @@ crossing, the stop, barrier recording and the degraded flag, plus one
 `PagePublisher` (CON-019) owning entry and removal projection, the
 fence-before-forward rule and the warnings. Only the checkpoint source (minted
 positional vs account-supplied) stays per front end.
-
-## CON-026 - Backfill completion state is tracked four times in memory
-
-**Reported by:** sync-lanes.
-
-`BackfillScopeWalk::stopped` (one bool); `ScopeWalkDriver::{exhausted,
-completed}`, which holds a `BackfillScopeWalk` and also re-derives stop;
-`BackfillScan::settled` (per incarnation, with a watermark); and
-`BackfillRegistry` (engine-wide, keyed by `(AccountId, CursorScope)` without
-incarnation, marked from the same answer, published through
-`SyncEngine::backfill_registry`). The registry and the scan agree because the
-orchestrator writes both; with no incarnation, a re-established scope reads the
-previous incarnation's state until overwritten. Owner: the registry becomes a
-read-only projection of `BackfillScan` (STR-044), keyed by incarnation.
-
-## CON-032 - IMAP decoder side tables kept in step with the parsers by hand
-
-**Reported by:** imap-protocol (latent).
-
-Each summarizes other code with nothing forcing agreement:
-
-- `decode/extensions.rs::starts_known_untagged_response`'s `DIRECT_KEYWORDS`
-  vs the `alt` list in `parse_untagged_with_backing`: decides whether a parse
-  failure is a connection-fatal violation or a tolerated unknown response; a new
-  parser added to the `alt` without the keyword is silently tolerant.
-- `decode/envelope_fetch.rs::has_closed_grammar` vs the arms of
-  `fetch_attr_value_inner`: the same strict/tolerant gate for FETCH attributes.
-  `MODSEQ` is listed as closed grammar while its arm swallows a malformed value.
-- `flags_caps::response_code_has_overflow` (code names and widths) vs the
-  `response_code_inner` arms; the mod-sequence ceiling is `MOD_SEQ_MAX = i64::MAX
-  as u64` in the encoder and a literal `i64::MAX as u64` here (STR-052).
-- ResponseCode names three ways - already producing a live defect, filed as
-  BUG-042.
-- `CommandKind::untagged_routing_key` is documented as "a summary of `classify`"
-  checked pairwise by a test - the brief's exact anti-pattern; derive it from a
-  classification table.
-- `types/profile.rs`: production `rev2_baseline_includes` is a non-exhaustive
-  `matches!`, while the test oracle `capability_matrix::in_rev2_baseline` is the
-  exhaustive match forcing a decision for every new `Capability`. The guard sits
-  on the copy; make production the exhaustive match and delete the oracle.
-- `classification::classify` ends in `_ => { debug_assert!(false); Impossible
-  }`, defeating exhaustiveness; every row is `(_, UR::X)`-shaped, so matching on
-  the response first and the command second would let the compiler catch a
-  missing row.
-
-Owner: table-driven decode dispatch (keyword -> parser + strictness + numeric
-width) and a classification table from which routing keys are computed.
 
 ## CON-047 - May this URL carry the account credential?
 

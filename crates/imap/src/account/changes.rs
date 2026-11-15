@@ -8,6 +8,8 @@ use bifrost_types::{
 
 use crate::types::{FetchAttr, MailboxName, SelectedMailbox, UidSet};
 
+use super::envelope::UidBaseline;
+
 use super::{
     BATCH_ITEMS, CompactUidSet, FolderCursor, ImapAccount, ScopeHandler, batch, decode_cursor,
     encode_cursor, encode_object_id, folder_from_scope, folder_scope, membership_scope,
@@ -27,7 +29,7 @@ impl ChangePlan {
     fn for_cursor(cursor: &FolderCursor, qresync_enabled: bool) -> Self {
         match cursor {
             FolderCursor::QResync {
-                known_uids_complete: false,
+                baseline: UidBaseline::Legacy(_),
                 ..
             } => Self::RefuseIncomplete,
             FolderCursor::QResync { .. } if qresync_enabled => Self::QResync,
@@ -211,13 +213,19 @@ async fn run_changes(
     let cursor = decode_cursor(&change_cursor)?;
     match ChangePlan::for_cursor(&cursor, account.qresync_enabled()) {
         ChangePlan::RefuseIncomplete => Err(super::error::incomplete_uid_baseline(&folder).into()),
-        ChangePlan::QResync => run_qresync(account, folder, cursor, tx).await,
+        ChangePlan::QResync => match cursor {
+            FolderCursor::QResync {
+                uidvalidity,
+                modseq,
+                baseline: UidBaseline::Complete(known_uids),
+            } => run_qresync(account, folder, uidvalidity, modseq, known_uids, tx).await,
+            _ => Err(super::error::incomplete_uid_baseline(&folder).into()),
+        },
         ChangePlan::Condstore => match cursor {
             FolderCursor::QResync {
                 uidvalidity,
                 modseq,
-                known_uids,
-                known_uids_complete,
+                baseline: UidBaseline::Complete(known_uids),
             } => {
                 // The NON-consuming read, deliberately. This used to take the
                 // account-level one-shot first and fall back to this, which could
@@ -247,7 +255,6 @@ async fn run_changes(
                         modseq,
                         known_uids,
                     },
-                    known_uids_complete,
                     tx,
                 )
                 .await
@@ -262,17 +269,17 @@ async fn run_changes(
 async fn run_qresync(
     account: ImapAccount,
     folder: MailboxName,
-    cursor: FolderCursor,
+    expected_uidvalidity: u32,
+    modseq: u64,
+    known_uids: CompactUidSet,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
-    let FolderCursor::QResync {
+    // The caller must extract Complete before dispatch; legacy baselines never
+    // reach this path. Enterprise users need re-inventory, not missed removals.
+    let cursor = FolderCursor::QResync {
         uidvalidity: expected_uidvalidity,
         modseq,
-        known_uids,
-        known_uids_complete,
-    } = cursor.clone()
-    else {
-        return Ok(());
+        baseline: UidBaseline::Complete(known_uids.clone()),
     };
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
@@ -314,7 +321,6 @@ async fn run_qresync(
                     modseq,
                     known_uids,
                 },
-                known_uids_complete,
                 tx,
             )
             .await;
@@ -323,7 +329,6 @@ async fn run_qresync(
     };
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, expected_uidvalidity, uidvalidity)?;
-    debug_assert!(known_uids_complete);
     if selected.mailbox.modseq().is_none() {
         send_strategy_downgrade(
             &tx,
@@ -450,14 +455,13 @@ async fn run_condstore(
     cursor: FolderCursor,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
-    run_condstore_with_baseline(account, folder, cursor, true, tx).await
+    run_condstore_with_baseline(account, folder, cursor, tx).await
 }
 
 async fn run_condstore_with_baseline(
     account: ImapAccount,
     folder: MailboxName,
     cursor: FolderCursor,
-    known_uids_complete: bool,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
     let FolderCursor::Condstore {
@@ -474,9 +478,6 @@ async fn run_condstore_with_baseline(
         .map_err(|err| select_error(&account, &folder, err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, cursor.uidvalidity(), uidvalidity)?;
-    if !known_uids_complete {
-        return Err(super::error::incomplete_uid_baseline(&folder).into());
-    }
     if selected.mailbox.modseq().is_none() {
         send_strategy_downgrade(
             &tx,

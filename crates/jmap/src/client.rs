@@ -472,7 +472,8 @@ impl ClientBuilder {
         let (session_url, session_bytes) = fetch_session(&transport, url)
             .await
             .map_err(crate::Error::from)?;
-        let session: Session = serde_json::from_slice(&session_bytes)?;
+        let session: Session =
+            serde_json::from_slice(&session_bytes).map_err(crate::Error::EnvelopeDecode)?;
         // Every installed session hands its API and upload limits to the
         // transport, so both bounds hold across all callers sharing this
         // client, not only within one call site.
@@ -1652,7 +1653,8 @@ impl<T: HttpTransport> Client<T> {
             .await
             .map_err(crate::Error::from)?;
         self.record_bytes_in(bytes_in);
-        let response: response::Response = serde_json::from_slice(&bytes)?;
+        let response: response::Response =
+            serde_json::from_slice(&bytes).map_err(crate::Error::EnvelopeDecode)?;
         self.note_session_state(response.session_state());
         Ok(response)
     }
@@ -1712,7 +1714,8 @@ impl<T: HttpTransport> Client<T> {
             .get_session(&self.inner.session_cell.session_url)
             .await
             .map_err(crate::Error::from)?;
-        let session: Session = serde_json::from_slice(&bytes)?;
+        let session: Session =
+            serde_json::from_slice(&bytes).map_err(crate::Error::EnvelopeDecode)?;
         let api_limit = session.api_request_concurrency();
         let upload_limit = session.upload_concurrency();
         let state = Arc::new(SessionState::derive(session)?);

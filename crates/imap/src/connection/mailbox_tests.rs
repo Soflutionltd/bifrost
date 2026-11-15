@@ -23,12 +23,7 @@ fn selected(caps: Vec<Capability>, enabled: &[&str]) -> ImapConnection {
 
 #[test]
 fn qresync_params_require_enable() {
-    let params = QresyncParams {
-        uid_validity: 1,
-        mod_seq: 2,
-        known_uids: None,
-        seq_match_data: None,
-    };
+    let params = QresyncParams::from_raw(1, 2, None, None).unwrap();
     let without = authed(vec![Capability::QResync]);
     assert!(matches!(
         without.validate_qresync_params(&params),
@@ -50,23 +45,18 @@ fn qresync_seq_match_data_requires_known_uids() {
         vec![Capability::QResync],
         &["QRESYNC"],
     );
-    let bad = QresyncParams {
-        uid_validity: 1,
-        mod_seq: 2,
-        known_uids: None,
-        seq_match_data: Some(("1:10".to_owned(), "100:110".to_owned())),
-    };
-    assert!(matches!(
-        conn.validate_qresync_params(&bad),
-        Err(Error::InvalidInput(_))
-    ));
+    assert!(
+        QresyncParams::from_raw(1, 2, None, Some(("1:10".to_owned(), "100:110".to_owned())))
+            .is_err()
+    );
 
-    let good = QresyncParams {
-        uid_validity: 1,
-        mod_seq: 2,
-        known_uids: Some("1:10".to_owned()),
-        seq_match_data: Some(("1:10".to_owned(), "100:110".to_owned())),
-    };
+    let good = QresyncParams::from_raw(
+        1,
+        2,
+        Some("1:10".to_owned()),
+        Some(("1:10".to_owned(), "100:110".to_owned())),
+    )
+    .unwrap();
     assert!(conn.validate_qresync_params(&good).is_ok());
 }
 

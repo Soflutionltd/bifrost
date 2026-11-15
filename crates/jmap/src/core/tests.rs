@@ -188,7 +188,7 @@ fn frame_parts_decode_into_the_same_response_the_envelope_produces() {
             "k".to_string(),
             "v".to_string(),
         )])),
-        "abc".to_string(),
+        "abc".into(),
     )
     .unwrap();
 
@@ -210,13 +210,13 @@ fn frame_parts_decode_into_the_same_response_the_envelope_produces() {
 
 /// A `methodResponses` array that is not an array of call triples is a
 /// decode failure, not a silently empty response: the WebSocket door
-/// reports it as `Error::ResponseDecode` while still having read the
+/// reports it as `Error::EnvelopeDecode` while still having read the
 /// frame's `sessionState`.
 #[test]
 fn frame_parts_reject_malformed_method_responses() {
     let method_responses = serde_json::value::RawValue::from_string("[[1,2]]".to_string()).unwrap();
 
-    assert!(Response::from_frame_parts(&method_responses, None, "abc".to_string()).is_err());
+    assert!(Response::from_frame_parts(&method_responses, None, "abc".into()).is_err());
 }
 
 // Decode leniency only. An absent `notFound` decoding as empty is NOT
@@ -442,7 +442,10 @@ fn set_response_deserializes() {
     });
 
     let mut response: SetResponse<TestObj> = serde_json::from_value(raw).unwrap();
-    assert_eq!(response.new_state(), Some("s2"));
+    assert_eq!(
+        response.new_state().map(super::id::ObjectState::as_str),
+        Some("s2")
+    );
     let created = response.created("c0").unwrap();
     assert_eq!(created.name.as_deref(), Some("created-obj"));
 }
@@ -510,8 +513,11 @@ fn an_absent_set_new_state_is_not_an_empty_one() {
         "newState": ""
     }))
     .unwrap();
-    assert_eq!(empty.new_state(), Some(""));
-    assert_eq!(empty.into_new_state(), Some(String::new()));
+    assert_eq!(
+        empty.new_state().map(super::id::ObjectState::as_str),
+        Some("")
+    );
+    assert_eq!(empty.into_new_state(), Some(String::new().into()));
 }
 
 #[test]
@@ -1164,7 +1170,7 @@ mod envelope {
         let _ = request.call(TestGet::new()).expect("encodes");
         let err = request.send().await.expect_err("body is not JSON");
         assert!(
-            matches!(err, crate::Error::ResponseDecode(_)),
+            matches!(err, crate::Error::EnvelopeDecode(_)),
             "got {err:?}"
         );
     }

@@ -28,8 +28,8 @@ pub struct RateLimit {
     /// Host the limit applies to. Matched against `Url::host_str` for
     /// outbound requests.
     pub host: String,
-    /// Caller-defined quota scope. Empty preserves host-wide sharing.
-    pub quota_scope: String,
+    /// Caller-defined quota scope. `HostOnly` preserves host-wide sharing.
+    pub quota_scope: crate::QuotaScope,
     /// Refill rate in units per second.
     pub quota_per_second: f64,
     /// Default per-request cost. Callers may override via
@@ -66,7 +66,7 @@ impl RateLimit {
     ) -> Self {
         Self {
             host: host.into(),
-            quota_scope: String::new(),
+            quota_scope: crate::QuotaScope::HostOnly,
             quota_per_second,
             cost_default,
             burst,
@@ -77,7 +77,7 @@ impl RateLimit {
     /// to its host. Accounts with different non-empty scopes never share a
     /// bucket; an empty scope retains the host-only compatibility behavior.
     #[must_use]
-    pub fn with_quota_scope(mut self, scope: impl Into<String>) -> Self {
+    pub fn with_quota_scope(mut self, scope: impl Into<crate::QuotaScope>) -> Self {
         self.quota_scope = scope.into();
         self
     }
@@ -86,14 +86,22 @@ impl RateLimit {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RateKey {
     pub(crate) host: String,
-    pub(crate) quota_scope: String,
+    pub(crate) quota_scope: crate::QuotaScope,
 }
 
 impl RateKey {
-    pub(crate) fn new(host: impl Into<String>, quota_scope: impl Into<String>) -> Self {
+    pub(crate) fn new(host: impl Into<String>, quota_scope: impl Into<crate::QuotaScope>) -> Self {
+        let scope = quota_scope.into();
+        // Normalize even explicitly constructed Named("") values. Registration
+        // and string-based governor lookups must reach the same bucket.
+        let quota_scope = if scope.as_str().is_empty() {
+            crate::QuotaScope::HostOnly
+        } else {
+            scope
+        };
         Self {
             host: host.into(),
-            quota_scope: quota_scope.into(),
+            quota_scope,
         }
     }
 }

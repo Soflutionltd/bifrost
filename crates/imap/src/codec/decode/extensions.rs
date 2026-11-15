@@ -350,48 +350,10 @@ pub(super) fn parse_untagged_unknown(input: &[u8]) -> IResult<&[u8], UntaggedRes
     ))
 }
 
-/// Whether `input` (the body of an untagged response, after `* `) opens with a
-/// response keyword this codec claims to parse.
-///
-/// The direct table lists keywords whose whole grammar we implement, so a
-/// parse failure on one of them is a server contract violation rather than an
-/// extension we do not know.
-///
-/// The numbered table is deliberately smaller than the set of numbered
-/// responses we parse: `EXISTS`, `RECENT`, and `EXPUNGE` are `number SP
-/// keyword` and nothing else, so any failure really is malformed input.
-/// `FETCH` is excluded on purpose - its `msg-att` body is open-ended, this
-/// parser must tolerate unmodelled data items, and hard-failing by keyword
-/// would turn an extension we do not understand into a dropped connection.
-/// The FETCH parser upgrades violations it recognizes (such as `UID 0`) at
-/// the attribute failure site while leaving unknown attributes skippable.
+/// Numbered response failures need special treatment: FETCH has an open
+/// attribute grammar, while EXISTS, RECENT and EXPUNGE are fully modelled.
+/// Direct responses are committed by their dispatch rows in response.rs.
 fn starts_known_untagged_response(input: &[u8]) -> bool {
-    const DIRECT_KEYWORDS: &[&[u8]] = &[
-        b"OK",
-        b"NO",
-        b"BAD",
-        b"BYE",
-        b"STATUS",
-        b"CAPABILITY",
-        b"FLAGS",
-        b"LIST",
-        b"LSUB",
-        b"ESEARCH",
-        b"SEARCH",
-        b"SORT",
-        b"ENABLED",
-        b"VANISHED",
-        b"ID",
-        b"NAMESPACE",
-        b"QUOTA",
-        b"QUOTAROOT",
-        b"ACL",
-        b"MYRIGHTS",
-        b"LISTRIGHTS",
-        b"METADATA",
-        b"THREAD",
-    ];
-
     const NUMBERED_KEYWORDS: &[&[u8]] = &[b"EXISTS", b"RECENT", b"EXPUNGE"];
 
     fn starts_keyword(value: &[u8], keywords: &[&[u8]]) -> bool {
@@ -403,10 +365,6 @@ fn starts_known_untagged_response(input: &[u8]) -> bool {
                     .get(keyword.len())
                     .is_none_or(|next| matches!(*next, b' ' | b'\r' | b'\n'))
         })
-    }
-
-    if starts_keyword(input, DIRECT_KEYWORDS) {
-        return true;
     }
 
     let digits = input.iter().take_while(|b| b.is_ascii_digit()).count();

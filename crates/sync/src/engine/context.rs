@@ -29,7 +29,7 @@ pub(super) struct SlotContext {
     pub account_id: AccountId,
     pub control: SyncControl,
     pub account_control_tx: broadcast::Sender<AccountControl>,
-    pub throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
+    pub throttles: Arc<crate::recovery::ThrottleBucket>,
     pub boundary_tx: watch::Sender<crate::cancel::BoundaryRequest>,
     pub capabilities: Arc<std::sync::RwLock<AccountCapabilities>>,
     pub subscriptions: Arc<SubscriptionRegistry>,

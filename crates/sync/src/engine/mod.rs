@@ -136,7 +136,7 @@ pub struct SyncEngine {
     /// so a `Budget` deadline recorded by one account pauses every
     /// sibling that declares the same budget. Recovery paths record; the per-scope poll
     /// loop and the push reconciler consult it before driving work.
-    throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
+    throttles: Arc<crate::recovery::ThrottleBucket>,
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -229,7 +229,7 @@ impl SyncEngineBuilder {
             bandwidth_registry: self.bandwidth_registry,
             ack_senders: DashMap::new(),
             lifecycle_inflight: Arc::new(AsyncMutex::new(std::collections::HashSet::new())),
-            throttles: Arc::new(std::sync::Mutex::new(crate::recovery::ThrottleBucket::new())),
+            throttles: Arc::new(crate::recovery::ThrottleBucket::new()),
         })
     }
 }
@@ -1010,9 +1010,7 @@ impl SyncEngine {
         self.sink.unregister(account_id);
         self.scheduler.budget().forget(account_id);
         self.backfill_registry.forget_account(account_id);
-        if let Ok(mut throttles) = self.throttles.lock() {
-            throttles.forget_account(account_id);
-        }
+        self.throttles.forget_account(account_id);
         if let Some(meter) = &self.bandwidth_meter {
             meter.forget_account(account_id);
         }
@@ -1322,14 +1320,14 @@ impl SyncEngine {
             account.push_subscribe(scopes).await?
         };
         let covered = accepted_push_scopes(&result);
-        for failure in result.outcomes.failed() {
+        for failure in result.outcomes().failed() {
             tracing::warn!(
                 target: "bifrost.sync.reconcile",
                 error = ?failure.error,
                 "push scope rejected; retaining polling coverage"
             );
         }
-        if let Some(handle) = &result.handle
+        if let Some(handle) = result.handle()
             && !self.subscriptions.record(
                 account_id.clone(),
                 handle.clone(),

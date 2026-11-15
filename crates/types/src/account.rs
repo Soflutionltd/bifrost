@@ -65,13 +65,12 @@ use crate::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
 /// Only scopes in `outcomes`' succeeded lane are covered by `handle`.
 /// Failed scopes remain available to the consumer's polling path. The handle
 /// is present exactly when at least one requested scope was accepted.
-/// Constructors validate this relationship; consumers that mutate the public
-/// fields must preserve it themselves.
+/// Private fields keep the constructor-validated relationship intact.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct PushSubscription {
-    pub handle: Option<SubscriptionHandle>,
-    pub outcomes: crate::error::BatchOutcome<CursorScope>,
+    handle: Option<SubscriptionHandle>,
+    outcomes: crate::error::BatchOutcome<CursorScope>,
 }
 
 /// A mismatch between a push subscription handle and its succeeded scopes.
@@ -90,6 +89,26 @@ pub enum PushSubscriptionBuildError {
 }
 
 impl PushSubscription {
+    /// The handle covering the succeeded scopes, if any.
+    pub fn handle(&self) -> Option<&SubscriptionHandle> {
+        self.handle.as_ref()
+    }
+
+    /// Per-scope subscription results.
+    pub fn outcomes(&self) -> &crate::error::BatchOutcome<CursorScope> {
+        &self.outcomes
+    }
+
+    /// Consume the result to recover both owned values.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Option<SubscriptionHandle>,
+        crate::error::BatchOutcome<CursorScope>,
+    ) {
+        (self.handle, self.outcomes)
+    }
+
     /// Build a result only when the handle agrees with the succeeded lane.
     pub fn new(
         handle: Option<SubscriptionHandle>,

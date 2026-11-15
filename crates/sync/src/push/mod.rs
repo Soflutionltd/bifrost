@@ -41,7 +41,7 @@ pub struct SinkTarget {
     pub ingress: Arc<PushIngress>,
     pub delivery: Arc<ChangeDelivery>,
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
-    pub throttles: Arc<std::sync::Mutex<ThrottleBucket>>,
+    pub throttles: Arc<ThrottleBucket>,
     /// The account's boundary, read synchronously (`peek`) before an engine
     /// directive is queued.
     pub boundary: BoundaryView,
@@ -217,7 +217,7 @@ mod tests {
             ingress: sink.new_ingress(1),
             delivery: Arc::new(ChangeDelivery::new(tx)),
             reopen_tx,
-            throttles: Arc::new(std::sync::Mutex::new(ThrottleBucket::new())),
+            throttles: Arc::new(ThrottleBucket::new()),
             boundary: view,
         };
         sink.register(account.clone(), target.clone());

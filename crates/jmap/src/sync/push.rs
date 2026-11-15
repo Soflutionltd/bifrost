@@ -1,3 +1,4 @@
+use crate::core::id::PushState;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -23,7 +24,7 @@ pub(crate) type DataTypeSet = HashSet<DataType>;
 pub(crate) struct SubscribeState {
     pub(crate) subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
     pub(crate) enabled: Arc<Mutex<DataTypeSet>>,
-    pub(crate) push_state: Arc<Mutex<Option<String>>>,
+    pub(crate) push_state: Arc<Mutex<Option<PushState>>>,
     pub(crate) closed: Arc<AtomicBool>,
 }
 
@@ -88,7 +89,7 @@ impl PushRouting {
 /// machinery with no invariant gap left to close.
 pub(crate) struct WsState {
     pub(crate) enabled: Arc<Mutex<DataTypeSet>>,
-    pub(crate) push_state: Arc<Mutex<Option<String>>>,
+    pub(crate) push_state: Arc<Mutex<Option<PushState>>>,
     pub(crate) policy: ReconnectPolicy,
     pub(crate) routing: Arc<PushRouting>,
     pub(crate) lease: bifrost_types::LaneLease,
@@ -162,7 +163,7 @@ pub(crate) trait PushTransport: Send + Sync + 'static {
     fn set_push_data_types(
         &self,
         data_types: &DataTypeSet,
-        push_state: Option<String>,
+        push_state: Option<PushState>,
     ) -> impl Future<Output = crate::Result<()>> + Send;
 
     /// Send a WebSocket ping on the current connection.
@@ -186,7 +187,7 @@ impl PushTransport for Client {
     fn set_push_data_types(
         &self,
         data_types: &DataTypeSet,
-        push_state: Option<String>,
+        push_state: Option<PushState>,
     ) -> impl Future<Output = crate::Result<()>> + Send {
         apply_push_set(self, data_types, push_state)
     }
@@ -312,7 +313,7 @@ pub(crate) async fn disable_for_close<T: PushTransport>(
     client: T,
     subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
     enabled: Arc<Mutex<DataTypeSet>>,
-    push_state: Arc<Mutex<Option<String>>>,
+    push_state: Arc<Mutex<Option<PushState>>>,
 ) -> crate::Result<()> {
     let mut subscriptions_guard = subscriptions.lock().await;
     let mut enabled_guard = enabled.lock().await;
@@ -351,7 +352,7 @@ pub(crate) fn unsubscribe<T: PushTransport>(
     handle: SubscriptionHandle,
     subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
     enabled: Arc<Mutex<DataTypeSet>>,
-    push_state: Arc<Mutex<Option<String>>>,
+    push_state: Arc<Mutex<Option<PushState>>>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let mut subscriptions_guard = subscriptions.lock().await;
@@ -406,7 +407,11 @@ pub(crate) fn unsubscribe<T: PushTransport>(
 /// to, so the cached value must be dropped. Keeping it would let a later
 /// re-enable replay a position minted under an abandoned configuration, which
 /// is a wrong replay rather than merely a cold start.
-fn commit_push_set(enabled: &mut DataTypeSet, push_state: &mut Option<String>, union: DataTypeSet) {
+fn commit_push_set(
+    enabled: &mut DataTypeSet,
+    push_state: &mut Option<PushState>,
+    union: DataTypeSet,
+) {
     if union.is_empty() {
         *push_state = None;
     }
@@ -459,7 +464,7 @@ fn union_data_types(subscriptions: &HashMap<SubscriptionHandle, DataTypeSet>) ->
 async fn apply_push_set(
     client: &Client,
     data_types: &DataTypeSet,
-    push_state: Option<String>,
+    push_state: Option<PushState>,
 ) -> crate::Result<()> {
     if data_types.is_empty() {
         client.disable_push_ws().await
@@ -524,7 +529,7 @@ impl<T: PushTransport> PushTransport for Arc<T> {
     async fn set_push_data_types(
         &self,
         data_types: &DataTypeSet,
-        push_state: Option<String>,
+        push_state: Option<PushState>,
     ) -> crate::Result<()> {
         self.as_ref()
             .set_push_data_types(data_types, push_state)
@@ -542,7 +547,7 @@ impl<T: PushTransport> PushTransport for Arc<T> {
 pub(crate) fn session<T: PushTransport>(
     transport: T,
     enabled: Arc<Mutex<DataTypeSet>>,
-    push_state: Arc<Mutex<Option<String>>>,
+    push_state: Arc<Mutex<Option<PushState>>>,
     shutdown: CancellationToken,
     policy: ReconnectPolicy,
     routing: Arc<PushRouting>,
@@ -634,7 +639,7 @@ fn classify_session_error(e: crate::Error) -> AccountError {
 async fn reenable_current_push_set<T: PushTransport>(
     transport: &T,
     enabled: &Arc<Mutex<DataTypeSet>>,
-    push_state: &Arc<Mutex<Option<String>>>,
+    push_state: &Arc<Mutex<Option<PushState>>>,
 ) -> crate::Result<()> {
     let current = {
         let guard = enabled.lock().await;
@@ -647,7 +652,7 @@ async fn reenable_current_push_set<T: PushTransport>(
 /// Keep the last present `pushState` of the block. `decompose` already
 /// resolved it across groups, so a block without one leaves the stored
 /// position untouched.
-async fn remember_push_state(block: &PushBlock, state: &Arc<Mutex<Option<String>>>) {
+async fn remember_push_state(block: &PushBlock, state: &Arc<Mutex<Option<PushState>>>) {
     if let Some(value) = block.state.as_ref().and_then(|s| s.push_state.clone()) {
         *state.lock().await = Some(value);
     }
@@ -816,7 +821,7 @@ mod tests {
         scopes: Vec<CursorScope>,
         subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
         enabled: Arc<Mutex<DataTypeSet>>,
-        push_state: Arc<Mutex<Option<String>>>,
+        push_state: Arc<Mutex<Option<PushState>>>,
     ) -> Result<(SubscriptionHandle, Vec<bool>), AccountError> {
         super::subscribe(
             client,
@@ -1187,7 +1192,7 @@ mod tests {
         }
     }
 
-    type AppliedPushSets = Arc<StdMutex<Vec<(DataTypeSet, Option<String>)>>>;
+    type AppliedPushSets = Arc<StdMutex<Vec<(DataTypeSet, Option<PushState>)>>>;
 
     struct RecordingPushTransport {
         fail: bool,
@@ -1211,7 +1216,7 @@ mod tests {
         async fn set_push_data_types(
             &self,
             data_types: &DataTypeSet,
-            push_state: Option<String>,
+            push_state: Option<PushState>,
         ) -> crate::Result<()> {
             self.applied
                 .lock()
@@ -1241,7 +1246,7 @@ mod tests {
         async fn set_push_data_types(
             &self,
             data_types: &DataTypeSet,
-            push_state: Option<String>,
+            push_state: Option<PushState>,
         ) -> crate::Result<()> {
             self.applied
                 .lock()
@@ -1279,7 +1284,7 @@ mod tests {
         async fn set_push_data_types(
             &self,
             _data_types: &DataTypeSet,
-            _push_state: Option<String>,
+            _push_state: Option<PushState>,
         ) -> crate::Result<()> {
             Ok(())
         }
@@ -1301,7 +1306,7 @@ mod tests {
         async fn set_push_data_types(
             &self,
             _data_types: &DataTypeSet,
-            _push_state: Option<String>,
+            _push_state: Option<PushState>,
         ) -> crate::Result<()> {
             Ok(())
         }
@@ -1417,7 +1422,7 @@ mod tests {
         async fn set_push_data_types(
             &self,
             _data_types: &DataTypeSet,
-            _push_state: Option<String>,
+            _push_state: Option<PushState>,
         ) -> crate::Result<()> {
             Err((self.error)())
         }
@@ -1597,7 +1602,7 @@ mod tests {
             let enabled = Arc::new(Mutex::new(
                 [DataType::Email, DataType::Mailbox].into_iter().collect(),
             ));
-            let push_state = Arc::new(Mutex::new(Some("push-7".to_string())));
+            let push_state = Arc::new(Mutex::new(Some("push-7".into())));
 
             unsubscribe(
                 FailingPushSetTransport { error },
@@ -1628,7 +1633,7 @@ mod tests {
                 applied,
                 vec![(
                     [DataType::Email].into_iter().collect::<DataTypeSet>(),
-                    Some("push-7".to_string())
+                    Some("push-7".into())
                 )],
                 "the next connection carries the narrowed union and the live position"
             );
@@ -1813,7 +1818,7 @@ mod tests {
         let applied = Arc::new(StdMutex::new(Vec::new()));
         let subscriptions = Arc::new(Mutex::new(HashMap::new()));
         let enabled = Arc::new(Mutex::new([DataType::Email].into_iter().collect()));
-        let push_state = Arc::new(Mutex::new(Some("push-7".to_string())));
+        let push_state = Arc::new(Mutex::new(Some("push-7".into())));
 
         subscribe(
             RecordingPushTransport {
@@ -1851,7 +1856,7 @@ mod tests {
             [DataType::Email].into_iter().collect::<DataTypeSet>(),
         )])));
         let enabled = Arc::new(Mutex::new([DataType::Email].into_iter().collect()));
-        let push_state = Arc::new(Mutex::new(Some("push-7".to_string())));
+        let push_state = Arc::new(Mutex::new(Some("push-7".into())));
 
         unsubscribe(
             RecordingPushTransport {
@@ -1892,7 +1897,7 @@ mod tests {
         let email: DataTypeSet = [DataType::Email].into_iter().collect();
         let subscriptions = Arc::new(Mutex::new(HashMap::from([(live.clone(), email.clone())])));
         let enabled = Arc::new(Mutex::new(email.clone()));
-        let push_state = Arc::new(Mutex::new(Some("push-3".to_string())));
+        let push_state = Arc::new(Mutex::new(Some("push-3".into())));
 
         unsubscribe(
             RecordingPushTransport {
@@ -1935,7 +1940,7 @@ mod tests {
         let with_state = || {
             let mut object = state_change("u1", DataType::Email, "s1");
             if let PushObject::StateChange { push_state, .. } = &mut object {
-                *push_state = Some("ps-1".to_string());
+                *push_state = Some("ps-1".into());
             }
             object
         };
@@ -1955,7 +1960,7 @@ mod tests {
 
         let mut later = state_change("u1", DataType::Mailbox, "s3");
         if let PushObject::StateChange { push_state, .. } = &mut later {
-            *push_state = Some("ps-2".to_string());
+            *push_state = Some("ps-2".into());
         }
         let group = PushObject::Group {
             entries: vec![with_state(), later],
@@ -1972,7 +1977,7 @@ mod tests {
             applied: Arc::clone(&applied),
         };
         let enabled = Arc::new(Mutex::new([DataType::Email].into_iter().collect()));
-        let state = Arc::new(Mutex::new(Some("push-7".to_string())));
+        let state = Arc::new(Mutex::new(Some("push-7".into())));
 
         reenable_current_push_set(&transport, &enabled, &state)
             .await
@@ -2076,7 +2081,7 @@ mod tests {
         fn set_push_data_types(
             &self,
             _data_types: &DataTypeSet,
-            _push_state: Option<String>,
+            _push_state: Option<PushState>,
         ) -> impl Future<Output = crate::Result<()>> + Send {
             let entered = Arc::clone(&self.entered);
             let hang = self.hang == Hang::Reenable;
@@ -2167,7 +2172,7 @@ mod tests {
         fn set_push_data_types(
             &self,
             _data_types: &DataTypeSet,
-            _push_state: Option<String>,
+            _push_state: Option<PushState>,
         ) -> impl Future<Output = crate::Result<()>> + Send {
             let attempts = Arc::clone(&self.attempts);
             async move {
@@ -2222,7 +2227,7 @@ mod tests {
         async fn set_push_data_types(
             &self,
             _data_types: &DataTypeSet,
-            _push_state: Option<String>,
+            _push_state: Option<PushState>,
         ) -> crate::Result<()> {
             Ok(())
         }
@@ -2297,7 +2302,7 @@ mod tests {
         async fn set_push_data_types(
             &self,
             _data_types: &DataTypeSet,
-            _push_state: Option<String>,
+            _push_state: Option<PushState>,
         ) -> crate::Result<()> {
             Ok(())
         }

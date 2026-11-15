@@ -96,21 +96,6 @@ pub(crate) enum Error {
         attempt: Option<ImapAttempt>,
     },
 
-    /// A ManageSieve server rejected a command (RFC 5804 Section 1.3).
-    ///
-    /// Separate from `No` because ManageSieve has its own response-code
-    /// vocabulary. Folding it into the IMAP `ResponseCode` would record a
-    /// code the server never sent; leaving it code-less (which is what
-    /// this crate did before) collapses every rejection to a terminal
-    /// `ProviderRefused`, including `TRYLATER`, which means the opposite.
-    ///
-    /// Always server-acknowledged: it is a tagged response.
-    #[error("ManageSieve rejected command: {message}")]
-    Sieve {
-        code: Option<crate::account::sieve::SieveResponseCode>,
-        message: String,
-    },
-
     /// Server returned a BAD response (RFC 3501 Section 7.1.3).
     ///
     /// As with `No`, a tagged `BAD` is server-acknowledged; constructors

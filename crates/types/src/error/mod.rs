@@ -11,7 +11,7 @@ pub mod scope;
 pub mod stream;
 pub mod warning;
 
-pub use account_error::AccountError;
+pub use account_error::{AccountError, HINTLESS_HOLD_WAIT, HoldTarget};
 pub use batch::{
     BatchFailure, BatchInvariantError, BatchItem, BatchItemId, BatchItemOutcome, BatchOutcome,
     BatchOutcomeBuilder, BatchSuccess, BatchUncertain, validate_batch_input,

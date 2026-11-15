@@ -31,7 +31,7 @@ pub(crate) struct PushLanes {
     pub ingress: Arc<PushIngress>,
     pub delivery: Arc<ChangeDelivery>,
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
-    pub throttles: Arc<std::sync::Mutex<ThrottleBucket>>,
+    pub throttles: Arc<ThrottleBucket>,
     pub boundary: BoundaryView,
     pub shutdown: CancellationToken,
     pub health: watch::Sender<PushHealth>,

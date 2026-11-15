@@ -5,10 +5,12 @@ use bifrost_types::{
     CursorScope, ErrorScope, FolderId, HydratedObject, HydratedObjectKind, ItemOutcome,
     MembershipScope, ObjectId, ObjectType, PageBoundary, Projection, SyncEvent,
 };
+#[cfg(test)]
 use bytes::Bytes;
 use futures::StreamExt;
 #[cfg(test)]
 use reqwest::StatusCode;
+#[cfg(test)]
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
@@ -27,7 +29,8 @@ pub(crate) fn get_stream(
     projection: Projection,
 ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
     Box::pin(async_stream::stream! {
-        let max_items = account.capabilities.batching_policy.max_items.max(1);
+        let max_items = account.capabilities.batching_policy.max_items
+            .clamp(1, super::batch::LIMIT);
         let mut chunk = Vec::with_capacity(max_items);
         // The input is a stream, so "is this the last chunk" is only
         // known after the input ends. Hold a filled chunk back by one
@@ -339,17 +342,15 @@ async fn fetch_batch(
         .collect();
     let replayable: Vec<_> = requests
         .iter()
-        .map(super::graph_error::subrequest_replayable)
+        .map(super::batch::subrequest_replayable)
         .collect();
     let request = BatchRequest { requests };
-    let response: BatchResponse = account
-        .client
-        .post_batch(
-            account.batch_resource(&rest_ids)?,
-            &request,
-            bifrost_net::ReplayPolicy::Idempotent,
-        )
-        .await?;
+    let response: BatchResponse = super::batch::submit(
+        &account.client,
+        account.batch_resource(&rest_ids)?,
+        &request,
+    )
+    .await?;
     let etags = reconcile_hydration_responses(
         &rest_ids,
         response.responses,
@@ -436,16 +437,7 @@ fn reconcile_hydration_responses(
             // the same response classifier the top-level boundary
             // uses. Headers and body flow through so retry-after,
             // throttle scope, and inner error envelope are preserved.
-            let headers = item
-                .headers
-                .as_ref()
-                .map(reconstruct_headers)
-                .unwrap_or_default();
-            let body = item
-                .body
-                .as_ref()
-                .map(|v| Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
-                .unwrap_or_default();
+            let (headers, body) = super::batch::response_parts(&item);
             let mut ctx = GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(
                 ErrorScope::Message {
                     id: (id.0.clone()).into(),
@@ -516,19 +508,6 @@ fn reconcile_hydration_responses(
     }
 
     etags
-}
-
-fn reconstruct_headers(h: &std::collections::HashMap<String, String>) -> HeaderMap {
-    let mut hm = HeaderMap::new();
-    for (k, v) in h {
-        if let (Ok(name), Ok(val)) = (
-            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-            reqwest::header::HeaderValue::from_str(v),
-        ) {
-            hm.insert(name, val);
-        }
-    }
-    hm
 }
 
 fn hydrated_from_value(id: ObjectId, value: &Value, projection: Projection) -> HydratedObject {

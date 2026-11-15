@@ -298,7 +298,7 @@ pub(crate) fn update(
         let response = client
             .execute_if_match(
                 &url,
-                "PATCH",
+                reqwest::Method::PATCH,
                 Some(&google_patch),
                 expected.as_deref(),
                 bifrost_net::ReplayPolicy::Never,
@@ -358,7 +358,7 @@ pub(crate) fn delete_if_version(
         let response = client
             .execute_if_match(
                 &url,
-                "DELETE",
+                reqwest::Method::DELETE,
                 None::<&()>,
                 expected,
                 bifrost_net::ReplayPolicy::Never,
@@ -414,7 +414,7 @@ pub(crate) fn rsvp_if_version(
         let response = client
             .execute_if_match(
                 &event_url(client.calendar_base(), &calendar_id, &event_id),
-                "PATCH",
+                reqwest::Method::PATCH,
                 Some(&patch),
                 expected,
                 bifrost_net::ReplayPolicy::Never,

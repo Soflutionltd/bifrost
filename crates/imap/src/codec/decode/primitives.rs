@@ -477,14 +477,20 @@ pub(super) fn nstring_bytes<'a>(
 
 /// Parse a number: 1*DIGIT (RFC 3501 Section 9 / RFC 9051 Section 9).
 ///
-/// Returns u32. Errors gracefully on overflow.
+/// Returns u32. Overflow reports TooLarge, which response-code recovery
+/// uses as evidence from the actual numeric grammar rather than a side table.
+/// This is a committed failure so list combinators cannot hide an overflowing
+/// later member by successfully returning only the preceding members.
 pub(super) fn number(input: &[u8]) -> IResult<&[u8], u32> {
     let (input, digits) = digit1(input)?;
     let s = std::str::from_utf8(digits).map_err(|_| {
         nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Digit))
     })?;
     let n: u32 = s.parse().map_err(|_| {
-        nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Digit))
+        nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        ))
     })?;
     Ok((input, n))
 }
@@ -522,13 +528,16 @@ pub(super) fn number64(input: &[u8]) -> IResult<&[u8], u64> {
         nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Digit))
     })?;
     let n: u64 = s.parse().map_err(|_| {
-        nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Digit))
+        nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        ))
     })?;
     // RFC 9051 Section 4: mod-sequence-value is limited to 63 bits (non-negative signed).
-    if n > i64::MAX as u64 {
-        return Err(nom::Err::Error(nom::error::Error::new(
+    if n > crate::types::ModSeq::MAX {
+        return Err(nom::Err::Failure(nom::error::Error::new(
             input,
-            nom::error::ErrorKind::Verify,
+            nom::error::ErrorKind::TooLarge,
         )));
     }
     Ok((input, n))

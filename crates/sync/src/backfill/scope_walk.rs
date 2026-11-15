@@ -58,6 +58,12 @@ impl WalkTotal {
 pub struct ScopeWalkDriver {
     source: PartitionSource,
     walk: BackfillScopeWalk,
+    // These verdicts are not interchangeable with the scan's settled state:
+    // a failed or incomplete partition can end enumeration without proving
+    // completion, and a barrier stop remains separately observable to callers.
+    // The scan settles only after delivery checks, and can revoke that settle
+    // later when a consumer departs. Keeping the walk-local evidence preserves
+    // those published capabilities instead of collapsing distinct lifetimes.
     /// Set once the source can produce nothing further, for any reason.
     exhausted: bool,
     completed: bool,

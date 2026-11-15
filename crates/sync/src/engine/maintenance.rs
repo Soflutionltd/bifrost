@@ -6,7 +6,7 @@ pub(super) struct MaintenanceGate<'a> {
     pub control: &'a SyncControl,
     pub scheduler: &'a Scheduler,
     pub current: &'a ArcSwap<crate::types::Incarnation>,
-    pub throttles: &'a std::sync::Mutex<crate::recovery::ThrottleBucket>,
+    pub throttles: &'a crate::recovery::ThrottleBucket,
     pub account_id: &'a AccountId,
     pub shutdown: &'a CancellationToken,
     pub boundary_tx: &'a watch::Sender<BoundaryRequest>,

@@ -475,7 +475,57 @@ pub struct DebtLedger {
     lineages: BTreeMap<ObligationKey, LineageBudget>,
 }
 
+/// Sticky debt admission cannot discharge obligations or change operator policy.
+pub(crate) struct AccruingLedger<'a>(&'a mut DebtLedger);
+
+impl AccruingLedger<'_> {
+    pub(crate) fn ingest_debt_only(
+        &mut self,
+        report: &InventoryCoverageReport,
+        generation: crate::cursor::WalkGeneration,
+        now: i64,
+    ) {
+        self.0.ingest_debt_only(report, generation, now);
+    }
+
+    pub(crate) fn record_barrier(&mut self, incident: BarrierIncident) {
+        self.0.record_barrier(incident);
+    }
+}
+
+/// Proof and policy are private candidates until their store operation succeeds.
+#[must_use]
+pub(crate) struct StagedLedger(DebtLedger);
+
+impl StagedLedger {
+    pub(crate) fn commit(self, ledger: &mut DebtLedger) {
+        *ledger = self.0;
+    }
+}
+
+impl std::ops::Deref for StagedLedger {
+    type Target = DebtLedger;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StagedLedger {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 impl DebtLedger {
+    pub(crate) fn accrue(&mut self) -> AccruingLedger<'_> {
+        AccruingLedger(self)
+    }
+
+    pub(crate) fn stage(&self) -> StagedLedger {
+        StagedLedger(self.clone())
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()

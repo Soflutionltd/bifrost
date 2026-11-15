@@ -26,7 +26,7 @@ use futures::stream::Stream;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::Error;
-use crate::types::{MailboxName, SyncSelectOptions, SyncSelectResult, UidValidity};
+use crate::types::{MailboxName, SelectOptions, SyncSelectResult, UidValidity};
 
 mod blob;
 mod capabilities;
@@ -298,38 +298,30 @@ impl ImapAccount {
         Ok(result)
     }
 
-    fn select_options(&self, purpose: SelectPurpose<'_>) -> SyncSelectOptions {
-        let (cursor, read_only) = match purpose {
-            SelectPurpose::Sync(cursor) => (Some(cursor), true),
-            SelectPurpose::Read => (None, true),
-            SelectPurpose::Mutate => (None, false),
-        };
-        let mut options = if read_only {
-            SyncSelectOptions::read_only()
-        } else {
-            SyncSelectOptions::read_write()
+    fn select_options(&self, purpose: SelectPurpose<'_>) -> SelectOptions {
+        let (cursor, mut options) = match purpose {
+            SelectPurpose::Sync(cursor) => (Some(cursor), SelectOptions::read_only()),
+            SelectPurpose::Read => (None, SelectOptions::read_only()),
+            SelectPurpose::Mutate => (None, SelectOptions::read_write()),
         };
 
         if self.qresync_enabled()
             && let Some(FolderCursor::QResync {
                 uidvalidity,
                 modseq,
-                known_uids,
-                known_uids_complete,
+                baseline: envelope::UidBaseline::Complete(known_uids),
             }) = cursor
             && let Some(validity) = UidValidity::new(*uidvalidity)
+            && let Some(modseq) = crate::types::ModSeq::new(*modseq)
         {
             // Straight from the compact ranges: the baseline is already
             // sorted and coalesced, and on a large mailbox expanding it into
             // individual UIDs only to re-coalesce them is the entire cost of
             // building the QRESYNC operand.
-            let known_uids = if *known_uids_complete {
-                crate::types::UidSet::from_ranges(known_uids.ranges())
-            } else {
-                None
-            };
-            options =
-                options.with_qresync(validity, crate::types::ModSeq::new(*modseq), known_uids);
+            let known_uids = crate::types::UidSet::from_ranges(known_uids.ranges());
+            options = options
+                .with_qresync(validity, modseq, known_uids)
+                .expect("compact cached UID ranges are finite");
         }
         options
     }
@@ -347,8 +339,7 @@ impl ImapAccount {
             return Ok(FolderCursor::QResync {
                 uidvalidity,
                 modseq,
-                known_uids,
-                known_uids_complete: true,
+                baseline: envelope::UidBaseline::Complete(known_uids),
             });
         }
         if let Some(modseq) = selected.modseq().map(crate::types::ModSeq::get) {

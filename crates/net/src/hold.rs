@@ -46,7 +46,7 @@ pub struct Held {
 }
 
 #[derive(Default)]
-pub(crate) struct HoldRegistry(Mutex<HashMap<String, Held>>);
+pub(crate) struct HoldRegistry(Mutex<HashMap<crate::HoldKey, Held>>);
 
 /// A key in a Net-owned registry. Dropping handles cannot erase a hold.
 /// Handles look up the key on every access, so pruning expired entries cannot
@@ -54,17 +54,17 @@ pub(crate) struct HoldRegistry(Mutex<HashMap<String, Held>>);
 #[derive(Clone)]
 pub struct SharedHold {
     registry: Arc<HoldRegistry>,
-    key: String,
+    key: crate::HoldKey,
 }
 
 impl SharedHold {
-    pub(crate) fn new(registry: Arc<HoldRegistry>, key: String) -> Self {
+    pub(crate) fn new(registry: Arc<HoldRegistry>, key: crate::HoldKey) -> Self {
         Self { registry, key }
     }
 
     #[must_use]
     pub fn key(&self) -> &str {
-        &self.key
+        self.key.as_str()
     }
 
     /// Keep the later deadline with its kind; quota wins an exact tie.
