@@ -568,7 +568,7 @@ async fn authenticate(
             // The mechanism is known here, so the refusal can say which rung
             // the server turned down rather than only that one was turned
             // down.
-            _ => Error::auth_with_mechanism(message, None, mechanism.name()),
+            _ => Error::auth_with_mechanism(message, None, mechanism),
         }),
         SieveStatus::Bye { code, message } => Err(Error::Sieve { code, message }),
     }

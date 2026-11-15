@@ -1096,7 +1096,7 @@ async fn run_backfill_partition_at_boundary(
             partition.clone(),
             live.as_ref(),
             changes_tx.clone(),
-            crate::cursor::ENGINE_VERSION,
+            bifrost_types::TraitEnvelopeVersion::new(crate::cursor::ENGINE_VERSION),
             Some(control),
             Some(coverage),
             Some(writer_tx),
@@ -1213,7 +1213,7 @@ pub(super) async fn emit_backfill_complete(
         partition: crate::backfill::partitioner::completion_partition(),
         progress_marker: None,
         progress: total_seen.completion_progress(),
-        envelope_version: crate::cursor::ENGINE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(crate::cursor::ENGINE_VERSION),
     };
     let batch: Batch<bifrost_types::Change> = Batch {
         items: Vec::new(),

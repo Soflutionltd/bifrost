@@ -140,7 +140,7 @@ impl ImapConnection {
     /// capabilities (RFC 9208 Section 3.1.1).
     pub(super) fn quota_resource_name(cap: &Capability) -> Option<&str> {
         match cap {
-            Capability::QuotaResource(name) => Some(name.as_str()),
+            Capability::QuotaResource(name) => Some(&**name),
             // The capability parser owns recognition of QUOTA=RES-. An Other
             // value is not a second spelling of a recognized resource.
             _ => None,

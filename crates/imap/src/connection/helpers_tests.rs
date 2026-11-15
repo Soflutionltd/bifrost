@@ -152,7 +152,7 @@ fn list_status_option_rejects_missing_parentheses() {
 
 #[test]
 fn quota_resource_name_from_typed_capability() {
-    let cap = Capability::QuotaResource("STORAGE".to_owned());
+    let cap = Capability::from_imap_str("QUOTA=RES-STORAGE");
     assert_eq!(ImapConnection::quota_resource_name(&cap), Some("STORAGE"));
 }
 
@@ -168,7 +168,7 @@ fn quota_resource_name_uses_capability_parser() {
 #[test]
 fn quota_resource_name_rejects_bare_prefix_and_others() {
     // Exactly `QUOTA=RES-` names no resource.
-    let bare = Capability::Other("QUOTA=RES-".to_owned());
+    let bare = Capability::from_imap_str("QUOTA=RES-");
     assert_eq!(ImapConnection::quota_resource_name(&bare), None);
     assert_eq!(
         ImapConnection::quota_resource_name(&Capability::Quota),
@@ -344,7 +344,7 @@ fn status_deleted_requires_rev2_or_quota_res_message() {
             .is_ok()
     );
     assert!(
-        conn(vec![Capability::QuotaResource("MESSAGE".to_owned())])
+        conn(vec![Capability::from_imap_str("QUOTA=RES-MESSAGE")])
             .validate_requested_status_items("DELETED")
             .is_ok()
     );
@@ -365,7 +365,7 @@ fn status_deleted_storage_requires_quota_res_storage() {
         Err(Error::MissingCapability(_))
     ));
     assert!(
-        conn(vec![Capability::QuotaResource("STORAGE".to_owned())])
+        conn(vec![Capability::from_imap_str("QUOTA=RES-STORAGE")])
             .validate_requested_status_items("DELETED-STORAGE")
             .is_ok()
     );

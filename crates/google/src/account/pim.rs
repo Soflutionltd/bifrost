@@ -1320,11 +1320,8 @@ fn render_message(
     default_address: &str,
     require_recipient: bool,
 ) -> Result<String, AccountError> {
-    if require_recipient && doc.to.is_empty() && doc.cc.is_empty() && doc.bcc.is_empty() {
-        return Err(other_error(
-            bifrost_types::AccountOperation::Send,
-            "gmail send requires at least one recipient",
-        ));
+    if require_recipient {
+        bifrost_types::compose::validate_send_recipients(&doc.to, &doc.cc, &doc.bcc)?;
     }
     if !doc.attachments_uploaded.is_empty() {
         return Err(unsupported(

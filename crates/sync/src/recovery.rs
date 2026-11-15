@@ -336,6 +336,31 @@ pub(crate) fn cursor_decode_failure(operation: AccountOperation) -> AccountError
     .expect("valid account error classification")
 }
 
+/// Envelope provenance decides whether recovery may clear durable state.
+#[derive(Clone, Copy)]
+pub(crate) enum CursorOrigin {
+    Fresh,
+    Stored,
+}
+
+/// A fresh invalid envelope is an implementation failure. Treating it as a
+/// migration would erase healthy account state without repairing the producer.
+pub(crate) fn classify_envelope(
+    cursor: &bifrost_types::ChangeCursor,
+    origin: CursorOrigin,
+    operation: AccountOperation,
+    scope: &CursorScope,
+) -> Result<(), AccountError> {
+    cursor.validate_envelope().map_err(|_| match origin {
+        CursorOrigin::Fresh => fresh_cursor_contract_error(
+            Some(&bifrost_types::Checkpoint::Change(cursor.clone())),
+            operation,
+            scope,
+        ),
+        CursorOrigin::Stored => cursor_decode_failure(operation),
+    })
+}
+
 /// Classify an account's violation of the batch boundary contract: a
 /// `PageBoundary::Partial` batch that nonetheless carries a checkpoint.
 ///
@@ -869,11 +894,13 @@ mod tests {
             scope: scope.clone(),
             server_state: bifrost_types::OpaqueChangeState {
                 protocol: bifrost_types::ProtocolKind::Imap,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: Vec::new(),
             },
             advanced_through: None,
-            envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+            ),
         });
         for error in [
             batch_boundary_violation(
@@ -1097,6 +1124,55 @@ mod tests {
         );
         assert_eq!(preserved.message_key(), terminal.message_key());
         assert!(preserved.recovery().is_terminal());
+    }
+
+    #[test]
+    fn envelope_classification_uses_provenance_before_authorizing_schema_reset() {
+        let scope = CursorScope::Folder(bifrost_types::FolderId("inbox".into()));
+        let mut cursor = bifrost_types::ChangeCursor {
+            scope: scope.clone(),
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Imap,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
+                bytes: Vec::new(),
+            },
+            advanced_through: None,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION + 1,
+            ),
+        };
+        let fresh = classify_envelope(
+            &cursor,
+            CursorOrigin::Fresh,
+            AccountOperation::EstablishCursor,
+            &scope,
+        )
+        .expect_err("fresh unsupported envelope");
+        assert_eq!(
+            fresh.kind(),
+            &AccountErrorKind::Internal(bifrost_types::InternalErrorKind::AccountContract),
+        );
+        assert!(fresh.recovery().is_terminal());
+        assert_eq!(fresh.scope(), Some(&ErrorScope::Cursor(scope.clone())));
+        let stored = classify_envelope(
+            &cursor,
+            CursorOrigin::Stored,
+            AccountOperation::EstablishCursor,
+            &scope,
+        )
+        .expect_err("stored unsupported envelope");
+        assert!(matches!(
+            stored.recovery(),
+            RecoveryClass::Engine(EngineDirective::SchemaIncompatible)
+        ));
+        cursor.envelope_version =
+            bifrost_types::TraitEnvelopeVersion::new(bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION);
+        for origin in [CursorOrigin::Fresh, CursorOrigin::Stored] {
+            assert!(
+                classify_envelope(&cursor, origin, AccountOperation::EstablishCursor, &scope)
+                    .is_ok()
+            );
+        }
     }
 
     #[test]

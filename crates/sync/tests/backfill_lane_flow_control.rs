@@ -1691,7 +1691,7 @@ async fn the_live_driver_refuses_a_backfill_checkpoint() {
                 partition: bifrost_types::Partition(b"complete:v2".to_vec()),
                 progress_marker: None,
                 progress: bifrost_types::BackfillProgress::default(),
-                envelope_version: 1,
+                envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
             })),
         })]
     }));

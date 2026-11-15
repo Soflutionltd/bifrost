@@ -489,7 +489,9 @@ pub(crate) fn derive(
         .unwrap_or_else(|| operation.is_none_or(AccountOperation::is_idempotent));
 
     match kind {
-        AccountErrorKind::ControlWaitEnded => RecoveryClass::Cancelled,
+        AccountErrorKind::ControlWaitEnded | AccountErrorKind::AccountClosed => {
+            RecoveryClass::Cancelled
+        }
         AccountErrorKind::Transport(_) => {
             debug_assert!(
                 tx_state != TransmissionState::Acknowledged,
@@ -590,7 +592,7 @@ pub(crate) fn suggest(
     chain: &CauseChain,
 ) -> Option<RemediationAction> {
     match kind {
-        AccountErrorKind::ControlWaitEnded => None,
+        AccountErrorKind::ControlWaitEnded | AccountErrorKind::AccountClosed => None,
         AccountErrorKind::Authentication(AuthErrorKind::Expired) => {
             Some(RemediationAction::RefreshToken)
         }
@@ -655,6 +657,7 @@ pub(crate) fn suggest(
 
 pub(crate) fn kind_matches_cause(kind: &AccountErrorKind, cause: &Cause) -> bool {
     match (kind, cause) {
+        (AccountErrorKind::AccountClosed, Cause::State(StateCause::AccountClosed)) => true,
         (AccountErrorKind::ControlWaitEnded, Cause::State(StateCause::ControlWaitEnded { .. })) => {
             true
         }

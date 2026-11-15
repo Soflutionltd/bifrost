@@ -174,6 +174,14 @@ layout belongs entirely to `bifrost-sync`'s envelope decoder, which stamps the
 current version on the way out, so a `ChangeCursor` a protocol crate is handed
 is always at the layout that crate compiles against. `ChangeCursorEnvelopeMismatch`
 reports `expected` and `found`.
+`OpaqueChangeState::envelope_version` is `PayloadVersion`, while the outer
+change cursor and backfill checkpoint use `TraitEnvelopeVersion`. Their private
+representations prevent substituting one version axis for another. Change and
+backfill deliberately share their outer storage layout and version axis.
+`OpaqueChangeState::open` validates the expected protocol and exact payload
+version before a protocol decoder reads bytes. `CursorDecodeFault::builder`
+owns the recovery policy described in `reference/error-model.md`; providers
+supply only fault identity, operation, scope and diagnostic decoration.
 `CursorEstablishment` is either `Ready(ChangeCursor)` or
 `EstablishViaInventory`. In the latter case the terminal inventory
 `Done` event carries the new change checkpoint.
@@ -419,9 +427,8 @@ result an error containing the original rejected items, rather than a partial
 recipient list. Empty lists and empty groups succeed. Unsupported syntax must
 be treated as a rejection, not evidence that the mailbox is invalid.
 The existing `parse_list` and `addresses` convenience methods return only
-accepted mailboxes. IMAP submission and Google draft hydration currently use
-these convenience methods; callers that submit or rewrite recipients must use
-the checked methods and propagate rejection before writing.
+accepted mailboxes. IMAP submission uses the checked methods through `submission_envelope`;
+Google draft hydration also propagates rejected addresses before rewriting.
 `HeaderMap::parse` accepts a standalone header block, unfolding continuations
 and preserving repeated fields in wire order. Its caller bounds the input;
 unlike full MIME parsing, it applies no header-size limit itself.
@@ -563,3 +570,31 @@ matching meetings to stay visible rather than disappear under an incomplete
 local comparison. This is a conservative guard, not occurrence expansion or
 request validation. A CalDAV listing fallback can therefore include candidates
 whose overlap cannot be established locally.
+
+## Submission validation and reverse paths
+
+`SendRequest::validate_recipients` and `compose::validate_send_recipients`
+own the requirement for at least one To, Cc or Bcc recipient. Draft patches
+are partial updates, so validate the resolved draft rather than a patch alone.
+The MIME send renderer, Google send renderer, JMAP send boundary and shared
+header submission resolver use this rule before submitting.
+
+`mime::HeaderMap::submission_envelope` checks every From, Sender, To, Cc and
+Bcc address and returns an optional reverse path plus ordered recipients.
+For one author, From wins over Sender: an enterprise user sending on behalf
+of a shared mailbox expects bounces at that mailbox rather than the delegate.
+Without From, Sender wins; without either the caller chooses its default or
+SMTP's null reverse path. Multiple authors require one Sender and use it as
+the only unambiguous reverse path. Multiple Senders are refused. Unsupported
+addresses and missing recipients are refused without dropping any address.
+SMTP header conversion and IMAP raw/draft submission share this owner.
+`mime::generate_message_id` owns fresh sender-domain correlation ids for both
+composed messages and raw IMAP submissions missing a structural Message-ID.
+
+## Shared entity validators
+
+`bifrost_types::EntityTag` owns strong/weak classification and preserves the
+original token bytes. `ServerVersion::ETag`, `ContactCard.etag` and
+`CalendarEvent.etag` carry this type. HTTP caller-token validation lives on the
+shared type; a token without a weak marker still needs syntax validation before
+it is accepted as an HTTP precondition. `StrongTag` has a private field.

@@ -512,8 +512,9 @@ pub(crate) fn flags_set(flags: &[crate::types::Flag]) -> HashSet<String> {
 }
 
 /// The IMAP flag judge behind `ImapAccount::flag_target`. `\Recent` is
-/// server-owned: no STORE sets or clears it, so an operation naming it is
-/// undecidable, and a `Set` compares the observation with `\Recent` removed.
+/// server-owned, and `\*` is only a permanent-keyword grant. Neither can be
+/// requested by STORE, so naming either is undecidable. Set comparison removes
+/// both from the observation.
 /// Requests use the same neutral-keyword conversion as STORE, followed by
 /// the generic case-insensitive judge. Observations retain wire identity.
 pub(crate) fn imap_flag_target(
@@ -521,13 +522,17 @@ pub(crate) fn imap_flag_target(
     op: &bifrost_types::FlagOp,
 ) -> bifrost_types::FlagTargetState {
     use bifrost_types::{FlagOp, FlagTargetState};
-    let recent = |flags: &HashSet<String>| flags.iter().any(|f| f.eq_ignore_ascii_case("\\recent"));
-    let names_recent = match op {
-        FlagOp::Add(s) | FlagOp::Remove(s) | FlagOp::Set(s) => recent(s),
-        FlagOp::Patch { add, remove } => recent(add) || recent(remove),
+    let unwritable = |flags: &HashSet<String>| {
+        flags
+            .iter()
+            .any(|f| !crate::types::Flag::from_neutral_keyword(f).is_writable())
+    };
+    let names_unwritable = match op {
+        FlagOp::Add(s) | FlagOp::Remove(s) | FlagOp::Set(s) => unwritable(s),
+        FlagOp::Patch { add, remove } => unwritable(add) || unwritable(remove),
         _ => return FlagTargetState::Indeterminate,
     };
-    if names_recent {
+    if names_unwritable {
         return FlagTargetState::Indeterminate;
     }
     // Translate only the request: a literal server keyword `$seen` is not
@@ -555,7 +560,7 @@ pub(crate) fn imap_flag_target(
     if matches!(op, FlagOp::Set(_)) {
         let flags = observed
             .iter()
-            .filter(|f| !f.eq_ignore_ascii_case("\\recent"))
+            .filter(|f| crate::types::Flag::from_imap_str(f).is_writable())
             .cloned()
             .collect();
         bifrost_types::flag_target_state(&flags, &op)
@@ -614,8 +619,8 @@ mod tests {
     }
 
     #[test]
-    fn imap_flag_target_ignores_recent_for_set() {
-        let observed = ["\\seen", "\\recent"]
+    fn imap_flag_target_ignores_server_only_flags_for_set() {
+        let observed = ["\\seen", "\\recent", "\\*"]
             .map(String::from)
             .into_iter()
             .collect();
@@ -641,6 +646,30 @@ mod tests {
         ] {
             assert_eq!(
                 super::imap_flag_target(&Default::default(), &op),
+                FlagTargetState::Indeterminate
+            );
+        }
+    }
+
+    #[test]
+    fn imap_flag_target_refuses_wildcard_requests() {
+        use bifrost_types::{FlagOp, FlagTargetState};
+        let flags = || ["\\*".to_owned()].into_iter().collect();
+        for op in [
+            FlagOp::Add(flags()),
+            FlagOp::Remove(flags()),
+            FlagOp::Set(flags()),
+            FlagOp::Patch {
+                add: flags(),
+                remove: Default::default(),
+            },
+            FlagOp::Patch {
+                add: Default::default(),
+                remove: flags(),
+            },
+        ] {
+            assert_eq!(
+                imap_flag_target(&Default::default(), &op),
                 FlagTargetState::Indeterminate
             );
         }
@@ -779,7 +808,7 @@ mod tests {
     }
 
     fn keyword(name: &str) -> crate::types::Flag {
-        crate::types::Flag::Custom(name.to_owned())
+        crate::types::Flag::from_imap_str(name)
     }
 
     // The fingerprint's flags_hash is what the engine diffs to decide

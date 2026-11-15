@@ -101,7 +101,7 @@ fn memberships_for_entry(
 /// folders only at open/reopen (NAMESPACE + LIST in `factory.rs`), and the
 /// engine re-runs `discover_cursor_scopes` / `discover_memberships` on
 /// every account reopen. Folder mutations observed mid-session via push
-/// IDLE (`IdleEvent::MailboxEvent` -> `FolderRegistry::apply_mailbox_event`,
+/// IDLE (`TypedEvent::MailboxEvent` -> `FolderRegistry::apply_mailbox_event`,
 /// in `push.rs`) update the in-memory registry and surface as
 /// `WatchEvent::Invalidated`, which drives a reconcile rather than a
 /// per-scope `RestartScope`. A folder that *appears* after attach (a newly

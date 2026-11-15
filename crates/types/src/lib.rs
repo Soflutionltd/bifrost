@@ -116,9 +116,9 @@ pub use directory::{DirectoryGroup, DirectoryGroupId, DirectoryGroupKind, Direct
 // Cursor + scope types.
 pub use cursor::{
     CHANGE_CURSOR_ENVELOPE_VERSION, ChangeCursor, ChangeCursorEnvelopeMismatch, CostClass,
-    CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope, ObjectType,
-    OpaqueChangeState, OpaqueProgressBytes, ProtocolKind, ScopeLifecycle, ScopeLifecycleEvent,
-    SyncStrategy,
+    CursorDecodeFault, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
+    ObjectType, OpaqueChangeState, OpaqueProgressBytes, PayloadVersion, ProtocolKind,
+    ScopeLifecycle, ScopeLifecycleEvent, SyncStrategy, TraitEnvelopeVersion,
 };
 
 pub use error::partial::{
@@ -204,3 +204,6 @@ pub use settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
 /// signature and the workspace will not link.
 #[allow(dead_code)]
 fn _dyn_safe(_: &dyn Account) {}
+
+mod etag;
+pub use etag::{EntityTag, StrongTag};

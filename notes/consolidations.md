@@ -209,14 +209,6 @@ the canonical refusal (`caps.pim_methods.gate(AccountOperation::X)?`,
 method once and generating the flag field, the operation variant and the
 default refusal.
 
-## CON-007 - Does this send have at least one recipient?
-
-**Reported by:** types.
-
-Sites: `mime::render::send_request_to_rfc5322`, Google `pim.rs` (its own
-`require_recipient` branch), IMAP `pim.rs` draft send, JMAP scheduled send.
-Owner: a `SendRequest` / `DraftPatch` validator in `compose.rs`.
-
 ## CON-009 - Which throttle budget does this work consume, and which does this error stamp?
 
 **Reported by:** types.
@@ -355,31 +347,6 @@ ignored or an error depending on the site. Its proposed owner: one
 can be exhaustive, if the equivalence is a protocol fact rather than engine
 policy.
 
-## CON-017 - Establishing a cursor is one operation written twice, and attach bypasses the writer
-
-**Reported by:** sync-engine.
-
-`attach.rs::establish_one` and `reattach.rs::run_establish` (whose doc says it
-"Mirrors `SyncEngine::establish_one`") each read the stored cursor; decide
-readable vs unreadable with the same `Ok(Some(c)) if validate_envelope().is_ok()
-/ Ok(Some(_)) | Err(SchemaIncompatible)` pattern and react differently by
-design; ask `is_inventory_cursor(&c) || inventory_resume_stream(c).is_some()`;
-handle `Ready` vs `EstablishViaInventory`; and fail an unknown variant with
-`EstablishCursorFailed("unknown CursorEstablishment variant")`. They already
-diverge on fresh-envelope classification (BUG-006). The attach path also writes
-the store directly (`persist_cursor` as `get_ledger` then `apply_transition`, and
-`clear_account_checkpoints`), while recovery goes through the writer: two
-implementations of "persist an established cursor preserving the ledger" and of
-"account schema clear".
-
-Owner: spawn the ack writer first in attach (it depends on no other worker), and
-run attach's establishment through the same `Establishment` routine as recovery
-and reattach, with an origin mode (`Attach`, `Recover`, `Reattach { attempt }`)
-deciding the real differences (persist-ready or stage; claim provisional rows;
-defer to fusion or run it inline). That makes "one writer per account owns every
-durable mutation" literally true; today the attach-time clear and persist are
-the exceptions.
-
 ## CON-018 - Which priority maps to which scheduler lane, and when does starvation fire?
 
 **Reported by:** sync-engine.
@@ -502,60 +469,6 @@ orchestrator writes both; with no incarnation, a re-established scope reads the
 previous incarnation's state until overwritten. Owner: the registry becomes a
 read-only projection of `BackfillScan` (STR-044), keyed by incarnation.
 
-## CON-030 - What does an IMAP server event mean for sync?
-
-**Reported by:** imap-protocol.
-
-Three vocabularies for one stream: `TypedEvent` (connection), `IdleEvent`
-(`connection/idle`) and `EventImpact` (`types/events.rs`, reached only through
-the crate-private `ergonomics.rs`). `EventImpact` and `push::map_idle_event` each
-decide what an event means and disagree: `Recent` -> `None` vs
-invalidate-selected; NOTIFICATIONOVERFLOW -> `NotifyRegistrationLost` vs coarse
-`Unknown`. `TypedEvent::MetadataChange` and `ServerMetadataChange` are never
-constructed in production but every mapping handles them. Owner: one meaning
-layer (the account's); delete or rewire `EventImpact`, and make the TypedEvent ->
-IdleEvent step lossless (STR-057).
-
-The imap-connection hunter counted four classifiers in a chain:
-`UntaggedResponse -> TypedEvent` (`impl From` in `typed_event.rs`), then
-`TypedEvent::priority()` (`typed_event.rs`), `TypedEvent::impact()`
-(`types/events.rs`, a different module from the type), then
-`typed_event_to_idle_event` / `untagged_to_idle_event` (`idle.rs`), then
-`map_idle_event` / `absorb_idle_event` / `idle_event_ending`
-(`account/push.rs`). Further disagreements: METADATA - `impact()` maps
-`TypedEvent::MetadataChange` to `SelectedMailboxChanged`, but that variant is
-never constructed; real METADATA arrives as `TypedEvent::Extension`, becomes
-`IdleEvent::MetadataChange`, and `map_idle_event` maps it to
-`HintPayload::Unknown`. Queue overflow - `impact()` says `EventQueueOverflow {
-dropped_count }`; the IDLE path turns it into `IdleEvent::Alert(String)`, which is
-documented as RFC 3501 section 7.1 text that "MUST be presented to the user", so
-a consumer honouring that shows the user an internal back-pressure message as if
-the server said it. Priority and impact are two independent tables over the same
-variants. `IdleEvent` duplicates `TypedEvent` variant for variant (plus Timeout,
-Cancelled, ServerTerminated). Dead variants: `TypedEvent::MetadataChange {}` and
-`ServerMetadataChange {}` (never constructed, mapped by both `impact()` and
-`typed_event_to_idle_event`); `IdleEvent::Bye` is unreachable on the live path
-(the prologue turns BYE into an error first) yet `account/push.rs` carries two
-defensive arms and a long comment for it; `IdleTermination::ClientDone` before
-DONE maps to `ServerTerminated`, "Shouldn't happen". Its owner: one `ServerEvent`
-enum and one classification table (`fn class(&self) -> EventClass { priority,
-impact, ends_idle_wait }`) in one module, with `IdleOutcome = Event(ServerEvent) |
-Timeout | Cancelled | ServerTerminated`; the account then reads `impact`, not
-variants.
-
-## CON-031 - IMAP mailbox display <-> wire conversion under a mode
-
-**Reported by:** imap-protocol.
-
-Decided in `codec/decode/mailbox.rs::decode_mailbox_from_wire`,
-`encode_mailbox_str` (the INBOX-prefix rewrite lives only here),
-`MailboxName::child` (`utf8 ? leaf : encode_utf7(leaf)`), `MailboxName::parent`
-and `from_account_id` (`from_utf8_lossy` or `decode_utf7`), and
-`MailboxName::identity` (`encode_utf7` for canonical). Owner: a codec-side
-`WireMode::{encode, decode}` pair that `MailboxName` calls, with the INBOX rule
-(BUG-027) there or in `MailboxName` construction, not in the encoder alone. The
-type-level part is STR-058.
-
 ## CON-032 - IMAP decoder side tables kept in step with the parsers by hand
 
 **Reported by:** imap-protocol (latent).
@@ -605,19 +518,6 @@ carries trusted origins, bearer-carrying requests take an `AdmittedUrl` minted b
 net, and each crate contributes only its policy for widening the set (DAV's
 discovered homes, Graph's upload sessions). Related: BUG-075.
 
-## CON-048 - After a whole-submission failure, is an item Failed or Uncertain?
-
-**Reported by:** graph.
-
-Graph's `mutate::append_batch_failure` scans the cause chain for an `InFlight`
-attempt or a `GraphError::Json` (the latter redundant with
-`AttemptCause::unreadable_success`); Google (`mutation.rs`, the
-`acknowledged_bodies`/`in_flight` match) and IMAP (`mutate.rs`,
-`Verdict::Uncertain`) each have their own verdict; `RecoveryClass::requires_reconciliation`
-already answers the question centrally. Owner: `ItemOutcome::from_submission_error(item,
-error)` in `bifrost-types`, picking the lane from the error's own transmission
-evidence.
-
 ## CON-049 - The final idempotency override is decided by three crates, and Graph can widen what net narrowed
 
 **Reported by:** graph, net-dav.
@@ -662,18 +562,6 @@ doors, which then differ only in reporting (streaming `ItemOutcome` vs
 `PartialCommit`). The same two-pipeline shape is STR-080 (IMAP) and BUG-071
 (JMAP).
 
-## CON-051 - What does a call on a closed account return?
-
-**Reported by:** google (cross-crate; the crates already differ).
-
-Google refuses calls on a closed account as `Unsupported(op)`
-(`account_closed_error`, `push::closed_error`) - the class a consumer reads as
-"this account cannot do this", for a method `capabilities()` advertises. Graph's
-`push::common::account_closed_error` refuses as `Internal(RuntimeFailure)`.
-bifrost-types has no lifecycle kind for this, so each crate picks one. Owner: a
-lifecycle kind (or a stated existing one) in the shared error model. Related: IMAP's
-four lifecycle carriers, STR-083.
-
 ## CON-052 - Is a Gmail `NotFound` dischargeable under the cursor bridge?
 
 **Reported by:** google.
@@ -699,24 +587,3 @@ in step. Owner: the one status classification (BUG-072) returns `throttles: bool
 and the provider context supplies the scope (and Graph's budget) exactly once.
 Related: BUG-083, CON-013.
 
-## CON-062 - "Is this entity tag weak?" is answered at five sites
-
-**Reported by:** net-dav.
-
-The DAV half landed: one parser in `dav-core/src/etag.rs`, `EntityTag` and a
-private-field `StrongTag`, and `PutCondition::IfMatch` requires the strong tag.
-Residue: the validator still travels as `String` in `ServerVersion::ETag(String)`
-(bifrost-types) and at the DAV account and snapshot boundaries, with the weak
-marker kept as text so later code re-detects it. Moving `EntityTag` into
-bifrost-types and adopting it for Graph's `If-Match`, Google People and Google
-Calendar etags is the remaining owner change.
-
-## CON-066 - "Send to a pre-authenticated session URL" is three bools that must agree
-
-**Reported by:** net-dav.
-
-`without_bearer_auth().credential_url().follow_redirects(Disabled)` is the same
-triple at three sites: Graph `execute_aux` for `AuxTarget::Anonymous`, and Google
-`cloud.rs` twice. Forgetting one leaks a token, leaks the URL into diagnostics, or
-replays a chunk to a redirect target. Owner: `AccountNet::session_request(method,
-&SessionUrl)` with a `SessionUrl` newtype whose `Debug` and `Display` redact.

@@ -1418,12 +1418,13 @@ pub(crate) fn cursor_error_to_account_error(
         CursorError::ProtocolMismatch
         | CursorError::EnvelopeUnknown
         | CursorError::SchemaIncompatible
-        | CursorError::Decode(_) => base_builder(
-            &ctx,
-            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-            Cause::State(StateCause::SchemaIncompatible),
-        )
-        .text(DiagnosticText::support_only(error.to_string())),
+        | CursorError::Decode(_) => bifrost_types::CursorDecodeFault::Malformed
+            .builder(ctx.protocol, ctx.operation)
+            .provider(Provider::Microsoft)
+            .text(DiagnosticText::support_only(error.to_string())),
+        CursorError::ScopeMismatch => bifrost_types::CursorDecodeFault::ScopeMismatch
+            .builder(ctx.protocol, ctx.operation)
+            .provider(Provider::Microsoft),
         CursorError::CalendarWindowExpired | CursorError::InventoryInProgress => base_builder(
             &ctx,
             AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),

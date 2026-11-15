@@ -402,7 +402,10 @@ pub(crate) async fn delete_if_version(
                 .to_string(),
         )
     } else {
-        get(account.clone(), event.clone()).await?.etag
+        get(account.clone(), event.clone())
+            .await?
+            .etag
+            .map(bifrost_types::EntityTag::into_string)
     };
     let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventDelete)?;
     let path = event_url(&account, &calendar_id, &event_id);
@@ -716,7 +719,7 @@ fn event_from_graph(calendar_id: String, event: GraphEvent) -> CalendarEvent {
             .change_key
             .as_deref()
             .map(super::inventory::graph_change_key_etag)
-            .map(GraphETag::into_string),
+            .map(GraphETag::into_entity_tag),
         provenance: CalendarProvenance {
             provider: ProtocolKind::Graph,
             native,

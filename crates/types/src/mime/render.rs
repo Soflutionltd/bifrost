@@ -98,9 +98,7 @@ pub fn send_request_to_rfc5322(
     if !request.attachments_uploaded.is_empty() {
         return Err(unsupported(AccountOperation::AttachmentUpload));
     }
-    if request.to.is_empty() && request.cc.is_empty() && request.bcc.is_empty() {
-        return Err(malformed("send requires at least one recipient"));
-    }
+    request.validate_recipients()?;
 
     let from = request.from.clone().unwrap_or_else(|| default_from.clone());
     let message_id = generate_message_id(&from);
@@ -590,7 +588,8 @@ fn boundary(kind: &str) -> String {
 /// `msg-id` regardless of what the caller put in the address: the value
 /// returned to the consumer in [`RenderedMessage::message_id`] is the
 /// same sanitized string emitted in the header, never raw caller input.
-fn generate_message_id(from: &Address) -> String {
+/// Generate a fresh sender-domain Message-ID for composed or raw submissions.
+pub fn generate_message_id(from: &Address) -> String {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()

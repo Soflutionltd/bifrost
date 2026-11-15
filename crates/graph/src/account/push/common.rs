@@ -91,12 +91,11 @@ pub(super) fn no_subscribable_push_scopes(failed: &[bifrost_types::BatchFailure]
 
 /// A closed account refuses subscription registration in either push mode.
 pub(super) fn account_closed_error() -> AccountError {
-    into_account_error(
-        crate::error::GraphError::RuntimeFailure {
-            message: "the account is closed".to_string(),
-        },
-        GraphErrorContext::graph(AccountOperation::PushSubscribe),
-    )
+    AccountError::account_closed(AccountOperation::PushSubscribe, Protocol::Graph)
+        .into_builder()
+        .provider(Provider::Microsoft)
+        .try_build()
+        .expect("valid closed account error classification")
 }
 
 /// Prefix of a bound webhook handle:

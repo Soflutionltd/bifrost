@@ -1,5 +1,9 @@
 # bifrost-google reference
 
+Closed-account refusals, including push registration, use the shared
+`AccountClosed` / terminal `Cancelled` classification. Active operations interrupted
+by shutdown retain their existing transmission evidence and recovery.
+
 Generic net translation receives the context throttle scope, falling back to
 account scope, just like the provider status ladder. Response excerpts use
 net's shared byte cap and truncation marker.
@@ -1712,8 +1716,8 @@ clock. There is no separate `retry_not_before` side-channel.
   - The cursor-envelope protocol, envelope-version and schema-version
     mismatches and the account-identity mismatch produce
     `SyncState(SchemaIncompatible)` -> `Engine(SchemaIncompatible)` so the
-    engine clears the cursor; a cursor payload that does not deserialize is
-    `SyncState(CursorInvalid)`.
+    engine clears the cursor and dependent backfill state. A payload that does
+    not deserialize uses that same shared `CursorDecodeFault` classification.
 
 `mutation_error(ids, error, ctx)` is the ordinary per-id fan-out for batched
 mutations: it translates the crate-level error once via `into_account_error`
@@ -2021,3 +2025,48 @@ Drive and OneDrive. Drive supplies header decoding and `NoProgress::LocalLimit`;
 its documented resend response remains a local work refusal. Provider errors,
 chunk acknowledgement counts, cancellation and partial-commit records remain in
 `account/cloud.rs`. The shared driver does not dispatch requests or follow URLs.
+
+## Session credential transport
+
+Pre-authenticated upload session sends use
+`AccountNet::session_request(method, &SessionUrl)`, which jointly suppresses the
+account bearer, redacts transport URL diagnostics and disables redirects.
+Provider URL admission remains local; the shared credential wrapper does not
+admit an origin. Users expect upload credentials and payloads to stay on the
+admitted destination. The shared resumable driver still owns chunk sequencing.
+
+Mutation termination uses `ItemOutcome::from_submission_error` for dispatched
+ids without earlier acknowledged bodies. The per-id progress ledger still reports
+earlier accepted bodies as uncertain and leaves unattempted ids for re-issue;
+submission-level evidence cannot replace those per-id facts.
+
+Google send rendering uses `bifrost_types::compose::validate_send_recipients`
+on the resolved document; empty To, Cc and Bcc is Request(Malformed). Draft
+saves may remain recipient-free.
+
+## Shared entity validators
+
+`bifrost_types::EntityTag` owns strong/weak classification and preserves the
+original token bytes. `ServerVersion::ETag`, `ContactCard.etag` and
+`CalendarEvent.etag` carry this type. HTTP caller-token validation lives on the
+shared type; a token without a weak marker still needs syntax validation before
+it is accepted as an HTTP precondition. `StrongTag` has a private field.
+
+Calendar caller tags use HTTP validation. People source tokens use the same
+byte-preserving carrier but remain opaque JSON values: a weak-looking prefix
+has no HTTP precondition meaning there. Nonempty People tokens are forwarded
+verbatim, so adopting the shared representation does not reject supported
+contact updates or rewrite a caller's source version.
+
+### Persisted cursor decoding
+
+Payload header validation uses `OpaqueChangeState::open` in bifrost-types.
+`CursorDecodeFault::builder` owns recovery classification: wrong protocol,
+unreadable layout or malformed bytes require `SchemaIncompatible`; a readable
+payload under a different scope requires `CursorInvalid` with that scope.
+Account identity mismatch requires schema clearing because no retained scope can
+safely consume another account's token. An enterprise user expects durable state
+to rebuild without blaming the provider or silently missing mail.
+Payload versions use `PayloadVersion`; change and backfill outer versions use
+`TraitEnvelopeVersion`. These are separate types with explicit numeric access
+for storage; existing wire values are unchanged.

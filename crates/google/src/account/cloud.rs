@@ -5,7 +5,7 @@
 //! bodies are rewritten onto bifrost-net's `RequestBuilder`/`Response` - no bare
 //! `reqwest::Client`, no hand-built `Authorization: Bearer` headers (the
 //! AccountNet token source supplies them; the pre-authenticated chunk PUT skips
-//! auth with `.without_bearer_auth()`).
+//! auth through `AccountNet::session_request`).
 //!
 //! The whole flow is one call: upload the bytes via the resumable session, then
 //! create a sharing permission and read the `webViewLink`. It returns only when
@@ -433,10 +433,10 @@ async fn cancel_upload_session(
     // pre-authenticated and admitted only as itself.
     let request = client
         .account_net()
-        .delete(upload_url)
-        .without_bearer_auth()
-        .credential_url()
-        .follow_redirects(bifrost_net::FollowRedirects::Disabled)
+        .session_request(
+            bifrost_net::Method::DELETE,
+            &bifrost_net::SessionUrl::new(upload_url),
+        )
         .retry(bifrost_net::RetryPolicy::disabled())
         .timeout(GDRIVE_CANCEL_TIMEOUT);
     let outcome = client
@@ -626,10 +626,10 @@ async fn upload_file_chunked_progress(
         // so the request's errors come back redacted (`credential_url`).
         let request = client
             .account_net()
-            .put(upload_url)
-            .without_bearer_auth()
-            .credential_url()
-            .follow_redirects(bifrost_net::FollowRedirects::Disabled)
+            .session_request(
+                bifrost_net::Method::PUT,
+                &bifrost_net::SessionUrl::new(upload_url),
+            )
             .header("Content-Range", &content_range)
             .body(chunk);
         let response = client

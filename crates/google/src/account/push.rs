@@ -420,7 +420,7 @@ pub(crate) fn push_subscribe(
             return Err(unsupported_push_scope_error(scopes[0].clone()));
         }
         if pubsub.shutdown.is_cancelled() {
-            return Err(closed_error(AccountOperation::PushSubscribe));
+            return Err(super::account_closed_error(AccountOperation::PushSubscribe));
         }
 
         // Gmail exposes one account-wide history cursor. One watch therefore
@@ -454,10 +454,10 @@ pub(crate) fn push_subscribe(
             .commands
             .send(WatchCommand::Subscribe { reply })
             .await
-            .map_err(|_| closed_error(AccountOperation::PushSubscribe))?;
-        let handle = response
-            .await
-            .unwrap_or_else(|_| Err(closed_error(AccountOperation::PushSubscribe)))?;
+            .map_err(|_| super::account_closed_error(AccountOperation::PushSubscribe))?;
+        let handle = response.await.unwrap_or_else(|_| {
+            Err(super::account_closed_error(AccountOperation::PushSubscribe))
+        })?;
         bifrost_types::PushSubscription::new(Some(handle), outcomes).map_err(|failure| {
             error::into_account_error(
                 crate::error::Error::internal(format!(
@@ -490,10 +490,12 @@ pub(crate) fn push_unsubscribe(
             .commands
             .send(WatchCommand::Unsubscribe { handle, reply })
             .await
-            .map_err(|_| closed_error(AccountOperation::PushUnsubscribe))?;
-        response
-            .await
-            .unwrap_or_else(|_| Err(closed_error(AccountOperation::PushUnsubscribe)))
+            .map_err(|_| super::account_closed_error(AccountOperation::PushUnsubscribe))?;
+        response.await.unwrap_or_else(|_| {
+            Err(super::account_closed_error(
+                AccountOperation::PushUnsubscribe,
+            ))
+        })
     })
 }
 
@@ -627,7 +629,7 @@ async fn watch_actor(
                                     if previous_expiration.is_none_or(|expiry| expiry <= client.wall_now()) { gap.store(true, Ordering::Release); }
                                     publish_schedule(&schedule, &lifecycle, &client);
                                     Ok(RenewOutcome::Renewed)
-                                } else { Err(closed_error(AccountOperation::PushSubscribe)) }
+                                } else { Err(super::account_closed_error(AccountOperation::PushSubscribe)) }
                             }
                             Err(e) => {
                                 let e = error::into_account_error(e, error::GmailErrorContext::push_subscribe());
@@ -694,7 +696,7 @@ async fn actor_subscribe(
     ownership: &mut WatchOwnership,
 ) -> Result<SubscriptionHandle, AccountError> {
     if shutdown.is_cancelled() || matches!(lifecycle, WatchLifecycle::Retired) {
-        return Err(closed_error(AccountOperation::PushSubscribe));
+        return Err(super::account_closed_error(AccountOperation::PushSubscribe));
     }
     let Some(config) = config else {
         return Err(error::into_account_error(
@@ -754,7 +756,7 @@ async fn actor_subscribe(
         }
     };
     if !commit_watched(client, shutdown, lifecycle, &response, ownership).await {
-        return Err(closed_error(AccountOperation::PushSubscribe));
+        return Err(super::account_closed_error(AccountOperation::PushSubscribe));
     }
     handles.insert(handle.0.clone());
     Ok(handle)
@@ -883,16 +885,6 @@ async fn commit_watched(
     true
 }
 
-fn closed_error(operation: AccountOperation) -> AccountError {
-    error::into_account_error(
-        crate::error::Error::unsupported_with(operation, "account is closed"),
-        match operation {
-            AccountOperation::PushUnsubscribe => error::GmailErrorContext::push_unsubscribe(),
-            _ => error::GmailErrorContext::push_subscribe(),
-        },
-    )
-}
-
 async fn watch_once(
     client: &GmailClient,
     config: &PubSubConfig,
@@ -939,12 +931,13 @@ fn renewal_delay_at(expiration: Option<SystemTime>, now: SystemTime) -> Duration
 mod tests {
     #[test]
     fn closed_unsubscribe_retains_unsubscribe_context() {
-        let error = super::closed_error(bifrost_types::AccountOperation::PushUnsubscribe);
+        let error =
+            super::super::account_closed_error(bifrost_types::AccountOperation::PushUnsubscribe);
         assert_eq!(
             error.operation(),
             Some(bifrost_types::AccountOperation::PushUnsubscribe)
         );
-        assert!(error.scope().is_none());
+        assert_eq!(error.scope(), Some(&bifrost_types::ErrorScope::Account));
     }
 
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
@@ -1737,7 +1730,7 @@ mod tests {
 
         assert!(matches!(
             error.kind(),
-            bifrost_types::AccountErrorKind::Unsupported(_)
+            bifrost_types::AccountErrorKind::AccountClosed
         ));
         assert!(script.requests().is_empty());
     }

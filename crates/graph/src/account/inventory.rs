@@ -192,7 +192,7 @@ pub(super) fn inventory_entry_from_parsed(
     let etag = graph_etag(value);
     let fingerprint = Fingerprint {
         server_version: etag
-            .map(|etag| ServerVersion::ETag(etag.into_string()))
+            .map(|etag| ServerVersion::ETag(etag.into_entity_tag()))
             .unwrap_or(ServerVersion::Unavailable),
         size: None,
         flags_hash: flags_hash(value),

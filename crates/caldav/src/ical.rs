@@ -189,7 +189,7 @@ fn project_event(
         calendar_id: calendar_id.clone(),
         native_id: uri.clone(),
         uid,
-        etag,
+        etag: etag.map(Into::into),
         provenance: CalendarProvenance {
             provider: ProtocolKind::CalDav,
             native: uri,

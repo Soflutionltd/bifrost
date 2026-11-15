@@ -758,7 +758,7 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
             mechanism,
             initial_response,
         } => {
-            session.require(Capability::Auth(mechanism.to_owned()))?;
+            session.require(Capability::from_imap_str(&format!("AUTH={mechanism}")))?;
             if initial_response.is_some() {
                 session.require(Capability::SaslIr)?;
             }
@@ -775,7 +775,7 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
         }
         Command::Sort { .. } | Command::UidSort { .. } => session.require(Capability::Sort)?,
         Command::Thread { algorithm, .. } | Command::UidThread { algorithm, .. } => {
-            session.require(Capability::Thread(algorithm.to_uppercase()))?;
+            session.require(Capability::from_imap_str(&format!("THREAD={algorithm}")))?;
         }
         Command::Status { items, .. } => session.validate_requested_status_items(items)?,
         Command::ListStatus { status_items, .. } => {

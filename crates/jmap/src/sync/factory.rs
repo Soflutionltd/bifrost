@@ -1958,7 +1958,9 @@ mod tests {
             scope: scope.clone(),
             server_state: encoded,
             advanced_through: None,
-            envelope_version: state::OUTER_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                state::OUTER_CURSOR_ENVELOPE_VERSION,
+            ),
         };
         let (_, seeded_state) = state::decode_cursor(&cursor).expect("seed decodes");
         assert_eq!(
@@ -3330,7 +3332,7 @@ mod tests {
             .expect("primary mail account");
         let scope = CursorScope::Type(ObjectType::Email);
         let mut cursor = state::cursor_for_scope(scope.clone(), "s1").expect("scope encodes");
-        cursor.server_state.envelope_version = 1;
+        cursor.server_state.envelope_version = bifrost_types::PayloadVersion::new(1);
 
         let mut stream = crate::sync::changes::stream(
             primary,
@@ -3396,7 +3398,9 @@ mod tests {
                 .expect("scope encodes");
         scope_mismatch.scope = scope.clone();
 
-        for cursor in [foreign_protocol, scope_mismatch] {
+        // A foreign protocol tag is unreadable state (schema incompatible);
+        // only a readable cursor filed under the wrong scope restarts that scope.
+        for (wrong_protocol, cursor) in [(true, foreign_protocol), (false, scope_mismatch)] {
             // No replies armed: reaching the wire at all is a failure.
             let client = scripted_client([]);
             let primary = client
@@ -3415,15 +3419,19 @@ mod tests {
                 Some(bifrost_types::SyncEvent::Terminated(err)) => {
                     assert_eq!(
                         err.kind(),
-                        &bifrost_types::AccountErrorKind::SyncState(
+                        &bifrost_types::AccountErrorKind::SyncState(if wrong_protocol {
+                            bifrost_types::SyncStateErrorKind::SchemaIncompatible
+                        } else {
                             bifrost_types::SyncStateErrorKind::CursorInvalid
-                        )
+                        })
                     );
                     assert_eq!(
                         err.recovery(),
-                        &bifrost_types::RecoveryClass::Engine(
+                        &bifrost_types::RecoveryClass::Engine(if wrong_protocol {
+                            bifrost_types::EngineDirective::SchemaIncompatible
+                        } else {
                             bifrost_types::EngineDirective::RestartScope(scope.clone())
-                        )
+                        })
                     );
                 }
                 other => panic!("expected a cursor-invalid termination, got {other:?}"),

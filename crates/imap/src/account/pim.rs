@@ -498,7 +498,10 @@ where
     Box::pin(async move {
         let _send_gate = account.send_gate.read().await;
         if account.shutdown.is_cancelled() {
-            return Err(op_err(AccountOperation::Send)(Error::closed()));
+            return Err(bifrost_types::AccountError::account_closed(
+                AccountOperation::Send,
+                bifrost_types::Protocol::Imap,
+            ));
         }
         // Graph-style shared-mailbox send routing is not modeled over
         // SMTP (a shared-mailbox send is `request.from` + relay
@@ -554,7 +557,10 @@ pub(crate) fn send_raw_message(
     Box::pin(async move {
         let _send_gate = account.send_gate.read().await;
         if account.shutdown.is_cancelled() {
-            return Err(op_err(AccountOperation::Send)(Error::closed()));
+            return Err(bifrost_types::AccountError::account_closed(
+                AccountOperation::Send,
+                bifrost_types::Protocol::Imap,
+            ));
         }
         let Some(submission) = account.submission.clone() else {
             return Err(super::error::unsupported(AccountOperation::Send));
@@ -603,7 +609,10 @@ pub(super) fn draft_send_with_clock(
     Box::pin(async move {
         let _send_gate = account.send_gate.read().await;
         if account.shutdown.is_cancelled() {
-            return Err(op_err(AccountOperation::DraftSend)(Error::closed()));
+            return Err(bifrost_types::AccountError::account_closed(
+                AccountOperation::DraftSend,
+                bifrost_types::Protocol::Imap,
+            ));
         }
         let Some(submission) = account.submission.clone() else {
             return Err(super::error::unsupported(AccountOperation::DraftSend));
@@ -828,7 +837,7 @@ struct ParsedDraft {
 
 /// Parse a saved draft's RFC 5322 headers into a submission envelope and
 /// strip the `Bcc:` header from the transmitted body. To/Cc/Bcc become
-/// the recipient set; From (or `default_from`) is the reverse path. The
+/// the recipient set; shared header resolution chooses the reverse path. The
 /// draft's own `Message-ID` is the fallback id.
 fn parse_draft_for_submission(
     raw: &[u8],
@@ -848,37 +857,16 @@ fn parse_draft_for_submission(
 
     let headers = bifrost_types::mime::HeaderMap::parse(header_block);
 
-    let from_addresses = checked_draft_addresses(&headers, "from", op)?;
-    let sender_addresses = checked_draft_addresses(&headers, "sender", op)?;
-    let to = checked_draft_addresses(&headers, "to", op)?;
-    let cc = checked_draft_addresses(&headers, "cc", op)?;
-    let bcc = checked_draft_addresses(&headers, "bcc", op)?;
-
-    let from = from_addresses
-        .into_iter()
-        .next()
-        .or_else(|| sender_addresses.into_iter().next())
-        .unwrap_or_else(|| default_from.clone());
-
-    let mut recipients = Vec::new();
-    recipients.extend(to);
-    recipients.extend(cc);
-    recipients.extend(bcc);
-    if recipients.is_empty() {
-        return Err(pim_malformed(op, "draft has no recipients"));
-    }
+    let (from, recipients) = headers
+        .submission_envelope()
+        .map_err(|detail| pim_malformed(op, detail))?;
+    let from = from.unwrap_or_else(|| default_from.clone());
 
     let message_id = headers
         .message_ids("message-id")
         .into_iter()
         .next()
-        .unwrap_or_else(|| {
-            let domain = from
-                .address
-                .rsplit_once('@')
-                .map_or("localhost", |(_, domain)| domain);
-            format!("bifrost.draft@{domain}")
-        });
+        .unwrap_or_else(|| bifrost_types::mime::generate_message_id(&from));
 
     let body = strip_bcc_header(header_block, &raw[body_start..]);
 
@@ -886,22 +874,6 @@ fn parse_draft_for_submission(
         envelope: bifrost_types::SubmissionEnvelope { from, recipients },
         body,
         message_id,
-    })
-}
-
-fn checked_draft_addresses(
-    headers: &bifrost_types::mime::HeaderMap,
-    name: &str,
-    op: AccountOperation,
-) -> Result<Vec<Address>, AccountError> {
-    headers.addresses_checked(name).map_err(|rejected| {
-        pim_malformed(
-            op,
-            format!(
-                "draft {name} header contains {} unsupported address item(s)",
-                rejected.len()
-            ),
-        )
     })
 }
 
@@ -3612,6 +3584,19 @@ body text\r\n";
     }
 
     #[test]
+    fn raw_submissions_without_message_id_get_distinct_correlation_ids() {
+        let raw = b"From: shared@example.test\r\nSender: delegate@example.test\r\nTo: target@example.test\r\n\r\nbody";
+        let default_from = Address::bare("default@example.test");
+        let first = parse_draft_for_submission(raw, &default_from, AccountOperation::Send)
+            .expect("first submission");
+        let second = parse_draft_for_submission(raw, &default_from, AccountOperation::Send)
+            .expect("second submission");
+        assert_eq!(first.envelope.from.address, "shared@example.test");
+        assert_ne!(first.message_id, second.message_id);
+        assert!(first.message_id.ends_with("@example.test"));
+    }
+
+    #[test]
     fn draft_send_falls_back_to_default_from_and_requires_recipient() {
         let default_from = bifrost_types::Address::bare("fallback@sender.test");
 
@@ -3753,12 +3738,12 @@ body text\r\n";
         );
         assert_eq!(
             folder_role(
-                &[MailboxAttribute::Custom("\\INBOX".to_owned())],
+                &[MailboxAttribute::from_imap_str("\\INBOX")],
                 "Posteingang",
                 None,
             ),
             None,
-            "a custom attribute cannot make another name the protocol INBOX",
+            "an Inbox attribute cannot make another name the protocol INBOX",
         );
     }
 
@@ -3974,11 +3959,11 @@ body text\r\n";
         // `$MDNSent` have no system-flag equivalent.
         assert_eq!(
             imap_flag_for_keyword("$MDNSent"),
-            Flag::Custom("$MDNSent".to_owned())
+            Flag::from_imap_str("$MDNSent")
         );
         assert_eq!(
             imap_flag_for_keyword(IMPORTANCE_KEYWORD),
-            Flag::Custom("$important".to_owned())
+            Flag::from_imap_str("$important")
         );
     }
 
@@ -4485,7 +4470,7 @@ body text\r\n";
     fn hydrated_message_maps_importance_from_the_important_keyword() {
         let with = crate::types::FetchResponse {
             uid: Some(2),
-            flags: Some(vec![Flag::Custom("$Important".to_owned())]),
+            flags: Some(vec![Flag::from_imap_str("$Important")]),
             ..Default::default()
         };
         let folder = MailboxName::new("INBOX").expect("valid mailbox");

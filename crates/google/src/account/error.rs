@@ -1254,24 +1254,25 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             malformed_request(&new_ctx, detail)
         }
         GmailLocalError::InvalidCursor { kind, detail } => {
-            let (sync_kind, cause) = match kind {
-                GmailCursorFailure::ProtocolMismatch
-                | GmailCursorFailure::EnvelopeMismatch
-                | GmailCursorFailure::SchemaMismatch => (
-                    AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-                    Cause::State(StateCause::SchemaIncompatible),
-                ),
-                GmailCursorFailure::MalformedPayload => (
-                    AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                    Cause::State(StateCause::CursorInvalid),
-                ),
+            let fault = match kind {
+                GmailCursorFailure::ProtocolMismatch => {
+                    bifrost_types::CursorDecodeFault::ProtocolMismatch
+                }
+                GmailCursorFailure::EnvelopeMismatch | GmailCursorFailure::SchemaMismatch => {
+                    bifrost_types::CursorDecodeFault::RetiredVersion
+                }
+                GmailCursorFailure::MalformedPayload => bifrost_types::CursorDecodeFault::Malformed,
             };
-            let mut builder = AccountErrorBuilder::new(sync_kind, cause)
+            let mut builder = fault
+                .builder(protocol_for(ctx), ctx.operation)
                 .google_provider(ctx)
                 .protocol(protocol_for(ctx))
                 .operation(ctx.operation)
                 .scope(ErrorScope::Cursor(CursorScope::Account))
                 .text(DiagnosticText::support_only(detail));
+            // These retained labels are diagnostics, not message keys. The
+            // shared builder derives the message key from CursorDecodeFault's
+            // kind, so consumers must not branch recovery on these strings.
             builder = builder.native_code(match kind {
                 GmailCursorFailure::ProtocolMismatch => "cursor_protocol_mismatch",
                 GmailCursorFailure::EnvelopeMismatch => "cursor_envelope_mismatch",
@@ -1285,20 +1286,18 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
         GmailLocalError::AccountIdentityMismatch {
             cursor_email,
             profile_email,
-        } => AccountErrorBuilder::new(
-            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-            Cause::State(StateCause::SchemaIncompatible),
-        )
-        .google_provider(ctx)
-        .protocol(protocol_for(ctx))
-        .operation(ctx.operation)
-        .scope(ErrorScope::Cursor(CursorScope::Account))
-        .native_code("cursor_account_identity_mismatch")
-        .text(DiagnosticText::support_only(format!(
-            "cursor account {cursor_email} != open account {profile_email}"
-        )))
-        .try_build()
-        .expect("valid account error classification"),
+        } => bifrost_types::CursorDecodeFault::IdentityMismatch
+            .builder(protocol_for(ctx), ctx.operation)
+            .google_provider(ctx)
+            .protocol(protocol_for(ctx))
+            .operation(ctx.operation)
+            .scope(ErrorScope::Cursor(CursorScope::Account))
+            .native_code("cursor_account_identity_mismatch")
+            .text(DiagnosticText::support_only(format!(
+                "cursor account {cursor_email} != open account {profile_email}"
+            )))
+            .try_build()
+            .expect("valid account error classification"),
         // Every producer raises this after a complete response lacked the
         // field, so the evidence is `Acknowledged` (see the variant's doc).
         GmailLocalError::MissingField { field, detail } => provider_fault(
@@ -1834,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_malformed_payload_maps_to_cursor_invalid() {
+    fn cursor_malformed_payload_maps_to_schema_incompatible() {
         let err = Error::Local(GmailLocalError::InvalidCursor {
             kind: GmailCursorFailure::MalformedPayload,
             detail: "truncated".to_owned(),
@@ -1842,11 +1841,11 @@ mod tests {
         let acc = into_account_error(err, GmailErrorContext::establish_cursor());
         assert!(matches!(
             acc.kind(),
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
         ));
         assert!(matches!(
             acc.recovery(),
-            RecoveryClass::Engine(EngineDirective::RestartScope(CursorScope::Account))
+            RecoveryClass::Engine(EngineDirective::SchemaIncompatible)
         ));
     }
 

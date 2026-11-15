@@ -1,3 +1,55 @@
+/// Parser-owned unknown capability token, preserving the original spelling.
+#[derive(Debug, Clone)]
+pub struct UnknownCapability(String);
+
+impl std::ops::Deref for UnknownCapability {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for UnknownCapability {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for UnknownCapability {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+/// Canonical parser-owned suffix of a structured capability.
+#[derive(Debug, Clone)]
+pub struct CapabilitySuffix(String);
+
+impl std::ops::Deref for CapabilitySuffix {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CapabilitySuffix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for CapabilitySuffix {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for CapabilitySuffix {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 /// Server capability (RFC 3501 Section 7.2.1 / RFC 9051 Section 7.2.1).
 ///
 /// Comparison and hashing are case-insensitive per RFC 3501 Section 7.2.1.
@@ -60,13 +112,13 @@ pub enum Capability {
     /// `QUOTA` (RFC 2087).
     Quota,
     /// `QUOTA=RES-<name>`  -  advertised quota resource type (RFC 9208 Section 3.1.1).
-    QuotaResource(String),
+    QuotaResource(CapabilitySuffix),
     /// `QUOTASET`  -  `SETQUOTA` command support (RFC 9208 Section 4.1.3).
     QuotaSet,
     /// `RIGHTS=<chars>`  -  indicates supported ACL rights (RFC 4314 Section 6).
     ///
     /// The `String` holds the new-rights characters (e.g. `"texk"`).
-    Rights(String),
+    Rights(CapabilitySuffix),
     /// `PREVIEW` (RFC 8970 Section 4).
     Preview,
     /// `SASL-IR` (RFC 4959).
@@ -87,7 +139,7 @@ pub enum Capability {
     ///
     /// The String holds the algorithm name (e.g. `"REFERENCES"`, `"ORDEREDSUBJECT"`).
     /// Servers may advertise multiple `THREAD=` capabilities, each as a separate entry.
-    Thread(String),
+    Thread(CapabilitySuffix),
     /// `STATUS=SIZE` (RFC 8438).
     StatusSize,
     /// `STATUS=DELETED`, a capability token no RFC defines. RFC 9051 Section 6.3.11 defines the STATUS data item
@@ -113,12 +165,10 @@ pub enum Capability {
     /// Gmail extension capability for `X-GM-*` FETCH attributes.
     XGmExt1,
     /// `AUTH=<mechanism>` (e.g. `AUTH=PLAIN`, `AUTH=XOAUTH2`) (RFC 3501 Section 7.2.1).
-    Auth(String),
+    Auth(CapabilitySuffix),
     /// Unrecognized capability  -  preserved verbatim.
-    // Account callers still construct payload variants directly. Until all
-    // producers use from_imap_str, enum-derived equality would silently change
-    // protocol identity for alternate spellings; retain wire-token equality.
-    Other(String),
+    // Only the parser mints unknown tokens; known spellings use known variants.
+    Other(UnknownCapability),
 }
 
 impl Capability {
@@ -189,9 +239,9 @@ impl Capability {
                     // capability = ("AUTH=" auth-type) / atom
                     // auth-type = atom, so an empty suffix is malformed.
                     if mechanism.is_empty() {
-                        Self::Other(s.to_owned())
+                        Self::Other(UnknownCapability(s.to_owned()))
                     } else {
-                        Self::Auth(mechanism.to_owned())
+                        Self::Auth(CapabilitySuffix(mechanism.to_owned()))
                     }
                 } else if upper == "SORT=DISPLAY" {
                     // RFC 5957 defines the dedicated SORT=DISPLAY capability.
@@ -200,16 +250,16 @@ impl Capability {
                     // RFC 9208 Section 3.1.1: supported quota resources are
                     // advertised as `QUOTA=RES-<name>`, so the suffix is required.
                     if resource.is_empty() {
-                        Self::Other(s.to_owned())
+                        Self::Other(UnknownCapability(s.to_owned()))
                     } else {
-                        Self::QuotaResource(resource.to_owned())
+                        Self::QuotaResource(CapabilitySuffix(resource.to_owned()))
                     }
                 } else if let Some(algo) = upper.strip_prefix("THREAD=") {
                     // THREAD=REFERENCES, THREAD=ORDEREDSUBJECT, etc. (RFC 5256 Section 1)
                     if algo.is_empty() {
-                        Self::Other(s.to_owned())
+                        Self::Other(UnknownCapability(s.to_owned()))
                     } else {
-                        Self::Thread(algo.to_owned())
+                        Self::Thread(CapabilitySuffix(algo.to_owned()))
                     }
                 } else if let Some(rights) = upper.strip_prefix("RIGHTS=") {
                     // RIGHTS=<chars> (RFC 4314 Section 6)
@@ -217,9 +267,9 @@ impl Capability {
                     // RFC 4314 Section 7: rights-capa = "RIGHTS=" new-rights,
                     // and new-rights = 1*LOWER-ALPHA, so an empty suffix is malformed.
                     if rights.is_empty() {
-                        Self::Other(s.to_owned())
+                        Self::Other(UnknownCapability(s.to_owned()))
                     } else {
-                        Self::Rights(rights.to_ascii_lowercase())
+                        Self::Rights(CapabilitySuffix(rights.to_ascii_lowercase()))
                     }
                 } else if let Some(rest) = upper.strip_prefix("APPENDLIMIT") {
                     if rest.is_empty() {
@@ -232,21 +282,21 @@ impl Capability {
                                 Self::AppendLimit(Some(n))
                             } else {
                                 // Non-numeric  -  preserve as-is.
-                                Self::Other(s.to_owned())
+                                Self::Other(UnknownCapability(s.to_owned()))
                             }
                         } else {
                             // Non-numeric  -  preserve as-is.
-                            Self::Other(s.to_owned())
+                            Self::Other(UnknownCapability(s.to_owned()))
                         }
                     } else {
                         // RFC 7889 Section 5 only defines bare `APPENDLIMIT`
                         // and `APPENDLIMIT=<number>`. Any other token starting
                         // with that prefix is an unknown capability and must be
                         // preserved verbatim for forward compatibility.
-                        Self::Other(s.to_owned())
+                        Self::Other(UnknownCapability(s.to_owned()))
                     }
                 } else {
-                    Self::Other(s.to_owned())
+                    Self::Other(UnknownCapability(s.to_owned()))
                 }
             }
         }
@@ -277,8 +327,7 @@ impl From<&str> for Capability {
 /// compare using ASCII case-insensitive comparison so that e.g.
 /// `Auth("PLAIN")` and `Auth("plain")` are treated as the same capability.
 ///
-/// Cross-representation is also handled: `Other("IDLE")` equals `Idle`,
-/// because they denote the same protocol capability.
+/// Parser-owned payloads prevent known tokens hiding in `Other`.
 impl PartialEq for Capability {
     fn eq(&self, other: &Self) -> bool {
         // RFC 3501 Section 7.2.1: capability comparisons are case-insensitive.
@@ -331,12 +380,8 @@ impl PartialEq for Capability {
             (Self::Auth(a), Self::Auth(b))
             | (Self::Thread(a), Self::Thread(b))
             | (Self::QuotaResource(a), Self::QuotaResource(b))
-            | (Self::Rights(a), Self::Rights(b))
-            | (Self::Other(a), Self::Other(b)) => a.eq_ignore_ascii_case(b),
-            // Cross-representation: compare Other's wire form against known variant.
-            (Self::Other(s), known) | (known, Self::Other(s)) => {
-                s.eq_ignore_ascii_case(&known.as_imap_str())
-            }
+            | (Self::Rights(a), Self::Rights(b)) => a.eq_ignore_ascii_case(b),
+            (Self::Other(a), Self::Other(b)) => a.eq_ignore_ascii_case(b),
             _ => false,
         }
     }
@@ -348,9 +393,8 @@ impl Eq for Capability {}
 /// RFC 3501 Section 7.2.1: capability names are case-insensitive.
 ///
 /// The `Hash` implementation must be consistent with `PartialEq`: capabilities that
-/// compare equal must hash to the same value. Because `Other("IDLE")` must
-/// equal `Idle`, we hash the lowercased wire form (`as_imap_str()`) for all
-/// variants, which is identical for cross-representation equivalents.
+/// compare equal must hash to the same value. Hash the folded wire spelling
+/// for every variant, without allocating a temporary string.
 impl std::hash::Hash for Capability {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         use std::fmt::Write;

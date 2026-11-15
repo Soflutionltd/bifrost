@@ -70,7 +70,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
     // Wire-side phase knowledge has one carrier. Keeping a second phase on the
     // context would let batch call sites construct disagreeing evidence.
     let phase = error.phase();
-    let diagnostic = error.diagnostic_text();
+    let diagnostic = name_mechanism(error.diagnostic_text(), auth_mechanism(phase));
 
     if let Some(account_error) = error.preclassified_account_error() {
         return recontextualize_preclassified(account_error, &ctx);
@@ -82,7 +82,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
     match error.kind() {
         ErrorKind::Authentication => {
             let (kind, cause) = auth_reauth();
-            let detail = name_mechanism(diagnostic.clone(), auth_mechanism(phase));
+            let detail = diagnostic.clone();
             build_basic(&ctx, kind, cause, attempt_state, detail.as_deref(), None)
         }
         ErrorKind::Parse => build_basic(
@@ -165,7 +165,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             None,
         ),
         ErrorKind::Policy => {
-            let detail = name_mechanism(diagnostic.clone(), auth_mechanism(phase));
+            let detail = diagnostic.clone();
             build_basic(
                 &ctx,
                 AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
@@ -175,6 +175,14 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
                 None,
             )
         }
+        ErrorKind::ServerUnavailable => build_basic(
+            &ctx,
+            AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+            attempt_state,
+            diagnostic.as_deref(),
+            None,
+        ),
         ErrorKind::Connection | ErrorKind::Network => build_transport(
             &ctx,
             TransportErrorKind::Network,
@@ -218,7 +226,9 @@ fn recontextualize_preclassified(error: AccountError, ctx: &SmtpErrorContext) ->
 }
 
 /// The SASL rung an auth-phase error was running, if the stamp names one.
-fn auth_mechanism(phase: Option<SmtpCommandPhase>) -> Option<&'static str> {
+fn auth_mechanism(
+    phase: Option<SmtpCommandPhase>,
+) -> Option<crate::transport::smtp::authentication::Mechanism> {
     match phase {
         Some(SmtpCommandPhase::Auth { mechanism }) => mechanism,
         _ => None,
@@ -242,7 +252,10 @@ fn auth_mechanism(phase: Option<SmtpCommandPhase>) -> Option<&'static str> {
 ///
 /// Only the mechanism NAME crosses this boundary. The credential and the SASL
 /// client responses stay inside the exchange.
-fn name_mechanism(text: Option<String>, mechanism: Option<&'static str>) -> Option<String> {
+fn name_mechanism(
+    text: Option<String>,
+    mechanism: Option<crate::transport::smtp::authentication::Mechanism>,
+) -> Option<String> {
     match (text, mechanism) {
         (Some(text), Some(mechanism)) if !text.is_empty() => {
             Some(format!("{text} (mechanism {mechanism})"))
@@ -1245,7 +1258,10 @@ mod tests {
         )
     }
 
-    fn auth_error_named(resp: Response, mechanism: &'static str) -> AccountError {
+    fn auth_error_named(
+        resp: Response,
+        mechanism: crate::transport::smtp::authentication::Mechanism,
+    ) -> AccountError {
         into_account_error(
             smtp_error::status(resp).with_phase(SmtpCommandPhase::Auth {
                 mechanism: Some(mechanism),
@@ -1278,7 +1294,10 @@ mod tests {
             Detail::Five,
             &["5.7.8 credentials rejected"],
         );
-        let named = auth_error_named(rejected.clone(), "SCRAM-SHA-256-PLUS");
+        let named = auth_error_named(
+            rejected.clone(),
+            crate::transport::smtp::authentication::Mechanism::ScramSha256Plus,
+        );
         let unnamed = auth_error(rejected);
         assert_eq!(named.kind(), unnamed.kind());
         assert!(matches!(
@@ -1315,7 +1334,7 @@ mod tests {
                 Detail::Four,
                 &["5.5.4 unrecognized authentication type"],
             ),
-            "SCRAM-SHA-1-PLUS",
+            crate::transport::smtp::authentication::Mechanism::ScramSha1Plus,
         );
         assert!(matches!(
             refused.kind(),
@@ -1341,7 +1360,7 @@ mod tests {
                 Detail::Five,
                 &[],
             ),
-            "OAUTHBEARER",
+            crate::transport::smtp::authentication::Mechanism::OAuthBearer,
         );
         assert_eq!(
             support_text(&account),
@@ -1357,7 +1376,9 @@ mod tests {
             let error: SmtpError = sasl.into();
             let account = into_account_error(
                 error.with_phase(SmtpCommandPhase::Auth {
-                    mechanism: Some("SCRAM-SHA-256-PLUS"),
+                    mechanism: Some(
+                        crate::transport::smtp::authentication::Mechanism::ScramSha256Plus,
+                    ),
                 }),
                 ctx,
             );
@@ -1383,7 +1404,7 @@ mod tests {
         let error: SmtpError = sasl.into();
         let account = into_account_error(
             error.with_phase(SmtpCommandPhase::Auth {
-                mechanism: Some("SCRAM-SHA-256"),
+                mechanism: Some(crate::transport::smtp::authentication::Mechanism::ScramSha256),
             }),
             ctx_smtp_send(),
         );

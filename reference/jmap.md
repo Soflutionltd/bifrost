@@ -1,5 +1,8 @@
 # bifrost-jmap reference
 
+Push subscription refused by the closed-account gate uses the shared
+`AccountClosed` / terminal `Cancelled` classification, with account scope.
+
 Generic net throttles explicitly use account scope for every JMAP provider.
 The factory test transport parses Retry-After as a hint before resolving its bounded delay;
 absolute dates remain in response headers for error recovery. SSE redirect
@@ -826,7 +829,7 @@ Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountF
 
 ### Cursor envelope
 
-`OpaqueChangeState` for JMAP is tagged with `ProtocolKind::Jmap` and `envelope_version = PAYLOAD_ENVELOPE_VERSION` (currently `2`). `OUTER_CURSOR_ENVELOPE_VERSION` is the matching `ChangeCursor.envelope_version` - the two consts sit on different axes, hence the `PAYLOAD_`/`OUTER_` prefixes. v2 is an OBJECT-ID encoding change, not a payload-shape change, exactly like graph's v2: v1 minted foreign thread ids bare, and a bare id still parses - as PRIMARY - so no additive field can detect one. A v1 cursor is therefore refused: `state::decode` distinguishes an OLDER envelope (`SchemaIncompatible` - reseed) from a FUTURE one (`CursorEnvelopeUnknown`), the refusal is pinned at the `changes_stream` door with its derived `Engine(SchemaIncompatible)` directive, and the engine's schema-clear deletes every durable checkpoint row of the account - change cursors and every backfill checkpoint, completion markers included, for scopes the engine does not track as well - so the next attach re-walks inventory and re-mints the ids - reseeding is the migration. The door classifies only genuine schema drift that way: a MIS-KEYED row (wrong protocol tag, or a payload scope disagreeing with the `ChangeCursor`) is a consumer/store bug, classified `SyncState(CursorInvalid)` -> `Engine(RestartScope(scope))` so the one bogus row is deleted and re-established without paying the account-wide clear and full re-hydration. Within the clearing session itself the re-established cursor covers changes from the open-time state onward only; the consumer's stored bare thread ids heal at that next-attach re-walk.
+`OpaqueChangeState` for JMAP is tagged with `ProtocolKind::Jmap` and `envelope_version = PAYLOAD_ENVELOPE_VERSION` (currently `2`). `OUTER_CURSOR_ENVELOPE_VERSION` is the matching `ChangeCursor.envelope_version` - the two consts sit on different axes, hence the `PAYLOAD_`/`OUTER_` prefixes. v2 is an OBJECT-ID encoding change, not a payload-shape change, exactly like graph's v2: v1 minted foreign thread ids bare, and a bare id still parses - as PRIMARY - so no additive field can detect one. A v1 cursor is therefore refused: `state::decode` distinguishes an OLDER envelope (`SchemaIncompatible` - reseed) from a FUTURE one (`CursorEnvelopeUnknown`), the refusal is pinned at the `changes_stream` door with its derived `Engine(SchemaIncompatible)` directive, and the engine's schema-clear deletes every durable checkpoint row of the account - change cursors and every backfill checkpoint, completion markers included, for scopes the engine does not track as well - so the next attach re-walks inventory and re-mints the ids - reseeding is the migration. Wrong protocol tags and malformed bytes use the same shared `CursorDecodeFault` schema-clear classification. A readable payload scope disagreeing with the `ChangeCursor` instead uses `SyncState(CursorInvalid)` -> `Engine(RestartScope(scope))`, resetting only that row. Within the clearing session itself the re-established cursor covers changes from the open-time state onward only; the consumer's stored bare thread ids heal at that next-attach re-walk.
 
 The payload is hand-rolled, length-prefixed bytes (little-endian `u32` lengths, single-byte tags):
 
@@ -1850,3 +1853,20 @@ return the winning state under that same lock. Both initial guard probes and
 stateMismatch refresh probes preserve a concurrent cache advance. An Outlook
 user expects concurrent edits to remain visible to mutation guards rather than
 be hidden by an older in-flight probe. The network probe holds no cache lock.
+
+The send boundary validates recipients through
+`SendRequest::validate_recipients` before identity lookup or submission, for
+both immediate and scheduled sends. Empty To, Cc and Bcc is Request(Malformed).
+
+### Persisted cursor decoding
+
+Payload header validation uses `OpaqueChangeState::open` in bifrost-types.
+`CursorDecodeFault::builder` owns recovery classification: wrong protocol,
+unreadable layout or malformed bytes require `SchemaIncompatible`; a readable
+payload under a different scope requires `CursorInvalid` with that scope.
+Account identity mismatch requires schema clearing because no retained scope can
+safely consume another account's token. An enterprise user expects durable state
+to rebuild without blaming the provider or silently missing mail.
+Payload versions use `PayloadVersion`; change and backfill outer versions use
+`TraitEnvelopeVersion`. These are separate types with explicit numeric access
+for storage; existing wire values are unchanged.

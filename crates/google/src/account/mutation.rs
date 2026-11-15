@@ -644,25 +644,14 @@ impl MutationProgress {
     }
 
     fn terminal_outcomes(&self, error: &AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
-        self.outcomes_before_stop(error, false)
+        self.outcomes_before_stop(error)
     }
 
     fn shutdown_outcomes(&self, error: &AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
-        self.outcomes_before_stop(error, true)
+        self.outcomes_before_stop(error)
     }
 
-    fn outcomes_before_stop(
-        &self,
-        error: &AccountError,
-        cancellation: bool,
-    ) -> Vec<ItemOutcome<MutationSuccess>> {
-        let ambiguous_attempt = error.chain().iter().any(|cause| {
-            matches!(
-                cause,
-                bifrost_types::Cause::Attempt(attempt)
-                    if attempt.transmission_state == bifrost_types::TransmissionState::InFlight
-            )
-        });
+    fn outcomes_before_stop(&self, error: &AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
         self.ids
             .iter()
             .zip(&self.states)
@@ -670,15 +659,31 @@ impl MutationProgress {
                 MutationIdProgress::Finished(outcome) => Some(outcome.clone()),
                 MutationIdProgress::Active {
                     acknowledged_bodies,
-                    in_flight,
                     ..
-                } if *acknowledged_bodies > 0
-                    || (*in_flight && (cancellation || ambiguous_attempt)) =>
-                {
+                } if *acknowledged_bodies > 0 => {
+                    // The per-id ledger knows about earlier accepted bodies;
+                    // the failing request's error alone cannot describe them.
                     Some(ItemOutcome::Uncertain(BatchUncertain::new(
                         BatchItemId(id.0.clone()),
                         error.clone(),
                     )))
+                }
+                MutationIdProgress::Active {
+                    in_flight: true, ..
+                } => {
+                    let outcome = ItemOutcome::from_submission_error(
+                        BatchItemId(id.0.clone()),
+                        error.clone(),
+                    );
+                    match outcome {
+                        ItemOutcome::Uncertain(_) => Some(outcome),
+                        // A known refusal leaves these ids for re-issue after
+                        // termination, just as an unattempted request does.
+                        ItemOutcome::Failed(_) => None,
+                        ItemOutcome::Succeeded(_) => {
+                            unreachable!("submission errors cannot succeed")
+                        }
+                    }
                 }
                 MutationIdProgress::Active { .. } => None,
             })

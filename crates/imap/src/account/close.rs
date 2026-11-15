@@ -181,11 +181,9 @@ mod tests {
                 .await
                 .unwrap_err(),
         ] {
-            let expected = super::super::account_error_with(
-                crate::Error::closed(),
-                super::super::error::ImapErrorContext::operation(
-                    bifrost_types::AccountOperation::Send,
-                ),
+            let expected = bifrost_types::AccountError::account_closed(
+                bifrost_types::AccountOperation::Send,
+                bifrost_types::Protocol::Imap,
             );
             assert_eq!(error.kind(), expected.kind());
         }

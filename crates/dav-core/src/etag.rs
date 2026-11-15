@@ -4,47 +4,7 @@
 
 use reqwest::header::HeaderMap;
 
-/// A validator parsed at a DAV or shared-account string boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum EntityTag {
-    Strong(StrongTag),
-    Weak(String),
-}
-
-/// A strong validator. The private field prevents weak If-Match conditions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StrongTag(String);
-
-impl StrongTag {
-    #[must_use]
-    pub fn to_header(&self) -> String {
-        format!("\"{}\"", self.0)
-    }
-}
-
-impl EntityTag {
-    #[must_use]
-    pub fn parse(value: &str) -> Self {
-        let value = value.trim();
-        if value
-            .get(..2)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
-        {
-            Self::Weak(value[2..].trim().to_string())
-        } else {
-            Self::Strong(StrongTag(value.trim_matches('"').to_string()))
-        }
-    }
-
-    #[must_use]
-    pub fn normalized(self) -> String {
-        match self {
-            Self::Strong(tag) => tag.0,
-            Self::Weak(value) => format!("W/{value}"),
-        }
-    }
-}
+pub use bifrost_types::{EntityTag, StrongTag};
 
 /// How a PUT is conditioned.
 #[derive(Debug, Clone)]
@@ -73,9 +33,15 @@ impl PutCondition {
     /// refusing every edit on such a server.
     #[must_use]
     pub fn from_etag(etag: Option<&str>) -> Self {
-        match etag.map(EntityTag::parse) {
+        Self::from_tag(etag.map(EntityTag::parse).as_ref())
+    }
+
+    /// Use an already classified account validator without reparsing it.
+    #[must_use]
+    pub fn from_tag(etag: Option<&EntityTag>) -> Self {
+        match etag.cloned() {
             Some(EntityTag::Strong(tag)) => Self::IfMatch(tag),
-            Some(EntityTag::Weak(_)) | None => Self::None,
+            _ => Self::None,
         }
     }
 }
@@ -109,7 +75,7 @@ pub fn normalize_http_etag(value: &str) -> String {
 pub fn prepare_if_match(etag: &str) -> Option<String> {
     match EntityTag::parse(etag) {
         EntityTag::Strong(tag) => Some(tag.to_header()),
-        EntityTag::Weak(_) => None,
+        _ => None,
     }
 }
 

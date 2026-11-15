@@ -63,6 +63,8 @@
 //! Version 9 adds Google provider (tag 6) and Calendar, People and Drive
 //! protocols (tags 10-12); older versions reject those tags.
 //!
+//! Version 10 adds `AccountClosed` (kind tag 12); older versions reject it.
+//!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
 //! checkpoint codec owns that layout and its migration chain, and a second
@@ -128,7 +130,7 @@ use crate::error::Error;
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 9;
+pub const LEDGER_ENVELOPE_VERSION: u32 = 10;
 
 /// Lowest ledger envelope version still readable by this engine.
 ///
@@ -870,6 +872,7 @@ fn canonical_cause(kind: &AccountErrorKind) -> Cause {
             SyncStateErrorKind::ScopeRevoked => StateCause::ScopeRevoked,
             _ => StateCause::CursorInvalid,
         }),
+        AccountErrorKind::AccountClosed => Cause::State(StateCause::AccountClosed),
         AccountErrorKind::ConcurrencyConflict => Cause::State(StateCause::ConcurrencyConflict),
         AccountErrorKind::ControlWaitEnded => Cause::State(StateCause::ControlWaitEnded {
             detail: DiagnosticText::support_only(""),
@@ -1007,6 +1010,7 @@ fn encode_error_kind(out: &mut Vec<u8>, kind: &AccountErrorKind) {
             });
         }
         AccountErrorKind::ControlWaitEnded => out.push(11),
+        AccountErrorKind::AccountClosed => out.push(12),
         // `AccountErrorKind` is `#[non_exhaustive]`; same rule as
         // `encode_obj_type` in the cursor envelope - the codec learns the
         // variant before a ledger carrying it may be stored.
@@ -1092,6 +1096,7 @@ fn decode_error_kind(reader: &mut Reader<'_>) -> Result<AccountErrorKind, Error>
         }),
         // Introduced in version 8; no older writer produced it.
         11 if reader.version >= 8 => AccountErrorKind::ControlWaitEnded,
+        12 if reader.version >= 10 => AccountErrorKind::AccountClosed,
         other => return Err(unknown_tag("account error kind", other)),
     };
     Ok(kind)
@@ -1886,7 +1891,7 @@ mod partial_commit_scope_tests {
     use super::*;
     #[test]
     fn google_api_error_digests_require_version_nine() {
-        assert_eq!(LEDGER_ENVELOPE_VERSION, 9);
+        const { assert!(LEDGER_ENVELOPE_VERSION >= 9) };
         for protocol in [
             Protocol::GoogleCalendar,
             Protocol::GooglePeople,
@@ -1916,6 +1921,29 @@ mod partial_commit_scope_tests {
                 assert!(decode_ledger(&legacy).is_ok());
             }
         }
+    }
+
+    #[test]
+    fn ledger_account_closed_v10_tag_round_trips() {
+        let kind = AccountErrorKind::AccountClosed;
+        let mut bytes = Vec::new();
+        encode_error_kind(&mut bytes, &kind);
+        assert_eq!(
+            decode_error_kind(&mut Reader::new(&bytes, 10)).unwrap(),
+            kind
+        );
+        for version in MIN_MIGRATABLE_LEDGER..10 {
+            assert!(decode_error_kind(&mut Reader::new(&bytes, version)).is_err());
+        }
+        let restored = AccountErrorBuilder::new(kind.clone(), canonical_cause(&kind))
+            .try_build()
+            .expect("canonical cause matches the kind");
+        assert_eq!(
+            restored.recovery(),
+            &bifrost_types::RecoveryClass::Cancelled
+        );
+        assert_eq!(restored.message_key(), "account.closed");
+        assert!(restored.suggested_remediation().is_none());
     }
 
     #[test]

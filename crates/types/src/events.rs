@@ -126,7 +126,7 @@ pub struct BackfillCheckpoint {
     pub partition: Partition,
     pub progress_marker: Option<crate::cursor::OpaqueProgressBytes>,
     pub progress: BackfillProgress,
-    pub envelope_version: u32,
+    pub envelope_version: crate::cursor::TraitEnvelopeVersion,
 }
 
 /// Backfill partition descriptor. Consumer-store key, opaque outside
@@ -557,7 +557,7 @@ mod inventory_completion_tests {
             partition: Partition(b"page:0:10".to_vec()),
             progress_marker: None,
             progress: BackfillProgress::default(),
-            envelope_version: 1,
+            envelope_version: crate::cursor::TraitEnvelopeVersion::new(1),
         })
     }
 
@@ -1056,11 +1056,11 @@ mod tests {
             scope,
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Imap,
-                envelope_version: 1,
+                envelope_version: crate::cursor::PayloadVersion::new(1),
                 bytes: bytes.to_vec(),
             },
             advanced_through: None,
-            envelope_version: 1,
+            envelope_version: crate::cursor::TraitEnvelopeVersion::new(1),
         })
     }
 
@@ -1122,11 +1122,11 @@ mod tests {
                 scope: CursorScope::Account,
                 server_state: OpaqueChangeState {
                     protocol: ProtocolKind::Imap,
-                    envelope_version: 1,
+                    envelope_version: crate::cursor::PayloadVersion::new(1),
                     bytes: vec![1],
                 },
                 advanced_through: None,
-                envelope_version: 1,
+                envelope_version: crate::cursor::TraitEnvelopeVersion::new(1),
             })),
         };
         assert!(batch.validate_boundary().is_err());

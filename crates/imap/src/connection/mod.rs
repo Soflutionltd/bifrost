@@ -15,11 +15,14 @@ use crate::error::Error;
 use crate::types::{
     AclEntry, AppendMessage, Capability, Command, CopyResult, EsearchResponse, ExpungeResult,
     FetchAttr, FetchResponse, Flag, ListRightsResponse, MailboxAttribute, MailboxFilter,
-    MailboxInfo, MailboxName, MetadataEntry, MetadataResult, MoveResult, NamespaceResponse,
-    NotifySetParams, QresyncParams, QuotaResource, QuotaRootResponse, Response, ResponseCode,
-    SelectOptions, SelectedMailbox, SequenceSet, StatusItem, StatusResult, StoreOperation,
-    StoreResult, ThreadNode, UidRange, UntaggedResponse, UntaggedStatus, format_fetch_attrs,
+    MailboxInfo, MailboxName, MetadataResult, MoveResult, NamespaceResponse, NotifySetParams,
+    QresyncParams, QuotaResource, QuotaRootResponse, Response, ResponseCode, SelectOptions,
+    SelectedMailbox, SequenceSet, StatusItem, StatusResult, StoreOperation, StoreResult,
+    ThreadNode, UidRange, format_fetch_attrs,
 };
+
+#[cfg(test)]
+use crate::types::{UntaggedResponse, UntaggedStatus};
 
 pub(crate) const LOGOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -45,6 +48,7 @@ pub(super) mod state;
 mod stream;
 mod tag;
 pub(crate) mod typed_event;
+use typed_event::TypedEvent;
 mod uid_ops;
 pub(super) mod wire;
 
@@ -114,166 +118,14 @@ pub(crate) enum SessionState {
     Logout,
 }
 
-/// Event received during an IDLE session (RFC 2177).
-#[non_exhaustive]
+/// Outcome of an IDLE wait. Server data retains the connection's event type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum IdleEvent {
-    /// New message(s) arrived  -  `* <n> EXISTS` (RFC 3501 Section 7.3.1).
-    Exists(u32),
-    /// Message expunged  -  `* <n> EXPUNGE` (RFC 3501 Section 7.4.1).
-    Expunge(u32),
-    /// Messages vanished  -  `* VANISHED [EARLIER] uid-set` (RFC 7162 Section 3.2.10.2).
-    ///
-    /// After `ENABLE QRESYNC`, servers send VANISHED instead of EXPUNGE.
-    Vanished {
-        /// `true` if this was a `VANISHED (EARLIER)` response (initial sync).
-        earlier: bool,
-        /// UIDs of vanished messages.
-        uids: Vec<UidRange>,
-    },
-    /// Message data changed  -  `* n FETCH ...` (RFC 3501 Section 7.4.2, RFC 2177 Section 3).
-    ///
-    /// During IDLE, the server may send unsolicited FETCH responses when message
-    /// attributes change (e.g., flags updated by another session). The full
-    /// `FetchResponse` is preserved so callers can inspect the sequence number,
-    /// UID, flags, and any other returned data items.
-    Fetch(Box<crate::types::FetchResponse>),
-    /// Recent message count changed  -  `* <n> RECENT` (RFC 3501 Section 7.3.2).
-    ///
-    /// RFC 2177 allows the server to send mailbox size messages during IDLE;
-    /// `* n RECENT` is one such message.
-    Recent(u32),
-    /// Server sent an ALERT that MUST be presented to the user
-    /// (RFC 3501 Section 7.1).
-    ///
-    /// RFC 3501 Section 7.1 mandates: "The human-readable text contains a
-    /// special alert that MUST be presented to the user in a fashion that
-    /// calls the user's attention to the message." RFC 2177 (IDLE) does not
-    /// exempt this requirement, so alerts received during IDLE are surfaced
-    /// immediately rather than buffered.
-    Alert(String),
-    /// The idle timed out (caller-supplied timeout elapsed).
+    Event(TypedEvent),
     Timeout,
-    /// The idle was cancelled via the `CancellationToken`.
     Cancelled,
-    /// Mailbox created, deleted, renamed, or access changed  -  `* LIST ...`
-    /// (RFC 5465 Sections 5.4-5.5).
-    ///
-    /// When NOTIFY is active with `MailboxName` (Section5.4) or
-    /// `SubscriptionChange` (Section5.5) events, the server delivers
-    /// mailbox-level notifications as LIST responses during IDLE.
-    MailboxEvent(MailboxInfo),
-    /// Non-selected mailbox status changed  -  `* STATUS "mailbox" (...)`
-    /// (RFC 5465 Section 4, Sections 5.1-5.3).
-    ///
-    /// When NOTIFY is active with message events (Section5.1-5.3) on
-    /// non-selected mailboxes, the server delivers status changes (new
-    /// messages, expunges, flag changes) as STATUS responses during IDLE.
-    /// The initial snapshot is delivered per the STATUS indicator (Section4).
-    MailboxStatus {
-        /// The mailbox whose status changed.
-        mailbox: MailboxName,
-        /// The status items that changed.
-        items: Vec<StatusItem>,
-    },
-    /// Mailbox or server metadata changed  -  `* METADATA "mailbox" (...)`
-    /// (RFC 5465 Sections 5.6-5.7).
-    ///
-    /// When NOTIFY is active with `MailboxMetadataChange` (Section5.6) or
-    /// `ServerMetadataChange` (Section5.7) events, the server delivers metadata
-    /// notifications as METADATA responses during IDLE.
-    MetadataChange {
-        /// The mailbox whose metadata changed (empty string for server-level).
-        mailbox: MailboxName,
-        /// The metadata entries that changed.
-        entries: Vec<MetadataEntry>,
-    },
-    /// Search context update  -  `* ESEARCH ...` or `* SEARCH ...`
-    /// (RFC 5267 Sections 2.4 / RFC 5465 Sections 5.1-5.3).
-    ///
-    /// When a search context is active (RFC 5267) or NOTIFY triggers
-    /// search-related notifications, the server may deliver ESEARCH
-    /// updates during IDLE.
-    ///
-    /// **Note on legacy `* SEARCH` conversion:** When the server sends a
-    /// legacy `* SEARCH n1 n2 ...` update (instead of ESEARCH), the numbers
-    /// are wrapped in an `EsearchResponse` with `uid: false`. However, IMAP
-    /// uses the same wire form for both sequence-number and UID results  -
-    /// the `uid` field may be inaccurate for legacy SEARCH. Callers should
-    /// use the `tag` field (if present) to correlate with the original search
-    /// context and determine the number semantics.
-    SearchUpdate(Box<crate::types::EsearchResponse>),
-    /// Extension-defined responses, metadata signals, and local queue loss.
-    /// Parsed response data is retained without using Debug output as an
-    /// event protocol. Consumers conservatively invalidate on these signals.
-    ExtensionEvent(IdleExtension),
-    /// Unsolicited status update with a response code  -  `* OK [code]` or
-    /// `* NO [code]` (RFC 3501 Section 7.1).
-    ///
-    /// Covers `[PERMANENTFLAGS]`, `[UIDVALIDITY]`, and any other response
-    /// code not handled by a more specific variant. Surfaced during IDLE
-    /// so the caller can react to state changes (e.g., updated writable
-    /// flags, NOTIFY-driven metadata updates).
-    StatusUpdate {
-        /// The original response condition (RFC 3501 Section 7.1).
-        /// OK, NO, and BAD are semantically distinct and must be preserved.
-        status: UntaggedStatus,
-        /// The response code.
-        code: ResponseCode,
-        /// Human-readable text.
-        text: String,
-    },
-    /// The server discarded the NOTIFY registration due to overflow
-    /// (RFC 5465 Section 5.8).
-    ///
-    /// The client MUST behave as if `NOTIFY NONE` was received  -  the
-    /// registration is gone and no further notifications will be delivered.
-    /// Callers should re-issue `notify_set()` to re-establish monitoring.
-    NotificationOverflow {
-        /// The response-code payload from `[NOTIFICATIONOVERFLOW ...]`
-        /// (RFC 5465 Section 5.8). `None` when the server omits the
-        /// optional argument.
-        code_text: Option<String>,
-        /// Human-readable text from the untagged status line
-        /// (RFC 3501 Section 7.1).
-        resp_text: String,
-    },
-    /// The server sent `* BYE`  -  the connection is closing
-    /// (RFC 3501 Section 7.1.5).
-    ///
-    /// Unlike [`Alert`], this signals that the server is terminating
-    /// the connection. After receiving this event, further commands
-    /// will fail.
-    Bye {
-        /// Optional response code from the BYE response.
-        code: Option<ResponseCode>,
-        /// Human-readable reason for disconnection.
-        text: String,
-    },
-    /// The server terminated the IDLE session by sending the tagged OK
-    /// response (RFC 2177 Section 3).
-    ///
-    /// Some servers (Exchange, Zimbra) have short IDLE limits and terminate
-    /// IDLE from the server side by sending the tagged OK rather than
-    /// waiting for the client's DONE. When this happens, the client MUST NOT
-    /// send DONE because the IDLE command is already complete.
     ServerTerminated,
-}
-
-/// Typed IDLE signals that require conservative account invalidation.
-/// Queue loss is distinct from a server ALERT: Outlook users expect cached
-/// mail to be reconciled after loss, even when no human-readable alert exists.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum IdleExtension {
-    QueueOverflow {
-        dropped_count: usize,
-        since: std::time::Instant,
-    },
-    MetadataChange {
-        server: bool,
-    },
-    Response(Box<UntaggedResponse>),
 }
 
 /// Result of a SEARCH or UID SEARCH command.
@@ -744,11 +596,7 @@ fn validate_tls_server_name(host: &str) -> Result<(), Error> {
 ///
 /// `\Recent` is server-only and `\*` (wildcard) is not valid in STORE.
 fn filter_store_flags(flags: &[Flag]) -> Vec<Flag> {
-    flags
-        .iter()
-        .filter(|f| !matches!(f, Flag::Recent | Flag::Wildcard))
-        .cloned()
-        .collect()
+    flags.iter().filter(|f| f.is_writable()).cloned().collect()
 }
 
 /// Expand a slice of [`UidRange`] into individual UIDs.

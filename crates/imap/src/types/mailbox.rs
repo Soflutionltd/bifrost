@@ -88,6 +88,10 @@ pub enum MailboxAttribute {
     /// a LIST without `\NoAccess`.
     NoAccess,
 
+    /// Non-standard Inbox observation. Only the exact mailbox name INBOX
+    /// establishes the account Inbox role.
+    Inbox,
+
     // --- Non-standard (Google-origin) but widely seen in the wild ---
     /// `\Memos`  -  memos/notes folder (Google-origin, non-standard).
     Memos,
@@ -130,6 +134,7 @@ impl MailboxAttribute {
             Self::Trash => "\\Trash",
             Self::Important => "\\Important",
             Self::NoAccess => "\\NoAccess",
+            Self::Inbox => "\\Inbox",
             Self::Memos => "\\Memos",
             Self::Scheduled => "\\Scheduled",
             Self::Snoozed => "\\Snoozed",
@@ -161,6 +166,7 @@ impl MailboxAttribute {
             | Self::Sent
             | Self::Trash
             | Self::Important
+            | Self::Inbox
             | Self::Memos
             | Self::Scheduled
             | Self::Snoozed => true,
@@ -286,6 +292,7 @@ impl MailboxAttribute {
             // RFC 5465 Section 5.9 / Section 8: mbx-list-oflag =/ "\NoAccess"
             "\\noaccess" => Self::NoAccess,
             // Non-standard (Google-origin) but widely seen in the wild.
+            "\\inbox" => Self::Inbox,
             "\\memos" => Self::Memos,
             "\\scheduled" => Self::Scheduled,
             "\\snoozed" => Self::Snoozed,
@@ -365,6 +372,10 @@ impl SpecialUse {
                 MailboxAttribute::Trash => Some(Self::Trash),
                 MailboxAttribute::Flagged => Some(Self::Flagged),
                 MailboxAttribute::Important => Some(Self::Important),
+                // A server's non-standard attribute cannot redirect primary
+                // mail away from INBOX. Enterprise users expect the protocol's
+                // primary mailbox, regardless of another folder's claim.
+                MailboxAttribute::Inbox => None,
                 _ => None,
             }
         })
@@ -547,6 +558,23 @@ mod tests;
 #[cfg(test)]
 mod classifier_tests {
     use super::{MailboxAttribute, SpecialUse};
+
+    #[test]
+    fn inbox_attribute_is_typed_without_redirecting_the_primary_role() {
+        assert_eq!(
+            MailboxAttribute::from_imap_str("\\iNbOx"),
+            MailboxAttribute::Inbox
+        );
+        assert_eq!(MailboxAttribute::Inbox.as_imap_str(), "\\Inbox");
+        assert_eq!(
+            SpecialUse::classify(&[MailboxAttribute::Inbox], "Other", None),
+            None
+        );
+        assert_eq!(
+            SpecialUse::classify(&[MailboxAttribute::Inbox], "INBOX", None),
+            Some(SpecialUse::Inbox)
+        );
+    }
 
     #[test]
     fn classifier_unifies_aliases_and_respects_namespace_and_authority() {

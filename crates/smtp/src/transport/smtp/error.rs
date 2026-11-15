@@ -129,7 +129,7 @@ pub(crate) enum SmtpCommandPhase {
     /// mechanism at every call site, the same reason the phase itself lives
     /// on the value rather than on `SmtpErrorContext`.
     Auth {
-        mechanism: Option<&'static str>,
+        mechanism: Option<crate::transport::smtp::authentication::Mechanism>,
     },
     MailFrom,
     RcptTo,
@@ -379,6 +379,8 @@ pub enum ErrorKind {
     Internal,
     /// A local runtime facility, such as the system entropy source, failed.
     LocalRuntime,
+    /// SCRAM server refusal caused by unavailable server resources.
+    ServerUnavailable,
     /// Client-side policy refusal.
     Policy,
     /// Connection error.
@@ -421,6 +423,9 @@ impl fmt::Display for Error {
             }
             ErrorKind::Internal => f.write_str("internal SMTP error")?,
             ErrorKind::LocalRuntime => f.write_str("SMTP local runtime failure")?,
+            ErrorKind::ServerUnavailable => {
+                f.write_str("SMTP authentication server unavailable")?;
+            }
             ErrorKind::Policy => f.write_str("SMTP policy error")?,
             ErrorKind::Network => f.write_str("SMTP network error")?,
             ErrorKind::Connection => f.write_str("SMTP connection error")?,
@@ -619,7 +624,7 @@ mod tests {
         // keep the unnamed stamp and throw the name away, which is how the
         // SCRAM server-error path would silently lose it.
         let named = SmtpCommandPhase::Auth {
-            mechanism: Some("SCRAM-SHA-256"),
+            mechanism: Some(crate::transport::smtp::authentication::Mechanism::ScramSha256),
         };
         let inner =
             invalid_input("invalid-proof").with_phase(SmtpCommandPhase::Auth { mechanism: None });
@@ -628,12 +633,12 @@ mod tests {
         // An already-named stamp is not overwritten, and a non-auth stamp
         // keeps set-if-absent: the auth upgrade is the only exception.
         let inner = invalid_input("invalid-proof").with_phase(SmtpCommandPhase::Auth {
-            mechanism: Some("PLAIN"),
+            mechanism: Some(crate::transport::smtp::authentication::Mechanism::Plain),
         });
         assert_eq!(
             inner.or_phase(named).phase(),
             Some(SmtpCommandPhase::Auth {
-                mechanism: Some("PLAIN")
+                mechanism: Some(crate::transport::smtp::authentication::Mechanism::Plain)
             })
         );
         let inner = invalid_input("body").with_phase(SmtpCommandPhase::DataBody);

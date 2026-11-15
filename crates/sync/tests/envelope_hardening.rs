@@ -30,11 +30,11 @@ fn change_envelope(scope: CursorScope) -> Vec<u8> {
         scope,
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: 3,
+            envelope_version: bifrost_types::PayloadVersion::new(3),
             bytes: b"inner".to_vec(),
         },
         advanced_through: None,
-        envelope_version: ENGINE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(ENGINE_VERSION),
     }))
 }
 
@@ -47,7 +47,7 @@ fn backfill_envelope() -> Vec<u8> {
             items_done: 500,
             items_estimated: Some(9000),
         },
-        envelope_version: ENGINE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(ENGINE_VERSION),
     }))
 }
 
@@ -197,7 +197,7 @@ fn backfill_without_estimate_roundtrips() {
             items_done: 7,
             items_estimated: None,
         },
-        envelope_version: ENGINE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(ENGINE_VERSION),
     }));
     let decoded = decode_envelope(&bytes).expect("decodes");
     let Checkpoint::Backfill(bf) = decoded else {

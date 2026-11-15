@@ -22,7 +22,7 @@ mod secret;
 
 pub use channel_binding::tls_server_end_point;
 pub use cram::cram_md5_response;
-pub use error::SaslError;
+pub use error::{RefusalClass, SaslError, ScramServerError};
 pub use oauth::{OAuthMechanism, oauthbearer_payload, xoauth2_payload};
 pub use plain::plain_payload;
 pub use scram::{

@@ -1,4 +1,5 @@
-use super::batch::{BatchFailure, BatchSuccess, BatchUncertain};
+use super::batch::{BatchFailure, BatchItemId, BatchSuccess, BatchUncertain};
+use super::{AccountError, Application};
 use crate::container::ContainerId;
 
 /// Per-item outcome in a streaming bulk operation. The three-lane
@@ -11,6 +12,28 @@ pub enum ItemOutcome<T> {
     Succeeded(BatchSuccess<T>),
     Failed(BatchFailure),
     Uncertain(BatchUncertain),
+}
+
+impl<T> ItemOutcome<T> {
+    /// Attribute a whole-submission failure to one submitted item.
+    ///
+    /// Transmission ambiguity is independent of retry advice: an idempotent
+    /// in-flight write can be retryable and still have applied. For a compound
+    /// write, the recorded primary leg decides this lane; earlier commits do
+    /// not turn an acknowledged refusal of that leg into an uncertain answer.
+    /// An enterprise mail user expects ambiguous writes to be checked, while
+    /// an explicit refusal remains a failure even after an earlier effect.
+    pub fn from_submission_error(item: BatchItemId, error: AccountError) -> Self {
+        let application = error.partial_commit().map_or_else(
+            || Application::from_leaf(&error),
+            |record| record.primary().application,
+        );
+        if application == Application::Uncertain {
+            Self::Uncertain(BatchUncertain::new(item, error))
+        } else {
+            Self::Failed(BatchFailure::new(item, error))
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,4 +95,60 @@ pub enum MutationEffect {
     FlagsPartiallyApplied {
         unsupported: Vec<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{
+        AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause, Cause,
+        ProtocolErrorKind, ServerCause, ServerErrorKind, TransmissionState,
+    };
+
+    #[test]
+    fn submission_lane_uses_classification_evidence_not_retry_or_decoration() {
+        for (attempt, uncertain) in [
+            (AttemptCause::new(TransmissionState::Unsent), false),
+            (AttemptCause::new(TransmissionState::Acknowledged), false),
+            (AttemptCause::new(TransmissionState::InFlight), true),
+        ] {
+            let error = AccountErrorBuilder::new(
+                AccountErrorKind::Server(ServerErrorKind::Unavailable),
+                Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+            )
+            .operation(AccountOperation::UpdateFlags)
+            .push_cause(Cause::Attempt(attempt))
+            .try_build()
+            .expect("valid submission error");
+            assert!(error.recovery().is_retryable());
+            // Historical attempt evidence cannot change this submission's lane.
+            let error = error
+                .into_builder()
+                .push_cause(Cause::Attempt(AttemptCause::new(
+                    TransmissionState::InFlight,
+                )))
+                .try_build()
+                .expect("valid decorated submission error");
+            let outcome =
+                ItemOutcome::<()>::from_submission_error(BatchItemId("item".into()), error);
+            assert_eq!(matches!(outcome, ItemOutcome::Uncertain(_)), uncertain);
+        }
+
+        let error = AccountErrorBuilder::new(
+            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
+            Cause::Wire(crate::error::WireCause::MalformedResponse {
+                protocol: crate::error::Protocol::Graph,
+                detail: Some(crate::error::DiagnosticText::support_only(
+                    "unreadable success",
+                )),
+            }),
+        )
+        .push_cause(Cause::Attempt(AttemptCause::unreadable_success()))
+        .try_build()
+        .expect("valid unreadable success");
+        assert!(matches!(
+            ItemOutcome::<()>::from_submission_error(BatchItemId("item".into()), error),
+            ItemOutcome::Uncertain(_)
+        ));
+    }
 }

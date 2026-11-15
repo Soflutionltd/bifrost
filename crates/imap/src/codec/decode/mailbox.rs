@@ -8,7 +8,7 @@
 //! bytes into [`MailboxName`] at parse time, so the decoder's output is always
 //! in decoded user-facing form, with the original address retained separately.
 
-use crate::codec::utf7::decode_utf7;
+use crate::codec::utf7::WireMode;
 use crate::types::validated::MailboxName;
 
 /// Decode a mailbox name from wire bytes into a [`MailboxName`].
@@ -22,14 +22,7 @@ use crate::types::validated::MailboxName;
 /// codec-internal constructor that bypasses user-input validation  -  the
 /// bytes have already been parsed from a protocol response.
 pub(in crate::codec) fn decode_mailbox_from_wire(bytes: &[u8], utf8_mode: bool) -> MailboxName {
-    let decoded = if utf8_mode {
-        // RFC 9051 Section 5.1 / RFC 6855 Section 3: mailbox names are
-        // Net-Unicode (UTF-8). Lossy conversion handles any non-conformant
-        // bytes without panicking.
-        String::from_utf8_lossy(bytes).into_owned()
-    } else {
-        // RFC 3501 Section 5.1.3: Modified UTF-7 encoding.
-        decode_utf7(bytes)
-    };
-    MailboxName::from_wire(decoded, bytes, utf8_mode)
+    let mode = WireMode::from(utf8_mode);
+    let (decoded, canonical) = mode.decode(bytes);
+    MailboxName::from_wire_decoded(decoded, bytes, mode, canonical)
 }

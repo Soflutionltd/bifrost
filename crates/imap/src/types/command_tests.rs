@@ -76,8 +76,8 @@ fn command_list() {
     };
     match &cmd {
         Command::List { reference, pattern } => {
-            assert!(reference.0.as_str().is_empty());
-            assert_eq!(pattern.0.as_str(), "*");
+            assert!(reference.as_str().is_empty());
+            assert_eq!(pattern.as_str(), "*");
         }
         _ => panic!("expected List"),
     }
@@ -99,11 +99,11 @@ fn command_list_extended() {
             return_options,
         } => {
             assert_eq!(selection_options, &["SUBSCRIBED", "RECURSIVEMATCH"]);
-            assert!(reference.0.as_str().is_empty());
+            assert!(reference.as_str().is_empty());
             assert_eq!(
                 patterns
                     .iter()
-                    .map(|name| name.0.as_str())
+                    .map(crate::types::MailboxArgument::as_str)
                     .collect::<Vec<_>>(),
                 ["*", "%"]
             );
@@ -126,8 +126,8 @@ fn command_list_status() {
             pattern,
             status_items,
         } => {
-            assert!(reference.0.as_str().is_empty());
-            assert_eq!(pattern.0.as_str(), "*");
+            assert!(reference.as_str().is_empty());
+            assert_eq!(pattern.as_str(), "*");
             assert_eq!(status_items, "MESSAGES UNSEEN");
         }
         _ => panic!("expected ListStatus"),

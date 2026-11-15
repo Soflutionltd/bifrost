@@ -382,7 +382,9 @@ fn cursor_from_state(scope: CursorScope, state_string: String) -> CursorEstablis
         scope,
         server_state,
         advanced_through: None,
-        envelope_version: state::OUTER_CURSOR_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+            state::OUTER_CURSOR_ENVELOPE_VERSION,
+        ),
     })
 }
 
@@ -2171,7 +2173,7 @@ mod tests {
             assert_eq!(state_string, expected_state);
             assert_eq!(cursor.advanced_through, None);
             assert_eq!(
-                cursor.envelope_version,
+                cursor.envelope_version.get(),
                 state::OUTER_CURSOR_ENVELOPE_VERSION
             );
             let cached = if matches!(scope, CursorScope::Type(ObjectType::Mailbox)) {

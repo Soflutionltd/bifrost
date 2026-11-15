@@ -504,7 +504,10 @@ async fn examine(
     op: AccountOperation,
 ) -> Result<(PooledConn, SelectedMailbox), AccountError> {
     if account.shutdown.is_cancelled() {
-        return Err(folder_error(Error::closed(), folder, op));
+        return Err(AccountError::account_closed(
+            op,
+            bifrost_types::Protocol::Imap,
+        ));
     }
     let mut conn = account
         .checkout_for_folder(folder)

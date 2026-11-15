@@ -52,7 +52,7 @@ pub(crate) fn changes_stream_admitted(
         };
         if !parsed.matches_payload(&payload) {
             yield SyncEvent::Terminated(cursor_error_to_account_error(
-                CursorError::SchemaIncompatible,
+                CursorError::ScopeMismatch,
                 ctx,
             ));
             return;
@@ -320,11 +320,13 @@ mod tests {
             scope: email_scope("inbox"),
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Gmail,
-                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+                envelope_version: bifrost_types::PayloadVersion::new(GRAPH_CURSOR_ENVELOPE_VERSION),
                 bytes: Vec::new(),
             },
             advanced_through: None,
-            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                CHANGE_CURSOR_ENVELOPE_VERSION,
+            ),
         };
         let error = terminal_kind(cursor).await;
         assert!(matches!(
@@ -339,11 +341,15 @@ mod tests {
             scope: email_scope("inbox"),
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Graph,
-                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION + 1,
+                envelope_version: bifrost_types::PayloadVersion::new(
+                    GRAPH_CURSOR_ENVELOPE_VERSION + 1,
+                ),
                 bytes: b"{}".to_vec(),
             },
             advanced_through: None,
-            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                CHANGE_CURSOR_ENVELOPE_VERSION,
+            ),
         };
         let error = terminal_kind(cursor).await;
         assert!(matches!(
@@ -377,11 +383,13 @@ mod tests {
             scope,
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Graph,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: serde_json::to_vec(&payload).expect("serialize"),
             },
             advanced_through: None,
-            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                CHANGE_CURSOR_ENVELOPE_VERSION,
+            ),
         };
         let error = terminal_kind(cursor).await;
         assert!(matches!(
@@ -406,11 +414,13 @@ mod tests {
             scope: email_scope("inbox"),
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Graph,
-                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+                envelope_version: bifrost_types::PayloadVersion::new(GRAPH_CURSOR_ENVELOPE_VERSION),
                 bytes: b"{not-json".to_vec(),
             },
             advanced_through: None,
-            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                CHANGE_CURSOR_ENVELOPE_VERSION,
+            ),
         };
         let error = terminal_kind(cursor).await;
         assert!(matches!(
@@ -446,7 +456,7 @@ mod tests {
         let error = terminal_kind(cursor).await;
         assert!(matches!(
             error.kind(),
-            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
         ));
     }
 
@@ -461,7 +471,7 @@ mod tests {
         let error = terminal_kind(cursor).await;
         assert!(matches!(
             error.kind(),
-            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
         ));
     }
 

@@ -27,11 +27,11 @@ fn store_flags_drop_recent_and_wildcard() {
         Flag::Seen,
         Flag::Recent,
         Flag::Wildcard,
-        Flag::Custom("$Important".to_owned()),
+        Flag::from_imap_str("$Important"),
     ]);
     assert_eq!(
         filtered,
-        vec![Flag::Seen, Flag::Custom("$Important".to_owned())]
+        vec![Flag::Seen, Flag::from_imap_str("$Important")]
     );
 }
 
@@ -251,7 +251,7 @@ async fn sort_requires_the_sort_capability() {
 async fn thread_requires_the_matching_algorithm_capability() {
     let conn = selected(vec![
         Capability::Imap4Rev2,
-        Capability::Thread("REFERENCES".to_owned()),
+        Capability::from_imap_str("THREAD=REFERENCES"),
     ]);
     // Algorithm names are upper-cased before the capability lookup.
     assert!(matches!(
@@ -260,7 +260,10 @@ async fn thread_requires_the_matching_algorithm_capability() {
     ));
     match conn.uid_thread("ORDEREDSUBJECT", "UTF-8", "ALL", T).await {
         Err(Error::MissingCapability(msg)) => {
-            assert_eq!(msg.capability, Capability::Thread("ORDEREDSUBJECT".into()));
+            assert_eq!(
+                msg.capability,
+                Capability::from_imap_str("THREAD=ORDEREDSUBJECT")
+            );
         }
         other => panic!("expected MissingCapability, got {other:?}"),
     }
@@ -277,7 +280,7 @@ fn sort_and_thread_inherit_the_search_criteria_gates() {
         capabilities: vec![
             Capability::Imap4Rev1,
             Capability::Sort,
-            Capability::Thread("ORDEREDSUBJECT".to_owned()),
+            Capability::from_imap_str("THREAD=ORDEREDSUBJECT"),
         ],
         enabled: Vec::new(),
     };

@@ -116,7 +116,12 @@ fn encode_change(c: &ChangeCursor) -> Vec<u8> {
     );
     let scope = encode_scope(&c.scope);
     let payload = encode_change_payload(c);
-    pack_envelope(EnvelopeKind::Change, c.envelope_version, &scope, &payload)
+    pack_envelope(
+        EnvelopeKind::Change,
+        c.envelope_version.get(),
+        &scope,
+        &payload,
+    )
 }
 
 fn encode_backfill(b: &BackfillCheckpoint) -> Vec<u8> {
@@ -401,7 +406,7 @@ fn decode_protocol(tag: u8) -> Result<ProtocolKind, Error> {
 fn encode_change_payload(c: &ChangeCursor) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(encode_protocol(c.server_state.protocol));
-    out.extend_from_slice(&c.server_state.envelope_version.to_le_bytes());
+    out.extend_from_slice(&c.server_state.envelope_version.get().to_le_bytes());
     write_bytes(&mut out, &c.server_state.bytes);
     match &c.advanced_through {
         Some(p) => {
@@ -448,11 +453,11 @@ fn decode_change_payload(
             scope,
             server_state: OpaqueChangeState {
                 protocol,
-                envelope_version: inner_version,
+                envelope_version: bifrost_types::PayloadVersion::new(inner_version),
                 bytes: payload,
             },
             advanced_through,
-            envelope_version,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(envelope_version),
         },
     ))
 }
@@ -487,7 +492,8 @@ fn decode_change_payload(
 /// fixture can prove the fixup reads the old payload correctly.
 fn migrate_change_cursor(from_version: u32, mut cursor: ChangeCursor) -> ChangeCursor {
     let _ = from_version;
-    cursor.envelope_version = bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION;
+    cursor.envelope_version =
+        bifrost_types::TraitEnvelopeVersion::new(bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION);
     cursor
 }
 
@@ -576,7 +582,7 @@ fn decode_backfill_payload(
             items_done,
             items_estimated,
         },
-        envelope_version,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(envelope_version),
     })
 }
 
@@ -626,11 +632,11 @@ mod migration_tests {
             scope: CursorScope::Account,
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Gmail,
-                envelope_version: 7,
+                envelope_version: bifrost_types::PayloadVersion::new(7),
                 bytes: vec![1, 2, 3],
             },
             advanced_through: None,
-            envelope_version: version,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(version),
         }
     }
 
@@ -645,7 +651,7 @@ mod migration_tests {
         let stale = cursor_at(ENGINE_VERSION.saturating_sub(1));
         let migrated = migrate_change_cursor(ENGINE_VERSION.saturating_sub(1), stale.clone());
         assert_eq!(
-            migrated.envelope_version,
+            migrated.envelope_version.get(),
             bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION
         );
         assert!(

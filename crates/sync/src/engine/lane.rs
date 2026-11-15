@@ -487,7 +487,7 @@ mod tests {
                 items_done: n,
                 items_estimated: None,
             },
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         })
     }
 
@@ -574,7 +574,7 @@ mod tests {
             bifrost_types::InventoryPartition::Full,
             &crate::backfill::runner::LiveSupersedes::default(),
             Some(h.tx.clone()),
-            1,
+            bifrost_types::TraitEnvelopeVersion::new(1),
             Some(&h.control),
             Some(&h.lane.coverage),
             None,
@@ -752,11 +752,11 @@ mod tests {
             scope: scope_a(),
             server_state: bifrost_types::OpaqueChangeState {
                 protocol: bifrost_types::ProtocolKind::Imap,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: state.to_vec(),
             },
             advanced_through: None,
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         })
     }
 
@@ -1242,11 +1242,11 @@ mod tests {
                     scope,
                     server_state: bifrost_types::OpaqueChangeState {
                         protocol: bifrost_types::ProtocolKind::Imap,
-                        envelope_version: 1,
+                        envelope_version: bifrost_types::PayloadVersion::new(1),
                         bytes: Vec::new(),
                     },
                     advanced_through: None,
-                    envelope_version: 1,
+                    envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
                 }),
                 CoverageClaim {
                     reports: Vec::new(),

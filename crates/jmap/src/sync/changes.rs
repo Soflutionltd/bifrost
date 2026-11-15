@@ -32,54 +32,24 @@ pub(crate) fn stream<T: HttpTransport>(
     let (scope, state_string) = match decoded {
         Ok(decoded) => decoded,
         Err(err) => {
-            // Cursor decode failure. `decode_cursor` reports a plain
-            // crate error, so the classified `AccountError` is
-            // synthesized at this boundary - and the CLASS matters,
-            // because the two failure families want opposite recoveries:
-            //
-            // - A version this engine has disowned (older envelope) or
-            //   cannot read yet (future envelope) is schema drift.
-            //   `SyncState(SchemaIncompatible)` derives the account-wide
-            //   schema clear, which also drops every backfill checkpoint
-            //   so the inventory re-walk re-mints ids - reseeding is the
-            //   migration.
-            // - A cursor tagged with another PROTOCOL, or whose payload
-            //   scope disagrees with the `ChangeCursor` it rode in on,
-            //   is a mis-keyed row: a consumer/store bug, not schema
-            //   drift. `SyncState(CursorInvalid)` derives
-            //   `Engine(RestartScope(scope))` - delete the bogus row and
-            //   re-establish THIS scope - instead of paying the
-            //   account-wide clear plus full re-hydration for a row the
-            //   schema machinery cannot heal anyway.
-            let schema_drift = matches!(
-                err,
-                state::JmapCursorError::SchemaIncompatible
-                    | state::JmapCursorError::CursorEnvelopeUnknown
-            );
-            let (kind, cause, text) = if schema_drift {
-                (
-                    bifrost_types::AccountErrorKind::SyncState(
-                        bifrost_types::SyncStateErrorKind::SchemaIncompatible,
-                    ),
-                    bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
-                    "JMAP change cursor envelope version is not readable by this engine",
-                )
-            } else {
-                (
-                    bifrost_types::AccountErrorKind::SyncState(
-                        bifrost_types::SyncStateErrorKind::CursorInvalid,
-                    ),
-                    bifrost_types::Cause::State(bifrost_types::StateCause::CursorInvalid),
-                    "JMAP change cursor row is mis-keyed (wrong protocol or scope mismatch)",
-                )
+            let fault = match &err {
+                state::JmapCursorError::CursorProtocolMismatch => {
+                    bifrost_types::CursorDecodeFault::ProtocolMismatch
+                }
+                state::JmapCursorError::CursorEnvelopeUnknown => {
+                    bifrost_types::CursorDecodeFault::FutureVersion
+                }
+                state::JmapCursorError::Other(_) => bifrost_types::CursorDecodeFault::ScopeMismatch,
+                _ => bifrost_types::CursorDecodeFault::Malformed,
             };
             return Box::pin(async_stream::stream! {
                 yield super::error::terminated(
-                    bifrost_types::AccountErrorBuilder::new(kind, cause)
-                        .protocol(bifrost_types::Protocol::Jmap)
-                        .operation(bifrost_types::AccountOperation::SyncChanges)
+                    fault.builder(
+                        bifrost_types::Protocol::Jmap,
+                        bifrost_types::AccountOperation::SyncChanges,
+                    )
                         .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
-                        .text(bifrost_types::DiagnosticText::support_only(text))
+                        .text(bifrost_types::DiagnosticText::support_only(format!("JMAP cursor decode: {err:?}")))
                         .try_build()
                         .expect("valid account error classification"),
                 );
@@ -384,7 +354,7 @@ mod tests {
             let cursor = checkpoint_for(scope.clone(), "state-1".to_string());
             assert_eq!(cursor.scope, scope);
             assert_eq!(
-                cursor.envelope_version,
+                cursor.envelope_version.get(),
                 state::OUTER_CURSOR_ENVELOPE_VERSION
             );
             let (_, state_string) =
@@ -851,7 +821,7 @@ mod tests {
             let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
             let mut cursor =
                 state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
-            cursor.server_state.envelope_version = version;
+            cursor.server_state.envelope_version = bifrost_types::PayloadVersion::new(version);
 
             let (events, log) = drive("primary", cursor, None).await;
             assert!(log.methods().is_empty(), "envelope {version}");
@@ -877,13 +847,9 @@ mod tests {
         }
     }
 
-    /// A row that is readable but MIS-KEYED - tagged with another
-    /// protocol, or whose payload scope disagrees with the scope it rode
-    /// in on - is a store bug, not schema drift. Paying the account-wide
-    /// schema clear for it would re-hydrate everything to heal one bad
-    /// row, so it restarts just that scope instead.
+    /// Protocol mismatch is unreadable state; a readable crossed scope resets locally.
     #[tokio::test]
-    async fn a_mis_keyed_cursor_row_restarts_only_its_own_scope() {
+    async fn cursor_decode_faults_use_the_shared_recovery_policy() {
         let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
         let good = state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
 
@@ -891,18 +857,24 @@ mod tests {
             scope: scope.clone(),
             server_state: bifrost_types::OpaqueChangeState {
                 protocol: bifrost_types::ProtocolKind::Gmail,
-                envelope_version: state::PAYLOAD_ENVELOPE_VERSION,
+                envelope_version: bifrost_types::PayloadVersion::new(
+                    state::PAYLOAD_ENVELOPE_VERSION,
+                ),
                 bytes: good.server_state.bytes.clone(),
             },
             advanced_through: None,
-            envelope_version: state::OUTER_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                state::OUTER_CURSOR_ENVELOPE_VERSION,
+            ),
         };
         // Same payload, but the row is filed under a different scope.
         let crossed = ChangeCursor {
             scope: CursorScope::Type(bifrost_types::ObjectType::Mailbox),
             server_state: good.server_state.clone(),
             advanced_through: None,
-            envelope_version: state::OUTER_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                state::OUTER_CURSOR_ENVELOPE_VERSION,
+            ),
         };
 
         for (label, cursor) in [
@@ -916,16 +888,20 @@ mod tests {
                 [SyncEvent::Terminated(err)] => {
                     assert_eq!(
                         err.kind(),
-                        &bifrost_types::AccountErrorKind::SyncState(
+                        &bifrost_types::AccountErrorKind::SyncState(if label == "wrong protocol" {
+                            bifrost_types::SyncStateErrorKind::SchemaIncompatible
+                        } else {
                             bifrost_types::SyncStateErrorKind::CursorInvalid
-                        ),
+                        }),
                         "{label}"
                     );
                     assert_eq!(
                         err.recovery(),
-                        &bifrost_types::RecoveryClass::Engine(
+                        &bifrost_types::RecoveryClass::Engine(if label == "wrong protocol" {
+                            bifrost_types::EngineDirective::SchemaIncompatible
+                        } else {
                             bifrost_types::EngineDirective::RestartScope(expected_scope)
-                        ),
+                        }),
                         "{label}"
                     );
                 }

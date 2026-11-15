@@ -25,7 +25,8 @@ inside the protocol consumers, never the other way around.
   unexpected SASL/SCRAM messages and peer-controlled input (the server's
   certificate); `InvalidCredential(String)` for a caller-supplied username or
   password that fails SASLprep or a PLAIN field containing NUL;
-  `AuthFailed(String)` for a SCRAM `e=` server error or a failed exchange.
+  `ServerRejected(ScramServerError)` for a typed SCRAM `e=` refusal;
+  `LocalRuntime(String)` for a local cryptographic facility failure.
 - `ScramHash` - `#[non_exhaustive]` `{ Sha1, Sha256 }`. Names the hash, not a
   protocol-layer mechanism. `mechanism_name(ChannelBinding)` returns the wire
   name, owning the `-PLUS` suffix in one place:
@@ -73,8 +74,8 @@ inside the protocol consumers, never the other way around.
   Result<(Secret, Vec<u8>), SaslError>` - parses the server-first message,
   runs PBKDF2/HMAC, returns the base64 client-final and the expected server
   signature. Protocol consumers write this value as returned and do not
-  base64-encode it again. Every error it returns is about the server-first
-  message. The `c=` attribute is
+  base64-encode it again. Errors describe the server-first message, except
+  local HMAC facility failures, which use LocalRuntime. The `c=` attribute is
   `base64(gs2_header || cbind_data)` derived from `binding`; `None` is
   byte-identical to the old `c=biws`.
 - `verify_server_final(server_final, expected_signature) -> Result<(),
@@ -120,17 +121,36 @@ pre-encoding response are zeroized on drop. Secret and verifier equality use
 
 ## Error mapping contract
 
-`SaslError` is mapped back into each protocol crate's error enum at the single
-call boundary. For IMAP: `Protocol(m)` becomes `Error::Protocol(m)` (identical
-message); `AuthFailed(m)` becomes `Error::auth_with_code(m, None)` (the
-auth-failure lane); `InvalidCredential(m)` becomes `Error::InvalidInput(m)`.
-SMTP uses `scram_server_error()` to read the original `e=` token before
-adding diagnostic attribution. `invalid-proof` becomes its credential-rejection
-kind and then `Authentication(ReauthorizationRequired)` / `AuthLost`, matching
-535. Other server errors retain SMTP's policy routing, including
-`channel-binding-not-supported` (`reference/smtp.md`). A SCRAM
-signature-verification mismatch is a protocol-class failure (`Protocol`), not
-`AuthFailed`.
+`ScramServerError` owns the server-final token vocabulary, preserving extensions
+as `Other(String)`. Its `refusal_class()` is the recovery authority for both
+protocols. No consumer parses display text to recover a token.
+
+| Server error | Refusal class | Ask for replacement credentials? |
+|---|---|---|
+| invalid-proof, unknown-user | Credential | Yes, repair password or account identity |
+| invalid-encoding, invalid-username-encoding | Protocol | No |
+| extensions-not-supported | Policy | No |
+| channel-bindings-dont-match | Policy | No |
+| server-does-support-channel-binding | Policy | No |
+| channel-binding-not-supported | Policy | No |
+| unsupported-channel-binding-type | Policy | No |
+| no-resources, other-error | Unavailable | No, retry |
+| Unknown extension token | Unavailable | No, retry |
+
+Enterprise users expect replacement credentials only when the server gives
+credential-loss evidence. An unspecified failure or an unknown extension is
+insufficient evidence; retry retains the original token for support. Binding
+failures require configuration or security repair and never justify descending
+to a weaker mechanism.
+
+Both protocols map Credential to reauthorization, Policy to policy blocked,
+Protocol to protocol/parse failure, and Unavailable to server unavailable.
+IMAP retains the typed refusal on `Error::Auth` through cancellation completion,
+without inventing an IMAP response code; SMTP uses `ErrorKind::ServerUnavailable`
+for the retryable case. `Protocol` remains protocol/parse-class,
+`InvalidCredential` remains local invalid input, and `LocalRuntime` maps to each
+protocol's local-runtime error. HMAC key construction failures use that local
+lane rather than blaming peer input. Signature mismatch remains `Protocol`.
 
 Both protocol crates prepare the username AND password while building the
 exchange, before the first byte of AUTHENTICATE / AUTH is sent, so an

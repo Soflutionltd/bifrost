@@ -8,6 +8,40 @@
 
 use crate::ids::{FolderId, LabelId, MailboxId, QueryId};
 
+/// Protocol-owned payload layout. Deliberately distinct from the trait envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PayloadVersion(u32);
+
+impl PayloadVersion {
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Trait-owned ChangeCursor and BackfillCheckpoint layout.
+/// Both use the same outer storage envelope and migration axis. Payload
+/// revisions are independent and cannot be substituted for this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TraitEnvelopeVersion(u32);
+
+impl TraitEnvelopeVersion {
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// Current layout version of the trait-owned [`ChangeCursor`] envelope.
 pub const CHANGE_CURSOR_ENVELOPE_VERSION: u32 = 1;
 
@@ -95,8 +129,75 @@ pub enum ProtocolKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpaqueChangeState {
     pub protocol: ProtocolKind,
-    pub envelope_version: u32,
+    pub envelope_version: PayloadVersion,
     pub bytes: Vec<u8>,
+}
+
+/// Why persisted cursor state cannot be resumed. The classification belongs
+/// here so every provider gives the engine the same recovery instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CursorDecodeFault {
+    ProtocolMismatch,
+    FutureVersion,
+    RetiredVersion,
+    Malformed,
+    ScopeMismatch,
+    /// Token belongs to another account; no stored scope can safely consume it.
+    IdentityMismatch,
+}
+
+impl CursorDecodeFault {
+    /// Build the shared classification; the caller supplies scope and diagnostics.
+    pub fn builder(
+        self,
+        protocol: crate::Protocol,
+        operation: crate::AccountOperation,
+    ) -> crate::AccountErrorBuilder {
+        // An enterprise user expects unreadable durable state to be rebuilt,
+        // including dependent backfill state, rather than blamed on the server.
+        // A readable token filed under another scope needs only that scope reset.
+        let (kind, cause) = match self {
+            Self::ScopeMismatch => (
+                crate::SyncStateErrorKind::CursorInvalid,
+                crate::StateCause::CursorInvalid,
+            ),
+            Self::ProtocolMismatch
+            | Self::FutureVersion
+            | Self::RetiredVersion
+            | Self::Malformed
+            | Self::IdentityMismatch => (
+                crate::SyncStateErrorKind::SchemaIncompatible,
+                crate::StateCause::SchemaIncompatible,
+            ),
+        };
+        crate::AccountErrorBuilder::new(
+            crate::AccountErrorKind::SyncState(kind),
+            crate::Cause::State(cause),
+        )
+        .protocol(protocol)
+        .operation(operation)
+    }
+}
+
+impl OpaqueChangeState {
+    /// Open only the expected protocol and exact supported payload layout.
+    pub fn open(
+        &self,
+        protocol: ProtocolKind,
+        version: PayloadVersion,
+    ) -> Result<&[u8], CursorDecodeFault> {
+        if self.protocol != protocol {
+            return Err(CursorDecodeFault::ProtocolMismatch);
+        }
+        if self.envelope_version > version {
+            return Err(CursorDecodeFault::FutureVersion);
+        }
+        if self.envelope_version < version {
+            return Err(CursorDecodeFault::RetiredVersion);
+        }
+        Ok(&self.bytes)
+    }
 }
 
 /// Mid-page resumption marker, opaque bytes owned by the protocol crate.
@@ -111,18 +212,18 @@ pub struct ChangeCursor {
     pub scope: CursorScope,
     pub server_state: OpaqueChangeState,
     pub advanced_through: Option<OpaqueProgressBytes>,
-    pub envelope_version: u32,
+    pub envelope_version: TraitEnvelopeVersion,
 }
 
 impl ChangeCursor {
     /// Validate the trait-owned outer envelope before protocol dispatch.
     pub fn validate_envelope(&self) -> Result<(), ChangeCursorEnvelopeMismatch> {
-        if self.envelope_version == CHANGE_CURSOR_ENVELOPE_VERSION {
+        if self.envelope_version.get() == CHANGE_CURSOR_ENVELOPE_VERSION {
             Ok(())
         } else {
             Err(ChangeCursorEnvelopeMismatch {
                 expected: CHANGE_CURSOR_ENVELOPE_VERSION,
-                found: self.envelope_version,
+                found: self.envelope_version.get(),
             })
         }
     }
@@ -219,16 +320,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persisted_cursor_faults_have_one_recovery_policy() {
+        use crate::{AccountOperation, EngineDirective, ErrorScope, Protocol, RecoveryClass};
+        for fault in [
+            CursorDecodeFault::ProtocolMismatch,
+            CursorDecodeFault::FutureVersion,
+            CursorDecodeFault::RetiredVersion,
+            CursorDecodeFault::Malformed,
+            CursorDecodeFault::ScopeMismatch,
+            CursorDecodeFault::IdentityMismatch,
+        ] {
+            let error = fault
+                .builder(Protocol::Imap, AccountOperation::SyncChanges)
+                .scope(ErrorScope::Cursor(CursorScope::Account))
+                .try_build()
+                .expect("valid cursor classification");
+            let expected = if fault == CursorDecodeFault::ScopeMismatch {
+                EngineDirective::RestartScope(CursorScope::Account)
+            } else {
+                EngineDirective::SchemaIncompatible
+            };
+            assert_eq!(error.recovery(), &RecoveryClass::Engine(expected));
+        }
+    }
+
+    #[test]
+    fn opaque_payload_open_checks_protocol_before_exact_layout() {
+        let mut state = OpaqueChangeState {
+            protocol: ProtocolKind::Imap,
+            envelope_version: PayloadVersion::new(2),
+            bytes: vec![7],
+        };
+        assert_eq!(
+            state.open(ProtocolKind::Imap, PayloadVersion::new(2)),
+            Ok(&[7][..])
+        );
+        assert_eq!(
+            state.open(ProtocolKind::Graph, PayloadVersion::new(1)),
+            Err(CursorDecodeFault::ProtocolMismatch)
+        );
+        assert_eq!(
+            state.open(ProtocolKind::Imap, PayloadVersion::new(1)),
+            Err(CursorDecodeFault::FutureVersion)
+        );
+        state.envelope_version = PayloadVersion::new(1);
+        assert_eq!(
+            state.open(ProtocolKind::Imap, PayloadVersion::new(2)),
+            Err(CursorDecodeFault::RetiredVersion)
+        );
+    }
+
+    #[test]
     fn outer_cursor_envelope_validation_rejects_any_other_version() {
         let cursor = ChangeCursor {
             scope: CursorScope::Account,
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Gmail,
-                envelope_version: 9,
+                envelope_version: crate::cursor::PayloadVersion::new(9),
                 bytes: Vec::new(),
             },
             advanced_through: None,
-            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION + 1,
+            envelope_version: crate::cursor::TraitEnvelopeVersion::new(
+                CHANGE_CURSOR_ENVELOPE_VERSION + 1,
+            ),
         };
         let mismatch = cursor
             .validate_envelope()

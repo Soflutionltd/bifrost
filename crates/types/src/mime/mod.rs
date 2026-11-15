@@ -14,7 +14,7 @@ pub use params::{ContentType, decode_rfc2231_params, parse_content_type, parse_d
 pub use parse::{MimePart, ParsedMessage, PartBody, parse_message, parse_message_with_limits};
 pub use render::{
     ComposedMessage, RenderedMessage, SubmissionEnvelope, format_address, format_rfc5322_date,
-    render_rfc5322, send_request_to_rfc5322,
+    generate_message_id, render_rfc5322, send_request_to_rfc5322,
 };
 pub use select::{DecodedAttachment, DecodedBody, SelectOptions, select_body, select_body_with};
 pub use transfer::TransferEncoding;

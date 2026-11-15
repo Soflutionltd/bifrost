@@ -510,7 +510,7 @@ impl CardDavAccount {
             .into_iter()
             .map(|entry| ContactSnapshotEntry {
                 uri: entry.uri,
-                etag: entry.etag,
+                etag: entry.etag.map(Into::into),
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.uri.cmp(&right.uri));
@@ -1316,7 +1316,7 @@ impl Account for CardDavAccount {
                         &url,
                         data,
                         expected_etag.map_or_else(
-                            || PutCondition::from_etag(current.etag.as_deref()),
+                            || PutCondition::from_tag(current.etag.as_ref()),
                             |etag| PutCondition::from_etag(Some(etag)),
                         ),
                         AccountOperation::ContactUpdate,
@@ -2003,11 +2003,13 @@ fn cursor_from_snapshot(scope: CursorScope, snapshot: &ContactSnapshot) -> Chang
         scope,
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::CardDav,
-            envelope_version: CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(CURSOR_ENVELOPE_VERSION),
             bytes: encode_cursor_snapshot(snapshot),
         },
         advanced_through: None,
-        envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+            bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        ),
     }
 }
 
@@ -2028,23 +2030,46 @@ fn encode_cursor_snapshot(snapshot: &ContactSnapshot) -> Vec<u8> {
 // decides whether it is a sync-token or a ctag.
 fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<ContactSnapshot, AccountError> {
     validate_contact_scope(&cursor.scope, AccountOperation::SyncChanges)?;
-    if cursor.server_state.protocol != ProtocolKind::CardDav
-        || cursor.server_state.envelope_version != CURSOR_ENVELOPE_VERSION
-    {
-        return Err(cursor_error("CardDAV cursor protocol or version mismatch"));
-    }
-    let decoded = decode_snapshot(
-        CURSOR_MAGIC,
-        DavProtocol::CardDav.label(),
-        &cursor.server_state.bytes,
-    )
-    .map_err(cursor_error)?;
+    let bytes = cursor
+        .server_state
+        .open(
+            ProtocolKind::CardDav,
+            bifrost_types::PayloadVersion::new(CURSOR_ENVELOPE_VERSION),
+        )
+        .map_err(|fault| {
+            fault
+                .builder(
+                    bifrost_types::Protocol::CardDav,
+                    AccountOperation::SyncChanges,
+                )
+                .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
+                .try_build()
+                .expect("valid account error classification")
+        })?;
+    let decoded =
+        decode_snapshot(CURSOR_MAGIC, DavProtocol::CardDav.label(), bytes).map_err(|error| {
+            cursor_error(error)
+                .into_builder()
+                .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
+                .try_build()
+                .expect("valid account error classification")
+        })?;
+    // Fixed, valid classification: try_build cannot fail.
+    #[allow(clippy::unwrap_in_result)]
     if let CursorScope::Folder(folder) = &cursor.scope
         && !same_dav_url(&folder.0, &decoded.collection_url)
     {
-        return Err(cursor_error(
-            "cursor collection does not match its folder scope",
-        ));
+        return Err(bifrost_types::CursorDecodeFault::ScopeMismatch
+            .builder(
+                bifrost_types::Protocol::CardDav,
+                AccountOperation::SyncChanges,
+            )
+            .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
+            .text(bifrost_types::DiagnosticText::support_only(
+                "cursor collection does not match its folder scope",
+            ))
+            .try_build()
+            .expect("valid account error classification"));
     }
     Ok(ContactSnapshot {
         addressbook_url: decoded.collection_url,
@@ -2071,17 +2096,14 @@ fn preserve_unobserved_contact_entries(previous: &ContactSnapshot, current: &mut
 }
 
 fn cursor_error(message: impl Into<String>) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::SyncState(
-            bifrost_types::SyncStateErrorKind::SchemaIncompatible,
-        ),
-        bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
-    )
-    .protocol(bifrost_types::Protocol::CardDav)
-    .operation(AccountOperation::SyncChanges)
-    .text(bifrost_types::DiagnosticText::support_only(message))
-    .try_build()
-    .expect("valid account error classification")
+    bifrost_types::CursorDecodeFault::Malformed
+        .builder(
+            bifrost_types::Protocol::CardDav,
+            AccountOperation::SyncChanges,
+        )
+        .text(bifrost_types::DiagnosticText::support_only(message))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn decode_contact_page_cursor(
@@ -3251,7 +3273,7 @@ mod tests {
         let mut report = CardDavMultigetReport {
             cards: vec![CardDavFetchedVCard {
                 uri: "/contacts/one.vcf".to_string(),
-                etag: Some("e1".to_string()),
+                etag: Some("e1".into()),
                 data: "BEGIN:VCARD\r\nFN:Ada\r\nEND:VCARD\r\n".to_string(),
             }],
             failed: vec![crate::parse::CardDavFailedResource {
@@ -3281,7 +3303,7 @@ mod tests {
         // so the snapshot diff can preserve it instead of destroying it.
         let good = CardDavFetchedVCard {
             uri: "/ab/good.vcf".to_string(),
-            etag: Some("e1".to_string()),
+            etag: Some("e1".into()),
             data: "BEGIN:VCARD\r\nFN:Ada Lovelace\r\nEND:VCARD\r\n".to_string(),
         };
         let bad = CardDavFetchedVCard {
@@ -3498,7 +3520,7 @@ mod tests {
             entries: vec![
                 ContactSnapshotEntry {
                     uri: "https://dav.example.test/contacts/a.vcf".to_string(),
-                    etag: Some("\"a\"".to_string()),
+                    etag: Some("\"a\"".into()),
                 },
                 ContactSnapshotEntry {
                     uri: "https://dav.example.test/contacts/b.vcf".to_string(),
@@ -3527,7 +3549,7 @@ mod tests {
     fn contact_cursor_rejects_the_base_relative_id_version() {
         let snapshot = ContactSnapshot::default();
         let mut cursor = cursor_from_snapshot(CursorScope::Type(ObjectType::Contact), &snapshot);
-        cursor.server_state.envelope_version = 1;
+        cursor.server_state.envelope_version = bifrost_types::PayloadVersion::new(1);
 
         let error = decode_cursor_snapshot(&cursor).expect_err("v1 cursors are disowned");
         assert!(matches!(
@@ -3563,15 +3585,15 @@ mod tests {
             entries: vec![
                 ContactSnapshotEntry {
                     uri: "a.vcf".to_string(),
-                    etag: Some("old".to_string()),
+                    etag: Some("old".into()),
                 },
                 ContactSnapshotEntry {
                     uri: "b.vcf".to_string(),
-                    etag: Some("same".to_string()),
+                    etag: Some("same".into()),
                 },
                 ContactSnapshotEntry {
                     uri: "d.vcf".to_string(),
-                    etag: Some("gone".to_string()),
+                    etag: Some("gone".into()),
                 },
             ],
             failed_hrefs: Vec::new(),
@@ -3582,15 +3604,15 @@ mod tests {
             entries: vec![
                 ContactSnapshotEntry {
                     uri: "a.vcf".to_string(),
-                    etag: Some("new".to_string()),
+                    etag: Some("new".into()),
                 },
                 ContactSnapshotEntry {
                     uri: "b.vcf".to_string(),
-                    etag: Some("same".to_string()),
+                    etag: Some("same".into()),
                 },
                 ContactSnapshotEntry {
                     uri: "c.vcf".to_string(),
-                    etag: Some("created".to_string()),
+                    etag: Some("created".into()),
                 },
             ],
             failed_hrefs: Vec::new(),
@@ -3623,7 +3645,7 @@ mod tests {
                 .iter()
                 .map(|uri| ContactSnapshotEntry {
                     uri: (*uri).to_string(),
-                    etag: Some("e".to_string()),
+                    etag: Some("e".into()),
                 })
                 .collect(),
             failed_hrefs: Vec::new(),

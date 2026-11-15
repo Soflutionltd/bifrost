@@ -2009,7 +2009,13 @@ async fn idle_returns_the_first_event_and_completes_the_done_handshake() {
         )
         .await
         .expect("IDLE must complete through the DONE handshake");
-    assert!(matches!(event, IdleEvent::Exists(3)), "got {event:?}");
+    assert!(
+        matches!(
+            event,
+            IdleEvent::Event(crate::connection::typed_event::TypedEvent::Exists(3))
+        ),
+        "got {event:?}"
+    );
     let _server = script.await.unwrap();
 
     assert!(
@@ -3047,7 +3053,10 @@ mod withdrawal {
         assert!(futures::poll!(&mut b).is_pending());
         assert_eq!(conn.cmd_tx.capacity(), one_queued(&conn));
         respond(&mut server, "* OK [ALERT] maintenance\r\n").await;
-        assert!(matches!(b.await.unwrap(), IdleEvent::Alert(_)));
+        assert!(matches!(
+            b.await.unwrap(),
+            IdleEvent::Event(crate::connection::typed_event::TypedEvent::Alert(_))
+        ));
         assert!(conn.is_reusable());
         next_capability(&conn, &mut server, a, &tag).await;
     }

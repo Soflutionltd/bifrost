@@ -6,10 +6,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream,
-    AttemptCause, BatchFailure, BatchItemId, BatchUncertain, Cause, DiagnosticText, FlagOp,
-    IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol,
-    RequestCause, RequestErrorKind, ServerCause, ServerErrorKind, StateCause, SyncEvent,
-    TransmissionState,
+    AttemptCause, BatchFailure, BatchItemId, Cause, DiagnosticText, FlagOp, IdempotencyKey,
+    ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol, RequestCause,
+    RequestErrorKind, ServerCause, ServerErrorKind, StateCause, SyncEvent, TransmissionState,
 };
 use futures::StreamExt;
 
@@ -312,22 +311,13 @@ async fn flush_mutation_groups(
                     let _ = tx.send(SyncEvent::Terminated(account_err)).await;
                     return Err(());
                 }
-                let verdict = mutation_error_verdict(&account_err);
                 let outcomes = unaccounted
                     .into_iter()
                     .map(|id| {
-                        let item = BatchItemId(id.id.0);
-                        match &verdict {
-                            Verdict::Uncertain(error) => {
-                                ItemOutcome::Uncertain(BatchUncertain::new(item, error.clone()))
-                            }
-                            Verdict::Failed(error) => {
-                                ItemOutcome::Failed(BatchFailure::new(item, error.clone()))
-                            }
-                            Verdict::Succeeded(_) => {
-                                unreachable!("a folder error cannot produce a successful verdict")
-                            }
-                        }
+                        ItemOutcome::from_submission_error(
+                            BatchItemId(id.id.0),
+                            account_err.clone(),
+                        )
                     })
                     .collect();
                 if tx
@@ -1255,18 +1245,9 @@ fn failed_all(ids: Vec<DecodedObjectId>, error: AccountError) -> Vec<ItemOutcome
         .collect()
 }
 
-/// A recorded primary determines its item lane; earlier commits never make
-/// a refused later command uncertain.
+/// Defer lane selection until the target permit supplies its item identity.
 fn mutation_error_verdict(error: &AccountError) -> Verdict<MutationSuccess> {
-    let uncertain = error.partial_commit().map_or_else(
-        || Application::from_leaf(error) == Application::Uncertain,
-        |r| r.primary().application == Application::Uncertain,
-    );
-    if uncertain {
-        Verdict::Uncertain(error.clone())
-    } else {
-        Verdict::Failed(error.clone())
-    }
+    Verdict::SubmissionError(error.clone())
 }
 
 fn invalid_move_destination_error() -> AccountError {
@@ -1577,7 +1558,7 @@ mod tests {
                 Flag::Seen,
                 Flag::Answered,
                 Flag::Flagged,
-                Flag::Custom("$Important".to_owned()),
+                Flag::from_imap_str("$Important"),
             ])
         );
     }
@@ -2388,7 +2369,10 @@ mod tests {
         assert!(
             matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget,bifrost_types::ReconcileAction::ObserveOnly])
         );
-        assert!(matches!(mutation_error_verdict(&error), Verdict::Failed(_)));
+        let outcomes = settled(&[4], AccountOperation::BulkMove, |_| {
+            mutation_error_verdict(&error)
+        });
+        assert!(matches!(outcomes.as_slice(), [ItemOutcome::Failed(_)]));
         assert!(
             error
                 .partial_commit()

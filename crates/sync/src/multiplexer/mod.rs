@@ -1254,13 +1254,13 @@ impl Multiplexer {
         match done {
             Some(Checkpoint::Change(c)) if &c.scope == scope => {
                 // This cursor was just minted by Account, not decoded from disk.
-                c.validate_envelope().map_err(|_| {
-                    Error::Account(crate::recovery::fresh_cursor_contract_error(
-                        Some(&Checkpoint::Change(c.clone())),
-                        bifrost_types::AccountOperation::SyncInventory,
-                        scope,
-                    ))
-                })?;
+                crate::recovery::classify_envelope(
+                    &c,
+                    crate::recovery::CursorOrigin::Fresh,
+                    bifrost_types::AccountOperation::SyncInventory,
+                    scope,
+                )
+                .map_err(Error::Account)?;
                 self.cursors.put(c);
                 Ok(())
             }
@@ -2240,7 +2240,7 @@ mod tests {
         let scope = CursorScope::Account;
         let cursor = crate::test_common::cursor_for(&scope, b"initial");
         let mut invalid = cursor.clone();
-        invalid.envelope_version = u32::MAX;
+        invalid.envelope_version = bifrost_types::TraitEnvelopeVersion::new(u32::MAX);
         let mut account = crate::test_common::StubAccount::new(vec![scope.clone()]);
         account.changes_hook = Some(Arc::new(move |_| {
             vec![SyncEvent::Done(Some(Checkpoint::Change(invalid.clone())))]
@@ -2460,11 +2460,11 @@ mod tests {
             scope: CursorScope::Account,
             server_state: bifrost_types::OpaqueChangeState {
                 protocol: bifrost_types::ProtocolKind::Imap,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: state.to_vec(),
             },
             advanced_through: None,
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         })
     }
 
@@ -2602,11 +2602,11 @@ mod tests {
             scope: scope.clone(),
             server_state: bifrost_types::OpaqueChangeState {
                 protocol: bifrost_types::ProtocolKind::Imap,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: b"state".to_vec(),
             },
             advanced_through: None,
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         });
         let membership = bifrost_types::MembershipScope::Folder(folder);
         cursors.link_membership(membership.clone(), scope.clone());
@@ -2656,11 +2656,11 @@ mod tests {
             scope: sibling,
             server_state: bifrost_types::OpaqueChangeState {
                 protocol: bifrost_types::ProtocolKind::Imap,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: b"state".to_vec(),
             },
             advanced_through: None,
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         });
         let folder = bifrost_types::FolderId("Fresh".into());
         let scope = CursorScope::Folder(folder.clone());
@@ -2687,11 +2687,11 @@ mod tests {
             scope: scope.clone(),
             server_state: bifrost_types::OpaqueChangeState {
                 protocol: bifrost_types::ProtocolKind::Jmap,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: b"state".to_vec(),
             },
             advanced_through: None,
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         });
     }
 
@@ -2955,7 +2955,7 @@ mod tests {
             partition: bifrost_types::Partition(b"page:0:10".to_vec()),
             progress_marker: None,
             progress: bifrost_types::BackfillProgress::default(),
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         });
         control.expect_checkpoint(checkpoint);
         assert_eq!(coverage.backfill_in_flight(), 1);
@@ -3024,7 +3024,7 @@ mod tests {
                 partition: bifrost_types::Partition(partition.as_bytes().to_vec()),
                 progress_marker: None,
                 progress: bifrost_types::BackfillProgress::default(),
-                envelope_version: 1,
+                envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
             })
         }
 

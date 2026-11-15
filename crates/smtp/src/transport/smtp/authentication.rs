@@ -219,11 +219,10 @@ impl Mechanism {
 
 /// Map a `bifrost-sasl` computation failure into the SMTP error model.
 ///
-/// Invalid proof is a credential rejection; other server errors retain the
-/// AUTH policy lane. Malformed messages and verifier mismatches stay parse-class.
+/// The shared refusal class owns recovery intent. Malformed messages and
+/// verifier mismatches stay parse-class; local facility failures stay local.
 impl From<bifrost_sasl::SaslError> for Error {
     fn from(e: bifrost_sasl::SaslError) -> Self {
-        let credential_rejected = e.scram_server_error() == Some("invalid-proof");
         match e {
             bifrost_sasl::SaslError::Protocol(m) => error::parse(m),
             // A caller credential that fails SASLprep, refused while the
@@ -232,13 +231,18 @@ impl From<bifrost_sasl::SaslError> for Error {
             // AUTH phase stamp, per the
             // local-refusal rule in `reference/error-model.md`.
             bifrost_sasl::SaslError::InvalidCredential(m) => error::invalid_input(m),
-            bifrost_sasl::SaslError::AuthFailed(m) => {
-                let kind = if credential_rejected {
-                    error::ErrorKind::Authentication
-                } else {
-                    error::ErrorKind::Policy
+            bifrost_sasl::SaslError::LocalRuntime(m) => error::local_runtime(m),
+            bifrost_sasl::SaslError::ServerRejected(refusal) => {
+                use bifrost_sasl::RefusalClass;
+                let kind = match refusal.refusal_class() {
+                    RefusalClass::Credential => error::ErrorKind::Authentication,
+                    RefusalClass::Protocol => error::ErrorKind::Parse,
+                    RefusalClass::Policy => error::ErrorKind::Policy,
+                    RefusalClass::Unavailable => error::ErrorKind::ServerUnavailable,
+                    _ => error::ErrorKind::Internal,
                 };
-                Error::new(kind, Some(m)).with_phase(SmtpCommandPhase::Auth { mechanism: None })
+                Error::new(kind, Some(format!("SCRAM server error: {refusal}")))
+                    .with_phase(SmtpCommandPhase::Auth { mechanism: None })
             }
             // `SaslError` is `#[non_exhaustive]`; any future variant is an
             // client mapping gap until it is handled explicitly.
@@ -372,31 +376,20 @@ enum ScramExchangeState {
 /// each decoded continuation into [`ScramExchange::step`].
 /// Classify a `bifrost-sasl` failure, then name the mechanism being driven.
 ///
-/// Classification happens before diagnostic attribution: invalid proof remains
-/// a credential rejection and other server errors keep their policy routing. A
+/// Classification happens before typed diagnostic attribution. A
 /// mechanism token is not secret (it travels in clear on the AUTH command line
 /// and in the EHLO advertisement); it is support-only because the telemetry
 /// tier carries no free-form text at all.
-fn named_sasl_error(mechanism: &'static str, error: bifrost_sasl::SaslError) -> Error {
-    // Classify the original error before adding diagnostic text to its source.
+fn named_sasl_error(mechanism: Mechanism, error: bifrost_sasl::SaslError) -> Error {
     let mapped: Error = error.into();
-    let kind = mapped.kind().clone();
-    let phase = mapped.phase();
-    let message = mapped.diagnostic_text().unwrap_or_default();
-    let named = Error::new(kind, Some(format!("{message} (mechanism {mechanism})")));
-    match phase {
-        Some(phase) => named.with_phase(phase),
-        None => named,
-    }
+    mapped.with_phase(SmtpCommandPhase::Auth {
+        mechanism: Some(mechanism),
+    })
 }
 
 pub(crate) struct ScramExchange {
     hash: ScramHash,
     binding: ScramChannelBinding,
-    /// Wire mechanism token for this exchange, from the single `bifrost-sasl`
-    /// authority, so a diagnostic can never name a rung other than the one
-    /// actually sent.
-    mechanism_name: &'static str,
     /// Prepared (RFC 4013 `SASLprep`) in `new`, before the AUTH line is sent, so a password the
     /// caller supplied that cannot be prepared is refused locally rather than
     /// discovered after the server-first message.
@@ -419,7 +412,6 @@ impl ScramExchange {
         let client_first_bare = Zeroizing::new(format!("n={},r={client_nonce}", username.as_str()));
         let password = bifrost_sasl::prepare_scram_password(password.as_str())?;
         Ok(ScramExchange {
-            mechanism_name: hash.mechanism_name(binding.binding()),
             hash,
             binding,
             password,
@@ -428,6 +420,16 @@ impl ScramExchange {
             expected_server_signature: None,
             state: ScramExchangeState::AwaitServerFirst,
         })
+    }
+
+    fn mechanism(&self) -> Mechanism {
+        match (self.hash, self.binding.binding()) {
+            (ScramHash::Sha1, bifrost_sasl::ChannelBinding::None) => Mechanism::ScramSha1,
+            (ScramHash::Sha256, bifrost_sasl::ChannelBinding::None) => Mechanism::ScramSha256,
+            (ScramHash::Sha1, _) => Mechanism::ScramSha1Plus,
+            (ScramHash::Sha256, _) => Mechanism::ScramSha256Plus,
+            _ => unreachable!("unsupported SCRAM hash"),
+        }
     }
 
     /// The client-first message to send after the server's first `334`,
@@ -455,7 +457,7 @@ impl ScramExchange {
                     server_line,
                     &self.binding,
                 )
-                .map_err(|e| named_sasl_error(self.mechanism_name, e))?;
+                .map_err(|e| named_sasl_error(self.mechanism(), e))?;
                 self.expected_server_signature = Some(server_signature);
                 self.state = ScramExchangeState::AwaitServerFinal;
                 // bifrost-sasl returns the already-base64 client line. Keep
@@ -467,7 +469,7 @@ impl ScramExchange {
                     error::parse("SCRAM server signature missing from client state")
                 })?;
                 bifrost_sasl::verify_server_final(server_line, &expected)
-                    .map_err(|e| named_sasl_error(self.mechanism_name, e))?;
+                    .map_err(|e| named_sasl_error(self.mechanism(), e))?;
                 self.state = ScramExchangeState::Done;
                 Ok(ScramStep::Complete)
             }
@@ -977,6 +979,24 @@ mod test {
     }
 
     #[test]
+    fn scram_server_refusals_keep_shared_recovery_intent() {
+        use crate::transport::smtp::error::ErrorKind;
+        for (token, expected) in [
+            ("unknown-user", ErrorKind::Authentication),
+            ("invalid-proof", ErrorKind::Authentication),
+            ("channel-binding-not-supported", ErrorKind::Policy),
+            ("invalid-encoding", ErrorKind::Parse),
+            ("no-resources", ErrorKind::ServerUnavailable),
+            ("other-error", ErrorKind::ServerUnavailable),
+            ("future-extension", ErrorKind::ServerUnavailable),
+        ] {
+            let sasl = bifrost_sasl::verify_server_final(&format!("e={token}"), &[]).unwrap_err();
+            let error = super::Error::from(sasl);
+            assert_eq!(error.kind(), &expected, "{token}");
+        }
+    }
+
+    #[test]
     fn scram_sasl_error_mapping() {
         use crate::transport::smtp::error::{ErrorKind, SmtpCommandPhase};
 
@@ -984,8 +1004,10 @@ mod test {
             bifrost_sasl::SaslError::Protocol("bad server-first".into()).into();
         assert_eq!(protocol.kind(), &ErrorKind::Parse);
 
-        let auth_failed: super::Error =
-            bifrost_sasl::SaslError::AuthFailed("server rejected".into()).into();
+        let auth_failed: super::Error = bifrost_sasl::SaslError::ServerRejected(
+            bifrost_sasl::ScramServerError::ChannelBindingNotSupported,
+        )
+        .into();
         assert_eq!(auth_failed.kind(), &ErrorKind::Policy);
         assert_eq!(
             auth_failed.phase(),
@@ -1166,7 +1188,7 @@ mod test {
         ));
         // A wrong v= signature is a protocol-class verification failure (the
         // bifrost-sasl contract: signature mismatch is `Protocol`, not
-        // `AuthFailed`), so it maps to a parse-class SMTP error.
+        // `ServerRejected`), so it maps to a parse-class SMTP error.
         let err = exchange.step("v=AAAA").unwrap_err();
         assert!(err.is_parse(), "got {err:?}");
     }
@@ -1197,15 +1219,17 @@ mod test {
         );
         assert_eq!(
             err.phase(),
-            Some(SmtpCommandPhase::Auth { mechanism: None })
+            Some(SmtpCommandPhase::Auth {
+                mechanism: Some(Mechanism::ScramSha256)
+            })
         );
         // The server refused THIS rung, and the exchange is the last place
-        // that still knows which one. The name rides the diagnostic message,
+        // that still knows which one. The enum rides the phase stamp,
         // which `account_error.rs` turns into support-only `DiagnosticText`;
         // the classification above is unchanged by the attribution.
         let text = err.diagnostic_text().unwrap_or_default();
         assert!(text.contains("invalid-proof"), "got {text}");
-        assert!(text.contains("SCRAM-SHA-256"), "got {text}");
+
         let account = crate::transport::smtp::account_error::into_account_error(
             err,
             crate::transport::smtp::account_error::SmtpErrorContext::send(
@@ -1227,6 +1251,7 @@ mod test {
     #[test]
     fn a_named_scram_failure_keeps_the_plus_suffix() {
         use super::{ScramExchange, ScramStep, scram_hash};
+        use crate::transport::smtp::error::SmtpCommandPhase;
         use bifrost_sasl::ScramChannelBinding;
 
         // An operator debugging a channel-binding problem has to be able to
@@ -1251,17 +1276,24 @@ mod test {
         ));
 
         let err = exchange.step("e=invalid-proof").unwrap_err();
-        let text = err.diagnostic_text().unwrap_or_default();
-        assert!(text.contains("SCRAM-SHA-256-PLUS"), "got {text}");
+        assert_eq!(
+            err.phase(),
+            Some(SmtpCommandPhase::Auth {
+                mechanism: Some(Mechanism::ScramSha256Plus),
+            })
+        );
 
         // A protocol-class failure is named too, and stays parse-class.
         let mut exchange =
             ScramExchange::new(hash, ScramChannelBinding::None, "user", "pw".into()).unwrap();
         let err = exchange.step("garbage-without-r=").unwrap_err();
         assert!(err.is_parse(), "got {err:?}");
-        let text = err.diagnostic_text().unwrap_or_default();
-        assert!(text.contains("SCRAM-SHA-256"), "got {text}");
-        assert!(!text.contains("-PLUS"), "got {text}");
+        assert_eq!(
+            err.phase(),
+            Some(SmtpCommandPhase::Auth {
+                mechanism: Some(Mechanism::ScramSha256),
+            })
+        );
     }
 
     #[test]

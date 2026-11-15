@@ -1080,7 +1080,7 @@ mod tests {
     fn fresh_invalid_fusion_checkpoint_is_a_scoped_terminal_contract_failure() {
         let scope = CursorScope::Account;
         let mut cursor = crate::test_common::cursor_for(&scope, b"fresh");
-        cursor.envelope_version = u32::MAX;
+        cursor.envelope_version = bifrost_types::TraitEnvelopeVersion::new(u32::MAX);
         let checkpoint = Checkpoint::Change(cursor);
         let Err(Error::Account(error)) = validate_checkpoint_envelope(Some(&checkpoint)) else {
             panic!("expected classified contract error");
@@ -1108,11 +1108,11 @@ mod tests {
             scope: CursorScope::Account,
             server_state: bifrost_types::OpaqueChangeState {
                 protocol: bifrost_types::ProtocolKind::Imap,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: vec![1],
             },
             advanced_through: None,
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         };
         assert!(
             validate_checkpoint_envelope(Some(&Checkpoint::Change(cursor))).is_ok(),
@@ -1128,7 +1128,7 @@ mod tests {
             partition: bifrost_types::Partition(b"page:0:10".to_vec()),
             progress_marker: None,
             progress: bifrost_types::BackfillProgress::default(),
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         });
         assert!(
             validate_checkpoint_envelope(Some(&backfill)).is_err(),
@@ -1444,11 +1444,11 @@ mod tests {
             scope: CursorScope::Account,
             server_state: bifrost_types::OpaqueChangeState {
                 protocol: bifrost_types::ProtocolKind::Imap,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: vec![1],
             },
             advanced_through: None,
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         });
         let page = bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
             removed: Vec::new(),

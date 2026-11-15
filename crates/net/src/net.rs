@@ -343,7 +343,7 @@ impl Net {
                 ambiguous_scope_hosts,
                 default_retry: spec.default_retry,
                 request_timeout: spec.request_timeout,
-                response_headers_timeout: spec.response_headers_timeout.or(spec.connect_timeout),
+                response_headers_timeout: spec.response_headers_timeout.duration(),
                 read_timeout: spec.read_timeout,
                 max_buffered_response: spec.max_buffered_response,
                 concurrency_limit: spec.concurrency_limit,
@@ -508,6 +508,33 @@ impl Drop for AccountNetInner {
     }
 }
 
+/// A provider-minted URL whose bytes are themselves a session credential.
+///
+/// Construction declares sensitivity only. The provider must admit the URL
+/// before sending it; this type does not validate its origin or scheme.
+#[derive(Clone)]
+pub struct SessionUrl(String);
+
+impl SessionUrl {
+    /// Mark a provider session URL as a credential after provider admission.
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
+        Self(url.into())
+    }
+}
+
+impl std::fmt::Debug for SessionUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionUrl([redacted])")
+    }
+}
+
+impl std::fmt::Display for SessionUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[redacted session URL]")
+    }
+}
+
 impl AccountNet {
     /// Read the same coordinating bearer cache used by HTTP requests.
     /// Non-HTTP wire paths must use this lifecycle, including its backoff.
@@ -555,6 +582,24 @@ impl AccountNet {
     #[must_use]
     pub fn request(&self, method: http::Method, url: &str) -> RequestBuilder {
         RequestBuilder::new(self.clone(), method, url)
+    }
+
+    /// Send to a provider-admitted, pre-authenticated session URL.
+    ///
+    /// Suppresses the account bearer, redacts transport URL diagnostics and
+    /// disables redirects together. Users expect an upload credential and its
+    /// payload to stay on the provider-admitted destination.
+    ///
+    /// The returned builder is the general one, so a caller could still call
+    /// `follow_redirects`, `hop_policy` or bearer setters afterwards. Session
+    /// callers must only add per-request options (headers, body, retry,
+    /// timeout); re-enabling any of the three policies defeats this door.
+    #[must_use]
+    pub fn session_request(&self, method: http::Method, url: &SessionUrl) -> RequestBuilder {
+        self.request(method, &url.0)
+            .without_bearer_auth()
+            .credential_url()
+            .follow_redirects(crate::FollowRedirects::Disabled)
     }
 
     /// Start a `POST` request.
@@ -937,13 +982,9 @@ pub struct AccountSpec {
     /// Default total timeout applied to requests from this account.
     /// `None` leaves requests unbounded unless a builder sets one.
     pub request_timeout: Option<Duration>,
-    // Keep this input while protocol consumers still assign it directly. A
-    // rename must migrate those consumers together; it is not a second clock.
-    /// Legacy name for `response_headers_timeout`. Retained for source
-    /// compatibility; new code should set `response_headers_timeout`.
-    pub connect_timeout: Option<Duration>,
-    /// Per-attempt deadline for receiving response headers.
-    pub response_headers_timeout: Option<Duration>,
+    /// Per-attempt response-header bound.
+    /// Connection setup itself is controlled by `NetConfig::connect_timeout`.
+    pub response_headers_timeout: ResponseHeadersTimeout,
     /// Inactivity deadline between response body chunks.
     pub read_timeout: Option<Duration>,
     /// Ceiling for buffered response bodies. `None` disables it.
@@ -963,6 +1004,26 @@ pub struct AccountSpec {
     pub token_max_age: Duration,
 }
 
+/// Per-attempt time allowed for response headers after dispatch.
+/// A single choice avoids precedence between two names for the same clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ResponseHeadersTimeout {
+    /// Do not impose a per-attempt response-header deadline.
+    Unbounded,
+    /// Bound the wait for response headers by this duration.
+    Bounded(Duration),
+}
+
+impl ResponseHeadersTimeout {
+    fn duration(self) -> Option<Duration> {
+        match self {
+            Self::Unbounded => None,
+            Self::Bounded(duration) => Some(duration),
+        }
+    }
+}
+
 impl AccountSpec {
     /// Common account defaults used by protocol clients.
     #[must_use]
@@ -972,8 +1033,7 @@ impl AccountSpec {
             token_source,
             default_retry: RetryPolicy::default(),
             request_timeout: None,
-            connect_timeout: Some(Duration::from_secs(10)),
-            response_headers_timeout: None,
+            response_headers_timeout: ResponseHeadersTimeout::Bounded(Duration::from_secs(10)),
             read_timeout: Some(Duration::from_secs(30)),
             max_buffered_response: Some(DEFAULT_MAX_BUFFERED_RESPONSE),
             concurrency_limit: None,
@@ -1300,9 +1360,8 @@ mod tests {
              rely on the default rather than setting it"
         );
         assert!(
-            policy.trusted_hosts.is_empty(),
-            "the allowlist is seeded per account from its own base host, \
-             so the default must start empty rather than trusting anything"
+            matches!(policy.cross_origin, crate::CrossOrigin::Any),
+            "the default admits cross-origin redirects; protocols can restrict it"
         );
     }
 

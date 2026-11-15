@@ -141,7 +141,8 @@ async fn a_push_drive_account_contract_error_is_published_and_parks_its_scope() 
                 return Vec::new();
             }
             let mut invalid = cursor.clone();
-            invalid.envelope_version += 1;
+            invalid.envelope_version =
+                bifrost_types::TraitEnvelopeVersion::new(invalid.envelope_version.get() + 1);
             vec![SyncEvent::Batch(Batch {
                 items: Vec::new(),
                 page_boundary: PageBoundary::Final,

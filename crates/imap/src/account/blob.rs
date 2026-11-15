@@ -199,7 +199,10 @@ pub(super) async fn run_fetch(
         partial: None,
     };
     if account.shutdown.is_cancelled() {
-        return Err(BlobError::Imap(crate::Error::closed()));
+        return Err(BlobError::Account(AccountError::account_closed(
+            op,
+            Protocol::Imap,
+        )));
     }
     let mut conn = account.checkout_for_folder(folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();

@@ -29,7 +29,7 @@ use crate::{DavHrefKey, dav_href_key};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotEntry {
     pub uri: String,
-    pub etag: Option<String>,
+    pub etag: Option<bifrost_types::EntityTag>,
 }
 
 /// A cursor payload read back off the wire.
@@ -419,7 +419,7 @@ pub fn decode_snapshot(
     for _ in 0..count {
         entries.push(SnapshotEntry {
             uri: read_string(&mut input, label)?,
-            etag: read_option_string(&mut input, label)?,
+            etag: read_option_string(&mut input, label)?.map(Into::into),
         });
     }
     if !input.is_empty() {
@@ -627,7 +627,7 @@ mod tests {
     fn entry(uri: &str, etag: Option<&str>) -> SnapshotEntry {
         SnapshotEntry {
             uri: uri.to_string(),
-            etag: etag.map(str::to_string),
+            etag: etag.map(Into::into),
         }
     }
 

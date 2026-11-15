@@ -423,7 +423,7 @@ impl CalDavAccount {
             .into_iter()
             .map(|entry| EventSnapshotEntry {
                 uri: entry.uri,
-                etag: entry.etag,
+                etag: entry.etag.map(Into::into),
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.uri.cmp(&right.uri));
@@ -1205,7 +1205,7 @@ impl Account for CalDavAccount {
                         &url,
                         body,
                         expected_etag.map_or_else(
-                            || PutCondition::from_etag(current.etag.as_deref()),
+                            || PutCondition::from_tag(current.etag.as_ref()),
                             |etag| PutCondition::from_etag(Some(etag)),
                         ),
                         AccountOperation::EventUpdate,
@@ -1328,7 +1328,7 @@ impl Account for CalDavAccount {
                 .put_event(
                     &url,
                     body,
-                    PutCondition::from_etag(current.etag.as_deref()),
+                    PutCondition::from_tag(current.etag.as_ref()),
                     AccountOperation::EventRsvp,
                 )
                 .await
@@ -1998,11 +1998,13 @@ fn cursor_from_snapshot(scope: CursorScope, snapshot: &EventSnapshot) -> ChangeC
         scope,
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::CalDav,
-            envelope_version: CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(CURSOR_ENVELOPE_VERSION),
             bytes: encode_cursor_snapshot(snapshot),
         },
         advanced_through: None,
-        envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+            bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        ),
     }
 }
 
@@ -2023,23 +2025,40 @@ fn encode_cursor_snapshot(snapshot: &EventSnapshot) -> Vec<u8> {
 // decides whether it is a sync-token or a ctag.
 fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<EventSnapshot, AccountError> {
     validate_event_scope(&cursor.scope, AccountOperation::SyncChanges)?;
-    if cursor.server_state.protocol != ProtocolKind::CalDav
-        || cursor.server_state.envelope_version != CURSOR_ENVELOPE_VERSION
-    {
-        return Err(cursor_error("CalDAV cursor protocol or version mismatch"));
-    }
-    let decoded = decode_snapshot(
-        CURSOR_MAGIC,
-        DavProtocol::CalDav.label(),
-        &cursor.server_state.bytes,
-    )
-    .map_err(cursor_error)?;
+    let bytes = cursor
+        .server_state
+        .open(
+            ProtocolKind::CalDav,
+            bifrost_types::PayloadVersion::new(CURSOR_ENVELOPE_VERSION),
+        )
+        .map_err(|fault| {
+            fault
+                .builder(Protocol::CalDav, AccountOperation::SyncChanges)
+                .scope(ErrorScope::Cursor(cursor.scope.clone()))
+                .try_build()
+                .expect("valid account error classification")
+        })?;
+    let decoded =
+        decode_snapshot(CURSOR_MAGIC, DavProtocol::CalDav.label(), bytes).map_err(|error| {
+            cursor_error(error)
+                .into_builder()
+                .scope(ErrorScope::Cursor(cursor.scope.clone()))
+                .try_build()
+                .expect("valid account error classification")
+        })?;
+    // Fixed, valid classification: try_build cannot fail.
+    #[allow(clippy::unwrap_in_result)]
     if let CursorScope::Folder(folder) = &cursor.scope
         && !same_dav_url(&folder.0, &decoded.collection_url)
     {
-        return Err(cursor_error(
-            "cursor collection does not match its folder scope",
-        ));
+        return Err(bifrost_types::CursorDecodeFault::ScopeMismatch
+            .builder(Protocol::CalDav, AccountOperation::SyncChanges)
+            .scope(ErrorScope::Cursor(cursor.scope.clone()))
+            .text(DiagnosticText::support_only(
+                "cursor collection does not match its folder scope",
+            ))
+            .try_build()
+            .expect("valid account error classification"));
     }
     Ok(EventSnapshot {
         calendar_url: decoded.collection_url,
@@ -2217,7 +2236,7 @@ fn apply_sync_report_with_key(
         }
         let resolved = EventSnapshotEntry {
             uri: uri.clone(),
-            etag: entry.etag,
+            etag: entry.etag.map(Into::into),
         };
         match current
             .entries
@@ -2247,15 +2266,11 @@ fn diff_event_snapshots(previous: &EventSnapshot, current: &EventSnapshot) -> Ve
 }
 
 fn cursor_error(message: impl Into<String>) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-        Cause::State(StateCause::SchemaIncompatible),
-    )
-    .protocol(Protocol::CalDav)
-    .operation(AccountOperation::SyncChanges)
-    .text(DiagnosticText::support_only(message))
-    .try_build()
-    .expect("valid account error classification")
+    bifrost_types::CursorDecodeFault::Malformed
+        .builder(Protocol::CalDav, AccountOperation::SyncChanges)
+        .text(DiagnosticText::support_only(message))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 #[cfg(test)]
@@ -3807,7 +3822,7 @@ mod tests {
             entries: vec![
                 EventSnapshotEntry {
                     uri: "https://dav.example.test/cal/a.ics".to_string(),
-                    etag: Some("a".to_string()),
+                    etag: Some("a".into()),
                 },
                 EventSnapshotEntry {
                     uri: "https://dav.example.test/cal/b.ics".to_string(),
@@ -3835,7 +3850,7 @@ mod tests {
         let snapshot = EventSnapshot::default();
         let mut cursor =
             cursor_from_snapshot(CursorScope::Type(ObjectType::CalendarEvent), &snapshot);
-        cursor.server_state.envelope_version = 1;
+        cursor.server_state.envelope_version = bifrost_types::PayloadVersion::new(1);
 
         let error = decode_cursor_snapshot(&cursor).expect_err("v1 cursors are disowned");
         assert!(matches!(
@@ -3872,15 +3887,15 @@ mod tests {
             entries: vec![
                 EventSnapshotEntry {
                     uri: "a.ics".to_string(),
-                    etag: Some("old".to_string()),
+                    etag: Some("old".into()),
                 },
                 EventSnapshotEntry {
                     uri: "b.ics".to_string(),
-                    etag: Some("same".to_string()),
+                    etag: Some("same".into()),
                 },
                 EventSnapshotEntry {
                     uri: "d.ics".to_string(),
-                    etag: Some("gone".to_string()),
+                    etag: Some("gone".into()),
                 },
             ],
             failed_hrefs: Vec::new(),
@@ -3891,15 +3906,15 @@ mod tests {
             entries: vec![
                 EventSnapshotEntry {
                     uri: "a.ics".to_string(),
-                    etag: Some("new".to_string()),
+                    etag: Some("new".into()),
                 },
                 EventSnapshotEntry {
                     uri: "b.ics".to_string(),
-                    etag: Some("same".to_string()),
+                    etag: Some("same".into()),
                 },
                 EventSnapshotEntry {
                     uri: "c.ics".to_string(),
-                    etag: Some("created".to_string()),
+                    etag: Some("created".into()),
                 },
             ],
             failed_hrefs: Vec::new(),
@@ -3932,7 +3947,7 @@ mod tests {
                 .iter()
                 .map(|uri| EventSnapshotEntry {
                     uri: (*uri).to_string(),
-                    etag: Some("e".to_string()),
+                    etag: Some("e".into()),
                 })
                 .collect(),
             failed_hrefs: Vec::new(),
@@ -4170,7 +4185,7 @@ mod tests {
         let entries = (10_000..11_000)
             .map(|index| crate::parse::CalDavSyncEntry {
                 uri: format!("https://dav.example.test/cal/{index:05}.ics"),
-                etag: Some("new".to_string()),
+                etag: Some("new".into()),
                 status: Some(200),
                 non_vevent: false,
             })
@@ -4201,7 +4216,7 @@ mod tests {
                 },
                 crate::parse::CalDavSyncEntry {
                     uri: literal.to_string(),
-                    etag: Some("updated".to_string()),
+                    etag: Some("updated".into()),
                     status: Some(200),
                     non_vevent: false,
                 },
@@ -4213,13 +4228,13 @@ mod tests {
                 },
                 crate::parse::CalDavSyncEntry {
                     uri: literal.to_string(),
-                    etag: Some("new".to_string()),
+                    etag: Some("new".into()),
                     status: Some(200),
                     non_vevent: false,
                 },
                 crate::parse::CalDavSyncEntry {
                     uri: encoded.to_string(),
-                    etag: Some("again".to_string()),
+                    etag: Some("again".into()),
                     status: Some(200),
                     non_vevent: false,
                 },
@@ -4254,7 +4269,7 @@ mod tests {
                 &mut snapshot,
                 vec![crate::parse::CalDavSyncEntry {
                     uri: "https://dav.example.test/cal/a@b.ics".to_string(),
-                    etag: Some("changed".to_string()),
+                    etag: Some("changed".into()),
                     status: Some(status),
                     non_vevent: false,
                 }],
@@ -4342,11 +4357,11 @@ mod tests {
             entries: vec![
                 EventSnapshotEntry {
                     uri: "https://dav.example.test/cal/one.ics".to_string(),
-                    etag: Some("old".to_string()),
+                    etag: Some("old".into()),
                 },
                 EventSnapshotEntry {
                     uri: "https://dav.example.test/cal/two.ics".to_string(),
-                    etag: Some("same".to_string()),
+                    etag: Some("same".into()),
                 },
             ],
             failed_hrefs: Vec::new(),
@@ -4357,7 +4372,7 @@ mod tests {
             vec![
                 crate::parse::CalDavSyncEntry {
                     uri: "https://dav.example.test/cal/one.ics".to_string(),
-                    etag: Some("new".to_string()),
+                    etag: Some("new".into()),
                     status: Some(200),
                     non_vevent: false,
                 },
@@ -4369,7 +4384,7 @@ mod tests {
                 },
                 crate::parse::CalDavSyncEntry {
                     uri: "https://dav.example.test/cal/three.ics".to_string(),
-                    etag: Some("created".to_string()),
+                    etag: Some("created".into()),
                     status: Some(200),
                     non_vevent: false,
                 },
@@ -4413,7 +4428,7 @@ mod tests {
             sync_token: Some("token-1".to_string()),
             entries: vec![EventSnapshotEntry {
                 uri: "https://dav.example.test/cal/one.ics".to_string(),
-                etag: Some("kept".to_string()),
+                etag: Some("kept".into()),
             }],
             failed_hrefs: Vec::new(),
         };
@@ -4568,7 +4583,7 @@ mod tests {
             sync_token: Some("token-1".to_string()),
             entries: vec![EventSnapshotEntry {
                 uri: "https://dav.example.test/cal/one.ics".to_string(),
-                etag: Some("e".to_string()),
+                etag: Some("e".into()),
             }],
             failed_hrefs: Vec::new(),
         };
@@ -4601,7 +4616,7 @@ mod tests {
             sync_token: Some("token-1".to_string()),
             entries: vec![EventSnapshotEntry {
                 uri: "https://dav.example.test/cal/phantom.ics".to_string(),
-                etag: Some("leaked".to_string()),
+                etag: Some("leaked".into()),
             }],
             failed_hrefs: Vec::new(),
         };
@@ -4611,19 +4626,19 @@ mod tests {
             vec![
                 crate::parse::CalDavSyncEntry {
                     uri: "https://dav.example.test/cal/task.ics".to_string(),
-                    etag: Some("t1".to_string()),
+                    etag: Some("t1".into()),
                     status: Some(200),
                     non_vevent: true,
                 },
                 crate::parse::CalDavSyncEntry {
                     uri: "https://dav.example.test/cal/phantom.ics".to_string(),
-                    etag: Some("leaked-2".to_string()),
+                    etag: Some("leaked-2".into()),
                     status: Some(200),
                     non_vevent: true,
                 },
                 crate::parse::CalDavSyncEntry {
                     uri: "https://dav.example.test/cal/unlabelled.ics".to_string(),
-                    etag: Some("u1".to_string()),
+                    etag: Some("u1".into()),
                     status: Some(200),
                     non_vevent: false,
                 },

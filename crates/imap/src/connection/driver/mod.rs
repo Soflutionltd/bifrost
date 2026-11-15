@@ -942,10 +942,11 @@ async fn dispatch_response_loop(
                 if let Some(error) = continuation_error.take() {
                     if cancellation_acknowledged {
                         // Preserve a structured auth code from the terminal
-                        // NO when the consumer recognized it. Without one,
+                        // NO when the consumer recognized it, unless a typed
+                        // SCRAM refusal already supplies the recovery class. Without one,
                         // the continuation error carries the more useful
                         // server-final explanation.
-                        let error = if matches!(&error, Error::Auth { .. }) {
+                        let error = if matches!(&error, Error::Auth { scram: None, .. }) {
                             match finalized_output {
                                 Err(completion_error @ Error::Auth { code: Some(_), .. }) => {
                                     completion_error

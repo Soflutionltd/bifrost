@@ -62,29 +62,28 @@ impl Default for FollowRedirects {
     }
 }
 
-/// Configurable redirect policy.
-///
-/// `trusted_hosts` is the allowlist for cross-host hops. When empty,
-/// every cross-host hop is accepted; when populated, only hops whose
-/// target host appears in the set are accepted and `Authorization`
-/// is still stripped on every cross-host hop regardless of
-/// membership.
+/// Admission policy for redirects that change scheme, host or effective port.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CrossOrigin {
+    /// Admit every cross-origin target.
+    Any,
+    /// Admit only these target hosts, compared case-insensitively.
+    /// An empty allowlist admits no cross-origin target.
+    AllowList(HashSet<String>),
+    /// Admit no cross-origin target.
+    Forbidden,
+}
+
+/// Configurable redirect policy. Same-origin hops are always admitted.
+/// Authorization is stripped on every admitted cross-origin hop.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct RedirectPolicy {
-    /// Maximum number of redirect hops before the loop aborts with
-    /// `Error::RedirectLoop`.
+    /// Maximum number of redirect hops before `Error::RedirectLoop`.
     pub max_hops: u8,
-    /// Refuse every hop that changes scheme, host, or effective port.
-    // These are independently writable public inputs. Replacing them with an
-    // enum requires consumer migration; admits_hop owns their precedence.
-    pub same_origin_only: bool,
-    /// Cross-host targets that the policy accepts. Empty means
-    /// "every host is allowed"; populated means strict allowlist.
-    /// Host comparison is case-insensitive (HTTP hosts are
-    /// case-insensitive in practice and this matches the IETF
-    /// guidance in RFC 3986 §3.2.2).
-    pub trusted_hosts: HashSet<String>,
+    /// The single admission choice for cross-origin hops.
+    pub cross_origin: CrossOrigin,
 }
 
 /// The shared walk permits ten relocations, bounding server loops without
@@ -95,8 +94,7 @@ impl Default for RedirectPolicy {
     fn default() -> Self {
         Self {
             max_hops: DEFAULT_MAX_HOPS,
-            same_origin_only: false,
-            trusted_hosts: HashSet::new(),
+            cross_origin: CrossOrigin::Any,
         }
     }
 }
@@ -108,43 +106,45 @@ impl RedirectPolicy {
     pub fn with_hops(max_hops: u8) -> Self {
         Self {
             max_hops,
-            same_origin_only: false,
-            trusted_hosts: HashSet::new(),
+            cross_origin: CrossOrigin::Any,
         }
     }
 
-    /// Restrict redirects to the departing origin.
+    /// Select `CrossOrigin::Forbidden`, replacing any existing allowlist.
     #[must_use]
     pub fn same_origin(mut self) -> Self {
-        self.same_origin_only = true;
+        self.cross_origin = CrossOrigin::Forbidden;
         self
     }
 
-    /// Add a trusted host to the allowlist. Builder-style; returns
-    /// `self`.
+    /// Select an allowlist and add a trusted host. An existing allowlist is
+    /// extended; `Any` or `Forbidden` is replaced by the new allowlist.
     #[must_use]
     pub fn trust_host(mut self, host: impl Into<String>) -> Self {
-        self.trusted_hosts.insert(host.into().to_ascii_lowercase());
+        let host = host.into().to_ascii_lowercase();
+        match &mut self.cross_origin {
+            CrossOrigin::AllowList(hosts) => {
+                hosts.insert(host);
+            }
+            CrossOrigin::Any | CrossOrigin::Forbidden => {
+                self.cross_origin = CrossOrigin::AllowList(HashSet::from([host]));
+            }
+        }
         self
     }
 
-    /// True iff `host` is acceptable as a cross-host redirect
-    /// target. When the allowlist is empty, every host is
-    /// acceptable unless `same_origin_only` is set. In that mode this
-    /// returns false for every host, including the departing host: a host
-    /// alone cannot establish equality of scheme and effective port.
-    /// This predicate does not decide same-origin hops; the redirect
-    /// classifier admits those before consulting this cross-host rule. Use
-    /// [`Self::admits_hop`] when both URLs are available.
+    /// Whether a host is admitted as a cross-origin target. A host alone
+    /// cannot establish matching scheme and port; use [`Self::admits_hop`]
+    /// when both URLs are available.
     #[must_use]
     pub fn allows_host(&self, host: &str) -> bool {
-        if self.same_origin_only {
-            return false;
+        match &self.cross_origin {
+            CrossOrigin::Any => true,
+            CrossOrigin::AllowList(hosts) => hosts
+                .iter()
+                .any(|trusted| trusted.eq_ignore_ascii_case(host)),
+            CrossOrigin::Forbidden => false,
         }
-        if self.trusted_hosts.is_empty() {
-            return true;
-        }
-        self.trusted_hosts.contains(&host.to_ascii_lowercase())
     }
 
     /// The follow / stop decision for one hop. The single rule the
@@ -455,6 +455,35 @@ mod tests {
         h
     }
 
+    #[test]
+    fn explicit_cross_origin_choices_admit_only_the_selected_targets() {
+        let mut policy = RedirectPolicy {
+            cross_origin: CrossOrigin::AllowList(HashSet::new()),
+            ..RedirectPolicy::default()
+        };
+        let prior = url("https://a.example/");
+        assert!(policy.admits_hop(Some(&prior), &url("https://a.example/next")));
+        assert!(!policy.admits_hop(Some(&prior), &url("https://b.example/")));
+        policy.cross_origin = CrossOrigin::AllowList(HashSet::from(["B.Example".to_owned()]));
+        assert!(policy.admits_hop(Some(&prior), &url("https://b.example/")));
+        assert!(!policy.admits_hop(Some(&prior), &url("https://c.example/")));
+        policy.cross_origin = CrossOrigin::Forbidden;
+        assert!(!policy.admits_hop(Some(&prior), &url("https://b.example/")));
+        policy.cross_origin = CrossOrigin::Any;
+        assert!(policy.admits_hop(Some(&prior), &url("https://c.example/")));
+    }
+
+    #[test]
+    fn redirect_builders_replace_the_previous_admission_choice() {
+        let restricted = RedirectPolicy::default()
+            .trust_host("a.example")
+            .same_origin();
+        assert_eq!(restricted.cross_origin, CrossOrigin::Forbidden);
+        let listed = restricted.trust_host("B.Example");
+        assert!(listed.allows_host("b.example"));
+        assert!(!listed.allows_host("a.example"));
+    }
+
     /// The precondition the two paths must share: the allowlist governs
     /// cross-origin hops only. A same-origin hop is followed even when
     /// the allowlist does not name that host - which is exactly what
@@ -552,8 +581,8 @@ mod tests {
     #[test]
     fn same_origin_policy_rejects_every_origin_change() {
         let policy = RedirectPolicy::default()
-            .same_origin()
-            .trust_host("a.example");
+            .trust_host("a.example")
+            .same_origin();
         let prior = url("https://a.example/");
         for target in [
             "https://other.example/",

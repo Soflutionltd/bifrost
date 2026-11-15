@@ -23,11 +23,11 @@ fn change_cursor(scope: &CursorScope, state: &[u8]) -> ChangeCursor {
         scope: scope.clone(),
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::Gmail,
-            envelope_version: 1,
+            envelope_version: bifrost_types::PayloadVersion::new(1),
             bytes: state.to_vec(),
         },
         advanced_through: None,
-        envelope_version: 1,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
     }
 }
 
@@ -40,7 +40,7 @@ fn backfill(scope: &CursorScope, partition: &[u8], items_done: u64) -> BackfillC
             items_done,
             items_estimated: None,
         },
-        envelope_version: 1,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
     }
 }
 

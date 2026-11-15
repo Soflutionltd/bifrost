@@ -1842,11 +1842,13 @@ mod tests {
             scope: email_scope(),
             server_state: bifrost_types::OpaqueChangeState {
                 protocol: bifrost_types::ProtocolKind::Imap,
-                envelope_version: crate::cursor::ENGINE_VERSION,
+                envelope_version: bifrost_types::PayloadVersion::new(crate::cursor::ENGINE_VERSION),
                 bytes: bytes.to_vec(),
             },
             advanced_through: None,
-            envelope_version: crate::cursor::ENGINE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                crate::cursor::ENGINE_VERSION,
+            ),
         }
     }
 
@@ -1980,7 +1982,7 @@ mod tests {
 
         let mut cursor = change_cursor(b"acked");
         if case == "rejected" {
-            cursor.envelope_version = u32::MAX;
+            cursor.envelope_version = bifrost_types::TraitEnvelopeVersion::new(u32::MAX);
         }
         store
             .fail_transitions
@@ -1995,7 +1997,9 @@ mod tests {
                 },
                 progress_marker: None,
                 progress: bifrost_types::BackfillProgress::default(),
-                envelope_version: crate::cursor::ENGINE_VERSION,
+                envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                    crate::cursor::ENGINE_VERSION,
+                ),
             })
         } else {
             Checkpoint::Change(cursor)

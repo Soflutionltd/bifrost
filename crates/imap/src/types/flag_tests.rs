@@ -27,7 +27,7 @@ fn case_insensitive_parsing() {
 #[test]
 fn custom_flag_preserved() {
     let flag = Flag::from_imap_str("$Important");
-    assert_eq!(flag, Flag::Custom("$Important".into()));
+    assert_eq!(flag, Flag::from_imap_str("$Important"));
 }
 
 // ===== Spec audit: failing tests for known deviations =====
@@ -63,13 +63,13 @@ fn custom_flag_equality_is_case_insensitive() {
     // RFC 3501 Section 2.3.2: "A flag can be permanent or session-only...
     // Flag names are case-insensitive."
     assert_eq!(
-        Flag::Custom("$Important".into()),
-        Flag::Custom("$important".into()),
+        Flag::from_imap_str("$Important"),
+        Flag::from_imap_str("$important"),
         "Custom flags must compare case-insensitively per RFC 3501 Section 2.3.2"
     );
     assert_eq!(
-        Flag::Custom("$JUNK".into()),
-        Flag::Custom("$Junk".into()),
+        Flag::from_imap_str("$JUNK"),
+        Flag::from_imap_str("$Junk"),
         "Custom flags must compare case-insensitively per RFC 3501 Section 2.3.2"
     );
 }
@@ -81,9 +81,9 @@ fn custom_flag_hash_is_case_insensitive() {
     use std::collections::HashSet;
 
     let mut set = HashSet::new();
-    set.insert(Flag::Custom("$Important".into()));
+    set.insert(Flag::from_imap_str("$Important"));
     // Inserting the same flag in different case should not grow the set.
-    set.insert(Flag::Custom("$important".into()));
+    set.insert(Flag::from_imap_str("$important"));
     assert_eq!(
         set.len(),
         1,
@@ -98,7 +98,7 @@ fn custom_seen_equals_seen_variant() {
     // RFC 3501 Section 2.3.2: "Flag names are case-insensitive."
     // Custom("\\Seen") represents the same flag as Flag::Seen.
     assert_eq!(
-        Flag::Custom("\\Seen".into()),
+        Flag::from_imap_str("\\Seen"),
         Flag::Seen,
         "Custom(\"\\\\Seen\") must equal Flag::Seen per RFC 3501 Section 2.3.2"
     );
@@ -110,7 +110,7 @@ fn custom_system_flag_cross_representation_hash() {
     use std::collections::HashSet;
     let mut set = HashSet::new();
     set.insert(Flag::Seen);
-    set.insert(Flag::Custom("\\Seen".into()));
+    set.insert(Flag::from_imap_str("\\Seen"));
     assert_eq!(
         set.len(),
         1,
@@ -122,7 +122,7 @@ fn custom_system_flag_cross_representation_hash() {
 fn custom_wildcard_equals_wildcard_variant() {
     // RFC 3501 Section 7.1: permanent flag wildcard.
     assert_eq!(
-        Flag::Custom("\\*".into()),
+        Flag::from_imap_str("\\*"),
         Flag::Wildcard,
         "Custom(\"\\\\*\") must equal Flag::Wildcard per RFC 3501 Section 7.1"
     );
@@ -160,9 +160,27 @@ fn from_str_case_insensitive() {
 #[test]
 fn from_str_custom_flag() {
     // RFC 3501 Section 2.3.2: keyword flags.
-    assert_eq!(Flag::from("$Custom"), Flag::Custom("$Custom".to_owned()));
+    assert_eq!(Flag::from("$Custom"), Flag::from_imap_str("$Custom"));
+    assert_eq!(Flag::from("$Important"), Flag::from_imap_str("$Important"));
+}
+
+#[test]
+fn writable_view_excludes_server_only_flags_and_validates_keywords() {
+    use super::StoreFlag;
+    for token in ["\\recent", "\\*"] {
+        let flag = Flag::from_imap_str(token);
+        assert!(StoreFlag::from_observed(&flag).unwrap().is_none());
+    }
+    for token in ["", "has space", "bad(flag", "bad\\flag", "nonascii-\u{e9}"] {
+        let flag = Flag::from_imap_str(token);
+        assert!(StoreFlag::from_observed(&flag).is_err(), "{token:?}");
+    }
+    let flag = Flag::from_imap_str("$Important");
     assert_eq!(
-        Flag::from("$Important"),
-        Flag::Custom("$Important".to_owned())
+        StoreFlag::from_observed(&flag)
+            .unwrap()
+            .unwrap()
+            .as_imap_str(),
+        "$Important"
     );
 }

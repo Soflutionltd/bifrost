@@ -702,7 +702,7 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
         self.refuse_directory_access(url, operation)?;
-        let etag = bifrost_types::ServerVersion::ETag(etag.to_string());
+        let etag = bifrost_types::ServerVersion::ETag(etag.into());
         let etag = etag.expected_etag(bifrost_types::error::Protocol::CardDav, operation, true)?;
         let etag = prepare_if_match(etag).expect("validated strong entity tag");
         let request = self

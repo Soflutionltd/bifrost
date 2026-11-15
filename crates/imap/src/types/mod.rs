@@ -14,7 +14,6 @@ pub(crate) mod body;
 mod capability;
 mod command;
 pub(crate) mod envelope;
-mod events;
 pub(crate) mod fetch;
 pub(crate) mod flag;
 mod ids;
@@ -34,7 +33,6 @@ pub(crate) use auth::{AuthMechanism, AuthOutcome, CredentialsKind};
 pub use auth::{AuthPolicy, Credentials};
 pub(crate) use body::BodyStructure;
 pub(crate) use envelope::{Envelope, EnvelopeAddress};
-pub(crate) use events::EventImpact;
 pub(crate) use fetch::format_fetch_attrs;
 pub(crate) use fetch::{AppendMessage, FetchAttr, FetchResponse, StoreOperation, StoreResult};
 pub(crate) use flag::Flag;
@@ -46,10 +44,12 @@ pub(crate) use notify::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetP
 pub(crate) use profile::ServerProfile;
 pub(crate) use response::{
     AclEntry, Capability, CopyResult, EsearchResponse, ExpungeResult, ListRightsResponse,
-    ListStatusEntry, MetadataEntry, MetadataResult, MoveResult, NamespaceResponse, QresyncParams,
+    ListStatusEntry, MetadataResult, MoveResult, NamespaceResponse, QresyncParams,
     QuotaResource, QuotaRootResponse, Response, ResponseCode, SelectOptions, SeqBound, ThreadNode,
-    UidRange, UntaggedResponse, UntaggedStatus,
+    UidRange, UntaggedResponse,
 };
+#[cfg(test)]
+pub(crate) use response::{MetadataEntry, UntaggedStatus};
 pub(crate) use search::SearchCriteria;
 pub(crate) use secret::SecretString;
 pub(crate) use sync::{

@@ -2351,8 +2351,7 @@ mod tests {
         let script = dav_script([Canned::Pending]);
         let mut spec = AccountSpec::new(None);
         spec.request_timeout = Some(DAV_CLIENT_TIMEOUT);
-        spec.connect_timeout = None;
-        spec.response_headers_timeout = None;
+        spec.response_headers_timeout = bifrost_net::ResponseHeadersTimeout::Unbounded;
         spec.follow_redirects = FollowRedirects::Disabled;
         spec.concurrency_limit = Some(bifrost_net::ConcurrencyLimit::new(1));
         let account_net = scripted_net(&script, NetConfig::default())

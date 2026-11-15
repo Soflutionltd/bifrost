@@ -287,7 +287,7 @@ mod tests {
                 items_done: position,
                 items_estimated: None,
             },
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         })
     }
 

@@ -220,7 +220,7 @@ fn flag_system() {
 #[test]
 fn flag_custom() {
     let (_, f) = flag_or_perm(b"$Important rest").unwrap();
-    assert_eq!(f, Flag::Custom("$Important".into()));
+    assert_eq!(f, Flag::from_imap_str("$Important"));
 }
 
 /// `\*` is only valid in `flag-perm` (PERMANENTFLAGS), not `flag`
@@ -333,7 +333,7 @@ fn capability_known() {
 #[test]
 fn capability_auth() {
     let (_, cap) = capability(b"AUTH=PLAIN").unwrap();
-    assert_eq!(cap, Capability::Auth("PLAIN".into()));
+    assert_eq!(cap, Capability::from_imap_str("AUTH=PLAIN"));
 }
 
 /// RFC 3501 Section 9 / RFC 9051 Section 9:
@@ -389,7 +389,7 @@ fn capability_rights_empty_suffix_is_other() {
 #[test]
 fn capability_unknown() {
     let (_, cap) = capability(b"XYZZY").unwrap();
-    assert_eq!(cap, Capability::Other("XYZZY".into()));
+    assert_eq!(cap, Capability::from_imap_str("XYZZY"));
 }
 
 #[test]
@@ -4291,13 +4291,13 @@ fn capability_metadata() {
 #[test]
 fn capability_thread_references() {
     let (_, cap) = capability(b"THREAD=REFERENCES").unwrap();
-    assert_eq!(cap, Capability::Thread("REFERENCES".into()));
+    assert_eq!(cap, Capability::from_imap_str("THREAD=REFERENCES"));
 }
 
 #[test]
 fn capability_thread_orderedsubject() {
     let (_, cap) = capability(b"THREAD=ORDEREDSUBJECT").unwrap();
-    assert_eq!(cap, Capability::Thread("ORDEREDSUBJECT".into()));
+    assert_eq!(cap, Capability::from_imap_str("THREAD=ORDEREDSUBJECT"));
 }
 
 #[test]
@@ -4698,7 +4698,7 @@ fn capability_quota_resource() {
     if let Response::Untagged(boxed) = resp
         && let UntaggedResponse::Capability(caps) = *boxed
     {
-        assert!(caps.contains(&Capability::QuotaResource("STORAGE".into())));
+        assert!(caps.contains(&Capability::from_imap_str("QUOTA=RES-STORAGE")));
         return;
     }
     panic!("expected QUOTA=RES-STORAGE capability");
@@ -9818,7 +9818,7 @@ fn spec_audit_multipart_empty_ext_params() {
 /// RFC 2177 Section 3: the server can send `* n FETCH (FLAGS (...))` during
 /// IDLE when message attributes change.  The parser must produce a
 /// `FetchResponse` with the correct sequence number and flags so the
-/// `IdleEvent::Fetch` variant can carry the full data to callers.
+/// `TypedEvent::FetchUpdate` variant can carry the full data to callers.
 ///
 /// Bug fix: the IDLE handler discarded the the IDLE handler discarded the
 /// `FetchResponse` and returned a unit `FlagsChanged` variant, losing the
@@ -11592,7 +11592,7 @@ fn capability_appendlimit_with_value() {
 #[test]
 fn capability_appendlimit_non_numeric_falls_to_other() {
     let (_, cap) = capability(b"APPENDLIMIT=abc").unwrap();
-    assert_eq!(cap, Capability::Other("APPENDLIMIT=abc".into()));
+    assert_eq!(cap, Capability::from_imap_str("APPENDLIMIT=abc"));
 }
 
 /// RFC 7889 Section 5: only bare `APPENDLIMIT` or `APPENDLIMIT=<number>`
@@ -11602,7 +11602,7 @@ fn capability_appendlimit_non_numeric_falls_to_other() {
 #[test]
 fn capability_appendlimit_prefix_without_separator_falls_to_other() {
     let (_, cap) = capability(b"APPENDLIMITXYZ").unwrap();
-    assert_eq!(cap, Capability::Other("APPENDLIMITXYZ".into()));
+    assert_eq!(cap, Capability::from_imap_str("APPENDLIMITXYZ"));
 }
 
 /// RFC 7889 Section 5 imports RFC 3501's `number` production
@@ -11611,21 +11611,21 @@ fn capability_appendlimit_prefix_without_separator_falls_to_other() {
 #[test]
 fn capability_appendlimit_leading_plus_falls_to_other() {
     let (_, cap) = capability(b"APPENDLIMIT=+123").unwrap();
-    assert_eq!(cap, Capability::Other("APPENDLIMIT=+123".into()));
+    assert_eq!(cap, Capability::from_imap_str("APPENDLIMIT=+123"));
 }
 
 /// Unknown capability string falls through to `Capability::Other`.
 #[test]
 fn capability_other_unknown_string() {
     let (_, cap) = capability(b"X-CUSTOM-CAP").unwrap();
-    assert_eq!(cap, Capability::Other("X-CUSTOM-CAP".into()));
+    assert_eq!(cap, Capability::from_imap_str("X-CUSTOM-CAP"));
 }
 
 /// Unknown capability with mixed case is preserved in `Other`.
 #[test]
 fn capability_other_preserves_original_case() {
     let (_, cap) = capability(b"XMixedCase").unwrap();
-    assert_eq!(cap, Capability::Other("XMixedCase".into()));
+    assert_eq!(cap, Capability::from_imap_str("XMixedCase"));
 }
 
 // ── 5. Greeting without response code bracket (L1033-1034) ──
@@ -13762,8 +13762,8 @@ fn capability_notify_case_insensitive() {
 /// `Capability::Notify` equals `Other("NOTIFY")` for cross-representation.
 #[test]
 fn capability_notify_cross_representation() {
-    assert_eq!(Capability::Notify, Capability::Other("NOTIFY".into()));
-    assert_eq!(Capability::Notify, Capability::Other("notify".into()));
+    assert_eq!(Capability::Notify, Capability::from_imap_str("NOTIFY"));
+    assert_eq!(Capability::Notify, Capability::from_imap_str("notify"));
 }
 
 /// `\NoAccess` mailbox attribute parsed from LIST response

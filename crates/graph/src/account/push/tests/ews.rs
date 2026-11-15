@@ -527,7 +527,7 @@ async fn subscribing_ews_on_a_closed_account_registers_nothing() {
         .expect("not aborted")
         .expect_err("a closed account refuses");
 
-    assert!(matches!(error.kind(), AccountErrorKind::Internal(_)));
+    assert!(matches!(error.kind(), AccountErrorKind::AccountClosed));
     assert_eq!(client.wire_attempts(), 0);
     assert_eq!(registration_count(&account), Some(0));
 }

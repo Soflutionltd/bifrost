@@ -641,7 +641,7 @@ impl CalDavClient {
         etag: &str,
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
-        let etag = bifrost_types::ServerVersion::ETag(etag.to_string());
+        let etag = bifrost_types::ServerVersion::ETag(etag.into());
         let etag = etag.expected_etag(bifrost_types::error::Protocol::CalDav, operation, true)?;
         let etag = prepare_if_match(etag).expect("validated strong entity tag");
         let request = self

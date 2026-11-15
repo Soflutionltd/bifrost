@@ -79,7 +79,7 @@ async fn a_cancelled_partition_walk_fails_rather_than_reporting_completion() {
             InventoryPartition::Full,
             &live,
             None,
-            1,
+            bifrost_types::TraitEnvelopeVersion::new(1),
             Some(&control),
             None,
             None,

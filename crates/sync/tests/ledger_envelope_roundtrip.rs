@@ -125,11 +125,13 @@ fn checkpoint() -> Checkpoint {
         scope: scope(),
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::Graph,
-            envelope_version: 3,
+            envelope_version: bifrost_types::PayloadVersion::new(3),
             bytes: b"delta-token".to_vec(),
         },
         advanced_through: None,
-        envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+            bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        ),
     })
 }
 

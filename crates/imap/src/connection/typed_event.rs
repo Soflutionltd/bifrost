@@ -19,7 +19,7 @@ use crate::types::validated::MailboxName;
 /// driver task converts raw [`UntaggedResponse`]s into `TypedEvent`s
 /// and publishes them via
 /// [`DriverEventSink`](super::driver::event_sink::DriverEventSink).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypedEvent {
     /// RFC 3501 Section7.1 \[ALERT\]  -  informational and high priority;
     /// loss under backpressure is reported by `QueueOverflow`.
@@ -59,10 +59,6 @@ pub enum TypedEvent {
         /// STATUS items delivered by the server.
         items: Vec<StatusItem>,
     },
-    /// RFC 5465 Section5 `MailboxMetadataChange`.
-    MetadataChange {},
-    /// RFC 5465 Section5 `ServerMetadataChange`.
-    ServerMetadataChange {},
     /// RFC 3501 Section7.2.1 CAPABILITY change.
     CapabilityChange(Vec<Capability>),
     /// Extension or future event.
@@ -132,26 +128,59 @@ impl From<UntaggedResponse> for TypedEvent {
     }
 }
 
+struct EventClass {
+    priority: Priority,
+    ends_idle_wait: bool,
+}
+
 impl TypedEvent {
-    /// Returns the back-pressure priority for this event.
-    pub(in crate::connection) fn priority(&self) -> Priority {
+    /// One protocol classification for queue admission and IDLE wakeups.
+    /// Sync policy deliberately belongs to the account, not this table.
+    fn class(&self) -> EventClass {
         match self {
             Self::Alert(_)
             | Self::Bye { .. }
             | Self::NotificationOverflow { .. }
-            | Self::QueueOverflow { .. } => Priority::Critical,
-            Self::CapabilityChange(_) => Priority::Requeryable,
+            | Self::QueueOverflow { .. } => EventClass {
+                priority: Priority::Critical,
+                ends_idle_wait: true,
+            },
+            Self::CapabilityChange(_) => EventClass {
+                priority: Priority::Requeryable,
+                ends_idle_wait: false,
+            },
             Self::Exists(_)
             | Self::Recent(_)
             | Self::Expunge(_)
             | Self::Vanished { .. }
             | Self::FetchUpdate(_)
             | Self::MailboxEvent(_)
-            | Self::MailboxStatus { .. }
-            | Self::MetadataChange { .. }
-            | Self::ServerMetadataChange { .. }
-            | Self::Extension(_) => Priority::Resyncable,
+            | Self::MailboxStatus { .. } => EventClass {
+                priority: Priority::Resyncable,
+                ends_idle_wait: true,
+            },
+            Self::Extension(response) => EventClass {
+                priority: Priority::Resyncable,
+                // The driver already applied bookkeeping. Plain OK is only
+                // a keepalive; all other extension payloads reach the account.
+                ends_idle_wait: !matches!(
+                    response.as_ref(),
+                    UntaggedResponse::Status {
+                        status: crate::types::response::UntaggedStatus::Ok,
+                        code: None,
+                        ..
+                    }
+                ),
+            },
         }
+    }
+
+    pub(super) fn ends_idle_wait(&self) -> bool {
+        self.class().ends_idle_wait
+    }
+
+    pub(in crate::connection) fn priority(&self) -> Priority {
+        self.class().priority
     }
 }
 

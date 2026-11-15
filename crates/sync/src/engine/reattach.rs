@@ -2482,9 +2482,71 @@ fn reattach_scope_step(result: &Result<EstablishOrigin, Error>) -> ReattachScope
     }
 }
 
-/// Re-establish a single scope. Mirrors `SyncEngine::establish_one` but lives
-/// at file scope so the reopen listener task can call it without owning a
-/// reference to the engine.
+/// The shared establishment decision. Callers retain ownership of persistence,
+/// fencing and inventory delivery: attach must wait for subscribers, while a
+/// running repair already has a delivery gate and may finish inventory inline.
+pub(super) enum Establishment {
+    Ready(ChangeCursor),
+    Resume {
+        cursor: ChangeCursor,
+        classified_as_inventory: bool,
+        stream: Option<AccountStream<bifrost_types::InventoryEvent>>,
+    },
+    Inventory,
+}
+
+pub(super) async fn establishment(
+    account: &dyn Account,
+    scope: &CursorScope,
+    stored: Option<ChangeCursor>,
+) -> Result<Establishment, Error> {
+    use crate::recovery::{CursorOrigin, classify_envelope};
+    use bifrost_types::AccountOperation;
+    if let Some(cursor) = stored {
+        classify_envelope(
+            &cursor,
+            CursorOrigin::Stored,
+            AccountOperation::EstablishCursor,
+            scope,
+        )
+        .map_err(Error::Account)?;
+        // Either positive answer stays out of changes_stream. Fusion owns the
+        // disagreement check; a malformed inventory contract must not skip mail.
+        let classified_as_inventory = account.is_inventory_cursor(&cursor);
+        let stream = account.inventory_resume_stream(cursor.clone());
+        return if classified_as_inventory || stream.is_some() {
+            Ok(Establishment::Resume {
+                cursor,
+                classified_as_inventory,
+                stream,
+            })
+        } else {
+            Ok(Establishment::Ready(cursor))
+        };
+    }
+    match account
+        .establish_initial_cursor(scope.clone())
+        .await
+        .map_err(Error::Account)?
+    {
+        CursorEstablishment::Ready(cursor) => {
+            classify_envelope(
+                &cursor,
+                CursorOrigin::Fresh,
+                AccountOperation::EstablishCursor,
+                scope,
+            )
+            .map_err(Error::Account)?;
+            Ok(Establishment::Ready(cursor))
+        }
+        CursorEstablishment::EstablishViaInventory => Ok(Establishment::Inventory),
+        _ => Err(Error::EstablishCursorFailed(
+            "unknown CursorEstablishment variant".into(),
+        )),
+    }
+}
+
+/// Re-establish a single scope using the shared establishment decision.
 ///
 /// `walk_fence` is the scope fence the CALLER's ownership of this
 /// establishment began under; this function never reads `scope_fence` itself.
@@ -2527,130 +2589,82 @@ async fn run_establish(
         // provisional row through the writer. An ordinary read (the live
         // scope's recovery) is shown a still-provisional row as absent and
         // establishes fresh; its PersistEstablished then owns the row.
-        match writer
+        let stored = match writer
             .get_change_cursor(scope.clone(), reattach_attempt)
             .await
         {
-            Ok(Some(existing)) if existing.validate_envelope().is_ok() => {
-                // A stored cursor may be a mid-inventory page position rather
-                // than a live changes cursor. Putting one into the registry
-                // would hand it straight to `changes_stream`, which has no
-                // delta link to walk. Finish the inventory instead - the same
-                // decision `establish_initial_cursor` makes at open.
-                let classified_as_inventory = account.is_inventory_cursor(&existing);
-                let resume_stream = account.inventory_resume_stream(existing.clone());
-                if classified_as_inventory || resume_stream.is_some() {
-                    pacing.wait(ctx, Some(account), Some(&scope)).await?;
-                    let fusion = crate::multiplexer::InventoryFusion {
-                        expected_fence: walk_fence,
-                        account_id: account_id.clone(),
-                        cursors: Arc::clone(&cursors),
-                        control: control.cloned(),
-                        coverage: Some(Arc::clone(&coverage)),
-                        writer_tx: Some(writer.sender()),
-                        generation: coverage.next_generation(),
-                        shutdown: Some(shutdown.clone()),
-                    };
-                    return match fusion
-                        .run_resume_stream_with_broadcast(
-                            scope.clone(),
-                            classified_as_inventory,
-                            resume_stream,
-                            Some(delivery),
-                        )
-                        .await?
-                    {
-                        crate::multiplexer::FusionOutcome::Established
-                        | crate::multiplexer::FusionOutcome::NoCursor => {
-                            Ok(EstablishOrigin::ResumedStored)
-                        }
-                        crate::multiplexer::FusionOutcome::Invalidated => Err(Error::Superseded),
-                        crate::multiplexer::FusionOutcome::Terminated(error) => {
-                            Err(Error::EstablishCursorTerminated(error))
-                        }
-                    };
-                }
-                if !cursors.put_if(existing, || coverage.scope_fence(&scope) == walk_fence) {
-                    return Err(Error::Superseded);
-                }
-                return Ok(EstablishOrigin::ResumedStored);
-            }
-            Ok(None) => {}
-            // Unlike attach, which clears the whole account when it meets an
-            // unreadable row before anything runs, this path runs while an installed
-            // account may still be acknowledging checkpoints. Its callers do
-            // not route this result back through `handle_account_error` or its
-            // schema-clear arm: scoped re-establishment reports it at its own
-            // exhaustion tail, replacement attach rejects the candidate, and
-            // automatic account restart retries the replacement. Do not reset
-            // this row here. A replacement may abort, leaving the old account
-            // live.
-            // ResetScope would mutate that account's preexisting cursor and
-            // backfill state, and reattach rollback has no safe restore path
-            // for those rows because consumer acknowledgements can persist
-            // newer state. Rollback only deletes rows created by this attempt,
-            // so return the typed error and preserve the row. Its
-            // `Engine(SchemaIncompatible)` classification alone does not
-            // invoke the account-wide schema-clear loop.
-            Ok(Some(_)) | Err(Error::SchemaIncompatible) => {
+            Ok(stored) => stored,
+            // A replacement can still abort. Never clear an unreadable stored
+            // row here: consumer acknowledgements may have advanced the live
+            // account, and provisional-row rollback cannot restore that state.
+            Err(Error::SchemaIncompatible) => {
                 return Err(Error::Account(crate::recovery::cursor_decode_failure(
                     bifrost_types::AccountOperation::EstablishCursor,
                 )));
             }
             Err(other) => return Err(other),
-        }
+        };
+        let origin = if stored.is_some() {
+            EstablishOrigin::ResumedStored
+        } else {
+            EstablishOrigin::CreatedFresh
+        };
         // The writer may have parked while another lane recorded a hold.
         pacing.wait(ctx, Some(account), Some(&scope)).await?;
-        match account
-            .establish_initial_cursor(scope.clone())
-            .await
-            .map_err(Error::Account)?
-        {
-            CursorEstablishment::Ready(cursor) => {
-                cursor.validate_envelope().map_err(|_| {
-                    Error::Account(crate::recovery::cursor_decode_failure(
-                        bifrost_types::AccountOperation::EstablishCursor,
-                    ))
-                })?;
-                if persist_ready {
-                    // No coverage report: preserve the ledger rather than
-                    // asserting completeness a cursor establishment never proved.
+        let decision = establishment(account, &scope, stored).await?;
+        let (classified_as_inventory, resume_stream) = match decision {
+            Establishment::Ready(cursor) => {
+                if persist_ready && origin == EstablishOrigin::CreatedFresh {
+                    // Establishment proves no coverage; preserve the ledger.
                     writer.persist_established(cursor.clone()).await?;
                 }
                 if !cursors.put_if(cursor, || coverage.scope_fence(&scope) == walk_fence) {
                     return Err(Error::Superseded);
                 }
-                Ok(EstablishOrigin::CreatedFresh)
+                return Ok(origin);
             }
-            CursorEstablishment::EstablishViaInventory => {
-                pacing.wait(ctx, Some(account), Some(&scope)).await?;
-                let fusion = crate::multiplexer::InventoryFusion {
-                    expected_fence: walk_fence,
-                    account_id: account_id.clone(),
-                    cursors: Arc::clone(&cursors),
-                    control: control.cloned(),
-                    coverage: Some(Arc::clone(&coverage)),
-                    writer_tx: Some(writer.sender()),
-                    generation: coverage.next_generation(),
-                    shutdown: Some(shutdown.clone()),
-                };
-                match fusion
+            Establishment::Resume {
+                classified_as_inventory,
+                stream,
+                ..
+            } => (Some(classified_as_inventory), stream),
+            Establishment::Inventory => (None, None),
+        };
+        pacing.wait(ctx, Some(account), Some(&scope)).await?;
+        let fusion = crate::multiplexer::InventoryFusion {
+            expected_fence: walk_fence,
+            account_id: account_id.clone(),
+            cursors: Arc::clone(&cursors),
+            control: control.cloned(),
+            coverage: Some(Arc::clone(&coverage)),
+            writer_tx: Some(writer.sender()),
+            generation: coverage.next_generation(),
+            shutdown: Some(shutdown.clone()),
+        };
+        let outcome = match classified_as_inventory {
+            Some(classified) => {
+                fusion
+                    .run_resume_stream_with_broadcast(
+                        scope.clone(),
+                        classified,
+                        resume_stream,
+                        Some(delivery),
+                    )
+                    .await?
+            }
+            None => {
+                fusion
                     .run_with_broadcast(account, scope, Some(delivery))
                     .await?
-                {
-                    crate::multiplexer::FusionOutcome::Established
-                    | crate::multiplexer::FusionOutcome::NoCursor => {
-                        Ok(EstablishOrigin::CreatedFresh)
-                    }
-                    crate::multiplexer::FusionOutcome::Invalidated => Err(Error::Superseded),
-                    crate::multiplexer::FusionOutcome::Terminated(error) => {
-                        Err(Error::EstablishCursorTerminated(error))
-                    }
-                }
             }
-            _ => Err(Error::EstablishCursorFailed(
-                "unknown CursorEstablishment variant".into(),
-            )),
+        };
+        match outcome {
+            crate::multiplexer::FusionOutcome::Established
+            | crate::multiplexer::FusionOutcome::NoCursor => Ok(origin),
+            crate::multiplexer::FusionOutcome::Invalidated => Err(Error::Superseded),
+            crate::multiplexer::FusionOutcome::Terminated(error) => {
+                Err(Error::EstablishCursorTerminated(error))
+            }
         }
     }
     .await;

@@ -807,7 +807,7 @@ fn event_from_google(
         calendar_id: CalendarId(calendar_id.clone()),
         native_id: native.clone(),
         uid: event.i_cal_uid,
-        etag: event.etag,
+        etag: event.etag.map(Into::into),
         provenance: CalendarProvenance {
             provider: ProtocolKind::Gmail,
             native,

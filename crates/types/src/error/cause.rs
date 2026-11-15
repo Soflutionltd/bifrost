@@ -446,6 +446,8 @@ impl StdError for ServerCause {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum StateCause {
+    /// Local refusal on an already closed account incarnation.
+    AccountClosed,
     /// The account stopped or its control channels closed during a boundary wait.
     ControlWaitEnded {
         detail: DiagnosticText,
@@ -477,7 +479,8 @@ impl StateCause {
         match self {
             Self::ControlWaitEnded { detail } => Some(detail.as_str()),
             Self::OperatorOverrideNeeded { reason } => Some(reason.as_str()),
-            Self::CursorInvalid
+            Self::AccountClosed
+            | Self::CursorInvalid
             | Self::StrategyFailure { .. }
             | Self::ScopeCapabilityLost
             | Self::SchemaIncompatible

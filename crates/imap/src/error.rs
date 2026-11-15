@@ -76,7 +76,9 @@ pub(crate) enum Error {
     Auth {
         text: String,
         code: Option<ResponseCode>,
-        mechanism: Option<&'static str>,
+        mechanism: Option<AuthMechanism>,
+        /// SCRAM refusal recovery comes from bifrost-sasl, not an IMAP code.
+        scram: Option<bifrost_sasl::ScramServerError>,
         attempt: Option<ImapAttempt>,
     },
 
@@ -355,15 +357,17 @@ impl PartialEq for Error {
                     text: t1,
                     code: c1,
                     mechanism: m1,
+                    scram: s1,
                     attempt: a1,
                 },
                 Self::Auth {
                     text: t2,
                     code: c2,
                     mechanism: m2,
+                    scram: s2,
                     attempt: a2,
                 },
-            ) => t1 == t2 && c1 == c2 && m1 == m2 && a1 == a2,
+            ) => t1 == t2 && c1 == c2 && m1 == m2 && s1 == s2 && a1 == a2,
             (
                 Self::No {
                     text: t1,
@@ -610,11 +614,13 @@ impl Error {
                 text,
                 code,
                 mechanism,
+                scram,
                 ..
             } => Self::Auth {
                 text,
                 code,
                 mechanism,
+                scram,
                 attempt,
             },
             Self::Io { source, .. } => Self::Io { source, attempt },
@@ -696,6 +702,7 @@ impl Error {
             text,
             code,
             mechanism: None,
+            scram: None,
             attempt: None,
         }
     }
@@ -709,12 +716,13 @@ impl Error {
     pub(crate) fn auth_with_mechanism(
         text: String,
         code: Option<ResponseCode>,
-        mechanism: &'static str,
+        mechanism: AuthMechanism,
     ) -> Self {
         Self::Auth {
             text,
             code,
             mechanism: Some(mechanism),
+            scram: None,
             attempt: None,
         }
     }

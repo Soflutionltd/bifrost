@@ -199,7 +199,7 @@ pub struct CalendarEvent {
     pub calendar_id: CalendarId,
     pub native_id: String,
     pub uid: Option<String>,
-    pub etag: Option<String>,
+    pub etag: Option<crate::EntityTag>,
     pub provenance: CalendarProvenance,
     pub title: Option<String>,
     pub description: Option<String>,

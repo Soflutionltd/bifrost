@@ -55,7 +55,7 @@ fn opts(literal_mode: LiteralMode, utf8_mode: bool) -> EncodeOptions {
             Capability::LiteralPlus,
             Capability::LiteralMinus,
             Capability::Sort,
-            Capability::Thread("REFERENCES".into()),
+            Capability::from_imap_str("THREAD=REFERENCES"),
         ],
         enabled: Vec::new(),
     }
@@ -2138,7 +2138,8 @@ fn encode_append_bodies_are_carried_by_reference() {
     }
 }
 
-/// A mailbox that cannot be a quoted string (here, one carrying CRLF) becomes a
+/// A mailbox that cannot be a quoted string (here, one carrying TAB; CR, LF and
+/// NUL are refused outright by mailbox validation) becomes a
 /// literal of its own. Under synchronizing literals that is a boundary in the
 /// middle of the header, so the message body is the THIRD segment.
 ///
@@ -2150,7 +2151,7 @@ fn encode_append_splits_at_a_synchronizing_mailbox_literal() {
     let msgs = [append_msg(&[], None, 6)];
     let cmd = append_command(
         "A001",
-        "a\r\nb",
+        "a\tb",
         &msgs,
         false,
         &append_opts(LiteralMode::Synchronizing, true),
@@ -2159,15 +2160,15 @@ fn encode_append_splits_at_a_synchronizing_mailbox_literal() {
     assert_eq!(
         append_segments(&cmd, &msgs),
         vec![
-            "A001 APPEND {4}\r\n".to_owned(),
-            "a\r\nb UTF8 (~{6}\r\n".to_owned(),
+            "A001 APPEND {3}\r\n".to_owned(),
+            "a\tb UTF8 (~{6}\r\n".to_owned(),
             "<6>)\r\n".to_owned(),
         ]
     );
 
     let cmd = append_command(
         "A001",
-        "a\r\nb",
+        "a\tb",
         &msgs,
         false,
         &append_opts(LiteralMode::Synchronizing, false),
@@ -2176,10 +2177,10 @@ fn encode_append_splits_at_a_synchronizing_mailbox_literal() {
     assert_eq!(
         append_segments(&cmd, &msgs),
         vec![
-            "A001 APPEND \"a&AA0ACg-b\" {6}\r\n".to_owned(),
+            "A001 APPEND \"a&AAk-b\" {6}\r\n".to_owned(),
             "<6>\r\n".to_owned(),
         ],
-        "modified UTF-7 turns CRLF into ASCII, so the mailbox stays quoted"
+        "modified UTF-7 turns TAB into ASCII, so the mailbox stays quoted"
     );
 }
 
@@ -3497,7 +3498,7 @@ fn regression_custom_flag_with_spaces_rejected() {
     let cmd = Command::Store {
         sequence_set: SequenceSet::new("1").unwrap(),
         operation: crate::types::StoreOperation::Add,
-        flags: vec![crate::types::Flag::Custom("has space".into())],
+        flags: vec![crate::types::Flag::from_imap_str("has space")],
         unchanged_since: None,
     };
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
@@ -3514,7 +3515,7 @@ fn regression_custom_flag_with_parens_rejected() {
     let cmd = Command::Store {
         sequence_set: SequenceSet::new("1").unwrap(),
         operation: crate::types::StoreOperation::Add,
-        flags: vec![crate::types::Flag::Custom("bad(flag".into())],
+        flags: vec![crate::types::Flag::from_imap_str("bad(flag")],
         unchanged_since: None,
     };
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
@@ -3531,7 +3532,7 @@ fn regression_empty_custom_flag_rejected() {
     let cmd = Command::Store {
         sequence_set: SequenceSet::new("1").unwrap(),
         operation: crate::types::StoreOperation::Add,
-        flags: vec![crate::types::Flag::Custom(String::new())],
+        flags: vec![crate::types::Flag::from_imap_str("")],
         unchanged_since: None,
     };
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
@@ -3549,9 +3550,9 @@ fn regression_valid_custom_flags_accepted() {
         sequence_set: SequenceSet::new("1").unwrap(),
         operation: crate::types::StoreOperation::Add,
         flags: vec![
-            crate::types::Flag::Custom("$Important".into()),
-            crate::types::Flag::Custom("$Junk".into()),
-            crate::types::Flag::Custom("NonJunk".into()),
+            crate::types::Flag::from_imap_str("$Important"),
+            crate::types::Flag::from_imap_str("$Junk"),
+            crate::types::Flag::from_imap_str("NonJunk"),
         ],
         unchanged_since: None,
     };
@@ -3828,7 +3829,7 @@ fn store_accepts_valid_custom_flag() {
         operation: crate::types::StoreOperation::Add,
         flags: vec![
             crate::types::Flag::Seen,
-            crate::types::Flag::Custom("$Important".into()),
+            crate::types::Flag::from_imap_str("$Important"),
         ],
         unchanged_since: None,
     };
@@ -3844,7 +3845,7 @@ fn store_rejects_invalid_custom_flag() {
     let cmd = Command::Store {
         sequence_set: SequenceSet::new("1").unwrap(),
         operation: crate::types::StoreOperation::Add,
-        flags: vec![crate::types::Flag::Custom("bad flag".into())],
+        flags: vec![crate::types::Flag::from_imap_str("bad flag")],
         unchanged_since: None,
     };
     assert!(
@@ -3980,7 +3981,7 @@ fn append_filters_recent_and_wildcard_flags() {
 #[test]
 fn append_accepts_valid_custom_flag() {
     let msgs = [append_msg(
-        &[crate::types::Flag::Custom("$MailFlagBit0".into())],
+        &[crate::types::Flag::from_imap_str("$MailFlagBit0")],
         None,
         10,
     )];
@@ -4000,7 +4001,7 @@ fn append_accepts_valid_custom_flag() {
 #[test]
 fn append_rejects_invalid_custom_flag() {
     let msgs = [append_msg(
-        &[crate::types::Flag::Custom("bad{flag}".into())],
+        &[crate::types::Flag::from_imap_str("bad{flag}")],
         None,
         10,
     )];

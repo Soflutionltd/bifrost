@@ -20,19 +20,134 @@ pub enum SaslError {
     /// to a provider fault, and never as a reason to retire the connection.
     #[error("SASL credential rejected: {0}")]
     InvalidCredential(String),
-    /// The server reported an error in its SCRAM server-final message
-    /// (the `e=` field). A server-signature mismatch is a `Protocol` error.
-    #[error("SCRAM authentication failed: {0}")]
-    AuthFailed(String),
+    /// The server's typed SCRAM server-final `e=` refusal.
+    #[error("SCRAM server error: {0}")]
+    ServerRejected(ScramServerError),
+    /// A local cryptographic facility failed, independently of peer input.
+    #[error("SASL local runtime failure: {0}")]
+    LocalRuntime(String),
+}
+
+/// Recovery intent for a SCRAM refusal. Only Credential asks for a new password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RefusalClass {
+    Credential,
+    Protocol,
+    Policy,
+    Unavailable,
+}
+
+/// RFC 5802 server-error vocabulary, preserving extension tokens losslessly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScramServerError {
+    InvalidEncoding,
+    ExtensionsNotSupported,
+    InvalidProof,
+    ChannelBindingsDontMatch,
+    ServerDoesSupportChannelBinding,
+    ChannelBindingNotSupported,
+    UnsupportedChannelBindingType,
+    UnknownUser,
+    InvalidUsernameEncoding,
+    NoResources,
+    OtherError,
+    Other(String),
+}
+
+impl ScramServerError {
+    pub fn from_token(token: &str) -> Self {
+        match token {
+            "invalid-encoding" => Self::InvalidEncoding,
+            "extensions-not-supported" => Self::ExtensionsNotSupported,
+            "invalid-proof" => Self::InvalidProof,
+            "channel-bindings-dont-match" => Self::ChannelBindingsDontMatch,
+            "server-does-support-channel-binding" => Self::ServerDoesSupportChannelBinding,
+            "channel-binding-not-supported" => Self::ChannelBindingNotSupported,
+            "unsupported-channel-binding-type" => Self::UnsupportedChannelBindingType,
+            "unknown-user" => Self::UnknownUser,
+            "invalid-username-encoding" => Self::InvalidUsernameEncoding,
+            "no-resources" => Self::NoResources,
+            "other-error" => Self::OtherError,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+
+    pub fn token(&self) -> &str {
+        match self {
+            Self::InvalidEncoding => "invalid-encoding",
+            Self::ExtensionsNotSupported => "extensions-not-supported",
+            Self::InvalidProof => "invalid-proof",
+            Self::ChannelBindingsDontMatch => "channel-bindings-dont-match",
+            Self::ServerDoesSupportChannelBinding => "server-does-support-channel-binding",
+            Self::ChannelBindingNotSupported => "channel-binding-not-supported",
+            Self::UnsupportedChannelBindingType => "unsupported-channel-binding-type",
+            Self::UnknownUser => "unknown-user",
+            Self::InvalidUsernameEncoding => "invalid-username-encoding",
+            Self::NoResources => "no-resources",
+            Self::OtherError => "other-error",
+            Self::Other(token) => token,
+        }
+    }
+
+    /// Enterprise users should repair credentials only on evidence they are
+    /// wrong. A server outage or an unknown extension is not that evidence.
+    /// Binding failures require policy repair, never a weaker mechanism retry.
+    pub fn refusal_class(&self) -> RefusalClass {
+        match self {
+            Self::InvalidProof | Self::UnknownUser => RefusalClass::Credential,
+            Self::InvalidEncoding | Self::InvalidUsernameEncoding => RefusalClass::Protocol,
+            Self::ExtensionsNotSupported
+            | Self::ChannelBindingsDontMatch
+            | Self::ServerDoesSupportChannelBinding
+            | Self::ChannelBindingNotSupported
+            | Self::UnsupportedChannelBindingType => RefusalClass::Policy,
+            Self::NoResources | Self::OtherError | Self::Other(_) => RefusalClass::Unavailable,
+        }
+    }
+}
+
+impl std::fmt::Display for ScramServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.token())
+    }
 }
 
 impl SaslError {
-    /// Return the SCRAM server-final `e=` token, when this error carries one.
-    /// Protocol consumers can classify it without parsing display text.
-    pub fn scram_server_error(&self) -> Option<&str> {
+    /// Return the typed server refusal without parsing display text.
+    pub fn scram_server_error(&self) -> Option<&ScramServerError> {
         match self {
-            Self::AuthFailed(message) => message.strip_prefix("SCRAM server error: "),
+            Self::ServerRejected(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RefusalClass, ScramServerError};
+
+    #[test]
+    fn server_refusal_table_preserves_tokens_and_password_repair_intent() {
+        use RefusalClass::{Credential, Policy, Protocol, Unavailable};
+        for (token, expected) in [
+            ("invalid-encoding", Protocol),
+            ("extensions-not-supported", Policy),
+            ("invalid-proof", Credential),
+            ("channel-bindings-dont-match", Policy),
+            ("server-does-support-channel-binding", Policy),
+            ("channel-binding-not-supported", Policy),
+            ("unsupported-channel-binding-type", Policy),
+            ("unknown-user", Credential),
+            ("invalid-username-encoding", Protocol),
+            ("no-resources", Unavailable),
+            ("other-error", Unavailable),
+            ("future-extension", Unavailable),
+        ] {
+            let refusal = ScramServerError::from_token(token);
+            assert_eq!(refusal.token(), token);
+            assert_eq!(refusal.refusal_class(), expected, "{token}");
         }
     }
 }

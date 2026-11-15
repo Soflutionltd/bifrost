@@ -462,13 +462,7 @@ fn append_batch_failure(
     error: crate::error::GraphError,
     outcomes: &mut Vec<ItemOutcome<MutationSuccess>>,
 ) {
-    let unreadable_success = matches!(&error, crate::error::GraphError::Json { .. });
     let error = into_account_error(error, GraphErrorContext::graph(operation_for_kind(kind)));
-    let uncertain = unreadable_success
-        || error.chain().iter().any(|cause| {
-            matches!(cause, bifrost_types::Cause::Attempt(attempt)
-                if attempt.transmission_state == bifrost_types::TransmissionState::InFlight)
-        });
     for id in ids {
         let scoped = error
             .clone()
@@ -479,11 +473,7 @@ fn append_batch_failure(
             .try_build()
             .expect("valid account error classification");
         let item = BatchItemId(id.0.clone());
-        outcomes.push(if uncertain {
-            ItemOutcome::Uncertain(BatchUncertain::new(item, scoped))
-        } else {
-            ItemOutcome::Failed(BatchFailure::new(item, scoped))
-        });
+        outcomes.push(ItemOutcome::from_submission_error(item, scoped));
     }
 }
 

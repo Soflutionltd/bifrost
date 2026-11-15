@@ -135,7 +135,7 @@ impl JmapScopeRepr {
 pub(crate) fn encode(state: &JmapCursorState) -> OpaqueChangeState {
     OpaqueChangeState {
         protocol: ProtocolKind::Jmap,
-        envelope_version: PAYLOAD_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::PayloadVersion::new(PAYLOAD_ENVELOPE_VERSION),
         bytes: encode_state(state),
     }
 }
@@ -151,22 +151,22 @@ pub(crate) fn encode_for_scope(
 }
 
 pub(crate) fn decode(raw: &OpaqueChangeState) -> Result<JmapCursorState, JmapCursorError> {
-    if raw.protocol != ProtocolKind::Jmap {
-        return Err(JmapCursorError::CursorProtocolMismatch);
-    }
-    // A FUTURE envelope is unknown - this build cannot read it and cannot
-    // reason about what it means. An OLDER envelope is understood exactly
-    // well enough to know it must not be resumed: its foreign thread ids
-    // were minted bare (see `PAYLOAD_ENVELOPE_VERSION`), so it is reported as
-    // `SchemaIncompatible` and the engine reseeds through inventory.
-    if raw.envelope_version > PAYLOAD_ENVELOPE_VERSION {
-        return Err(JmapCursorError::CursorEnvelopeUnknown);
-    }
-    if raw.envelope_version < PAYLOAD_ENVELOPE_VERSION {
-        return Err(JmapCursorError::SchemaIncompatible);
-    }
+    let bytes = raw
+        .open(
+            ProtocolKind::Jmap,
+            bifrost_types::PayloadVersion::new(PAYLOAD_ENVELOPE_VERSION),
+        )
+        .map_err(|fault| match fault {
+            bifrost_types::CursorDecodeFault::ProtocolMismatch => {
+                JmapCursorError::CursorProtocolMismatch
+            }
+            bifrost_types::CursorDecodeFault::FutureVersion => {
+                JmapCursorError::CursorEnvelopeUnknown
+            }
+            _ => JmapCursorError::SchemaIncompatible,
+        })?;
 
-    decode_state(&raw.bytes)
+    decode_state(bytes)
 }
 
 fn encode_state(state: &JmapCursorState) -> Vec<u8> {
@@ -291,7 +291,7 @@ pub(crate) fn cursor_for_scope(
         scope,
         server_state,
         advanced_through: None,
-        envelope_version: OUTER_CURSOR_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(OUTER_CURSOR_ENVELOPE_VERSION),
     })
 }
 
@@ -326,7 +326,7 @@ mod tests {
 
         let encoded = encode(&state);
         assert_eq!(encoded.protocol, ProtocolKind::Jmap);
-        assert_eq!(encoded.envelope_version, PAYLOAD_ENVELOPE_VERSION);
+        assert_eq!(encoded.envelope_version.get(), PAYLOAD_ENVELOPE_VERSION);
         assert_eq!(decode(&encoded).unwrap(), state);
     }
 
@@ -334,7 +334,7 @@ mod tests {
     fn rejects_other_protocol_cursor() {
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Gmail,
-            envelope_version: PAYLOAD_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(PAYLOAD_ENVELOPE_VERSION),
             bytes: Vec::new(),
         };
 
@@ -350,7 +350,7 @@ mod tests {
             scope: JmapScopeRepr::Mailbox,
             state_string: "s456".to_string(),
         });
-        raw.envelope_version = PAYLOAD_ENVELOPE_VERSION + 1;
+        raw.envelope_version = bifrost_types::PayloadVersion::new(PAYLOAD_ENVELOPE_VERSION + 1);
 
         assert!(matches!(
             decode(&raw),
@@ -373,7 +373,7 @@ mod tests {
             },
             state_string: "s-old".to_string(),
         });
-        raw.envelope_version = 1;
+        raw.envelope_version = bifrost_types::PayloadVersion::new(1);
 
         assert!(matches!(
             decode(&raw),
@@ -445,7 +445,7 @@ mod tests {
     fn rejects_unknown_state_tag() {
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: PAYLOAD_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(PAYLOAD_ENVELOPE_VERSION),
             bytes: vec![0xff],
         };
         assert!(matches!(
@@ -458,7 +458,7 @@ mod tests {
     fn rejects_unknown_scope_tag() {
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: PAYLOAD_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(PAYLOAD_ENVELOPE_VERSION),
             bytes: vec![STATE_TAG_V1, 0xff, 0, 0, 0, 0],
         };
         assert!(matches!(
@@ -477,7 +477,7 @@ mod tests {
         bytes.pop();
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: PAYLOAD_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(PAYLOAD_ENVELOPE_VERSION),
             bytes,
         };
         assert!(matches!(
@@ -496,7 +496,7 @@ mod tests {
         bytes.push(0);
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: PAYLOAD_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(PAYLOAD_ENVELOPE_VERSION),
             bytes,
         };
         assert!(matches!(
@@ -518,7 +518,9 @@ mod tests {
             scope: CursorScope::Type(ObjectType::Mailbox),
             server_state: email.server_state,
             advanced_through: None,
-            envelope_version: OUTER_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                OUTER_CURSOR_ENVELOPE_VERSION,
+            ),
         };
         assert!(matches!(
             decode_cursor(&crossed),
@@ -539,7 +541,9 @@ mod tests {
             scope: CursorScope::Folder(super::super::foreign::encode_foreign("acct-9", "mbx-2")),
             server_state: seeded.server_state,
             advanced_through: None,
-            envelope_version: OUTER_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                OUTER_CURSOR_ENVELOPE_VERSION,
+            ),
         };
         assert!(matches!(
             decode_cursor(&crossed),
@@ -564,7 +568,7 @@ mod tests {
     fn rejects_non_utf8_string() {
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: PAYLOAD_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(PAYLOAD_ENVELOPE_VERSION),
             bytes: vec![STATE_TAG_V1, SCOPE_TAG_EMAIL, 1, 0, 0, 0, 0xff],
         };
         assert!(matches!(

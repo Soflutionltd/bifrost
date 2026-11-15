@@ -274,7 +274,7 @@ pub(crate) fn update(
         // tokens such as caller-old. Empty tokens remain Unsupported here.
         let expected = match patch.expected_version.as_ref() {
             Some(bifrost_types::ServerVersion::ETag(etag)) if !etag.is_empty() => {
-                Some(etag.clone())
+                Some(etag.as_str().to_owned())
             }
             None => None,
             Some(_) => {
@@ -855,7 +855,7 @@ fn person_in_group(person: &Person, group: Option<&str>) -> bool {
 }
 
 fn contact_from_person(person: Person, corpus: ContactCorpus) -> ContactCard {
-    let etag = contact_source_etag(&person).map(str::to_owned);
+    let etag = contact_source_etag(&person).map(Into::into);
     let native = person.resource_name.unwrap_or_default();
     let book_id = book_id_for_corpus(corpus);
     let display_name = person

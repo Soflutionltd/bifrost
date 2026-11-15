@@ -919,7 +919,7 @@ impl AsyncSmtpConnection {
         // running, derived from the same `Mechanism` that frames the AUTH
         // command, so the reported name and the wire token cannot disagree.
         let phase = SmtpCommandPhase::Auth {
-            mechanism: Some(mechanism.name()),
+            mechanism: Some(mechanism),
         };
         let (username, password) = credentials.password_parts()?;
         let mut exchange = ScramExchange::new(hash, binding, username, password.into())?;
@@ -1022,7 +1022,7 @@ impl AsyncSmtpConnection {
         // running, derived from the same `Mechanism` that frames the AUTH
         // command, so the reported name and the wire token cannot disagree.
         let phase = SmtpCommandPhase::Auth {
-            mechanism: Some(mechanism.name()),
+            mechanism: Some(mechanism),
         };
         // Resolve the OAuth access token from the shared source once, up
         // front, so the same token frames the initial response and any
@@ -2908,7 +2908,7 @@ mod transcript_tests {
         assert_eq!(
             error.phase(),
             Some(super::SmtpCommandPhase::Auth {
-                mechanism: Some("SCRAM-SHA-256-PLUS")
+                mechanism: Some(crate::transport::smtp::authentication::Mechanism::ScramSha256Plus)
             })
         );
         let account = into_account_error(error, SmtpErrorContext::send(Dialect::Smtp));

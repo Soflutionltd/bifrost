@@ -205,7 +205,10 @@ pub(crate) async fn update(
                 .to_string(),
         )
     } else {
-        get(account.clone(), contact.clone()).await?.etag
+        get(account.clone(), contact.clone())
+            .await?
+            .etag
+            .map(bifrost_types::EntityTag::into_string)
     };
     let prefix = account.client.api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
@@ -261,7 +264,10 @@ pub(crate) async fn delete_if_version(
                 .to_string(),
         )
     } else {
-        get(account.clone(), contact.clone()).await?.etag
+        get(account.clone(), contact.clone())
+            .await?
+            .etag
+            .map(bifrost_types::EntityTag::into_string)
     };
     let prefix = account.client.api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
@@ -935,7 +941,7 @@ fn contact_from_graph(contact: GraphContact) -> ContactCard {
         id: ContactId(contact.id.clone()),
         address_book_id: contact.parent_folder_id.clone().map(AddressBookId),
         native_id: contact.id.clone(),
-        etag: contact.etag,
+        etag: contact.etag.map(Into::into),
         provenance: ContactProvenance {
             provider: ProtocolKind::Graph,
             native: contact.id,

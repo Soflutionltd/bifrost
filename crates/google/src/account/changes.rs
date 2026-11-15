@@ -18,7 +18,7 @@ use futures::stream;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
-use crate::error::{Error, GmailLocalError, PageRefusal};
+use crate::error::{Error, PageRefusal};
 use crate::types::{GmailHistoryItem, GmailMessage, GmailProfile};
 
 #[cfg(test)]
@@ -119,26 +119,11 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
                     () = state.shutdown.cancelled() => return None,
                     result = state.client.get_profile() => result,
                 };
-                match profile {
-                    Ok(current)
-                        if super::mailbox::MailboxAddress::from_provider_value(
-                            &current.email_address,
-                        )
-                        .matches(&decoded.profile_email) =>
-                    {
-                        crate::types::HistoryId(decoded.history_id)
-                    }
-                    Ok(current) => {
-                        state.phase = ChangePhase::Ended;
-                        let account_error = account_error::into_account_error(
-                            Error::Local(GmailLocalError::AccountIdentityMismatch {
-                                cursor_email: decoded.profile_email,
-                                profile_email: current.email_address,
-                            }),
-                            account_error::GmailErrorContext::changes(),
-                        );
-                        return Some((SyncEvent::Terminated(account_error), state));
-                    }
+                let verified = profile.and_then(|current| {
+                    super::cursor::validate_gmail_profile(&decoded, &current.email_address)
+                });
+                match verified {
+                    Ok(()) => crate::types::HistoryId(decoded.history_id),
                     Err(error) => {
                         state.phase = ChangePhase::Ended;
                         let account_error = account_error::into_account_error(

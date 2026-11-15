@@ -210,23 +210,6 @@ impl ImapConnection {
         self.uid_fetch_limited(uids, &request.attrs, max_estimated_bytes, timeout)
             .await
     }
-
-    /// Drain pending typed events and return their sync impacts.
-    pub async fn drain_event_impacts(&self) -> Vec<crate::types::EventImpact> {
-        self.drain_events()
-            .await
-            .into_iter()
-            .map(|event| event.impact())
-            .collect()
-    }
-
-    /// Wait for the next event and return its sync impact.
-    pub async fn next_event_impact(
-        &self,
-        timeout: Duration,
-    ) -> Result<Option<crate::types::EventImpact>, Error> {
-        Ok(self.next_event(timeout).await?.map(|event| event.impact()))
-    }
 }
 
 #[cfg(test)]

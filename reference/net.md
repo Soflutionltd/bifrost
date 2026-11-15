@@ -122,6 +122,17 @@ fresh wire request: governor debit + outbound metering + body send
 (`send_streaming`) share `send_streaming_inner`; the buffered path
 drains the body through the same metering reader.
 
+`AccountNet::session_request(method, &SessionUrl)` is the shared constructor for
+provider-admitted pre-authenticated session URLs. It suppresses account bearer
+authentication, redacts transport-generated URL error text and disables redirects
+in one operation. `SessionUrl::new` declares sensitivity, not URL admission;
+providers still validate scheme, host and upload surface before constructing it.
+Its `Debug` and `Display` redact the credential, and it exposes no raw URL getter.
+The returned request builder retains ordinary body, deadline, replay and accounting
+controls. Callers must retain these session policies when customizing it.
+Graph's anonymous auxiliary requests and both Drive session sends use this door;
+Outlook audience selection and provider upload sequencing remain provider-owned.
+
 ### Shared provider holds and error observation
 
 `Net::shared_hold(key)` and `AccountNet::shared_hold(key)` open a `SharedHold`
@@ -246,11 +257,13 @@ collecting its excerpt.
 `NetConfig::connect_timeout` bounds DNS, TCP, and TLS connection setup on the
 shared client and defaults to 10s. Because reqwest owns this timer, an expiry is
 classified `Unsent` and a POST can be replayed safely. Per account,
-`response_headers_timeout` bounds one dispatch until response headers arrive,
-and `read_timeout` bounds inactivity between response body chunks. The response
-header and body defaults are 10s and 30s respectively. The published
-`AccountSpec::connect_timeout` remains as a compatibility input for the response
-header bound; `response_headers_timeout`, when set, takes precedence.
+`AccountSpec::response_headers_timeout` is the sole response-header bound,
+expressed as `ResponseHeadersTimeout::{Unbounded, Bounded(Duration)}`. The
+former `AccountSpec::connect_timeout` name was dropped because it read as a
+connection-setup bound beside `NetConfig::connect_timeout`; there is one field
+and no precedence rule. `read_timeout`
+bounds inactivity between response body chunks. The response-header and body
+defaults are 10s and 30s respectively.
 `RequestBuilder::timeout` is the per-request override for the total request
 deadline. When it is absent, `AccountSpec::request_timeout` supplies the
 per-account default; when both are `None`, the pipeline invents no total
@@ -275,7 +288,7 @@ consumer resumes. A streaming response therefore cannot hand up an
 already-buffered slice past the absolute deadline.
 
 Expiry before dispatch of the replacement attempt is `Timeout { Unsent }` and
-replay-safe for any method; a `response_headers_timeout` expiry while awaiting
+replay-safe for any method; a response-header bound expiring while awaiting
 headers is `Timeout { InFlight }` - bytes may have gone out, so a
 non-replayable request reconciles instead of replaying even under an idempotent
 operation. Expiry *after* headers
@@ -1200,10 +1213,11 @@ classified cross-origin only because the default ports happen to differ
 (443 vs 80), so a downgrade spelled `http://h:443/` would have carried
 the bearer onto a cleartext hop.
 
-`RedirectPolicy::trusted_hosts` is an allowlist for cross-host hops:
-empty means every host is acceptable; populated means only matching
-hosts are admitted (case-insensitive host comparison per RFC 3986
-section 3.2.2) and `Error::RedirectRejected` is returned otherwise.
+`RedirectPolicy::cross_origin` selects `CrossOrigin::Any`,
+`CrossOrigin::AllowList(HashSet<String>)`, or `CrossOrigin::Forbidden`.
+The default is `Any`. An allowlist admits only matching hosts, compared
+case-insensitively per RFC 3986 section 3.2.2; an empty allowlist admits no
+cross-origin target. A refused hop returns `Error::RedirectRejected`.
 `Authorization` headers are stripped on every cross-host hop
 regardless of allowlist membership, covering both the
 token-source-derived bearer the pipeline injects in `build_reqwest`
@@ -1349,10 +1363,13 @@ rejection of the re-encoded DER, or client-builder failure. These
 route to the account error model as `Request(Malformed)`, not as a
 retryable transport setup failure.
 
-`RedirectPolicy::same_origin()` restricts followed hops to the departing
-scheme, host and effective port, even if `trusted_hosts` names the target.
-The default policy continues to allow any cross-origin target with an empty
-allowlist. JMAP selects the restriction when its trusted-host list is empty.
+`RedirectPolicy::same_origin()` selects `CrossOrigin::Forbidden`, restricting
+followed hops to the departing scheme, host and effective port.
+`trust_host(host)` selects an allowlist or extends the current allowlist;
+calling it after `same_origin()` replaces `Forbidden`. Each builder selects
+one policy rather than leaving a hidden host set behind an overriding flag.
+JMAP selects `Forbidden` when its trusted-host list is empty and otherwise
+builds an allowlist.
 
 `UnexpectedResponse { response: FinalResponse }` lets protocol consumers reject
 an otherwise valid passed-through response without fabricating `Status`.
@@ -1436,7 +1453,7 @@ variants:
 - `RangeNotHonored { kind, message }` - local invalid range input or
   a response that did not honor the requested range.
 - `RedirectRejected { message }` - 3xx target host fell outside
-  the configured `RedirectPolicy::trusted_hosts` allowlist.
+  the configured `RedirectPolicy::cross_origin` admission policy.
 - `MalformedRedirect { kind, message }` - acknowledged 3xx response
   with a present-but-broken `Location` (non-UTF-8 or unresolvable). A
   *missing* `Location` is not an error: it passes through (see the
@@ -1563,7 +1580,7 @@ crates/net/src/
 ## Redirect predicate contract
 
 `RedirectPolicy::allows_host` is a cross-host filter, not a complete redirect
-predicate. With `same_origin_only`, it returns false for every host, including
+predicate. With `CrossOrigin::Forbidden`, it returns false for every host, including
 the departing host, because a host alone cannot establish matching scheme and
 effective port. Call `RedirectPolicy::admits_hop(prior, next)` for the same
 origin-aware decision the request pipeline uses. A known same-origin hop is

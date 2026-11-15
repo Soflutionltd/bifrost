@@ -11,6 +11,8 @@ pub enum AccountErrorKind {
     SyncState(SyncStateErrorKind),
     /// A pause or checkpoint wait ended before a safe boundary was reached.
     ControlWaitEnded,
+    /// This account incarnation was closed before the operation could start.
+    AccountClosed,
     ConcurrencyConflict,
     Request(RequestErrorKind),
     NotFound(ResourceKind),

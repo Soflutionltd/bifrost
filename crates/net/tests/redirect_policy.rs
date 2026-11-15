@@ -3,8 +3,8 @@ use bifrost_net::RedirectPolicy;
 #[test]
 fn same_origin_policy_distinguishes_host_filter_from_hop_admission() {
     let policy = RedirectPolicy::default()
-        .same_origin()
-        .trust_host("other.example");
+        .trust_host("other.example")
+        .same_origin();
     let prior = reqwest::Url::parse("https://dav.example/a").unwrap();
     assert!(!policy.allows_host("dav.example"));
     assert!(policy.admits_hop(Some(&prior), &prior.join("/b").unwrap()));

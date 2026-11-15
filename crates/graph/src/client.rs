@@ -1363,30 +1363,22 @@ impl GraphClient {
         // Autodiscover is ungated: EWS throttling is per calling user under
         // its own policy, and streaming notifications have a separate
         // subscription budget. The REST per-mailbox four does not apply.
-        let (url, bearer) = match target {
+        #[cfg(test)]
+        let (url, bearer) = match &target {
             AuxTarget::Bearer(url) => (url.as_str(), true),
             AuxTarget::Anonymous(url) => (url.as_str(), false),
         };
         #[cfg(test)]
         self.record_aux(method.as_str(), url, headers, bearer, &body);
         let account_net = self.attached_net()?;
-        let mut builder = account_net.request(method, url);
-        if bearer {
-            builder = builder.hop_policy(self.outlook_auth());
-        } else {
-            // An anonymous target was admitted under the upload rule, which
-            // the transport's redirect walk cannot apply to a hop: following
-            // one would send the chunk (and a URL that is itself the
-            // credential's destination) somewhere never admitted, over plain
-            // http included. Graph's upload flow does not redirect, so a 3xx
-            // comes back to the caller as the response it is. The URL is the
-            // session credential, and the HTTP stack's error text names it,
-            // so every error of the request comes back redacted.
-            builder = builder
-                .without_bearer_auth()
-                .credential_url()
-                .follow_redirects(bifrost_net::FollowRedirects::Disabled);
-        }
+        let mut builder = match target {
+            AuxTarget::Bearer(url) => account_net
+                .request(method, url.as_str())
+                .hop_policy(self.outlook_auth()),
+            AuxTarget::Anonymous(url) => {
+                account_net.session_request(method, &bifrost_net::SessionUrl::new(url.as_str()))
+            }
+        };
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }

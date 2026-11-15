@@ -303,9 +303,9 @@ pub fn verify_server_final(server_final: &str, expected_signature: &[u8]) -> Res
 
     validate_scram_attributes(server_final)?;
     if let Some(error) = scram_field(server_final, 'e')? {
-        return Err(SaslError::AuthFailed(format!(
-            "SCRAM server error: {error}"
-        )));
+        return Err(SaslError::ServerRejected(
+            crate::ScramServerError::from_token(error),
+        ));
     }
     let verifier = scram_field(server_final, 'v')?
         .ok_or_else(|| SaslError::Protocol("SCRAM server-final message missing verifier".into()))?;
@@ -421,7 +421,7 @@ where
     M: hmac::Mac + hmac::digest::KeyInit,
 {
     let mut mac = <M as hmac::digest::KeyInit>::new_from_slice(key)
-        .map_err(|e| SaslError::Protocol(format!("invalid SCRAM HMAC key: {e}")))?;
+        .map_err(|e| SaslError::LocalRuntime(format!("invalid SCRAM HMAC key: {e}")))?;
     mac.update(data);
     Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
 }
@@ -899,23 +899,29 @@ mod tests {
             "v={}",
             base64::engine::general_purpose::STANDARD.encode(&actual)
         );
-        // Signature mismatch is a protocol-class failure, not AuthFailed.
+        // Signature mismatch is a protocol-class failure, not ServerRejected.
         let err = verify_server_final(&server_final, &expected).unwrap_err();
         assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
     }
 
     #[test]
-    fn verify_server_final_surfaces_server_error_as_auth_failed() {
+    fn verify_server_final_surfaces_typed_server_refusal() {
         let err = verify_server_final("e=invalid-proof", &[0x00]).unwrap_err();
-        assert_eq!(err.scram_server_error(), Some("invalid-proof"));
-        assert!(matches!(err, SaslError::AuthFailed(_)), "got {err:?}");
+        assert_eq!(
+            err.scram_server_error(),
+            Some(&crate::ScramServerError::InvalidProof)
+        );
+        assert!(matches!(err, SaslError::ServerRejected(_)), "got {err:?}");
     }
 
     #[test]
     fn server_error_token_preserves_policy_and_unknown_values() {
         for token in ["channel-binding-not-supported", "unknown-extension-error"] {
             let err = verify_server_final(&format!("e={token}"), &[]).unwrap_err();
-            assert_eq!(err.scram_server_error(), Some(token));
+            assert_eq!(
+                err.scram_server_error(),
+                Some(&crate::ScramServerError::from_token(token))
+            );
         }
         let malformed = verify_server_final("not-a-server-final", &[]).unwrap_err();
         assert_eq!(malformed.scram_server_error(), None);

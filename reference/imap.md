@@ -1,5 +1,9 @@
 # bifrost-imap reference
 
+Explicit account-shutdown guards in send, draft send, raw blob fetch and
+polling EXAMINE use `AccountClosed` / terminal `Cancelled`. Ordinary connection
+closure retains its transport classification and transmission evidence.
+
 Current architecture of the IMAP client crate. Daaki-derived. Tokio + native-tls only.
 
 The public consumer surface is intentionally small after S1-W3: `ImapAccountFactory`, `ImapAccountConfig`, `ImapConfig`, `ManageSieveConfig`, `Credentials`, `AuthPolicy`. Consumers construct the factory and use it through `Arc<dyn bifrost_types::AccountFactory>`; raw IMAP, ManageSieve, parser, command, protocol-error, and sync-helper surfaces are crate-internal. CardDAV/CalDAV composition (`with_carddav`/`with_caldav`) is under "Account layer".
@@ -33,6 +37,14 @@ Equality and hashing distinguish noncanonical wire identities even when their
 display strings coincide, while canonical names compare equal to caller-created
 names. NUL-bearing mailbox wire strings are refused rather than silently
 stripped. Gmail FETCH labels use the negotiated mailbox decoding mode.
+The codec's `utf7::WireMode` owns mailbox display conversion and reports
+canonicality at construction. `MailboxName` retains an explicit wire state and
+a cached identity key; equality, hashing and re-encoding admission borrow that
+state without UTF-7 conversion or identity allocation. Mailbox command text
+remains text until encoding validates it through `MailboxName::new`, including
+LIST patterns and NOTIFY names; retained server names keep their literal-capable
+wire path. Caller text containing NUL, CR or LF is refused consistently.
+
 
 The exact name INBOX compares and hashes ASCII-case-insensitively (RFC 3501
 Section 5.1), and command-response correlation (`MailboxName::matches_mailbox`)
@@ -50,9 +62,9 @@ its children in another case.
 `Capability` hashing streams its case-folded wire spelling through `Display`
 without allocating. `SORT=DISPLAY` is the unit variant `SortDisplay`. Parsed
 `AUTH=`, `THREAD=` and `QUOTA=RES-` suffixes are stored uppercase and `RIGHTS=`
-suffixes lowercase; payload variants still compare case-insensitively because
-callers may construct them directly, and `ServerProfile::new` still normalizes
-directly constructed AUTH and THREAD payloads for the same reason.
+suffixes lowercase; suffix and unknown-token payloads have private storage and are minted only by
+`Capability::from_imap_str`. Callers use that parser instead of constructing
+payload variants. Equality remains ASCII-case-insensitive.
 
 The account registry keys on `MailboxName`. Folder/container ids and the
 folder component of object, thread and part ids retain noncanonical wire
@@ -453,7 +465,14 @@ are legitimate solicited results and are not reclassified as NOTIFY events,
 so the direct and pipelined paths cannot disagree. LIST-STATUS returns
 `ListStatusEntry { mailbox, status }` per solicited mailbox.
 
-`TypedEvent::impact()` returns `EventImpact` for cache-coherence: `SelectedMailboxChanged`, `SelectedMailboxResync`, `MailboxStateChanged`, `ServerMetadataChanged`, `Heartbeat`, `Extension`, `None`. RECENT maps to `None` (informational; deprecated by IMAP4rev2). ServerMetadataChange is server-scoped, not selected-mailbox scoped.
+`connection/typed_event.rs::TypedEvent` is the sole server-event vocabulary.
+Its private `EventClass` table supplies queue priority and whether an event
+ends an IDLE wait. Capability changes and plain OK keepalives are transparent;
+the driver already applied their bookkeeping. Sync meaning belongs solely to
+`account/push.rs`, not a second connection-level impact API. RECENT, EXISTS,
+EXPUNGE, VANISHED and FETCH invalidate the selected folder: enterprise users
+expect mail delivered through another client to appear even when RECENT is
+the only hint. STATUS and LIST invalidate their named folder.
 
 `DriverEventSink` never waits on the event receiver. It buffers critical
 events up to 4096 by default; requeryable and resyncable events are dropped
@@ -464,14 +483,21 @@ a loss is pending, later events join that loss window and are counted until the
 marker is delivered, so neither a newer event nor the marker can overtake the
 event sequence it summarizes.
 
-During IDLE, extension signals reach the caller as typed
-`IdleEvent::ExtensionEvent(IdleExtension)` values rather than formatted text:
-`QueueOverflow { dropped_count, since }` keeps the queue-loss count and the
-start of the loss window, `MetadataChange { server }` distinguishes a
-mailbox-scoped METADATA change from a server-scoped one, and any other
-unrecognized untagged response is carried parsed as `Response(..)`. The account
-push loop cannot know what such an event changed, so it conservatively answers
-every `ExtensionEvent` with an `Unknown` invalidation.
+IDLE returns `IdleEvent::Event(TypedEvent)`, `Timeout`, `Cancelled`, or
+`ServerTerminated`. It wraps actionable events without converting their
+payloads. METADATA and legacy SEARCH remain parsed extension responses,
+including SEARCH's original MODSEQ and number semantics. Queue loss retains
+`dropped_count` and `since` and never masquerades as a server ALERT.
+Mailbox METADATA invalidates its named folder; empty-mailbox server metadata
+and other extension responses conservatively invalidate the account.
+The two payload-free metadata variants were removed because no producer
+constructed them; the parsed METADATA response remains the authority.
+
+NOTIFICATIONOVERFLOW invalidates account-wide coverage and ends the push
+session as `Lost`. The next session reissues NOTIFY through normal setup;
+enterprise users expect non-selected folder updates to resume after the server
+clears registration. Local queue overflow invalidates account-wide coverage
+without discarding an otherwise valid NOTIFY registration.
 
 ## Streaming FETCH
 
@@ -1004,11 +1030,14 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
   its save time as a provisional `Date`.
 - Draft submission reads its header block through `HeaderMap::parse`, with
   shared address-list parsing (quoted-pairs and RFC 2047 display names) and
-  `HeaderMap::message_ids`. `HeaderMap::addresses_checked` validates From,
+  `HeaderMap::message_ids`. `HeaderMap::submission_envelope` validates From,
   Sender, To, Cc, and Bcc; any rejected item returns `Request(Malformed)` before
   SMTP submission. Repeated recipient headers retain wire order. Message IDs
-  without angle brackets are not recognized and use the existing sender-domain
-  fallback. Header decoding does not rewrite the transmitted draft bytes; only
+  without angle brackets are not recognized and use a fresh sender-domain
+  correlation fallback, shared with the MIME renderer. A single From wins over
+  Sender so a shared mailbox receives its own bounces; without From, Sender
+  wins, then the configured default. Multiple authors require a single Sender
+  and use it as the reverse path. Header decoding does not rewrite the transmitted draft bytes; only
   the Bcc header is stripped from the SMTP copy.
 - Receipt id rule: the `SendReceipt::id` of `send_message`, `send_raw_message`
   and `draft_send` is the APPENDUID-derived id from the Sent APPEND when UIDPLUS
@@ -1869,3 +1898,50 @@ NoModSeq, or Highest with a nonzero value. `modseq()` supplies the typed
 that denial wins over contradictory positive codes in either order, including
 the tagged completion. Enterprise users expect conservative concurrency
 protection rather than guarded writes based on contradictory server metadata.
+
+Mutation errors defer failure-lane selection through `targets::Verdict::SubmissionError`
+until the target permit supplies its identity, then use
+`ItemOutcome::from_submission_error`. A partial record uses its primary leg: an
+earlier commit does not turn a later acknowledged refusal into Uncertain.
+
+## Flag wire admission
+
+`Flag` retains lossless observations for both FLAGS and PERMANENTFLAGS, including
+Recent and the permanent-keyword wildcard. Unknown flag payloads have private
+storage and are minted only by `Flag::from_imap_str`; known spellings cannot hide
+inside Custom. This shared observation type intentionally retains malformed
+server observations for inspection rather than rejecting a whole response.
+`StoreFlag` is the validated borrowed output view: STORE and APPEND obtain it
+through one conversion which excludes Recent and Wildcard and validates keyword
+atoms. The connection's preliminary STORE filter and the account flag judge use
+the same `Flag::is_writable` classification. Requests explicitly naming either
+server-only value are Indeterminate. Observed Set equality excludes both values.
+
+`MailboxAttribute::Inbox` preserves the non-standard Inbox attribute as a typed
+observation. It does not assign an account role: only exact INBOX names do so,
+matching enterprise users' expectation that primary mail remains in INBOX.
+
+### Persisted cursor decoding
+
+Payload header validation uses `OpaqueChangeState::open` in bifrost-types.
+`CursorDecodeFault::builder` owns recovery classification: wrong protocol,
+unreadable layout or malformed bytes require `SchemaIncompatible`; a readable
+payload under a different scope requires `CursorInvalid` with that scope.
+Account identity mismatch requires schema clearing because no retained scope can
+safely consume another account's token. An enterprise user expects durable state
+to rebuild without blaming the provider or silently missing mail.
+Payload versions use `PayloadVersion`; change and backfill outer versions use
+`TraitEnvelopeVersion`. These are separate types with explicit numeric access
+for storage; existing wire values are unchanged.
+
+## Typed SCRAM refusal recovery
+
+`Error::Auth` carries `Option<AuthMechanism>` and an optional typed
+`ScramServerError`. The shared `refusal_class()` table in `reference/sasl.md`
+owns recovery: credential rejection requests reauthorization, policy refusal
+blocks, protocol refusal reports a contract violation, and unavailable server
+resources or unspecified errors retry. The account boundary renders mechanism
+names only for support diagnostics. No SCRAM token is recovered from prose and
+no IMAP response code is fabricated for a SCRAM refusal. The cancellation drain
+preserves a typed SCRAM refusal rather than replacing it with a generic tagged
+NO. OAuth token lookup classification remains owned by bifrost-net.

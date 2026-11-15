@@ -146,7 +146,7 @@ pub struct SendRequest {
     pub from: Option<Address>,
     /// To recipients. At least one of `to`, `cc`, or `bcc` must be
     /// non-empty for the protocol to accept the send; this is
-    /// enforced at the protocol layer, not in this type.
+    /// checked by `validate_recipients` at the protocol boundary.
     pub to: Vec<Address>,
     pub cc: Vec<Address>,
     pub bcc: Vec<Address>,
@@ -229,6 +229,40 @@ pub struct SendRequest {
     /// recipient honors the request is out of the sender's control on every
     /// provider.
     pub request_read_receipt: bool,
+}
+
+impl SendRequest {
+    /// Reject a send with no To, Cc or Bcc recipients before provider I/O.
+    pub fn validate_recipients(&self) -> Result<(), crate::AccountError> {
+        validate_send_recipients(&self.to, &self.cc, &self.bcc)
+    }
+}
+
+/// Validate resolved recipient lists. Draft patches must first be applied to
+/// their stored draft: an omitted patch field does not mean an empty list.
+pub fn validate_send_recipients(
+    to: &[Address],
+    cc: &[Address],
+    bcc: &[Address],
+) -> Result<(), crate::AccountError> {
+    use crate::error::{
+        AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, DiagnosticText,
+        RequestCause, RequestErrorKind,
+    };
+    // The builder is given a fixed, valid classification; try_build cannot fail.
+    #[allow(clippy::unwrap_in_result)]
+    if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+        return Err(AccountErrorBuilder::new(
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::user_safe("send requires at least one recipient"),
+            }),
+        )
+        .operation(AccountOperation::Send)
+        .try_build()
+        .expect("valid account error classification"));
+    }
+    Ok(())
 }
 
 /// Validate a requested scheduled-send instant at the provider
@@ -571,5 +605,31 @@ mod send_as_tests {
         let mailbox = MailboxId("shared@contoso.com".to_string());
         assert_eq!(SendAs::As(mailbox.clone()).mailbox(), &mailbox);
         assert_eq!(SendAs::OnBehalfOf(mailbox.clone()).mailbox(), &mailbox);
+    }
+}
+
+#[cfg(test)]
+mod recipient_validation_tests {
+    use super::{Address, SendRequest};
+
+    #[test]
+    fn empty_send_is_malformed_but_each_recipient_lane_is_sufficient() {
+        let error = SendRequest::default()
+            .validate_recipients()
+            .expect_err("empty send");
+        assert_eq!(
+            *error.kind(),
+            crate::AccountErrorKind::Request(crate::RequestErrorKind::Malformed)
+        );
+        for lane in 0..3 {
+            let mut request = SendRequest::default();
+            let recipients = match lane {
+                0 => &mut request.to,
+                1 => &mut request.cc,
+                _ => &mut request.bcc,
+            };
+            recipients.push(Address::bare("recipient@example.test"));
+            request.validate_recipients().expect("recipient present");
+        }
     }
 }

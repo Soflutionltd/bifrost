@@ -569,7 +569,7 @@ pub(crate) fn item_to_inventory_entry(
             server_version: item
                 .change_key
                 .clone()
-                .map(ServerVersion::ETag)
+                .map(|etag| ServerVersion::ETag(etag.into()))
                 .unwrap_or(ServerVersion::Unavailable),
             size: None,
             flags_hash: super::inventory::tracked_flags_hash(
@@ -1473,7 +1473,7 @@ pub(crate) fn public_folder_changes_stream(
             let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
             yield SyncEvent::Terminated(cursor_error_to_account_error(
-                super::cursor::CursorError::SchemaIncompatible, ctx));
+                super::cursor::CursorError::ScopeMismatch, ctx));
             yield SyncEvent::Done(None);
             return;
         }

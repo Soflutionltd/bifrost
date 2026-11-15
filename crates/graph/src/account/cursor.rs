@@ -14,6 +14,8 @@ use crate::origin::AdmittedUrl;
 pub(crate) enum CursorError {
     /// Cursor belongs to a different protocol.
     ProtocolMismatch,
+    /// Readable payload filed under another cursor scope.
+    ScopeMismatch,
     /// Cursor envelope version is ahead of what this build understands.
     EnvelopeUnknown,
     /// Cursor envelope version is older than this build can migrate.
@@ -45,6 +47,7 @@ pub(crate) enum CursorError {
 impl std::fmt::Display for CursorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ScopeMismatch => f.write_str("cursor payload scope mismatch"),
             Self::ProtocolMismatch => f.write_str("cursor protocol mismatch"),
             Self::EnvelopeUnknown => f.write_str("cursor envelope version unknown"),
             Self::SchemaIncompatible => f.write_str("cursor schema incompatible"),
@@ -507,27 +510,29 @@ pub(crate) fn encode_cursor(
         scope,
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::Graph,
-            envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(GRAPH_CURSOR_ENVELOPE_VERSION),
             bytes,
         },
         advanced_through: progress,
-        envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(CHANGE_CURSOR_ENVELOPE_VERSION),
     })
 }
 
 pub(crate) fn decode_cursor(cursor: &ChangeCursor) -> Result<GraphCursorPayload, CursorError> {
-    if cursor.server_state.protocol != ProtocolKind::Graph {
-        return Err(CursorError::ProtocolMismatch);
-    }
-    if cursor.server_state.envelope_version > GRAPH_CURSOR_ENVELOPE_VERSION {
-        return Err(CursorError::EnvelopeUnknown);
-    }
-    if cursor.server_state.envelope_version < GRAPH_CURSOR_ENVELOPE_VERSION {
-        return Err(CursorError::SchemaIncompatible);
-    }
+    let bytes = cursor
+        .server_state
+        .open(
+            ProtocolKind::Graph,
+            bifrost_types::PayloadVersion::new(GRAPH_CURSOR_ENVELOPE_VERSION),
+        )
+        .map_err(|fault| match fault {
+            bifrost_types::CursorDecodeFault::ProtocolMismatch => CursorError::ProtocolMismatch,
+            bifrost_types::CursorDecodeFault::FutureVersion => CursorError::EnvelopeUnknown,
+            _ => CursorError::SchemaIncompatible,
+        })?;
 
-    let mut payload: GraphCursorPayload = serde_json::from_slice(&cursor.server_state.bytes)
-        .map_err(|error| CursorError::Decode(error.to_string()))?;
+    let mut payload: GraphCursorPayload =
+        serde_json::from_slice(bytes).map_err(|error| CursorError::Decode(error.to_string()))?;
     // The outer `ChangeCursor::advanced_through` is the single source of
     // truth for page progress, in BOTH directions: the engine persists it
     // separately from the opaque payload bytes and may have acked a later
@@ -573,7 +578,7 @@ mod tests {
             GraphCursorPayload::public_folder(public_folder_cursor()),
         )
         .expect("encode");
-        cursor.server_state.envelope_version = 5;
+        cursor.server_state.envelope_version = bifrost_types::PayloadVersion::new(5);
         assert!(matches!(
             decode_cursor(&cursor),
             Err(CursorError::SchemaIncompatible)
@@ -600,7 +605,7 @@ mod tests {
         assert_eq!(cursor.scope, scope);
         assert_eq!(cursor.server_state.protocol, ProtocolKind::Graph);
         assert_eq!(
-            cursor.server_state.envelope_version,
+            cursor.server_state.envelope_version.get(),
             GRAPH_CURSOR_ENVELOPE_VERSION
         );
 
@@ -618,11 +623,13 @@ mod tests {
             scope: CursorScope::Account,
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Gmail,
-                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+                envelope_version: bifrost_types::PayloadVersion::new(GRAPH_CURSOR_ENVELOPE_VERSION),
                 bytes: Vec::new(),
             },
             advanced_through: None,
-            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                CHANGE_CURSOR_ENVELOPE_VERSION,
+            ),
         };
 
         assert!(matches!(
@@ -637,11 +644,15 @@ mod tests {
             scope: CursorScope::Account,
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Graph,
-                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION + 1,
+                envelope_version: bifrost_types::PayloadVersion::new(
+                    GRAPH_CURSOR_ENVELOPE_VERSION + 1,
+                ),
                 bytes: b"{}".to_vec(),
             },
             advanced_through: None,
-            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                CHANGE_CURSOR_ENVELOPE_VERSION,
+            ),
         };
 
         assert!(matches!(
@@ -656,11 +667,13 @@ mod tests {
             scope: CursorScope::Account,
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Graph,
-                envelope_version: 0,
+                envelope_version: bifrost_types::PayloadVersion::new(0),
                 bytes: b"{}".to_vec(),
             },
             advanced_through: None,
-            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                CHANGE_CURSOR_ENVELOPE_VERSION,
+            ),
         };
 
         assert!(matches!(
@@ -675,11 +688,13 @@ mod tests {
             scope: CursorScope::Account,
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Graph,
-                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+                envelope_version: bifrost_types::PayloadVersion::new(GRAPH_CURSOR_ENVELOPE_VERSION),
                 bytes: b"{not-json".to_vec(),
             },
             advanced_through: None,
-            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                CHANGE_CURSOR_ENVELOPE_VERSION,
+            ),
         };
 
         assert!(matches!(
@@ -703,11 +718,13 @@ mod tests {
             scope: scope.clone(),
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Graph,
-                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+                envelope_version: bifrost_types::PayloadVersion::new(GRAPH_CURSOR_ENVELOPE_VERSION),
                 bytes: serde_json::to_vec(&payload).expect("serialize"),
             },
             advanced_through: Some(OpaqueProgressBytes(b"{nope".to_vec())),
-            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                CHANGE_CURSOR_ENVELOPE_VERSION,
+            ),
         };
 
         assert!(matches!(
@@ -763,7 +780,7 @@ mod tests {
         assert_eq!(cursor.scope, scope);
         assert_eq!(cursor.server_state.protocol, ProtocolKind::Graph);
         assert_eq!(
-            cursor.server_state.envelope_version,
+            cursor.server_state.envelope_version.get(),
             GRAPH_CURSOR_ENVELOPE_VERSION
         );
 
@@ -960,11 +977,13 @@ mod tests {
             scope: CursorScope::Folder(FolderId("AAMkPF=".to_string())),
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Graph,
-                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+                envelope_version: bifrost_types::PayloadVersion::new(GRAPH_CURSOR_ENVELOPE_VERSION),
                 bytes,
             },
             advanced_through: None,
-            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                CHANGE_CURSOR_ENVELOPE_VERSION,
+            ),
         };
 
         let decoded = decode_cursor(&cursor).expect("legacy public-folder cursor decodes");

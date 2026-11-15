@@ -716,7 +716,7 @@ impl SmtpConnection {
         // running, derived from the same `Mechanism` that frames the AUTH
         // command, so the reported name and the wire token cannot disagree.
         let phase = SmtpCommandPhase::Auth {
-            mechanism: Some(mechanism.name()),
+            mechanism: Some(mechanism),
         };
         let (username, password) = credentials.password_parts()?;
         let mut exchange = ScramExchange::new(hash, binding, username, password.into())?;
@@ -826,7 +826,7 @@ impl SmtpConnection {
         // running, derived from the same `Mechanism` that frames the AUTH
         // command, so the reported name and the wire token cannot disagree.
         let phase = SmtpCommandPhase::Auth {
-            mechanism: Some(mechanism.name()),
+            mechanism: Some(mechanism),
         };
         // Resolve only a non-refreshing cache snapshot. A stale source requires
         // the async transport; cache-lock contention remains a transient error.
@@ -2561,7 +2561,7 @@ mod transcript_tests {
         assert_eq!(
             error.phase(),
             Some(super::SmtpCommandPhase::Auth {
-                mechanism: Some("PLAIN")
+                mechanism: Some(crate::transport::smtp::authentication::Mechanism::Plain)
             })
         );
         let account = into_account_error(error, SmtpErrorContext::send(Dialect::Smtp));

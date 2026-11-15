@@ -294,7 +294,7 @@ fn project(folder: &str, node: &Node) -> Result<ContactCard, ews::EwsError> {
         id: foreign::public_contact(folder, &native),
         address_book_id: Some(foreign::public_address_book(folder)),
         native_id: native.clone(),
-        etag: identity.change_key.clone(),
+        etag: identity.change_key.clone().map(Into::into),
         provenance: ContactProvenance {
             provider: ProtocolKind::Graph,
             native,

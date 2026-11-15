@@ -525,9 +525,39 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             text,
             code,
             mechanism,
+            scram,
             attempt,
         } => {
             let mut translation = classify_auth(text, code.as_ref(), *mechanism);
+            if let Some(refusal) = scram {
+                use bifrost_sasl::RefusalClass;
+                let (kind, cause) = match refusal.refusal_class() {
+                    RefusalClass::Credential => (
+                        AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
+                        Cause::Auth(AuthCause::ReauthorizationRequired),
+                    ),
+                    RefusalClass::Policy => (
+                        AccountErrorKind::Authorization(
+                            bifrost_types::AccessErrorKind::PolicyBlocked,
+                        ),
+                        Cause::Access(AccessCause::PolicyBlocked),
+                    ),
+                    RefusalClass::Protocol => (
+                        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+                        Cause::Wire(WireCause::MalformedResponse {
+                            protocol: Protocol::Imap,
+                            detail: Some(DiagnosticText::support_only(text.to_owned())),
+                        }),
+                    ),
+                    RefusalClass::Unavailable => (
+                        AccountErrorKind::Server(ServerErrorKind::Unavailable),
+                        Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+                    ),
+                    _ => unreachable!("unmapped SCRAM refusal class"),
+                };
+                translation.kind = kind;
+                translation.primary_cause = cause;
+            }
             if let Some(attempt) = attempt {
                 translation.attempt = Some(attempt.transmission_state);
             }
@@ -797,7 +827,7 @@ fn classify_sieve(
 fn classify_auth(
     text: &str,
     code: Option<&ResponseCode>,
-    mechanism: Option<&'static str>,
+    mechanism: Option<crate::types::AuthMechanism>,
 ) -> Translation {
     let (kind, cause) = match code {
         Some(ResponseCode::Expired) => (
@@ -822,6 +852,7 @@ fn classify_auth(
         ),
     };
     let mut t = Translation::new(kind, cause);
+    let mechanism = mechanism.map(crate::types::AuthMechanism::name);
     let detail = match (text.is_empty(), mechanism) {
         (false, Some(mechanism)) => Some(format!("{text} (mechanism {mechanism})")),
         (true, Some(mechanism)) => Some(format!("server refused mechanism {mechanism}")),

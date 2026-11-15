@@ -26,7 +26,6 @@ use super::driver::{DriverCommand, IdleTermination};
 use super::typed_event::TypedEvent;
 use super::{IdleEvent, ImapConnection};
 use crate::error::Error;
-use crate::types::response::{UntaggedResponse, UntaggedStatus};
 use bifrost_types::TransmissionState;
 
 impl ImapConnection {
@@ -236,125 +235,10 @@ impl ImapConnection {
     }
 }
 
-/// Convert a [`TypedEvent`] into an [`IdleEvent`], if meaningful.
-///
-/// Maps the internal event representation to the public IDLE-specific
-/// event type. Returns `None` for events that are handled transparently
-/// by the protocol state machine and should not interrupt IDLE
-/// (e.g., capability changes  -  already applied by `apply_side_effects`,
-/// observable via `state_rx`).
-///
-/// Handles all `TypedEvent` variants, extracting IDLE-relevant data
-/// from `Extension` variants where needed (e.g., `Metadata`,
-/// `Search`/`Esearch`).
-fn typed_event_to_idle_event(ev: TypedEvent) -> Option<IdleEvent> {
-    match ev {
-        TypedEvent::Exists(n) => Some(IdleEvent::Exists(n)),
-        TypedEvent::Recent(n) => Some(IdleEvent::Recent(n)),
-        TypedEvent::Expunge(n) => Some(IdleEvent::Expunge(n)),
-        TypedEvent::FetchUpdate(f) => Some(IdleEvent::Fetch(f)),
-        TypedEvent::Alert(text) => Some(IdleEvent::Alert(text)),
-        TypedEvent::MailboxEvent(info) => Some(IdleEvent::MailboxEvent(info)),
-        TypedEvent::MailboxStatus { mailbox, items } => {
-            Some(IdleEvent::MailboxStatus { mailbox, items })
-        }
-        TypedEvent::Vanished { earlier, uids } => Some(IdleEvent::Vanished { earlier, uids }),
-        TypedEvent::NotificationOverflow { code, text } => Some(IdleEvent::NotificationOverflow {
-            code_text: code,
-            resp_text: text,
-        }),
-        TypedEvent::CapabilityChange(_) => {
-            // Capability changes during IDLE are handled transparently
-            // by apply_side_effects  -  the protocol state is already
-            // updated and the caller can observe it via state_rx.
-            // Surfacing this as an IdleEvent would prematurely end
-            // the IDLE wait (RFC 2177 Section 3  -  the client should
-            // remain in IDLE until a meaningful mailbox event, timeout,
-            // or cancellation occurs).
-            trace!("idle: suppressing CapabilityChange (handled by state machine)");
-            None
-        }
-        TypedEvent::Bye { code, text } => Some(IdleEvent::Bye { code, text }),
-        TypedEvent::QueueOverflow {
-            dropped_count,
-            since,
-        } => Some(IdleEvent::ExtensionEvent(
-            super::IdleExtension::QueueOverflow {
-                dropped_count,
-                since,
-            },
-        )),
-        TypedEvent::MetadataChange {} => Some(IdleEvent::ExtensionEvent(
-            super::IdleExtension::MetadataChange { server: false },
-        )),
-        TypedEvent::ServerMetadataChange {} => Some(IdleEvent::ExtensionEvent(
-            super::IdleExtension::MetadataChange { server: true },
-        )),
-        TypedEvent::Extension(resp) => untagged_to_idle_event(*resp),
-    }
-}
-
-/// Convert a raw [`UntaggedResponse`] (wrapped in `TypedEvent::Extension`)
-/// into an [`IdleEvent`], if meaningful.
-///
-/// Returns `None` for purely informational `* OK` keepalives (no response
-/// code)  -  these are server-generated heartbeats that should not interrupt
-/// IDLE (RFC 3501 Section 7.1).
-///
-/// Handles response types that `TypedEvent::From<UntaggedResponse>`
-/// routes to `Extension`  -  notably `Metadata`, `Search`, and
-/// `Esearch`. The `MailboxStatus` arm remains for callers that
-/// construct raw extension events directly.
-fn untagged_to_idle_event(resp: UntaggedResponse) -> Option<IdleEvent> {
-    match resp {
-        UntaggedResponse::MailboxStatus { mailbox, items } => {
-            Some(IdleEvent::MailboxStatus { mailbox, items })
-        }
-        UntaggedResponse::Metadata { mailbox, entries } => {
-            Some(IdleEvent::MetadataChange { mailbox, entries })
-        }
-        UntaggedResponse::Search { uids, mod_seq: _ } => {
-            // Legacy `* SEARCH` during IDLE  -  wrap in
-            // EsearchResponse for the SearchUpdate variant.
-            Some(IdleEvent::SearchUpdate(Box::new(
-                crate::types::EsearchResponse {
-                    tag: None,
-                    uid: false,
-                    all: uids
-                        .into_iter()
-                        .map(crate::types::UidRange::single)
-                        .collect(),
-                    min: None,
-                    max: None,
-                    count: None,
-                    mod_seq: None,
-                },
-            )))
-        }
-        UntaggedResponse::Esearch(e) => Some(IdleEvent::SearchUpdate(Box::new(e))),
-        UntaggedResponse::Status {
-            status,
-            code: Some(code),
-            text,
-        } => Some(IdleEvent::StatusUpdate { status, code, text }),
-        // RFC 3501 Section 7.1: `* OK text` with no response code is
-        // purely informational. Servers like Dovecot send these as
-        // periodic keepalives (e.g., `* OK Still here`) to prevent
-        // TCP timeouts. They carry no actionable data and should not
-        // interrupt the IDLE wait.
-        UntaggedResponse::Status {
-            status: UntaggedStatus::Ok,
-            code: None,
-            text,
-        } => {
-            trace!("idle: suppressing informational OK keepalive: {text:?}");
-            None
-        }
-        // Everything else: wrap as extension event.
-        other => Some(IdleEvent::ExtensionEvent(super::IdleExtension::Response(
-            Box::new(other),
-        ))),
-    }
+/// IDLE wraps the original event, without normalizing SEARCH or discarding
+/// extension fields. Sync meaning belongs to the account push adapter.
+fn typed_event_to_idle_event(event: TypedEvent) -> Option<IdleEvent> {
+    event.ends_idle_wait().then_some(IdleEvent::Event(event))
 }
 
 #[cfg(test)]

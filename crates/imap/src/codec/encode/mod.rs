@@ -513,14 +513,6 @@ fn validate_imap_quoted_string(s: &str, context: &str) -> Result<(), crate::Erro
     Ok(())
 }
 
-/// Validate that a custom flag keyword contains only ATOM-CHARs.
-///
-/// RFC 3501 Section 9: `flag-keyword = atom`.
-/// Delegates to [`validate_atom`].
-pub(crate) fn validate_flag_keyword(s: &str) -> Result<(), crate::Error> {
-    validate_atom(s, "flag keyword")
-}
-
 /// Validate a METADATA entry name before sending GETMETADATA/SETMETADATA.
 ///
 /// RFC 5464 Section 3.2 imposes additional restrictions beyond generic
@@ -604,28 +596,12 @@ fn validate_metadata_entry_name(entry: &str, context: &str) -> Result<(), crate:
 /// Returns the filtered flags with `\Recent` and `\*` removed.
 fn validate_and_filter_flags<'a>(
     flags: &'a [crate::types::Flag],
-    context: &str,
-) -> Result<Vec<&'a crate::types::Flag>, crate::Error> {
-    let valid_flags: Vec<_> = flags
+    _context: &str,
+) -> Result<Vec<crate::types::flag::StoreFlag<'a>>, crate::Error> {
+    flags
         .iter()
-        .filter(|f| {
-            if matches!(f, crate::types::Flag::Recent | crate::types::Flag::Wildcard) {
-                tracing::debug!(
-                    flag = %f,
-                    "Skipping flag not permitted in {context} per RFC 3501 Section 9 (flag production)"
-                );
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
-    for flag in &valid_flags {
-        if let crate::types::Flag::Custom(s) = flag {
-            validate_flag_keyword(s)?;
-        }
-    }
-    Ok(valid_flags)
+        .filter_map(|flag| crate::types::flag::StoreFlag::from_observed(flag).transpose())
+        .collect()
 }
 
 /// Validate an APPEND date-time string against RFC 3501 Section 9.

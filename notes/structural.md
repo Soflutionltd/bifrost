@@ -223,16 +223,6 @@ uses `caller_input_error`; `contacts` uses `caller_input_error` with the raw
 `SyncState(SchemaIncompatible)` (BUG-069). Google should have a `PageCursor` whose
 refusal matches the workspace answer.
 
-## STR-007 - Envelope version numbers are interchangeable `u32`s
-
-**Reported by:** types.
-
-`ChangeCursor::envelope_version` and `OpaqueChangeState::envelope_version` are
-both `u32` and mean different things (the struct doc spends a paragraph saying
-so); `BackfillCheckpoint::envelope_version` is a third. Distinct newtypes
-(`TraitEnvelopeVersion`, `PayloadVersion`) make the swap a compile error. The
-decision on top is BUG-073.
-
 ## STR-008 - Versions are read as `etag: Option<String>` and written as `ServerVersion`
 
 **Reported by:** types, jmap-account.
@@ -1193,20 +1183,6 @@ scans for `SAVE`) likewise. The `search_validation.rs` lexer is hung off
 `ImapConnection` as associated functions used only by the codec encoder (and a
 `#[cfg(test)]` adapter); it belongs in `codec/` or disappears with `SearchKey`.
 
-## STR-054 - IMAP has one `Flag` type for read-only and writable flags
-
-**Reported by:** imap-protocol.
-
-`Flag` includes `Recent` and `Wildcard` (`\*`, PERMANENTFLAGS-only) beside
-writable flags, and `Custom(String)` is unvalidated. "Which flags may a STORE /
-APPEND carry" is decided at `encode::validate_and_filter_flags` (silently drops
-`\Recent` / `\*` with a debug log, validates keyword atoms) and again at
-`connection::filter_store_flags`; `account/inventory.rs::imap_flag_target`
-separately special-cases `\recent` by string. Proposal: `StoreFlag` (system
-flags + validated `Keyword(ImapAtom)`), `Flag` (observed, includes `Recent`) and
-`PermanentFlag` (includes `Wildcard`). The live keyword-folding defect on top is
-BUG-026; the workspace-level flag identity question is STR-004.
-
 ## STR-055 - IMAP ENABLEd extensions are `Vec<String>` and the UTF-8 mode is a bool
 
 **Reported by:** imap-protocol.
@@ -1259,43 +1235,13 @@ gates), embedded in `EncodeOptions` and `ConsumerContext`, with
 
 **Reported by:** imap-protocol.
 
-Allocation-free capability hashing, the unit `SortDisplay`, one canonical
-suffix spelling per capability variant, and direct case-insensitive flag and
-attribute equality landed. What remains crosses into `crates/imap/src/account/`,
-so it wants a fixer owning both sides:
+The escape-payload newtypes and `MailboxAttribute::Inbox` landed. One residue:
 
-- Escape payloads are still public, so equality has to tolerate
-  `Custom("\\Seen")` meaning `Seen`. Make the payload a private newtype minted
-  only by `from_imap_str`; the account constructs `Flag::Custom(s)` and
-  `Capability::Thread(s)` directly and must switch to `from_imap_str`.
-- `MailboxAttribute` has no `Inbox` variant, so the account's
-  `folder_registry.rs` role match reads `Custom("\\Inbox")`.
 - `MoveResult::copy_uid` / `CopyResult::copy_uid: Option<ResponseCode>` are
   documented "Always a `ResponseCode::CopyUid` when present" and every consumer
   re-matches. Use `Option<CopyUid { validity: UidValidity, source: UidSet, dest:
   UidSet }>` (and the same struct inside `ResponseCode::CopyUid`); its readers
   are `account/mutate.rs` and three matches in `account/error.rs`.
-
-## STR-058 - `MailboxName`'s wire encoding is a bool, and identity is recomputed per comparison
-
-**Reported by:** imap-protocol.
-
-`MailboxName(String, Option<(Vec<u8>, bool)>)`, `identity() -> (bool, Vec<u8>)`,
-`wire_bytes(utf8: bool)`. `identity()` runs `encode_utf7` and allocates on every
-`eq` and `hash`, so each `HashMap<MailboxName, _>` probe UTF-7-encodes the name;
-`can_reencode()` (called by `child`, `parent`, `account_id`, `matches_mailbox`,
-the encoder) computes two identities. The canonicality bit is recomputed by
-round-trip because `decode_utf7` returns a lossy `String` with no "was this
-canonical" signal; it also maps control characters to U+FFFD without signalling,
-so a name with a control byte decodes to a display name that re-encodes
-differently, caught only because `MailboxName` keeps raw wire bytes - any path
-dropping them (`from_decoded`) silently changes identity. And
-`MailboxArgument::from(String)` goes through `MailboxName::from_decoded` (no
-validation, "Text is validated by the encoder") while the rest of the crate
-validates at `MailboxName::new`: two validation boundaries for one input.
-Proposal: the codec returns the canonical flag; store `enum Wire { Canonical,
-Raw { bytes, mode: WireMode } }` and a precomputed identity key. The conversion
-decision is CON-031.
 
 ## STR-059 - IMAP dependency edges point upward
 
@@ -2050,38 +1996,6 @@ vacation; thread and message hydration; `MailDocument`. Suggested split:
 the shared MIME selector), `search.rs` (with one query encoder, CON-053),
 `settings.rs`. The same shape in IMAP and JMAP is STR-079 and STR-104.
 
-## STR-133 - SASL errors are prose; SCRAM server errors carry a magic prefix
-
-**Reported by:** smtp-sasl.
-
-`SaslError::AuthFailed(String)` is built in `verify_server_final` as
-`format!("SCRAM server error: {error}")`, and `SaslError::scram_server_error()`
-recovers the token with `strip_prefix("SCRAM server error: ")`; SMTP's
-`From<SaslError>` branches on `scram_server_error() == Some("invalid-proof")`, and
-tests on both sides assert on the exact prose. RFC 5802 section 7 enumerates the
-`server-error-value` vocabulary (`invalid-encoding`, `extensions-not-supported`,
-`invalid-proof`, `channel-bindings-dont-match`,
-`server-does-support-channel-binding`, `channel-binding-not-supported`,
-`unsupported-channel-binding-type`, `unknown-user`, `invalid-username-encoding`,
-`no-resources`, `other-error`, plus extensions). Proposal: `enum SaslError {
-Protocol(String), InvalidCredential(String), ServerRejected(ScramServerError) }`
-(typed, with `Other(String)`), plus a local-runtime case (BUG-102), with
-`ScramServerError::is_credential_rejection()` owned by bifrost-sasl - what makes
-BUG-100 fixable in one place. Mechanism names on error stamps are the same smell:
-`SmtpCommandPhase::Auth { mechanism: Option<&'static str> }` and IMAP `Error::Auth {
-mechanism: Option<&'static str> }` carry a string though each crate has a mechanism
-enum ("the name that went out on the wire" is the enum's `name()`, not a reason to
-erase it); `ScramExchange` stores both `hash` and a separately computed
-`mechanism_name: &'static str`; IMAP's `AuthenticateXoauth2Consumer` carries
-`mechanism: &'static str` because one consumer serves two mechanisms. Typed, these
-become `Option<Mechanism>`. Lateral: `cram_md5_response` maps an HMAC
-key-construction failure to `SaslError::Protocol` ("invalid CRAM-MD5 key"), blaming
-the peer for the caller's password (HMAC accepts any key length, so unreachable,
-but wrongly classified if it fires); same for `hmac_digest` in `scram.rs`. Several
-SMTP and IMAP tests assert on error prose (`to_string().contains("unsolicited
-reply")`, exact `"SCRAM server error: ..."`); typed errors would let them assert on
-variants.
-
 ## STR-134 - `select_scram_rung` answers three questions through one signature
 
 **Reported by:** smtp-sasl.
@@ -2298,22 +2212,6 @@ redirect classification), `redirect_guard: Fn(&str, &str)`,
 and every DAV native id. `reqwest::Url` is already a dependency; with an `Origin` and
 a `DavHref` on top (BUG-112), several of the CON-060 and BUG-112 disagreements become
 unrepresentable. Related: CON-047.
-
-## STR-147 - Smaller bifrost-net axes
-
-**Reported by:** net-dav.
-
-The timeout enum, typed `ByteRange` validation and typed priority landed. The
-two public reshapes below were deferred because they need consumer-crate
-migration; do them as one change that also edits the consumers.
-
-- `AccountSpec::connect_timeout` is a legacy alias for `response_headers_timeout`,
-  so two fields carry one meaning and a precedence rule lives in `attach_account`
-  (reshaping is ruled fine; removing the field needs the owner).
-- `RedirectPolicy`: `same_origin_only: bool` beside `trusted_hosts: HashSet<String>`;
-  the bool silently overrides the set, and in that mode `allows_host` returns false
-  for every host including the departing one, as the docs warn. Type fix:
-  `CrossOrigin { Any, AllowList(set), Forbidden }`.
 
 ## STR-150 - A DAV collection is a `CursorScope::Folder`, so IMAP resolves ownership by string collision
 

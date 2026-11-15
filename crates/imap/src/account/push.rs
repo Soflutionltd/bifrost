@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::account::error::ImapErrorContext;
 use crate::connection::IdleEvent;
+use crate::connection::typed_event::TypedEvent;
 
 use super::{ImapAccount, account_error_with, folder_scope};
 
@@ -459,6 +460,14 @@ pub(crate) fn push_stream(
                     }
                     let event = match result { Ok(event) => event, Err(e) => { drop(conn); yield E::Failed(account.folder_error(e, &folder, ImapErrorContext::operation(AccountOperation::PushStream))); return; } };
                     if absorb_idle_event(&account, &folder, uidvalidity, &event).is_err() { yield invalidated(HintPayload::Unknown); }
+                    // RFC 5465: overflow clears NOTIFY. Invalidate all coverage
+                    // and redial so the next session re-establishes registration.
+                    // Outlook users expect updates outside the selected mailbox
+                    // to resume rather than silently degrading to selected-only.
+                    if matches!(&event, IdleEvent::Event(TypedEvent::NotificationOverflow { .. })) {
+                        yield invalidated(HintPayload::Unknown);
+                        drop(conn); yield E::Ended(End::Lost); return;
+                    }
                     if let Some(end) = idle_event_ending(&event, &folder) { drop(conn); yield end; return; }
                     if changed {
                         assignment.borrow_and_update();
@@ -683,8 +692,11 @@ fn absorb_idle_event(
     uidvalidity: Option<u32>,
     event: &IdleEvent,
 ) -> Result<(), crate::Error> {
+    let IdleEvent::Event(event) = event else {
+        return Ok(());
+    };
     match event {
-        IdleEvent::Fetch(fetch) => {
+        TypedEvent::FetchUpdate(fetch) => {
             if let (Some(uidvalidity), Some(uid), Some(modseq)) =
                 (uidvalidity, fetch.uid, fetch.mod_seq)
             {
@@ -693,47 +705,36 @@ fn absorb_idle_event(
                     .record_modseq(selected, uidvalidity, uid, modseq)?;
             }
         }
-        IdleEvent::Vanished { uids, .. } => {
+        TypedEvent::Vanished { uids, .. } => {
             if let Some(uidvalidity) = uidvalidity {
                 account
                     .folders
                     .clear_modseq_ranges(selected, uidvalidity, uids);
             }
         }
-        IdleEvent::MailboxEvent(info) => account.folders.apply_mailbox_event(info.clone()),
+        TypedEvent::MailboxEvent(info) => account.folders.apply_mailbox_event(info.clone()),
         _ => {}
     }
     Ok(())
 }
 
-/// The terminal item for an IDLE round whose event leaves the connection
-/// unusable, or `None` when the session carries on.
-///
-/// A server-initiated tagged completion carries no error and ends `Lost`.
-///
-/// On the live path a BYE never arrives here. Every driver read loop that
-/// serves IDLE (the `+` grant wait, the loop, the post-DONE drain) runs the
-/// shared untagged prologue, which turns an untagged BYE into `Error::Bye`
-/// before any event is emitted, so the session sees it through `idle()`'s
-/// error arm and ends `Failed` there. The `Bye` arm is defensive: `idle()`
-/// still maps a BYE typed event to `IdleEvent::Bye`, and should the driver's
-/// short-circuit ever move, this arm keeps the session contract for it -
-/// classified like the error path (`PushStream`, folder scope), ended
-/// `Failed` whatever its recovery, and never an exclusion, because a BYE is
-/// connection-level and does not say which folder failed.
+/// BYE normally arrives as an IDLE error; retain the same classification if
+/// an already queued BYE is read. A tagged completion ends coverage as Lost.
 fn idle_event_ending(
     event: &IdleEvent,
     folder: &crate::types::MailboxName,
 ) -> Option<bifrost_types::PushSessionEvent> {
     match event {
-        IdleEvent::Bye { code, text } => Some(bifrost_types::PushSessionEvent::Failed(classify(
-            crate::Error::Bye {
-                code: code.clone(),
-                text: text.clone(),
-                attempt: None,
-            },
-            folder,
-        ))),
+        IdleEvent::Event(TypedEvent::Bye { code, text }) => {
+            Some(bifrost_types::PushSessionEvent::Failed(classify(
+                crate::Error::Bye {
+                    code: code.clone(),
+                    text: text.clone(),
+                    attempt: None,
+                },
+                folder,
+            )))
+        }
         IdleEvent::ServerTerminated => Some(bifrost_types::PushSessionEvent::Ended(
             bifrost_types::PushSessionEnd::Lost,
         )),
@@ -741,37 +742,43 @@ fn idle_event_ending(
     }
 }
 
+/// The account owns sync meaning. Even RECENT invalidates the selected
+/// mailbox: an enterprise user expects another client's delivery to appear.
+/// Local queue loss is never represented as a server ALERT.
 pub(crate) fn map_idle_event(
     event: IdleEvent,
     selected: &crate::types::MailboxName,
 ) -> Option<bifrost_types::PushSessionEvent> {
-    match event {
-        IdleEvent::Exists(_)
-        | IdleEvent::Expunge(_)
-        | IdleEvent::Vanished { .. }
-        | IdleEvent::Fetch(_)
-        | IdleEvent::Recent(_) => Some(invalidated(HintPayload::SpecificCursorScope(
-            folder_scope(selected),
-        ))),
-        IdleEvent::MailboxStatus { mailbox, .. } => Some(invalidated(
-            HintPayload::SpecificCursorScope(folder_scope(&mailbox)),
-        )),
-        IdleEvent::MailboxEvent(info) => Some(invalidated(HintPayload::SpecificCursorScope(
-            folder_scope(&info.name),
-        ))),
-        IdleEvent::MetadataChange { .. }
-        | IdleEvent::SearchUpdate(_)
-        | IdleEvent::StatusUpdate { .. }
-        | IdleEvent::NotificationOverflow { .. }
-        | IdleEvent::Alert(_)
-        // Never mapped: the driver delivers a BYE during IDLE as `idle()`'s
-        // error, and a `Bye` event, were one ever emitted, ends the session in
-        // `idle_event_ending` before mapping. The arm exists because the
-        // match must be total, and a coarse invalidation is the safe answer.
-        | IdleEvent::Bye { .. }
-        | IdleEvent::ExtensionEvent(_) => Some(invalidated(HintPayload::Unknown)),
-        IdleEvent::Timeout | IdleEvent::Cancelled | IdleEvent::ServerTerminated => None,
-    }
+    let IdleEvent::Event(event) = event else {
+        return None;
+    };
+    let payload = match event {
+        TypedEvent::Exists(_)
+        | TypedEvent::Expunge(_)
+        | TypedEvent::Vanished { .. }
+        | TypedEvent::FetchUpdate(_)
+        | TypedEvent::Recent(_) => HintPayload::SpecificCursorScope(folder_scope(selected)),
+        TypedEvent::MailboxStatus { mailbox, .. } => {
+            HintPayload::SpecificCursorScope(folder_scope(&mailbox))
+        }
+        TypedEvent::MailboxEvent(info) => {
+            HintPayload::SpecificCursorScope(folder_scope(&info.name))
+        }
+        TypedEvent::Extension(response) => match *response {
+            crate::types::UntaggedResponse::Metadata { mailbox, .. }
+                if !mailbox.as_str().is_empty() =>
+            {
+                HintPayload::SpecificCursorScope(folder_scope(&mailbox))
+            }
+            _ => HintPayload::Unknown,
+        },
+        TypedEvent::CapabilityChange(_) => return None,
+        TypedEvent::NotificationOverflow { .. }
+        | TypedEvent::QueueOverflow { .. }
+        | TypedEvent::Alert(_)
+        | TypedEvent::Bye { .. } => HintPayload::Unknown,
+    };
+    Some(invalidated(payload))
 }
 
 /// A round cancelled by a subscription change that moved this slot's
@@ -1053,10 +1060,10 @@ mod session_classification_tests {
         use bifrost_types::{PushSessionEnd as End, PushSessionEvent as E};
         let folder = crate::types::MailboxName::new("INBOX").unwrap();
         let denied = idle_event_ending(
-            &IdleEvent::Bye {
+            &IdleEvent::Event(TypedEvent::Bye {
                 code: Some(crate::types::ResponseCode::NoPerm),
                 text: "denied".into(),
-            },
+            }),
             &folder,
         );
         let Some(E::Failed(e)) = denied else {
@@ -1068,10 +1075,10 @@ mod session_classification_tests {
             "the classification alone would exclude; the arm must not"
         );
         let plain = idle_event_ending(
-            &IdleEvent::Bye {
+            &IdleEvent::Event(TypedEvent::Bye {
                 code: None,
                 text: "logging out".into(),
-            },
+            }),
             &folder,
         );
         assert!(
@@ -1083,7 +1090,7 @@ mod session_classification_tests {
             Some(E::Ended(End::Lost))
         ));
         for event in [
-            IdleEvent::Exists(2),
+            IdleEvent::Event(TypedEvent::Exists(2)),
             IdleEvent::Timeout,
             IdleEvent::Cancelled,
         ] {
@@ -1091,10 +1098,10 @@ mod session_classification_tests {
         }
         assert!(matches!(
             map_idle_event(
-                IdleEvent::Bye {
+                IdleEvent::Event(TypedEvent::Bye {
                     code: None,
                     text: "bye".into()
-                },
+                }),
                 &folder
             ),
             Some(E::Invalidated(InvalidationHint {
@@ -1102,6 +1109,63 @@ mod session_classification_tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn server_events_have_one_account_invalidation_policy() {
+        let selected = crate::types::MailboxName::new("INBOX").unwrap();
+        let archive = crate::types::MailboxName::new("Archive").unwrap();
+        let cases = [
+            (
+                TypedEvent::Recent(1),
+                HintPayload::SpecificCursorScope(folder_scope(&selected)),
+            ),
+            (
+                TypedEvent::from(crate::types::UntaggedResponse::Metadata {
+                    mailbox: archive.clone(),
+                    entries: vec![],
+                }),
+                HintPayload::SpecificCursorScope(folder_scope(&archive)),
+            ),
+            (
+                TypedEvent::from(crate::types::UntaggedResponse::Metadata {
+                    mailbox: crate::types::MailboxName::default(),
+                    entries: vec![],
+                }),
+                HintPayload::Unknown,
+            ),
+            (
+                TypedEvent::QueueOverflow {
+                    dropped_count: 3,
+                    since: std::time::Instant::now(),
+                },
+                HintPayload::Unknown,
+            ),
+            (
+                TypedEvent::NotificationOverflow {
+                    code: None,
+                    text: String::new(),
+                },
+                HintPayload::Unknown,
+            ),
+        ];
+        for (event, expected) in cases {
+            let Some(bifrost_types::PushSessionEvent::Invalidated(hint)) =
+                map_idle_event(IdleEvent::Event(event), &selected)
+            else {
+                panic!("expected invalidation");
+            };
+            match (hint.payload, expected) {
+                (HintPayload::Unknown, HintPayload::Unknown) => {}
+                (
+                    HintPayload::SpecificCursorScope(actual),
+                    HintPayload::SpecificCursorScope(expected),
+                ) => {
+                    assert_eq!(actual, expected);
+                }
+                other => panic!("unexpected invalidation: {other:?}"),
+            }
+        }
     }
 }
 

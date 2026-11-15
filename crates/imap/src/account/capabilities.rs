@@ -627,7 +627,7 @@ mod tests {
     #[test]
     fn thread_backed_methods_require_thread_references() {
         let references = ServerProfile::new(
-            vec![Capability::Thread("REFERENCES".to_owned())],
+            vec![Capability::from_imap_str("THREAD=REFERENCES")],
             Vec::new(),
         );
         let caps = build_capabilities(&references, &[], false, None, None, false, false, 1);
@@ -636,14 +636,14 @@ mod tests {
 
         // The capability match is case-insensitive on the algorithm name.
         let lowercase = ServerProfile::new(
-            vec![Capability::Thread("references".to_owned())],
+            vec![Capability::from_imap_str("THREAD=references")],
             Vec::new(),
         );
         let caps = build_capabilities(&lowercase, &[], false, None, None, false, false, 1);
         assert!(caps.pim_methods.search);
 
         let ordered_subject = ServerProfile::new(
-            vec![Capability::Thread("ORDEREDSUBJECT".to_owned())],
+            vec![Capability::from_imap_str("THREAD=ORDEREDSUBJECT")],
             Vec::new(),
         );
         let caps = build_capabilities(&ordered_subject, &[], false, None, None, false, false, 1);

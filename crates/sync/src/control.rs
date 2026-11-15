@@ -875,11 +875,11 @@ mod tests {
             scope: CursorScope::Account,
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Imap,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: state.to_vec(),
             },
             advanced_through: None,
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         })
     }
 
@@ -1040,7 +1040,7 @@ mod tests {
             partition: bifrost_types::Partition(partition.to_vec()),
             progress_marker: None,
             progress: bifrost_types::BackfillProgress::default(),
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         })
     }
 
@@ -1108,11 +1108,11 @@ mod tests {
             scope: CursorScope::Type(bifrost_types::ObjectType::Email),
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Imap,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: b"type-older".to_vec(),
             },
             advanced_through: None,
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         });
         let account_publication = control.expect_checkpoint(account_checkpoint.clone());
         let type_publication = control.expect_checkpoint(type_checkpoint.clone());

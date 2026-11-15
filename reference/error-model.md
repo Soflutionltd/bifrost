@@ -128,6 +128,15 @@ top-level taxonomy with per-family subkind enums:
 - `ControlWaitEnded` (flat): pause or checkpoint wait interrupted by account
   stop or control-channel closure. Cause `StateCause::ControlWaitEnded` retains
   support-only detail; message key `control.wait-ended`.
+- `AccountClosed` (flat): local refusal before dispatch on a closed account
+  incarnation. Cause `StateCause::AccountClosed`; key `account.closed`.
+  Recovery is terminal `Cancelled`, with no suggested remediation. An enterprise
+  Outlook user closing an account expects its work to stop, without a retry,
+  credential prompt, bug report or claim that an advertised feature is unsupported.
+  `AccountError::account_closed(operation, protocol)` owns construction, including
+  account scope; providers decorate it with their identity. This does not erase
+  transmission evidence for operations interrupted after dispatch: those retain
+  their existing failure and reconciliation classification.
 - `ConcurrencyConflict` (flat).
 - `Request(RequestErrorKind)` - `Malformed` / `BatchInputInvalid`.
 - `NotFound(ResourceKind)` - message, mailbox, thread, calendar, event,
@@ -329,6 +338,7 @@ operation is treated idempotent). The rules at altitude (read
 - **ControlWaitEnded** -> terminal `Cancelled`, with no retry, engine action,
   or suggested remediation. The account incarnation can no longer satisfy the
   wait; this does not blame the caller or claim a durable boundary.
+- **AccountClosed** -> terminal `Cancelled`, with no suggested remediation.
 - **ConcurrencyConflict** -> `Retry(AfterStateRefresh,
   ConcurrencyConflict)`.
 - **Request** (both subkinds) -> `ClientBug`.
@@ -541,7 +551,17 @@ name the same folder twice. No fourth lane and no parallel contract: an
 `stream.rs`. `ItemOutcome<T>` is the streaming counterpart -
 `Succeeded(BatchSuccess<T>)` / `Failed(BatchFailure)` /
 `Uncertain(BatchUncertain)` - the same closed three-lane model, emitted
-per item instead of collected. Deliberately not `#[non_exhaustive]`: a
+per item instead of collected. `ItemOutcome::from_submission_error(item, error)`
+owns whole-submission failure attribution. It uses the partial record's primary
+application when present, otherwise `Application::from_leaf`: classification-prefix
+InFlight, unreadable-success evidence or reconciling leaf recovery is Uncertain;
+other errors are Failed. Retry advice alone cannot decide application: an
+idempotent in-flight write can retry while still being uncertain. Earlier committed
+legs do not make an explicitly refused primary uncertain. Producers retain per-id
+progress outside the helper when it proves earlier accepted bodies or non-dispatch.
+Enterprise mail users expect ambiguous writes checked and explicit refusals reported
+without losing known earlier effects.
+Deliberately not `#[non_exhaustive]`: a
 wildcard arm would let stale consumer policy silently apply to a new
 lane. `MutationSuccess::{Applied, Skipped, Downgraded { actual }}` is the
 mutation success payload, and the three are distinct answers to
@@ -829,3 +849,16 @@ plan. A missing provider hint means one second; stream-owned reconnect backoff
 may impose a larger floor. Publication remains producer-owned: a terminal
 outcome already broadcast by drive/fusion is not broadcast again by recovery.
 An injected watch has no incarnation identity and retains unstamped routing.
+
+## Persisted cursor decode ownership
+
+`cursor::CursorDecodeFault::builder` is the shared classification owner for
+protocol-tag mismatch, future/retired payload layout, malformed payload, scope
+mismatch and account identity mismatch. All but a readable scope mismatch use
+`SyncState(SchemaIncompatible)`; a scope mismatch uses `CursorInvalid` and must
+carry the cursor scope. Rebuilding unreadable durable state, including dependent
+backfill state, is preferable to silent gaps for an enterprise user. Account
+identity mismatch clears account state because none of its retained scopes can
+safely consume another account's token. These are local durable-state faults,
+never provider protocol faults. Provider-native expired tokens retain their
+existing scope-restart policy.

@@ -16,6 +16,50 @@ use base64::engine::DecodePaddingMode;
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use std::sync::LazyLock;
 
+/// Negotiated mailbox wire encoding. Conversion and canonicality live here so
+/// display decoding never silently becomes a new server address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WireMode {
+    ModifiedUtf7,
+    Utf8,
+}
+
+impl From<bool> for WireMode {
+    fn from(utf8: bool) -> Self {
+        if utf8 { Self::Utf8 } else { Self::ModifiedUtf7 }
+    }
+}
+
+impl WireMode {
+    pub(crate) fn encode(self, name: &str) -> String {
+        // Only the exact INBOX token is case-insensitive. An Outlook user
+        // selecting an Inbox child expects the server's exact LIST address.
+        if name.eq_ignore_ascii_case("INBOX") {
+            return "INBOX".to_owned();
+        }
+        self.encode_component(name)
+    }
+
+    pub(crate) fn encode_component(self, name: &str) -> String {
+        match self {
+            Self::Utf8 => name.to_owned(),
+            Self::ModifiedUtf7 => encode_utf7(name),
+        }
+    }
+
+    pub(crate) fn decode(self, bytes: &[u8]) -> (String, bool) {
+        let display = match self {
+            Self::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+            Self::ModifiedUtf7 => decode_utf7(bytes),
+        };
+        // INBOX casing is canonical identity, but must not fold a malformed
+        // shifted spelling of INBOX into the reserved mailbox.
+        let canonical = bytes == self.encode(&display).as_bytes()
+            || (display.eq_ignore_ascii_case("INBOX") && bytes == display.as_bytes());
+        (display, canonical)
+    }
+}
+
 /// Modified Base64 alphabet string for IMAP UTF-7 (RFC 3501 Section 5.1.3).
 ///
 /// Standard Base64 with `/` replaced by `,`.

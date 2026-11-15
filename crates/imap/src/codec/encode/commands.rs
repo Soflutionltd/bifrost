@@ -563,24 +563,7 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
 /// mailboxes, and any other site that carries a decoded mailbox name
 /// as `&str` rather than [`MailboxName`].
 pub(crate) fn encode_mailbox_str(name: &str, utf8: bool) -> String {
-    // RFC 3501 Section 5.1: INBOX is case-insensitive.
-    if name.eq_ignore_ascii_case("INBOX") {
-        return "INBOX".to_owned();
-    }
-    // Only the exact INBOX token is special (RFC 3501 Section 5.1). An INBOX
-    // child such as `inbox/Sub` is sent as spelled, never rewritten to
-    // `INBOX/Sub`: child names are case-sensitive, the server's hierarchy
-    // delimiter is not known here, and the names callers pass come from the
-    // server's own LIST spelling. An enterprise user acting on a subfolder of
-    // Inbox expects the command to reach exactly the folder the server listed;
-    // a rewrite could only ever repair a spelling no server reported, and on a
-    // server whose children are listed in another case it would address a
-    // different (or missing) folder.
-    if utf8 {
-        name.to_owned()
-    } else {
-        crate::codec::utf7::encode_utf7(name)
-    }
+    crate::codec::utf7::WireMode::from(utf8).encode(name)
 }
 
 /// Encode a [`MailboxName`] for the wire.
@@ -612,7 +595,14 @@ pub(super) fn encode_mailbox_argument(
     name: &crate::types::MailboxArgument,
     utf8: bool,
 ) -> Result<Vec<u8>, crate::Error> {
-    encode_mailbox_name(&name.0, utf8)
+    match name {
+        crate::types::MailboxArgument::Name(name) => encode_mailbox_name(name, utf8),
+        crate::types::MailboxArgument::Text(text) => {
+            let name = MailboxName::new(text.clone())
+                .map_err(|err| crate::Error::InvalidInput(err.to_string().into()))?;
+            encode_mailbox_name(&name, utf8)
+        }
+    }
 }
 
 /// Encode a command that takes a single mailbox argument as a quoted-or-literal string.

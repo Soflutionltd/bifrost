@@ -1,5 +1,8 @@
 # bifrost-graph reference
 
+Push registration refused because the account is closed uses the shared
+`AccountClosed` / terminal `Cancelled` classification, with account scope.
+
 Generic net translation receives `throttle_scope_for()` explicitly for REST and EWS.
 The context-free helper supplies the Account fallback; mailbox budget attribution
 remains context-dependent at the classified throttle sites.
@@ -1010,7 +1013,9 @@ The mail cache, hydration observations, mutation preflight maps and
 accept `&GraphETag` through the wire funnel; batch builders convert validators
 to strings only when constructing serialized headers. Shared account values
 such as `ServerVersion::ETag`, `ContactCard::etag` and `CalendarEvent::etag`
-remain strings and are explicitly converted at the Graph boundary.
+carry `bifrost_types::EntityTag`. `GraphETag` wraps that shared type while
+retaining its explicit OData/change-key constructors. Weak Graph validators
+retain their exact wire spelling and remain supported on conditional writes.
 
 ### Per-batch byte accounting
 
@@ -1189,7 +1194,8 @@ it and inventory recognition preserves the scoped restart; resume returns `Curso
 scope. The engine acknowledged no page position, so this does not clear every
 scope as a schema reset would.
 `changes_stream` cross-checks that payload kind projects back to
-`cursor.scope`; mismatches terminate with `SyncState(SchemaIncompatible)`.
+`cursor.scope`; readable scope mismatches terminate with `SyncState(CursorInvalid)`
+and restart only that scope through the shared `CursorDecodeFault` policy.
 `establish_initial_cursor` accepts delta-eligible `FolderType` scopes (email,
 event/calendar event, contact) plus any `CursorScope::Folder` in the
 public-folder routing map; both mint the first cursor through inventory. A delta
@@ -3010,3 +3016,29 @@ acknowledged-chunk counts and partial-commit records stay in `account/cloud.rs`.
 Empty data or a zero chunk size reaching that driver is an internal refusal
 before a chunk request. Redirect classification is shared; transport redirect
 following remains disabled at the existing anonymous request boundary.
+
+## Session credential transport
+
+Pre-authenticated upload session sends use
+`AccountNet::session_request(method, &SessionUrl)`, which jointly suppresses the
+account bearer, redacts transport URL diagnostics and disables redirects.
+Provider URL admission remains local; the shared credential wrapper does not
+admit an origin. Users expect upload credentials and payloads to stay on the
+admitted destination. The shared resumable driver still owns chunk sequencing.
+
+Whole-batch mutation errors use `ItemOutcome::from_submission_error` after
+Graph translation and per-message scope decoration. Unreadable success evidence
+comes from the translator, without a separate JSON-error verdict.
+
+### Persisted cursor decoding
+
+Payload header validation uses `OpaqueChangeState::open` in bifrost-types.
+`CursorDecodeFault::builder` owns recovery classification: wrong protocol,
+unreadable layout or malformed bytes require `SchemaIncompatible`; a readable
+payload under a different scope requires `CursorInvalid` with that scope.
+Account identity mismatch requires schema clearing because no retained scope can
+safely consume another account's token. An enterprise user expects durable state
+to rebuild without blaming the provider or silently missing mail.
+Payload versions use `PayloadVersion`; change and backfill outer versions use
+`TraitEnvelopeVersion`. These are separate types with explicit numeric access
+for storage; existing wire values are unchanged.

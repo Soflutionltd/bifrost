@@ -1,7 +1,7 @@
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, ChangeCursor,
     CursorScope, DiagnosticText, ObjectId, OpaqueChangeState, Protocol, ProtocolKind, RequestCause,
-    RequestErrorKind, SyncStateErrorKind, ThreadId,
+    RequestErrorKind, ThreadId,
 };
 
 use crate::types::MailboxName;
@@ -55,27 +55,37 @@ pub(crate) fn encode_cursor(scope: CursorScope, cursor: &FolderCursor) -> Change
         scope,
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::Imap,
-            envelope_version: ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(ENVELOPE_VERSION),
             bytes: encode_folder_cursor(cursor),
         },
         advanced_through: None,
-        envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+            bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        ),
     }
 }
 
 pub(crate) fn decode_cursor(cursor: &ChangeCursor) -> Result<FolderCursor, AccountError> {
-    if cursor.server_state.protocol != ProtocolKind::Imap {
-        return Err(schema_incompatible(
-            "cursor protocol mismatch: expected IMAP",
-        ));
-    }
-    if cursor.server_state.envelope_version != ENVELOPE_VERSION {
-        return Err(schema_incompatible(&format!(
-            "unsupported IMAP cursor envelope version {}",
-            cursor.server_state.envelope_version
-        )));
-    }
-    decode_folder_cursor(&cursor.server_state.bytes)
+    let bytes = cursor
+        .server_state
+        .open(
+            ProtocolKind::Imap,
+            bifrost_types::PayloadVersion::new(ENVELOPE_VERSION),
+        )
+        .map_err(|fault| {
+            fault
+                .builder(Protocol::Imap, AccountOperation::SyncChanges)
+                .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
+                .try_build()
+                .expect("valid account error classification")
+        })?;
+    decode_folder_cursor(bytes).map_err(|error| {
+        error
+            .into_builder()
+            .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
+            .try_build()
+            .expect("valid account error classification")
+    })
 }
 
 fn encode_folder_cursor(cursor: &FolderCursor) -> Vec<u8> {
@@ -567,16 +577,11 @@ pub(super) fn malformed(detail: &str, op: AccountOperation) -> AccountError {
 /// unrecognizable, which triggers the `SchemaIncompatible` engine
 /// directive to clear cursor state and re-establish from inventory.
 fn schema_incompatible(detail: &str) -> AccountError {
-    use bifrost_types::StateCause;
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-        Cause::State(StateCause::SchemaIncompatible),
-    )
-    .protocol(Protocol::Imap)
-    .operation(AccountOperation::EstablishCursor)
-    .text(DiagnosticText::support_only(detail.to_owned()))
-    .try_build()
-    .expect("valid account error classification")
+    bifrost_types::CursorDecodeFault::Malformed
+        .builder(Protocol::Imap, AccountOperation::SyncChanges)
+        .text(DiagnosticText::support_only(detail.to_owned()))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 #[cfg(test)]
@@ -708,7 +713,8 @@ mod tests {
                 known_uids_complete: true,
             },
         );
-        change.server_state.envelope_version = ENVELOPE_VERSION + 1;
+        change.server_state.envelope_version =
+            bifrost_types::PayloadVersion::new(ENVELOPE_VERSION + 1);
         let err = decode_cursor(&change).expect_err("should fail on version mismatch");
         assert!(
             matches!(

@@ -113,7 +113,7 @@ fn lane_page(scope: &CursorScope, partition: &str, done: u64) -> bifrost_types::
             items_done: done,
             items_estimated: None,
         },
-        envelope_version: 1,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
     })
 }
 
@@ -266,11 +266,11 @@ async fn a_discard_fences_the_backfill_lane_and_leaves_live_acks_alone() {
         scope: scope.clone(),
         server_state: bifrost_types::OpaqueChangeState {
             protocol: bifrost_types::ProtocolKind::Imap,
-            envelope_version: 1,
+            envelope_version: bifrost_types::PayloadVersion::new(1),
             bytes: vec![7],
         },
         advanced_through: None,
-        envelope_version: 1,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
     };
     let live_checkpoint = bifrost_types::Checkpoint::Change(live);
     let live_publication = control.publish_checkpoint_without_report(live_checkpoint.clone());
@@ -763,7 +763,7 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
             items_done: 99,
             items_estimated: None,
         },
-        envelope_version: crate::cursor::ENGINE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(crate::cursor::ENGINE_VERSION),
     });
     let marker_publication =
         publish_a_marker(&coverage, &marker, coverage.undelivered_watermark(&scope));
@@ -782,7 +782,7 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
             items_done: 199,
             items_estimated: None,
         },
-        envelope_version: crate::cursor::ENGINE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(crate::cursor::ENGINE_VERSION),
     });
     let retry_tag = coverage.undelivered_watermark(&scope);
     let _retry_marker_publication = publish_a_marker(&coverage, &retry_marker, retry_tag);
@@ -1612,11 +1612,11 @@ fn change_cursor(bytes: &[u8]) -> ChangeCursor {
         scope: email_scope(),
         server_state: bifrost_types::OpaqueChangeState {
             protocol: bifrost_types::ProtocolKind::Imap,
-            envelope_version: crate::cursor::ENGINE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(crate::cursor::ENGINE_VERSION),
             bytes: bytes.to_vec(),
         },
         advanced_through: None,
-        envelope_version: crate::cursor::ENGINE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(crate::cursor::ENGINE_VERSION),
     }
 }
 
@@ -1668,7 +1668,7 @@ fn backfill_checkpoint_at(
             items_done,
             items_estimated: None,
         },
-        envelope_version: crate::cursor::ENGINE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(crate::cursor::ENGINE_VERSION),
     })
 }
 
@@ -2551,11 +2551,11 @@ async fn an_aborted_reattach_spares_a_cursor_an_ack_has_claimed() {
             scope: CursorScope::Folder(FolderId(name.into())),
             server_state: OpaqueChangeState {
                 protocol: ProtocolKind::Imap,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: vec![1],
             },
             advanced_through: None,
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         }
     }
 
@@ -2681,11 +2681,11 @@ impl ProvisionalWriter {
                     scope: Self::scope(name),
                     server_state: OpaqueChangeState {
                         protocol: ProtocolKind::Imap,
-                        envelope_version: 1,
+                        envelope_version: bifrost_types::PayloadVersion::new(1),
                         bytes: vec![1],
                     },
                     advanced_through: None,
-                    envelope_version: 1,
+                    envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
                 },
                 done,
             })
@@ -3524,11 +3524,11 @@ fn disable_scope_deletes_cursor_and_drops_membership() {
         scope: scope.clone(),
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::Imap,
-            envelope_version: 1,
+            envelope_version: bifrost_types::PayloadVersion::new(1),
             bytes: Vec::new(),
         },
         advanced_through: None,
-        envelope_version: 1,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
     };
     cursors.put(mk(&shared));
     cursors.put(mk(&sibling));
@@ -3574,7 +3574,7 @@ fn checkpoint_on(
             items_done,
             items_estimated: None,
         },
-        envelope_version: 1,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
     }
 }
 

@@ -358,7 +358,7 @@ impl BackfillRunner {
         partition: InventoryPartition,
         live: &LiveSupersedes,
         changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
-        envelope_version: u32,
+        envelope_version: bifrost_types::TraitEnvelopeVersion,
         control: Option<&SyncControl>,
         coverage: Option<&Arc<crate::cursor::PendingCoverage>>,
         writer_tx: Option<&tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>>,

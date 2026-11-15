@@ -46,7 +46,7 @@ async fn an_external_consumer_can_still_build_and_use_the_writer() {
                 items_done: 50,
                 items_estimated: None,
             },
-            envelope_version: 1,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         })
         .await
         .expect("the direct route still writes");

@@ -43,6 +43,22 @@ struct AccountErrorInner {
 }
 
 impl AccountError {
+    /// Refuse work on a closed account incarnation before dispatch.
+    #[must_use]
+    pub fn account_closed(operation: AccountOperation, protocol: Protocol) -> Self {
+        // An Outlook user expects closing an account to stop its work, without
+        // a retry, credential prompt, or claim that the feature is unsupported.
+        super::builder::AccountErrorBuilder::new(
+            AccountErrorKind::AccountClosed,
+            super::cause::Cause::State(super::cause::StateCause::AccountClosed),
+        )
+        .operation(operation)
+        .protocol(protocol)
+        .scope(ErrorScope::Account)
+        .try_build()
+        .expect("valid closed account error classification")
+    }
+
     /// Refuse an operation locally, with its protocol and canonical classification.
     /// Add scope, provider, or diagnostics through [`Self::into_builder`].
     #[must_use]
@@ -494,6 +510,23 @@ mod tests {
         AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, RequestCause,
         RequestErrorKind,
     };
+
+    #[test]
+    fn closed_account_is_terminal_cancellation_without_remediation() {
+        let error = AccountError::account_closed(AccountOperation::Send, Protocol::Gmail);
+        assert_eq!(error.kind(), &AccountErrorKind::AccountClosed);
+        assert_eq!(error.recovery(), &RecoveryClass::Cancelled);
+        assert!(error.recovery().is_terminal());
+        assert_eq!(error.message_key(), "account.closed");
+        assert_eq!(error.scope(), Some(&ErrorScope::Account));
+        assert_eq!(error.operation(), Some(AccountOperation::Send));
+        assert_eq!(error.protocol(), Some(Protocol::Gmail));
+        assert!(error.suggested_remediation().is_none());
+        assert!(matches!(
+            error.chain().outermost(),
+            Cause::State(super::super::cause::StateCause::AccountClosed)
+        ));
+    }
 
     fn request_error() -> AccountError {
         AccountErrorBuilder::new(

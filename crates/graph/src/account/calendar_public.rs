@@ -692,7 +692,7 @@ fn project(folder: &str, node: &Node) -> Result<CalendarEvent, ews::EwsError> {
         calendar_id: foreign::public_calendar(folder),
         native_id: native.clone(),
         uid: node.value("UID"),
-        etag: id.change_key.clone(),
+        etag: id.change_key.clone().map(Into::into),
         provenance: CalendarProvenance {
             provider: ProtocolKind::Graph,
             native,

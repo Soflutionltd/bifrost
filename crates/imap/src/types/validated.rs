@@ -354,7 +354,7 @@ pub(crate) fn validate_atom_bytes(bytes: &[u8], context: &str) -> Result<(), Val
 /// # Parse-don't-validate discipline
 ///
 /// `MailboxName` has caller and codec construction paths: [`MailboxName::new`]
-/// (public, validating) and `from_wire` / `from_decoded` (codec-private, **not**
+/// (public, validating) and `from_wire` / `from_decoded` (crate-private, **not**
 /// validating). `from_wire` retains the original address; `from_decoded`
 /// retains only display text. A parsed name's display form is valid UTF-8; do not assume the NUL / CR /
 /// LF exclusion for names you did not construct yourself. Injection safety on
@@ -365,7 +365,17 @@ pub(crate) fn validate_atom_bytes(bytes: &[u8], context: &str) -> Result<(), Val
 /// this internal type; external doctests cannot name it through the private
 /// protocol module.
 #[derive(Debug, Clone)]
-pub struct MailboxName(String, Option<(Vec<u8>, bool)>);
+pub struct MailboxName(String, MailboxWire, (bool, Vec<u8>));
+
+#[derive(Debug, Clone)]
+enum MailboxWire {
+    Canonical,
+    Raw {
+        bytes: Vec<u8>,
+        mode: crate::codec::utf7::WireMode,
+        canonical: bool,
+    },
+}
 
 #[cfg(test)]
 mod mailbox_conversion_contract {
@@ -414,7 +424,7 @@ impl MailboxName {
                  RFC 9051 Section 2.2)",
             ));
         }
-        Ok(Self(s, None))
+        Ok(Self::from_decoded(s))
     }
 
     /// Return the inner string.
@@ -424,40 +434,60 @@ impl MailboxName {
 
     /// Retain the address separately from the lenient display decoding.
     pub(crate) fn from_wire(s: String, bytes: &[u8], utf8: bool) -> Self {
-        Self(s, Some((bytes.to_vec(), utf8)))
+        let mode = crate::codec::utf7::WireMode::from(utf8);
+        let (decoded, canonical) = mode.decode(bytes);
+        // A mismatched display must never authorize a mode conversion.
+        let canonical = canonical && decoded == s;
+        Self::from_wire_decoded(s, bytes, mode, canonical)
+    }
+
+    pub(crate) fn from_wire_decoded(
+        s: String,
+        bytes: &[u8],
+        mode: crate::codec::utf7::WireMode,
+        canonical: bool,
+    ) -> Self {
+        let utf8 = mode == crate::codec::utf7::WireMode::Utf8;
+        let identity = if canonical {
+            Self::canonical_identity(&s)
+        } else {
+            (utf8 && bytes != s.as_bytes(), bytes.to_vec())
+        };
+        Self(
+            s,
+            MailboxWire::Raw {
+                bytes: bytes.to_vec(),
+                mode,
+                canonical,
+            },
+            identity,
+        )
     }
 
     /// Original octets apply only in the mode in which they were received.
     pub(crate) fn wire_bytes(&self, utf8: bool) -> Option<&[u8]> {
-        self.1
-            .as_ref()
-            .filter(|(_, mode)| *mode == utf8)
-            .map(|(bytes, _)| bytes.as_slice())
+        match &self.1 {
+            MailboxWire::Raw { bytes, mode, .. }
+                if *mode == crate::codec::utf7::WireMode::from(utf8) =>
+            {
+                Some(bytes)
+            }
+            _ => None,
+        }
     }
 
-    // Canonical server spellings compare equal to caller-created names.
-    // Noncanonical octets must remain distinct even when display decoding
-    // collapses them; malformed UTF-8 needs a separate identity domain.
-    fn identity(&self) -> (bool, Vec<u8>) {
-        // RFC 3501 Section 5.1 reserves only the exact name INBOX. Keep the
-        // display spelling and account_id unchanged: enterprise users expect
-        // stored folder ids to survive upgrades, while registry keys and
-        // response correlation must recognize the same inbox. Never fold a
-        // hierarchy prefix or a noncanonical wire spelling into another folder.
-        if self.0.eq_ignore_ascii_case("INBOX")
-            && self
-                .1
-                .as_ref()
-                .is_none_or(|(bytes, _)| bytes == self.0.as_bytes())
-        {
-            return (false, b"INBOX".to_vec());
-        }
-        let canonical = crate::codec::utf7::encode_utf7(&self.0).into_bytes();
-        match &self.1 {
-            Some((bytes, false)) => (false, bytes.clone()),
-            Some((bytes, true)) if bytes != self.0.as_bytes() => (true, bytes.clone()),
-            _ => (false, canonical),
-        }
+    fn canonical_identity(display: &str) -> (bool, Vec<u8>) {
+        (
+            false,
+            crate::codec::utf7::WireMode::ModifiedUtf7
+                .encode(display)
+                .into_bytes(),
+        )
+    }
+
+    // Construction pays the conversion cost once; registry probes only borrow.
+    fn identity(&self) -> &(bool, Vec<u8>) {
+        &self.2
     }
 
     /// Stable account identity. Ordinary canonical names keep their existing ids;
@@ -465,15 +495,12 @@ impl MailboxName {
     pub(crate) fn account_id(&self) -> String {
         use base64::Engine;
         const PREFIX: &str = "~imap-wire:";
-        if self.identity() == Self::from_decoded(self.0.clone()).identity()
-            && !self.0.starts_with(PREFIX)
-            && Self::new(self.0.clone()).is_ok()
-        {
+        if self.can_reencode() && !self.0.starts_with(PREFIX) && Self::new(self.0.clone()).is_ok() {
             return self.0.clone();
         }
         let (utf8, bytes) = self.identity();
-        let mut payload = vec![u8::from(utf8)];
-        payload.extend_from_slice(&bytes);
+        let mut payload = vec![u8::from(*utf8)];
+        payload.extend_from_slice(bytes);
         format!(
             "{PREFIX}{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
@@ -485,7 +512,7 @@ impl MailboxName {
         self.as_str().cmp(other.as_str()).then_with(|| {
             let (mode, bytes) = self.identity();
             let (other_mode, other_bytes) = other.identity();
-            bytes.cmp(&other_bytes).then(mode.cmp(&other_mode))
+            bytes.cmp(other_bytes).then(mode.cmp(other_mode))
         })
     }
 
@@ -514,18 +541,14 @@ impl MailboxName {
                 "invalid mailbox identity payload",
             ));
         }
-        let display = if mode == 1 {
-            String::from_utf8_lossy(bytes).into_owned()
-        } else {
-            crate::codec::utf7::decode_utf7(bytes)
-        };
+        let (display, _) = crate::codec::utf7::WireMode::from(mode == 1).decode(bytes);
         Ok(Self::from_wire(display, bytes, mode == 1))
     }
 
     pub(crate) fn child(&self, delimiter: char, leaf: &str) -> Result<Self, ValidationError> {
         let display = Self::new(format!("{}{delimiter}{leaf}", self.0))?;
         Self::new(leaf)?;
-        if let Some((bytes, utf8)) = &self.1 {
+        if let MailboxWire::Raw { bytes, mode, .. } = &self.1 {
             // Hierarchy syntax is meaningful in the wire address, not in a
             // lenient display decoding. Never reconstruct a noncanonical parent.
             if !delimiter.is_ascii() && !self.can_reencode() {
@@ -537,20 +560,20 @@ impl MailboxName {
             if delimiter.is_ascii() {
                 let mut raw = bytes.clone();
                 raw.extend_from_slice(delimiter.to_string().as_bytes());
-                let leaf = if *utf8 {
-                    leaf.to_owned()
-                } else {
-                    crate::codec::utf7::encode_utf7(leaf)
-                };
+                let leaf = mode.encode_component(leaf);
                 raw.extend_from_slice(leaf.as_bytes());
-                return Ok(Self::from_wire(display.0, &raw, *utf8));
+                return Ok(Self::from_wire(
+                    display.0,
+                    &raw,
+                    *mode == crate::codec::utf7::WireMode::Utf8,
+                ));
             }
         }
         Ok(display)
     }
 
     pub(crate) fn parent(&self, delimiter: char) -> Result<Option<Self>, ValidationError> {
-        if let Some((bytes, utf8)) = &self.1 {
+        if let MailboxWire::Raw { bytes, mode, .. } = &self.1 {
             if !delimiter.is_ascii() && !self.can_reencode() {
                 return Err(ValidationError::new(
                     ValidationReason::NonAsciiHierarchyDelimiter,
@@ -566,12 +589,12 @@ impl MailboxName {
                     return Ok(None);
                 };
                 let raw = &bytes[..index];
-                let display = if *utf8 {
-                    String::from_utf8_lossy(raw).into_owned()
-                } else {
-                    crate::codec::utf7::decode_utf7(raw)
-                };
-                return Ok(Some(Self::from_wire(display, raw, *utf8)));
+                let (display, _) = mode.decode(raw);
+                return Ok(Some(Self::from_wire(
+                    display,
+                    raw,
+                    *mode == crate::codec::utf7::WireMode::Utf8,
+                )));
             }
         }
         self.0
@@ -581,7 +604,14 @@ impl MailboxName {
     }
 
     pub(crate) fn can_reencode(&self) -> bool {
-        self.identity() == Self::from_decoded(self.0.clone()).identity()
+        matches!(
+            self.1,
+            MailboxWire::Canonical
+                | MailboxWire::Raw {
+                    canonical: true,
+                    ..
+                }
+        )
     }
 
     /// Command correlation uses the same identity as registry keys and hashing.
@@ -597,7 +627,8 @@ impl MailboxName {
     /// it cannot recover a noncanonical server spelling; the parser uses
     /// `from_wire` instead. CR/LF are safely framed by the command writer.
     pub(crate) fn from_decoded(s: String) -> Self {
-        Self(s, None)
+        let identity = Self::canonical_identity(&s);
+        Self(s, MailboxWire::Canonical, identity)
     }
 }
 
@@ -627,14 +658,46 @@ impl<T: MailboxInput + ?Sized> MailboxInput for &T {
     }
 }
 
-/// Command arguments accept caller text or a retained server address. Text is
-/// validated by the encoder, where literal framing safely handles CR and LF.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct MailboxArgument(pub(crate) MailboxName);
+/// Command arguments retain caller text until the encoder invokes the same
+/// validating constructor as mailbox command helpers. Server addresses stay typed.
+#[derive(Debug, Clone)]
+pub(crate) enum MailboxArgument {
+    Text(String),
+    Name(MailboxName),
+}
+
+impl MailboxArgument {
+    #[cfg(test)]
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Text(text) => text,
+            Self::Name(name) => name.as_str(),
+        }
+    }
+
+    fn identity(&self) -> std::borrow::Cow<'_, (bool, Vec<u8>)> {
+        match self {
+            Self::Text(text) => std::borrow::Cow::Owned(MailboxName::canonical_identity(text)),
+            Self::Name(name) => std::borrow::Cow::Borrowed(name.identity()),
+        }
+    }
+}
+
+impl PartialEq for MailboxArgument {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+impl Eq for MailboxArgument {}
+impl std::hash::Hash for MailboxArgument {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(self.identity().as_ref(), state);
+    }
+}
 
 impl From<String> for MailboxArgument {
     fn from(value: String) -> Self {
-        Self(MailboxName::from_decoded(value))
+        Self::Text(value)
     }
 }
 impl From<&str> for MailboxArgument {
@@ -644,12 +707,12 @@ impl From<&str> for MailboxArgument {
 }
 impl From<MailboxName> for MailboxArgument {
     fn from(value: MailboxName) -> Self {
-        Self(value)
+        Self::Name(value)
     }
 }
 impl From<&MailboxName> for MailboxArgument {
     fn from(value: &MailboxName) -> Self {
-        Self(value.clone())
+        Self::Name(value.clone())
     }
 }
 
@@ -663,7 +726,7 @@ impl Eq for MailboxName {}
 
 impl std::hash::Hash for MailboxName {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(&self.identity(), state);
+        std::hash::Hash::hash(self.identity(), state);
     }
 }
 
@@ -673,7 +736,7 @@ impl Default for MailboxName {
     /// The empty string is valid per RFC 5464 Section 4.2 (server-level
     /// METADATA) and RFC 3501 Section 6.3.8 (LIST reference name).
     fn default() -> Self {
-        Self(String::new(), None)
+        Self::from_decoded(String::new())
     }
 }
 

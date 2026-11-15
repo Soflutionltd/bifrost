@@ -22,7 +22,7 @@ nom = { workspace = true }
 futures = { workspace = true }
 idna = "1"
 
-bifrost-types = { path = "../types", optional = true }
+bifrost-types = { path = "../types" }
 bifrost-sasl = { path = "../sasl" }
 bifrost-net = { path = "../net" }
 getrandom = { workspace = true }
@@ -64,7 +64,7 @@ default = ["account-error"]
 
 test-support = ["tokio"]
 
-account-error = ["dep:bifrost-types"]
+account-error = []
 
 tokio = [
     "dep:tokio",

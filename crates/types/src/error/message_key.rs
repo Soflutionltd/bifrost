@@ -63,6 +63,7 @@ pub(crate) fn derive(kind: &AccountErrorKind) -> &'static str {
         }
         AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked) => "syncstate.scope-revoked",
         AccountErrorKind::ControlWaitEnded => "control.wait-ended",
+        AccountErrorKind::AccountClosed => "account.closed",
         AccountErrorKind::ConcurrencyConflict => "concurrency.conflict",
         AccountErrorKind::Request(RequestErrorKind::Malformed) => "request.malformed",
         AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid) => {

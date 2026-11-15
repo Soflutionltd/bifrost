@@ -256,10 +256,9 @@ pub(crate) fn subscribe<T: PushTransport>(
         let mut enabled_guard = state.enabled.lock().await;
         let mut push_state_guard = state.push_state.lock().await;
         if state.closed.load(Ordering::Acquire) {
-            return Err(super::error::unsupported_error(
+            return Err(bifrost_types::AccountError::account_closed(
                 AccountOperation::PushSubscribe,
-                None,
-                "JMAP account is closed",
+                bifrost_types::Protocol::Jmap,
             ));
         }
         let mut prospective = subscriptions_guard.clone();
@@ -1566,7 +1565,7 @@ mod tests {
         .expect_err("a waiter after close cannot re-enable push");
         assert_eq!(
             refused.kind(),
-            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
+            &bifrost_types::AccountErrorKind::AccountClosed
         );
         assert_eq!(applied.lock().expect("apply log").len(), 2);
     }

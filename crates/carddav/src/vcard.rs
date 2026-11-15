@@ -48,7 +48,7 @@ pub(crate) fn contact_from_vcard(
         id: ContactId(uri.clone()),
         address_book_id: address_book_id.clone(),
         native_id: uri.clone(),
-        etag,
+        etag: etag.map(Into::into),
         provenance: ContactProvenance {
             provider: ProtocolKind::CardDav,
             native: uri,

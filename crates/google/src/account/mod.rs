@@ -374,10 +374,11 @@ fn shutdown_account_future_error(
 }
 
 fn account_closed_error(operation: AccountOperation) -> AccountError {
-    error::into_account_error(
-        crate::Error::unsupported_with(operation, "account is closed"),
-        error::GmailErrorContext::base(operation),
-    )
+    AccountError::account_closed(operation, bifrost_types::Protocol::Gmail)
+        .into_builder()
+        .provider(bifrost_types::Provider::Gmail)
+        .try_build()
+        .expect("valid closed account error classification")
 }
 
 /// Runs the transport detach when the close future finishes OR is
@@ -1711,7 +1712,7 @@ mod tests {
             .expect_err("closed account refuses before polling the operation");
         assert!(matches!(
             error.kind(),
-            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::CalendarsList)
+            bifrost_types::AccountErrorKind::AccountClosed
         ));
         assert!(script.requests().is_empty());
     }

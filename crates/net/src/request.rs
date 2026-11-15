@@ -2727,8 +2727,8 @@ mod tests {
         let script = ScriptedDispatch::new([Canned::Pending]);
         let mut spec =
             crate::AccountSpec::new(Some(Arc::new(StaticTokenSource::new("test", None))));
-        spec.connect_timeout = None;
-        spec.response_headers_timeout = Some(Duration::from_secs(7));
+        spec.response_headers_timeout =
+            crate::ResponseHeadersTimeout::Bounded(Duration::from_secs(7));
         spec.default_retry = RetryPolicy::disabled();
         let account = crate::test_support::scripted_net(&script, NetConfig::default())
             .attach_account(crate::AccountId("connect-timeout".to_owned()), spec);
@@ -2934,7 +2934,8 @@ mod tests {
         ]);
         let mut spec =
             crate::AccountSpec::new(Some(Arc::new(StaticTokenSource::new("test", None))));
-        spec.response_headers_timeout = Some(Duration::from_secs(30));
+        spec.response_headers_timeout =
+            crate::ResponseHeadersTimeout::Bounded(Duration::from_secs(30));
         spec.default_retry = two_attempts();
         let account = crate::test_support::scripted_net(&script, NetConfig::default())
             .attach_account(crate::AccountId("redirect-deadline".to_owned()), spec);
@@ -4055,7 +4056,8 @@ mod tests {
     async fn capped_upload_preserves_body_length_and_excludes_admission_from_headers_timeout() {
         let script = ScriptedDispatch::new([canned(StatusCode::OK, b"")]);
         let mut spec = crate::AccountSpec::new(None);
-        spec.response_headers_timeout = Some(Duration::from_millis(100));
+        spec.response_headers_timeout =
+            crate::ResponseHeadersTimeout::Bounded(Duration::from_millis(100));
         let account = crate::test_support::scripted_net(&script, NetConfig::default())
             .attach_account(crate::AccountId("upload".into()), spec);
         account.set_bandwidth_cap(Some(10));
@@ -4085,7 +4087,8 @@ mod tests {
     async fn header_timeout_still_runs_after_upload_admission() {
         let script = ScriptedDispatch::new([Canned::Pending]);
         let mut spec = crate::AccountSpec::new(None);
-        spec.response_headers_timeout = Some(Duration::from_millis(100));
+        spec.response_headers_timeout =
+            crate::ResponseHeadersTimeout::Bounded(Duration::from_millis(100));
         let account = crate::test_support::scripted_net(&script, NetConfig::default())
             .attach_account(crate::AccountId("upload-stall".into()), spec);
         account.set_bandwidth_cap(Some(10));

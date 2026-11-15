@@ -10,7 +10,7 @@ use super::{
     CommandWriter, encode_mailbox_argument, validate_and_filter_flags, validate_append_datetime,
 };
 use crate::codec::encode::{EncodeOptions, LiteralForm};
-use crate::types::{AppendMessage, Flag};
+use crate::types::AppendMessage;
 
 /// Which syntax carries one message body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +85,7 @@ pub(crate) fn encode_append(
         }
 
         // Flags (RFC 3501 Section 6.3.11).
-        let flags: Vec<&Flag> = validate_and_filter_flags(&msg.flags, "APPEND")?;
+        let flags = validate_and_filter_flags(&msg.flags, "APPEND")?;
         if !flags.is_empty() {
             w.raw(b" (");
             for (n, flag) in flags.iter().enumerate() {

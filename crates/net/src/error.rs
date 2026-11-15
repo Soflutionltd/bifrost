@@ -304,7 +304,7 @@ pub enum Error {
     },
 
     /// Server attempted to redirect to a host outside the configured
-    /// `RedirectPolicy::trusted_hosts` allowlist. Returned by the
+    /// `RedirectPolicy::cross_origin` admission policy. Returned by the
     /// `bifrost-net` redirect loop before any further request is
     /// issued.
     #[error("redirect rejected: {message}")]

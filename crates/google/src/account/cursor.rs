@@ -57,28 +57,29 @@ pub(crate) fn encode_gmail_state(state: &GmailChangeState) -> OpaqueChangeState 
     let bytes = serde_json::to_vec(state).expect("GmailChangeState must serialize");
     OpaqueChangeState {
         protocol: GMAIL_PROTOCOL,
-        envelope_version: GMAIL_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::PayloadVersion::new(GMAIL_ENVELOPE_VERSION),
         bytes,
     }
 }
 
 pub(crate) fn decode_gmail_state(state: &OpaqueChangeState) -> Result<GmailChangeState, Error> {
-    if state.protocol != GMAIL_PROTOCOL {
-        return Err(cursor_error(
-            GmailCursorFailure::ProtocolMismatch,
-            format!("expected {GMAIL_PROTOCOL:?}, got {:?}", state.protocol),
-        ));
-    }
-    if state.envelope_version != GMAIL_ENVELOPE_VERSION {
-        return Err(cursor_error(
-            GmailCursorFailure::EnvelopeMismatch,
-            format!(
-                "expected envelope version {GMAIL_ENVELOPE_VERSION}, got {}",
-                state.envelope_version
-            ),
-        ));
-    }
-    let decoded: GmailChangeState = serde_json::from_slice(&state.bytes).map_err(|err| {
+    let bytes = state
+        .open(
+            GMAIL_PROTOCOL,
+            bifrost_types::PayloadVersion::new(GMAIL_ENVELOPE_VERSION),
+        )
+        .map_err(|fault| {
+            cursor_error(
+                match fault {
+                    bifrost_types::CursorDecodeFault::ProtocolMismatch => {
+                        GmailCursorFailure::ProtocolMismatch
+                    }
+                    _ => GmailCursorFailure::EnvelopeMismatch,
+                },
+                format!("Gmail cursor header: {fault:?}"),
+            )
+        })?;
+    let decoded: GmailChangeState = serde_json::from_slice(bytes).map_err(|err| {
         cursor_error(
             GmailCursorFailure::MalformedPayload,
             format!("cursor JSON decode failed: {err}"),
@@ -101,15 +102,23 @@ pub(crate) fn decode_gmail_state_for_profile(
     profile_email: &str,
 ) -> Result<GmailChangeState, Error> {
     let decoded = decode_gmail_state(state)?;
+    validate_gmail_profile(&decoded, profile_email)?;
+    Ok(decoded)
+}
+
+pub(super) fn validate_gmail_profile(
+    decoded: &GmailChangeState,
+    profile_email: &str,
+) -> Result<(), Error> {
     if !super::mailbox::MailboxAddress::from_provider_value(profile_email)
         .matches(&decoded.profile_email)
     {
         return Err(Error::Local(GmailLocalError::AccountIdentityMismatch {
-            cursor_email: decoded.profile_email,
+            cursor_email: decoded.profile_email.clone(),
             profile_email: profile_email.to_string(),
         }));
     }
-    Ok(decoded)
+    Ok(())
 }
 
 pub(crate) fn cursor_from_state(state: OpaqueChangeState) -> ChangeCursor {
@@ -117,7 +126,9 @@ pub(crate) fn cursor_from_state(state: OpaqueChangeState) -> ChangeCursor {
         scope: CursorScope::Account,
         server_state: state,
         advanced_through: None,
-        envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+            bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        ),
     }
 }
 
@@ -168,7 +179,7 @@ mod tests {
     #[test]
     fn rejects_envelope_version_mismatch() {
         let mut opaque = encode_gmail_state(&GmailChangeState::new(1, "a@example.test"));
-        opaque.envelope_version = 2;
+        opaque.envelope_version = bifrost_types::PayloadVersion::new(2);
         let err = decode_gmail_state(&opaque).expect_err("envelope mismatch");
         assert_cursor_kind(err, GmailCursorFailure::EnvelopeMismatch);
     }
@@ -211,7 +222,7 @@ mod tests {
         });
         let opaque = OpaqueChangeState {
             protocol: GMAIL_PROTOCOL,
-            envelope_version: GMAIL_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(GMAIL_ENVELOPE_VERSION),
             bytes: serde_json::to_vec(&payload).expect("serialize"),
         };
         let err = decode_gmail_state(&opaque).expect_err("schema mismatch");
@@ -230,7 +241,7 @@ mod tests {
     fn rejects_empty_bytes() {
         let opaque = OpaqueChangeState {
             protocol: GMAIL_PROTOCOL,
-            envelope_version: GMAIL_ENVELOPE_VERSION,
+            envelope_version: bifrost_types::PayloadVersion::new(GMAIL_ENVELOPE_VERSION),
             bytes: Vec::new(),
         };
         let err = decode_gmail_state(&opaque).expect_err("empty bytes");
@@ -241,7 +252,10 @@ mod tests {
     fn cursor_for_history_round_trips_via_envelope() {
         let cursor = cursor_for_history(99, "a@example.test");
         assert_eq!(cursor.scope, CursorScope::Account);
-        assert_eq!(cursor.envelope_version, GMAIL_ENVELOPE_VERSION);
+        assert_eq!(
+            cursor.envelope_version.get(),
+            bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION
+        );
         let decoded =
             decode_gmail_state_for_profile(&cursor.server_state, "a@example.test").expect("decode");
         assert_eq!(decoded.history_id, 99);

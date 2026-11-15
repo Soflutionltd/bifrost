@@ -569,7 +569,7 @@ async fn schema_recovery_clears_the_completion_marker_of_an_unregistered_scope()
                 partition: bifrost_sync::backfill::partitioner::completion_partition(),
                 progress_marker: None,
                 progress: Default::default(),
-                envelope_version: 1,
+                envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
             },
         )
         .await

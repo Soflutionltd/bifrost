@@ -742,6 +742,27 @@ A compare-and-swap primitive on `CheckpointStore` would remove the class
 outright. It was considered and deliberately not taken - it is a published trait
 change, so it is an owner-level proposal rather than hardening work.
 
+Attach starts the ack writer before cursor discovery and establishment, after
+restoring the durable coverage proof order. Its cursor reads, schema reset and
+fresh cursor persistence use `WriterHandle`; no attach-time durable mutation
+bypasses the writer. Until slot installation an abort-on-drop owner retains the
+writer task, so a setup failure or cancellation cannot detach it. Registrations
+remain unpublished until discovery and establishment succeed. Deferred inventory
+captures the current coverage fence after any schema reset, since the writer's
+reset advances that fence even when no producer has started.
+
+`engine/reattach.rs::establishment` owns the common stored-versus-fresh cursor
+decision, resume-hook classification, initial establishment and fresh-envelope
+validation. Attach defers inventory until subscription; recovery and reattach
+run fusion inline under the caller's captured fence. Writer resume reads retain
+reattach attempt ownership. Only freshly created Ready cursors need a new
+durable write. An unreadable stored row resets the whole account only during attach
+preflight; a replacement preserves it because it can still abort while the live
+account acknowledges newer work. `recovery::classify_envelope` uses explicit
+fresh or stored provenance: fresh invalid envelopes are scoped terminal account
+contract failures, while stored invalid envelopes retain schema recovery. An
+enterprise user must not lose healthy checkpoints to repair a faulty producer.
+
 The same boundary covers recovery. `RecoveryContext` holds a `WriterHandle`,
 not `Arc<DynCheckpointStore>`. Scope restart, disable, schema reset, established
 cursor persistence, vanished-scope cleanup, and reattach compensation are all
@@ -3482,6 +3503,8 @@ by older readers. Version 8 adds the `ControlWaitEnded` account error kind
 (kind tag 11), rejected in older-version rows. Version 9 adds Google provider
 (tag 6) and GoogleCalendar, GooglePeople and GoogleDrive protocols (tags 10-12).
 Versions 3 through 8 remain readable, but reject these new tags as corruption.
+Version 10 adds `AccountClosed` (kind tag 12), rejected in older-version rows.
+Versions 3 through 9 remain readable without that tag.
 Existing tags and layouts are unchanged; the readable minimum remains 3.
 
 Decode VALIDATES, never heals: a duplicated entry, barrier or lineage key,
@@ -4390,7 +4413,7 @@ ids carry one.
 
 These are representation wrappers, not a storage migration. Ledger generation
 fields and discharge fingerprints still use the same eight little-endian bytes;
-the ledger envelope remains version 9. Backfill completion progress still writes
+they did not bump the ledger envelope version. Backfill completion progress still writes
 `items_done = observed + 1` (saturating) and `items_estimated = observed`.
 Publication segments and counters retain their existing packed representation.
 Before exposing registrations or starting producers, attach loads the durable
@@ -4437,3 +4460,14 @@ connection could label an old event as belonging to its replacement. Terminal
 campaign items retain their accounting instead of stopping unrelated items.
 These differences preserve one notification and the actual failure's ownership,
 while shared dispatch prevents timing and throttle policy from drifting.
+
+## Cursor version axes
+
+`OpaqueChangeState::envelope_version` uses `PayloadVersion` while
+`ChangeCursor::envelope_version` and `BackfillCheckpoint::envelope_version` use
+`TraitEnvelopeVersion`. Change and backfill share the outer storage envelope,
+so those two deliberately share a type; neither can accept a payload version.
+The storage codec explicitly extracts and reconstructs numeric values without
+changing their little-endian wire representation. Protocol-owned payload opening
+and decode-fault recovery belong to bifrost-types (`OpaqueChangeState::open`
+and `CursorDecodeFault::builder`), rather than provider-specific recovery tables.

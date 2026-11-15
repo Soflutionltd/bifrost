@@ -1551,3 +1551,33 @@ also true when composed into IMAP. Enterprise users expect all discovered
 collections to sync; there is no single-collection limit to report. Discovery
 failures still fail the standalone open and are classified skips at the IMAP
 composition boundary.
+
+## Shared entity validators
+
+`bifrost_types::EntityTag` owns strong/weak classification and preserves the
+original token bytes. `ServerVersion::ETag`, `ContactCard.etag` and
+`CalendarEvent.etag` carry this type. HTTP caller-token validation lives on the
+shared type; a token without a weak marker still needs syntax validation before
+it is accepted as an HTTP precondition. `StrongTag` has a private field.
+
+DAV `SnapshotEntry.etag` also carries the shared type. Snapshot encoding still
+writes the original string and decoding classifies that string, preserving the
+persisted format. Wire XML/header adapters retain string inputs and normalize
+DAV tags before account projection. `PutCondition::from_tag` consumes the
+classified account validator; weak observed tags retain the existing
+unconditional-save behavior, while weak caller preconditions are refused.
+Users can keep saving on weak-only servers, but those saves cannot promise
+lost-update protection.
+
+### Persisted cursor decoding
+
+Payload header validation uses `OpaqueChangeState::open` in bifrost-types.
+`CursorDecodeFault::builder` owns recovery classification: wrong protocol,
+unreadable layout or malformed bytes require `SchemaIncompatible`; a readable
+payload under a different scope requires `CursorInvalid` with that scope.
+Account identity mismatch requires schema clearing because no retained scope can
+safely consume another account's token. An enterprise user expects durable state
+to rebuild without blaming the provider or silently missing mail.
+Payload versions use `PayloadVersion`; change and backfill outer versions use
+`TraitEnvelopeVersion`. These are separate types with explicit numeric access
+for storage; existing wire values are unchanged.

@@ -884,7 +884,7 @@ mod tests {
             uid: Some(3),
             flags: Some(vec![
                 crate::types::Flag::Seen,
-                crate::types::Flag::Custom("$Important".to_owned()),
+                crate::types::Flag::from_imap_str("$Important"),
             ]),
             ..Default::default()
         };

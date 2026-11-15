@@ -656,6 +656,7 @@ pub(crate) fn send_message<T: HttpTransport>(
                 native.to_owned()
             }
         };
+        request.validate_recipients()?;
         let personal_identity = request.identity.clone();
         let identity = if let Some(foreign) = foreign.as_ref() {
             let selected = foreign_sending_identity(&mail, request.identity.as_ref()).await?;
@@ -698,9 +699,6 @@ pub(crate) fn send_message<T: HttpTransport>(
             .chain(&request.bcc)
             .cloned()
             .collect::<Vec<_>>();
-        if scheduled.is_some() && envelope_recipients.is_empty() {
-            return Err(scheduled_requires_envelope());
-        }
         if scheduled.is_some() && request.from.is_none() && identity.is_none() {
             if let Some(identity_id) = personal_identity.as_ref() {
                 let selected = primary_sending_identity(&mail, identity_id).await?;

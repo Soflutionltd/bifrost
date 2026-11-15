@@ -33,26 +33,6 @@ request, so a forged or stale handle steers the provider. Gmail and JMAP refuse
 regardless. Proposal: providers re-derive handle capability from the `BlobId`
 they minted rather than reading it off the caller's handle.
 
-## BUG-006 - A freshly minted cursor with a bad envelope gets three classifications
-
-**Reported by:** sync-engine (P2/P3, sites already disagree).
-
-When an `Account` hands the engine a brand-new `ChangeCursor` whose envelope
-fails `validate_envelope()`:
-
-| Site | Classification |
-|---|---|
-| `multiplexer/changes.rs::drive_changes_stream` | `fresh_cursor_contract_error`: `Internal(AccountContract)`, terminal, scoped |
-| `multiplexer/mod.rs::fuse_inventory_done` | same |
-| `engine/reattach.rs::run_establish`, `Ready` arm | `cursor_decode_failure`: `SyncState(SchemaIncompatible)`, deriving the persisted-schema directive |
-| `engine/attach.rs::persist_cursor` | bare `Error::SchemaIncompatible`, failing the whole attach |
-
-`reference/sync.md` says fresh account-authored envelopes are contract failures
-and schema recovery is reserved for persisted envelopes; two sites contradict
-it. Owner: one function taking the cursor's origin,
-`classify_envelope(cursor, Origin::Fresh | Origin::Stored)`, called by every
-site. The two establishment paths that host two of these sites are CON-017.
-
 ## BUG-016 - The backfill completion marker wins resume selection by a magic number, and can lose
 
 **Reported by:** sync-lanes (latent; live once any provider adopts partitioning).
@@ -334,56 +314,6 @@ status-line precedent applies: net exports the status classification, and JMAP
 overrides only the JMAP-typed problem types (`limit`, `unknownCapability`,
 `notJSON`, `notRequest`).
 
-## BUG-073 - Account crates classify the same cursor-decode failures differently; JMAP and Gmail are exactly inverted
-
-**Reported by:** types (LATENT), jmap-account (live disagreement), graph, google.
-
-The google hunter confirms the Google arm (`GmailCursorFailure::MalformedPayload`
--> `SyncState(CursorInvalid)` -> `RestartScope(Account)`) against Graph's and
-JMAP's `SchemaIncompatible`, and proposes `OpaqueChangeState::decode::<T>(protocol,
-version)` returning one typed `CursorDecodeError` with one mapping in the error
-model. It also notes `changes.rs` re-implements
-`decode_gmail_state_for_profile`'s identity check inline instead of calling it.
-
-The graph hunter adds that Graph (`cursor::decode_cursor`) splits newer
-(`EnvelopeUnknown`) from older (`SchemaIncompatible`) and then maps both to
-`SchemaIncompatible` anyway, while IMAP, CalDAV and CardDAV use strict equality;
-its owner is `OpaqueChangeState::open(expected_protocol, expected_version) ->
-Result<&[u8], InnerEnvelopeMismatch>` with the one mapping onto `AccountError`.
-
-The types hunter's sites: `imap/src/account/envelope.rs::decode_cursor`,
-`carddav/src/account.rs::decode_cursor_snapshot`, `caldav/src/account.rs` (same
-shape), `graph/src/account/cursor.rs::decode_cursor`,
-`jmap/src/sync/state.rs::decode`, `google/src/account/cursor.rs::decode_gmail_state`.
-It read them as converging on `SyncState(SchemaIncompatible)` by different routes:
-Graph and JMAP split newer (`EnvelopeUnknown`) from older (`SchemaIncompatible`);
-IMAP, DAV and Gmail do not distinguish direction; DAV merges protocol and version
-into one message; IMAP stamps `AccountOperation::EstablishCursor` even when
-decoding for `changes_stream`; Gmail mints its own message keys.
-
-The jmap-account hunter found they do not converge:
-
-| Failure | JMAP (`changes::stream`) | Gmail (`InvalidCursor`) | Graph (`cursor_error_to_account_error`) | IMAP (`envelope.rs`) |
-|---|---|---|---|---|
-| wrong `protocol` tag | `CursorInvalid` (restart scope) | `SchemaIncompatible` (account clear) | `SchemaIncompatible` | `SchemaIncompatible` |
-| malformed payload bytes | `SchemaIncompatible` | `CursorInvalid` | `SchemaIncompatible` | `SchemaIncompatible` |
-
-JMAP and Gmail are exactly inverted, each with a comment arguing its own choice.
-The protocol-tag check is protocol-neutral (it compares
-`OpaqueChangeState::protocol` with the account's own protocol), so four crates
-should not answer it at all. Within JMAP the mapping is also built inline in
-`changes::stream` rather than in `error.rs`, outside the module carrying
-`#![warn(dead_code)]`.
-
-Owner: `bifrost-types` (or the engine, which knows `account.protocol()` before
-dispatch). The types hunter's shape: `OpaqueChangeState::payload_for(protocol,
-version) -> Result<&[u8], PayloadMismatch { Protocol, Older, Newer }>` plus one
-`AccountError` constructor, each crate supplying only operation and scope. The
-jmap-account hunter's: a shared `CursorDecodeFault { ProtocolMismatch,
-FutureVersion, RetiredVersion, Malformed, ScopeMismatch }` -> `AccountError`
-mapping every crate calls. The interchangeable version integers beneath it are
-STR-007.
-
 ## BUG-075 - Graph presents its Graph-audience token to EWS and Autodiscover
 
 **Reported by:** graph (probable live; not observable hermetically).
@@ -414,42 +344,6 @@ classification. The classification of a snapshot state belongs on `TokenSnapshot
 (or in net's projection). Token-lookup failures themselves are now classified
 once, by `bifrost_net::token_source_account_error`, for IMAP, ManageSieve and
 SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
-
-## BUG-100 - A SCRAM server error other than `invalid-proof` is `AuthLost` on IMAP and `PolicyBlocked` on SMTP
-
-**Reported by:** smtp-sasl (drift).
-
-SMTP `From<SaslError>`: `invalid-proof` -> `ErrorKind::Authentication` (AuthLost);
-any other value -> `InvalidInput` + Auth phase -> `Authorization(PolicyBlocked)`,
-pinned by `a_scram_policy_error_carries_its_rung_through_the_policy_lane`. IMAP
-`From<SaslError>` and `AuthenticateScramConsumer::named_sasl_error`: every
-`AuthFailed` -> `Error::Auth` -> `ReauthorizationRequired` -> AuthLost. So
-`e=channel-binding-not-supported` is a policy block on SMTP and "re-enter your
-password" on IMAP, for the same server and credential. IMAP's comment says it
-"mirrors `bifrost_smtp`'s `named_sasl_error`; the two crates must not differ" - they
-differ in the class and agree only on the message suffix. Root cause: the server
-error is prose with a magic prefix (STR-133). Owner: bifrost-sasl, via a typed
-`ScramServerError` and one `is_credential_rejection()` / `refusal_class()`.
-
-## BUG-104 - The reverse path depends on which door sends the message
-
-**Reported by:** smtp-sasl (drift).
-
-Given RFC 5322 headers, which address is the reverse path: bifrost-smtp
-`Envelope::try_from(&Headers)` lets `Sender` win over `From` (pinned by
-`envelope_from_headers_sender`); IMAP `pim.rs::parse_draft_for_submission`
-(draft_send, send_raw_message) takes first `From`, else first `Sender`, else the
-configured default; bifrost-types `mime::render` (send_message) uses the resolved
-`from` (request or default) and does not model `Sender`. The same raw message sent
-through bifrost-smtp's `Transport::send` and through the IMAP account's
-`send_raw_message` gets a different MAIL FROM; RFC 5322 makes `Sender` the agent
-responsible for transmission, the conventional bounce target, and IMAP chose the
-opposite without saying why. Owner: one `HeaderMap::submission_envelope()` in
-bifrost-types used by IMAP and by `Envelope::try_from`. Adjacent: when a draft has
-no Message-ID, `parse_draft_for_submission` falls back to the constant
-`bifrost.draft@{domain}`, so every such draft from one domain gets the same id,
-which then becomes the "stable fallback id" on the receipt
-(`append_to_sent_or_fallback`) - not unique by construction.
 
 ## BUG-170 - Small wave 10 lateral findings across Google, Graph, JMAP and IMAP
 
@@ -511,6 +405,56 @@ which then becomes the "stable fallback id" on the receipt
 - Google `flags::eq_flag` now compares label flags (id and advisory name)
   case-sensitively, where the whole string used to compare ASCII
   case-insensitively. Probably intended; no test pins it.
+
+## BUG-172 - Small wave 12 lateral findings across sync, net, Google, Graph, SASL and providers
+
+**Reported by:** wave 12 fixers (lateral).
+
+- Sync `engine/attach.rs`: cancelling `attach` can leave `lifecycle_inflight`
+  occupied, because removal happens only after its awaited setup returns.
+- bifrost-net `AccountNet::session_request` returns a general
+  `RequestBuilder`, which still lets a caller explicitly re-enable redirects;
+  the session policy is only documented, not enforced.
+- Google raw and stored-draft sends still delegate recipient validation to
+  Gmail, unlike the shared check in `bifrost_types::compose`.
+- Closed-account guards are not universal across provider methods: the shared
+  `AccountClosed` kind replaced existing refusals, but many methods have no
+  lifecycle gate at all.
+- Graph `account/public_folder.rs` emits `Done` after some `Terminated`
+  inventory events.
+- bifrost-sasl SCRAM server-final parsing still accepts an empty `e=` and a
+  message carrying both `e=` and `v=`.
+- Sync `engine/attach.rs` `AttachingWriter` aborts the checkpoint writer task
+  on any attach error or cancellation before slot installation; an abort landing
+  inside a store await could interrupt a multi-statement durable write
+  (`reset_account_for_schema_recovery`, `persist_established`). Closing the
+  channel and awaiting the writer may be the correct teardown.
+- Google `MutationProgress`: `terminal_outcomes` and `shutdown_outcomes` are
+  identical wrappers over `outcomes_before_stop`; shutdown stays correct only
+  because `shutdown_inflight_error` carries InFlight evidence, which no test
+  pins.
+- dav-core `etag.rs` keeps `normalize_http_etag` and `prepare_if_match`, which
+  restate strong/weak classification beside `bifrost_types::EntityTag`.
+- `EntityTag::valid_http(false)` rejects a lowercase `w/` prefix while `parse`
+  accepts it case-insensitively.
+- Gmail: a malformed cursor payload now maps to `SchemaIncompatible` (account
+  clear) through `CursorDecodeFault::Malformed`, where it used to be
+  `CursorInvalid` with a scope restart. Matches the engine's stance on
+  unreadable rows; confirm it is intended.
+- `bifrost_types::compose::validate_send_recipients` builds its error without
+  a protocol stamp, so empty-send refusals lost the `Protocol` JMAP's scheduled
+  path used to stamp; it could take a `Protocol` argument.
+- Graph `cursor_error_to_account_error` maps protocol mismatch, unknown envelope
+  and schema incompatibility all to `CursorDecodeFault::Malformed`, losing which
+  failure it was; JMAP `changes::stream` maps every `JmapCursorError::Other` to
+  `ScopeMismatch`, so a future `Other` would silently restart a scope.
+- `EntityTag::parse` classifies after `trim()` while `as_str` and `valid_http`
+  use the untrimmed value (unreachable from current producers).
+- Sync `reattach::run_establish` runs `pacing.wait` twice on a stored resume
+  path, and once before an unreadable row is classified where it used to fail
+  first.
+- SMTP `TooManyFrom` is now unused (multiple From with one Sender is accepted)
+  but is still a public error variant.
 
 ## BUG-167 - IMAP discovery still advertises DAV scopes that were excluded, and namespace-prefix failures use account scope
 

@@ -36,7 +36,7 @@ pub use account::{
 pub use connection::ImapConfig;
 pub use types::{AuthPolicy, Credentials};
 
-pub(crate) use connection::{ImapConnection, typed_event::TypedEvent};
+pub(crate) use connection::ImapConnection;
 pub(crate) use error::Error;
 
 /// Result type alias for IMAP operations.

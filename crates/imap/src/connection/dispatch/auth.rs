@@ -12,20 +12,25 @@ use super::{Consumer, ConsumerContext, ContinuationConsumer, ContinuationReply, 
 
 /// Map a `bifrost-sasl` computation failure back into the IMAP error model.
 ///
-/// Protocol-class messages stay `Error::Protocol`; a SCRAM `e=` server error
-/// (the auth-failure lane) stays `Error::auth_with_code(.., None)`. A
-/// caller credential that fails SASLprep is `InvalidInput`: it is refused
-/// while the consumer is built, before AUTHENTICATE is submitted, so it is a
-/// local refusal and must neither blame the server nor retire the connection.
+/// Protocol errors remain protocol errors; typed SCRAM refusals retain the
+/// shared refusal class until account translation. Invalid credentials are
+/// refused locally before AUTHENTICATE and never retire the connection.
 impl From<bifrost_sasl::SaslError> for Error {
     fn from(e: bifrost_sasl::SaslError) -> Self {
         match e {
             bifrost_sasl::SaslError::Protocol(m) => Error::Protocol(m),
             bifrost_sasl::SaslError::InvalidCredential(m) => Error::InvalidInput(m.into()),
-            bifrost_sasl::SaslError::AuthFailed(m) => Error::auth_with_code(m, None),
+            bifrost_sasl::SaslError::LocalRuntime(m) => Error::LocalRuntime(m),
+            bifrost_sasl::SaslError::ServerRejected(refusal) => Error::Auth {
+                text: refusal.to_string(),
+                code: None,
+                mechanism: None,
+                scram: Some(refusal),
+                attempt: None,
+            },
             // `SaslError` is `#[non_exhaustive]`; any future variant is an
-            // unclassified auth failure until it is mapped explicitly.
-            other => Error::auth_with_code(other.to_string(), None),
+            // mapping gap until it is handled explicitly.
+            other => Error::Internal(other.to_string()),
         }
     }
 }
@@ -42,7 +47,7 @@ impl From<bifrost_sasl::SaslError> for Error {
 /// and carried to the diagnostics tier rather than reconstructed later.
 fn require_ok_auth(
     tagged: TaggedResponse,
-    mechanism: &'static str,
+    mechanism: AuthMechanism,
 ) -> Result<TaggedResponse, Error> {
     match tagged.status {
         StatusKind::Ok => Ok(tagged),
@@ -81,7 +86,7 @@ impl Consumer for LoginConsumer {
         // `buffered` is `Either`-classified data whose only carrier is the
         // event stream, so a rejected LOGIN surrenders it rather than
         // dropping it with the consumer.
-        if let Err(e) = require_ok_auth(tagged, AuthMechanism::Login.name()) {
+        if let Err(e) = require_ok_auth(tagged, AuthMechanism::Login) {
             return Finalized::failure(e, self.buffered);
         }
         Finalized::success((), self.buffered)
@@ -127,7 +132,7 @@ impl Consumer for AuthenticatePlainConsumer {
 
     fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         // Surrender the `Either` buffer on both arms.
-        if let Err(e) = require_ok_auth(tagged, AuthMechanism::Plain.name()) {
+        if let Err(e) = require_ok_auth(tagged, AuthMechanism::Plain) {
             return Finalized::failure(e, self.buffered);
         }
         Finalized::success((), self.buffered)
@@ -201,7 +206,19 @@ impl Consumer for AuthenticateXoauth2Consumer {
 
     fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         // Surrender the `Either` buffer on both arms.
-        if let Err(e) = require_ok_auth(tagged, self.mechanism.name()) {
+        if let Err(e) = require_ok_auth(
+            tagged,
+            match self.mechanism {
+                bifrost_sasl::OAuthMechanism::Xoauth2 => AuthMechanism::XOAuth2,
+                bifrost_sasl::OAuthMechanism::OAuthBearer => AuthMechanism::OAuthBearer,
+                _ => {
+                    return Finalized::failure(
+                        Error::Internal("unmapped OAuth mechanism".into()),
+                        self.buffered,
+                    );
+                }
+            },
+        ) {
             return Finalized::failure(e, self.buffered);
         }
         Finalized::success((), self.buffered)
@@ -266,7 +283,7 @@ impl Consumer for AuthenticateCramMd5Consumer {
 
     fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         // Surrender the `Either` buffer on both arms.
-        if let Err(e) = require_ok_auth(tagged, AuthMechanism::CramMd5.name()) {
+        if let Err(e) = require_ok_auth(tagged, AuthMechanism::CramMd5) {
             return Finalized::failure(e, self.buffered);
         }
         Finalized::success((), self.buffered)
@@ -346,36 +363,31 @@ impl AuthenticateScramConsumer {
         })
     }
 
-    /// Wire mechanism token for this exchange, taken from the same
-    /// `bifrost_sasl` authority that built the AUTHENTICATE command line, so
-    /// the diagnostic can never name a different rung than the one sent.
-    fn mechanism_name(&self) -> &'static str {
-        self.mechanism.mechanism_name(self.binding.binding())
+    /// Derive the diagnostic rung from the exchange hash and binding.
+    fn mechanism(&self) -> AuthMechanism {
+        match (self.mechanism, self.binding.binding()) {
+            (ScramHash::Sha1, bifrost_sasl::ChannelBinding::None) => AuthMechanism::ScramSha1,
+            (ScramHash::Sha256, bifrost_sasl::ChannelBinding::None) => AuthMechanism::ScramSha256,
+            (ScramHash::Sha1, _) => AuthMechanism::ScramSha1Plus,
+            (ScramHash::Sha256, _) => AuthMechanism::ScramSha256Plus,
+            _ => unreachable!("unsupported SCRAM hash"),
+        }
     }
 
-    /// Re-message a `bifrost-sasl` failure so it names this rung, then route
-    /// it through the crate's `From<SaslError>` split. The classification is
-    /// untouched: `Protocol` stays protocol-class, `AuthFailed` stays on the
-    /// auth-failure lane. Only the message grows, and the account boundary
-    /// turns that message into SUPPORT-ONLY `DiagnosticText`. Mirrors
-    /// `bifrost_smtp`'s `named_sasl_error`; the two crates must not differ in
-    /// what a SCRAM refusal can tell an operator.
+    /// Classify through the shared owner before adding the selected rung.
     fn named_sasl_error(&self, error: bifrost_sasl::SaslError) -> Error {
-        let mechanism = self.mechanism_name();
-        match error {
-            bifrost_sasl::SaslError::Protocol(m) => {
-                Error::Protocol(format!("{m} (mechanism {mechanism})"))
+        let mechanism = self.mechanism();
+        let mut mapped = Error::from(error);
+        match &mut mapped {
+            Error::Auth {
+                mechanism: stamp, ..
+            } => *stamp = Some(mechanism),
+            Error::Protocol(message) => {
+                message.push_str(&format!(" (mechanism {})", mechanism.name()));
             }
-            bifrost_sasl::SaslError::InvalidCredential(m) => {
-                Error::InvalidInput(format!("{m} (mechanism {mechanism})").into())
-            }
-            bifrost_sasl::SaslError::AuthFailed(m) => {
-                Error::auth_with_mechanism(m, None, mechanism)
-            }
-            // `SaslError` is `#[non_exhaustive]`; any future variant is an
-            // unclassified auth failure, matching the `From` impl above.
-            other => Error::auth_with_mechanism(other.to_string(), None, mechanism),
+            _ => {}
         }
+        mapped
     }
 
     pub(crate) fn initial_response(&self) -> SecretString {
@@ -403,7 +415,7 @@ impl Consumer for AuthenticateScramConsumer {
 
     fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         // Surrender the `Either` buffer on every arm.
-        if let Err(e) = require_ok_auth(tagged, self.mechanism_name()) {
+        if let Err(e) = require_ok_auth(tagged, self.mechanism()) {
             return Finalized::failure(e, self.buffered);
         }
         if self.state != ScramState::Done {
@@ -624,7 +636,7 @@ mod tests {
         // the wire. If it does not stamp the name here, "which mechanism was
         // refused" is unrecoverable downstream - which is why it is asserted
         // on every consumer rather than only on one.
-        fn mechanism_of(err: Error) -> Option<&'static str> {
+        fn mechanism_of(err: Error) -> Option<AuthMechanism> {
             match err {
                 Error::Auth { mechanism, .. } => mechanism,
                 other => panic!("tagged NO must be an auth failure, got {other:?}"),
@@ -650,7 +662,7 @@ mod tests {
             ),
             // The PLUS suffix must survive: an operator debugging a channel
             // binding problem needs to see which of the two rungs was refused.
-            Some("SCRAM-SHA-256-PLUS"),
+            Some(AuthMechanism::ScramSha256Plus),
         );
 
         let plain = AuthenticatePlainConsumer::new("payload".to_owned().into(), true);
@@ -662,7 +674,7 @@ mod tests {
                     .err()
                     .unwrap()
             ),
-            Some("PLAIN"),
+            Some(AuthMechanism::Plain),
         );
 
         let cram = AuthenticateCramMd5Consumer::new("user".to_owned(), "pw".to_owned().into());
@@ -674,7 +686,7 @@ mod tests {
                     .err()
                     .unwrap()
             ),
-            Some("CRAM-MD5"),
+            Some(AuthMechanism::CramMd5),
         );
 
         let login = LoginConsumer::default();
@@ -686,7 +698,7 @@ mod tests {
                     .err()
                     .unwrap()
             ),
-            Some("LOGIN"),
+            Some(AuthMechanism::Login),
         );
 
         // The XOAUTH2 consumer is shared by two mechanisms, so its token is
@@ -705,7 +717,10 @@ mod tests {
                         .err()
                         .unwrap()
                 ),
-                Some(mechanism.name()),
+                Some(match mechanism {
+                    bifrost_sasl::OAuthMechanism::Xoauth2 => AuthMechanism::XOAuth2,
+                    _ => AuthMechanism::OAuthBearer,
+                }),
             );
         }
     }

@@ -22,7 +22,7 @@ pub enum ServerVersion {
     /// IMAP CONDSTORE / QRESYNC per-message MODSEQ.
     ModSeq(u64),
     /// HTTP entity tag, including Graph wire tags and DAV normalized tags.
-    ETag(String),
+    ETag(crate::EntityTag),
     /// Gmail historyId snapshot covering this item.
     HistoryAt(u64),
     /// JMAP State string covering this item.
@@ -43,29 +43,10 @@ impl ServerVersion {
         operation: crate::error::AccountOperation,
         strong: bool,
     ) -> Result<&str, crate::error::AccountError> {
-        if let Self::ETag(etag) = self {
-            let weak = etag
-                .get(..2)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"));
-            if strong
-                && !weak
-                && etag
-                    .bytes()
-                    .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80)
-            {
-                return Ok(etag);
-            }
-            let value = etag.strip_prefix("W/").unwrap_or(etag);
-            if (!strong || !etag.starts_with("W/"))
-                && value.starts_with('"')
-                && value.ends_with('"')
-                && value.len() >= 2
-                && value[1..value.len() - 1]
-                    .bytes()
-                    .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80)
-            {
-                return Ok(etag);
-            }
+        if let Self::ETag(etag) = self
+            && etag.valid_http(strong)
+        {
+            return Ok(etag.as_str());
         }
         Err(crate::error::AccountError::unsupported(operation, protocol))
     }

@@ -1,7 +1,6 @@
 use super::Address;
 use crate::Error;
-use crate::message::header::{self, Headers};
-use crate::message::{Mailbox, Mailboxes};
+use crate::message::header::Headers;
 
 /// Simple email envelope representation
 ///
@@ -166,36 +165,26 @@ impl TryFrom<&Headers> for Envelope {
     type Error = Error;
 
     fn try_from(headers: &Headers) -> Result<Self, Self::Error> {
-        let from = match headers.get::<header::Sender>() {
-            // If there is a Sender, use it
-            Some(sender) => Some(Mailbox::from(sender).email),
-            // ... else try From
-            None => match headers.get::<header::From>() {
-                Some(header::From(a)) => {
-                    let mut from: Vec<Mailbox> = a.into();
-                    if from.len() > 1 {
-                        return Err(Error::TooManyFrom);
-                    }
-                    let from = from.pop().expect("From header has 1 Mailbox");
-                    Some(from.email)
-                }
-                None => None,
-            },
-        };
-
-        fn add_addresses_from_mailboxes(
-            addresses: &mut Vec<Address>,
-            mailboxes: Option<Mailboxes>,
-        ) {
-            if let Some(mailboxes) = mailboxes {
-                addresses.extend(mailboxes.into_iter().map(|mb| mb.email));
-            }
-        }
-        let mut to = vec![];
-        add_addresses_from_mailboxes(&mut to, headers.get::<header::To>().map(|h| h.0));
-        add_addresses_from_mailboxes(&mut to, headers.get::<header::Cc>().map(|h| h.0));
-        add_addresses_from_mailboxes(&mut to, headers.get::<header::Bcc>().map(|h| h.0));
-
+        // The reverse-path rule lives in bifrost-types so SMTP and IMAP draft
+        // submission agree. A single From wins over Sender (a delegate sending
+        // for a shared mailbox expects bounces at the mailbox); this reverses
+        // the inherited lettre Sender-first rule on purpose.
+        let raw = headers.to_string();
+        let headers = bifrost_types::mime::HeaderMap::parse(raw.as_bytes());
+        let (from, recipients) = headers
+            .submission_envelope()
+            .map_err(|detail| Error::InvalidInput(detail.to_owned()))?;
+        let from = from
+            .map(|address| address.address.parse())
+            .transpose()
+            .map_err(|error: crate::address::AddressError| {
+                Error::InvalidInput(error.to_string())
+            })?;
+        let to = recipients
+            .into_iter()
+            .map(|address| address.address.parse())
+            .collect::<Result<Vec<Address>, _>>()
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
         Self::new(from, to)
     }
 }

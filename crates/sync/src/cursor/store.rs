@@ -474,7 +474,9 @@ mod resume_tests {
                 items_done: count,
                 items_estimated: None,
             },
-            envelope_version: crate::cursor::ENGINE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                crate::cursor::ENGINE_VERSION,
+            ),
         }
     }
 

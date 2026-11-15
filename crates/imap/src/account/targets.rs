@@ -33,8 +33,7 @@
 //! unaccounted for cannot go unnoticed.
 
 use bifrost_types::{
-    AccountError, AccountOperation, BatchFailure, BatchItemId, BatchSuccess, BatchUncertain,
-    ItemOutcome,
+    AccountError, AccountOperation, BatchFailure, BatchItemId, BatchSuccess, ItemOutcome,
 };
 
 use super::envelope::DecodedObjectId;
@@ -255,7 +254,7 @@ impl TargetBatch {
 pub(crate) enum Verdict<T> {
     Succeeded(T),
     Failed(AccountError),
-    Uncertain(AccountError),
+    SubmissionError(AccountError),
 }
 
 /// The permit to answer for exactly one id.
@@ -289,9 +288,7 @@ impl Target {
                 ItemOutcome::Succeeded(BatchSuccess::new(self.item, value))
             }
             Verdict::Failed(error) => ItemOutcome::Failed(BatchFailure::new(self.item, error)),
-            Verdict::Uncertain(error) => {
-                ItemOutcome::Uncertain(BatchUncertain::new(self.item, error))
-            }
+            Verdict::SubmissionError(error) => ItemOutcome::from_submission_error(self.item, error),
         })
     }
 }

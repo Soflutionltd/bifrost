@@ -5453,7 +5453,7 @@ async fn a_stopped_session_logs_out_before_ending() {
 /// excluding the selected folder. The BYE arrives before the `+` grant, so the
 /// driver's grant wait raises it as `Error::Bye` and the session sees it
 /// through `idle()`'s error arm - the only way a BYE reaches the live session.
-/// The defensive `IdleEvent::Bye` arm is pinned by a unit test in `push.rs`.
+/// The defensive `TypedEvent::Bye` arm is pinned by a unit test in `push.rs`.
 #[tokio::test(start_paused = true)]
 async fn a_bye_never_excludes_the_selected_folder() {
     use bifrost_types::{Account, PushGate, PushLane, PushSessionEvent as E, SessionStop};
@@ -5504,7 +5504,7 @@ async fn a_bye_never_excludes_the_selected_folder() {
 ///
 /// The driver short-circuits an untagged BYE read during IDLE into
 /// `Error::Bye` before emitting any event, so on the wire the BYE reaches the
-/// session through `idle()`'s error arm, not as `IdleEvent::Bye`. The test
+/// session through `idle()`'s error arm, not as `TypedEvent::Bye`. The test
 /// pins the outcome on that live path.
 #[tokio::test(start_paused = true)]
 async fn bye_and_server_termination_close_the_connection() {

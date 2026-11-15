@@ -46,12 +46,11 @@ impl ServerProfile {
     /// Build a profile from capability and enabled-extension snapshots.
     pub fn new(capabilities: Vec<Capability>, enabled: Vec<String>) -> Self {
         let imap4rev2 = imap4rev2_active(&capabilities, &enabled);
-        // Directly constructed Auth/Thread payloads need not be canonical.
-        // Keep profile normalization until every producer uses from_imap_str.
+        // Capability parsing owns canonical suffix spelling; profiles project it.
         let auth_mechanisms = capabilities
             .iter()
             .filter_map(|cap| match cap {
-                Capability::Auth(mechanism) => Some(mechanism.to_ascii_uppercase()),
+                Capability::Auth(mechanism) => Some(mechanism.to_string()),
                 _ => None,
             })
             .collect();
@@ -80,7 +79,7 @@ impl ServerProfile {
         let thread_algorithms = capabilities
             .iter()
             .filter_map(|cap| match cap {
-                Capability::Thread(algorithm) => Some(algorithm.to_ascii_uppercase()),
+                Capability::Thread(algorithm) => Some(algorithm.to_string()),
                 _ => None,
             })
             .collect();
@@ -343,9 +342,9 @@ pub(crate) mod capability_matrix {
             Capability::ObjectId,
             Capability::QResync,
             Capability::Quota,
-            Capability::QuotaResource("STORAGE".to_owned()),
+            Capability::from_imap_str("QUOTA=RES-STORAGE"),
             Capability::QuotaSet,
-            Capability::Rights("texk".to_owned()),
+            Capability::from_imap_str("RIGHTS=texk"),
             Capability::Preview,
             Capability::SaslIr,
             Capability::SaveDate,
@@ -354,7 +353,7 @@ pub(crate) mod capability_matrix {
             Capability::SortDisplay,
             Capability::StartTls,
             Capability::SpecialUse,
-            Capability::Thread("REFERENCES".to_owned()),
+            Capability::from_imap_str("THREAD=REFERENCES"),
             Capability::StatusSize,
             Capability::StatusDeleted,
             Capability::UidPlus,
@@ -364,8 +363,8 @@ pub(crate) mod capability_matrix {
             Capability::Utf8Only,
             Capability::Within,
             Capability::XGmExt1,
-            Capability::Auth("PLAIN".to_owned()),
-            Capability::Other("X-VENDOR".to_owned()),
+            Capability::from_imap_str("AUTH=PLAIN"),
+            Capability::from_imap_str("X-VENDOR"),
         ]
     }
 

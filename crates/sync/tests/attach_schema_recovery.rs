@@ -99,11 +99,11 @@ fn cursor_for(scope: &CursorScope, state: &[u8]) -> ChangeCursor {
         scope: scope.clone(),
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: 1,
+            envelope_version: bifrost_types::PayloadVersion::new(1),
             bytes: state.to_vec(),
         },
         advanced_through: None,
-        envelope_version: 1,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
     }
 }
 
@@ -1264,7 +1264,7 @@ async fn one_undecodable_scope_clears_every_row_of_the_account_at_attach() {
                     partition: bifrost_sync::backfill::partitioner::completion_partition(),
                     progress_marker: None,
                     progress: Default::default(),
-                    envelope_version: 1,
+                    envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
                 },
             )
             .await

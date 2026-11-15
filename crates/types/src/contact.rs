@@ -149,7 +149,7 @@ pub struct ContactCard {
     pub native_id: String,
     /// Provider etag, change key, or similar optimistic-concurrency
     /// token when available.
-    pub etag: Option<String>,
+    pub etag: Option<crate::EntityTag>,
     /// Wire-level metadata for round trips.
     pub provenance: ContactProvenance,
     /// Corpus this contact belongs to. Mirrors the `corpus` of its

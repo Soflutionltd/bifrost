@@ -23,11 +23,11 @@ fn sample_checkpoint(state: &[u8]) -> Checkpoint {
         scope: CursorScope::Account,
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::Imap,
-            envelope_version: 1,
+            envelope_version: bifrost_types::PayloadVersion::new(1),
             bytes: state.to_vec(),
         },
         advanced_through: None,
-        envelope_version: 1,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
     })
 }
 

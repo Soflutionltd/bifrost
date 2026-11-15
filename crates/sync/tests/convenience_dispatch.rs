@@ -625,11 +625,13 @@ fn default_inventory_cursor_classifier_delegates_to_resume_hook() {
         scope: CursorScope::Account,
         server_state: bifrost_types::OpaqueChangeState {
             protocol: ProtocolKind::Gmail,
-            envelope_version: 1,
+            envelope_version: bifrost_types::PayloadVersion::new(1),
             bytes: Vec::new(),
         },
         advanced_through: None,
-        envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+            bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        ),
     };
     assert!(Account::is_inventory_cursor(
         &RecorderAccount::with_conveniences(ConvenienceShape::default()),

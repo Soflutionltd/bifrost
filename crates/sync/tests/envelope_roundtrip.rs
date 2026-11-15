@@ -22,11 +22,11 @@ fn sample_change_cursor() -> ChangeCursor {
         },
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::Graph,
-            envelope_version: 7,
+            envelope_version: bifrost_types::PayloadVersion::new(7),
             bytes: b"DELTA_LINK_BYTES".to_vec(),
         },
         advanced_through: Some(OpaqueProgressBytes(b"page=12".to_vec())),
-        envelope_version: ENGINE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(ENGINE_VERSION),
     }
 }
 
@@ -39,7 +39,7 @@ fn sample_backfill_checkpoint() -> BackfillCheckpoint {
             items_done: 12345,
             items_estimated: Some(67890),
         },
-        envelope_version: ENGINE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(ENGINE_VERSION),
     }
 }
 
@@ -73,7 +73,7 @@ fn backfill_checkpoint_roundtrip() {
         decoded_bf.progress.items_estimated,
         bf.progress.items_estimated
     );
-    assert_eq!(decoded_bf.envelope_version, bf.envelope_version);
+    assert_eq!(decoded_bf.envelope_version.get(), bf.envelope_version.get());
 }
 
 #[test]
@@ -95,11 +95,11 @@ fn account_scope_roundtrips() {
         scope: CursorScope::Account,
         server_state: OpaqueChangeState {
             protocol: ProtocolKind::Gmail,
-            envelope_version: 1,
+            envelope_version: bifrost_types::PayloadVersion::new(1),
             bytes: b"historyId=123456".to_vec(),
         },
         advanced_through: None,
-        envelope_version: ENGINE_VERSION,
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(ENGINE_VERSION),
     };
     let bytes = encode_envelope(&Checkpoint::Change(cursor.clone()));
     let decoded = decode_envelope(&bytes).expect("decode succeeds");
@@ -145,7 +145,7 @@ fn version_above_engine_is_schema_incompatible() {
 #[test]
 fn an_unknown_change_cursor_outer_version_is_detectable() {
     let mut cursor = sample_change_cursor();
-    cursor.envelope_version = ENGINE_VERSION + 41;
+    cursor.envelope_version = bifrost_types::TraitEnvelopeVersion::new(ENGINE_VERSION + 41);
     assert!(cursor.validate_envelope().is_err());
     assert!(
         std::panic::catch_unwind(|| encode_envelope(&Checkpoint::Change(cursor))).is_err(),
@@ -184,7 +184,8 @@ fn every_accepted_envelope_version_decodes_into_a_cursor_that_validates() {
             "version {version} decoded but would be rejected before protocol dispatch",
         );
         assert_eq!(
-            cursor.server_state.envelope_version, 7,
+            cursor.server_state.envelope_version.get(),
+            7,
             "the protocol-owned inner version is not touched by outer migration",
         );
 
@@ -203,7 +204,7 @@ fn every_accepted_envelope_version_decodes_into_a_cursor_that_validates() {
 #[test]
 fn a_protocol_authored_backfill_version_does_not_reach_the_header() {
     let mut bf = sample_backfill_checkpoint();
-    bf.envelope_version = ENGINE_VERSION + 41;
+    bf.envelope_version = bifrost_types::TraitEnvelopeVersion::new(ENGINE_VERSION + 41);
     let bytes = encode_envelope(&Checkpoint::Backfill(bf));
 
     assert_eq!(
@@ -213,7 +214,7 @@ fn a_protocol_authored_backfill_version_does_not_reach_the_header() {
     let Checkpoint::Backfill(decoded) = decode_envelope(&bytes).expect("decode succeeds") else {
         panic!("expected Backfill variant");
     };
-    assert_eq!(decoded.envelope_version, ENGINE_VERSION);
+    assert_eq!(decoded.envelope_version.get(), ENGINE_VERSION);
 }
 
 #[test]
@@ -252,11 +253,11 @@ fn protocol_tag_is_preserved() {
             scope: CursorScope::Account,
             server_state: OpaqueChangeState {
                 protocol,
-                envelope_version: 1,
+                envelope_version: bifrost_types::PayloadVersion::new(1),
                 bytes: vec![0xAB, 0xCD],
             },
             advanced_through: None,
-            envelope_version: ENGINE_VERSION,
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(ENGINE_VERSION),
         };
         let bytes = encode_envelope(&Checkpoint::Change(cursor.clone()));
         let decoded = decode_envelope(&bytes).expect("decode succeeds");

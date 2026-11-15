@@ -274,7 +274,7 @@ fn binary_fetch_items_are_usable_under_rev2_or_an_advertised_binary() {
 
 #[test]
 fn auth_mechanisms_are_case_insensitive() {
-    let profile = ServerProfile::new(vec![Capability::Auth("plain".to_owned())], vec![]);
+    let profile = ServerProfile::new(vec![Capability::from_imap_str("AUTH=plain")], vec![]);
     assert!(profile.supports_auth(AuthMechanism::Plain));
     assert!(profile.supports_sasl_auth(AuthMechanism::Plain));
     assert!(!profile.supports_auth(AuthMechanism::ScramSha256));
@@ -283,7 +283,7 @@ fn auth_mechanisms_are_case_insensitive() {
 #[test]
 fn scram_plus_does_not_satisfy_non_plus_scram() {
     let profile = ServerProfile::new(
-        vec![Capability::Auth("SCRAM-SHA-256-PLUS".to_owned())],
+        vec![Capability::from_imap_str("AUTH=SCRAM-SHA-256-PLUS")],
         vec![],
     );
 
@@ -340,7 +340,7 @@ fn append_limit_policy_is_explicit() {
 
 #[test]
 fn thread_algorithms_are_normalized() {
-    let profile = ServerProfile::new(vec![Capability::Thread("references".to_owned())], vec![]);
+    let profile = ServerProfile::new(vec![Capability::from_imap_str("THREAD=references")], vec![]);
     assert_eq!(profile.thread_algorithms, vec!["REFERENCES"]);
 }
 

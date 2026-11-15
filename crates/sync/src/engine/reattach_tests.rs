@@ -593,7 +593,7 @@ async fn unreadable_stored_envelope_returns_error_without_reset_request() {
     let writer = WriterHandle::new(writer_tx);
     let ctx = fixture.ctx(&writer);
     let mut invalid = common::cursor_for(&SCOPE, b"legacy-page");
-    invalid.envelope_version = u32::MAX;
+    invalid.envelope_version = bifrost_types::TraitEnvelopeVersion::new(u32::MAX);
     let mut pacing = RepairPacing::default();
     let establish = run_establish(
         &fixture.id,

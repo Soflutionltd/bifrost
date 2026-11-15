@@ -100,6 +100,46 @@ impl HeaderMap {
         }
     }
 
+    /// Resolve submission addresses without dropping unsupported mailboxes.
+    ///
+    /// From wins over Sender: an enterprise user sending on behalf of a
+    /// shared mailbox expects bounces at that mailbox, not the delegate.
+    /// Multiple authors use their single Sender. Without From, Sender is the
+    /// fallback; the caller supplies any final default.
+    /// A missing reverse path remains available for SMTP's null reverse path.
+    pub fn submission_envelope(&self) -> Result<(Option<Address>, Vec<Address>), &'static str> {
+        let from = self
+            .addresses_checked("from")
+            .map_err(|_| "unsupported From address")?;
+        let sender = self
+            .addresses_checked("sender")
+            .map_err(|_| "unsupported Sender address")?;
+        if sender.len() > 1 || (from.len() > 1 && sender.is_empty()) {
+            return Err("multiple authors require a single Sender address");
+        }
+        let to = self
+            .addresses_checked("to")
+            .map_err(|_| "unsupported To address")?;
+        let cc = self
+            .addresses_checked("cc")
+            .map_err(|_| "unsupported Cc address")?;
+        let bcc = self
+            .addresses_checked("bcc")
+            .map_err(|_| "unsupported Bcc address")?;
+        crate::compose::validate_send_recipients(&to, &cc, &bcc)
+            .map_err(|_| "send requires at least one recipient")?;
+        // Multiple authors have no single author mailbox; retain the explicit
+        // transmitting agent as the only unambiguous reverse path in that case.
+        let reverse_path = if from.len() > 1 {
+            sender.into_iter().next()
+        } else {
+            from.into_iter()
+                .next()
+                .or_else(|| sender.into_iter().next())
+        };
+        Ok((reverse_path, to.into_iter().chain(cc).chain(bcc).collect()))
+    }
+
     pub fn date(&self, name: &str) -> Option<SystemTime> {
         self.get(name).and_then(parse_date)
     }
@@ -538,3 +578,42 @@ fn parse_zone(zone: &str) -> Option<i32> {
 #[cfg(test)]
 #[path = "header_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod submission_tests {
+    use super::HeaderMap;
+
+    #[test]
+    fn shared_mailbox_is_reverse_path_and_bcc_is_a_recipient() {
+        let headers = HeaderMap::parse(b"From: shared@example.test\r\nSender: delegate@example.test\r\nBcc: blind@example.test\r\n");
+        let (from, recipients) = headers.submission_envelope().expect("envelope");
+        assert_eq!(from.expect("reverse path").address, "shared@example.test");
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].address, "blind@example.test");
+    }
+
+    #[test]
+    fn sender_fallback_and_multiple_authors_remain_supported() {
+        for authors in ["", "From: a@example.test, b@example.test\r\n"] {
+            let raw = format!("{authors}Sender: agent@example.test\r\nTo: target@example.test\r\n");
+            let (from, _) = HeaderMap::parse(raw.as_bytes())
+                .submission_envelope()
+                .expect("envelope");
+            assert_eq!(from.expect("reverse path").address, "agent@example.test");
+        }
+    }
+
+    #[test]
+    fn missing_or_partially_rejected_recipients_are_refused() {
+        for raw in [
+            "From: a@example.test\r\n",
+            "To: accepted@example.test, rejected-item\r\n",
+        ] {
+            assert!(
+                HeaderMap::parse(raw.as_bytes())
+                    .submission_envelope()
+                    .is_err()
+            );
+        }
+    }
+}

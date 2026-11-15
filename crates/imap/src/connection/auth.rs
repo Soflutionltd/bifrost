@@ -1168,7 +1168,7 @@ mod ladder_tests {
     fn profile(mechanisms: &[&str]) -> ServerProfile {
         let caps = mechanisms
             .iter()
-            .map(|m| Capability::Auth((*m).to_owned()))
+            .map(|m| Capability::from_imap_str(&format!("AUTH={m}")))
             .collect();
         ServerProfile::new(caps, vec![])
     }
@@ -1290,7 +1290,7 @@ mod ladder_tests {
 
         let connection = detached(
             SessionState::NotAuthenticated,
-            vec![Capability::Auth("plain".to_owned())],
+            vec![Capability::from_imap_str("AUTH=plain")],
             &[],
         );
         assert!(
@@ -1324,7 +1324,7 @@ mod ladder_tests {
         for (user, password) in [("user\0other", "pw"), ("user", "pw\0other")] {
             let connection = detached(
                 SessionState::NotAuthenticated,
-                vec![Capability::Auth("PLAIN".to_owned())],
+                vec![Capability::from_imap_str("AUTH=PLAIN")],
                 &[],
             );
             let error = connection

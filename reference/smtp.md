@@ -50,7 +50,8 @@ conversion from shared account addresses. Disabling it retains direct blocking
 SMTP/LMTP and, with `tokio`, async SMTP/LMTP, including password and OAuth
 credentials. The local transmission-state vocabulary remains independent of
 bifrost-types so direct clients can retain send evidence without account APIs.
-The shared dependency can still occur transitively through bifrost-net.
+The shared bifrost-types dependency is unconditional so header envelope
+resolution uses the same owner with or without account-error.
 Mixed account/wire test suites require `account-error`; independent parser,
 encoder, framing and network suites remain available without it.
 
@@ -706,7 +707,15 @@ The legacy continuation budget is ten answers. Reaching zero after the tenth
 answer is accepted when that answer received a final response; a further
 `334` is a challenge-limit error.
 
-`SaslError` maps at the `From<SaslError> for Error` boundary: `Protocol` (malformed SASL, signature mismatch) to `ErrorKind::Parse`; `AuthFailed` with SCRAM `e=invalid-proof` to `ErrorKind::Authentication` + `SmtpCommandPhase::Auth`, which becomes `Authentication(ReauthorizationRequired)` and `AuthLost`, matching a 535 credential rejection; other SCRAM server errors use explicit `Policy` classification, including `e=channel-binding-not-supported`; `InvalidCredential` (a username or password that fails SASLprep) to `ErrorKind::InvalidInput`, so `Request(Malformed)` even when an outer AUTH driver stamps the phase. `ScramExchange::new` prepares both credentials, before the AUTH line is sent, so that last refusal is local and never reaches the wire.
+`SaslError` maps at the `From<SaslError> for Error` boundary. Typed
+`ScramServerError::refusal_class()` in `reference/sasl.md` owns the table:
+Credential becomes Authentication, Policy becomes Policy, Protocol becomes
+Parse, and Unavailable becomes ServerUnavailable (shared Server Unavailable,
+retryable). LocalRuntime stays local runtime; InvalidCredential remains
+InvalidInput. `ScramExchange::new` prepares both credentials before AUTH.
+`ScramExchange` derives its typed Mechanism from hash and binding rather than
+storing a second wire-name string. Mechanism stamps retain the enum until
+support diagnostic rendering.
 
 Builder helpers: `.password(user, password)` for password auth,
 `.oauth2(identity, access_token)` for a raw OAuth bearer string, and
@@ -913,12 +922,12 @@ lets batch recovery retry a transient refresh failure instead of asking the user
 for another password. Local auth classification reads typed error kinds; source
 Display text remains support diagnostics rather than a local auth discriminator.
 
-`Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Non-reply buckets are `Parse`, `Authentication`, `InvalidInput`, `FeatureUnsupported`, `ParameterOverLimit`, `Internal`, `LocalRuntime`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `LocalRuntime` covers local facility failures such as SCRAM nonce entropy failure and maps to `Internal(RuntimeFailure)`, including on the AUTH lane. `Policy` covers local refusals such as plaintext-AUTH refusal. `FeatureUnsupported` / `ParameterOverLimit` are the FUTURERELEASE discriminators (a relay that did not advertise the extension vs a HOLDFOR over the advertised max interval), kept distinct from generic `InvalidInput` so the account-error mapping can tell scheduled-send-unsupported apart from a malformed parameter. SMTP replies are line-bounded before allocation and decoded from bytes, so oversized or non-UTF-8 replies are `Parse`, not retryable network errors.
+`Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Non-reply buckets are `Parse`, `Authentication`, `InvalidInput`, `FeatureUnsupported`, `ParameterOverLimit`, `Internal`, `LocalRuntime`, `ServerUnavailable`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `LocalRuntime` covers local facility failures such as SCRAM nonce entropy failure and maps to `Internal(RuntimeFailure)`, including on the AUTH lane. `Policy` covers local refusals such as plaintext-AUTH refusal. `FeatureUnsupported` / `ParameterOverLimit` are the FUTURERELEASE discriminators (a relay that did not advertise the extension vs a HOLDFOR over the advertised max interval), kept distinct from generic `InvalidInput` so the account-error mapping can tell scheduled-send-unsupported apart from a malformed parameter. SMTP replies are line-bounded before allocation and decoded from bytes, so oversized or non-UTF-8 replies are `Parse`, not retryable network errors.
 
 Internal pipeline errors carry value-side classification data:
 
 - `SmtpTransmissionState` (`Unsent` / `InFlight` / `Acknowledged`), attached via `with_attempt`.
-- `SmtpCommandPhase`, attached via `with_phase`. The 16 variants cover every wire boundary the driver crosses: `Connect`, `Greeting`, `Hello`, `StartTls`, `Auth`, `MailFrom`, `RcptTo`, `DataCommand`, `DataBody`, `DataFinal`, `BdatBody`, `LmtpFinalStatus`, `Noop`, `Vrfy`, `Expn`, `Rset`. `Auth` alone carries a payload, `Auth { mechanism: Option<&'static str> }`: the name sits on the variant rather than on `Error` so that stamping the auth phase forces a decision about which rung was in play, the same argument that puts `phase` on the value rather than on `SmtpErrorContext`. `Some` comes from the four driver functions (`auth_scram` and `auth_legacy` on both adapters), which bind it once per exchange from `Mechanism::name`, so a `-PLUS` rung cannot desync from the AUTH line that framed it. `None` is for the genuinely pre-rung refusals: declining to pick a mechanism, refusing plaintext AUTH, an OAuth token-source failure, nonce generation. `or_phase` is set-if-absent with exactly one exception - an unnamed `Auth` stamp accepts the mechanism from a named one, because otherwise the inner `From<SaslError>` stamp would outrank the driver's named outer stamp and the SCRAM `e=` path would lose the name it had. `DataCommand` covers the `DATA` command write/read; `DataBody` covers body upload; `DataFinal` covers the final reply after the dot terminator. Phase lives on `Error::Inner`, and every send-driver wire boundary attaches it before returning - transport failures and server rejections alike. On the pipelined path that is a compile-time property of `PhasedError` rather than a convention (see "PIPELINING"). Paired transcript tests assert the value directly on both I/O halves for the `MailFrom`, `RcptTo`, `DataCommand` and `DataBody` boundaries, so the default PIPELINING path cannot silently lose the classifier input.
+- `SmtpCommandPhase`, attached via `with_phase`. The 16 variants cover every wire boundary the driver crosses: `Connect`, `Greeting`, `Hello`, `StartTls`, `Auth`, `MailFrom`, `RcptTo`, `DataCommand`, `DataBody`, `DataFinal`, `BdatBody`, `LmtpFinalStatus`, `Noop`, `Vrfy`, `Expn`, `Rset`. `Auth` alone carries a payload, `Auth { mechanism: Option<Mechanism> }`: the name sits on the variant rather than on `Error` so that stamping the auth phase forces a decision about which rung was in play, the same argument that puts `phase` on the value rather than on `SmtpErrorContext`. `Some` comes from the four driver functions (`auth_scram` and `auth_legacy` on both adapters), which bind the selected `Mechanism` once per exchange, so a `-PLUS` rung cannot desync from the AUTH line that framed it. `None` is for the genuinely pre-rung refusals: declining to pick a mechanism, refusing plaintext AUTH, an OAuth token-source failure, nonce generation. `or_phase` is set-if-absent with exactly one exception - an unnamed `Auth` stamp accepts the mechanism from a named one, because otherwise the inner `From<SaslError>` stamp would outrank the driver's named outer stamp and the SCRAM `e=` path would lose the name it had. `DataCommand` covers the `DATA` command write/read; `DataBody` covers body upload; `DataFinal` covers the final reply after the dot terminator. Phase lives on `Error::Inner`, and every send-driver wire boundary attaches it before returning - transport failures and server rejections alike. On the pipelined path that is a compile-time property of `PhasedError` rather than a convention (see "PIPELINING"). Paired transcript tests assert the value directly on both I/O halves for the `MailFrom`, `RcptTo`, `DataCommand` and `DataBody` boundaries, so the default PIPELINING path cannot silently lose the classifier input.
 
 With `account-error`, OAuth token-source failures also carry bifrost-net's already-built `AccountError` projection through the low-level SMTP error. The SMTP translation boundary reapplies its actual SMTP or LMTP protocol and fixed send operation and idempotency context while preserving the source kind and cause chain. The token-source conversion passes no throttle scope because it has no SMTP transaction scope to name. SMTP reply classifications of `RateLimited` or `QuotaExhausted` explicitly carry `ThrottleScope::Account`. This keeps `AuthLost` and `RefreshTransient` distinct.
 
@@ -1211,3 +1220,10 @@ also derives the existing dotted diagnostic spelling from those components.
 Fallback prose hints live in `RATE_HINTS`, `QUOTA_HINTS` and `POLICY_HINTS` in
 the account translator; they preserve first-line ASCII-insensitive substring
 matching and apply only after recognized enhanced codes have been considered.
+
+Header-derived `Envelope::try_from` delegates reverse-path selection and
+checked recipient extraction to `bifrost_types::mime::HeaderMap::submission_envelope`.
+A single From takes precedence over Sender so a shared mailbox receives its
+own bounces when a delegate sends on its behalf. Multiple authors require a
+single Sender; missing From and Sender retain the null reverse path.
+Unsupported addresses fail conversion rather than silently losing recipients.

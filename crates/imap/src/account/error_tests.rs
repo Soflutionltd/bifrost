@@ -280,7 +280,7 @@ fn a_server_auth_rejection_carries_the_mechanism_at_the_support_tier() {
     let err = Error::auth_with_mechanism(
         "credentials rejected".into(),
         Some(ResponseCode::AuthenticationFailed),
-        "SCRAM-SHA-256-PLUS",
+        crate::types::AuthMechanism::ScramSha256Plus,
     );
     let account = into_account_error(err, ImapErrorContext::operation(AccountOperation::Discover));
 
@@ -1047,9 +1047,13 @@ fn auth_attempt_evidence_survives_account_translation_and_override() {
         TransmissionState::InFlight,
         TransmissionState::Acknowledged,
     ] {
-        let error = Error::auth_with_mechanism("SASL failure".into(), None, "PLAIN")
-            .with_attempt(TransmissionState::InFlight)
-            .with_attempt(state);
+        let error = Error::auth_with_mechanism(
+            "SASL failure".into(),
+            None,
+            crate::types::AuthMechanism::Plain,
+        )
+        .with_attempt(TransmissionState::InFlight)
+        .with_attempt(state);
         assert_eq!(error.attempt(), Some(state));
         let account = into_account_error(
             error,
@@ -1133,5 +1137,32 @@ fn oauth_token_failures_preserve_net_classification_and_context() {
             cause,
             Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged
         )));
+    }
+}
+
+#[test]
+fn scram_refusals_keep_shared_recovery_intent() {
+    for (token, lane) in [
+        ("unknown-user", "credential"),
+        ("invalid-proof", "credential"),
+        ("channel-binding-not-supported", "policy"),
+        ("invalid-encoding", "protocol"),
+        ("no-resources", "unavailable"),
+        ("other-error", "unavailable"),
+        ("future-extension", "unavailable"),
+    ] {
+        let sasl = bifrost_sasl::verify_server_final(&format!("e={token}"), &[]).unwrap_err();
+        let error = into_account_error(
+            Error::from(sasl),
+            ImapErrorContext::operation(AccountOperation::Discover),
+        );
+        let actual = match error.kind() {
+            AccountErrorKind::Authentication(_) => "credential",
+            AccountErrorKind::Authorization(_) => "policy",
+            AccountErrorKind::Protocol(_) => "protocol",
+            AccountErrorKind::Server(_) => "unavailable",
+            other => panic!("unexpected SCRAM refusal kind: {other:?}"),
+        };
+        assert_eq!(actual, lane, "{token}");
     }
 }

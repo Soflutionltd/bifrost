@@ -384,12 +384,12 @@ fn untagged_flags() {
     let resp = UntaggedResponse::Flags(vec![
         Flag::Seen,
         Flag::Answered,
-        Flag::Custom("$Junk".into()),
+        Flag::from_imap_str("$Junk"),
     ]);
     match &resp {
         UntaggedResponse::Flags(flags) => {
             assert_eq!(flags.len(), 3);
-            assert_eq!(flags[2], Flag::Custom("$Junk".into()));
+            assert_eq!(flags[2], Flag::from_imap_str("$Junk"));
         }
         _ => panic!("expected Flags"),
     }
@@ -459,12 +459,12 @@ fn untagged_capability() {
     let resp = UntaggedResponse::Capability(vec![
         Capability::Imap4Rev1,
         Capability::Idle,
-        Capability::Auth("PLAIN".into()),
+        Capability::from_imap_str("AUTH=PLAIN"),
     ]);
     match &resp {
         UntaggedResponse::Capability(caps) => {
             assert_eq!(caps.len(), 3);
-            assert_eq!(caps[2], Capability::Auth("PLAIN".into()));
+            assert_eq!(caps[2], Capability::from_imap_str("AUTH=PLAIN"));
         }
         _ => panic!("expected Capability"),
     }
@@ -732,19 +732,19 @@ fn capability_variants() {
     assert_eq!(Capability::Imap4Rev1, Capability::Imap4Rev1);
     assert_ne!(Capability::Imap4Rev1, Capability::Imap4Rev2);
     assert_eq!(
-        Capability::Auth("PLAIN".into()),
-        Capability::Auth("PLAIN".into())
+        Capability::from_imap_str("AUTH=PLAIN"),
+        Capability::from_imap_str("AUTH=PLAIN")
     );
     assert_ne!(
-        Capability::Auth("PLAIN".into()),
-        Capability::Auth("XOAUTH2".into())
+        Capability::from_imap_str("AUTH=PLAIN"),
+        Capability::from_imap_str("AUTH=XOAUTH2")
     );
 }
 
 #[test]
 fn capability_other() {
-    let cap = Capability::Other("XSPECIAL".into());
-    assert_eq!(cap, Capability::Other("XSPECIAL".into()));
+    let cap = Capability::from_imap_str("XSPECIAL");
+    assert_eq!(cap, Capability::from_imap_str("XSPECIAL"));
 }
 
 // ===== RFC 3501 Section 7.2.1 audit: capability names are case-insensitive =====
@@ -754,8 +754,8 @@ fn capability_other_case_insensitive() {
     // RFC 3501 Section 7.2.1: capability names are case-insensitive.
     // Two `Other` variants differing only in case must compare equal.
     assert_eq!(
-        Capability::Other("XYZZY".into()),
-        Capability::Other("xyzzy".into()),
+        Capability::from_imap_str("XYZZY"),
+        Capability::from_imap_str("xyzzy"),
         "Capability::Other must compare case-insensitively per RFC 3501 Section 7.2.1"
     );
 }
@@ -764,8 +764,8 @@ fn capability_other_case_insensitive() {
 fn capability_auth_case_insensitive() {
     // RFC 3501 Section 7.2.1: capability names are case-insensitive.
     assert_eq!(
-        Capability::Auth("PLAIN".into()),
-        Capability::Auth("plain".into()),
+        Capability::from_imap_str("AUTH=PLAIN"),
+        Capability::from_imap_str("AUTH=plain"),
         "Capability::Auth must compare case-insensitively per RFC 3501 Section 7.2.1"
     );
 }
@@ -774,8 +774,8 @@ fn capability_auth_case_insensitive() {
 fn capability_thread_case_insensitive() {
     // RFC 3501 Section 7.2.1: capability names are case-insensitive.
     assert_eq!(
-        Capability::Thread("REFERENCES".into()),
-        Capability::Thread("references".into()),
+        Capability::from_imap_str("THREAD=REFERENCES"),
+        Capability::from_imap_str("THREAD=references"),
         "Capability::Thread must compare case-insensitively per RFC 3501 Section 7.2.1"
     );
 }
@@ -785,8 +785,8 @@ fn capability_other_case_insensitive_hash() {
     // RFC 3501 Section 7.2.1: case-insensitively equal capabilities must hash the same.
     use std::collections::HashSet;
     let mut set = HashSet::new();
-    set.insert(Capability::Other("XYZZY".into()));
-    set.insert(Capability::Other("xyzzy".into()));
+    set.insert(Capability::from_imap_str("XYZZY"));
+    set.insert(Capability::from_imap_str("xyzzy"));
     assert_eq!(
         set.len(),
         1,
@@ -797,9 +797,9 @@ fn capability_other_case_insensitive_hash() {
 
 #[test]
 fn capability_thread() {
-    let cap = Capability::Thread("REFERENCES".into());
-    assert_eq!(cap, Capability::Thread("REFERENCES".into()));
-    assert_ne!(cap, Capability::Thread("ORDEREDSUBJECT".into()));
+    let cap = Capability::from_imap_str("THREAD=REFERENCES");
+    assert_eq!(cap, Capability::from_imap_str("THREAD=REFERENCES"));
+    assert_ne!(cap, Capability::from_imap_str("THREAD=ORDEREDSUBJECT"));
 }
 
 #[test]
@@ -1044,7 +1044,7 @@ fn custom_idle_equals_idle_variant() {
     // RFC 3501 Section 7.2.1: capability names are case-insensitive atoms.
     // Custom("IDLE") represents the same capability as Capability::Idle.
     assert_eq!(
-        Capability::Other("IDLE".into()),
+        Capability::from_imap_str("IDLE"),
         Capability::Idle,
         "Other(\"IDLE\") must equal Capability::Idle per RFC 3501 Section 7.2.1"
     );
@@ -1056,7 +1056,7 @@ fn custom_capability_cross_representation_hash() {
     use std::collections::HashSet;
     let mut set = HashSet::new();
     set.insert(Capability::Idle);
-    set.insert(Capability::Other("IDLE".into()));
+    set.insert(Capability::from_imap_str("IDLE"));
     assert_eq!(
         set.len(),
         1,
@@ -1069,7 +1069,7 @@ fn custom_capability_cross_representation_hash() {
 fn custom_starttls_equals_starttls_variant() {
     // RFC 3501 Section 7.2.1: capability names are case-insensitive atoms.
     assert_eq!(
-        Capability::Other("STARTTLS".into()),
+        Capability::from_imap_str("STARTTLS"),
         Capability::StartTls,
         "Other(\"STARTTLS\") must equal Capability::StartTls \
              per RFC 3501 Section 7.2.1"
@@ -1080,8 +1080,8 @@ fn custom_starttls_equals_starttls_variant() {
 fn custom_auth_plain_equals_auth_variant() {
     // RFC 3501 Section 7.2.1: AUTH=PLAIN as Other must equal Auth("PLAIN").
     assert_eq!(
-        Capability::Other("AUTH=PLAIN".into()),
-        Capability::Auth("PLAIN".into()),
+        Capability::from_imap_str("AUTH=PLAIN"),
+        Capability::from_imap_str("AUTH=PLAIN"),
         "Other(\"AUTH=PLAIN\") must equal Auth(\"PLAIN\") \
              per RFC 3501 Section 7.2.1"
     );
@@ -1101,7 +1101,7 @@ fn sort_display_as_imap_str_round_trip() {
 fn sort_display_cross_representation_equality() {
     // Cross-representation: Other("SORT=DISPLAY") must equal SortDisplay.
     let structured = Capability::SortDisplay;
-    let other = Capability::Other("SORT=DISPLAY".to_owned());
+    let other = Capability::from_imap_str("SORT=DISPLAY");
     assert_eq!(structured, other);
     assert_eq!(other, structured);
 }
@@ -1113,7 +1113,7 @@ fn sort_display_hash_consistency() {
     use std::hash::{Hash, Hasher};
 
     let a = Capability::SortDisplay;
-    let b = Capability::Other("SORT=DISPLAY".to_owned());
+    let b = Capability::from_imap_str("SORT=DISPLAY");
 
     let hash = |c: &Capability| {
         let mut h = DefaultHasher::new();
@@ -1283,12 +1283,12 @@ fn capability_as_imap_str_all_variants() {
     assert_eq!(Capability::QResync.as_imap_str(), "QRESYNC");
     assert_eq!(Capability::Quota.as_imap_str(), "QUOTA");
     assert_eq!(
-        Capability::QuotaResource("STORAGE".into()).as_imap_str(),
+        Capability::from_imap_str("QUOTA=RES-STORAGE").as_imap_str(),
         "QUOTA=RES-STORAGE"
     );
     assert_eq!(Capability::QuotaSet.as_imap_str(), "QUOTASET");
     assert_eq!(
-        Capability::Rights("texk".into()).as_imap_str(),
+        Capability::from_imap_str("RIGHTS=texk").as_imap_str(),
         "RIGHTS=texk"
     );
     assert_eq!(Capability::SaslIr.as_imap_str(), "SASL-IR");
@@ -1299,7 +1299,7 @@ fn capability_as_imap_str_all_variants() {
     assert_eq!(Capability::StartTls.as_imap_str(), "STARTTLS");
     assert_eq!(Capability::SpecialUse.as_imap_str(), "SPECIAL-USE");
     assert_eq!(
-        Capability::Thread("REFERENCES".into()).as_imap_str(),
+        Capability::from_imap_str("THREAD=REFERENCES").as_imap_str(),
         "THREAD=REFERENCES"
     );
     assert_eq!(Capability::StatusSize.as_imap_str(), "STATUS=SIZE");
@@ -1311,11 +1311,11 @@ fn capability_as_imap_str_all_variants() {
     assert_eq!(Capability::Utf8Accept.as_imap_str(), "UTF8=ACCEPT");
     assert_eq!(Capability::Utf8Only.as_imap_str(), "UTF8=ONLY");
     assert_eq!(
-        Capability::Auth("XOAUTH2".into()).as_imap_str(),
+        Capability::from_imap_str("AUTH=XOAUTH2").as_imap_str(),
         "AUTH=XOAUTH2"
     );
     assert_eq!(
-        Capability::Other("XSPECIAL".into()).as_imap_str(),
+        Capability::from_imap_str("XSPECIAL").as_imap_str(),
         "XSPECIAL"
     );
 }
@@ -1342,13 +1342,13 @@ fn capability_rights_equality() {
     // RFC 4314 Section 6: RIGHTS=<chars> capability.
     // Rights variants with same payload must be equal (case-insensitive).
     assert_eq!(
-        Capability::Rights("texk".into()),
-        Capability::Rights("TEXK".into()),
+        Capability::from_imap_str("RIGHTS=texk"),
+        Capability::from_imap_str("RIGHTS=TEXK"),
         "Rights must compare case-insensitively per RFC 3501 Section 7.2.1"
     );
     assert_ne!(
-        Capability::Rights("texk".into()),
-        Capability::Rights("abc".into()),
+        Capability::from_imap_str("RIGHTS=texk"),
+        Capability::from_imap_str("RIGHTS=abc"),
     );
 }
 
@@ -1504,11 +1504,11 @@ fn capability_from_str_auth() {
     // RFC 3501 Section 7.2.1: AUTH=mechanism.
     assert_eq!(
         Capability::from("AUTH=PLAIN"),
-        Capability::Auth("PLAIN".to_owned())
+        Capability::from_imap_str("AUTH=PLAIN")
     );
     assert_eq!(
         Capability::from("AUTH=XOAUTH2"),
-        Capability::Auth("XOAUTH2".to_owned())
+        Capability::from_imap_str("AUTH=XOAUTH2")
     );
 }
 
@@ -1530,7 +1530,7 @@ fn capability_from_str_thread() {
     // RFC 5256: THREAD=REFERENCES.
     assert_eq!(
         Capability::from("THREAD=REFERENCES"),
-        Capability::Thread("REFERENCES".to_owned())
+        Capability::from_imap_str("THREAD=REFERENCES")
     );
 }
 
@@ -1539,7 +1539,7 @@ fn capability_from_str_unknown() {
     // Unknown capabilities preserved verbatim.
     assert_eq!(
         Capability::from("X-CUSTOM-CAP"),
-        Capability::Other("X-CUSTOM-CAP".to_owned())
+        Capability::from_imap_str("X-CUSTOM-CAP")
     );
 }
 

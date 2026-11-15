@@ -189,13 +189,13 @@ pub async fn drive_changes_stream(
             return Ok(ChangesEvent::Terminated(error));
         }
         if let Some(Checkpoint::Change(cursor)) = &checkpoint
-            && cursor.validate_envelope().is_err()
-        {
-            let error = crate::recovery::fresh_cursor_contract_error(
-                checkpoint.as_ref(),
+            && let Err(error) = crate::recovery::classify_envelope(
+                cursor,
+                crate::recovery::CursorOrigin::Fresh,
                 bifrost_types::AccountOperation::SyncChanges,
                 &scope,
-            );
+            )
+        {
             if !publish_contract_termination(
                 &cursors,
                 &delivery,
@@ -810,7 +810,7 @@ mod tests {
                         _ => {}
                     }
                     let mut invalid = cursor.clone();
-                    invalid.envelope_version = u32::MAX;
+                    invalid.envelope_version = bifrost_types::TraitEnvelopeVersion::new(u32::MAX);
                     let checkpoint = if violation == 1 {
                         Checkpoint::Backfill(BackfillCheckpoint {
                             scope: cursor.scope.clone(),
@@ -820,7 +820,7 @@ mod tests {
                                 items_done: 0,
                                 items_estimated: None,
                             },
-                            envelope_version: 1,
+                            envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
                         })
                     } else if violation == 2 {
                         Checkpoint::Change(invalid)

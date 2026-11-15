@@ -3,6 +3,18 @@
 
 use super::*;
 
+/// Until slot installation the attach future owns the only writer task. An
+/// error or cancellation must not detach a background durable-state owner.
+struct AttachingWriter(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AttachingWriter {
+    fn drop(&mut self) {
+        if let Some(writer) = &self.0 {
+            writer.abort();
+        }
+    }
+}
+
 impl SyncEngine {
     /// Attach an account to the engine.
     ///
@@ -134,8 +146,42 @@ impl SyncEngine {
         // pauses every sibling declaring the same budget.
         let throttles = Arc::clone(&self.throttles);
 
+        // Load before publishing registrations or spawning producers. Failure
+        // unwinds the opened account without leaving a running unseeded lane.
+        // The same lifecycle guard excludes the preceding attachment's writer.
+        let pending_coverage =
+            Arc::new(ack::restore_proof_order(&account_id, self.checkpoints.as_ref()).await?);
+
+        // Wire boundary + priority watches.
+        let (boundary, boundary_view) = Boundary::new();
+        let (priority_tx, priority_rx) = watch::channel(Priority::Normal);
+        let (bandwidth_cap_tx, bandwidth_cap_rx) = watch::channel(None);
+
+        // Control handle shared between the SyncControl returned to
+        // the consumer and the engine's spawned workers (so workers
+        // can call `record_checkpoint`).
+        let control = SyncControl::new_with_publications(
+            account_id.clone(),
+            boundary.clone(),
+            priority_tx.clone(),
+            bandwidth_cap_tx.clone(),
+            Arc::clone(&pending_coverage),
+        );
+
+        control.bind_control_events(account_control_tx.clone());
+
+        let (ack_tx, ack_rx) = mpsc::channel::<WriterRequest>(256);
+        let writer = WriterHandle::new(ack_tx.clone());
+        let mut attaching_writer = AttachingWriter(Some(tokio::spawn(ack_writer(
+            account_id.clone(),
+            Arc::clone(&self.checkpoints),
+            control.clone(),
+            Arc::clone(&pending_coverage),
+            ack_rx,
+        ))));
+
         // Drive cursor establishment per scope. We do this before
-        // spawning long-running tasks because multiplexer + backfill
+        // spawning stream workers because multiplexer + backfill
         // need the registry pre-populated for `Ready` scopes. For
         // `EstablishViaInventory` scopes the inventory walk IS the
         // cursor establishment AND surfaces inventory items - we
@@ -163,8 +209,16 @@ impl SyncEngine {
         let mut stored = HashMap::new();
         let mut unreadable = false;
         for scope in &scopes {
-            match self.checkpoints.get_change_cursor(&account_id, scope).await {
-                Ok(Some(cursor)) if cursor.validate_envelope().is_ok() => {
+            match writer.get_change_cursor(scope.clone(), None).await {
+                Ok(Some(cursor))
+                    if crate::recovery::classify_envelope(
+                        &cursor,
+                        crate::recovery::CursorOrigin::Stored,
+                        bifrost_types::AccountOperation::EstablishCursor,
+                        scope,
+                    )
+                    .is_ok() =>
+                {
                     stored.insert(scope.clone(), cursor);
                 }
                 Ok(None) => {}
@@ -179,17 +233,14 @@ impl SyncEngine {
                 "an unreadable durable cursor; clearing every durable row of the account \
                  and establishing every scope fresh"
             );
-            let ledger = self.checkpoints.get_ledger(&account_id).await?;
-            self.checkpoints
-                .clear_account_checkpoints(&account_id, ledger)
-                .await?;
+            writer.reset_account_for_schema_recovery().await?;
             stored.clear();
         }
         let mut deferred_inventory_scopes = Vec::new();
         for scope in scopes.clone() {
             let established = self
                 .establish_one(
-                    &account_id,
+                    &writer,
                     opened.as_ref(),
                     scope.clone(),
                     stored.remove(&scope),
@@ -198,7 +249,11 @@ impl SyncEngine {
                 .await;
             match established {
                 Ok(InitialScope::Ready) => {}
-                Ok(InitialScope::DeferredInventory(inventory)) => {
+                Ok(InitialScope::DeferredInventory(mut inventory)) => {
+                    // The writer's account schema reset advances the coverage
+                    // fence even before producers exist. Carry that new fence,
+                    // or the deferred worker would discard every fresh walk.
+                    inventory.fence = pending_coverage.scope_fence(inventory.scope());
                     deferred_inventory_scopes.push(inventory);
                 }
                 // A scope-local failure must stay scope-local. The running
@@ -227,17 +282,6 @@ impl SyncEngine {
         self.discover_and_link_memberships(opened.as_ref(), Arc::clone(&cursors))
             .await?;
 
-        // Load before publishing registrations or spawning producers. Failure
-        // unwinds the opened account without leaving a running unseeded lane.
-        // The same lifecycle guard excludes the preceding attachment's writer.
-        let pending_coverage =
-            Arc::new(ack::restore_proof_order(&account_id, self.checkpoints.as_ref()).await?);
-
-        // Wire boundary + priority watches.
-        let (boundary, boundary_view) = Boundary::new();
-        let (priority_tx, priority_rx) = watch::channel(Priority::Normal);
-        let (bandwidth_cap_tx, bandwidth_cap_rx) = watch::channel(None);
-
         let ingress = self
             .sink
             .new_ingress(self.config.multiplexer.watch_capacity);
@@ -246,7 +290,6 @@ impl SyncEngine {
         // (scope, checkpoint) here after committing the matching
         // batch; a dedicated writer task persists them to
         // `CheckpointStore`.
-        let (ack_tx, ack_rx) = mpsc::channel::<WriterRequest>(256);
         self.ack_senders.insert(account_id.clone(), ack_tx.clone());
 
         // Register per-account budget semaphores.
@@ -266,19 +309,6 @@ impl SyncEngine {
         let (account_generation_tx, account_generation_rx) =
             watch::channel(crate::types::Incarnation::initial_generation());
         let reopen_lock = Arc::new(AsyncMutex::new(()));
-
-        // Control handle shared between the SyncControl returned to
-        // the consumer and the engine's spawned workers (so workers
-        // can call `record_checkpoint`).
-        let control = SyncControl::new_with_publications(
-            account_id.clone(),
-            boundary.clone(),
-            priority_tx.clone(),
-            bandwidth_cap_tx.clone(),
-            Arc::clone(&pending_coverage),
-        );
-
-        control.bind_control_events(account_control_tx.clone());
 
         // Reopen channel: the multiplexer's per-scope tasks raise
         // requests when a stream ends with an `EngineDirective`-class
@@ -320,22 +350,11 @@ impl SyncEngine {
             });
         };
 
-        // Ack writer: durably persists cursors as they are acked. Lives
-        // as long as the slot does.
-        let ack_writer_store = Arc::clone(&self.checkpoints);
-        let ack_writer_aid = account_id.clone();
-        let ack_writer_control = control.clone();
-        // Producers record what each enumeration proved; the single writer
-        // reads it back when the matching acknowledgement arrives.
+        // Transfer the early writer into slot teardown ownership only after
+        // all fallible discovery and establishment operations have completed.
         spawn(
             crate::types::WorkerRole::AckWriter,
-            tokio::spawn(ack_writer(
-                ack_writer_aid,
-                ack_writer_store,
-                ack_writer_control,
-                Arc::clone(&pending_coverage),
-                ack_rx,
-            )),
+            attaching_writer.0.take().expect("attach owns writer"),
         );
 
         // Control applier: forwards priority and bandwidth-cap
@@ -758,86 +777,42 @@ impl SyncEngine {
         discover_scopes_from(account).await
     }
 
-    /// Establish one discovered scope at attach. `stored` is the scope's
-    /// readable durable cursor, pre-read by `attach_inner`; this function never
-    /// reads the store itself, so an unreadable row is never healed per scope
-    /// (see the account-wide clear in `attach_inner`).
+    /// Attach preflights every durable row before this shared decision, since
+    /// one unreadable row requires an account-wide reset before any scope starts.
+    /// Inventory is deferred until subscription so cold-start mail is delivered.
     async fn establish_one(
         &self,
-        account_id: &AccountId,
+        writer: &WriterHandle,
         account: &dyn Account,
         scope: CursorScope,
         stored: Option<ChangeCursor>,
         cursors: Arc<CursorRegistry>,
     ) -> Result<InitialScope, Error> {
-        if let Some(existing) = stored {
-            // The classifier and the stream hook are required to agree.
-            // Defer either positive answer so InventoryFusion's guard can
-            // route a disagreement through scoped recovery. In
-            // particular, putting a cursor into the registry when only
-            // the stream hook accepts it would send an inventory page
-            // cursor to changes_stream.
-            let classified_as_inventory = account.is_inventory_cursor(&existing);
-            let has_resume_stream = account.inventory_resume_stream(existing.clone()).is_some();
-            if classified_as_inventory || has_resume_stream {
-                return Ok(InitialScope::DeferredInventory(DeferredInventory {
-                    epoch: cursors.lifecycle_epoch(&scope),
-                    fence: crate::cursor::PendingCoverage::initial_fence(),
-                    kind: DeferredKind::Resume(existing),
-                }));
-            }
-            cursors.put(existing);
-            return Ok(InitialScope::Ready);
-        }
-        match account
-            .establish_initial_cursor(scope.clone())
-            .await
-            .map_err(Error::Account)?
-        {
-            CursorEstablishment::Ready(cursor) => {
-                self.persist_cursor(account_id, cursor, cursors).await?;
+        let fresh = stored.is_none();
+        match super::reattach::establishment(account, &scope, stored).await? {
+            super::reattach::Establishment::Ready(cursor) => {
+                if fresh {
+                    // No coverage claim: the single writer preserves debt.
+                    writer.persist_established(cursor.clone()).await?;
+                }
+                cursors.put(cursor);
                 Ok(InitialScope::Ready)
             }
-            CursorEstablishment::EstablishViaInventory => {
+            super::reattach::Establishment::Resume { cursor, .. } => {
+                Ok(InitialScope::DeferredInventory(DeferredInventory {
+                    epoch: cursors.lifecycle_epoch(&scope),
+                    fence: crate::cursor::PendingCoverage::initial_fence(),
+                    kind: DeferredKind::Resume(cursor),
+                }))
+            }
+            super::reattach::Establishment::Inventory => {
                 Ok(InitialScope::DeferredInventory(DeferredInventory {
                     epoch: cursors.lifecycle_epoch(&scope),
                     fence: crate::cursor::PendingCoverage::initial_fence(),
                     kind: DeferredKind::Start(scope),
                 }))
             }
-            // `CursorEstablishment` is `#[non_exhaustive]`; treat any
-            // future variant as "cannot establish" so the engine fails
-            // closed rather than silently continuing.
-            _ => Err(Error::EstablishCursorFailed(
-                "unknown CursorEstablishment variant".into(),
-            )),
         }
-    }
-
-    async fn persist_cursor(
-        &self,
-        account_id: &AccountId,
-        cursor: ChangeCursor,
-        cursors: Arc<CursorRegistry>,
-    ) -> Result<(), Error> {
-        cursor
-            .validate_envelope()
-            .map_err(|_| Error::SchemaIncompatible)?;
-        // Carries no coverage report, so the ledger is preserved rather than
-        // overwritten: establishing a cursor proves nothing about what any
-        // enumeration covered.
-        let ledger = self.checkpoints.get_ledger(account_id).await?;
-        self.checkpoints
-            .apply_transition(
-                account_id,
-                CheckpointTransition {
-                    checkpoint: Checkpoint::Change(cursor.clone()),
-                    ledger,
-                },
-            )
-            .await?;
-        cursors.put(cursor);
-        Ok(())
     }
 
     /// Drive the bounded `discover_memberships` stream to completion
@@ -1301,9 +1276,11 @@ mod tests {
         account.resume_inventory_classifier = Some(false);
         let cursors = Arc::new(CursorRegistry::new());
 
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let writer = WriterHandle::new(writer_tx);
         let established = engine
             .establish_one(
-                &account_id,
+                &writer,
                 &account,
                 scope.clone(),
                 Some(cursor.clone()),
