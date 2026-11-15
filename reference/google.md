@@ -1605,6 +1605,10 @@ Mapping highlights:
   `ResourceKind`: `Draft`, `Identity`, `Vacation`,
   `PushSubscription` (for Pub/Sub watch). Blob 404 maps to the
   parent message's `NotFound(Message)`.
+  Explicit context resource hints take precedence; otherwise the resource
+  comes from `ErrorScope::resource()`, then defaults to `Message` if unknown.
+  Not-found IDs come from `ErrorScope::object_id()`. Calendar and contact
+  collection scopes retain their resource kind without an object ID.
 - Gmail-envelope `Retry-After` is resolved at response observation to
   `RetryHint::At` on the originating
   `ServerCause::{Unavailable, RateLimited, QuotaExhausted}` and forwarded to

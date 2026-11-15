@@ -582,7 +582,6 @@ pub(super) async fn ack_writer(
                 delete_backfill,
                 done,
             } => {
-                provisional.remove(&scope);
                 // Nothing here touches backfill capacity explicitly, and that is
                 // the fix rather than an omission. `invalidate_scope` removes the
                 // scope's boundary registrations, and those registrations ARE the
@@ -614,6 +613,18 @@ pub(super) async fn ack_writer(
                     Ok(())
                 }
                 .await;
+                // Ownership follows the change row, not the reset request. A
+                // failed ledger write or delete leaves that row abort-owned;
+                // release the mark only once its deletion has succeeded.
+                // Retaining it cannot let the old attempt's abort delete a
+                // freshly established cursor: both reset callers
+                // (`establish_if_absent`, `restart_scope_admitted`) re-establish
+                // through `run_establish`, which reads the row first
+                // and reaches `PersistEstablished` only when it is ABSENT. A row
+                // that survived a failed reset is resumed, never overwritten.
+                if result.is_ok() {
+                    provisional.remove(&scope);
+                }
                 // Second pass, closing the window the deletes just opened.
                 // Anything the still-draining scope published while they were
                 // in flight is retired here, its debt carried, and the fence

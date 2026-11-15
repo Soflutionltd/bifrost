@@ -431,9 +431,8 @@ impl BlobGetResponse {
 /// **Important**: The JMAP request's `using` array must include the
 /// capability that defines each type listed in `typeNames`. For example,
 /// looking up `"Email"` requires `urn:ietf:params:jmap:mail`. Use
-/// [`Request::add_capability`] to add the required capabilities, or use
-/// the `lookup_blob_with_capabilities` helper which handles this
-/// automatically for known types.
+/// [`Request::add_capability`] to add the required capabilities; callers
+/// must supply the capabilities for the requested types.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BlobLookupRequest {
     #[serde(rename = "accountId")]

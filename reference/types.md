@@ -242,8 +242,9 @@ are retained as bounded intent and may widen into a full reconcile; controls
 are handled synchronously and may overtake pending invalidations.
 
 `Control::pause` and `Control::checkpoint_now` return
-`Result<Option<Checkpoint>, AccountError>`. `None` means the stream is
-at a safe boundary but has never produced a durable checkpoint.
+`Result<DurableCheckpointSet, AccountError>`. The set describes the account's
+durable checkpoint boundary across cursor scopes and backfill partitions; an
+empty set means no durable checkpoint has been produced.
 
 ### Inventory ranges and completeness
 
@@ -396,8 +397,8 @@ suggests kinship:
   caller hands the serializer to send.
 - `hydration::MessageAttachment` / `AttachmentSource::Inline` - INBOUND, what a
   hydrated `Message` carries to a consumer.
-- `mime::DecodedAttachment` - the PARSER's intermediate, produced by
-  `select_body` and mapped onto `MessageAttachment` by each protocol crate. It
+- `mime::DecodedAttachment` - the MIME selector's intermediate attachment
+  representation, which consumers can project into `MessageAttachment`. It
   knows nothing about blobs.
 
 `AttachmentInline` and `AttachmentSource::Inline` are not related.

@@ -494,33 +494,6 @@ engine-side check), no consumer re-checks. `Container` carries `kind` and
 `provenance.kind`, `native_id` and `provenance.native`: duplicated public fields
 with no check that they agree.
 
-## STR-022 - Documentation drift noticed in passing
-
-**Reported by:** types, sync-lanes, jmap-protocol, smtp-sasl, net-dav.
-
-The sync, net and dav-core comment drift is corrected. Still open, each verified
-current by the fix pass:
-
-- `reference/types.md` says `DecodedAttachment` is "mapped onto
-  `MessageAttachment` by each protocol crate"; IMAP and Google call
-  `select_body`. Suggested wording: "the MIME selector's intermediate attachment
-  representation, which consumers can project into `MessageAttachment`. It knows
-  nothing about blobs."
-- `reference/types.md` documents control results as
-  `Result<Option<Checkpoint>, AccountError>`; the code returns
-  `DurableCheckpointSet`.
-- `crates/sync/src/engine/attach.rs::scope_covers_membership` says "Graph maps
-  folders 1:1 to mailboxes" (STR-001).
-- `reference/sync.md` (throttle section) compares the clock move to bifrost-smtp's
-  `ByteBucket`, which no longer exists.
-- jmap-protocol: the `BlobLookupRequest` doc names a helper that does not exist
-  (STR-089); the `email_submission::SetArguments` doc inverts the `#` convention
-  (STR-085); the `event_source/stream.rs` doc calls its traversal the same as the
-  WS lane's (CON-038). The `Capability` trait doc's session-level list is
-  BUG-058.
-- `BatchingPolicy` defaults (STR-017) and the `account_compose` module doc
-  (STR-016) belong to their own entries.
-
 ## STR-023 - The acknowledgement is assembled from loose parts the consumer must keep in step
 
 **Reported by:** sync-engine.

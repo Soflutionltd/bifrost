@@ -554,6 +554,12 @@ does not promote the provisional change cursor for the same scope. An
 already-persisted change publication also counts as durable and promotes the
 row. Rollback removes ownership only after its cursor delete succeeds; a failed
 delete leaves the row owned for a later abort, claim, commit or acknowledgement.
+A scope reset likewise releases ownership only after its change-cursor delete
+succeeds. A failed debt-ledger write, backfill delete or change-cursor delete
+preserves the mark, so a later abort can still remove the surviving row. An
+account reset clears all marks only after the account checkpoint clear succeeds.
+Once the row has been deleted, later debt persistence does not restore ownership:
+a subsequently established cursor must survive the old attempt's abort.
 
 A reattach that RESUMES a stored row (`run_establish` reading it through the
 writer's `GetChangeCursor`) passes its attempt as `claim_for`; if the row is
@@ -3834,8 +3840,8 @@ boundary, `record_throttle_parts`: a provider `RetryHint` - a duration
 against `SystemTime::now()` and immediately anchored to `Instant::now()`.
 `account_throttle_wait` takes no `now` for the same reason: there is one
 correct clock for a wait site, and a caller-supplied instant is how the wrong
-one got read. This is the same move `bifrost-smtp` made for `AsyncDeadline`
-and `ByteBucket`.
+one got read. Deadlines and the timers that retire them must use the same
+clock domain.
 
 `tests/throttle_defers_changes.rs` pins the engine-level fact the unit
 tests cannot reach: that a recorded deadline actually defers `changes_stream`

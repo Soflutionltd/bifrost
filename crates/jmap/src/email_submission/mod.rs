@@ -26,8 +26,8 @@ pub(crate) type EmailSubmissionId = crate::core::id::Id<marker::EmailSubmission>
 #[derive(Debug, Clone, Serialize, Default)]
 pub(crate) struct SetArguments {
     /// Patches to apply to the referenced email on successful submit,
-    /// keyed by `EmailSubmission` create-id (e.g. "c0") or by real
-    /// `EmailSubmission` id with `#` prefix per RFC 8621.
+    /// keyed by an `EmailSubmission` reference: prefix a create-id with `#`
+    /// and use an existing server id without a prefix, per RFC 8621.
     #[serde(rename = "onSuccessUpdateEmail")]
     #[serde(skip_serializing_if = "Option::is_none")]
     on_success_update_email: Option<HashMap<String, EmailPatch>>,

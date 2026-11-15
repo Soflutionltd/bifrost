@@ -1720,25 +1720,20 @@ while the PIM path dedupes by raw string and builds an `ErrorScope::Account`
 outcome; the etag rules are restated per lane. Owner: one `BatchAnswers::resolve`
 plus `EtagIndex::observe(id, Observation)` (STR-108).
 
-## BUG-130 - `ResetScope` clears provisional ownership before its fallible persist
+## BUG-133 - A stale reattach abort can delete a row a scoped recovery resumed
 
-**Reported by:** resolution wave (lateral, beside the `ReattachAbort` ordering fix).
+**Reported by:** resolution wave review (lateral; needs a ruling).
 
-`crates/sync/src/engine/ack.rs`: the `Ack` and `ReattachAbort` arms now release
-provisional ownership only after the store write or delete succeeds. `ResetScope`
-still clears it before its fallible persistence and deletion, so a failed reset
-leaves the row unowned.
-
-## BUG-131 - Google keeps a private `ErrorScope` to resource mapping that disagrees with the shared one
-
-**Reported by:** resolution wave review (lateral, after the shared
-`ErrorScope::resource()` / `object_id()` landed in bifrost-types).
-
-net, Graph and JMAP now read `ErrorScope::resource()`, which maps
-`CalendarCollection` / `ContactCollection` to `Calendar` / `Contact` with no object
-id. `crates/google/src/account/error.rs` still has its own local reader mapping both
-collection scopes to `None`, so a collection-scoped Google failure classifies
-differently from every other crate. Route it through the shared methods.
+`crates/sync/src/engine/ack.rs` now keeps a provisional reattach mark until the
+owning write or delete succeeds. In the resume case the scoped re-establish reads
+with `claim_for = None`, so a surviving row stays marked for the old reattach
+attempt; if that attempt's `ReattachAbort` arrives after the live scope resumed the
+row, it deletes the durable row. In-memory state is unaffected and the next durable
+`Ack` rewrites and promotes it, so the exposure is losing the resume point across a
+restart before that ack. Before the ordering fixes the mark was always dropped, so
+the window is new. It needs a reattach attempt still pending while a scoped
+recovery runs on the same scope; decide whether that interleaving is reachable and
+whether a non-reattach resume should drop or transfer the mark.
 
 ## BUG-132 - One malformed Gmail message history id now fails the whole response decode
 

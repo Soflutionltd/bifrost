@@ -889,9 +889,9 @@ pub(super) fn scope_covers_membership(scope: &CursorScope, membership: &Membersh
         (CursorScope::Folder(folder), MembershipScope::Folder(m)) => folder == m,
         (CursorScope::FolderType { folder, .. }, MembershipScope::Folder(m)) => folder == m,
         // Folder-typed cursors over an arbitrary folder match mailbox
-        // memberships that share the same id (Graph maps folders 1:1
-        // to mailboxes; we treat the FolderId / MailboxId String the
-        // same in the side index).
+        // memberships that share the same id: the side index compares
+        // the underlying FolderId / MailboxId strings without converting
+        // between provider-specific identities.
         (CursorScope::Folder(FolderId(folder_id)), MembershipScope::Mailbox(mbx)) => {
             folder_id == &mbx.0
         }

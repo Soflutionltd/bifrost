@@ -3766,6 +3766,166 @@ async fn a_failed_account_clear_keeps_reattach_ownership() {
     writer.await.expect("writer");
 }
 
+// Both failures precede a durable cursor delete. The later abort must still
+// own that row, including when a resuming attempt claims it after the reset.
+async fn failed_scope_reset_ownership_case(fail_ledger: bool, transfer: bool) {
+    let inner = Arc::new(crate::cursor::InMemoryCheckpointStore::new());
+    let store = Arc::new(GatedDeleteStore::new(Arc::clone(&inner)));
+    let (account, _, tx, writer) =
+        writer_harness_over(Arc::clone(&store) as Arc<DynCheckpointStore>);
+    let handle = WriterHandle::new(tx.clone());
+    handle
+        .reattach_insert(7, change_cursor(b"provisional"))
+        .await
+        .expect("insert");
+    store
+        .fail_ledger
+        .store(fail_ledger, std::sync::atomic::Ordering::SeqCst);
+    store
+        .fail_delete
+        .store(!fail_ledger, std::sync::atomic::Ordering::SeqCst);
+    assert!(handle.reset_scope_for_restart(email_scope()).await.is_err());
+    assert!(
+        inner
+            .get_change_cursor(&account, &email_scope())
+            .await
+            .expect("read")
+            .is_some()
+    );
+    if transfer {
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::GetChangeCursor {
+            scope: email_scope(),
+            claim_for: Some(8),
+            done,
+        })
+        .await
+        .expect("writer alive");
+        assert!(wait.await.expect("answered").expect("read").is_some());
+    }
+    store
+        .fail_ledger
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    store
+        .fail_delete
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    store.release.add_permits(2);
+    handle.reattach_abort(7).await;
+    if transfer {
+        assert!(
+            inner
+                .get_change_cursor(&account, &email_scope())
+                .await
+                .expect("read")
+                .is_some(),
+            "the stale abort must respect the resuming attempt's claim"
+        );
+        handle.reattach_abort(8).await;
+    }
+    assert!(
+        inner
+            .get_change_cursor(&account, &email_scope())
+            .await
+            .expect("read")
+            .is_none(),
+        "the surviving row must remain owned until its abort deletes it"
+    );
+    drop(handle);
+    drop(tx);
+    writer.await.expect("writer");
+}
+
+#[tokio::test]
+async fn a_failed_scope_reset_ledger_write_preserves_reattach_ownership() {
+    failed_scope_reset_ownership_case(true, false).await;
+}
+
+#[tokio::test]
+async fn a_failed_scope_reset_cursor_delete_preserves_reattach_ownership() {
+    failed_scope_reset_ownership_case(false, false).await;
+}
+
+#[tokio::test]
+async fn a_failed_scope_reset_allows_a_resuming_attempt_to_claim_ownership() {
+    failed_scope_reset_ownership_case(false, true).await;
+}
+
+#[tokio::test]
+async fn a_failed_scope_reset_backfill_delete_preserves_reattach_ownership() {
+    let inner = Arc::new(crate::cursor::InMemoryCheckpointStore::new());
+    let store = Arc::new(FailingDeleteStore {
+        inner: Arc::clone(&inner),
+    });
+    let (account, _, tx, writer) = writer_harness_over(store);
+    let handle = WriterHandle::new(tx.clone());
+    handle
+        .reattach_insert(7, change_cursor(b"provisional"))
+        .await
+        .expect("insert");
+    assert!(
+        handle
+            .reset_scope_for_deletion(email_scope())
+            .await
+            .is_err()
+    );
+    assert!(
+        inner
+            .get_change_cursor(&account, &email_scope())
+            .await
+            .expect("read")
+            .is_some()
+    );
+    handle.reattach_abort(7).await;
+    assert!(
+        inner
+            .get_change_cursor(&account, &email_scope())
+            .await
+            .expect("read")
+            .is_none()
+    );
+    drop(handle);
+    drop(tx);
+    writer.await.expect("writer");
+}
+
+// A successful reset must also release the mark: keeping it would let the old
+// attempt delete the cursor that the scope establishes after its reset.
+#[tokio::test]
+async fn a_successful_scope_reset_releases_ownership_before_reestablishment() {
+    let (account, store, _, tx, writer) = writer_harness();
+    let handle = WriterHandle::new(tx.clone());
+    handle
+        .reattach_insert(7, change_cursor(b"provisional"))
+        .await
+        .expect("insert");
+    handle
+        .reset_scope_for_restart(email_scope())
+        .await
+        .expect("reset");
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::PersistEstablished {
+        cursor: change_cursor(b"reestablished"),
+        done,
+    })
+    .await
+    .expect("writer alive");
+    wait.await.expect("answered").expect("persisted");
+    handle.reattach_abort(7).await;
+    assert_eq!(
+        store
+            .get_change_cursor(&account, &email_scope())
+            .await
+            .expect("read")
+            .expect("reestablished cursor survives")
+            .server_state
+            .bytes,
+        b"reestablished"
+    );
+    drop(handle);
+    drop(tx);
+    writer.await.expect("writer");
+}
+
 /// The detach-race cleanup in `subscribe_push` deletes a subscription it could
 /// not register, and that delete is a `push_unsubscribe` like any other: it
 /// must bump the push topology, and only once the provider call has finished.

@@ -22,10 +22,9 @@ use std::collections::HashMap;
 /// objects, so a group's state changes are exactly as authoritative as a
 /// top-level one - and dropping them is the precise loss the state-teardown
 /// rule in `event_source` exists to prevent, minus the teardown that would
-/// at least have replayed them. The WebSocket lane already recurses
-/// through groups (`sync/push.rs::emit_push`); this is the same traversal,
-/// written with an explicit worklist because the nesting depth is chosen by
-/// the server. Entries are pushed in reverse so they pop in wire order.
+/// at least have replayed them. An explicit worklist visits nested groups
+/// depth-first because the nesting depth is chosen by the server. Entries
+/// are pushed in reverse so they pop in wire order.
 ///
 /// One SSE block yields at most ONE `StateChange`, because the block has
 /// exactly one resume token. Emitting a state change per nested entry gave

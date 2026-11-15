@@ -2,13 +2,14 @@ use serde::de::DeserializeOwned;
 
 /// A JMAP capability identified by its URN.
 ///
-/// `Config` describes the session object for Core and WebSocket and the
-/// account object for account-scoped extensions. Capabilities with no configuration
-/// (empty JSON object) should use `()`.
+/// `Config` describes the capability object decoded by the typed reader.
+/// [`super::session::Session::capability_config`] selects the session object
+/// or the primary account's object according to the capability URI.
+/// Capabilities with no configuration (empty JSON object) should use `()`.
 pub(crate) trait Capability {
     const URI: &'static str;
 
-    /// Capability configuration at its specified session or account level.
+    /// Capability configuration decoded from the object selected by the reader.
     type Config: DeserializeOwned + Send + Sync + 'static;
 }
 

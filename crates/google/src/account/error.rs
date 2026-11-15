@@ -1058,29 +1058,19 @@ fn malformed_kind_cause(detail: String) -> (AccountErrorKind, Cause) {
 }
 
 fn not_found_kind_cause(ctx: &GmailErrorContext) -> (AccountErrorKind, Cause) {
-    // every typed `GmailResource` now maps to a real
-    // `ResourceKind` (Blob -> Message because a missing blob means
-    // the parent message can't be opened, PubSubWatch ->
-    // PushSubscription, Account, etc.). The fallback to `Message` only
-    // fires when no `GmailResource` was attached at all - which is a
-    // producer bug rather than a documented coercion; every `not_found`
-    // path in this crate sets `ctx.resource`.
+    // Explicit hints preserve operation-specific meanings such as a blob
+    // miss naming its parent message. Otherwise use the shared scope reader,
+    // including collection kinds without an individual object id.
     let what = ctx
         .resource
         .and_then(GmailResource::to_resource_kind)
+        .or_else(|| ctx.scope.as_ref().and_then(ErrorScope::resource))
         .unwrap_or(ResourceKind::Message);
-    let id = ctx.scope.as_ref().and_then(|scope| match scope {
-        ErrorScope::Message { id } => Some(id.0.clone()),
-        ErrorScope::Mailbox { id } => Some(id.0.clone()),
-        ErrorScope::Thread { id } => Some(id.0.clone()),
-        ErrorScope::Calendar { id } => Some(id.0.clone()),
-        ErrorScope::Contact { id } => Some(id.0.clone()),
-        ErrorScope::Account
-        | ErrorScope::Cursor(_)
-        | ErrorScope::CalendarCollection
-        | ErrorScope::ContactCollection => None,
-        _ => None,
-    });
+    let id = ctx
+        .scope
+        .as_ref()
+        .and_then(ErrorScope::object_id)
+        .map(str::to_owned);
     (
         AccountErrorKind::NotFound(what),
         Cause::Request(RequestCause::NotFound { what, id }),
@@ -2125,6 +2115,45 @@ mod tests {
             acc.kind(),
             AccountErrorKind::NotFound(ResourceKind::PushSubscription)
         ));
+    }
+
+    #[test]
+    fn not_found_scope_fallback_uses_collection_resource_without_object_id() {
+        for (scope, what) in [
+            (ErrorScope::CalendarCollection, ResourceKind::Calendar),
+            (ErrorScope::ContactCollection, ResourceKind::Contact),
+        ] {
+            let mut ctx = GmailErrorContext::base(AccountOperation::SyncInventory);
+            ctx.scope = Some(scope);
+            let acc = into_account_error(gmail_response(404, ""), ctx);
+            assert_eq!(acc.kind(), &AccountErrorKind::NotFound(what));
+            assert!(acc.chain().iter().any(|cause| {
+                matches!(
+                    cause,
+                    Cause::Request(RequestCause::NotFound { what: actual, id: None })
+                        if *actual == what
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn not_found_scope_fallback_uses_event_resource_and_object_id() {
+        let mut ctx = GmailErrorContext::base(AccountOperation::EventGet);
+        ctx.scope = Some(ErrorScope::Event {
+            id: bifrost_types::EventId("calendar::event".to_owned()),
+        });
+        let acc = into_account_error(gmail_response(404, ""), ctx);
+        assert_eq!(acc.kind(), &AccountErrorKind::NotFound(ResourceKind::Event));
+        assert!(acc.chain().iter().any(|cause| {
+            matches!(
+                cause,
+                Cause::Request(RequestCause::NotFound {
+                    what: ResourceKind::Event,
+                    id: Some(id),
+                }) if id == "calendar::event"
+            )
+        }));
     }
 
     #[test]
