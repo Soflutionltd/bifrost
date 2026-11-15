@@ -121,6 +121,16 @@ face.
   Separate fields (message id, correlation id, scheduled handle) would let
   `cancel_scheduled_send` / `reschedule_send` take the handle by type. Also
   `draft_send` has no per-call `save_to_sent`; IMAP uses the account default.
+  The November 2026 design hunt (types scope) proposed the same split as
+  `SendReceipt::id: SubmissionRef` (`Message(ObjectId)`,
+  `Scheduled(ScheduledSendHandle)`, `Correlation(String)`), with the scheduled
+  primitives taking `ScheduledSendHandle`, and noted that `DraftHandle` exists
+  "so the type system catches mix-ups" while `impl From<DraftHandle> for
+  ObjectId` undoes it. The imap-account scope of the same hunt reached the same
+  shape from `append_to_sent_or_fallback`, which returns either an
+  APPENDUID-derived id or `ObjectId("imapmsgid1:<Message-ID>")` that
+  `decode_object_id` rejects, and noted `SentCopy::Filed { id: Option<..> }`
+  already carries the addressable case separately.
 - **A JMAP send's leftover staging Email has no routable handle on the
   receipt.** When the implicit `Email/set` refuses or does not confirm the
   Sent move, the created/imported Email (or, for `draft_send`, the submitted
@@ -146,7 +156,10 @@ face.
   is the owner's decision, to be made later. JMAP, CalDAV, CardDAV and Graph
   moved off it, so no provider advertises it. The `IdempotencyKey` doc in
   `crates/types/src/mutation.rs` still contrasts itself with `StateBased` as
-  "optimistic concurrency on the wire".
+  "optimistic concurrency on the wire". The November 2026 design hunt (types
+  scope) confirmed it is constructed nowhere and folded the question into a
+  proposal to replace `ExpectedVersion`'s eight bools plus `None` with one
+  doors bitset (filed in the hunt's `structural.md`).
 - **Engine-internal requests on the published `ReopenRequest`.**
   `ScopeDeleted`, `ScopeCreated`, `EstablishIfAbsent` and `SchemaReset` are
   engine plumbing whose epochs and generations mean nothing to a consumer, on
@@ -155,6 +168,10 @@ face.
   identical in meaning to `Recovery { generation: Some(_) }` (both are
   stamped with the producing incarnation's generation and declined the same
   way), so merging it into `Recovery` also removes a published variant.
+  The November 2026 design hunt (sync-engine scope) proposed one variant
+  carrying a stamp type, `Stamp::{Incarnation(AccountGeneration), Injected}`,
+  so the type says only the sink is unstamped, and argued `ReopenRequest`
+  belongs to the per-account supervisor rather than to `multiplexer`.
 - **Caller-version residue.** Ruled (2026-10-21) and largely landed. Still
   open: JMAP PIM reads expose no caller type-state field, so a consumer has
   nothing to hand back, although JMAP capabilities already advertise
@@ -185,7 +202,12 @@ face.
   returns a bare terminal `Protocol(MissingField)` with acknowledged evidence
   and no record; `Application::from_leaf` would read that leaf NotApplied, but
   nothing calls it there). The committed-unidentified partial-commit shape can
-  carry them without inventing uncertainty.
+  carry them without inventing uncertainty. The November 2026 design hunt
+  (imap-account scope) reported the IMAP case independently: with no APPENDUID
+  (RFC 4315 forbids it for a `UIDNOTSTICKY` mailbox, and servers may omit it)
+  the draft exists and the caller gets `Err(Unsupported(DraftCreate))`, which
+  reads as "nothing happened", so a retry duplicates the draft; the UIDPLUS
+  capability gate does not cover it.
 - **Graph and JMAP judge the same identity-less draft create differently.**
   Graph `send_created_draft` (crates/graph/src/account/pim/send.rs) records
   the committed unidentified `Created` as `Repeatable`; JMAP `draft_create`
@@ -281,13 +303,19 @@ Narrow edge cases, audits with no known defect, and design work.
   per-folder SELECT or SEARCH error with `?` across every selectable folder,
   shared ones included, and never use `Page::skipped_scopes`; Graph
   quarantines a revoked mailbox instead. Needs a ruling on which per-folder
-  failures quarantine rather than fail.
+  failures quarantine rather than fail. The November 2026 design hunt
+  (imap-account scope) reported the same and filed IMAP's wider skip-lane gap
+  (shared-namespace LIST / NAMESPACE failures dropped at open) in the hunt's
+  `bugs.md`.
 - **IMAP search: the ESEARCH expansion cap is reported as `Request(Malformed)`.**
   `SearchResultTruncated` (`crates/imap/src/account/error.rs`) maps to a
   `ClientBug` class although the request was well formed and the server
   answered correctly; a caller cannot tell "criteria malformed" from "result
   too large" except by support-only text. Position paging does not help, since
-  every page call still expands the whole folder result.
+  every page call still expands the whole folder result. The November 2026
+  design hunt (imap-account scope) traced this to a gap in the shared
+  vocabulary - `RequestErrorKind` has only `Malformed` and `BatchInputInvalid` -
+  and filed the wider set of collapsed failures in the hunt's `structural.md`.
 - **IMAP search cursor is not bound to its query.** The `imapsearch1:` cursor
   carries only a position, so it is accepted for a different `SearchRequest`.
   A position is meaningful under any query, so this resumes rather than
@@ -308,7 +336,17 @@ Narrow edge cases, audits with no known defect, and design work.
   `Request(Malformed)` (a `ClientBug` class for a server-side generation
   change); reference/error-model.md never names UIDVALIDITY. The poller
   (`crates/imap/src/account/poll.rs`) answers a typed `GenerationChanged`
-  instead. Needs a ruling on the shared class.
+  instead. Needs a ruling on the shared class. The November 2026 design hunt
+  (imap-account scope) counted seven sites: `get.rs` and `mutate.rs`
+  `uidvalidity_changed_error`, `blob.rs::run_raw`, `pim.rs::valid_uids` (no
+  scope), `parts.rs::DecodedPartHandle::verify_uidvalidity` (all
+  `Request(Malformed)`), `pim.rs::SearchPager::check_epoch`
+  (`ConcurrencyConflict`), `changes.rs::validate_uidvalidity`
+  (`SyncState(CursorInvalid)`). It proposed the epoch check live on one IMAP
+  identity type (`ImapRef::check_epoch(live) -> Result<(), EpochVoided>`) with
+  one translation of `EpochVoided` in `error.rs`, most likely
+  `NotFound(Message)` with a folder-scoped cause so the engine also learns the
+  scope needs re-inventory.
 - **No persistence contract for a `ChangeCursor` held outside the engine.**
   bifrost#3 offered it as the alternative to the UID polling surface; the
   surface landed instead. The cursor codec lives in bifrost-sync and nothing
@@ -353,7 +391,11 @@ Narrow edge cases, audits with no known defect, and design work.
   to `Error::Timeout { attempt: None }`, including one after the STARTTLS
   tagged OK or the stream swap. Harmless today (the half-built session is
   dropped before a driver exists and the only recovery is a fresh dial), but
-  it is the one transition path whose error states no phase.
+  it is the one transition path whose error states no phase. The November 2026
+  design hunt (imap-connection scope) found the same for the CAPABILITY line,
+  and traced it to setup running outside the driver as a second execution
+  context with its own evidence model; its proposal to move setup into the
+  driver is filed in the hunt's `structural.md`.
 - **Session cap does not span account incarnations.** A failed or cancelled
   factory open, or a closing incarnation during reopen, can leave a transport
   tail that the next incarnation's cap does not count.
