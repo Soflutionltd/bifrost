@@ -272,6 +272,8 @@ impl SyncEngine {
             Arc::clone(&pending_coverage),
         );
 
+        control.bind_control_events(account_control_tx.clone());
+
         // Reopen channel: the multiplexer's per-scope tasks raise
         // requests when a stream ends with an `EngineDirective`-class
         // recovery, carrying the originating `AccountError`.
@@ -334,6 +336,7 @@ impl SyncEngine {
         // changes to the currently-open protocol handle. Reopen also
         // reapplies the snapshots to the replacement handle.
         {
+            let applying = control.clone();
             let control_budget = bandwidth_budget.clone();
             let control_account = Arc::clone(&current);
             let control_shutdown = shutdown.clone();
@@ -344,14 +347,7 @@ impl SyncEngine {
                 tokio::spawn(async move {
                     {
                         let account = control_account.load_full();
-                        account
-                            .as_ref()
-                            .as_ref()
-                            .set_priority(*priority_view.borrow());
-                        account
-                            .as_ref()
-                            .as_ref()
-                            .set_bandwidth_cap(*bandwidth_view.borrow());
+                        applying.apply_to(account.as_ref().as_ref(), control_budget.as_ref());
                     }
                     loop {
                         tokio::select! {
@@ -360,21 +356,15 @@ impl SyncEngine {
                                 if changed.is_err() {
                                     return;
                                 }
-                                let priority = *priority_view.borrow();
                                 let account = control_account.load_full();
-                                account.as_ref().as_ref().set_priority(priority);
+                                applying.apply_to(account.as_ref().as_ref(), control_budget.as_ref());
                             }
                             changed = bandwidth_view.changed() => {
                                 if changed.is_err() {
                                     return;
                                 }
-                                let cap = bandwidth_view.borrow();
-                                if let Some(budget) = &control_budget {
-                                    // Keep the watch read locked through the policy write.
-                                    budget.set_cap(*cap);
-                                }
                                 let account = control_account.load_full();
-                                account.as_ref().as_ref().set_bandwidth_cap(*cap);
+                                applying.apply_to(account.as_ref().as_ref(), control_budget.as_ref());
                             }
                         }
                     }
@@ -525,7 +515,6 @@ impl SyncEngine {
 
         let backfill_wiring = BackfillWiring {
             live: Arc::clone(&live_supersedes),
-            store: Arc::clone(&self.checkpoints),
             registry: Arc::clone(&self.backfill_registry),
             config: self.config.backfill,
             fusion_owned_scopes: deferred_inventory_scopes

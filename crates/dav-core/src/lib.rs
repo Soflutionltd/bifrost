@@ -46,7 +46,9 @@ pub use error::{
     not_found_error, parse_error, recovery_rank, response_read_error, should_fallback_discovery,
     status_error, transport_error, unsupported_error, worse_recovery,
 };
-pub use etag::{PutCondition, normalize_http_etag, prepare_if_match, response_etag};
+pub use etag::{
+    EntityTag, PutCondition, StrongTag, normalize_http_etag, prepare_if_match, response_etag,
+};
 pub use multistatus::{
     FailedResource, MultiStatusOutcome, MultiStatusSink, MultistatusError, PropSet, ResponseParts,
     classify_207, commit_if_present, extract_href_properties, extract_href_properties_in_namespace,

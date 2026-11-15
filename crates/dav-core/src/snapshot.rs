@@ -234,9 +234,10 @@ impl Observation {
 /// entries whose hrefs the server reported failed are re-inserted from the
 /// previous snapshot. URL equivalence is used only for this lookup: when a
 /// current member matches an old one under another spelling, the old native id
-/// is retained. The result is re-sorted and deduplicated on href - the diff
-/// above depends on both. The returned observation also decides whether the
-/// collection token can advance; preserving entries alone cannot make
+/// is retained. Observed results are re-sorted and deduplicated by DAV identity.
+/// A wholly unobserved persisted snapshot keeps its historical aliases until
+/// a real listing can reconcile them. The returned observation also decides
+/// whether the collection token can advance; preserving entries alone cannot make
 /// checkpointing past a refused member safe.
 pub fn preserve_unobserved_entries(
     previous: &[SnapshotEntry],
@@ -287,7 +288,11 @@ pub fn preserve_unobserved_entries(
             .cloned(),
     );
     current.sort_by(|left, right| left.uri.cmp(&right.uri));
-    current.dedup_by(|left, right| left.uri == right.uri);
+    // Inventory must expose one resource per DAV identity. Keep the first
+    // native spelling deterministically; changing aliases must not duplicate
+    // an enterprise user's calendar event or contact.
+    let mut seen = HashSet::new();
+    current.retain(|entry| seen.insert(dav_href_key(&entry.uri)));
     observation
 }
 
@@ -624,6 +629,24 @@ mod tests {
             uri: uri.to_string(),
             etag: etag.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn preservation_collapses_aliases_in_observed_snapshots() {
+        let mut current = vec![
+            entry("https://dav.test/c/%61", Some("first")),
+            entry("https://dav.test/c/a", Some("second")),
+            entry("https://dav.test/c/b", Some("other")),
+        ];
+        let observation = preserve_unobserved_entries(&[], &mut current, &[]);
+        assert!(observation.complete);
+        assert_eq!(
+            current,
+            vec![
+                entry("https://dav.test/c/%61", Some("first")),
+                entry("https://dav.test/c/b", Some("other")),
+            ]
+        );
     }
 
     #[test]

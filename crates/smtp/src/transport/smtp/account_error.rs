@@ -15,11 +15,12 @@ use bifrost_types::error::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, DiagnosticText,
     EnhancedStatusCode as TypesEnhancedStatusCode, InternalCause, InternalErrorKind,
-    MailboxUnavailableKind, Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind,
+    MailboxUnavailableKind, Protocol, ProtocolErrorKind, RequestCause, RequestErrorKind,
     ResourceKind, ServerCause, ServerErrorKind, ThrottleScope, TransmissionState, TransportCause,
     TransportErrorKind, TransportKind, WireCause,
 };
 
+use super::Dialect;
 use crate::error::Error as MessageError;
 use crate::transport::smtp::error::{
     Error as SmtpError, ErrorKind, SmtpCommandPhase, SmtpTransmissionState,
@@ -36,7 +37,9 @@ fn finish(builder: AccountErrorBuilder) -> AccountError {
         .expect("valid account error classification")
 }
 
-/// Call-site evidence that is not carried on the low-level `SmtpError`.
+/// Submission dialect not carried on the low-level `SmtpError`.
+/// Operation and idempotency are fixed by the submission boundary; transmission
+/// evidence comes only from the error. Do not add mutable copies here.
 ///
 /// There is deliberately no `scope` field. No `ErrorScope` variant can
 /// honestly locate an SMTP failure: the id-bearing variants take typed
@@ -47,32 +50,18 @@ fn finish(builder: AccountErrorBuilder) -> AccountError {
 /// the blocking and async drivers in step here rather than convention.
 #[derive(Clone, Debug)]
 pub(crate) struct SmtpErrorContext {
-    pub(crate) operation: Option<AccountOperation>,
-    pub(crate) provider: Option<Provider>,
-    pub(crate) protocol: Protocol,
-    pub(crate) idempotency_override: Option<bool>,
-    pub(crate) transmission_state: Option<SmtpTransmissionState>,
+    pub(crate) protocol: Dialect,
 }
 
 impl SmtpErrorContext {
-    pub(crate) fn send(protocol: Protocol) -> Self {
-        assert!(
-            matches!(protocol, Protocol::Smtp | Protocol::Lmtp),
-            "SmtpErrorContext requires Protocol::Smtp or Protocol::Lmtp"
-        );
-        Self {
-            operation: Some(AccountOperation::Send),
-            provider: None,
-            protocol,
-            idempotency_override: Some(false),
-            transmission_state: None,
-        }
+    pub(crate) fn send(protocol: Dialect) -> Self {
+        Self { protocol }
     }
 }
 
 /// Convert a low-level SMTP transport `Error` into an `AccountError`.
 pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> AccountError {
-    let attempt_state = error.attempt().or(ctx.transmission_state);
+    let attempt_state = error.attempt();
     // Wire-side phase knowledge has one carrier. Keeping a second phase on the
     // context would let batch call sites construct disagreeing evidence.
     let phase = error.phase();
@@ -92,7 +81,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             &ctx,
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
             Cause::Wire(WireCause::MalformedResponse {
-                protocol: ctx.protocol,
+                protocol: ctx.protocol.into(),
                 detail: diagnostic.clone().map(DiagnosticText::support_only),
             }),
             attempt_state,
@@ -232,17 +221,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
 /// command, and bifrost-net already knows whether its failure is auth loss,
 /// refresh-transient, or another typed outcome.
 fn recontextualize_preclassified(error: AccountError, ctx: &SmtpErrorContext) -> AccountError {
-    let mut builder = error.into_builder().protocol(ctx.protocol);
-    if let Some(operation) = ctx.operation {
-        builder = builder.operation(operation);
-    }
-    if let Some(provider) = ctx.provider {
-        builder = builder.provider(provider);
-    }
-    if let Some(idempotency_override) = ctx.idempotency_override {
-        builder = builder.idempotency_override(idempotency_override);
-    }
-    finish(builder)
+    finish(apply_context(error.into_builder(), ctx))
 }
 
 /// The SASL rung an auth-phase error was running, if the stamp names one.
@@ -293,9 +272,9 @@ fn build_basic(
     let mut builder = match kind {
         // Classification tables return parts so they can retain wire evidence.
         AccountErrorKind::Unsupported(operation) => {
-            AccountError::unsupported(operation, ctx.protocol).into_builder()
+            AccountError::unsupported(operation, ctx.protocol.into()).into_builder()
         }
-        _ => AccountErrorBuilder::new(kind, cause).protocol(ctx.protocol),
+        _ => AccountErrorBuilder::new(kind, cause).protocol(ctx.protocol.into()),
     };
     builder = apply_context(builder, ctx);
     if let Some(state) = attempt {
@@ -328,7 +307,7 @@ fn build_transport(
             diagnostic.map(|t| DiagnosticText::support_only(t.to_owned())),
         )),
     )
-    .protocol(ctx.protocol);
+    .protocol(ctx.protocol.into());
     builder = apply_context(builder, ctx);
     if let Some(state) = attempt {
         builder = builder.push_cause(Cause::Attempt(AttemptCause::new(to_types_state(state))));
@@ -339,17 +318,11 @@ fn build_transport(
     finish(builder)
 }
 
-fn apply_context(mut builder: AccountErrorBuilder, ctx: &SmtpErrorContext) -> AccountErrorBuilder {
-    if let Some(op) = ctx.operation {
-        builder = builder.operation(op);
-    }
-    if let Some(provider) = ctx.provider {
-        builder = builder.provider(provider);
-    }
-    if let Some(over) = ctx.idempotency_override {
-        builder = builder.idempotency_override(over);
-    }
+fn apply_context(builder: AccountErrorBuilder, ctx: &SmtpErrorContext) -> AccountErrorBuilder {
     builder
+        .protocol(ctx.protocol.into())
+        .operation(AccountOperation::Send)
+        .idempotency_override(false)
 }
 
 pub(crate) fn to_types_state(state: SmtpTransmissionState) -> TransmissionState {
@@ -396,7 +369,7 @@ pub(crate) fn response_to_account_error(
         auth_mechanism(phase),
     );
 
-    let (kind, primary_cause) = classify_response(response, phase, ctx.protocol);
+    let (kind, primary_cause) = classify_response(response, phase, ctx.protocol.into());
     // Decided from the same classification the builder is given, so the
     // throttle hint below cannot drift away from the kind it describes.
     let rate_or_quota = kind_is_rate_or_quota(&kind);
@@ -404,9 +377,9 @@ pub(crate) fn response_to_account_error(
     let mut builder = match kind {
         // Classification tables return parts so they can retain wire evidence.
         AccountErrorKind::Unsupported(operation) => {
-            AccountError::unsupported(operation, ctx.protocol).into_builder()
+            AccountError::unsupported(operation, ctx.protocol.into()).into_builder()
         }
-        _ => AccountErrorBuilder::new(kind, primary_cause).protocol(ctx.protocol),
+        _ => AccountErrorBuilder::new(kind, primary_cause).protocol(ctx.protocol.into()),
     }
     .status(Some(status))
     .native_code(native);
@@ -868,7 +841,7 @@ mod tests {
     }
 
     fn ctx_smtp_send() -> SmtpErrorContext {
-        SmtpErrorContext::send(Protocol::Smtp)
+        SmtpErrorContext::send(Dialect::Smtp)
     }
 
     #[test]
@@ -1379,7 +1352,7 @@ mod tests {
 
     #[test]
     fn scram_invalid_proof_matches_a_535_credential_rejection() {
-        for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+        for protocol in [Dialect::Smtp, Dialect::Lmtp] {
             let ctx = SmtpErrorContext::send(protocol);
             let sasl = bifrost_sasl::verify_server_final("e=invalid-proof", &[]).unwrap_err();
             let error: SmtpError = sasl.into();
@@ -1662,12 +1635,12 @@ mod unsupported_constructor_tests {
     #[test]
     fn unsupported_constructor_stamps_protocol_and_kind() {
         let operation = bifrost_types::AccountOperation::Send;
-        for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+        for protocol in [Dialect::Smtp, Dialect::Lmtp] {
             let error = into_account_error(
                 crate::transport::smtp::error::feature_unsupported("unavailable"),
                 SmtpErrorContext::send(protocol),
             );
-            assert_eq!(error.protocol(), Some(protocol));
+            assert_eq!(error.protocol(), Some(protocol.into()));
             assert_eq!(error.operation(), Some(operation));
             assert_eq!(error.kind(), &AccountErrorKind::Unsupported(operation));
         }

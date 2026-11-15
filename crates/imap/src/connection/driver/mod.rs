@@ -827,15 +827,7 @@ pub(in crate::connection) async fn run_prepared_command(
         state.set_in_unauthenticate(true);
     }
 
-    // RFC 5465 Section3: tell apply_tagged to update NOTIFY per-type flags
-    // on tagged OK. NOTIFY SET computes flags from the registration
-    // params; NOTIFY NONE resets to default (no notifications).
-    if let Command::NotifySet(params) = cmd {
-        state.set_in_notify_set(Some(super::NotifyFlags::from(params)));
-    }
-    if matches!(cmd, Command::NotifyNone) {
-        state.set_in_notify_set(Some(super::NotifyFlags::default()));
-    }
+    state.arm_notify(cmd, &tag);
 
     // Send. Exactly one command is on the wire, so the continuation wait has
     // no routing context; a refused literal comes back as that command's own

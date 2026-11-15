@@ -862,7 +862,7 @@ async fn directory_review_redirected_writes_check_every_source_and_rebased_desti
                         if door == "create-put" {
                             PutCondition::IfNoneMatch
                         } else {
-                            PutCondition::IfMatch("v1")
+                            PutCondition::from_etag(Some("v1"))
                         },
                         AccountOperation::ContactUpdate,
                     )
@@ -955,7 +955,7 @@ async fn directory_review_redirected_writes_to_siblings_still_work() {
                 .put_vcard(
                     &source,
                     "card".into(),
-                    PutCondition::IfMatch("v1"),
+                    PutCondition::from_etag(Some("v1")),
                     AccountOperation::ContactUpdate,
                 )
                 .await
@@ -1178,7 +1178,7 @@ async fn directory_round_two_late_markers_reach_the_redirect_guard() {
                 .put_vcard(
                     &source,
                     "card".into(),
-                    PutCondition::IfMatch("v1"),
+                    PutCondition::from_etag(Some("v1")),
                     AccountOperation::ContactUpdate,
                 )
                 .await

@@ -13,6 +13,7 @@ mod cursor;
 mod error;
 mod ews_stream;
 mod filters;
+mod flags;
 mod foreign;
 mod get;
 pub(crate) mod graph_error;
@@ -162,7 +163,7 @@ pub(crate) struct GraphAccount {
     /// truncation. Only then does a folder missing from `routing_map` prove
     /// the folder is gone for this user rather than not yet rediscovered;
     /// hydration uses it to stop retrying such items (see
-    /// `graph_error::unroutable_public_item_error`). Starts false on every
+    /// `graph_error::unroutable_public_resource_error`). Starts false on every
     /// open, like the map it qualifies.
     pub(crate) public_folder_discovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Projection metadata for every discovered public folder (display name,
@@ -598,31 +599,49 @@ impl GraphAccount {
     /// The refusal for a public-folder item whose folder has no routing entry.
     /// A retryable stale-local-state conflict until a complete discovery pass
     /// has run; after one, `NotFound(Message)` so the item stops retrying
-    /// (ruling on `graph_error::unroutable_public_item_error`).
+    /// (ruling on `graph_error::unroutable_public_resource_error`).
     pub(crate) fn missing_public_route_error(
         &self,
         operation: bifrost_types::AccountOperation,
         id: &bifrost_types::ObjectId,
         folder: &bifrost_types::FolderId,
     ) -> bifrost_types::AccountError {
+        self.missing_public_collection_route_error(
+            operation,
+            folder,
+            bifrost_types::ErrorScope::Message {
+                id: id.0.clone().into(),
+            },
+            bifrost_types::ResourceKind::Message,
+            &id.0,
+        )
+    }
+
+    /// Before discovery, preserve the visible resource while routing catches up.
+    /// After a complete browse, an Outlook user expects an absent collection to
+    /// stop retrying. Keep its actual resource kind and scope for the consumer.
+    pub(crate) fn missing_public_collection_route_error(
+        &self,
+        operation: bifrost_types::AccountOperation,
+        folder: &bifrost_types::FolderId,
+        scope: bifrost_types::ErrorScope,
+        kind: bifrost_types::ResourceKind,
+        id: &str,
+    ) -> bifrost_types::AccountError {
         let detail = format!("public folder {} has no routing entry", folder.0);
         if self
             .public_folder_discovery_complete
             .load(std::sync::atomic::Ordering::SeqCst)
         {
-            graph_error::unroutable_public_item_error(
+            graph_error::unroutable_public_resource_error(
                 operation,
-                &id.0,
+                scope,
+                kind,
+                id,
                 format!("{detail} after a complete public-folder discovery"),
             )
         } else {
-            graph_error::stale_local_state_error(
-                operation,
-                bifrost_types::ErrorScope::Message {
-                    id: id.0.clone().into(),
-                },
-                detail,
-            )
+            graph_error::stale_local_state_error(operation, scope, detail)
         }
     }
 
@@ -1857,6 +1876,58 @@ mod tests {
         PublicFolderRouting, encode_cursor, kind_for_scope,
     };
     use super::*;
+
+    #[test]
+    fn missing_public_routes_preserve_kind_and_scope_after_discovery() {
+        use bifrost_types::{ErrorScope, ResourceKind};
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let folder = FolderId("public-folder".into());
+        let cases = [
+            (
+                AccountOperation::ContactsList,
+                ErrorScope::ContactCollection,
+                ResourceKind::Contact,
+            ),
+            (
+                AccountOperation::EventsInRange,
+                ErrorScope::Calendar {
+                    id: "calendar".into(),
+                },
+                ResourceKind::Calendar,
+            ),
+            (
+                AccountOperation::SyncInventory,
+                ErrorScope::Cursor(bifrost_types::CursorScope::Folder(folder.clone())),
+                ResourceKind::Mailbox,
+            ),
+        ];
+        for (operation, scope, kind) in cases {
+            account
+                .public_folder_discovery_complete
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let before = account.missing_public_collection_route_error(
+                operation,
+                &folder,
+                scope.clone(),
+                kind,
+                &folder.0,
+            );
+            assert_eq!(before.kind(), &AccountErrorKind::ConcurrencyConflict);
+            account
+                .public_folder_discovery_complete
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let after = account.missing_public_collection_route_error(
+                operation,
+                &folder,
+                scope.clone(),
+                kind,
+                &folder.0,
+            );
+            assert_eq!(after.kind(), &AccountErrorKind::NotFound(kind));
+            assert_eq!(after.scope(), Some(&scope));
+        }
+    }
 
     #[test]
     fn mailbox_case_aliases_have_one_client_and_accept_old_owner_tags() {

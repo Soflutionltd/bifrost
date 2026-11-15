@@ -267,12 +267,11 @@ async fn run_folder_get(
     let mut conn = account.checkout_for_folder(folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
     let folder_entry = account.folders.get(folder);
-    let cursor = folder_entry.as_ref().and_then(|entry| entry.cursor());
     let shared_owner = folder_entry
         .as_ref()
         .and_then(|entry| entry.shared_owner.clone());
     let selected = match account
-        .select_folder(&mut conn, folder, cursor.as_ref(), true)
+        .select_folder(&mut conn, folder, super::SelectPurpose::Read)
         .await
     {
         Ok(selected) => selected,

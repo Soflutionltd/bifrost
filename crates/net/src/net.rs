@@ -6,7 +6,7 @@
 //! and bandwidth metering can coordinate across accounts that share a
 //! host.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -292,21 +292,23 @@ impl Net {
         // declares two scopes on one host, and silently letting the
         // last declaration win would leave the other bucket registered,
         // refcounted, and permanently unreachable. First declaration
-        // wins and the ambiguity is announced; reaching the others is
-        // what `RequestBuilder::quota_scope` is for.
+        // wins; reaching the others is what `RequestBuilder::quota_scope`
+        // is for.
+        //
+        // Declaring several scopes on one host is a legitimate design (Google
+        // registers one per API surface on `www.googleapis.com`), so it is not
+        // announced here: an operator would see a warning on every attach of a
+        // correctly configured account. The ambiguity is recorded instead, and
+        // the warning fires only when a request actually reaches such a host
+        // WITHOUT an explicit scope - the one case that silently debits the
+        // first-declared bucket. See `resolve_quota_scope`.
         let mut rate_scopes: HashMap<String, String> = HashMap::new();
+        let mut ambiguous_scope_hosts: HashSet<String> = HashSet::new();
         for key in &registered_hosts {
             match rate_scopes.get(&key.host) {
                 Some(existing) if existing == &key.quota_scope => {}
-                Some(existing) => {
-                    tracing::warn!(
-                        host = %key.host,
-                        default_scope = %existing,
-                        also_declared = %key.quota_scope,
-                        "account declares multiple quota scopes for one host; \
-                         requests that do not call RequestBuilder::quota_scope \
-                         will debit the first-declared scope",
-                    );
+                Some(_) => {
+                    ambiguous_scope_hosts.insert(key.host.clone());
                 }
                 None => {
                     rate_scopes.insert(key.host.clone(), key.quota_scope.clone());
@@ -343,6 +345,7 @@ impl Net {
                     }
                 }),
                 rate_scopes,
+                ambiguous_scope_hosts,
                 default_retry: spec.default_retry,
                 request_timeout: spec.request_timeout,
                 response_headers_timeout: spec.response_headers_timeout.or(spec.connect_timeout),
@@ -460,6 +463,10 @@ pub(crate) struct AccountNetInner {
     pub(crate) token_source: Option<Arc<dyn TokenSource>>,
     /// Quota discriminator selected for each registered request host.
     pub(crate) rate_scopes: HashMap<String, String>,
+    /// Hosts this account declared more than one quota scope for. A request
+    /// to one of them without an explicit `RequestBuilder::quota_scope` is
+    /// the only ambiguous case, and is the one that warns.
+    pub(crate) ambiguous_scope_hosts: HashSet<String>,
     /// Default retry policy applied to every request unless the
     /// caller overrides via `RequestBuilder::retry`.
     pub(crate) default_retry: RetryPolicy,
@@ -524,6 +531,12 @@ impl AccountNet {
 
     pub(crate) fn rate_scope_for(&self, host: &str) -> &str {
         self.inner.rate_scopes.get(host).map_or("", String::as_str)
+    }
+
+    /// Whether this account declared several quota scopes on `host`, so a
+    /// request without an explicit scope falls to the first-declared one.
+    pub(crate) fn has_ambiguous_rate_scope(&self, host: &str) -> bool {
+        self.inner.ambiguous_scope_hosts.contains(host)
     }
 
     /// True when two account handles use the same process-wide client,
@@ -892,6 +905,7 @@ impl AccountNet {
                 meter: account_meter,
                 token_source: self.inner.token_source.clone(),
                 rate_scopes: self.inner.rate_scopes.clone(),
+                ambiguous_scope_hosts: self.inner.ambiguous_scope_hosts.clone(),
                 default_retry: self.inner.default_retry.clone(),
                 request_timeout: self.inner.request_timeout,
                 response_headers_timeout: self.inner.response_headers_timeout,

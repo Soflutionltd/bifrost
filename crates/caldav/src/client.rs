@@ -597,7 +597,7 @@ impl CalDavClient {
         &self,
         url: &str,
         body: String,
-        condition: PutCondition<'_>,
+        condition: PutCondition,
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         // Every event PUT is `Never`, whatever its condition. A create-PUT
@@ -615,16 +615,8 @@ impl CalDavClient {
             .replay(bifrost_net::ReplayPolicy::Never)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
             .body(body);
-        match condition {
-            PutCondition::IfNoneMatch => {
-                request = request.header("If-None-Match", "*");
-            }
-            PutCondition::IfMatch(etag) => {
-                if let Some(etag) = prepare_if_match(etag) {
-                    request = request.header("If-Match", etag);
-                }
-            }
-            PutCondition::None => {}
+        if let Some((name, value)) = condition.header() {
+            request = request.header(name, value);
         }
         let response = self.dav.send_raw_request(request, operation).await?;
         let status = response.status;
@@ -1582,7 +1574,7 @@ mod tests {
             .put_event(
                 "https://dav.example.test/cal/one.ics",
                 "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_string(),
-                PutCondition::IfMatch("v1"),
+                PutCondition::from_etag(Some("v1")),
                 AccountOperation::EventUpdate,
             )
             .await

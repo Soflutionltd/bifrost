@@ -511,7 +511,10 @@ async fn examine(
         .folders
         .get(folder)
         .and_then(|entry| entry.shared_owner.clone());
-    match account.select_folder(&mut conn, folder, None, true).await {
+    match account
+        .select_folder(&mut conn, folder, super::SelectPurpose::Read)
+        .await
+    {
         Ok(selected) => Ok((conn, selected.mailbox)),
         Err(err) => Err(super::error::shared_folder_error(
             err,

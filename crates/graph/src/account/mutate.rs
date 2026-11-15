@@ -935,7 +935,10 @@ fn apply_flag_removes(body: &mut serde_json::Map<String, Value>, flags: &HashSet
 fn categories_from_flags(flags: &HashSet<String>) -> Vec<String> {
     let mut categories: Vec<String> = flags
         .iter()
-        .filter_map(|flag| flag.strip_prefix("category:").map(str::to_string))
+        .filter_map(|flag| match super::flags::GraphFlag::parse(flag) {
+            Some(super::flags::GraphFlag::Category(name)) => Some(name.to_string()),
+            _ => None,
+        })
         .collect();
     categories.sort();
     categories
@@ -956,7 +959,9 @@ fn unsupported_flag_tokens(op: &FlagOp) -> Vec<String> {
     let mut tokens: Vec<String> = sets
         .into_iter()
         .flatten()
-        .filter(|flag| graph_flag_field(flag).is_none() && !flag.starts_with("category:"))
+        .filter(|flag| {
+            graph_flag_field(flag).is_none() && !flag.starts_with(super::flags::CATEGORY_PREFIX)
+        })
         .cloned()
         .collect();
     tokens.sort();
@@ -1005,8 +1010,8 @@ fn invalid_flag_op_error(op: &FlagOp) -> Option<bifrost_types::AccountError> {
 fn canonical_flag_name(flag: &str) -> String {
     let normalized = flag.to_ascii_lowercase();
     match graph_flag_field(&normalized) {
-        Some(GraphFlagField::Read) => "\\seen".to_string(),
-        Some(GraphFlagField::Flagged) => "\\flagged".to_string(),
+        Some(GraphFlagField::Read) => super::flags::GraphFlag::Read.token(),
+        Some(GraphFlagField::Flagged) => super::flags::GraphFlag::Flagged.token(),
         None => normalized,
     }
 }
@@ -1017,23 +1022,21 @@ enum GraphFlagField {
     Flagged,
 }
 
-/// The single alias table for both PATCH projection and contradiction checks.
+/// Project the shared vocabulary onto Graph's two scalar PATCH fields.
 fn graph_flag_field(flag: &str) -> Option<GraphFlagField> {
-    if flag.eq_ignore_ascii_case("\\seen") || flag.eq_ignore_ascii_case("read") {
-        Some(GraphFlagField::Read)
-    } else if flag.eq_ignore_ascii_case("\\flagged")
-        || flag.eq_ignore_ascii_case("flagged")
-        || flag.eq_ignore_ascii_case("starred")
-    {
-        Some(GraphFlagField::Flagged)
-    } else {
-        None
+    match super::flags::GraphFlag::parse(flag) {
+        Some(super::flags::GraphFlag::Read) => Some(GraphFlagField::Read),
+        Some(super::flags::GraphFlag::Flagged) => Some(GraphFlagField::Flagged),
+        _ => None,
     }
 }
 
 fn flag_op_requires_category_rmw(op: &FlagOp) -> bool {
-    let has_categories =
-        |flags: &HashSet<String>| flags.iter().any(|flag| flag.starts_with("category:"));
+    let has_categories = |flags: &HashSet<String>| {
+        flags
+            .iter()
+            .any(|flag| flag.starts_with(super::flags::CATEGORY_PREFIX))
+    };
     match op {
         FlagOp::Add(flags) | FlagOp::Remove(flags) => has_categories(flags),
         FlagOp::Patch { add, remove } => has_categories(add) || has_categories(remove),
@@ -1060,12 +1063,13 @@ pub(crate) fn graph_flag_target(
             .iter()
             .map(|flag| {
                 let canonical = match graph_flag_field(flag) {
-                    Some(GraphFlagField::Read) => "\\seen".to_string(),
-                    Some(GraphFlagField::Flagged) => "\\flagged".to_string(),
-                    None if flag.starts_with("category:") => flag.clone(),
+                    Some(GraphFlagField::Read) => super::flags::GraphFlag::Read.token(),
+                    Some(GraphFlagField::Flagged) => super::flags::GraphFlag::Flagged.token(),
+                    None if flag.starts_with(super::flags::CATEGORY_PREFIX) => flag.clone(),
                     None => return None,
                 };
-                if super::pim::ews_read_folder(target).is_some() && canonical != "\\seen" {
+                if super::pim::ews_read_folder(target).is_some() && canonical != super::flags::READ
+                {
                     return None;
                 }
                 Some(canonical)

@@ -466,7 +466,9 @@ flag false. `foreign.rs` tags collections as `public-calendar\u{1e}<folder>`
 and events as `public-calendar\u{1e}<folder>\u{1e}<item>`; native ids and
 provenance retain the bare EWS ids. Every typed calendar door dispatches
 before REST id/cursor decoding. Missing public routing refuses locally as
-`ConcurrencyConflict` with `Unsent` evidence, never a REST fallback.
+`ConcurrencyConflict` with `Unsent` evidence until a complete discovery pass.
+After that pass, a missing route is `NotFound(Calendar)` with the tagged calendar
+scope, never a REST fallback.
 
 `events_in_range` uses `FindItem` with `CalendarView`, never an indexed item
 view. Exchange expands occurrences and exceptions and hides recurring masters;
@@ -1512,11 +1514,22 @@ whole hierarchy browsed, with no early exit, skipped subtree or step-cap
 truncation) has run without restoring the folder, both message hydration
 doors (`fetch_ews_outcomes` and `pim::hydrate`) report the item
 `NotFound(Message)` with `Unsent` evidence
-(`graph_error::unroutable_public_item_error`, via
+(`graph_error::unroutable_public_resource_error`, via
 `GraphAccount::missing_public_route_error`), so it stops retrying and drops
 out of view as an `ErrorItemNotFound` would. The flag starts false on every
-open and is reset at the start of each pass. The contact and calendar public
-doors keep the conflict refusal. Both
+open and is reset at the start of each pass. Public contact, calendar and
+attachment reads, plus public-folder inventory, use the same completion gate.
+Collection refusals keep their collection scope, and the kind agrees with
+`ErrorScope::resource()`. Contacts use `NotFound(Contact)` with
+`ContactCollection`, so a consumer routing on either the kind or the scope
+reaches its contacts handling for a vanished address book. Inventory uses
+`NotFound(Mailbox)` for the EWS folder under its cursor scope (the resource
+vocabulary has no separate folder kind). Calendars use `NotFound(Calendar)`, and attachments retain their
+parent's `NotFound(Message)`. Before completion they remain retryable conflicts.
+An Outlook user expects a vanished collection to stop retrying after rediscovery,
+just as a vanished message does. A resumed changes poll instead retains usable
+routing in its saved cursor; it does not consult the discovery map and lets live
+EWS errors decide whether the folder is gone. Both
 arms land in one `Batch`, so the consumer still sees exactly one outcome per pulled id. `hydrated_from_ews_item` projects into the SAME
 `HydratedObject` shape the REST arm returns: `Metadata` (the identical
 inventory-entry projection) for the body-bearing projections, `FlagsOnly` for
@@ -2782,3 +2795,25 @@ Bulk mutation streams already preserve per-item lanes and do not carry sibling
 records. Reaction reads and single-request event/contact writes have no
 multi-step producer to adopt. Standalone draft/filter creates with missing ids
 are outside the multi-step scope.
+
+## Subscription expiry representation
+
+Subscription expiry remains server text in `SubscriptionResponse` and
+`GraphSubscriptionState`. The renewal pass parses it and treats malformed text
+as due, warning once per row. Rejecting a create response merely because its
+expiry is malformed would discard its decoded server id before registration,
+losing the existing rollback, unsubscribe and close ownership. Outlook users
+expect recoverable push coverage and reachable cleanup. A future typed-expiry
+conversion must retain that id through the failure lane and preserve those
+account-owned effects; parsing into a bare fallible timestamp is insufficient.
+
+## Graph flag vocabulary
+
+`account/flags.rs` owns `GraphFlag` parsing and canonical read, flagged and
+case-sensitive category tokens. Bulk mutation and desired-state validation
+consume the same aliases as typed and batch hydration produce. The category
+door shares the flagged aliases, with its existing `$flagged` sentinel admitted
+only there. A category called `read` remains a literal category; `$flagged` does
+not become a new bulk flag alias. The inventory fingerprint deliberately keeps
+its raw provider-state vocabulary: missing versus false `isRead`, and complete
+versus notFlagged, must remain distinguishable even when hydrated flags coincide.

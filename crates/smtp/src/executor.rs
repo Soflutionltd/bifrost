@@ -5,9 +5,9 @@ use std::time::Duration;
 #[cfg(feature = "tokio")]
 use crate::transport::smtp::AsyncSmtpConnection;
 #[cfg(feature = "tokio")]
-use crate::transport::smtp::Error;
+use crate::transport::smtp::Dialect;
 #[cfg(feature = "tokio")]
-use crate::transport::smtp::Protocol;
+use crate::transport::smtp::Error;
 #[cfg(feature = "tokio")]
 use crate::transport::smtp::Tls;
 use crate::transport::smtp::WireMetering;
@@ -42,7 +42,7 @@ pub(crate) trait SpawnHandle: Debug + Send + Sync + 'static + private::Sealed {
 }
 
 pub(crate) struct ConnectionOptions {
-    pub(crate) protocol: Protocol,
+    pub(crate) protocol: Dialect,
     pub(crate) metering: WireMetering,
     #[cfg(feature = "test-support")]
     pub(crate) connector: Option<crate::transport::smtp::test_support::ScriptedConnector>,

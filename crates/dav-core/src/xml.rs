@@ -128,15 +128,7 @@ pub fn local_name(full: &str) -> String {
 /// snapshot equality does not depend on quoting.
 #[must_use]
 pub fn normalize_etag(text: &str) -> Option<String> {
-    trimmed(text).map(|value| {
-        value
-            .get(..2)
-            .filter(|prefix| prefix.eq_ignore_ascii_case("W/"))
-            .map_or_else(
-                || value.trim_matches('"').to_string(),
-                |_| format!("W/{}", value[2..].trim()),
-            )
-    })
+    trimmed(text).map(|text| crate::etag::normalize_http_etag(&text))
 }
 
 /// Rebase a DAV response href against its request URI at the XML decoding

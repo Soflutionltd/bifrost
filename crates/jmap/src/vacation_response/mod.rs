@@ -52,7 +52,7 @@ pub(crate) struct VacationResponse {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct VacationResponseCreate {
     #[serde(skip)]
-    pub(super) _create_id: Option<usize>,
+    pub(super) _create_id: Option<crate::core::creation::CreationId>,
 
     #[serde(rename = "isEnabled")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,10 +144,13 @@ impl crate::core::set::SetObject for VacationResponse {
 
 impl crate::core::SetCreate for VacationResponseCreate {
     fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
+        self._create_id.as_ref().map(ToString::to_string)
+    }
+    fn set_create_id(&mut self, id: crate::core::creation::CreationId) {
+        self._create_id = Some(id);
     }
 
-    fn new(create_id: Option<usize>) -> Self {
+    fn new(create_id: Option<crate::core::creation::CreationId>) -> Self {
         use crate::core::set::from_timestamp;
         VacationResponseCreate {
             _create_id: create_id,

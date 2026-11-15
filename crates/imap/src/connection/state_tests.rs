@@ -570,3 +570,35 @@ fn foreign_tagged_responses_do_not_complete_or_disarm_logout() {
         assert!(state.in_logout.is_none());
     }
 }
+
+#[test]
+fn notify_pending_effects_belong_to_their_own_tags() {
+    use crate::types::{Command, MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams};
+
+    let command = Command::NotifySet(NotifySetParams::new(
+        vec![NotifyEventGroup::new(
+            MailboxFilter::Personal,
+            vec![NotifyEvent::MailboxName],
+        )],
+        false,
+    ));
+    let mut state = ProtocolState::new();
+    state.arm_notify(&command, "N1");
+    state.arm_notify(&Command::NotifyNone, "N2");
+    // A foreign refusal must not consume either pending registration.
+    state.apply_tagged(&TaggedResponse {
+        tag: "other".into(),
+        status: StatusKind::No,
+        code: None,
+        text: String::new(),
+    });
+    for (tag, expected) in [("N1", true), ("N2", false)] {
+        state.apply_tagged(&TaggedResponse {
+            tag: tag.into(),
+            status: StatusKind::Ok,
+            code: None,
+            text: String::new(),
+        });
+        assert_eq!(state.notify().list, expected);
+    }
+}

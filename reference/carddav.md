@@ -936,3 +936,27 @@ not decide resource identity. Response href resolution keeps RFC 3986 semantics
 against the effective request URI; configured account base paths deliberately
 use directory semantics instead. Adding a slash to a resource request URI would
 resolve a sibling response href as a child.
+
+
+## DAV validator and cursor boundaries
+
+DAV entity-tag normalization and weak-tag recognition share one `EntityTag`
+parser. `PutCondition::IfMatch` carries a privately constructed `StrongTag`;
+a weak validator cannot become an If-Match header. A server offering only weak
+validators still accepts unconditional edits: an enterprise user must be able
+to save changes, with the accepted loss of HTTP lost-update protection.
+Strings remain at the shared account version and persisted snapshot boundaries;
+they are parsed when entering the conditional-write boundary.
+
+Observed snapshot preservation deduplicates by `DavHrefKey`, keeping the first
+native spelling in sorted order so aliases cannot duplicate inventory entries.
+An entirely unobserved previous snapshot retains its historical entries until
+a real listing can reconcile them; its collection token does not advance.
+
+The existing cursor bytes remain unchanged. The magic identifies the dialect;
+its suffix is not the active schema version. The envelope version guards the
+native-id namespace. The payload collection URL remains necessary for accepted
+legacy type scopes, which have no URL, and folder scopes validate it before
+polling. The shared optional token is storage only: CalDAV interprets it as a
+sync-token and CardDAV as a ctag. Neither token is interchangeable with the
+other dialect's token.

@@ -23,7 +23,7 @@ use super::{
 use crate::{
     address::{Address, Envelope},
     transport::smtp::{
-        Protocol,
+        Dialect,
         authentication::{
             Credentials, Mechanism, ScramExchange, ScramStep, decode_auth_challenge,
             decode_scram_payload, oauth_mechanism, password_mechanism, resolve_scram_binding,
@@ -92,7 +92,7 @@ pub(crate) struct SmtpConnection {
     /// Client identity used for EHLO.
     hello_name: ClientId,
     /// Wire protocol used for this connection.
-    protocol: Protocol,
+    protocol: Dialect,
     /// Reused storage for serializing individual SMTP commands.
     command_buffer: Zeroizing<String>,
     /// Set once an LMTP final-status drain has run: the connection must not
@@ -133,7 +133,7 @@ impl SmtpConnection {
             hello_name,
             tls_parameters,
             local_address,
-            Protocol::Smtp,
+            Dialect::Smtp,
             WireMetering::disabled(),
         )
     }
@@ -144,7 +144,7 @@ impl SmtpConnection {
     pub(in crate::transport::smtp) fn from_transcript(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
-        protocol: Protocol,
+        protocol: Dialect,
     ) -> Result<Self, Error> {
         let stream = BufReader::new(NetworkStream::from_transcript(transcript));
         let mut conn = Self {
@@ -167,7 +167,7 @@ impl SmtpConnection {
         hello_name: &ClientId,
         tls_parameters: Option<&TlsParameters>,
         local_address: Option<IpAddr>,
-        protocol: Protocol,
+        protocol: Dialect,
         metering: WireMetering,
     ) -> Result<SmtpConnection, Error> {
         let mut stream = NetworkStream::connect(server, timeout, tls_parameters, local_address)?;
@@ -200,7 +200,7 @@ impl SmtpConnection {
         path: &Path,
         timeout: Option<Duration>,
         hello_name: &ClientId,
-        protocol: Protocol,
+        protocol: Dialect,
         metering: WireMetering,
     ) -> Result<SmtpConnection, Error> {
         let mut stream = NetworkStream::connect_unix(path, timeout)?;
@@ -332,7 +332,7 @@ impl SmtpConnection {
         options: &SendOptions,
     ) -> Result<SendProgress, (Error, SendProgress)> {
         let (mail_cmd, rcpt_cmds, progress) =
-            self.build_batch(Protocol::Smtp, from, recipients, email, options)?;
+            self.build_batch(Dialect::Smtp, from, recipients, email, options)?;
         let pipelined = self.server_info().supports_pipelining();
         let mut machine = core::BatchSmtp::new(mail_cmd, rcpt_cmds, pipelined, progress);
         self.drive(&mut machine, email)
@@ -350,7 +350,7 @@ impl SmtpConnection {
         options: &SendOptions,
     ) -> Result<SendProgress, (Error, SendProgress)> {
         let (mail_cmd, rcpt_cmds, progress) =
-            self.build_batch(Protocol::Lmtp, from, recipients, email, options)?;
+            self.build_batch(Dialect::Lmtp, from, recipients, email, options)?;
         let mut machine = core::BatchLmtp::new(mail_cmd, rcpt_cmds, progress);
         self.drive(&mut machine, email)
     }
@@ -360,7 +360,7 @@ impl SmtpConnection {
     #[allow(clippy::type_complexity)]
     fn build_batch(
         &self,
-        protocol: Protocol,
+        protocol: Dialect,
         from: Option<Address>,
         recipients: Vec<SmtpBatchRecipient>,
         email: &[u8],
@@ -506,11 +506,11 @@ impl SmtpConnection {
     /// Send EHLO or LHLO and update server info
     fn hello(&mut self, hello_name: &ClientId) -> Result<(), Error> {
         let response = match self.protocol {
-            Protocol::Lmtp => {
+            Dialect::Lmtp => {
                 let command = Lhlo::new(hello_name.clone())?;
                 try_smtp!(self.command(command), self)
             }
-            _ => {
+            Dialect::Smtp => {
                 let command = Ehlo::new(hello_name.clone())?;
                 try_smtp!(self.command(command), self)
             }
@@ -1080,7 +1080,7 @@ mod transcript_tests {
     use crate::{
         address::{Address, Envelope},
         transport::smtp::{
-            Protocol,
+            Dialect,
             account_error::{SmtpErrorContext, into_account_error},
             authentication::{Credentials, Mechanism},
             batch::SmtpBatchRecipient,
@@ -1104,14 +1104,14 @@ mod transcript_tests {
         let transcript =
             Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
         let connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let recipients = vec![SmtpBatchRecipient {
             id: BatchItemId("item-0".to_owned()),
             address: "recipient@example.com".parse().unwrap(),
         }];
 
         let Err((error, _progress)) = connection.build_batch(
-            Protocol::Smtp,
+            Dialect::Smtp,
             Some(Address::new_dangerous("sender\r\nRSET", "example.com")),
             recipients,
             b"body",
@@ -1141,7 +1141,7 @@ mod transcript_tests {
         let error = SmtpConnection::from_transcript(
             transcript,
             &ClientId::Domain("client.example".to_owned()),
-            Protocol::Smtp,
+            Dialect::Smtp,
         )
         .err()
         .expect("an oversized banner line must surface as an error");
@@ -1173,8 +1173,7 @@ mod transcript_tests {
                 )
                 .expect("RSET\r\n", "250 reset ok\r\n");
             let mut connection =
-                SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp)
-                    .unwrap();
+                SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Lmtp).unwrap();
             let statuses = if chunking {
                 connection
                     .send_lmtp_bdat_with_options(&envelope, b"body", &Default::default())
@@ -1188,8 +1187,8 @@ mod transcript_tests {
             transcript.assert_exhausted();
         }
 
-        for protocol in [Protocol::Smtp, Protocol::Lmtp] {
-            let hello_command = if protocol == Protocol::Smtp {
+        for protocol in [Dialect::Smtp, Dialect::Lmtp] {
+            let hello_command = if protocol == Dialect::Smtp {
                 "EHLO client.example\r\n"
             } else {
                 "LHLO client.example\r\n"
@@ -1208,7 +1207,7 @@ mod transcript_tests {
             }];
             let mut connection =
                 SmtpConnection::from_transcript(transcript.clone(), &hello, protocol).unwrap();
-            let progress = if protocol == Protocol::Smtp {
+            let progress = if protocol == Dialect::Smtp {
                 connection.send_smtp_batch(
                     Some("sender@example.com".parse().unwrap()),
                     batch,
@@ -1245,7 +1244,7 @@ mod transcript_tests {
             .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
             .expect(window, "550 sender rejected\r\n250 recipient ok\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).unwrap();
         let error = connection.send(&envelope, b"body").unwrap_err();
         assert_eq!(error.phase(), Some(super::SmtpCommandPhase::MailFrom));
 
@@ -1255,7 +1254,7 @@ mod transcript_tests {
             .expect(window, "250 sender ok\r\n550 recipient rejected\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).unwrap();
         let error = connection.send(&envelope, b"body").unwrap_err();
         assert_eq!(error.phase(), Some(super::SmtpCommandPhase::RcptTo));
 
@@ -1266,7 +1265,7 @@ mod transcript_tests {
             .expect("DATA\r\n", "554 no data\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).unwrap();
         let error = connection.send(&envelope, b"body").unwrap_err();
         assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataCommand));
     }
@@ -1292,7 +1291,7 @@ mod transcript_tests {
                 "250-first\r\n250-second\r\n250-third\r\n250 fourth\r\n",
             );
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         connection
             .set_timeout(Some(Duration::from_secs(30)))
             .unwrap();
@@ -1351,7 +1350,7 @@ mod transcript_tests {
             .expect(HELLO, "250 smtp.example\r\n")
             .expect(mail, "550 sender rejected\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let error = connection.send(&envelope, b"body").unwrap_err();
         assert_eq!(error.phase(), Some(super::SmtpCommandPhase::MailFrom));
         assert!(!connection.has_broken());
@@ -1364,7 +1363,7 @@ mod transcript_tests {
             .expect(rcpt, "550 recipient rejected\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let error = connection.send(&envelope, b"body").unwrap_err();
         assert_eq!(error.phase(), Some(super::SmtpCommandPhase::RcptTo));
         assert!(!connection.has_broken());
@@ -1378,7 +1377,7 @@ mod transcript_tests {
             .expect("DATA\r\n", "554 no data\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let error = connection.send(&envelope, b"body").unwrap_err();
         assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataCommand));
         assert!(!connection.has_broken());
@@ -1391,7 +1390,7 @@ mod transcript_tests {
             .expect(rcpt, "550 recipient rejected\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let error = connection
             .send_bdat_with_options(&envelope, b"body", &SendOptions::default())
             .unwrap_err();
@@ -1417,7 +1416,7 @@ mod transcript_tests {
         )
         .unwrap();
         let mut connection =
-            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).unwrap();
 
         let error = connection.send(&envelope, b"body").unwrap_err();
 
@@ -1461,8 +1460,7 @@ mod transcript_tests {
             }
             transcript = transcript.expect(terminator, "250 queued\r\n");
             let mut connection =
-                SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
-                    .unwrap();
+                SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
             connection.message(body).unwrap();
             transcript.assert_exhausted();
@@ -1474,7 +1472,7 @@ mod transcript_tests {
             .expect("\n", "")
             .expect(".\r\n", "250 queued\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         connection
             .message_iter([b"body\r".as_slice(), b"\n".as_slice()].into_iter())
             .unwrap();
@@ -1504,7 +1502,7 @@ mod transcript_tests {
             address: "recipient@example.com".parse().unwrap(),
         }];
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Lmtp).unwrap();
 
         let outcome = connection
             .send_lmtp_batch(
@@ -1538,7 +1536,7 @@ mod transcript_tests {
         )
         .unwrap();
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Lmtp).unwrap();
 
         let statuses = connection.send_lmtp(&envelope, b"body\r\n").unwrap();
 
@@ -1569,7 +1567,7 @@ mod transcript_tests {
             Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         connection.send(&envelope, b"body").unwrap();
         transcript.assert_exhausted();
     }
@@ -1596,7 +1594,7 @@ mod transcript_tests {
             Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let error = connection.send(&envelope, b"body").unwrap_err();
 
         assert!(
@@ -1638,7 +1636,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let outcome = connection
             .send_smtp_batch(
                 Some("sender@example.com".parse().unwrap()),
@@ -1685,7 +1683,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let outcome = connection
             .send_smtp_batch(
                 Some("sender@example.com".parse().unwrap()),
@@ -1731,7 +1729,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).unwrap();
         let outcome = connection
             .send_smtp_batch(
                 Some("sender@example.com".parse().unwrap()),
@@ -1779,7 +1777,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).unwrap();
         let outcome = connection
             .send_smtp_batch(
                 Some("sender@example.com".parse().unwrap()),
@@ -1819,7 +1817,7 @@ mod transcript_tests {
             Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Lmtp).unwrap();
         let statuses = connection.send_lmtp(&envelope, b"body").unwrap();
 
         assert!(statuses[0].is_positive());
@@ -1850,7 +1848,7 @@ mod transcript_tests {
             Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Lmtp).unwrap();
         assert!(connection.send_lmtp(&envelope, b"body").is_err());
         // `has_broken()` after an abort is sharp against the adapter
         // dropping the `Op::Abort` arm entirely, and only that: it does NOT
@@ -1886,7 +1884,7 @@ mod transcript_tests {
             Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Lmtp).unwrap();
         let error = connection
             .send_lmtp(&envelope, b"body")
             .expect_err("a surplus final status desynchronizes the stream");
@@ -1922,7 +1920,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript, &hello, Protocol::Lmtp).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Dialect::Lmtp).unwrap();
         let outcome = connection
             .send_lmtp_batch(
                 Some("sender@example.com".parse().unwrap()),
@@ -1960,7 +1958,7 @@ mod transcript_tests {
         }];
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         connection
             .send_smtp_batch(
                 Some("sender@example.com".parse().unwrap()),
@@ -2002,7 +2000,7 @@ mod transcript_tests {
             Envelope::new(Some("sender@example.com".parse().unwrap()), addresses).unwrap();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         connection
             .send_with_options(&envelope, b"body", &SendOptions::default())
             .expect_err("MAIL FROM was rejected");
@@ -2042,7 +2040,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Lmtp).unwrap();
         let outcome = connection
             .send_lmtp_batch(
                 Some("sender@example.com".parse().unwrap()),
@@ -2072,7 +2070,7 @@ mod transcript_tests {
         let transcript =
             Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         connection.abort();
         transcript.assert_exhausted();
@@ -2084,7 +2082,7 @@ mod transcript_tests {
         let transcript =
             Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
         let connection =
-            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).unwrap();
 
         assert!(
             connection.peer_certificate_der().is_none(),
@@ -2100,7 +2098,7 @@ mod transcript_tests {
             .expect(HELLO, "250 smtp.example\r\n")
             .expect("NOOP\r\n", "");
         let mut connection =
-            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).unwrap();
 
         assert!(!connection.test_connected());
         assert!(connection.has_broken());
@@ -2148,7 +2146,7 @@ mod transcript_tests {
             .recipient_original_recipient(first_recipient, "rfc822", "alias=first@example.com");
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let response = connection
             .send_with_options(&envelope, b"Subject: test\r\n\r\nHello", &options)
             .unwrap();
@@ -2181,7 +2179,7 @@ mod transcript_tests {
         .unwrap();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         assert!(
             connection
                 .send(&envelope, b"Subject: test\r\n\r\nHello")
@@ -2220,7 +2218,7 @@ mod transcript_tests {
             .mail_parameter(MailParameter::Body(MailBodyParameter::EightBitMime));
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let response = connection
             .send_with_options(&envelope, "Subject: test\r\n\r\nHéllo".as_bytes(), &options)
             .unwrap();
@@ -2240,7 +2238,7 @@ mod transcript_tests {
             address: crate::address::Address::new_dangerous("üser", "example.com"),
         }];
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         let (error, _) = connection
             .send_smtp_batch(
@@ -2275,7 +2273,7 @@ mod transcript_tests {
         )
         .unwrap();
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         assert!(
             connection
@@ -2310,7 +2308,7 @@ mod transcript_tests {
         )
         .unwrap();
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         assert!(
             connection
@@ -2358,7 +2356,7 @@ mod transcript_tests {
             SendOptions::new().mail_parameter(MailParameter::Body(MailBodyParameter::BinaryMime));
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let response = connection
             .send_bdat_with_options(&envelope, message, &options)
             .unwrap();
@@ -2373,7 +2371,7 @@ mod transcript_tests {
         let transcript = Transcript::new("220 smtp.example\r\n")
             .expect(HELLO, "250-smtp.example\r\n250- \r\n250 AUTH PLAIN\r\n");
 
-        let error = SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+        let error = SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
             .err()
             .expect("whitespace-only EHLO text must be rejected");
 
@@ -2391,7 +2389,7 @@ mod transcript_tests {
             .expect_generated(scram_enhanced_success_reply)
             .expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         let response = connection
             .auth(
@@ -2424,7 +2422,7 @@ mod transcript_tests {
             .expect("AQ==\r\n", "235 authenticated\r\n")
             .expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         let response = connection
             .auth(&[Mechanism::OAuthBearer], &credentials)
@@ -2450,7 +2448,7 @@ mod transcript_tests {
             .expect(plain, "235 authenticated\r\n")
             .expect(HELLO, "250-smtp.example\r\n250 8BITMIME\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         assert!(
             connection
@@ -2492,7 +2490,7 @@ mod transcript_tests {
             )
             .expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         let response = connection
             .auth(
@@ -2522,7 +2520,7 @@ mod transcript_tests {
             .expect(HELLO, "250-smtp.example\r\n250 AUTH PLAIN\r\n")
             .expect(plain, "535 5.7.8 credentials rejected\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         let error = connection
             .auth(
@@ -2537,7 +2535,7 @@ mod transcript_tests {
                 mechanism: Some("PLAIN")
             })
         );
-        let account = into_account_error(error, SmtpErrorContext::send(Protocol::Smtp));
+        let account = into_account_error(error, SmtpErrorContext::send(Dialect::Smtp));
         assert!(
             matches!(
                 account.kind(),
@@ -2571,7 +2569,7 @@ mod transcript_tests {
                 "535 rejected\r\n",
             );
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         let error = connection
             .auth(
@@ -2599,7 +2597,7 @@ mod transcript_tests {
             // the single `0x01` cancel byte before reading the final reply.
             .expect("AQ==\r\n", "535 rejected\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         let error = connection
             .auth(
@@ -2623,7 +2621,7 @@ mod transcript_tests {
             .expect(HELLO, "250 smtp.example\r\n")
             .expect("NOOP\r\n", "250 noop\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         assert!(!connection.can_starttls());
         let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
@@ -2654,7 +2652,7 @@ mod transcript_tests {
                 "220 go ahead\r\n250 attacker-controlled capabilities\r\n",
             );
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
 
         let error = connection
@@ -2678,7 +2676,7 @@ mod transcript_tests {
             .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
             .expect("STARTTLS\r\n", "220 ready to start tls\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         assert!(connection.can_starttls());
         let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
@@ -2705,7 +2703,7 @@ mod transcript_tests {
             .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
             .expect("STARTTLS\r\n", "220 ready to start tls\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         connection.set_timeout(configured).unwrap();
         transcript.take_read_timeouts();
 
@@ -2763,7 +2761,7 @@ mod transcript_tests {
             .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
             .expect("STARTTLS\r\n", "454 TLS temporarily unavailable\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
         let error = connection
@@ -2787,7 +2785,7 @@ mod transcript_tests {
         let transcript = Transcript::new("220 smtp.example\r\n")
             .expect_then_close(HELLO, "250-smtp.example\r\n250 PIPELI");
 
-        let Err(error) = SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp) else {
+        let Err(error) = SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp) else {
             panic!("a truncated EHLO reply cannot yield a usable connection");
         };
         assert!(
@@ -2813,7 +2811,7 @@ mod transcript_tests {
         }];
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).unwrap();
         let outcome = connection
             .send_smtp_batch(
                 Some("sender@example.com".parse().unwrap()),
@@ -2850,7 +2848,7 @@ mod transcript_tests {
             .expect(HELLO, "250 smtp.example\r\n")
             .expect_coalesced("NOOP\r\n", "250 noop ok\r\n421 service closing\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).unwrap();
 
         let error = connection
             .command(crate::transport::smtp::commands::Noop)
@@ -2879,7 +2877,7 @@ mod transcript_tests {
         let options = SendOptions::new().notify([DsnNotify::Failure]).unwrap();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let error = connection
             .send_with_options(&envelope, b"body", &options)
             .expect_err("DSN parameters must not be emitted to a server without DSN");
@@ -2920,7 +2918,7 @@ mod transcript_tests {
         }];
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let (error, progress) = connection
             .send_smtp_batch(
                 Some("sender@example.com".parse().unwrap()),
@@ -2981,7 +2979,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let outcome = connection
             .send_smtp_batch(
                 Some("sender@example.com".parse().unwrap()),
@@ -3026,7 +3024,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let outcome = connection
             .send_smtp_batch(
                 Some("sender@example.com".parse().unwrap()),
@@ -3084,7 +3082,7 @@ mod transcript_tests {
             .expect("body", "")
             .expect("\r\n.\r\n", "554 Message rejected as spam\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         let error = connection.send(&envelope, b"body").unwrap_err();
         assert_eq!(error.status().map(u16::from), Some(554));
@@ -3121,7 +3119,7 @@ mod transcript_tests {
             .expect("body", "452 4.3.1 out of storage\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         let error = connection
             .send_bdat_with_options(&envelope, b"body", &SendOptions::default())
@@ -3158,7 +3156,7 @@ mod transcript_tests {
             .expect("body", "")
             .expect("\r\n.\r\n", "421 closing transmission channel\r\n");
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
 
         let error = connection.send(&envelope, b"body").unwrap_err();
         assert_eq!(error.status().map(u16::from), Some(421));
@@ -3199,7 +3197,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp).unwrap();
         let outcome = connection
             .send_smtp_batch(
                 Some("sender@example.com".parse().unwrap()),

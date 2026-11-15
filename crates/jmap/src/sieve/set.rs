@@ -1,4 +1,5 @@
 use super::{SetArguments, SieveScriptCreate, SieveScriptId, SieveScriptPatch, SieveScriptSet};
+use crate::core::creation::{CreationId, IdOrRef};
 use crate::core::id::BlobId;
 
 macro_rules! sieve_setters {
@@ -25,7 +26,7 @@ impl SetArguments {
     /// `set` request. Wraps the value with `#` per JMAP create-id refs.
     pub(crate) fn on_success_activate_script(&mut self, create_id: impl Into<String>) -> &mut Self {
         self.on_success_activate_script =
-            Some(SieveScriptId::new(format!("#{}", create_id.into())));
+            Some(IdOrRef::Reference(CreationId::named(create_id).reference()));
         self
     }
 
@@ -33,7 +34,7 @@ impl SetArguments {
         &mut self,
         id: impl Into<SieveScriptId>,
     ) -> &mut Self {
-        self.on_success_activate_script = Some(id.into());
+        self.on_success_activate_script = Some(IdOrRef::Id(id.into()));
         self
     }
 

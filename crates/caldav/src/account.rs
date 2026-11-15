@@ -1209,8 +1209,8 @@ impl Account for CalDavAccount {
                         &url,
                         body,
                         expected_etag.map_or_else(
-                            || put_condition(current.etag.as_deref()),
-                            PutCondition::IfMatch,
+                            || PutCondition::from_etag(current.etag.as_deref()),
+                            |etag| PutCondition::from_etag(Some(etag)),
                         ),
                         AccountOperation::EventUpdate,
                     )
@@ -1332,7 +1332,7 @@ impl Account for CalDavAccount {
                 .put_event(
                     &url,
                     body,
-                    put_condition(current.etag.as_deref()),
+                    PutCondition::from_etag(current.etag.as_deref()),
                     AccountOperation::EventRsvp,
                 )
                 .await
@@ -1829,15 +1829,6 @@ fn skipped_calendar_scope(calendar_url: &str, degraded: Option<AccountError>) ->
         .collect()
 }
 
-fn put_condition(etag: Option<&str>) -> PutCondition<'_> {
-    etag.filter(|etag| {
-        !etag
-            .get(..2)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
-    })
-    .map_or(PutCondition::None, PutCondition::IfMatch)
-}
-
 /// Resource identity for a consumer-restated calendar id against a URL this
 /// crate derived. Delegates to the shared normalizing comparison: percent
 /// encoding, host case and a redundant default port are spellings, not
@@ -2028,6 +2019,12 @@ fn encode_cursor_snapshot(snapshot: &EventSnapshot) -> Vec<u8> {
     )
 }
 
+// Keep the persisted dialect magic stable: its suffix is not a second schema
+// version. The envelope alone rejects the old native-id namespace. The payload
+// collection is also necessary for accepted legacy Type scopes, which carry no
+// URL; Folder scopes cross-check it to prevent polling a different collection.
+// Sharing the token's storage does not share its semantics: only this dialect
+// decides whether it is a sync-token or a ctag.
 fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<EventSnapshot, AccountError> {
     validate_event_scope(&cursor.scope, AccountOperation::SyncChanges)?;
     if cursor.server_state.protocol != ProtocolKind::CalDav

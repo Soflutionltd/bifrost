@@ -50,6 +50,9 @@ pub(crate) mod identity;
 pub(crate) mod mailbox;
 #[cfg(feature = "calendars")]
 pub(crate) mod participant_identity;
+// Principal admin ACL fields also use the mailbox vocabulary without mail enabled.
+#[path = "mailbox/rights.rs"]
+mod mailbox_rights;
 pub(crate) mod principal;
 pub(crate) mod push_subscription;
 #[cfg(feature = "quota")]

@@ -265,7 +265,10 @@ async fn run_inventory(
         .and_then(|entry| entry.shared_owner.clone());
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
-    let selected = match account.select_folder(&mut conn, &folder, None, true).await {
+    let selected = match account
+        .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
+        .await
+    {
         Ok(selected) => selected,
         // A permission denial on a shared folder quarantines just that
         // scope (`ScopeRevoked` -> `DisableScope`) instead of escalating

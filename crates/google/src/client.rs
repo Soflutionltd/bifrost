@@ -517,10 +517,8 @@ impl GmailClient {
 
     /// Quota units this URL costs, when it resolves against the Gmail
     /// base. `None` for anything else (Calendar, Drive, People), which
-    /// keeps the host `cost_default`. Callers that build a request
-    /// through `account_net()` directly rather than through `execute`
-    /// must apply this themselves, or their traffic is billed at the
-    /// default and under-charges the shared per-user budget.
+    /// keeps that surface's `cost_default`. Raw Gmail builders must apply
+    /// this cost explicitly; production Gmail mutations use the typed funnel.
     pub(crate) fn gmail_quota_cost(&self, url: &str, method: &str) -> Option<u32> {
         if self.surface_for_url(url) != crate::quota::ApiSurface::Gmail {
             return None;
@@ -557,6 +555,15 @@ impl GmailClient {
         use crate::quota::ApiSurface;
         // Redirected test bases can share an origin or nest under another
         // base. The most specific path root owns the request.
+        //
+        // A URL under no configured base is Drive, not a refusal. The
+        // production instance is a server-issued Drive resumable-upload
+        // session URL, which the Drive bucket on `www.googleapis.com`
+        // meters. It goes unmetered only when the host has no registration
+        // (redirected test bases, or a session URL on another host). That
+        // is bounded by Google's own 429s, which net still honours. Refusing
+        // it would fail an Outlook user's attachment upload to protect a
+        // client-side budget the server enforces anyway.
         [
             (self.api_base(), ApiSurface::Gmail),
             (self.calendar_base(), ApiSurface::Calendar),
@@ -599,6 +606,7 @@ impl GmailClient {
         // configured project. Same-surface redirects still use net's policy.
         let redirect_client = self.clone();
         builder = builder
+            .quota_scope(surface_quota_scope(self.account_net().account(), surface))
             .redirect_guard(move |_, target| redirect_client.surface_for_url(target) == surface);
         let project = self
             .quota_project
@@ -706,16 +714,11 @@ pub(crate) async fn check_response_status(response: Response, _service: &str) ->
     ))
 }
 
-/// Attach an account, registering a rate limit per DISTINCT host this client
-/// will talk to.
-///
-/// The hosts come from the configured bases, not from literals: a redirected
-/// base otherwise registers no limit for the host it actually reaches. Gmail
-/// and Calendar share `www.googleapis.com` in production, so the same host
-/// commonly appears twice and is deduplicated - registering it twice would
-/// install a second bucket for one host, and the Calendar entry (registered
-/// second) would silently replace the Gmail one, halving nothing but making
-/// the effective limit whichever registration happened to win.
+/// Stable account-and-surface identity shared by registration and dispatch.
+fn surface_quota_scope(account: &AccountId, surface: crate::quota::ApiSurface) -> String {
+    format!("google:{:?}:{surface:?}", account.0)
+}
+
 fn default_account_net(
     net: &Net,
     account: AccountId,
@@ -724,46 +727,41 @@ fn default_account_net(
     calendar_base: &str,
     token_source: Arc<dyn TokenSource>,
 ) -> AccountNet {
-    let quota_scope = account.0.clone();
-    let gmail_host = host_of(gmail_base, "www.googleapis.com");
-    let people_host = host_of(people_base, "people.googleapis.com");
-    let calendar_host = host_of(calendar_base, "www.googleapis.com");
-
-    let mut hosts = vec![
-        RateLimit::new(
-            gmail_host.clone(),
+    // Surface identities keep calendar reads independent of mail hydration,
+    // as users expect even when Google serves both APIs on one host.
+    use crate::quota::ApiSurface;
+    let hosts = [
+        (
+            host_of(gmail_base, "www.googleapis.com"),
+            ApiSurface::Gmail,
             GOOGLE_API_QUOTA_PER_SECOND,
-            1,
             GOOGLE_API_BURST,
-        )
-        .with_quota_scope(quota_scope.clone()),
-    ];
-    if people_host != gmail_host {
-        hosts.push(
-            RateLimit::new(
-                people_host.clone(),
-                PEOPLE_API_QUOTA_PER_SECOND,
-                1,
-                PEOPLE_API_BURST,
-            )
-            .with_quota_scope(quota_scope.clone()),
-        );
-    }
-    // Calendar bills per request rather than in Gmail quota units, so it takes
-    // the general Google bucket. Only registered when it is a host neither of
-    // the other two already covers - the production case is exactly that
-    // overlap, where Calendar rides the Gmail registration.
-    if calendar_host != gmail_host && calendar_host != people_host {
-        hosts.push(
-            RateLimit::new(
-                calendar_host,
-                GOOGLE_API_QUOTA_PER_SECOND,
-                1,
-                GOOGLE_API_BURST,
-            )
-            .with_quota_scope(quota_scope),
-        );
-    }
+        ),
+        (
+            host_of(people_base, "people.googleapis.com"),
+            ApiSurface::People,
+            PEOPLE_API_QUOTA_PER_SECOND,
+            PEOPLE_API_BURST,
+        ),
+        (
+            host_of(calendar_base, "www.googleapis.com"),
+            ApiSurface::Calendar,
+            GOOGLE_API_QUOTA_PER_SECOND,
+            GOOGLE_API_BURST,
+        ),
+        (
+            "www.googleapis.com".to_owned(),
+            ApiSurface::Drive,
+            GOOGLE_API_QUOTA_PER_SECOND,
+            GOOGLE_API_BURST,
+        ),
+    ]
+    .into_iter()
+    .map(|(host, surface, rate, burst)| {
+        RateLimit::new(host, rate, 1, burst)
+            .with_quota_scope(surface_quota_scope(&account, surface))
+    })
+    .collect();
 
     let mut spec = AccountSpec::new(Some(token_source));
     spec.hosts = hosts;
@@ -785,9 +783,8 @@ fn default_account_net(
 /// method we have not checked, and under-charging it is the failure mode
 /// that produced sustained 429 backoff on the hydration loop, so it is
 /// billed like a `messages.get` until someone looks it up. Requests that
-/// do not resolve against the Gmail base at all - Calendar, Drive, raw
-/// builder traffic - keep the host `cost_default` of one unit, and are
-/// still throttled harder than before by the lower per-second budget.
+/// do not resolve against the Gmail base at all - Calendar, Drive and
+/// People - keep their separate surface's `cost_default` of one request.
 fn gmail_quota_cost(path: &str, method: &str) -> u32 {
     /// Charged to any Gmail method not in the table below.
     const UNLISTED_METHOD_COST: u32 = 20;
@@ -1042,7 +1039,14 @@ mod tests {
         let net = bifrost_net::test_support::scripted_account(
             &script,
             bifrost_net::NetConfig::default(),
-            vec![RateLimit::new("gmail.test", 100.0, 1, 100)],
+            // Gmail requests meter under the account-and-surface scope, so the
+            // registration must carry the same identity dispatch uses.
+            vec![
+                RateLimit::new("gmail.test", 100.0, 1, 100).with_quota_scope(surface_quota_scope(
+                    &AccountId("scripted".to_string()),
+                    crate::quota::ApiSurface::Gmail,
+                )),
+            ],
             Arc::new(StaticTokenSource::new("token", None)),
             bifrost_net::RetryPolicy::disabled(),
         );
@@ -1185,15 +1189,10 @@ mod tests {
         );
     }
 
-    /// Rate limits are registered for the hosts the client will actually reach.
-    ///
-    /// Registering literal production hostnames left a redirected base
-    /// completely unmetered. The production case is that Gmail and Calendar
-    /// share `www.googleapis.com`, so the host must be registered ONCE - a
-    /// duplicate registration installs a second bucket for one host and the
-    /// effective limit becomes whichever won.
+    /// Overrides retain host metering; shared production hosts have distinct
+    /// account-and-surface quota identities.
     #[test]
-    fn rate_limit_hosts_come_from_the_configured_bases_and_are_deduplicated() {
+    fn rate_limit_hosts_follow_bases_and_surface_scopes_are_distinct() {
         assert_eq!(
             host_of("https://gcal.mock.test/calendar/v3", "www.googleapis.com"),
             "gcal.mock.test"
@@ -1208,9 +1207,20 @@ mod tests {
         assert_eq!(
             host_of(GMAIL_API_BASE, "x"),
             host_of(CALENDAR_API_BASE, "y"),
-            "the production Gmail and Calendar bases share a host, so registration must dedupe"
+            "the production Gmail and Calendar bases share a host"
         );
         assert_ne!(host_of(PEOPLE_API_BASE, "x"), host_of(GMAIL_API_BASE, "y"));
+        let account = AccountId("quota-test".into());
+        let scopes: std::collections::HashSet<_> = [
+            crate::quota::ApiSurface::Gmail,
+            crate::quota::ApiSurface::Calendar,
+            crate::quota::ApiSurface::People,
+            crate::quota::ApiSurface::Drive,
+        ]
+        .into_iter()
+        .map(|surface| surface_quota_scope(&account, surface))
+        .collect();
+        assert_eq!(scopes.len(), 4);
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ use super::smtp_data_size;
 use crate::{
     address::{Address, Envelope},
     transport::smtp::{
-        Protocol,
+        Dialect,
         batch::{SendProgress, SmtpBatchRecipient},
         commands::{Mail, Rcpt, build_recipient_commands, build_transaction_commands},
         error,
@@ -46,7 +46,7 @@ impl EnvelopeBuilder<'_> {
     #[allow(clippy::type_complexity)]
     pub(super) fn build_batch(
         &self,
-        protocol: Protocol,
+        protocol: Dialect,
         from: Option<Address>,
         recipients: Vec<SmtpBatchRecipient>,
         email: &[u8],
@@ -421,7 +421,7 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains(message), "{error}");
         }
-        for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+        for protocol in [Dialect::Smtp, Dialect::Lmtp] {
             let recipients = vec![SmtpBatchRecipient {
                 id: BatchItemId("recipient".to_owned()),
                 address: envelope.to()[0].clone(),
@@ -617,7 +617,7 @@ mod tests {
             rcpt[0].to_string(),
             "RCPT TO:<recipient@example.com> NOTIFY=NEVER\r\n"
         );
-        for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+        for protocol in [Dialect::Smtp, Dialect::Lmtp] {
             let recipients = vec![SmtpBatchRecipient {
                 id: BatchItemId("recipient".to_owned()),
                 address: envelope.to()[0].clone(),

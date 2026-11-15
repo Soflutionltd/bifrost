@@ -2,6 +2,7 @@ use super::{
     Address, EmailSubmissionCreate, EmailSubmissionPatch, EmailSubmissionSet, Envelope,
     SetArguments, UndoStatus,
 };
+use crate::core::creation::{CreationId, IdOrRef};
 use crate::core::request::ResultReference;
 use crate::email::{EmailId, EmailPatch};
 use crate::identity::IdentityId;
@@ -14,7 +15,14 @@ impl EmailSubmissionCreate {
     }
 
     pub(crate) fn email_id(&mut self, email_id: impl Into<EmailId>) -> &mut Self {
-        self.email_id = Some(email_id.into());
+        self.email_id = Some(IdOrRef::Id(email_id.into()));
+        self.email_id_ref = None;
+        self
+    }
+
+    /// Reference an Email created by another method in the same request.
+    pub(crate) fn email_id_creation_ref(&mut self, create_id: impl Into<String>) -> &mut Self {
+        self.email_id = Some(IdOrRef::Reference(CreationId::named(create_id).reference()));
         self.email_id_ref = None;
         self
     }
@@ -107,20 +115,23 @@ impl SetArguments {
         &mut self,
         create_id: impl Into<String>,
     ) -> &mut EmailPatch {
-        self.on_success_update_email_(format!("#{}", create_id.into()))
+        self.on_success_update_email_(IdOrRef::Reference(CreationId::named(create_id).reference()))
     }
 
     pub(crate) fn on_success_update_email_id(
         &mut self,
         id: impl Into<super::EmailSubmissionId>,
     ) -> &mut EmailPatch {
-        self.on_success_update_email_(id.into().into_string())
+        self.on_success_update_email_(IdOrRef::Id(id.into()))
     }
 
-    fn on_success_update_email_(&mut self, id: impl Into<String>) -> &mut EmailPatch {
+    fn on_success_update_email_(
+        &mut self,
+        id: IdOrRef<super::EmailSubmissionId>,
+    ) -> &mut EmailPatch {
         self.on_success_update_email
             .get_or_insert_with(HashMap::new)
-            .entry(id.into())
+            .entry(id)
             .or_default()
     }
 
@@ -129,7 +140,7 @@ impl SetArguments {
     pub(crate) fn on_success_destroy_email(&mut self, create_id: impl Into<String>) -> &mut Self {
         self.on_success_destroy_email
             .get_or_insert_with(Vec::new)
-            .push(format!("#{}", create_id.into()));
+            .push(IdOrRef::Reference(CreationId::named(create_id).reference()));
         self
     }
 
@@ -139,7 +150,7 @@ impl SetArguments {
     ) -> &mut Self {
         self.on_success_destroy_email
             .get_or_insert_with(Vec::new)
-            .push(id.into().into_string());
+            .push(IdOrRef::Id(id.into()));
         self
     }
 }

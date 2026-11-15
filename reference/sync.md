@@ -4151,3 +4151,33 @@ The primary Failed-item hold can be recorded by classification and again by
 the batch observer; deadlines take the maximum, so this is harmless.
 Direct PIM writes forward the error: recovery() describes the operation,
 leg_recovery() the failing leg, and partial_commit() the historical effects.
+
+## Authoritative reads and retained control state
+
+While an account is attached, `SyncEngine::debt` and `repair_debt` read the
+account writer's authoritative ledger through `WriterRequest::GetLedger`.
+This includes obligations retained after a failed store write: an enterprise
+mail user inspecting incomplete synchronization must see that debt immediately.
+Detached debt inspection reads the durable store snapshot. Backfill resume reads
+use `GetBackfill` on the same writer queue as resets and progress discards.
+A ledger load failure refuses ledger reads rather than inventing empty debt.
+These snapshots order with earlier writer requests; they do not reserve state
+against subsequent requests.
+
+`SyncControl::engine_state()` returns a retained watch of
+`control::EngineState::{Running, Paused(PauseReason), Stopping}`. A subscriber
+joining after a pause can learn why synchronization stopped. Consumer pauses
+use `ConsumerRequested`; automatic pauses retain their recovery reason.
+`Control::resume` and `SyncEngine::resume_account` share one transition and emit
+one `AccountControl::Resume` when the boundary changes. Repeated resume is a
+no-op. Pause, resume and detach's stop serialize their retained state and
+broadcast updates; stop is terminal and produces no false resume notification.
+Checkpoint requests remain transient boundary requests, not run-state changes.
+
+`SyncControl::apply_to` owns priority and bandwidth application to an account
+incarnation, for initial forwarding, control changes and replacement opens.
+Each watch borrow stays held through its setter, preventing a concurrent update
+from being overwritten by a stale snapshot. The optional slot bandwidth budget
+is updated under the same bandwidth borrow. Pre-open budget application stays
+separate because a replacement account does not exist yet; it uses the same
+snapshot discipline. The two controls are independent, not one atomic pair.

@@ -523,14 +523,14 @@ enum ImplicitOutcome {
 /// Read the implicit `Email/set` RFC 8621 s7.5 appends under the submission
 /// call id, after the explicit submission response has been consumed (so the
 /// first remaining response under that id is the implicit one). Returns its
-/// non-empty `newState` and the outcome for `email`, which is the NATIVE id
-/// the server keys its answer by - never a foreign-encoded id.
+/// oldState -> newState transition and the outcome for `email`, the native
+/// id the server keys its answer by, never a foreign-encoded id.
 fn take_implicit_email_set(
     response: &mut crate::core::response::Response,
     call_id: &str,
     email: &EmailId,
     on_success: OnSuccess,
-) -> (Option<String>, ImplicitOutcome) {
+) -> (Option<(String, String)>, ImplicitOutcome) {
     let mut result = match response.get_method::<EmailSet>(call_id) {
         Ok(result) => result,
         Err(error) => {
@@ -549,10 +549,7 @@ fn take_implicit_email_set(
             return (None, outcome);
         }
     };
-    let state = result
-        .new_state()
-        .filter(|state| !state.is_empty())
-        .map(str::to_string);
+    let state = state_cache::set_transition(result.old_state(), result.new_state());
     let answer = match on_success {
         OnSuccess::File => result.updated(email).map(drop),
         OnSuccess::Destroy => result.destroyed(email),
@@ -761,12 +758,8 @@ pub(crate) fn send_message<T: HttpTransport>(
             OnSuccess::Destroy
         };
 
-        // Capture the per-account email state observed before the set so
-        // the post-call advance is compare-and-swap, not an
-        // unconditional overwrite. A slow `Email/set` response carrying
-        // an older `newState` must not clobber a newer state the
-        // `Email/changes` loop has since CAS-set.
-        let prior_state = state_cache::get(&email_states, &account_id).await;
+        // Each Email response is observed from its own oldState, so a
+        // concurrent edit cannot be blessed by an unrelated send.
         let mut batch = mail.build();
         let email_handle = batch
             .call(email_set)
@@ -795,25 +788,16 @@ pub(crate) fn send_message<T: HttpTransport>(
             .get(&email_handle)
             .map_err(to_acct_err(AccountOperation::Send))
             .map(|result| {
-                let new_state = result
-                    .new_state()
-                    .filter(|state| !state.is_empty())
-                    .map(str::to_string);
+                let new_state = state_cache::set_transition(result.old_state(), result.new_state());
                 (result, new_state)
             });
 
+        if let Ok((_, transition)) = email_result.as_ref() {
+            state_cache::observe_set(&email_states, &account_id, transition.clone()).await;
+        }
         let submission = match submission_result {
             Ok(submission) => submission,
             Err((error, rejected)) => {
-                if let Ok((_, Some(new_state))) = email_result.as_ref() {
-                    state_cache::advance(
-                        &email_states,
-                        &account_id,
-                        prior_state.as_deref(),
-                        new_state.clone(),
-                    )
-                    .await;
-                }
                 let email = email_result
                     .ok()
                     .and_then(|(mut result, _)| result.created(&email_create_id).ok())
@@ -838,7 +822,7 @@ pub(crate) fn send_message<T: HttpTransport>(
             }
         };
 
-        let (email_result, created_state) = match email_result {
+        let (email_result, _created_state) = match email_result {
             Ok((mut result, state)) => (
                 result
                     .created(&email_create_id)
@@ -850,9 +834,9 @@ pub(crate) fn send_message<T: HttpTransport>(
         };
         // RFC 8621 appends the implicit Email/set result under the
         // submission call id. Its state follows the initial Email create,
-        // so advance once to the newest state rather than CAS-advancing
-        // twice against the same pre-call value. Its per-item answer for the
-        // created Email decides the receipt's Sent copy.
+        // and is observed as a separate oldState -> newState transition.
+        // A concurrent change between the calls must remain unobserved.
+        // Its per-item answer for the created Email decides the Sent copy.
         let (implicit_email_state, implicit) = match email_result.as_ref() {
             Ok(email_id) => {
                 let (state, outcome) = take_implicit_email_set(
@@ -867,21 +851,13 @@ pub(crate) fn send_message<T: HttpTransport>(
                 response
                     .get_method::<EmailSet>(&submission_handle.call_id)
                     .ok()
-                    .and_then(crate::core::set::SetResponse::into_new_state)
-                    .filter(|state| !state.is_empty()),
+                    .and_then(|result| {
+                        state_cache::set_transition(result.old_state(), result.new_state())
+                    }),
                 None,
             ),
         };
-        let email_state = implicit_email_state.or(created_state);
-        if let Some(new_state) = email_state {
-            state_cache::advance(
-                &email_states,
-                &account_id,
-                prior_state.as_deref(),
-                new_state,
-            )
-            .await;
-        }
+        state_cache::observe_set(&email_states, &account_id, implicit_email_state).await;
 
         let email_id = email_result.map_err(|error| {
             let public_submission = submission.id().map(|id| public(id.as_str()));
@@ -985,7 +961,6 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
             .call(submission_set)
             .map_err(to_acct_err(AccountOperation::Send))?;
 
-        let prior_state = state_cache::get(&email_states, &account_id).await;
         let mut response = batch
             .send()
             .await
@@ -998,24 +973,17 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
             .get(&import_handle)
             .map_err(to_acct_err(AccountOperation::Send))
             .map(|result| {
-                let imported_state = result.new_state().to_string();
+                let imported_state =
+                    state_cache::set_transition(result.old_state(), Some(result.new_state()));
                 (result, imported_state)
             });
 
+        if let Ok((_, transition)) = email_result.as_ref() {
+            state_cache::observe_set(&email_states, &account_id, transition.clone()).await;
+        }
         let submission = match submission_result {
             Ok(submission) => submission,
             Err((error, rejected)) => {
-                if let Ok((_, imported_state)) = email_result.as_ref()
-                    && !imported_state.is_empty()
-                {
-                    state_cache::advance(
-                        &email_states,
-                        &account_id,
-                        prior_state.as_deref(),
-                        imported_state.clone(),
-                    )
-                    .await;
-                }
                 let email = email_result
                     .ok()
                     .and_then(|(mut result, _)| result.created(&import_create_id).ok())
@@ -1033,7 +1001,7 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
                 return Err(failed_submission(error, rejected, email.as_ref(), cleanup));
             }
         };
-        let (email_result, imported_state) = match email_result {
+        let (email_result, _imported_state) = match email_result {
             Ok((mut result, state)) => (
                 result
                     .created(&import_create_id)
@@ -1043,7 +1011,7 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
                         false,
                     ))
                     .and_then(|email| require_created_email_id(&email, AccountOperation::Send)),
-                (!state.is_empty()).then_some(state),
+                state,
             ),
             Err(error) => (Err(error), None),
         };
@@ -1063,20 +1031,13 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
                 response
                     .get_method::<EmailSet>(&submission_handle.call_id)
                     .ok()
-                    .and_then(crate::core::set::SetResponse::into_new_state)
-                    .filter(|state| !state.is_empty()),
+                    .and_then(|result| {
+                        state_cache::set_transition(result.old_state(), result.new_state())
+                    }),
                 None,
             ),
         };
-        if let Some(new_state) = implicit_email_state.or(imported_state) {
-            state_cache::advance(
-                &email_states,
-                &account_id,
-                prior_state.as_deref(),
-                new_state,
-            )
-            .await;
-        }
+        state_cache::observe_set(&email_states, &account_id, implicit_email_state).await;
         let email_id = email_result.map_err(|error| {
             acknowledged_send_error(
                 error,
@@ -1197,23 +1158,17 @@ pub(crate) fn draft_create<T: HttpTransport>(
         .await?;
         let mut set = EmailSet::new();
         let create_id = set.create_item(create);
-        // CAS the post-create state against the state seen before the
-        // call (see `send_message`) so a slow response cannot clobber a
-        // newer state the changes loop already advanced to.
-        let prior_state = state_cache::get(&email_states, &account_id).await;
+        // Advance only across the transition proved by this response.
         let mut response = mail
             .call(set)
             .await
             .map_err(to_acct_err(AccountOperation::DraftCreate))?;
-        if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
-            state_cache::advance(
-                &email_states,
-                &account_id,
-                prior_state.as_deref(),
-                new_state.to_string(),
-            )
-            .await;
-        }
+        state_cache::observe_set(
+            &email_states,
+            &account_id,
+            state_cache::set_transition(response.old_state(), response.new_state()),
+        )
+        .await;
         let email = response.created(&create_id).map_err(set_answer_error(
             AccountOperation::DraftCreate,
             "Email/set",
@@ -1353,8 +1308,8 @@ pub(crate) fn draft_send<T: HttpTransport>(
             &draft_id,
             OnSuccess::File,
         );
-        if let Some(state) = implicit_state {
-            state_cache::advance(&email_states, &account_id, prior_state.as_deref(), state).await;
+        if implicit_state.is_some() {
+            state_cache::observe_set(&email_states, &account_id, implicit_state).await;
         } else if let Ok(fresh) = super::mutation::probe_email_state(&mail).await {
             state_cache::advance(&email_states, &account_id, prior_state.as_deref(), fresh).await;
         }
@@ -1985,7 +1940,8 @@ pub(crate) fn identity_update<T: HttpTransport>(
             ));
         }
         let mut set = IdentitySet::new();
-        let item = set.update(JmapIdentityId::new(identity.0));
+        let identity = JmapIdentityId::new(identity.0);
+        let item = set.update(identity.clone());
         if let Some(name) = patch.name {
             item.name(name);
         }
@@ -2007,13 +1963,20 @@ pub(crate) fn identity_update<T: HttpTransport>(
             let values = reply_to.into_iter().map(address_to_jmap);
             item.reply_to(Some(values));
         }
-        let response = account
+        let mut response = account
             .call(set)
             .await
             .map_err(to_acct_err(AccountOperation::IdentityUpdate))?;
+        // An Outlook user must not see settings saved without confirmation
+        // for the requested id; silence is an unanswered write.
         response
-            .unwrap_update_errors()
-            .map_err(to_acct_err(AccountOperation::IdentityUpdate))
+            .updated(&identity)
+            .map(drop)
+            .map_err(set_answer_error(
+                AccountOperation::IdentityUpdate,
+                "Identity/set",
+                false,
+            ))
     })
 }
 
@@ -2066,13 +2029,20 @@ pub(crate) fn vacation_set<T: HttpTransport>(
         patch.html_body(config.body_html);
         patch.from_date(config.starts_at.map(system_time_to_unix));
         patch.to_date(config.ends_at.map(system_time_to_unix));
-        let response = account
+        let mut response = account
             .call(set)
             .await
             .map_err(to_acct_err(AccountOperation::VacationSet))?;
+        // An Outlook user must not see settings saved without confirmation
+        // for the requested id; silence is an unanswered write.
         response
-            .unwrap_update_errors()
-            .map_err(to_acct_err(AccountOperation::VacationSet))
+            .updated(&VacationResponseId::new("singleton"))
+            .map(drop)
+            .map_err(set_answer_error(
+                AccountOperation::VacationSet,
+                "VacationResponse/set",
+                false,
+            ))
     })
 }
 
@@ -2596,7 +2566,6 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
     let mut if_in_state = read_state;
     let mut progress = SetProgress::default();
     for (index, chunk) in ids.chunks(batch_size).enumerate() {
-        let prior_state = state_cache::get(email_states, account_id).await;
         let set = EmailSet::new()
             .if_in_state(if_in_state.clone())
             .destroy(chunk.iter().cloned());
@@ -2611,15 +2580,12 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
             .new_state()
             .filter(|state| !state.is_empty())
             .map(str::to_string);
-        if let Some(new_state) = new_state.as_ref() {
-            state_cache::advance(
-                email_states,
-                account_id,
-                prior_state.as_deref(),
-                new_state.clone(),
-            )
-            .await;
-        }
+        state_cache::observe_set(
+            email_states,
+            account_id,
+            state_cache::set_transition(response.old_state(), response.new_state()),
+        )
+        .await;
         for id in chunk {
             progress.item(id, response.destroyed(id), op, true);
         }
@@ -2861,17 +2827,13 @@ where
     // An account-wide `ifInState` rejects them after an unrelated Email
     // change, while a patch preserves fields it does not name. Keep the cache
     // advance compare-and-swap guarded without probing before the write.
-    let prior_state = state_cache::get(email_states, account_id).await;
     let response = mail.call(make_set()).await.map_err(to_acct_err(op))?;
-    if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
-        state_cache::advance(
-            email_states,
-            account_id,
-            prior_state.as_deref(),
-            new_state.to_string(),
-        )
-        .await;
-    }
+    state_cache::observe_set(
+        email_states,
+        account_id,
+        state_cache::set_transition(response.old_state(), response.new_state()),
+    )
+    .await;
     Ok(response)
 }
 
@@ -4855,6 +4817,49 @@ mod tests {
             _url: &str,
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_changes_require_an_answer_for_the_requested_id() {
+        for identity in [true, false] {
+            let client = crate::client::Client::with_transport(
+                OmittingSetTransport::default(),
+                search_session(),
+                "https://example.test/.well-known/jmap",
+            )
+            .expect("client builds");
+            let account = crate::account::Account::new(client, "primary");
+            let result = if identity {
+                let mut patch = bifrost_types::IdentityPatch::default();
+                patch.name = Some("Renamed".into());
+                identity_update(
+                    Some(account),
+                    bifrost_types::IdentityId("identity".into()),
+                    patch,
+                )
+                .await
+            } else {
+                vacation_set(
+                    Some(account),
+                    VacationConfig {
+                        is_enabled: true,
+                        subject: None,
+                        body_text: None,
+                        body_html: None,
+                        starts_at: None,
+                        ends_at: None,
+                    },
+                )
+                .await
+            };
+            let error = result.expect_err("omission cannot confirm saved settings");
+            assert!(matches!(
+                error.kind(),
+                bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::PartialResponse
+                )
+            ));
         }
     }
 
@@ -7041,7 +7046,17 @@ mod tests {
                             } else {
                                 serde_json::json!({
                                     "accountId": account_id,
-                                    "oldState": args["ifInState"],
+                                    // A real server always reports the state the
+                                    // set started from. An unconditional destroy
+                                    // follows the create or import that produced
+                                    // the Email, so it starts from that state.
+                                    "oldState": if !args["ifInState"].is_null() {
+                                        args["ifInState"].clone()
+                                    } else if !self.calls("Email/import").is_empty() {
+                                        serde_json::json!("email-imported-state")
+                                    } else {
+                                        serde_json::json!("email-created-state")
+                                    },
                                     "newState": "email-deleted-state",
                                     "destroyed": destroyed
                                 })
@@ -7246,7 +7261,11 @@ mod tests {
                         .to_string();
                     let mut implicit = serde_json::json!({
                         "accountId": account_id.clone(),
-                        "oldState": "email-created-state",
+                        "oldState": if responses.iter().any(|r| r[0] == "Email/import") {
+                            "email-imported-state"
+                        } else {
+                            "email-created-state"
+                        },
                         "newState": self.implicit_email_state,
                     });
                     let refusal = serde_json::json!({"type": "forbidden"});
@@ -7423,7 +7442,29 @@ mod tests {
         assert_eq!(sets[0]["update"]["email-old"]["keywords/$seen"], true);
         assert_eq!(
             state_cache::get(&states, "primary").await.as_deref(),
-            Some("email-updated-state")
+            Some("cached-state")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_does_not_bless_unobserved_concurrent_email_changes() {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.implicit_email_state = Some("email-after-send");
+        let states = send_state_map();
+        state_cache::set(&states, "primary", "unobserved-predecessor".into()).await;
+        send_message(
+            send_account(transport),
+            Arc::clone(&states),
+            "primary".into(),
+            3600,
+            None,
+            basic_send_request(),
+        )
+        .await
+        .expect("submission succeeds independently of the cached guard");
+        assert_eq!(
+            state_cache::get(&states, "primary").await.as_deref(),
+            Some("unobserved-predecessor")
         );
     }
 
@@ -7432,7 +7473,7 @@ mod tests {
         let mut transport = SendTransport::new(false, false, false, false);
         transport.implicit_email_state = Some("email-after-send");
         let states = send_state_map();
-        state_cache::set(&states, "primary", "email-before-send".to_string()).await;
+        state_cache::set(&states, "primary", "email-state-before-create".to_string()).await;
 
         let sent = send_message(
             send_account(transport.clone()),
@@ -7465,7 +7506,7 @@ mod tests {
         let mut transport = SendTransport::new(false, false, false, false);
         transport.implicit_email_state = Some("email-after-raw-send");
         let states = send_state_map();
-        state_cache::set(&states, "primary", "email-before-send".to_string()).await;
+        state_cache::set(&states, "primary", "email-state-before-import".to_string()).await;
 
         send_raw_message(
             send_account(transport.clone()),
@@ -7492,7 +7533,7 @@ mod tests {
         let mut transport = SendTransport::new(false, false, true, false);
         transport.implicit_email_state = Some("email-after-draft-send");
         let states = send_state_map();
-        state_cache::set(&states, "primary", "email-before-send".to_string()).await;
+        state_cache::set(&states, "primary", "email-created-state".to_string()).await;
 
         let sent = draft_send(
             send_account(transport.clone()),
@@ -7871,6 +7912,7 @@ mod tests {
     async fn failed_send_message_submission_best_effort_destroys_created_email() {
         let transport = SendTransport::new(true, false, false, false);
         let states = send_state_map();
+        state_cache::set(&states, "primary", "email-state-before-create".to_string()).await;
         let result = send_message(
             send_account(transport.clone()),
             Arc::clone(&states),
@@ -7995,6 +8037,7 @@ mod tests {
     async fn failed_raw_send_submission_best_effort_destroys_imported_email() {
         let transport = SendTransport::new(true, false, false, false);
         let states = send_state_map();
+        state_cache::set(&states, "primary", "email-state-before-import".to_string()).await;
         let result = send_raw_message(
             send_account(transport.clone()),
             Arc::clone(&states),

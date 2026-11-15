@@ -116,6 +116,10 @@ pub(crate) struct JmapAccount {
     /// the primary and each foreign account hold distinct state - a
     /// single `Option<String>` would clobber one with the other.
     pub(crate) email_states: StateMap,
+    // This map records observations, not mutation guards, so deleting it does
+    // not fix Email guard continuity. Keep that cleanup separate from the fix.
+    // It must never replace lifecycle progress: a local write must not skip
+    // sidebar changes that only the lifecycle walk delivers.
     pub(crate) mailbox_states: StateMap,
     /// Private Mailbox/changes position for scope lifecycle polling. This is
     /// deliberately separate from `mailbox_states`, whose consumers may

@@ -29,10 +29,11 @@ pub(crate) struct SetArguments {
     /// and use an existing server id without a prefix, per RFC 8621.
     #[serde(rename = "onSuccessUpdateEmail")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    on_success_update_email: Option<HashMap<String, EmailPatch>>,
+    on_success_update_email:
+        Option<HashMap<crate::core::creation::IdOrRef<EmailSubmissionId>, EmailPatch>>,
     #[serde(rename = "onSuccessDestroyEmail")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    on_success_destroy_email: Option<Vec<String>>,
+    on_success_destroy_email: Option<Vec<crate::core::creation::IdOrRef<EmailSubmissionId>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,7 +82,7 @@ pub(crate) struct EmailSubmission {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EmailSubmissionCreate {
     #[serde(skip)]
-    pub(super) _create_id: Option<usize>,
+    pub(super) _create_id: Option<crate::core::creation::CreationId>,
 
     #[serde(rename = "identityId")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,7 +90,7 @@ pub(crate) struct EmailSubmissionCreate {
 
     #[serde(rename = "emailId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) email_id: Option<EmailId>,
+    pub(super) email_id: Option<crate::core::creation::IdOrRef<EmailId>>,
 
     #[serde(rename = "#emailId")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,10 +223,13 @@ impl crate::core::set::SetObject for EmailSubmission {
 
 impl crate::core::SetCreate for EmailSubmissionCreate {
     fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
+        self._create_id.as_ref().map(ToString::to_string)
+    }
+    fn set_create_id(&mut self, id: crate::core::creation::CreationId) {
+        self._create_id = Some(id);
     }
 
-    fn new(create_id: Option<usize>) -> Self {
+    fn new(create_id: Option<crate::core::creation::CreationId>) -> Self {
         EmailSubmissionCreate {
             _create_id: create_id,
             identity_id: None,

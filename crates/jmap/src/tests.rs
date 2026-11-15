@@ -34,7 +34,7 @@ mod patch_object_null_semantics {
 
     #[test]
     fn calendar_event_create_removal_omits_membership() {
-        let mut event = CalendarEventCreate::new(Some(0));
+        let mut event = CalendarEventCreate::new(None);
         event.calendar_id("keep", true);
         event.calendar_id("cal-1", true);
         event.calendar_id("cal-1", false);
@@ -46,7 +46,7 @@ mod patch_object_null_semantics {
 
     #[test]
     fn calendar_event_calendar_id_true_produces_true() {
-        let mut event = CalendarEventCreate::new(Some(0));
+        let mut event = CalendarEventCreate::new(None);
         event.calendar_id("cal-1", true);
 
         let value = serde_json::to_value(&event).unwrap();
@@ -57,7 +57,7 @@ mod patch_object_null_semantics {
 
     #[test]
     fn contact_card_create_removal_omits_membership() {
-        let mut card = ContactCardCreate::new(Some(0));
+        let mut card = ContactCardCreate::new(None);
         card.address_book_id("keep", true);
         card.address_book_id("ab-1", true);
         card.address_book_id("ab-1", false);
@@ -69,7 +69,7 @@ mod patch_object_null_semantics {
 
     #[test]
     fn contact_card_address_book_id_true_produces_true() {
-        let mut card = ContactCardCreate::new(Some(0));
+        let mut card = ContactCardCreate::new(None);
         card.address_book_id("ab-1", true);
 
         let value = serde_json::to_value(&card).unwrap();
@@ -511,7 +511,7 @@ mod calendar_option_option_serialization {
 
     #[test]
     fn calendar_description_none_serializes_as_null() {
-        let mut cal = CalendarCreate::new(Some(0));
+        let mut cal = CalendarCreate::new(None);
         cal.name("Test Calendar");
         cal.description(None::<String>);
 
@@ -530,7 +530,7 @@ mod calendar_option_option_serialization {
 
     #[test]
     fn calendar_description_unset_is_absent() {
-        let mut cal = CalendarCreate::new(Some(0));
+        let mut cal = CalendarCreate::new(None);
         cal.name("Test Calendar");
         // Do NOT call cal.description() - leave it as outer None
 
@@ -544,7 +544,7 @@ mod calendar_option_option_serialization {
 
     #[test]
     fn calendar_description_some_serializes_as_string() {
-        let mut cal = CalendarCreate::new(Some(0));
+        let mut cal = CalendarCreate::new(None);
         cal.name("Test Calendar");
         cal.description(Some("A nice calendar"));
 
@@ -1918,8 +1918,8 @@ mod email_set_patch_shapes {
 mod mailbox_wire {
     use super::*;
     use crate::core::SetCreate;
+    use crate::mailbox::ACL;
     use crate::mailbox::{MailboxCreate, MailboxId, MailboxPatch, MailboxSet, Role};
-    use crate::principal::ACL;
 
     #[test]
     fn role_wire_names() {
@@ -1980,13 +1980,13 @@ mod mailbox_wire {
         // `shareWith`) all have to be skipped, or a plain
         // `Mailbox/set create` would carry three properties the caller
         // never asked for.
-        let create = MailboxCreate::new(Some(0));
+        let create = MailboxCreate::new(None);
         assert_eq!(serde_json::to_value(&create).unwrap(), json!({}));
     }
 
     #[test]
     fn create_with_an_explicit_none_parent_sends_null() {
-        let mut create = MailboxCreate::new(Some(0));
+        let mut create = MailboxCreate::new(None);
         create.name("Top level");
         create.parent_id(None::<MailboxId>);
         let value = serde_json::to_value(&create).unwrap();
@@ -1996,7 +1996,7 @@ mod mailbox_wire {
 
     #[test]
     fn create_id_references_are_hash_prefixed() {
-        let mut create = MailboxCreate::new(Some(0));
+        let mut create = MailboxCreate::new(None);
         create.parent_id_ref("c0");
         assert_eq!(
             serde_json::to_value(&create).unwrap().get("parentId"),
@@ -2440,13 +2440,13 @@ mod patch_defaults {
         use crate::core::SetCreate;
         #[cfg(feature = "contacts")]
         assert_eq!(
-            serde_json::to_value(crate::address_book::AddressBookCreate::new(Some(0))).unwrap(),
+            serde_json::to_value(crate::address_book::AddressBookCreate::new(None)).unwrap(),
             json!({})
         );
         #[cfg(feature = "calendars")]
         assert_eq!(
             serde_json::to_value(crate::participant_identity::ParticipantIdentityCreate::new(
-                Some(0)
+                Some(crate::core::creation::CreationId::named("c0"))
             ))
             .unwrap(),
             json!({"calendarAddress": ""})
@@ -2454,23 +2454,21 @@ mod patch_defaults {
         #[cfg(feature = "mail")]
         {
             assert_eq!(
-                serde_json::to_value(crate::mailbox::MailboxCreate::new(Some(0))).unwrap(),
+                serde_json::to_value(crate::mailbox::MailboxCreate::new(None)).unwrap(),
                 json!({})
             );
             assert_eq!(
-                serde_json::to_value(crate::identity::IdentityCreate::new(Some(0))).unwrap(),
+                serde_json::to_value(crate::identity::IdentityCreate::new(None)).unwrap(),
                 json!({})
             );
             assert_eq!(
-                serde_json::to_value(crate::vacation_response::VacationResponseCreate::new(Some(
-                    0
-                )))
-                .unwrap(),
+                serde_json::to_value(crate::vacation_response::VacationResponseCreate::new(None))
+                    .unwrap(),
                 json!({})
             );
         }
         assert_eq!(
-            serde_json::to_value(crate::principal::PrincipalCreate::new(Some(0))).unwrap(),
+            serde_json::to_value(crate::principal::PrincipalCreate::new(None)).unwrap(),
             json!({})
         );
     }
@@ -3355,7 +3353,7 @@ mod participant_identity_wire {
             json!("calendarAddress")
         );
 
-        let mut create = ParticipantIdentityCreate::new(Some(0));
+        let mut create = ParticipantIdentityCreate::new(None);
         create.calendar_address("mailto:ada@example.test");
         assert_eq!(
             serde_json::to_value(create).unwrap(),
@@ -3557,13 +3555,13 @@ mod push_subscription_wire {
 
     #[test]
     fn a_fresh_create_omits_the_empty_types_list() {
-        let create = PushSubscriptionCreate::new(Some(0));
+        let create = PushSubscriptionCreate::new(None);
         assert_eq!(serde_json::to_value(&create).unwrap(), json!({}));
     }
 }
 
 // ---------------------------------------------------------------------------
-// Principal ACL vocabulary (RFC 8621 s2 shareWith)
+// Mailbox ACL vocabulary (RFC 8621 s2 shareWith)
 // ---------------------------------------------------------------------------
 
 mod principal_property_wire_names {
@@ -3598,9 +3596,9 @@ mod principal_property_wire_names {
     }
 }
 
-mod principal_acl_vocabulary {
+mod mailbox_acl_vocabulary {
     use super::*;
-    use crate::principal::ACL;
+    use crate::mailbox_rights::ACL;
 
     #[test]
     fn acl_serialises_with_the_share_with_property_names() {

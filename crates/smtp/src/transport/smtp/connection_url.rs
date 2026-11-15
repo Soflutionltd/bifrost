@@ -83,14 +83,14 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
     match (connection_url.scheme(), tls.as_deref()) {
         ("smtp", None) => {
             builder = builder.port(connection_url.port().unwrap_or(default_port(
-                bifrost_types::error::Protocol::Smtp,
+                crate::transport::smtp::Dialect::Smtp,
                 PortTls::Plaintext,
             )));
         }
         ("smtp", Some("required")) => {
             builder = builder
                 .port(connection_url.port().unwrap_or(default_port(
-                    bifrost_types::error::Protocol::Smtp,
+                    crate::transport::smtp::Dialect::Smtp,
                     PortTls::StartTls,
                 )))
                 .tls(Tls::Required(TlsParameters::new(host.into())?));
@@ -98,7 +98,7 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
         ("smtp", Some("opportunistic")) => {
             builder = builder
                 .port(connection_url.port().unwrap_or(default_port(
-                    bifrost_types::error::Protocol::Smtp,
+                    crate::transport::smtp::Dialect::Smtp,
                     PortTls::StartTls,
                 )))
                 .tls(Tls::Opportunistic(TlsParameters::new(host.into())?));
@@ -106,7 +106,7 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
         ("smtps", _) => {
             builder = builder
                 .port(connection_url.port().unwrap_or(default_port(
-                    bifrost_types::error::Protocol::Smtp,
+                    crate::transport::smtp::Dialect::Smtp,
                     PortTls::Implicit,
                 )))
                 .tls(Tls::Wrapper(TlsParameters::new(host.into())?));

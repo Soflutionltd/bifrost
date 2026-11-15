@@ -150,7 +150,7 @@ pub(super) fn message_from_ews_item(
     };
     let mut flags = HashSet::new();
     if item.is_read {
-        flags.insert("\\seen".to_string());
+        flags.insert(crate::account::flags::GraphFlag::Read.token());
     }
     Message {
         id,
@@ -428,7 +428,7 @@ pub(super) fn flags_from_message(value: &Value) -> HashSet<String> {
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        flags.insert("\\seen".to_string());
+        flags.insert(crate::account::flags::GraphFlag::Read.token());
     }
     if value
         .get("flag")
@@ -436,10 +436,10 @@ pub(super) fn flags_from_message(value: &Value) -> HashSet<String> {
         .and_then(Value::as_str)
         .is_some_and(|status| status.eq_ignore_ascii_case("flagged"))
     {
-        flags.insert("\\flagged".to_string());
+        flags.insert(crate::account::flags::GraphFlag::Flagged.token());
     }
     for category in categories_from_value(value) {
-        flags.insert(format!("category:{category}"));
+        flags.insert(crate::account::flags::GraphFlag::Category(&category).token());
     }
     flags
 }

@@ -1,29 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct AdvertisedAppendLimits {
-    global: Option<u64>,
-    mailbox_specific: bool,
-}
-
-impl AdvertisedAppendLimits {
-    fn from_capabilities(capabilities: &[Capability]) -> Self {
-        let mut limits = Self::default();
-        for capability in capabilities {
-            match capability {
-                Capability::AppendLimit(Some(limit)) => {
-                    limits.global =
-                        Some(limits.global.map_or(*limit, |current| current.min(*limit)));
-                }
-                Capability::AppendLimit(None) => limits.mailbox_specific = true,
-                _ => {}
-            }
-        }
-        limits
-    }
-}
-
 impl ImapConnection {
     // -----------------------------------------------------------------------
     // Append
@@ -78,7 +55,7 @@ impl ImapConnection {
         self.require_state(crate::types::CommandKind::Append)?;
 
         let deadline = tokio::time::Instant::now() + timeout;
-        if let Some(limit) = self.append_limit_for_mailbox(mailbox, timeout).await? {
+        if let Some(limit) = self.append_limit_for_mailbox(mailbox, deadline).await? {
             self.check_append_limit(message.data.len(), limit)?;
         }
 
@@ -133,14 +110,11 @@ impl ImapConnection {
         // Snapshot the advertised APPENDLIMIT before any STATUS lookup for a
         // mailbox-specific limit. This is the only handle-side read of
         // capabilities: it feeds the client-side size check, not wire bytes.
-        let advertised_limits = {
-            let snap = self.state_rx.borrow();
-            AdvertisedAppendLimits::from_capabilities(&snap.capabilities)
-        };
+        let advertised_limits = self.server_profile().append_limit;
 
         let deadline = tokio::time::Instant::now() + timeout;
         if let Some(limit) = self
-            .append_limit_from_advertisement(mailbox, advertised_limits, timeout)
+            .append_limit_from_advertisement(mailbox, advertised_limits, deadline)
             .await?
         {
             for msg in messages {
@@ -170,38 +144,42 @@ impl ImapConnection {
     async fn append_limit_for_mailbox(
         &self,
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
-        timeout: Duration,
+        deadline: tokio::time::Instant,
     ) -> Result<Option<u64>, Error> {
-        let advertised = {
-            let snapshot = self.state_rx.borrow();
-            AdvertisedAppendLimits::from_capabilities(&snapshot.capabilities)
-        };
-        self.append_limit_from_advertisement(mailbox, advertised, timeout)
+        let advertised = self.server_profile().append_limit;
+        self.append_limit_from_advertisement(mailbox, advertised, deadline)
             .await
     }
 
     async fn append_limit_from_advertisement(
         &self,
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
-        advertised: AdvertisedAppendLimits,
-        timeout: Duration,
+        advertised: crate::types::profile::AppendLimitPolicy,
+        deadline: tokio::time::Instant,
     ) -> Result<Option<u64>, Error> {
-        let mailbox_limit = if advertised.mailbox_specific {
-            // This STATUS is a preflight: the APPEND itself has not been
-            // written, so every failure here is Unsent evidence relative to
-            // the APPEND. Leaving the STATUS attempt state in place would make
-            // a non-idempotent APPEND look uncertain and send recovery down
-            // the reconcile path instead of simply retrying.
-            let status = self
-                .status(mailbox, "APPENDLIMIT", timeout)
-                .await
-                .map_err(unsent_preflight)?;
-            mailbox_append_limit(&status)?
-        } else {
-            None
-        };
+        use crate::types::profile::AppendLimitPolicy;
 
-        Ok(match (advertised.global, mailbox_limit) {
+        let global = match advertised {
+            AppendLimitPolicy::NotAdvertised => return Ok(None),
+            AppendLimitPolicy::Limit(limit) => return Ok(Some(limit)),
+            AppendLimitPolicy::PerMailbox { global_ceiling } => global_ceiling,
+        };
+        // APPEND submission already uses the original deadline; carry it
+        // through the helper too, rather than starting a fresh relative budget.
+        // The helper and APPEND share one budget. Its failures describe an
+        // APPEND never sent, even if the STATUS itself reached the server.
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| unsent_preflight(Error::timeout()))?;
+        let status =
+            tokio::time::timeout_at(deadline, self.status(mailbox, "APPENDLIMIT", remaining))
+                .await
+                .map_err(|_| unsent_preflight(Error::timeout()))?
+                .map_err(unsent_preflight)?;
+        let mailbox_limit = mailbox_append_limit(&status)?;
+
+        Ok(match (global, mailbox_limit) {
             (Some(global), Some(mailbox)) => Some(global.min(mailbox)),
             (Some(global), None) => Some(global),
             (None, Some(mailbox)) => Some(mailbox),
@@ -258,4 +236,30 @@ pub(super) fn mailbox_append_limit(status: &StatusResult) -> Result<Option<u64>,
 /// reconcile a message that was never written.
 fn unsent_preflight(error: Error) -> Error {
     error.with_attempt(bifrost_types::TransmissionState::Unsent)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn expired_append_preflight_is_unsent_without_submitting_status() {
+        let connection = crate::connection::test_support::detached(
+            SessionState::Authenticated,
+            vec![Capability::AppendLimit(None)],
+            &[],
+        );
+        let result = connection
+            .append_limit_for_mailbox("INBOX", tokio::time::Instant::now())
+            .await;
+        // The detached driver would return DriverGone if STATUS was queued.
+        let error = result.expect_err("expired preflight must fail");
+        assert!(matches!(error, Error::Timeout { .. }));
+        assert_eq!(
+            error.attempt(),
+            Some(bifrost_types::TransmissionState::Unsent)
+        );
+    }
 }

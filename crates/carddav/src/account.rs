@@ -1316,8 +1316,8 @@ impl Account for CardDavAccount {
                         &url,
                         data,
                         expected_etag.map_or_else(
-                            || put_condition(current.etag.as_deref()),
-                            PutCondition::IfMatch,
+                            || PutCondition::from_etag(current.etag.as_deref()),
+                            |etag| PutCondition::from_etag(Some(etag)),
                         ),
                         AccountOperation::ContactUpdate,
                     )
@@ -1797,15 +1797,6 @@ fn same_collection_url(left: &str, right: &str) -> bool {
     same_dav_url(left, right)
 }
 
-fn put_condition(etag: Option<&str>) -> PutCondition<'_> {
-    etag.filter(|etag| {
-        !etag
-            .get(..2)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
-    })
-    .map_or(PutCondition::None, PutCondition::IfMatch)
-}
-
 /// Map a vCard projection failure to an `AccountError` for the single-resource
 /// paths (get/update), where there is no listing to degrade a skip into.
 ///
@@ -2029,6 +2020,12 @@ fn encode_cursor_snapshot(snapshot: &ContactSnapshot) -> Vec<u8> {
     )
 }
 
+// Keep the persisted dialect magic stable: its suffix is not a second schema
+// version. The envelope alone rejects the old native-id namespace. The payload
+// collection is also necessary for accepted legacy Type scopes, which carry no
+// URL; Folder scopes cross-check it to prevent polling a different collection.
+// Sharing the token's storage does not share its semantics: only this dialect
+// decides whether it is a sync-token or a ctag.
 fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<ContactSnapshot, AccountError> {
     validate_contact_scope(&cursor.scope, AccountOperation::SyncChanges)?;
     if cursor.server_state.protocol != ProtocolKind::CardDav

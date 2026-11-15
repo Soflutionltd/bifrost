@@ -312,19 +312,30 @@ fn append_limit_policy_is_explicit() {
     assert_eq!(profile.append_limit, AppendLimitPolicy::NotAdvertised);
 
     let profile = ServerProfile::new(vec![Capability::AppendLimit(None)], vec![]);
-    assert_eq!(profile.append_limit, AppendLimitPolicy::PerMailbox);
+    assert_eq!(
+        profile.append_limit,
+        AppendLimitPolicy::PerMailbox {
+            global_ceiling: None,
+        },
+    );
 
     let profile = ServerProfile::new(vec![Capability::AppendLimit(Some(1024))], vec![]);
     assert_eq!(profile.append_limit, AppendLimitPolicy::Limit(1024));
 
     let profile = ServerProfile::new(
         vec![
+            Capability::AppendLimit(Some(2048)),
             Capability::AppendLimit(Some(1024)),
             Capability::AppendLimit(None),
         ],
         vec![],
     );
-    assert_eq!(profile.append_limit, AppendLimitPolicy::PerMailbox);
+    assert_eq!(
+        profile.append_limit,
+        AppendLimitPolicy::PerMailbox {
+            global_ceiling: Some(1024),
+        },
+    );
 }
 
 #[test]

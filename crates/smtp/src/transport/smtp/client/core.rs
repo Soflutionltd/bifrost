@@ -21,7 +21,7 @@
 
 use super::PhasedError;
 use crate::transport::smtp::{
-    Protocol,
+    Dialect,
     account_error::{SmtpErrorContext, into_account_error},
     batch::{RcptProgress, SendProgress},
     commands::{Bdat, Data, Mail, Rcpt, Rset},
@@ -203,6 +203,9 @@ fn window_commands(mail: &Mail, recipients: &[Rcpt], start: usize, end: usize) -
 
 // ---------------------------------------------------------------------------
 // Direct SMTP send
+// The Response-only API cannot report a rejected recipient alongside delivery
+// to another one. Preserve its stop-before-body contract; submission consumers
+// needing partial delivery use the batch API and submission_status instead.
 // ---------------------------------------------------------------------------
 
 /// `SmtpConnection::send_with_options` / `send_bdat_with_options`, pipelined or
@@ -758,7 +761,10 @@ impl DirectLmtp {
     fn after_envelope(&mut self) -> Step<Result<Vec<Response>, Error>> {
         if self.accepted == 0 {
             // Every recipient was rejected: clear the transaction and report
-            // the per-recipient statuses. Not a failure of the send.
+            // the per-recipient statuses. Ok here means the exchange completed,
+            // not that anyone received the message. Unlike Response-only SMTP,
+            // this API can retain every rejection. Use the batch API and
+            // submission_status for a message-submission decision.
             let rejected = self
                 .statuses
                 .iter()
@@ -1031,7 +1037,7 @@ impl BatchSmtp {
     }
 
     fn account_error(error: Error) -> bifrost_types::error::AccountError {
-        into_account_error(error, SmtpErrorContext::send(Protocol::Smtp))
+        into_account_error(error, SmtpErrorContext::send(Dialect::Smtp))
     }
 
     fn begin_epilogue(&mut self, epilogue: (Epilogue<BatchExit>, Op)) -> Step<BatchResult> {
@@ -1427,7 +1433,7 @@ impl BatchLmtp {
     }
 
     fn account_error(error: Error) -> bifrost_types::error::AccountError {
-        into_account_error(error, SmtpErrorContext::send(Protocol::Lmtp))
+        into_account_error(error, SmtpErrorContext::send(Dialect::Lmtp))
     }
 
     fn begin_epilogue(&mut self, epilogue: (Epilogue<BatchExit>, Op)) -> Step<BatchResult> {

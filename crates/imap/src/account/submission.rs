@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use bifrost_net::TokenSource;
 use bifrost_smtp::transport::smtp::authentication::Credentials as SmtpCredentials;
-use bifrost_smtp::transport::smtp::{PoolConfig, SendOptions};
+use bifrost_smtp::transport::smtp::{PoolConfig, SendOptions, SubmissionStatus, submission_status};
 use bifrost_smtp::{Address as SmtpAddress, AsyncSmtpTransport, TokioExecutor};
 use bifrost_types::error::{AccountError, BatchItem, BatchItemId};
 use bifrost_types::mime::SubmissionEnvelope;
@@ -311,37 +311,51 @@ impl SubmissionTransport {
         // send (A delivered, B rejected on RCPT) is therefore a success,
         // and the recipients that were not accepted ride the receipt,
         // each with its own error, never resent by us.
-        if !outcome.succeeded().is_empty() {
-            let mut not_accepted = locally_failed;
-            not_accepted.extend(not_accepted_recipients(&envelope.recipients, &outcome));
-            if !not_accepted.is_empty() {
-                tracing::warn!(
-                    target: "bifrost_imap::send",
-                    delivered = outcome.succeeded().len(),
-                    failed = not_accepted.iter().filter(|r| {
-                        r.outcome == RecipientOutcome::Failed
-                    }).count(),
-                    uncertain = outcome.uncertain().len(),
-                    "partial submission: message committed to some recipients while \
-                     others were not accepted; reported on the receipt"
-                );
+        //
+        // bifrost-smtp's `submission_status` owns that "counts as a send"
+        // decision; this match only maps its answer onto the receipt.
+        match submission_status(&outcome) {
+            SubmissionStatus::Committed => {}
+            // Nothing acknowledged acceptance, but a recipient may still
+            // have the message. Its error (InFlight evidence, so
+            // `Application::from_leaf` reads Uncertain) is returned rather
+            // than a failed recipient's, whose recovery could advise
+            // resending the whole call and duplicate the uncertain one.
+            // Whether an uncertain IMAP send should instead surface as an
+            // uncertain receipt is an open owner ruling; this keeps the
+            // existing error return until it is made.
+            SubmissionStatus::AcceptanceUncertain(error) | SubmissionStatus::Rejected(error) => {
+                return Err(error.clone());
             }
-            return Ok(not_accepted);
+            SubmissionStatus::Empty => return Ok(Vec::new()),
+            // A status bifrost-smtp adds later is not known to commit the
+            // message, so it is reported through whichever lane error exists
+            // rather than claimed as sent.
+            _ => {
+                if let Some(lane) = outcome.uncertain().first() {
+                    return Err(lane.error.clone());
+                }
+                return match outcome.failed().first() {
+                    Some(lane) => Err(lane.error.clone()),
+                    None => Ok(Vec::new()),
+                };
+            }
         }
-
-        // Nothing acknowledged acceptance. An uncertain recipient may
-        // still have the message, so its error (InFlight evidence, so
-        // `Application::from_leaf` reads Uncertain) wins over a failed
-        // recipient's, whose recovery could advise resending the whole
-        // call and duplicate the uncertain one. Only with no uncertain
-        // recipient does the first failure speak for the send.
-        if let Some(uncertain) = outcome.uncertain().first() {
-            return Err(uncertain.error.clone());
+        let mut not_accepted = locally_failed;
+        not_accepted.extend(not_accepted_recipients(&envelope.recipients, &outcome));
+        if !not_accepted.is_empty() {
+            tracing::warn!(
+                target: "bifrost_imap::send",
+                delivered = outcome.succeeded().len(),
+                failed = not_accepted.iter().filter(|r| {
+                    r.outcome == RecipientOutcome::Failed
+                }).count(),
+                uncertain = outcome.uncertain().len(),
+                "partial submission: message committed to some recipients while \
+                 others were not accepted; reported on the receipt"
+            );
         }
-        if let Some(failure) = outcome.failed().first() {
-            return Err(failure.error.clone());
-        }
-        Ok(Vec::new())
+        Ok(not_accepted)
     }
 }
 

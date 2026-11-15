@@ -353,12 +353,10 @@ impl ImapConnection {
                 }
                 "HIGHESTMODSEQ" => self.require_condstore()?,
                 "APPENDLIMIT" => {
-                    let has_appendlimit = self
-                        .state_rx
-                        .borrow()
-                        .capabilities
-                        .iter()
-                        .any(|cap| matches!(cap, Capability::AppendLimit(_)));
+                    let has_appendlimit = !matches!(
+                        self.server_profile().append_limit,
+                        crate::types::profile::AppendLimitPolicy::NotAdvertised
+                    );
                     if !has_appendlimit {
                         return Err(Error::MissingCapability("APPENDLIMIT".into()));
                     }

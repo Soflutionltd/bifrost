@@ -506,7 +506,7 @@ mod tests {
 
     use super::abort_concurrent;
     use crate::transport::smtp::{
-        Protocol, client::AsyncSmtpConnection, extension::ClientId, test_support::Transcript,
+        Dialect, client::AsyncSmtpConnection, extension::ClientId, test_support::Transcript,
     };
 
     #[tokio::test(crate = "tokio", start_paused = true)]
@@ -523,7 +523,7 @@ mod tests {
             let mut conn = AsyncSmtpConnection::from_transcript_with_timeout(
                 transcript,
                 &hello,
-                Protocol::Smtp,
+                Dialect::Smtp,
                 Duration::from_secs(5),
             )
             .await
@@ -569,7 +569,7 @@ mod tests {
                 AsyncSmtpConnection::from_transcript_with_timeout(
                     transcript,
                     &hello,
-                    Protocol::Smtp,
+                    Dialect::Smtp,
                     Duration::from_secs(5),
                 )
                 .await

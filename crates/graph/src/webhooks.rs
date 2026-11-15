@@ -34,6 +34,11 @@ struct GraphSubscription {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SubscriptionResponse {
+    // Keep the decoded id even when expirationDateTime is malformed. Turning
+    // expiry parsing into a fallible response conversion here would discard a
+    // successfully created subscription before the owner can register its id
+    // for rollback, close, and unsubscribe. A typed-expiry redesign must carry
+    // that id through its error lane and preserve account-owned cleanup.
     pub(crate) id: String,
     pub(crate) expiration_date_time: String,
 }

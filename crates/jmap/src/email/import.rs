@@ -28,7 +28,7 @@ pub(crate) struct EmailImportRequest {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EmailImport {
     #[serde(skip)]
-    create_id: usize,
+    create_id: crate::core::creation::CreationId,
 
     #[serde(rename = "blobId")]
     blob_id: BlobId,
@@ -111,8 +111,8 @@ impl EmailImportRequest {
     /// Add an email entry. Stays imperative because the returned
     /// `&mut EmailImport` writes into a HashMap entry.
     pub(crate) fn email(&mut self, blob_id: impl Into<BlobId>) -> &mut EmailImport {
-        let create_id = self.emails.len();
-        let create_id_str = format!("i{create_id}");
+        let create_id = crate::core::creation::CreationId::next('i', Some(&self.emails));
+        let create_id_str = create_id.to_string();
         self.emails.insert(
             create_id_str.clone(),
             EmailImport::new(blob_id.into(), create_id),
@@ -122,7 +122,7 @@ impl EmailImportRequest {
 }
 
 impl EmailImport {
-    fn new(blob_id: BlobId, create_id: usize) -> Self {
+    fn new(blob_id: BlobId, create_id: crate::core::creation::CreationId) -> Self {
         EmailImport {
             create_id,
             blob_id,
@@ -165,7 +165,7 @@ impl EmailImport {
     }
 
     pub(crate) fn create_id(&self) -> String {
-        format!("i{}", self.create_id)
+        self.create_id.to_string()
     }
 }
 

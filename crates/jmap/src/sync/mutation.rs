@@ -608,15 +608,12 @@ async fn apply_batch_with_version<T: HttpTransport>(
 
     // Absent (non-conforming) and empty both mean "no state to record".
     // Only a real state string advances the cache.
-    if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
-        state_cache::advance(
-            email_states,
-            account_id,
-            state.as_deref(),
-            new_state.to_string(),
-        )
-        .await;
-    }
+    state_cache::observe_set(
+        email_states,
+        account_id,
+        state_cache::set_transition(response.old_state(), response.new_state()),
+    )
+    .await;
 
     let operation = operation_for_kind(kind);
     let mut results = Vec::with_capacity(ids.len());

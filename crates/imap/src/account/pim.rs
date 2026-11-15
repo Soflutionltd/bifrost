@@ -760,7 +760,7 @@ async fn fetch_full_message(
         .await
         .map_err(err)?;
     account
-        .select_folder(&mut conn, &decoded.folder, None, true)
+        .select_folder(&mut conn, &decoded.folder, super::SelectPurpose::Read)
         .await
         .map_err(err)?;
     let operand = pim_operand([decoded.uid], AccountOperation::DraftSend)?;
@@ -1126,7 +1126,7 @@ pub(crate) fn search(
             }
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
             let selected = account
-                .select_folder(&mut conn, &folder, None, true)
+                .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
                 .await
                 .map_err(err)?;
             let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
@@ -1181,7 +1181,7 @@ pub(crate) fn search_messages(
             }
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
             let selected = account
-                .select_folder(&mut conn, &folder, None, true)
+                .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
                 .await
                 .map_err(err)?;
             let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
@@ -1656,7 +1656,7 @@ async fn copy_messages(
                 .await
                 .map_err(preflight)?;
             let selected = account
-                .select_folder(&mut conn, &folder, None, false)
+                .select_folder(&mut conn, &folder, super::SelectPurpose::Mutate)
                 .await
                 .map_err(preflight)?;
             let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
@@ -1711,7 +1711,7 @@ async fn delete_messages(
                 .await
                 .map_err(preflight)?;
             let selected = account
-                .select_folder(&mut conn, &folder, None, false)
+                .select_folder(&mut conn, &folder, super::SelectPurpose::Mutate)
                 .await
                 .map_err(preflight)?;
             let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
@@ -1794,7 +1794,7 @@ async fn set_flag(
                 .await
                 .map_err(preflight)?;
             let selected = account
-                .select_folder(&mut conn, &folder, None, false)
+                .select_folder(&mut conn, &folder, super::SelectPurpose::Mutate)
                 .await
                 .map_err(preflight)?;
             let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
@@ -1853,7 +1853,7 @@ async fn hydrate_decoded(
             .await
             .map_err(preflight)?;
         let selected = account
-            .select_folder(&mut conn, &folder, None, true)
+            .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
             .await
             .map_err(preflight)?;
         let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
@@ -1969,7 +1969,7 @@ async fn resolve_thread_members(
             .await
             .map_err(preflight)?;
         let selected = account
-            .select_folder(&mut conn, &folder, None, true)
+            .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
             .await
             .map_err(preflight)?;
         let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
@@ -2448,7 +2448,7 @@ impl SearchPosition {
     }
 
     fn decode(bytes: &[u8], op: AccountOperation) -> Result<Self, AccountError> {
-        let invalid = || pim_malformed(op, "invalid IMAP page cursor");
+        let invalid = || search_page_cursor_error(op, "invalid IMAP page cursor");
         let payload = std::str::from_utf8(bytes)
             .ok()
             .and_then(|text| text.strip_prefix(SEARCH_CURSOR_PREFIX))
@@ -2502,7 +2502,7 @@ impl<T> SearchPager<T> {
         if let (Some(resume), Some(restriction)) = (&resume, restriction)
             && resume.folder.cmp_account_order(restriction) != std::cmp::Ordering::Equal
         {
-            return Err(pim_malformed(
+            return Err(search_page_cursor_error(
                 op,
                 "IMAP page cursor names a folder outside the search restriction",
             ));
@@ -2613,8 +2613,35 @@ impl<T> SearchPager<T> {
     }
 }
 
+/// A page cursor this account cannot use (undecodable, or naming a folder
+/// outside the search restriction) requires restarting the walk, not
+/// retrying the same page. The shared page_cursor field is the signal JMAP
+/// uses too, so consumers restart paging the same way across providers.
+fn search_page_cursor_error(op: AccountOperation, detail: impl Into<String>) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("page_cursor"),
+            message: Some(DiagnosticText::support_only(detail.into())),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(op)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// The cursor's folder answered with a different UIDVALIDITY, so the UID
 /// the walk resumes after no longer names anything there.
+///
+/// This stays `ConcurrencyConflict`, not the page_cursor `Malformed` fault the
+/// decode and restriction cases use: the cursor was valid when issued and the
+/// server replaced the mailbox under it. `Malformed` derives ClientBug, which
+/// would report a server-side epoch change as an application defect; an
+/// Outlook user whose mailbox was rebuilt expects the search to simply run
+/// again, which a conflict's re-read recovery gives. A consumer restarts
+/// paging on either error. How UIDVALIDITY changes are classified across the
+/// rest of the IMAP account is a separate, still open, question.
 fn search_cursor_voided(op: AccountOperation, folder: &MailboxName) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::ConcurrencyConflict,
@@ -4094,19 +4121,34 @@ body text\r\n";
     #[test]
     fn a_search_page_refuses_cursors_and_limits_it_cannot_honour() {
         let malformed = AccountErrorKind::Request(RequestErrorKind::Malformed);
+        let is_page_cursor_fault = |err: &AccountError| {
+            matches!(
+                err.chain().outermost(),
+                Cause::Request(RequestCause::InvalidArgument {
+                    field: Some("page_cursor"),
+                    ..
+                })
+            )
+        };
         // The retired offset spelling, garbage, and a legacy imap1 payload.
         for cursor in ["2", "not-a-number", "imapsearch1:imap1:5:INBOX:7:9"] {
             let err = search_page(&[], None, 2, Some(cursor.as_bytes().to_vec()))
                 .expect_err("a cursor this crate did not mint");
             assert_eq!(*err.kind(), malformed, "{cursor}");
+            assert!(is_page_cursor_fault(&err), "{cursor}");
         }
         let err = search_page(&[], None, 0, None).expect_err("a zero limit");
         assert_eq!(*err.kind(), malformed);
+        assert!(
+            !is_page_cursor_fault(&err),
+            "a zero limit is not a cursor fault"
+        );
 
         let first = search_page(&[("A", 1, &[1, 2])], Some("A"), 1, None).expect("first page");
         let err = search_page(&[("B", 1, &[1, 2])], Some("B"), 1, first.next_cursor)
             .expect_err("a cursor from another folder restriction");
         assert_eq!(*err.kind(), malformed);
+        assert!(is_page_cursor_fault(&err));
     }
 
     #[test]

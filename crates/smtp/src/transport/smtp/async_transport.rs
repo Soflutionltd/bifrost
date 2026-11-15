@@ -18,7 +18,7 @@ use super::WireMetering;
 use super::batch::{SmtpBatchRecipient, batch_level_error};
 use super::pool::async_impl::Pool;
 use super::{
-    AsyncSmtpConnection, ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions,
+    AsyncSmtpConnection, ClientId, Credentials, Dialect, Error, Mechanism, Response, SendOptions,
     SmtpInfo,
 };
 use crate::AsyncTransport;
@@ -132,7 +132,7 @@ where
 
         Ok(Self::builder_dangerous(relay)
             .port(default_port(
-                bifrost_types::error::Protocol::Smtp,
+                crate::transport::smtp::Dialect::Smtp,
                 PortTls::Implicit,
             ))
             .tls(Tls::Wrapper(tls_parameters)))
@@ -157,7 +157,7 @@ where
 
         Ok(Self::builder_dangerous(relay)
             .port(default_port(
-                bifrost_types::error::Protocol::Smtp,
+                crate::transport::smtp::Dialect::Smtp,
                 PortTls::StartTls,
             ))
             .tls(Tls::Required(tls_parameters)))
@@ -413,11 +413,11 @@ where
     where
         E: SmtpExecutor,
     {
-        let ctx = SmtpErrorContext::send(Protocol::Smtp);
+        let ctx = SmtpErrorContext::send(Dialect::Smtp);
 
         bifrost_types::error::validate_batch_input(
             &recipients,
-            Protocol::Smtp,
+            Dialect::Smtp.into(),
             bifrost_types::error::AccountOperation::Send,
         )?;
 
@@ -599,11 +599,11 @@ where
     where
         E: SmtpExecutor,
     {
-        let ctx = SmtpErrorContext::send(Protocol::Lmtp);
+        let ctx = SmtpErrorContext::send(Dialect::Lmtp);
 
         bifrost_types::error::validate_batch_input(
             &recipients,
-            Protocol::Lmtp,
+            Dialect::Lmtp.into(),
             bifrost_types::error::AccountOperation::Send,
         )?;
 
@@ -689,7 +689,7 @@ impl AsyncSmtpTransportBuilder {
     // Create new builder with default parameters
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
         AsyncSmtpTransportBuilder {
-            info: SmtpInfo::new(server, Protocol::Smtp),
+            info: SmtpInfo::new(server, Dialect::Smtp),
             pool_config: PoolConfig::default(),
         }
     }
@@ -875,7 +875,7 @@ impl AsyncLmtpTransportBuilder {
     // Create new builder with default parameters
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
         AsyncLmtpTransportBuilder {
-            info: SmtpInfo::new(server, Protocol::Lmtp),
+            info: SmtpInfo::new(server, Dialect::Lmtp),
             pool_config: PoolConfig::default(),
         }
     }
@@ -1035,7 +1035,7 @@ where
     #[cfg(test)]
     pub(super) fn for_pool_test() -> Self {
         Self {
-            info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+            info: SmtpInfo::new("transcript.invalid", Dialect::Smtp),
             marker_: PhantomData,
         }
     }
@@ -1112,7 +1112,7 @@ mod tests {
         },
     };
 
-    use super::{AsyncSmtpClient, AsyncSmtpConnection, ClientId, Protocol};
+    use super::{AsyncSmtpClient, AsyncSmtpConnection, ClientId, Dialect};
 
     #[test]
     fn tokio_transport_from_plaintext_url() {
@@ -1128,7 +1128,7 @@ mod tests {
         let builder = AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("localhost");
 
         assert_eq!(builder.info.port, super::super::LMTP_PORT);
-        assert_eq!(builder.info.protocol, Protocol::Lmtp);
+        assert_eq!(builder.info.protocol, Dialect::Lmtp);
     }
 
     /// URL parsing decides the port, the TLS posture and the credentials, and
@@ -1300,7 +1300,7 @@ mod tests {
         let mut conn = AsyncSmtpConnection::from_transcript(
             transcript.clone(),
             &ClientId::Domain("client.example".to_owned()),
-            Protocol::Smtp,
+            Dialect::Smtp,
         )
         .await
         .unwrap();
@@ -1337,7 +1337,7 @@ mod tests {
         let mut conn = AsyncSmtpConnection::from_transcript(
             transcript.clone(),
             &ClientId::Domain("client.example".to_owned()),
-            Protocol::Smtp,
+            Dialect::Smtp,
         )
         .await
         .unwrap();
@@ -1368,7 +1368,7 @@ mod tests {
 
         use super::super::{
             AsyncLmtpTransport, AsyncSmtpClient, AsyncSmtpConnection, AsyncSmtpTransport, ClientId,
-            Pool, PoolConfig, Protocol, SendOptions, SmtpInfo, TokioExecutor,
+            Dialect, Pool, PoolConfig, SendOptions, SmtpInfo, TokioExecutor,
         };
 
         fn hello() -> ClientId {
@@ -1379,7 +1379,7 @@ mod tests {
         /// out is the scripted one parked here.
         async fn pool_with(
             conn: AsyncSmtpConnection,
-            protocol: Protocol,
+            protocol: Dialect,
         ) -> Arc<Pool<TokioExecutor>> {
             let pool = Pool::new(
                 // The checkout probe would need its own scripted NOOP step;
@@ -1434,11 +1434,11 @@ mod tests {
                     "250 first recipient ok\r\n451 third recipient deferred\r\n",
                 );
             let conn =
-                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Lmtp)
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Lmtp)
                     .await
                     .unwrap();
             let transport = AsyncLmtpTransport::<TokioExecutor> {
-                inner: pool_with(conn, Protocol::Lmtp).await,
+                inner: pool_with(conn, Dialect::Lmtp).await,
             };
 
             let envelope = Envelope::new(
@@ -1481,9 +1481,9 @@ mod tests {
                 builder.info.unix_socket.as_deref(),
                 Some(std::path::Path::new("/run/lmtp.sock"))
             );
-            assert_eq!(builder.info.protocol, Protocol::Lmtp);
+            assert_eq!(builder.info.protocol, Dialect::Lmtp);
 
-            let mut info = SmtpInfo::new("localhost", Protocol::Lmtp);
+            let mut info = SmtpInfo::new("localhost", Dialect::Lmtp);
             info.unix_socket = Some(std::path::PathBuf::from("/run/lmtp.sock"));
             info.tls = Tls::Wrapper(
                 TlsParametersBuilder::new("localhost".to_owned())
@@ -1522,10 +1522,10 @@ mod tests {
                     "250 first delivered\r\n550 second rejected\r\n",
                 );
             let conn =
-                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Lmtp)
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Lmtp)
                     .await
                     .unwrap();
-            let pool = pool_with(conn, Protocol::Lmtp).await;
+            let pool = pool_with(conn, Dialect::Lmtp).await;
             let transport = AsyncLmtpTransport::<TokioExecutor> {
                 inner: Arc::clone(&pool),
             };
@@ -1596,12 +1596,12 @@ mod tests {
             let conn = AsyncSmtpConnection::from_transcript_metered(
                 transcript.clone(),
                 &hello(),
-                Protocol::Smtp,
+                Dialect::Smtp,
                 WireMetering::new(Some(handle), None),
             )
             .await
             .unwrap();
-            let pool = pool_with(conn, Protocol::Smtp).await;
+            let pool = pool_with(conn, Dialect::Smtp).await;
             let transport = AsyncSmtpTransport::<TokioExecutor> {
                 inner: Arc::clone(&pool),
             };
@@ -1660,7 +1660,7 @@ mod tests {
         /// The default configuration has no sink and an unlimited budget.
         #[tokio::test(crate = "tokio")]
         async fn an_unmetered_transport_is_the_default() {
-            let info = SmtpInfo::new("transcript.invalid", Protocol::Smtp);
+            let info = SmtpInfo::new("transcript.invalid", Dialect::Smtp);
             assert!(
                 !info.metering.is_enabled(),
                 "metering is opt-in; a plain transport must not meter"
@@ -1686,10 +1686,10 @@ mod tests {
                 .expect("body", "")
                 .expect("\r\n.\r\n", "250 queued\r\n");
             let conn =
-                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Smtp)
                     .await
                     .unwrap();
-            let pool = pool_with(conn, Protocol::Smtp).await;
+            let pool = pool_with(conn, Dialect::Smtp).await;
             let transport = AsyncSmtpTransport::<TokioExecutor> {
                 inner: Arc::clone(&pool),
             };
@@ -1729,13 +1729,13 @@ mod tests {
             let transcript = Transcript::new("220 smtp.example\r\n")
                 .expect("EHLO client.example\r\n", "250 smtp.example\r\n");
             let conn =
-                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Smtp)
                     .await
                     .unwrap();
             let pool = Pool::new(
                 PoolConfig::new().max_size(1).test_on_checkout(false),
                 AsyncSmtpClient::<TokioExecutor> {
-                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                    info: SmtpInfo::new("transcript.invalid", Dialect::Smtp),
                     marker_: PhantomData,
                 },
             );
@@ -1765,13 +1765,13 @@ mod tests {
                 .expect("EHLO client.example\r\n", "250 smtp.example\r\n")
                 .stall_shutdown();
             let conn =
-                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Smtp)
                     .await
                     .unwrap();
             let pool = Pool::new(
                 PoolConfig::new().max_size(1).test_on_checkout(false),
                 AsyncSmtpClient::<TokioExecutor> {
-                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                    info: SmtpInfo::new("transcript.invalid", Dialect::Smtp),
                     marker_: PhantomData,
                 },
             );
@@ -1809,13 +1809,13 @@ mod tests {
             let transcript = Transcript::new("220 smtp.example\r\n")
                 .expect("EHLO client.example\r\n", "250 smtp.example\r\n");
             let conn =
-                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Smtp)
                     .await
                     .unwrap();
             let pool = Pool::new(
                 PoolConfig::new().max_size(1).test_on_checkout(false),
                 AsyncSmtpClient::<TokioExecutor> {
-                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                    info: SmtpInfo::new("transcript.invalid", Dialect::Smtp),
                     marker_: PhantomData,
                 },
             );
@@ -1875,7 +1875,7 @@ mod tests {
             let pool = Pool::new(
                 PoolConfig::new(),
                 AsyncSmtpClient::<TokioExecutor> {
-                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                    info: SmtpInfo::new("transcript.invalid", Dialect::Smtp),
                     marker_: PhantomData,
                 },
             );

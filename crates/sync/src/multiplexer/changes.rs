@@ -534,6 +534,15 @@ pub enum WriterRequest {
         claim_for: Option<u64>,
         done: oneshot::Sender<Result<Option<ChangeCursor>, Error>>,
     },
+    /// Read the authoritative ledger, including debt retained after a failed write.
+    GetLedger {
+        done: oneshot::Sender<Result<crate::cursor::DebtLedger, Error>>,
+    },
+    /// Read resume progress in order with resets and discards.
+    GetBackfill {
+        scope: CursorScope,
+        done: oneshot::Sender<Result<Option<bifrost_types::BackfillCheckpoint>, Error>>,
+    },
     /// Persist an established live cursor without making a coverage claim.
     PersistEstablished {
         cursor: ChangeCursor,
@@ -684,6 +693,10 @@ impl std::fmt::Debug for WriterRequest {
                 .debug_struct("ReattachCommit")
                 .field("attempt", attempt)
                 .finish(),
+            Self::GetLedger { .. } => f.debug_struct("GetLedger").finish(),
+            Self::GetBackfill { scope, .. } => {
+                f.debug_struct("GetBackfill").field("scope", scope).finish()
+            }
             Self::GetChangeCursor {
                 scope, claim_for, ..
             } => f

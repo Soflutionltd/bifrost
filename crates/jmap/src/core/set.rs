@@ -248,7 +248,8 @@ where
 {
     /// Get or insert a fresh create entry with auto-assigned `cN` id.
     pub(crate) fn create(&mut self) -> &mut O::Create {
-        let (create_id, create_id_str) = next_auto_create_id(self.create.as_ref());
+        let create_id = crate::core::creation::CreationId::next('c', self.create.as_ref());
+        let create_id_str = create_id.to_string();
         self.create
             .get_or_insert_with(HashMap::new)
             .entry(create_id_str)
@@ -256,15 +257,18 @@ where
     }
 
     pub(crate) fn create_with_id(&mut self, create_id: impl Into<String>) -> &mut O::Create {
-        let create_id = create_id.into();
+        let create_id = crate::core::creation::CreationId::named(create_id);
+        let create_id_str = create_id.to_string();
         self.create
             .get_or_insert_with(HashMap::new)
-            .entry(create_id)
-            .or_insert_with(|| O::Create::new(None))
+            .entry(create_id_str)
+            .or_insert_with(|| O::Create::new(Some(create_id)))
     }
 
-    pub(crate) fn create_item(&mut self, item: O::Create) -> String {
-        let (_, create_id_str) = next_auto_create_id(self.create.as_ref());
+    pub(crate) fn create_item(&mut self, mut item: O::Create) -> String {
+        let create_id = crate::core::creation::CreationId::next('c', self.create.as_ref());
+        let create_id_str = create_id.to_string();
+        item.set_create_id(create_id);
         self.create
             .get_or_insert_with(HashMap::new)
             .insert(create_id_str.clone(), item);
@@ -275,21 +279,6 @@ where
         self.update
             .get_or_insert_with(HashMap::new)
             .insert(id.into(), item);
-    }
-}
-
-/// First `cN` id not already present in the map. Length-based assignment
-/// collided when `create_with_id("c1")` preceded an auto `create()` (len 1
-/// -> "c1"): `create` handed back the existing entry, silently aliasing two
-/// logical creates, and `create_item` overwrote one without error.
-fn next_auto_create_id<V>(existing: Option<&HashMap<String, V>>) -> (usize, String) {
-    let mut n = existing.map_or(0, HashMap::len);
-    loop {
-        let id = format!("c{n}");
-        if !existing.is_some_and(|map| map.contains_key(&id)) {
-            return (n, id);
-        }
-        n += 1;
     }
 }
 

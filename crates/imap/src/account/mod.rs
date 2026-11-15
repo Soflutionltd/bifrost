@@ -85,6 +85,14 @@ const BATCH_ITEMS: usize = 128;
 /// Maximum decoded target ids retained before a get or mutation stream flushes.
 const TARGET_BUFFER_ITEMS: usize = 256;
 
+/// Only changes consumes SELECT's replay payload. Reads and writes must not
+/// replay a cached checkpoint that their caller cannot acknowledge.
+pub(crate) enum SelectPurpose<'a> {
+    Sync(&'a FolderCursor),
+    Read,
+    Mutate,
+}
+
 /// Open IMAP account handle. The handle owns the connection pool.
 #[derive(Clone)]
 pub(crate) struct ImapAccount {
@@ -228,10 +236,9 @@ impl ImapAccount {
         &self,
         conn: &mut PooledConn,
         folder: &MailboxName,
-        cursor: Option<&FolderCursor>,
-        read_only: bool,
+        purpose: SelectPurpose<'_>,
     ) -> Result<SyncSelectResult, Error> {
-        let options = self.select_options(cursor, read_only);
+        let options = self.select_options(purpose);
         let result = conn
             .connection()
             .select_for_sync(&folder, &options, self.command_timeout())
@@ -244,7 +251,12 @@ impl ImapAccount {
         Ok(result)
     }
 
-    fn select_options(&self, cursor: Option<&FolderCursor>, read_only: bool) -> SyncSelectOptions {
+    fn select_options(&self, purpose: SelectPurpose<'_>) -> SyncSelectOptions {
+        let (cursor, read_only) = match purpose {
+            SelectPurpose::Sync(cursor) => (Some(cursor), true),
+            SelectPurpose::Read => (None, true),
+            SelectPurpose::Mutate => (None, false),
+        };
         let mut options = if read_only {
             SyncSelectOptions::read_only()
         } else {
@@ -428,11 +440,11 @@ impl Account for ImapAccount {
                 }
                 keys
             }
-            ThrottleWork::Membership(MembershipScope::Folder(folder))
-                if self.dav_scopes.owner(folder).is_none() =>
-            {
-                vec![key(&folder.0)]
-            }
+            ThrottleWork::Membership(MembershipScope::Folder(folder)) => self
+                .dav_scopes
+                .imap_mailbox(folder)
+                .map(|mailbox| vec![key(&mailbox.account_id())])
+                .unwrap_or_default(),
             // A DAV-owned collection, or a membership IMAP never routes a
             // move to; `ThrottleWork` is `#[non_exhaustive]`.
             _ => Vec::new(),
@@ -1305,6 +1317,16 @@ pub(crate) struct DavScopeIndex {
 }
 
 impl DavScopeIndex {
+    /// Mail membership must use the same ownership and canonical identity as
+    /// sync routing. Enterprise users expect a mail move into an address book
+    /// or calendar to fail locally, never to create mail effects at that URL.
+    pub(crate) fn imap_mailbox(&self, folder: &bifrost_types::FolderId) -> Option<MailboxName> {
+        if self.owner(folder).is_some() {
+            return None;
+        }
+        MailboxName::from_account_id(&folder.0).ok()
+    }
+
     pub(crate) fn build(
         contact_folders: Vec<bifrost_types::FolderId>,
         calendar_folders: Vec<bifrost_types::FolderId>,

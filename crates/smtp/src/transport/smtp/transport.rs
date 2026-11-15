@@ -12,7 +12,7 @@ use super::WireMetering;
 use super::batch::{SmtpBatchRecipient, batch_level_error};
 use super::pool::sync_impl::Pool;
 use super::{
-    ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions, SmtpConnection,
+    ClientId, Credentials, Dialect, Error, Mechanism, Response, SendOptions, SmtpConnection,
     SmtpInfo,
 };
 use super::{PortTls, Tls, TlsParameters, default_port};
@@ -134,7 +134,7 @@ impl SmtpTransport {
 
         Ok(Self::builder_dangerous(relay)
             .port(default_port(
-                bifrost_types::error::Protocol::Smtp,
+                crate::transport::smtp::Dialect::Smtp,
                 PortTls::Implicit,
             ))
             .tls(Tls::Wrapper(tls_parameters)))
@@ -156,7 +156,7 @@ impl SmtpTransport {
 
         Ok(Self::builder_dangerous(relay)
             .port(default_port(
-                bifrost_types::error::Protocol::Smtp,
+                crate::transport::smtp::Dialect::Smtp,
                 PortTls::StartTls,
             ))
             .tls(Tls::Required(tls_parameters)))
@@ -370,11 +370,11 @@ impl SmtpTransport {
         email: &[u8],
         options: &SendOptions,
     ) -> Result<BatchOutcome<()>, AccountError> {
-        let ctx = SmtpErrorContext::send(Protocol::Smtp);
+        let ctx = SmtpErrorContext::send(Dialect::Smtp);
 
         bifrost_types::error::validate_batch_input(
             &recipients,
-            Protocol::Smtp,
+            Dialect::Smtp.into(),
             bifrost_types::error::AccountOperation::Send,
         )?;
 
@@ -508,11 +508,11 @@ impl LmtpTransport {
         email: &[u8],
         options: &SendOptions,
     ) -> Result<BatchOutcome<()>, AccountError> {
-        let ctx = SmtpErrorContext::send(Protocol::Lmtp);
+        let ctx = SmtpErrorContext::send(Dialect::Lmtp);
 
         bifrost_types::error::validate_batch_input(
             &recipients,
-            Protocol::Lmtp,
+            Dialect::Lmtp.into(),
             bifrost_types::error::AccountOperation::Send,
         )?;
 
@@ -554,7 +554,7 @@ impl SmtpTransportBuilder {
     // Create new builder with default parameters
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
         Self {
-            info: SmtpInfo::new(server, Protocol::Smtp),
+            info: SmtpInfo::new(server, Dialect::Smtp),
             pool_config: PoolConfig::default(),
         }
     }
@@ -726,7 +726,7 @@ impl LmtpTransportBuilder {
     // Create new builder with default parameters
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
         Self {
-            info: SmtpInfo::new(server, Protocol::Lmtp),
+            info: SmtpInfo::new(server, Dialect::Lmtp),
             pool_config: PoolConfig::default(),
         }
     }
@@ -962,7 +962,7 @@ mod tests {
         },
     };
 
-    use super::{ClientId, Protocol, SmtpClient, SmtpConnection, SmtpErrorContext};
+    use super::{ClientId, Dialect, SmtpClient, SmtpConnection, SmtpErrorContext};
 
     fn hello() -> ClientId {
         ClientId::Domain("client.example".to_owned())
@@ -981,7 +981,7 @@ mod tests {
         let builder = LmtpTransport::builder_dangerous("localhost");
 
         assert_eq!(builder.info.port, super::super::LMTP_PORT);
-        assert_eq!(builder.info.protocol, Protocol::Lmtp);
+        assert_eq!(builder.info.protocol, Dialect::Lmtp);
     }
 
     #[test]
@@ -1076,7 +1076,7 @@ mod tests {
             assert!(error.is_invalid_input(), "{url}: {error}");
             let account = crate::transport::smtp::account_error::into_account_error(
                 error,
-                SmtpErrorContext::send(Protocol::Smtp),
+                SmtpErrorContext::send(Dialect::Smtp),
             );
             assert!(matches!(
                 account.kind(),
@@ -1158,7 +1158,7 @@ mod tests {
             "250-localhost\r\n250 AUTH PLAIN\r\n",
         );
         let mut conn =
-            SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Smtp).unwrap();
 
         let info = SmtpTransport::builder_dangerous("127.0.0.1")
             .password("user", "pass")
@@ -1187,7 +1187,7 @@ mod tests {
             // may change once the session is authenticated.
             .expect("EHLO client.example\r\n", "250 localhost\r\n");
         let mut conn =
-            SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Smtp).unwrap();
 
         let info = SmtpTransport::builder_dangerous("127.0.0.1")
             .password("user", "pass")
@@ -1209,7 +1209,7 @@ mod tests {
         use crate::transport::smtp::test_support::Transcript;
 
         use super::super::{
-            ClientId, LmtpTransport, Pool, PoolConfig, Protocol, SendOptions, SmtpClient,
+            ClientId, Dialect, LmtpTransport, Pool, PoolConfig, SendOptions, SmtpClient,
             SmtpConnection, SmtpInfo, SmtpTransport,
         };
 
@@ -1219,7 +1219,7 @@ mod tests {
 
         /// A pool that will never dial: the only connection it can ever hand
         /// out is the scripted one parked here.
-        fn pool_with(conn: SmtpConnection, protocol: Protocol) -> Arc<Pool> {
+        fn pool_with(conn: SmtpConnection, protocol: Dialect) -> Arc<Pool> {
             let pool = Pool::new(
                 // The checkout probe would need its own scripted NOOP step;
                 // the probe itself is pinned at the connection level.
@@ -1241,13 +1241,12 @@ mod tests {
         fn pool_max_size_bounds_checked_out_connections() {
             let transcript = Transcript::new("220 smtp.example\r\n")
                 .expect("EHLO client.example\r\n", "250 smtp.example\r\n");
-            let conn =
-                SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
-                    .unwrap();
+            let conn = SmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Smtp)
+                .unwrap();
             let pool = Pool::new(
                 PoolConfig::new().max_size(1).test_on_checkout(false),
                 SmtpClient {
-                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                    info: SmtpInfo::new("transcript.invalid", Dialect::Smtp),
                 },
             );
             pool.park_for_test(conn);
@@ -1293,13 +1292,12 @@ mod tests {
         fn shutdown_wakes_a_blocked_checkout_instead_of_letting_it_dial() {
             let transcript = Transcript::new("220 smtp.example\r\n")
                 .expect("EHLO client.example\r\n", "250 smtp.example\r\n");
-            let conn =
-                SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
-                    .unwrap();
+            let conn = SmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Smtp)
+                .unwrap();
             let pool = Pool::new(
                 PoolConfig::new().max_size(1).test_on_checkout(false),
                 SmtpClient {
-                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                    info: SmtpInfo::new("transcript.invalid", Dialect::Smtp),
                 },
             );
             pool.park_for_test(conn);
@@ -1376,11 +1374,10 @@ mod tests {
                     "\r\n.\r\n",
                     "250 first recipient ok\r\n451 third recipient deferred\r\n",
                 );
-            let conn =
-                SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Lmtp)
-                    .unwrap();
+            let conn = SmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Lmtp)
+                .unwrap();
             let transport = LmtpTransport {
-                inner: pool_with(conn, Protocol::Lmtp),
+                inner: pool_with(conn, Dialect::Lmtp),
             };
 
             let envelope = Envelope::new(
@@ -1422,12 +1419,12 @@ mod tests {
                 builder.info.unix_socket.as_deref(),
                 Some(std::path::Path::new("/run/lmtp.sock"))
             );
-            assert_eq!(builder.info.protocol, Protocol::Lmtp);
+            assert_eq!(builder.info.protocol, Dialect::Lmtp);
 
             // TLS over a Unix socket is refused inside `connection()`, before
             // any connect syscall, so this branch is reachable hermetically -
             // and proves the Unix funnel, not the TCP one, was entered.
-            let mut info = SmtpInfo::new("localhost", Protocol::Lmtp);
+            let mut info = SmtpInfo::new("localhost", Dialect::Lmtp);
             info.unix_socket = Some(std::path::PathBuf::from("/run/lmtp.sock"));
             info.tls = Tls::Wrapper(
                 crate::transport::smtp::client::TlsParametersBuilder::new("localhost".to_owned())
@@ -1461,10 +1458,9 @@ mod tests {
                     "\r\n.\r\n",
                     "250 first delivered\r\n550 second rejected\r\n",
                 );
-            let conn =
-                SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Lmtp)
-                    .unwrap();
-            let pool = pool_with(conn, Protocol::Lmtp);
+            let conn = SmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Lmtp)
+                .unwrap();
+            let pool = pool_with(conn, Dialect::Lmtp);
             let transport = LmtpTransport {
                 inner: Arc::clone(&pool),
             };
@@ -1507,10 +1503,9 @@ mod tests {
                 .expect("DATA\r\n", "354 send body\r\n")
                 .expect("body", "")
                 .expect("\r\n.\r\n", "250 queued\r\n");
-            let conn =
-                SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
-                    .unwrap();
-            let pool = pool_with(conn, Protocol::Smtp);
+            let conn = SmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Smtp)
+                .unwrap();
+            let pool = pool_with(conn, Dialect::Smtp);
             let transport = SmtpTransport {
                 inner: Arc::clone(&pool),
             };
@@ -1552,7 +1547,7 @@ mod tests {
             let pool = Pool::new(
                 PoolConfig::new(),
                 SmtpClient {
-                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                    info: SmtpInfo::new("transcript.invalid", Dialect::Smtp),
                 },
             );
             pool.shutdown();

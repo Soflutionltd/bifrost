@@ -7,7 +7,6 @@ use super::*;
 /// slot-wide rides in the [`SlotContext`].
 pub(super) struct BackfillWiring {
     pub live: Arc<LiveSupersedes>,
-    pub store: Arc<DynCheckpointStore>,
     pub registry: Arc<BackfillRegistry>,
     pub config: BackfillConfig,
     /// Scope incarnations whose cold-start inventory the fusion worker
@@ -54,7 +53,6 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
     } = ctx;
     let BackfillWiring {
         live,
-        store,
         registry,
         config,
         fusion_owned_scopes,
@@ -304,7 +302,10 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     );
                     plan.walk_from_scratch()
                 } else {
-                    match store.get_backfill(&account_id, &scope).await {
+                    match super::ack::WriterHandle::new(writer_tx.clone())
+                        .get_backfill(scope.clone())
+                        .await
+                    {
                         Ok(stored) => plan.resume(stored.as_ref()),
                         Err(err) => {
                             // A read failure is not authoritative; fall back to a

@@ -18,7 +18,6 @@ pub(crate) struct RecoveryContext<'a> {
     pub control: &'a SyncControl,
     pub account_control_tx: &'a broadcast::Sender<AccountControl>,
     pub throttles: &'a Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
-    pub boundary_tx: &'a watch::Sender<crate::cancel::BoundaryRequest>,
     pub capabilities: &'a Arc<std::sync::RwLock<AccountCapabilities>>,
     pub subscriptions: &'a Arc<SubscriptionRegistry>,
     pub account_generation_tx: &'a watch::Sender<u64>,
@@ -1728,9 +1727,7 @@ async fn reattach_account_paced(
         skipped_scopes: next_skips,
     } = replacement;
     let next = Arc::clone(&guard.account);
-    next.set_priority(ctx.control.priority_snapshot());
-    ctx.control
-        .apply_bandwidth_cap(|cap| next.set_bandwidth_cap(cap));
+    ctx.control.apply_to(next.as_ref(), None);
 
     let result = async {
         let discovered = discover_scopes_from(next.as_ref()).await?;
@@ -2346,17 +2343,9 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
 /// workers park. Consumers flip `AccountControl::Resume` (engine-side
 /// helper on `SyncEngine`) to unpause.
 fn engine_pause(ctx: &RecoveryContext<'_>, reason: PauseReason) {
-    let _ = ctx.account_control_tx.send(AccountControl::Pause(reason));
-    // Flip the boundary to Pause. Per-scope polls / push reconciler
-    // park on `boundary.peek() == Pause`, so this halts all engine-
-    // driven work for the account until a consumer calls
-    // `SyncEngine::resume_account` (or sends `Resume` through
-    // `Control::resume`).
-    // Recovery can finish after detach has published Stop. Preserve that
-    // terminal request atomically so workers exit and checkpoint waiters
-    // observe teardown even if they have not polled the watch yet.
-    Boundary::from(ctx.boundary_tx.clone())
-        .set_unless_stopped(crate::cancel::BoundaryRequest::Pause);
+    ctx.control
+        .bind_control_events(ctx.account_control_tx.clone());
+    ctx.control.engine_pause(reason);
 }
 
 /// Emit one structured `warn!` per open-time skip. The durable record

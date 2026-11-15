@@ -200,11 +200,11 @@ fn a_421_at_any_envelope_boundary_aborts_instead_of_parking() {
     // Batch SMTP and LMTP: a 421 to RCPT TO rejects that recipient with the
     // reply, leaves the rest Unsent (no DATA was issued), and aborts; a 421 to
     // DATA fails the accepted recipients and aborts without a reset.
-    for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+    for protocol in [Dialect::Smtp, Dialect::Lmtp] {
         let run = |script: Vec<OpOutcome>| {
             let progress = SendProgress::new(protocol, batch_recipients(2));
             let mut harness = Harness::new(script);
-            let progress = if protocol == Protocol::Smtp {
+            let progress = if protocol == Dialect::Smtp {
                 let mut machine = BatchSmtp::new(mail(), rcpts(2), false, progress);
                 harness.run(&mut machine)
             } else {
@@ -785,7 +785,7 @@ fn lmtp_reads_one_final_status_per_accepted_recipient() {
 /// the stream: an LMTP connection is retired rather than pooled.
 #[test]
 fn lmtp_batch_finals_land_on_the_accepted_recipient_indexes() {
-    let progress = SendProgress::new(Protocol::Lmtp, batch_recipients(3));
+    let progress = SendProgress::new(Dialect::Lmtp, batch_recipients(3));
     let mut machine = BatchLmtp::new(mail(), rcpts(3), progress);
     let mut harness = Harness::new(vec![
         OpOutcome::Reply(ok_reply()),
@@ -818,7 +818,7 @@ fn lmtp_batch_finals_land_on_the_accepted_recipient_indexes() {
 /// non-idempotent send the server already refused.
 #[test]
 fn a_rejected_data_command_fails_recipients_rather_than_the_batch() {
-    for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+    for protocol in [Dialect::Smtp, Dialect::Lmtp] {
         let script = vec![
             OpOutcome::Reply(ok_reply()),
             OpOutcome::Reply(ok_reply()),
@@ -827,7 +827,7 @@ fn a_rejected_data_command_fails_recipients_rather_than_the_batch() {
         ];
         let progress = SendProgress::new(protocol, batch_recipients(1));
         let mut harness = Harness::new(script);
-        let progress = if protocol == Protocol::Smtp {
+        let progress = if protocol == Dialect::Smtp {
             let mut machine = BatchSmtp::new(mail(), rcpts(1), false, progress);
             harness.run(&mut machine)
         } else {
@@ -851,7 +851,7 @@ fn a_rejected_data_command_fails_recipients_rather_than_the_batch() {
 /// recipients the server already accepted.
 #[test]
 fn a_drop_before_data_marks_recipients_unsent() {
-    let progress = SendProgress::new(Protocol::Smtp, batch_recipients(2));
+    let progress = SendProgress::new(Dialect::Smtp, batch_recipients(2));
     let mut machine = BatchSmtp::new(mail(), rcpts(2), false, progress);
     let mut harness = Harness::new(vec![
         OpOutcome::Reply(ok_reply()),
@@ -870,7 +870,7 @@ fn a_drop_before_data_marks_recipients_unsent() {
 /// connection: unlike the direct path, the batch driver aborts.
 #[test]
 fn a_rejected_batch_mail_from_aborts() {
-    let progress = SendProgress::new(Protocol::Smtp, batch_recipients(1));
+    let progress = SendProgress::new(Dialect::Smtp, batch_recipients(1));
     let mut machine = BatchSmtp::new(mail(), rcpts(1), false, progress);
     let mut harness = Harness::new(vec![OpOutcome::Reply(rejection())]);
     let (error, _progress) = harness
@@ -921,7 +921,7 @@ fn a_failed_rset_write_aborts_instead_of_keeping_the_connection() {
 #[test]
 fn a_failure_at_a_pipelined_group_boundary_returns_without_a_second_abort() {
     // OpenReplyGroup: nothing has been read yet, so no recipient is resolved.
-    let progress = SendProgress::new(Protocol::Smtp, batch_recipients(2));
+    let progress = SendProgress::new(Dialect::Smtp, batch_recipients(2));
     let mut machine = BatchSmtp::new(mail(), rcpts(2), true, progress);
     let mut harness = Harness::positive(8).aiming(Aim::Kind("OPEN", 0));
     let (error, progress) = harness
@@ -946,7 +946,7 @@ fn a_failure_at_a_pipelined_group_boundary_returns_without_a_second_abort() {
 
     // CloseReplyGroup: every reply in the window was read, so the acceptances
     // survive the failure that closes it.
-    let progress = SendProgress::new(Protocol::Smtp, batch_recipients(2));
+    let progress = SendProgress::new(Dialect::Smtp, batch_recipients(2));
     let mut machine = BatchSmtp::new(mail(), rcpts(2), true, progress);
     let mut harness = Harness::positive(8).aiming(Aim::Kind("CLOSE", 0));
     let (error, progress) = harness
@@ -975,7 +975,7 @@ fn a_failure_at_a_pipelined_group_boundary_returns_without_a_second_abort() {
 /// batch result stands even though the drain fails.
 #[test]
 fn a_failure_closing_the_lmtp_drain_preserves_the_recipient_outcomes() {
-    let progress = SendProgress::new(Protocol::Lmtp, batch_recipients(2));
+    let progress = SendProgress::new(Dialect::Lmtp, batch_recipients(2));
     let mut machine = BatchLmtp::new(mail(), rcpts(2), progress);
     let mut harness = Harness::new(vec![
         OpOutcome::Reply(ok_reply()),
@@ -1030,7 +1030,7 @@ fn a_failure_closing_the_lmtp_drain_preserves_the_recipient_outcomes() {
 /// `expect` below.
 #[test]
 fn a_failed_lmtp_group_open_leaves_the_recipients_uncertain_not_the_batch_unsent() {
-    let progress = SendProgress::new(Protocol::Lmtp, batch_recipients(2));
+    let progress = SendProgress::new(Dialect::Lmtp, batch_recipients(2));
     let mut machine = BatchLmtp::new(mail(), rcpts(2), progress);
     let mut harness = Harness::new(vec![
         OpOutcome::Reply(ok_reply()),

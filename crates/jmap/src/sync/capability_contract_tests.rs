@@ -111,6 +111,7 @@ fn account_with(submission_available: bool, foreign_submission_id: Option<&str>)
     let mail = crate::account::Account::new(client.clone(), "acct-1");
 
     let support = PimSupport {
+        attachment_upload: true,
         submission: submission_available,
         max_delayed_send: 0,
         foreign_submission: foreign_submission_id.is_some(),

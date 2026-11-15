@@ -198,7 +198,7 @@ where
 #[derive(Debug, Clone, Serialize, Default)]
 pub(crate) struct EmailCreate {
     #[serde(skip)]
-    pub(super) _create_id: Option<usize>,
+    pub(super) _create_id: Option<crate::core::creation::CreationId>,
 
     #[serde(rename = "mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -899,10 +899,13 @@ impl crate::core::set::SetObject for Email {
 
 impl crate::core::SetCreate for EmailCreate {
     fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
+        self._create_id.as_ref().map(ToString::to_string)
+    }
+    fn set_create_id(&mut self, id: crate::core::creation::CreationId) {
+        self._create_id = Some(id);
     }
 
-    fn new(create_id: Option<usize>) -> Self {
+    fn new(create_id: Option<crate::core::creation::CreationId>) -> Self {
         EmailCreate {
             _create_id: create_id,
             ..Default::default()

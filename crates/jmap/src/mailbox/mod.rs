@@ -10,7 +10,6 @@ pub(crate) mod set;
 use crate::core::field::Field;
 use crate::core::set::skip_if_empty_map;
 use crate::mailbox::set::role_not_set;
-use crate::principal::ACL;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -121,15 +120,15 @@ pub(crate) struct Mailbox {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct MailboxCreate {
     #[serde(skip)]
-    pub(super) _create_id: Option<usize>,
+    pub(super) _create_id: Option<crate::core::creation::CreationId>,
 
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
 
     #[serde(rename = "parentId")]
-    #[serde(skip_serializing_if = "crate::core::id::skip_if_empty_id")]
-    pub(super) parent_id: Option<MailboxId>,
+    #[serde(skip_serializing_if = "crate::core::creation::skip_if_empty_id_or_ref")]
+    pub(super) parent_id: Option<crate::core::creation::IdOrRef<MailboxId>>,
 
     #[serde(rename = "role")]
     #[serde(skip_serializing_if = "role_not_set")]
@@ -157,7 +156,7 @@ pub(crate) struct MailboxPatch {
 
     #[serde(rename = "parentId")]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub(super) parent_id: Field<MailboxId>,
+    pub(super) parent_id: Field<crate::core::creation::IdOrRef<MailboxId>>,
 
     #[serde(rename = "role")]
     #[serde(skip_serializing_if = "role_not_set")]
@@ -216,44 +215,7 @@ pub(crate) enum Role {
     None,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct MailboxRights {
-    #[serde(rename = "mayReadItems")]
-    #[serde(default)]
-    pub(super) may_read_items: bool,
-
-    #[serde(rename = "mayAddItems")]
-    #[serde(default)]
-    pub(super) may_add_items: bool,
-
-    #[serde(rename = "mayRemoveItems")]
-    #[serde(default)]
-    pub(super) may_remove_items: bool,
-
-    #[serde(rename = "maySetSeen")]
-    #[serde(default)]
-    pub(super) may_set_seen: bool,
-
-    #[serde(rename = "maySetKeywords")]
-    #[serde(default)]
-    pub(super) may_set_keywords: bool,
-
-    #[serde(rename = "mayCreateChild")]
-    #[serde(default)]
-    pub(super) may_create_child: bool,
-
-    #[serde(rename = "mayRename")]
-    #[serde(default)]
-    pub(super) may_rename: bool,
-
-    #[serde(rename = "mayDelete")]
-    #[serde(default)]
-    pub(super) may_delete: bool,
-
-    #[serde(rename = "maySubmit")]
-    #[serde(default)]
-    pub(super) may_submit: bool,
-}
+pub(crate) use crate::mailbox_rights::{ACL, MailboxRights};
 
 crate::core::method::define_property_enum! {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
@@ -318,14 +280,17 @@ impl crate::core::set::SetObject for Mailbox {
 
 impl crate::core::SetCreate for MailboxCreate {
     fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
+        self._create_id.as_ref().map(ToString::to_string)
+    }
+    fn set_create_id(&mut self, id: crate::core::creation::CreationId) {
+        self._create_id = Some(id);
     }
 
-    fn new(create_id: Option<usize>) -> Self {
+    fn new(create_id: Option<crate::core::creation::CreationId>) -> Self {
         MailboxCreate {
             _create_id: create_id,
             name: None,
-            parent_id: Some(MailboxId::new("")),
+            parent_id: Some(crate::core::creation::IdOrRef::Id(MailboxId::new(""))),
             role: Role::None.into(),
             sort_order: None,
             is_subscribed: None,

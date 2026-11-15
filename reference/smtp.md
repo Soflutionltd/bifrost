@@ -4,7 +4,7 @@ Current architecture of the SMTP client crate. Descended from lettre 0.11.22; th
 
 ## Port defaults and local configuration
 
-`default_port(protocol, PortTls)` owns the TCP defaults used by blocking and
+`default_port(Dialect, PortTls)` owns the TCP defaults used by blocking and
 async builders and connection URLs: SMTP plaintext 25 (relay),
 STARTTLS (required or opportunistic) 587, implicit TLS 465. LMTP retains its
 port 24 convention. Explicit port overrides take precedence.
@@ -874,11 +874,11 @@ Internal pipeline errors carry value-side classification data:
 - `SmtpTransmissionState` (`Unsent` / `InFlight` / `Acknowledged`), attached via `with_attempt`.
 - `SmtpCommandPhase`, attached via `with_phase`. The 16 variants cover every wire boundary the driver crosses: `Connect`, `Greeting`, `Hello`, `StartTls`, `Auth`, `MailFrom`, `RcptTo`, `DataCommand`, `DataBody`, `DataFinal`, `BdatBody`, `LmtpFinalStatus`, `Noop`, `Vrfy`, `Expn`, `Rset`. `Auth` alone carries a payload, `Auth { mechanism: Option<&'static str> }`: the name sits on the variant rather than on `Error` so that stamping the auth phase forces a decision about which rung was in play, the same argument that puts `phase` on the value rather than on `SmtpErrorContext`. `Some` comes from the four driver functions (`auth_scram` and `auth_legacy` on both adapters), which bind it once per exchange from `Mechanism::name`, so a `-PLUS` rung cannot desync from the AUTH line that framed it. `None` is for the genuinely pre-rung refusals: declining to pick a mechanism, refusing plaintext AUTH, an OAuth token-source failure, nonce generation. `or_phase` is set-if-absent with exactly one exception - an unnamed `Auth` stamp accepts the mechanism from a named one, because otherwise the inner `From<SaslError>` stamp would outrank the driver's named outer stamp and the SCRAM `e=` path would lose the name it had. `DataCommand` covers the `DATA` command write/read; `DataBody` covers body upload; `DataFinal` covers the final reply after the dot terminator. Phase lives on `Error::Inner`, and every send-driver wire boundary attaches it before returning - transport failures and server rejections alike. On the pipelined path that is a compile-time property of `PhasedError` rather than a convention (see "PIPELINING"). Paired transcript tests assert the value directly on both I/O halves for the `MailFrom`, `RcptTo`, `DataCommand` and `DataBody` boundaries, so the default PIPELINING path cannot silently lose the classifier input.
 
-OAuth token-source failures also carry bifrost-net's already-built `AccountError` projection through the low-level SMTP error. The SMTP translation boundary reapplies its actual SMTP or LMTP protocol, operation, and provider context while preserving the source kind and cause chain. The token-source conversion passes no throttle scope because it has no SMTP transaction scope to name. SMTP reply classifications of `RateLimited` or `QuotaExhausted` explicitly carry `ThrottleScope::Account`. This keeps `AuthLost` and `RefreshTransient` distinct.
+OAuth token-source failures also carry bifrost-net's already-built `AccountError` projection through the low-level SMTP error. The SMTP translation boundary reapplies its actual SMTP or LMTP protocol and fixed send operation and idempotency context while preserving the source kind and cause chain. The token-source conversion passes no throttle scope because it has no SMTP transaction scope to name. SMTP reply classifications of `RateLimited` or `QuotaExhausted` explicitly carry `ThrottleScope::Account`. This keeps `AuthLost` and `RefreshTransient` distinct.
 
 `crates/smtp/src/transport/smtp/account_error.rs` is the single translation boundary into the shared `AccountError`. It funnels through `AccountErrorBuilder::try_build` (never the removed `.build()`), reads command phase only from `error.phase()`, and routes local `InvalidInput` + `SmtpCommandPhase::Auth` failures (e.g. "no compatible authentication mechanism") to `Authorization(PolicyBlocked)` so consumers see a reauth/policy-change UX instead of `Request(Malformed) -> ClientBug` (internal telemetry). Typed OAuth token-source projections pass through this boundary, so refresh failures stay retryable and terminal credential loss stays `AuthLost`. The auth lane is also where reply codes stop meaning what they mean elsewhere: `is_auth_lane` sends `504` and `504 5.5.4` to `Authorization(PolicyBlocked)` rather than to `Unsupported(Send)` or `Request(Malformed)`, since a server refusing a SASL mechanism has not said anything about whether it can send mail, and it refused before any credential crossed the wire, so `Authentication(_)` would send the user to re-enter credentials that were never presented. That is the same kind the local half of the condition already produced, so one condition now gets one answer whichever side noticed it. `454` and `4.7.0` on the same lane become `Authentication(RefreshTransient)`, which is RFC 4954's "temporary authentication failure" and the only kind meaning retry-but-refresh-first. Off the auth lane all four keep their RFC 5321 meanings. Where the phase carries a mechanism name, both auth lanes fold it into the `DiagnosticText::support_only` text; classification never reads it, and the support tier is not a preference but the only tier that can hold free-form text at all (`TelemetryView` carries none, pinned by `telemetry_has_no_free_form_text`). It also maps `FeatureUnsupported` to `Unsupported(AccountOperation::Send)` (so the IMAP layer surfaces a stable `Unsupported(Send)` kind when a relay lacks FUTURERELEASE) and `ParameterOverLimit` to `Request(Malformed)` (the hold time is outside the allowed window). `message_error_to_account_error(MessageError, Protocol) -> AccountError` is the boundary for builder-side validation failures (`MissingFrom`, `MissingTo`, `EmailMissingAt`, ...); every variant maps to `Request(Malformed)`.
 
-Evidence must match what actually crossed the wire. A transport failure in the envelope phase (`MAIL FROM` / `RCPT TO`), including a failed write of a later PIPELINING recipient window, is `Unsent` and resolves through `SendProgress::mark_unresolved_unsent`: `DATA` has not been issued, so no message content can have reached the peer and an `Uncertain` lane would falsely claim a possible delivery. RCPT rejections the server already gave are preserved; accepted and unanswered recipients are both rewritten (an accepted RCPT with no `DATA` would otherwise resolve as a delivery that never happened), into `failed` lanes that `RecoveryClass` derives as `Retry(SameRequest)`. `InFlight` is reserved for failures from the `DATA` command onward.
+Evidence must match what actually crossed the wire. A transport failure in the envelope phase (`MAIL FROM` / `RCPT TO`), including a failed write of a later PIPELINING recipient window, is `Unsent` and resolves through `SendProgress::mark_unresolved_unsent`: `DATA` has not been issued, so no message content can have reached the peer and an `Uncertain` lane would falsely claim a possible delivery. RCPT rejections the server already gave are preserved; accepted and unanswered recipients are both rewritten (an accepted RCPT with no `DATA` would otherwise resolve as a delivery that never happened), into `failed` lanes that `RecoveryClass` derives as `Retry(SameRequest)`. The `DATA` command itself is still pre-body: a failed `DATA` write or a lost reply to it is `Unsent` / `DataCommand` and resolves the same way (`SendPhase::DataIssued` counts as pre-body in `SendProgress::resolve`), because no message content was offered until the server's `354` started the body write. `InFlight` is reserved for failures from the body write onward (`DataBody`, `BdatBody`, `DataFinal`, `LmtpFinalStatus`).
 
 The dividing line for batch sends is whether the body has left. A batch-level
 `Err((error, progress))` means "nothing was transmitted, resend the whole
@@ -1125,3 +1125,35 @@ for both diagnostic copies, keeping all message construction failures in the
 existing malformed-input classification. Blocking bandwidth admission remains
 in the SMTP adapter until bifrost-net supplies a blocking budget API; removing
 that wait loop would remove blocking transport throttling.
+
+## Wire dialect and submission interpretation
+
+`Dialect::{Smtp, Lmtp}` is the two-valued wire configuration type, including
+`default_port`, connection options, both connection adapters, batch progress,
+and `SmtpErrorContext`. Other account protocols cannot configure an SMTP
+connection. Conversion to the shared error-model `Protocol` happens when
+constructing shared errors or validating shared batch input. The context carries
+only the dialect: operation is always `Send`, idempotency is always false,
+provider decoration is preserved from a preclassified source, and transmission
+evidence comes only from the low-level error.
+
+`submission_status(&BatchOutcome<()>)` owns submission interpretation and borrows
+the outcome without consuming its recipient lanes. `SubmissionStatus::Committed`
+means at least one recipient acknowledged delivery, even if others failed or
+remain uncertain. An enterprise Outlook user expects that message to remain
+sent, with those other recipients reported on its receipt; retrying the entire
+message would duplicate delivery. With none acknowledged,
+`AcceptanceUncertain(&AccountError)` preserves the first uncertain error,
+`Rejected(&AccountError)` preserves the first failed error only when there is no
+uncertainty, and `Empty` identifies a batch without outcomes. Whether uncertain
+acceptance becomes a send error or an uncertain receipt remains a caller policy
+awaiting an owner decision. The helper deliberately supplies no `Result`
+projection for that case.
+
+The direct APIs retain their distinct contracts. Direct SMTP's single
+`Response` cannot retain recipient refusals alongside partial delivery, so it
+stops before sending a body when any RCPT is refused. Direct LMTP returns every
+recipient's `Response`; `Ok` means the exchange completed and may contain only
+negative statuses. Neither contract is removed or silently reinterpreted.
+Message-submission consumers should use the batch APIs and `submission_status`
+for the shared committed-message rule, retaining all lanes on their receipt.

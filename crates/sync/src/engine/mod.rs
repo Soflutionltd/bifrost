@@ -392,7 +392,17 @@ impl SyncEngine {
     /// one selected row, so it could never list what a scope owes across all
     /// its partitions - and durable debt nothing can list is only half a fix.
     pub async fn debt(&self, account_id: &AccountId) -> Result<crate::cursor::DebtLedger, Error> {
-        self.checkpoints.get_ledger(account_id).await
+        // A user inspecting debt must see obligations even when persistence failed.
+        // Detached accounts have no writer and expose their durable snapshot.
+        let tx = self
+            .ack_senders
+            .get(account_id)
+            .map(|entry| entry.value().clone());
+        if let Some(tx) = tx {
+            ack::WriterHandle::new(tx).get_ledger().await
+        } else {
+            self.checkpoints.get_ledger(account_id).await
+        }
     }
 
     /// Run one repair pass over this account's open coverage debt.
@@ -434,7 +444,9 @@ impl SyncEngine {
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         drop(slot);
 
-        let ledger = self.checkpoints.get_ledger(account_id).await?;
+        let ledger = ack::WriterHandle::new(writer_tx.clone())
+            .get_ledger()
+            .await?;
         crate::repair::run_repair_pass(
             account.as_ref().as_ref(),
             account_id,
@@ -711,7 +723,7 @@ impl SyncEngine {
         // discard request included - before the flag is observed.
         slot.delivery.begin_teardown(&slot.coverage);
         // Ask running workers to checkpoint cleanly, then stop.
-        slot.boundary_tx.send_replace(BoundaryRequest::Stop);
+        slot.control.stop();
         // Trip shutdown before awaiting workers. Some account-level
         // workers park on the shutdown token rather than the boundary
         // watch, so waiting first would always run to detach_timeout.
@@ -1023,7 +1035,6 @@ impl SyncEngine {
             control: &slot.control,
             account_control_tx: &slot.account_control_tx,
             throttles: &slot.throttles,
-            boundary_tx: &slot.boundary_tx,
             capabilities: &slot.capabilities,
             subscriptions: &self.subscriptions,
             account_generation_tx: &slot.account_generation_tx,
@@ -1181,9 +1192,7 @@ impl SyncEngine {
             .accounts
             .get(account_id)
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        Boundary::from(slot.boundary_tx.clone())
-            .set_unless_stopped(crate::cancel::BoundaryRequest::Run);
-        let _ = slot.account_control_tx.send(AccountControl::Resume);
+        bifrost_types::Control::resume(&slot.control);
         Ok(())
     }
 

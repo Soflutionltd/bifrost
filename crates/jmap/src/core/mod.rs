@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 pub(crate) mod capability;
 pub(crate) mod changes;
 pub(crate) mod copy;
+pub(crate) mod creation;
 pub(crate) mod error;
 pub(crate) mod field;
 pub(crate) mod get;
@@ -40,7 +41,8 @@ pub(crate) trait Object: Sized {
 /// `MailboxCreate`, `EmailCreate`).
 pub(crate) trait SetCreate: Sized {
     fn create_id(&self) -> Option<String>;
-    fn new(create_id: Option<usize>) -> Self;
+    fn set_create_id(&mut self, id: crate::core::creation::CreationId);
+    fn new(create_id: Option<crate::core::creation::CreationId>) -> Self;
 }
 
 /// Generates the trio of JSON-map-backed JMAP types: Get-shape
@@ -63,7 +65,7 @@ macro_rules! json_object_struct {
 
         #[derive(Debug, Clone)]
         pub(crate) struct $create {
-            pub(super) _create_id: Option<usize>,
+            pub(super) _create_id: Option<crate::core::creation::CreationId>,
             pub(crate) properties: serde_json::Map<String, serde_json::Value>,
         }
 
@@ -80,9 +82,12 @@ macro_rules! json_object_struct {
 
         impl $crate::core::SetCreate for $create {
             fn create_id(&self) -> Option<String> {
-                self._create_id.map(|id| format!("c{id}"))
+                self._create_id.as_ref().map(ToString::to_string)
             }
-            fn new(_create_id: Option<usize>) -> Self {
+            fn set_create_id(&mut self, id: crate::core::creation::CreationId) {
+                self._create_id = Some(id);
+            }
+            fn new(_create_id: Option<crate::core::creation::CreationId>) -> Self {
                 Self {
                     _create_id,
                     properties: serde_json::Map::new(),

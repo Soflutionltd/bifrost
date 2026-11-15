@@ -803,3 +803,95 @@ fn next_tag(tag: &str) -> String {
     let n = u32::from_str_radix(counter, 16).expect("the counter is 8 hex digits");
     format!("{prefix}{:08x}", n + 1)
 }
+
+/// Exercise both send branches with the real encoder, reader and router.
+/// The control without overflow proves that an ordinary OK still registers;
+/// the overflow case must stay cleared after the same tagged completion.
+#[tokio::test]
+async fn notify_overflow_cancels_pending_registration_on_both_send_branches() {
+    use super::{ConsumerErased, SubBatch, encode_command, run_pipeline_batch};
+    use crate::connection::{ImapStream, dispatch, state::ProtocolState, stream, wire::WireReader};
+    use crate::types::{
+        Capability, Command, MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams,
+    };
+    use crate::types::response::{GreetingResponse, GreetingStatus};
+    use tokio::io::AsyncWriteExt;
+
+    for synchronizing in [false, true] {
+        for overflow in [false, true] {
+            let mut state = ProtocolState::new();
+            state
+                .apply_greeting(&GreetingResponse {
+                    status: GreetingStatus::PreAuth,
+                    code: Some(crate::types::ResponseCode::Capability(vec![
+                        Capability::Imap4Rev1,
+                        Capability::Notify,
+                        Capability::Acl,
+                    ])),
+                    text: String::new(),
+                })
+                .unwrap();
+            let mut commands = vec![Command::NotifySet(NotifySetParams::new(
+                vec![NotifyEventGroup::new(
+                    MailboxFilter::Personal,
+                    vec![NotifyEvent::MailboxName],
+                )],
+                false,
+            ))];
+            let mut tags = vec!["N1".to_owned()];
+            let mut consumers: Vec<Box<dyn ConsumerErased>> =
+                vec![Box::new(dispatch::NotifySetConsumer::default())];
+            if synchronizing {
+                commands.push(Command::ListRights {
+                    mailbox: MailboxName::new("INBOX").unwrap(),
+                    identifier: LITERAL_IDENTIFIER.to_owned(),
+                });
+                tags.push("L2".to_owned());
+                consumers.push(Box::new(dispatch::TaggedOkConsumer::default()));
+            }
+            let opts = super::super::build_encode_options(&state);
+            let wires = commands
+                .iter()
+                .zip(&tags)
+                .map(|(cmd, tag)| encode_command(tag, cmd, &opts).unwrap())
+                .collect();
+            let (client, mut server) = tokio::io::duplex(8192);
+            let mut transcript = String::new();
+            if overflow {
+                transcript.push_str("* OK [NOTIFICATIONOVERFLOW] lost\r\n");
+            }
+            // In the literal branch N1 completes inside L2's continuation
+            // wait, so the same assertion covers the other router entry.
+            transcript.push_str("N1 OK registered\r\n");
+            if synchronizing {
+                transcript.push_str("+ ready\r\nL2 OK done\r\n");
+            }
+            server.write_all(transcript.as_bytes()).await.unwrap();
+            let mut reader = WireReader::new_metered(
+                ImapStream::Memory(stream::Tracked::new(client)),
+                None,
+                None,
+            );
+            let (tx, _rx) = tokio::sync::mpsc::channel(16);
+            let mut sink = super::event_sink::DriverEventSink::new(tx, None);
+            let mut results = (0..commands.len()).map(|_| None).collect::<Vec<_>>();
+            let outcome = run_pipeline_batch(
+                &mut reader,
+                &mut state,
+                &mut sink,
+                SubBatch {
+                    commands,
+                    consumers,
+                    tags,
+                    wires,
+                },
+                &mut results,
+                0,
+            )
+            .await;
+            assert!(outcome.is_ok());
+            assert!(results.iter().all(|result| matches!(result, Some(Ok(_)))));
+            assert_eq!(state.notify().list, !overflow);
+        }
+    }
+}

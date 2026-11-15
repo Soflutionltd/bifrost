@@ -258,19 +258,23 @@ two Calendar endpoints in one process, and a bifrost crate naming its downstream
 consumer in an identifier. An explicit `with_calendar_api_base` always wins; a
 variable set after a client is built does not affect that client.
 
-Rate limits are registered against the hosts derived from these configured
-bases, not against literal production hostnames - a redirected base was
-otherwise completely unmetered. Each declaration carries the engine
-`AccountId` as its `quota_scope`, so Gmail's per-user quota is per account
-rather than pooled across every account in the process that happens to share
-`www.googleapis.com`. The same `(host, quota_scope)` key is registered once:
-Gmail and Calendar share `www.googleapis.com` in production, and registering it
-twice would install a second bucket for one key so the effective limit became
-whichever registration won. Because this account declares exactly one scope per
-host, its requests need no `RequestBuilder::quota_scope` override - the
-account-level default resolves unambiguously. A base that fails to parse falls
-back to the production host, so a malformed override meters the real host rather
-than nothing.
+Rate limits are registered against hosts derived from the configured bases.
+Each bucket is scoped by engine account identity AND API surface (Gmail, People,
+Calendar or Drive). Every buffered request selects that scope in the shared
+send funnel, including raw Drive builders. Thus production APIs sharing
+`www.googleapis.com` do not debit Gmail quota units or wait behind mail
+hydration: users expect calendar reads to remain independent of mail traffic.
+Gmail uses method quota costs; the other surfaces use request costs. Drive
+registers its production host explicitly. Malformed base overrides fall back
+to the corresponding production host for registration. Declaring several scopes
+on one host does not warn at attach; `bifrost-net` warns only if a request
+reaches that host without an explicit scope, which this funnel never does.
+A URL under no configured base is classified Drive rather than refused: the
+production case is a server-issued Drive resumable-upload session URL, which the
+Drive bucket meters. Such a request goes unmetered client-side only when its
+host has no registration (redirected test bases, or a session URL on another
+host). It is still bounded by Google's 429s. Refusing it would fail a user's
+attachment upload in order to protect a budget the server enforces anyway.
 
 ### Gmail data concurrency
 
@@ -919,7 +923,13 @@ nothing cached, the operation fails rather than canonicalizing against
 an empty vocabulary; a populated stale cache stays usable when a later
 refresh fails. Membership discovery and flag translation use the same
 single-flight reader and fallback policy, including a successfully fetched empty
-list. Explicit invalidation disables fallback until a fresh fetch succeeds.
+list. Failed refreshes arm a shared 30-second monotonic cooldown. Readers with
+a previously fetched snapshot reuse it immediately during that cooldown;
+readers without one and authoritative refreshes wait under the single-flight
+lock before retrying. Each failed attempt rearms the cooldown, bounding outage
+traffic even before the first successful fetch. A successful fetch clears it.
+Cancellation drops the waiting reader without admitting another request early.
+Explicit invalidation disables fallback until a fresh fetch succeeds.
 This keeps known folders browsable during an outage, as an Outlook user expects;
 authoritative container listing and lifecycle polling still propagate errors.
 
@@ -1615,6 +1625,10 @@ Mapping highlights:
   `SyncState(CursorInvalid)`. `failedPrecondition` elsewhere ->
   `ConcurrencyConflict` (etag / version mismatch semantics),
   routed through `Retry::AfterStateRefresh`.
+- Deleted or expired Pub/Sub registrations map to `Server(Unavailable)` with
+  retry advice, including during watch renewal. Losing push does not invalidate
+  the history cursor. Users retain sync progress while push retries and existing
+  gap hints drive history catch-up; only actual history loss restarts the scope.
 - 404 / 410 on the history endpoint -> `SyncState(CursorInvalid)`
   -> `Engine(RestartScope(scope))`; the scope is always
   `CursorScope::Account`, so this reseeds from `getProfile`.

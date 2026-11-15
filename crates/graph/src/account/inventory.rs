@@ -694,6 +694,9 @@ pub(crate) fn tracked_flags_hash<'a>(
     flag_status: Option<&str>,
     categories: impl IntoIterator<Item = &'a str>,
 ) -> u64 {
+    // This is a provider-state fingerprint, not a set of writable flag tokens.
+    // Preserve false versus missing and complete versus notFlagged: collapsing
+    // those into the read projection would hide real observed state changes.
     let mut flags = Vec::new();
     if let Some(is_read) = is_read {
         flags.push(format!("isread={is_read}"));

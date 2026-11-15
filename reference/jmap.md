@@ -60,6 +60,34 @@ references. Mail account capabilities accept nullable `maxMailboxDepth` and
 an omitted member defaults rather than marking the account's required mail
 capability Malformed and refusing the account at open.
 
+Creation identities are request-owned and kept apart from server ids
+(`core/creation.rs`). `CreationId` is a create-map key, either allocated
+(`CreationId::next`, the first `cN` not already in the map, so a
+caller-selected `c1` is never aliased) or caller-named; every `SetCreate`
+carries its own `CreationId`, so `create_id()` reports the key it was stored
+under. `CreationRef` is its `#`-prefixed wire reference. Client-sent fields
+that may name either an existing object or one created earlier in the same
+request are typed `IdOrRef<I>`, which serializes untagged as the plain id or
+the reference string (map keys included): Mailbox create/patch `parentId`,
+EmailSubmission `emailId`, `onSuccessUpdateEmail` keys and
+`onSuccessDestroyEmail` entries, and SieveScript `onSuccessActivateScript`.
+Server-returned ids keep their object-specific `Id<T>` types and never use
+the union.
+
+The mailbox rights vocabulary has one table, `mailbox/rights.rs` (compiled as
+`crate::mailbox_rights` so Principal can use it without the mail module):
+each entry names the `ACL` variant used for `shareWith` keys, the
+`MailboxRights` (`myRights`) field and its reader, and the wire name, so the
+two can no longer drift. It includes `mayShare` (`ACL::Administer`); older
+mail-only servers omit it, and absence grants no sharing authority.
+
+The Principal object keeps the server-admin dialect fields (secret, dkim,
+quota, members, acl, domain and list) mixed into the RFC 9670 shape. No
+documented admin capability URI or method contract exists to split them out
+against, so they are neither guessed into a separate capability nor deleted;
+unknown fields are also not rejected, since RFC objects must tolerate
+extension properties.
+
 CalendarEvent and ContactCard create membership setters build complete
 `Id[Boolean]` objects containing only `true` values. Passing `false` removes
 that id from the local create set. Patch membership setters instead emit escaped
@@ -278,9 +306,10 @@ eagerly, because the account uses them throughout. `uploadUrl` and
 Outlook user whose server mis-advertises its upload template expects mail,
 contacts and calendars to keep working, so the session opens and each upload
 is refused as the provider's contract violation (`Protocol(ContractViolation)`
-at the account boundary). `attachment_upload` stays advertised, because the
-capability describes the protocol surface, not one session's template; the
-refusal is per call. Likewise a server whose EventSource template this crate
+at the account boundary). `attachment_upload` is advertised only when the derived session's upload
+template is usable. An Outlook user expects the attachment action to be offered
+only when the current account can upload. Direct upload calls still report the
+provider's contract violation; the rest of the account remains usable. Likewise a server whose EventSource template this crate
 cannot parse can still be opened for sync, which never touches EventSource.
 At the sync boundary, a method response whose `sessionState` differs marks the
 client stale and advances a watch generation. The always-driven scope lifecycle
@@ -701,7 +730,7 @@ Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountF
   observation and reassertion capability").
 - `batching_policy`: `max_items = core.maxObjectsInSet` clamped `[1,500]`, `max_wait: 100ms`, `flush_on_input_close: true`.
 - `rate_limit_class: Generous`; `quota_signal: None` (quota via `quota_get`); `requires_uidvalidity_recheck: false`; `historyid_/delta_token_expires_after: None`; `discovers_foreign_namespaces_on_rediscovery: true` unconditionally, because shared-account scopes are discovered from the session at open, there is no foreign scope-lifecycle stream, and no session signal can prove a server will never grant a share (the accounts list is only the current grants; RFC 9670 principals support is sufficient but not necessary evidence of sharing).
-- `pim_methods` advertises mailbox membership add/remove, keyword/read-state mutation, `set_importance`, attachment upload, draft lifecycle, search, mailbox CRUD, identity list/update (Submission), vacation get/set (VacationResponse), quota get (Quota), and thread/message hydration. `scheduled_send` is true iff the selected submission account's `accountCapabilities` block is PRESENT, parseable, and advertises `maxDelayedSend > 0` (onto `PimSupport.max_delayed_send` for boundary validation). The session-level Submission object is an empty support marker. A malformed account-level Submission block does not degrade to `maxDelayedSend = 0`: `SubmissionCapabilities` is not `#[serde(default)]` at the container level, so a block omitting the mandatory RFC 8621 s1.3.2 `maxDelayedSend` fails to parse and lands in the malformed lane, where the family gate takes the whole submission family (send, drafts send, identities, `scheduled_send`) off with a named warning. A well-formed block advertising `maxDelayedSend: 0` is a different server and keeps the family, with only `scheduled_send` false. Gmail labels, Graph categories/extended properties are false.
+- `pim_methods` advertises mailbox membership add/remove, keyword/read-state mutation, `set_importance`, attachment upload (only with a usable derived upload template), draft lifecycle, search, mailbox CRUD, identity list/update (Submission), vacation get/set (VacationResponse), quota get (Quota), and thread/message hydration. `scheduled_send` is true iff the selected submission account's `accountCapabilities` block is PRESENT, parseable, and advertises `maxDelayedSend > 0` (onto `PimSupport.max_delayed_send` for boundary validation). The session-level Submission object is an empty support marker. A malformed account-level Submission block does not degrade to `maxDelayedSend = 0`: `SubmissionCapabilities` is not `#[serde(default)]` at the container level, so a block omitting the mandatory RFC 8621 s1.3.2 `maxDelayedSend` fails to parse and lands in the malformed lane, where the family gate takes the whole submission family (send, drafts send, identities, `scheduled_send`) off with a named warning. A well-formed block advertising `maxDelayedSend: 0` is a different server and keeps the family, with only `scheduled_send` false. Gmail labels, Graph categories/extended properties are false.
 - `filter_rule_shape: Scripts` and every filter flag true with a primary Sieve account; without Sieve they are false and the shape is `None`.
 - `conveniences`: `starred = Keyword`, `replied`/`forwarded`/`mdn_sent` via keyword true, extended-property routes false. `set_starred`/`mark_replied`/`mark_forwarded`/`mark_mdn_sent` map to `$flagged`/`$answered`/`$forwarded`/`$MDNSent`. `set_importance` is two-valued: `High` sets `$important`, else clears; read maps `$important` presence onto `Message.importance`.
 
@@ -755,7 +784,17 @@ Each `Email/get` answer is reconciled against the ids the batch submitted (`hydr
 
 `GetResponse::not_found` carries `#[serde(default)]`. RFC 8620 s5.1 makes `notFound` mandatory, but implementations omit it when empty often enough that rejecting the body would fail every sibling call in the same request over one absent empty array. Decoding it as empty is leniency, not proof that every requested id was answered - any caller with a closed per-item accounting contract must reconcile against its own submitted ids.
 
-`SetResponse::new_state()` / `into_new_state()` return `Option`, not a fabricated `""`. RFC 8620 s5.3 makes `newState` mandatory, so absence means a non-conforming server, and folding it into an empty string made that indistinguishable from a state a server really did report as empty - a distinction the per-`accountId` state cache gives its own meaning ("probed, empty" versus "never probed"). Every caller now advances the cache only on a present, non-empty state; absent and empty are both "nothing to record", stated as such rather than inferred from a sentinel.
+`SetResponse::new_state()` / `into_new_state()` return `Option`, not a fabricated `""`. RFC 8620 s5.3 makes `newState` mandatory, so absence means a non-conforming server, and folding it into an empty string made that indistinguishable from a state a server really did report as empty - a distinction the per-`accountId` state cache gives its own meaning ("probed, empty" versus "never probed"). Email set and import observations require both a present, non-empty `oldState`
+and `newState`. They advance only when the current cache equals the response's
+`oldState`, never a pre-call cache snapshot. Create/import and implicit post-submit
+sets are observed separately in wire order, so a concurrent change between them
+cannot be laundered into the next whole-property guard. An Outlook user expects
+that unobserved edit to cause a conflict rather than be silently overwritten.
+Missing endpoints leave the cache unchanged. Explicit probes remain state
+observations, and changes walks advance from their requested `sinceState`.
+The absent and probed-empty cache forms intentionally both supply no guard.
+The separate Mailbox observation map supplies no mutation guard and never
+substitutes for the lifecycle walk's delivery position.
 
 ### The WebSocket request door
 
@@ -960,6 +999,10 @@ a shared folder acts inside that share. An unreachable owner stays literal
 on the primary route to prevent native-id collisions. Mailboxes surface as `ContainerKind::Folder` (native mailbox id); `Mailbox.role` maps to `FolderRole` (`inbox`->INBOX, `sent`->SENT, `drafts`->DRAFT, `trash`->TRASH, `junk`->SPAM). `container_delete` leaves `onDestroyRemoveEmails = false`, so non-empty deletion fails rather than dropping messages.
 
 Settings use `Identity/get`/`set`, `VacationResponse/get`/`set` (`singleton` id), and `Quota/get`. `identity_update` supports name/signatures/reply-to; default-identity selection is unsupported.
+Identity and vacation updates require an `updated` answer for the requested id
+(the vacation id is `singleton`). A missing per-id answer reports an unanswered
+write through `Protocol(PartialResponse)`, matching mailbox rename/move; an
+Outlook user must not see settings saved without confirmation.
 
 `thread_hydrate` does `Thread/get` then `Email/get` in order. `message_hydrate` selects headers / preview / full projections and returns blob handles without pre-downloading. `move_thread` and `delete_thread` from elsewhere add-to-target then remove-from-source. When the caller says the thread is already in Trash, `delete_thread` expands the thread and reads each member's active `mailboxIds`; only members present in the resolved Trash mailbox are destroyed, so Sent, Inbox, and other copies survive. The move path resolves the thread once and both membership legs use that fixed id set (`patch_mailbox_membership_of`); the cross-account container check runs for both containers before the resolve. Each leg used to run its own `Thread/get`, so a message delivered to the thread between the two resolves was removed from the source having never been added to the target - it lost its source membership and gained nothing. The two-leg non-atomicity itself is the documented cross-provider shape and remains; each leg now applies the same fixed id set in bounded `Email/set` batches.
 

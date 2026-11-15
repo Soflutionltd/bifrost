@@ -223,6 +223,9 @@ impl AccountFactory for JmapAccountFactory {
             // never merely from the session. A foreign account skipped during
             // probing must not make us advertise an unreachable send-as path.
             let support = capabilities::PimSupport {
+                // Outlook should offer attachments only when this session can
+                // upload them. A broken upload URL must not disable reading mail.
+                attachment_upload: client.session_state().upload_url().is_ok(),
                 submission: submission.is_some(),
                 max_delayed_send,
                 foreign_submission: !foreign_submission.is_empty(),
@@ -1663,6 +1666,7 @@ mod tests {
         assert_eq!(families.max_delayed_send, 0);
 
         let support = crate::sync::capabilities::PimSupport {
+            attachment_upload: true,
             submission: families.submission.is_some(),
             max_delayed_send: families.max_delayed_send,
             foreign_submission: false,
@@ -1690,6 +1694,7 @@ mod tests {
         let client = scripted_client_with_session(session_with_family_blocks(blocks), []);
         let families = resolve_optional_families(&client);
         let support = crate::sync::capabilities::PimSupport {
+            attachment_upload: true,
             submission: families.submission.is_some(),
             max_delayed_send: families.max_delayed_send,
             foreign_submission: false,
@@ -2954,6 +2959,7 @@ mod tests {
         let error = crate::sync::capabilities::build(
             &client.session(),
             crate::sync::capabilities::PimSupport {
+                attachment_upload: true,
                 submission: false,
                 max_delayed_send: 0,
                 foreign_submission: false,
@@ -2999,6 +3005,7 @@ mod tests {
         let error = crate::sync::capabilities::build(
             &client.session(),
             crate::sync::capabilities::PimSupport {
+                attachment_upload: true,
                 submission: false,
                 max_delayed_send: 0,
                 foreign_submission: false,

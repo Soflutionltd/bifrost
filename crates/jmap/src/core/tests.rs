@@ -30,7 +30,7 @@ pub(crate) struct TestObj {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub(crate) struct TestObjCreate {
     #[serde(skip)]
-    _create_id: Option<usize>,
+    _create_id: Option<crate::core::creation::CreationId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 }
@@ -78,9 +78,12 @@ impl super::set::SetObject for TestObj {
 
 impl SetCreate for TestObjCreate {
     fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
+        self._create_id.as_ref().map(ToString::to_string)
     }
-    fn new(create_id: Option<usize>) -> Self {
+    fn set_create_id(&mut self, id: crate::core::creation::CreationId) {
+        self._create_id = Some(id);
+    }
+    fn new(create_id: Option<crate::core::creation::CreationId>) -> Self {
         TestObjCreate {
             _create_id: create_id,
             name: None,
@@ -1123,4 +1126,40 @@ fn response_get_rejects_a_method_name_mismatch() {
             actual,
         } if call_id == "s0" && actual == "Definitely/not-what-was-asked"
     ));
+}
+
+#[test]
+fn create_payload_identity_follows_its_owning_map() {
+    let mut set = super::set::SetRequest::<TestObj>::new();
+    assert_eq!(
+        set.create_with_id("chosen").create_id().as_deref(),
+        Some("chosen")
+    );
+    let detached = TestObjCreate::new(Some(super::creation::CreationId::named("old")));
+    let inserted = set.create_item(detached);
+    assert_eq!(
+        set.create_with_id(inserted.clone()).create_id().as_deref(),
+        Some(inserted.as_str())
+    );
+    assert_eq!(
+        set.create_with_id("chosen").create_id().as_deref(),
+        Some("chosen")
+    );
+}
+
+#[test]
+fn automatic_creation_ids_skip_explicit_collisions() {
+    let mut set = super::set::SetRequest::<TestObj>::new();
+    set.create_with_id("c1");
+    assert_eq!(set.create().create_id().as_deref(), Some("c2"));
+    let wire = serde_json::to_value(set).unwrap();
+    assert_eq!(wire["create"].as_object().unwrap().len(), 2);
+    assert!(wire["create"].get("c1").is_some());
+    assert!(wire["create"].get("c2").is_some());
+}
+
+#[test]
+fn copy_payload_retains_its_caller_selected_creation_id() {
+    let mut copy = super::copy::CopyRequest::<TestObj>::new("source");
+    assert_eq!(copy.create("copy0").create_id().as_deref(), Some("copy0"));
 }

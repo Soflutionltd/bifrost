@@ -143,7 +143,7 @@ async fn fetch_ews_outcomes(
             // Once a complete discovery pass has run without finding the
             // folder, that retry would never end, so the item is reported
             // NotFound instead (ruling recorded on
-            // `graph_error::unroutable_public_item_error`).
+            // `graph_error::unroutable_public_resource_error`).
             let error = account.missing_public_route_error(AccountOperation::Hydrate, id, folder);
             outcomes.push(ItemOutcome::Failed(BatchFailure::new(batch_id, error)));
             continue;
@@ -249,7 +249,7 @@ pub(crate) fn hydrated_from_ews_item(
 fn ews_flags(item: &crate::ews::EwsItem) -> HashSet<String> {
     let mut flags = HashSet::new();
     if item.is_read {
-        flags.insert("\\seen".to_string());
+        flags.insert(crate::account::flags::GraphFlag::Read.token());
     }
     flags
 }
@@ -603,7 +603,7 @@ fn flags_from_value(value: &Value) -> HashSet<String> {
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        flags.insert("\\seen".to_string());
+        flags.insert(crate::account::flags::GraphFlag::Read.token());
     }
     if value
         .get("flag")
@@ -611,12 +611,12 @@ fn flags_from_value(value: &Value) -> HashSet<String> {
         .and_then(Value::as_str)
         .is_some_and(|status| status.eq_ignore_ascii_case("flagged"))
     {
-        flags.insert("\\flagged".to_string());
+        flags.insert(crate::account::flags::GraphFlag::Flagged.token());
     }
     if let Some(categories) = value.get("categories").and_then(Value::as_array) {
         for category in categories {
             if let Some(category) = category.as_str() {
-                flags.insert(format!("category:{category}"));
+                flags.insert(crate::account::flags::GraphFlag::Category(category).token());
             }
         }
     }

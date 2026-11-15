@@ -192,9 +192,8 @@ impl GmailErrorContext {
 
     pub(crate) fn push_subscribe() -> Self {
         let mut ctx = Self::base(AccountOperation::PushSubscribe);
-        // A Gmail watch covers the account cursor. If renewal reports a
-        // deleted or expired subscription, CursorInvalid needs this coordinate
-        // to derive RestartScope(Account) instead of failing error construction.
+        // The watch covers account changes, but losing it does not invalidate
+        // the history cursor. Keep this scope for diagnostics only.
         ctx.scope = Some(ErrorScope::Cursor(CursorScope::Account));
         ctx.resource = Some(GmailResource::PubSubWatch);
         ctx
@@ -861,14 +860,9 @@ fn classify_response(
                 Cause::State(StateCause::ConcurrencyConflict),
             );
         }
-        GmailSignal::PubSubSubscriptionDeleted | GmailSignal::PubSubSubscriptionExpired
-            if matches!(ctx.operation, AccountOperation::PushSubscribe) =>
-        {
-            return (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
-            );
-        }
+        // A missing registration is retryable watch unavailability. Outlook
+        // users expect polling to retain mail progress while push recovers;
+        // a registration gap is not evidence that history has expired.
         GmailSignal::PubSubSubscriptionDeleted | GmailSignal::PubSubSubscriptionExpired => {
             return (
                 AccountErrorKind::Server(ServerErrorKind::Unavailable),
@@ -1567,6 +1561,22 @@ mod tests {
             acc.recovery(),
             RecoveryClass::Engine(EngineDirective::RestartScope(CursorScope::Account))
         ));
+    }
+
+    #[test]
+    fn lost_push_registration_preserves_history_cursor() {
+        for reason in ["pubsubSubscriptionDeleted", "pubsubSubscriptionExpired"] {
+            let body = format!(r#"{{"error":{{"errors":[{{"reason":"{reason}"}}]}}}}"#);
+            let acc = into_account_error(
+                gmail_response(400, &body),
+                GmailErrorContext::push_subscribe(),
+            );
+            assert!(matches!(
+                acc.kind(),
+                AccountErrorKind::Server(ServerErrorKind::Unavailable)
+            ));
+            assert!(!acc.recovery().requires_engine_action());
+        }
     }
 
     #[test]

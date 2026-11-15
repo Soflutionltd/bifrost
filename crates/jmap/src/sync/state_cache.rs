@@ -23,6 +23,8 @@ pub(crate) type StateMap = Arc<Mutex<HashMap<String, Option<String>>>>;
 
 /// The current cached state for an account, or `None` when the account
 /// has never been probed (absent key) or was probed empty (`Some(None)`).
+/// Both cases intentionally supply no mutation guard; provenance is not a
+/// usable server state. Set observations never initialize either case.
 pub(crate) async fn get(map: &StateMap, account_id: &str) -> Option<String> {
     let guard = map.lock().await;
     guard.get(account_id).cloned().flatten()
@@ -53,12 +55,57 @@ pub(crate) async fn advance(
     }
 }
 
+/// A set response proves only its own oldState -> newState transition.
+/// Missing/empty endpoints prove no continuity with our observed changes.
+pub(crate) fn set_transition(old: Option<&str>, new: Option<&str>) -> Option<(String, String)> {
+    Some((
+        old.filter(|s| !s.is_empty())?.to_string(),
+        new.filter(|s| !s.is_empty())?.to_string(),
+    ))
+}
+
+/// Preserve unobserved concurrent changes for the next whole-property guard.
+/// An Outlook user expects a concurrent edit to conflict rather than have a
+/// later unrelated write silently bless it as already observed.
+pub(crate) async fn observe_set(
+    map: &StateMap,
+    account_id: &str,
+    transition: Option<(String, String)>,
+) {
+    if let Some((old, new)) = transition {
+        advance(map, account_id, Some(&old), new).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn map() -> StateMap {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn set_observation_requires_continuous_server_states() {
+        let m = map();
+        set(&m, "acct-a", "s1".into()).await;
+        observe_set(&m, "acct-a", set_transition(Some("unobserved"), Some("s3"))).await;
+        assert_eq!(get(&m, "acct-a").await.as_deref(), Some("s1"));
+        observe_set(&m, "acct-a", set_transition(Some("s1"), Some("s2"))).await;
+        observe_set(&m, "acct-a", set_transition(Some("s2"), Some("s3"))).await;
+        assert_eq!(get(&m, "acct-a").await.as_deref(), Some("s3"));
+        for (old, new) in [
+            (None, Some("s4")),
+            (Some(""), Some("s4")),
+            (Some("s3"), None),
+            (Some("s3"), Some("")),
+        ] {
+            observe_set(&m, "acct-a", set_transition(old, new)).await;
+            observe_set(&m, "absent", set_transition(old, new)).await;
+        }
+        observe_set(&m, "absent", set_transition(Some("s3"), Some("s4"))).await;
+        assert_eq!(get(&m, "acct-a").await.as_deref(), Some("s3"));
+        assert_eq!(get(&m, "absent").await, None);
     }
 
     #[tokio::test]

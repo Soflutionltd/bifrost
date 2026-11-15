@@ -96,7 +96,6 @@ pub(super) struct PipelineRouting<'a> {
     /// been sent at all.
     sending: Option<usize>,
     tag_to_idx: &'a std::collections::HashMap<String, usize>,
-    commands: &'a [Command],
     kinds: &'a [crate::types::CommandKind],
     targets: &'a [Option<MailboxName>],
     tags: &'a [String],
@@ -135,39 +134,6 @@ pub(super) enum Routed {
     OwnTagRejected,
     /// Routed; keep reading.
     Continue,
-}
-
-/// Apply the pre-`apply_side_effects` state mutation a tagged completion
-/// implies for its own command.
-///
-/// Among pipelinable commands only NOTIFY SET/NONE need this (RFC 5465
-/// Section3). The ordering is load-bearing: `apply_side_effects` consumes the
-/// registration this installs, so installing it afterwards loses the
-/// transition permanently. It lives here, called once from the router, because
-/// the router is reached from two read loops and a second copy of this rule is
-/// the drift shape this crate has paid for before.
-///
-/// Design note: the other state-changing commands (ENABLE, SELECT, CLOSE,
-/// UNSELECT, ...) cannot reach a batch - `run_pipeline` refuses any command
-/// whose `CommandKind::pipelinable` is false before a byte is written - which
-/// is why there is no `set_in_close` here.
-fn apply_pipeline_pre_effects(
-    state: &mut super::super::state::ProtocolState,
-    routing: &PipelineRouting<'_>,
-    t: &crate::types::response::TaggedResponse,
-) {
-    let Some(&idx) = routing.tag_to_idx.get(&t.tag) else {
-        return;
-    };
-    match routing.commands[idx] {
-        Command::NotifySet(ref params) => {
-            state.set_in_notify_set(Some(super::super::NotifyFlags::from(params)));
-        }
-        Command::NotifyNone => {
-            state.set_in_notify_set(Some(super::super::NotifyFlags::default()));
-        }
-        _ => {}
-    }
 }
 
 /// Where a tag-correlated ESEARCH goes when its correlator names a search
@@ -262,8 +228,8 @@ pub(super) fn route_pipeline_response(
                 && routing.sending == routing.tag_to_idx.get(&t.tag).copied()
     );
 
-    if !early_own_ok && let crate::types::Response::Tagged(ref t) = resp {
-        apply_pipeline_pre_effects(state, routing, t);
+    if early_own_ok && let crate::types::Response::Tagged(ref t) = resp {
+        state.disarm_notify(&t.tag);
     }
 
     let digest = state.apply_side_effects(&resp);
@@ -795,6 +761,9 @@ async fn run_pipeline_batch(
         // are all `+`, or there are none): the whole batch is one write,
         // flushed once. Which commands a partial write carried is unknown,
         // so any socket progress counts every command as possibly sent.
+        for (command, tag) in commands.iter().zip(&tags) {
+            state.arm_notify(command, tag);
+        }
         let start = wire_reader.written();
         let chunks: Vec<&bytes::Bytes> = wires
             .iter()
@@ -817,11 +786,11 @@ async fn run_pipeline_batch(
         // the batch's routing so earlier commands' responses read during a
         // continuation wait reach their own consumers.
         for (i, wire) in wires.iter().enumerate() {
+            state.arm_notify(&commands[i], &tags[i]);
             let start = wire_reader.written();
             let mut routing = PipelineRouting {
                 sending: Some(i),
                 tag_to_idx: &tag_to_idx,
-                commands: &commands,
                 kinds: &kinds,
                 targets: &targets,
                 tags: &tags,
@@ -866,7 +835,6 @@ async fn run_pipeline_batch(
         let mut routing = PipelineRouting {
             sending: None,
             tag_to_idx: &tag_to_idx,
-            commands: &commands,
             kinds: &kinds,
             targets: &targets,
             tags: &tags,

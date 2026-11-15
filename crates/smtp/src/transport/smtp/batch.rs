@@ -17,16 +17,56 @@
 
 use bifrost_types::error::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause, BatchItem,
-    BatchItemId, BatchOutcome, Cause, DiagnosticText, Protocol, ProtocolErrorKind,
-    TransmissionState, WireCause,
+    BatchItemId, BatchOutcome, Cause, DiagnosticText, ProtocolErrorKind, TransmissionState,
+    WireCause,
 };
 
+use super::Dialect;
 use crate::address::Address;
 use crate::transport::smtp::account_error::{
     SmtpErrorContext, into_account_error, response_to_account_error,
 };
 use crate::transport::smtp::error::{Error as SmtpError, SmtpCommandPhase, SmtpTransmissionState};
 use crate::transport::smtp::response::Response;
+
+/// Submission-level interpretation of a recipient batch, without discarding lanes.
+///
+/// Acceptance uncertainty is deliberately distinct from rejection. The caller
+/// chooses its UI and retry policy for that case; no success or error projection
+/// is implied by this type.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum SubmissionStatus<'a> {
+    /// At least one recipient acknowledged delivery. Retain the other lanes on
+    /// the receipt; resending the entire message would duplicate delivery.
+    Committed,
+    /// None acknowledged delivery, and at least one may have received it.
+    AcceptanceUncertain(&'a AccountError),
+    /// Every reported recipient definitively failed.
+    Rejected(&'a AccountError),
+    /// The batch contains no recipient outcomes.
+    Empty,
+}
+
+/// Interpret SMTP or LMTP batch lanes for a message-submission consumer.
+/// The batch remains available for recipient-level receipt reporting.
+#[must_use]
+pub fn submission_status(outcome: &BatchOutcome<()>) -> SubmissionStatus<'_> {
+    // An Outlook user expects a partially delivered message to remain sent,
+    // with the other recipients reported on the receipt. Retrying the whole
+    // message would deliver a second copy to recipients who acknowledged it.
+    if !outcome.succeeded().is_empty() {
+        SubmissionStatus::Committed
+    } else if let Some(lane) = outcome.uncertain().first() {
+        // Whether this becomes a send error or an uncertain receipt is a
+        // caller policy still awaiting a decision. Keep that choice explicit.
+        SubmissionStatus::AcceptanceUncertain(&lane.error)
+    } else if let Some(lane) = outcome.failed().first() {
+        SubmissionStatus::Rejected(&lane.error)
+    } else {
+        SubmissionStatus::Empty
+    }
+}
 
 /// Account-oriented recipient input. The address part is the SMTP envelope
 /// recipient; the id is opaque to SMTP and round-tripped to each lane entry.
@@ -77,7 +117,7 @@ pub(crate) struct RecipientProgress {
 /// and call `resolve()` at the end.
 #[derive(Clone, Debug)]
 pub(crate) struct SendProgress {
-    pub(crate) protocol: Protocol,
+    pub(crate) protocol: Dialect,
     pub(crate) recipients: Vec<RecipientProgress>,
     phase: SendPhase,
 }
@@ -92,7 +132,7 @@ enum SendPhase {
 }
 
 impl SendProgress {
-    pub(crate) fn new(protocol: Protocol, recipients: Vec<SmtpBatchRecipient>) -> Self {
+    pub(crate) fn new(protocol: Dialect, recipients: Vec<SmtpBatchRecipient>) -> Self {
         Self {
             protocol,
             recipients: recipients
@@ -233,7 +273,7 @@ impl SendProgress {
                         }
                     } else {
                         debug_assert!(
-                            protocol == Protocol::Smtp,
+                            protocol == Dialect::Smtp,
                             "LMTP Accepted without Final at resolve time: missing \
                              per-recipient transition in the final-status drain"
                         );
@@ -313,17 +353,17 @@ fn with_recipient_text(error: AccountError, address: &Address) -> AccountError {
         .expect("valid account error classification")
 }
 
-fn partial_completion_error(protocol: Protocol, address: &Address) -> AccountError {
+fn partial_completion_error(protocol: Dialect, address: &Address) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
         Cause::Wire(WireCause::MalformedResponse {
-            protocol,
+            protocol: protocol.into(),
             detail: Some(DiagnosticText::support_only(format!(
                 "transport drop after body write; recipient {address} uncertain"
             ))),
         }),
     )
-    .protocol(protocol)
+    .protocol(protocol.into())
     .operation(AccountOperation::Send)
     .idempotency_override(false)
     .push_cause(Cause::Attempt(AttemptCause::new(
@@ -352,6 +392,56 @@ mod tests {
         AccountErrorKind, BatchInputInvalidReason, BatchItem, BatchItemId, ReconcileReason,
         RecoveryClass, RequestCause, RequestErrorKind, ResourceKind, validate_batch_input,
     };
+
+    #[test]
+    fn submission_projection_preserves_uncertainty_and_committed_delivery() {
+        let ids = [BatchItemId("a".into()), BatchItemId("b".into())];
+        let address = "a@x.com".parse::<Address>().unwrap();
+        let uncertain = partial_completion_error(Dialect::Smtp, &address);
+        let rejected = response_to_account_error(
+            &rcpt_reject(),
+            &SmtpErrorContext::send(Dialect::Smtp),
+            Some(SmtpCommandPhase::RcptTo),
+            Some(SmtpTransmissionState::Unsent),
+        );
+        let mut builder = bifrost_types::BatchOutcomeBuilder::<()>::new();
+        builder.push_failed(ids[0].clone(), rejected.clone());
+        builder.push_uncertain(ids[1].clone(), uncertain.clone());
+        let outcome = builder.finalize(&ids).unwrap();
+        let SubmissionStatus::AcceptanceUncertain(error) = submission_status(&outcome) else {
+            panic!("uncertain acceptance must remain distinct from rejection");
+        };
+        assert!(std::ptr::eq(error, &outcome.uncertain()[0].error));
+
+        for companion_is_uncertain in [false, true] {
+            let mut builder = bifrost_types::BatchOutcomeBuilder::<()>::new();
+            builder.push_succeeded(ids[0].clone(), ());
+            if companion_is_uncertain {
+                builder.push_uncertain(ids[1].clone(), uncertain.clone());
+            } else {
+                builder.push_failed(ids[1].clone(), rejected.clone());
+            }
+            let outcome = builder.finalize(&ids).unwrap();
+            assert!(matches!(
+                submission_status(&outcome),
+                SubmissionStatus::Committed
+            ));
+            assert_eq!(outcome.failed().len() + outcome.uncertain().len(), 1);
+        }
+
+        let mut builder = bifrost_types::BatchOutcomeBuilder::<()>::new();
+        builder.push_failed(ids[0].clone(), rejected);
+        let outcome = builder.finalize(&ids[..1]).unwrap();
+        let SubmissionStatus::Rejected(error) = submission_status(&outcome) else {
+            panic!("a definitive refusal must remain rejected");
+        };
+        assert!(std::ptr::eq(error, &outcome.failed()[0].error));
+
+        let empty = bifrost_types::BatchOutcomeBuilder::<()>::new()
+            .finalize(&[])
+            .unwrap();
+        assert!(matches!(submission_status(&empty), SubmissionStatus::Empty));
+    }
 
     fn recip(id: &str, addr: &str) -> SmtpBatchRecipient {
         SmtpBatchRecipient {
@@ -417,7 +507,7 @@ mod tests {
         // anywhere else. Passing the wrong phase here - or dropping it -
         // reports a mailbox rejection as an account-wide permission failure,
         // which sends the consumer to reauth instead of to the address.
-        let mut progress = SendProgress::new(Protocol::Smtp, vec![recip("a", "a@x.com")]);
+        let mut progress = SendProgress::new(Dialect::Smtp, vec![recip("a", "a@x.com")]);
         progress.record_rcpt_rejected(0, rcpt_reject_bare_550());
 
         let outcome = progress.resolve();
@@ -438,7 +528,7 @@ mod tests {
     fn validation_rejects_empty() {
         let items: Vec<BatchItem<Address>> = Vec::new();
         let account =
-            validate_batch_input(&items, Protocol::Smtp, AccountOperation::Send).unwrap_err();
+            validate_batch_input(&items, Dialect::Smtp.into(), AccountOperation::Send).unwrap_err();
         assert!(matches!(
             account.kind(),
             AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid)
@@ -461,7 +551,8 @@ mod tests {
                 "b@example.com".parse::<Address>().unwrap(),
             ),
         ];
-        let err = validate_batch_input(&items, Protocol::Smtp, AccountOperation::Send).unwrap_err();
+        let err =
+            validate_batch_input(&items, Dialect::Smtp.into(), AccountOperation::Send).unwrap_err();
         let Cause::Request(RequestCause::BatchInputInvalid { items }) = err.chain().outermost()
         else {
             panic!("item diagnostics expected");
@@ -474,7 +565,7 @@ mod tests {
     fn pre_body_resolution_needs_no_recipient_mark() {
         for data_issued in [false, true] {
             let mut progress = SendProgress::new(
-                Protocol::Smtp,
+                Dialect::Smtp,
                 vec![recip("a", "a@x.com"), recip("b", "b@x.com")],
             );
             progress.record_rcpt_accepted(0);
@@ -492,7 +583,7 @@ mod tests {
 
     #[test]
     fn intermediate_final_reply_does_not_claim_delivery() {
-        let mut progress = SendProgress::new(Protocol::Smtp, vec![recip("a", "a@x.com")]);
+        let mut progress = SendProgress::new(Dialect::Smtp, vec![recip("a", "a@x.com")]);
         progress.record_rcpt_accepted(0);
         progress.set_body_started();
         progress.set_data_response(Response::new(
@@ -511,7 +602,7 @@ mod tests {
     #[test]
     fn smtp_all_succeed() {
         let mut progress = SendProgress::new(
-            Protocol::Smtp,
+            Dialect::Smtp,
             vec![recip("a", "a@x.com"), recip("b", "b@x.com")],
         );
         progress.record_rcpt_accepted(0);
@@ -529,7 +620,7 @@ mod tests {
     #[test]
     fn smtp_mixed_rcpt_rejects_split_lanes() {
         let mut progress = SendProgress::new(
-            Protocol::Smtp,
+            Dialect::Smtp,
             vec![
                 recip("a", "good@x.com"),
                 recip("b", "bad@x.com"),
@@ -556,7 +647,7 @@ mod tests {
     #[test]
     fn smtp_all_rcpt_rejected_is_ok_batch_outcome() {
         let mut progress = SendProgress::new(
-            Protocol::Smtp,
+            Dialect::Smtp,
             vec![recip("a", "x@x.com"), recip("b", "y@x.com")],
         );
         progress.record_rcpt_rejected(0, rcpt_reject());
@@ -571,7 +662,7 @@ mod tests {
     #[test]
     fn smtp_data_negative_marks_accepted_failed() {
         let mut progress = SendProgress::new(
-            Protocol::Smtp,
+            Dialect::Smtp,
             vec![recip("a", "x@x.com"), recip("b", "y@x.com")],
         );
         progress.record_rcpt_accepted(0);
@@ -588,7 +679,7 @@ mod tests {
     #[test]
     fn smtp_drop_after_body_marks_accepted_uncertain() {
         let mut progress = SendProgress::new(
-            Protocol::Smtp,
+            Dialect::Smtp,
             vec![recip("a", "x@x.com"), recip("b", "y@x.com")],
         );
         progress.record_rcpt_accepted(0);
@@ -608,7 +699,7 @@ mod tests {
     #[test]
     fn pipelining_rcpt_failure_is_per_recipient_lane() {
         let mut progress = SendProgress::new(
-            Protocol::Smtp,
+            Dialect::Smtp,
             vec![recip("a", "x@x.com"), recip("b", "y@x.com")],
         );
         // Pipelined drain: first reply rejects, second accepts.
@@ -628,7 +719,7 @@ mod tests {
     #[test]
     fn pipelining_drain_drop_marks_unresolved_uncertain() {
         let mut progress = SendProgress::new(
-            Protocol::Smtp,
+            Dialect::Smtp,
             vec![
                 recip("a", "x@x.com"),
                 recip("b", "y@x.com"),
@@ -640,7 +731,7 @@ mod tests {
         // Recipients b and c are still Pending. Simulate batch tracker marking
         // unresolved uncertain on a transport drop during drain.
         progress.mark_uncertain_unresolved(|| {
-            partial_completion_error(Protocol::Smtp, &"y@x.com".parse::<Address>().unwrap())
+            partial_completion_error(Dialect::Smtp, &"y@x.com".parse::<Address>().unwrap())
         });
 
         let outcome = progress.resolve();
@@ -650,7 +741,7 @@ mod tests {
     #[test]
     fn envelope_phase_write_failure_marks_unresolved_unsent_and_keeps_rejections() {
         let mut progress = SendProgress::new(
-            Protocol::Smtp,
+            Dialect::Smtp,
             vec![
                 recip("a", "x@x.com"),
                 recip("b", "y@x.com"),
@@ -662,7 +753,7 @@ mod tests {
         // c never got its RCPT written: a later PIPELINING window failed to
         // write, and DATA was never issued.
         progress.mark_unresolved_unsent(|| {
-            partial_completion_error(Protocol::Smtp, &"z@x.com".parse::<Address>().unwrap())
+            partial_completion_error(Dialect::Smtp, &"z@x.com".parse::<Address>().unwrap())
         });
 
         let outcome = progress.resolve();
@@ -679,7 +770,7 @@ mod tests {
     #[test]
     fn lmtp_mixed_final_statuses_preserve_order() {
         let mut progress = SendProgress::new(
-            Protocol::Lmtp,
+            Dialect::Lmtp,
             vec![
                 recip("a", "x@x.com"),
                 recip("b", "y@x.com"),
@@ -713,7 +804,7 @@ mod tests {
     #[test]
     fn lmtp_final_read_drop_keeps_read_marks_rest_uncertain() {
         let mut progress = SendProgress::new(
-            Protocol::Lmtp,
+            Dialect::Lmtp,
             vec![
                 recip("a", "x@x.com"),
                 recip("b", "y@x.com"),
@@ -727,7 +818,7 @@ mod tests {
         progress.record_lmtp_final(0, positive_data_final());
         // b and c never got their final status.
         progress.mark_uncertain_unresolved(|| {
-            partial_completion_error(Protocol::Lmtp, &"y@x.com".parse::<Address>().unwrap())
+            partial_completion_error(Dialect::Lmtp, &"y@x.com".parse::<Address>().unwrap())
         });
 
         let outcome = progress.resolve();
@@ -751,7 +842,7 @@ mod tests {
         );
         let err = response_to_account_error(
             &resp,
-            &SmtpErrorContext::send(Protocol::Smtp),
+            &SmtpErrorContext::send(Dialect::Smtp),
             Some(SmtpCommandPhase::DataCommand),
             Some(SmtpTransmissionState::Acknowledged),
         );
@@ -767,7 +858,7 @@ mod tests {
         // must classify under SmtpCommandPhase::DataFinal, not DataBody. A
         // body-side phase tag would conflate this with a transport drop
         // mid-body in any future phase-aware classifier.
-        let mut progress = SendProgress::new(Protocol::Smtp, vec![recip("a", "a@x.com")]);
+        let mut progress = SendProgress::new(Dialect::Smtp, vec![recip("a", "a@x.com")]);
         progress.record_rcpt_accepted(0);
         progress.set_body_started();
         progress.set_body_finished();
@@ -810,7 +901,7 @@ mod tests {
         if cfg!(debug_assertions) {
             return;
         }
-        let mut progress = SendProgress::new(Protocol::Lmtp, vec![recip("a", "a@x.com")]);
+        let mut progress = SendProgress::new(Dialect::Lmtp, vec![recip("a", "a@x.com")]);
         progress.record_rcpt_accepted(0);
         progress.set_body_started();
         // No record_lmtp_final, no mark_uncertain_unresolved: bug path.
@@ -829,7 +920,7 @@ mod tests {
         // idempotent message to every recipient after the server already
         // rejected it.
         let mut progress = SendProgress::new(
-            Protocol::Lmtp,
+            Dialect::Lmtp,
             vec![recip("a", "a@x.com"), recip("b", "b@x.com")],
         );
         progress.record_rcpt_accepted(0);
@@ -861,7 +952,7 @@ mod tests {
         use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
         use crate::transport::smtp::error::{Error as SmtpError, ErrorKind};
         let mut progress = SendProgress::new(
-            Protocol::Lmtp,
+            Dialect::Lmtp,
             vec![recip("a", "a@x.com"), recip("b", "b@x.com")],
         );
         progress.record_rcpt_accepted(0);
@@ -877,7 +968,7 @@ mod tests {
         )
         .with_attempt(SmtpTransmissionState::Unsent)
         .with_phase(SmtpCommandPhase::DataCommand);
-        let ae = into_account_error(smtp_err, SmtpErrorContext::send(Protocol::Lmtp));
+        let ae = into_account_error(smtp_err, SmtpErrorContext::send(Dialect::Lmtp));
         let ae2 = ae.clone();
         progress.mark_unresolved_unsent(|| ae2.clone());
 
@@ -897,7 +988,7 @@ mod tests {
         // support-only diagnostic text. Sharing only the wire response
         // text loses correlation when a DATA-final-negative fanout
         // produces N lanes with identical response text.
-        let mut progress = SendProgress::new(Protocol::Smtp, vec![recip("a", "a@x.com")]);
+        let mut progress = SendProgress::new(Dialect::Smtp, vec![recip("a", "a@x.com")]);
         progress.record_rcpt_rejected(0, rcpt_reject());
         let outcome = progress.resolve();
         let err = &outcome.failed()[0].error;

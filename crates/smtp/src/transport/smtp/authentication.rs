@@ -526,7 +526,7 @@ mod test {
         assert_eq!(error.kind(), &ErrorKind::LocalRuntime);
         let account = into_account_error(
             error,
-            SmtpErrorContext::send(bifrost_types::error::Protocol::Smtp),
+            SmtpErrorContext::send(crate::transport::smtp::Dialect::Smtp),
         );
         assert_eq!(
             account.kind(),
@@ -567,13 +567,16 @@ mod test {
     fn oauth_token_source_preserves_terminal_auth_loss_classification() {
         use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
         use bifrost_net::Error as NetError;
-        use bifrost_types::error::{AccountErrorKind, AuthErrorKind, Protocol, RecoveryClass};
+        use bifrost_types::error::{AccountErrorKind, AuthErrorKind, RecoveryClass};
 
         let error = super::oauth_token_error(NetError::AuthLost {
             transmission_state: None,
             final_response: None,
         });
-        let account = into_account_error(error, SmtpErrorContext::send(Protocol::Smtp));
+        let account = into_account_error(
+            error,
+            SmtpErrorContext::send(crate::transport::smtp::Dialect::Smtp),
+        );
 
         assert_eq!(
             account.kind(),
@@ -587,7 +590,7 @@ mod test {
         use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
         use bifrost_net::Error as NetError;
         use bifrost_types::error::{
-            AccountErrorKind, AuthErrorKind, Protocol, RecoveryClass, RetryDisposition, RetryReason,
+            AccountErrorKind, AuthErrorKind, RecoveryClass, RetryDisposition, RetryReason,
         };
         use std::sync::Arc;
 
@@ -595,13 +598,19 @@ mod test {
             retry_after: None,
             source: Arc::new(NetError::Cancelled),
         });
-        let account = into_account_error(error.clone(), SmtpErrorContext::send(Protocol::Lmtp));
+        let account = into_account_error(
+            error.clone(),
+            SmtpErrorContext::send(crate::transport::smtp::Dialect::Lmtp),
+        );
 
         assert_eq!(
             account.kind(),
             &AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient)
         );
-        assert_eq!(account.protocol(), Some(Protocol::Lmtp));
+        assert_eq!(
+            account.protocol(),
+            Some(bifrost_types::error::Protocol::Lmtp)
+        );
         assert!(matches!(
             account.recovery(),
             RecoveryClass::Retry(advice)
@@ -625,7 +634,7 @@ mod test {
     #[test]
     fn blocking_oauth_contended_snapshot_is_transient() {
         use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
-        use bifrost_types::error::{AccountErrorKind, AuthErrorKind, Protocol};
+        use bifrost_types::error::{AccountErrorKind, AuthErrorKind};
 
         struct BusySource;
         impl TokenSource for BusySource {
@@ -645,7 +654,10 @@ mod test {
         }
         let credentials = Credentials::oauth2_source("alice", Arc::new(BusySource));
         let error = credentials.oauth2_token_blocking().unwrap_err();
-        let account = into_account_error(error, SmtpErrorContext::send(Protocol::Smtp));
+        let account = into_account_error(
+            error,
+            SmtpErrorContext::send(crate::transport::smtp::Dialect::Smtp),
+        );
         assert_eq!(
             account.kind(),
             &AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient)
@@ -663,7 +675,7 @@ mod test {
     #[test]
     fn blocking_oauth_snapshot_preserves_typed_source_errors() {
         use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
-        use bifrost_types::error::{AccountErrorKind, AuthErrorKind, Protocol};
+        use bifrost_types::error::{AccountErrorKind, AuthErrorKind};
 
         struct LostSource;
         impl TokenSource for LostSource {
@@ -686,7 +698,10 @@ mod test {
         }
         let credentials = Credentials::oauth2_source("alice", Arc::new(LostSource));
         let error = credentials.oauth2_token_blocking().unwrap_err();
-        let account = into_account_error(error, SmtpErrorContext::send(Protocol::Lmtp));
+        let account = into_account_error(
+            error,
+            SmtpErrorContext::send(crate::transport::smtp::Dialect::Lmtp),
+        );
         assert_eq!(
             account.kind(),
             &AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired)
@@ -1194,7 +1209,7 @@ mod test {
         let account = crate::transport::smtp::account_error::into_account_error(
             err,
             crate::transport::smtp::account_error::SmtpErrorContext::send(
-                bifrost_types::error::Protocol::Smtp,
+                crate::transport::smtp::Dialect::Smtp,
             ),
         );
         assert!(matches!(

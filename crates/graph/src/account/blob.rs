@@ -164,7 +164,13 @@ async fn fetch_ews_attachment(
     };
     let folder = bifrost_types::FolderId(folder.to_string());
     let Some(routing) = account.public_folder_routing(&folder).await else {
-        return Err(EwsAttachmentError::NotPublic);
+        return Err(EwsAttachmentError::MissingRoute(Box::new(
+            account.missing_public_route_error(
+                AccountOperation::OpenBlob,
+                &ObjectId(locator.message_id.clone()),
+                &folder,
+            ),
+        )));
     };
     let ews = super::public_folder::ews_client(account)
         .map_err(|error| EwsAttachmentError::NotAttached(Box::new(error)))?;
@@ -176,9 +182,9 @@ async fn fetch_ews_attachment(
 }
 
 enum EwsAttachmentError {
-    /// The locator does not name a public folder we route (a stale handle,
-    /// or discovery has not seeded the folder).
+    /// The locator does not contain a public-folder-qualified message id.
     NotPublic,
+    MissingRoute(Box<bifrost_types::AccountError>),
     /// No attached transport: the client's own invariant (see
     /// `public_folder::ews_client`), scoped to the account.
     NotAttached(Box<crate::ews::EwsError>),
@@ -200,6 +206,9 @@ fn open_ews_blob_stream(
                 yield SyncEvent::Warning(warning_blob_not_byte_stream(
                     &ObjectId(locator.message_id.clone()),
                 ));
+            }
+            Err(EwsAttachmentError::MissingRoute(error)) => {
+                yield SyncEvent::Terminated(*error);
             }
             Err(EwsAttachmentError::NotAttached(error)) => {
                 let ctx = GraphErrorContext::ews(AccountOperation::OpenBlob)
@@ -482,6 +491,41 @@ mod tests {
     use crate::account::{GraphAccount, PushMode};
     use crate::client::GraphClient;
     use bifrost_types::CursorScope;
+
+    #[tokio::test]
+    async fn missing_public_attachment_route_is_not_a_non_byte_stream_warning() {
+        use bifrost_types::{AccountErrorKind, FolderId, ResourceKind};
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let folder = FolderId("public-folder".into());
+        let locator = GraphBlobLocator {
+            message_id: super::super::foreign::encode_public_item_id(&folder, "item").0,
+            attachment_id: "attachment".into(),
+            kind: GraphBlobKind::Ews,
+        };
+        for complete in [false, true] {
+            account
+                .public_folder_discovery_complete
+                .store(complete, std::sync::atomic::Ordering::SeqCst);
+            let mut stream = open_ews_blob_stream(account.clone(), locator.clone());
+            let event = futures::StreamExt::next(&mut stream).await.unwrap();
+            let SyncEvent::Terminated(error) = event else {
+                panic!("a missing route must terminate with its routing error");
+            };
+            let expected = if complete {
+                AccountErrorKind::NotFound(ResourceKind::Message)
+            } else {
+                AccountErrorKind::ConcurrencyConflict
+            };
+            assert_eq!(error.kind(), &expected);
+            assert_eq!(
+                error.scope(),
+                Some(&ErrorScope::Message {
+                    id: locator.message_id.clone().into()
+                })
+            );
+        }
+    }
 
     /// A blob handle minted from a foreign-encoded message id inherits the
     /// owning mailbox: `blob_handle_from_graph_attachment(&encoded_id, ..)`

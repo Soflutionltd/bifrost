@@ -1467,7 +1467,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn engine_directive_from_renewal_stops_local_retry_and_can_resubscribe() {
+    async fn history_loss_from_renewal_stops_local_retry_and_can_resubscribe() {
         let now_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
@@ -1485,9 +1485,7 @@ mod tests {
             Canned::Response {
                 status: StatusCode::BAD_REQUEST,
                 headers: reqwest::header::HeaderMap::new(),
-                body: Bytes::from_static(
-                    br#"{"error":{"errors":[{"reason":"pubsubSubscriptionDeleted"}]}}"#,
-                ),
+                body: Bytes::from_static(br#"{"error":{"errors":[{"reason":"historyNotFound"}]}}"#),
             },
             Canned::Response {
                 status: StatusCode::OK,

@@ -454,6 +454,14 @@ pub(super) async fn ack_writer(
                 provisional.retain(|_, owner| *owner != attempt);
                 continue;
             }
+            WriterRequest::GetLedger { done } => {
+                let _ = done.send(Ok(ledger.clone()));
+                continue;
+            }
+            WriterRequest::GetBackfill { scope, done } => {
+                let _ = done.send(store.get_backfill(&account_id, &scope).await);
+                continue;
+            }
             WriterRequest::GetChangeCursor {
                 scope,
                 claim_for,
@@ -767,6 +775,27 @@ impl WriterHandle {
         Self { tx }
     }
 
+    pub(super) async fn get_ledger(&self) -> Result<crate::cursor::DebtLedger, Error> {
+        let (done, recv) = oneshot::channel();
+        self.tx
+            .send(WriterRequest::GetLedger { done })
+            .await
+            .map_err(|_| Error::ShuttingDown)?;
+        recv.await.map_err(|_| Error::ShuttingDown)?
+    }
+
+    pub(super) async fn get_backfill(
+        &self,
+        scope: CursorScope,
+    ) -> Result<Option<BackfillCheckpoint>, Error> {
+        let (done, recv) = oneshot::channel();
+        self.tx
+            .send(WriterRequest::GetBackfill { scope, done })
+            .await
+            .map_err(|_| Error::ShuttingDown)?;
+        recv.await.map_err(|_| Error::ShuttingDown)?
+    }
+
     pub(super) async fn get_change_cursor(
         &self,
         scope: CursorScope,
@@ -1025,6 +1054,12 @@ async fn reject_unloaded_request(
         }
         WriterRequest::ScopeBarrierBlocked { done, .. } => {
             let _ = done.send(true);
+        }
+        WriterRequest::GetLedger { done } => {
+            let _ = done.send(Err(error));
+        }
+        WriterRequest::GetBackfill { scope, done } => {
+            let _ = done.send(store.get_backfill(account, &scope).await);
         }
         WriterRequest::GetChangeCursor { scope, done, .. } => {
             let _ = done.send(store.get_change_cursor(account, &scope).await);

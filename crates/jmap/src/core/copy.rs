@@ -110,9 +110,10 @@ where
         use crate::core::SetCreate;
         // Get-or-insert, like SetRequest::create_with_id: a repeated id must
         // hand back the existing entry, not silently overwrite an object.
+        let id = crate::core::creation::CreationId::named(id);
         self.create
-            .entry(id.into())
-            .or_insert_with(|| O::Create::new(None))
+            .entry(id.to_string())
+            .or_insert_with(|| O::Create::new(Some(id)))
     }
 }
 

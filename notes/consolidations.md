@@ -504,18 +504,6 @@ becomes an orphan, and log. Only the unwind path records throttle holds
 `SubscriptionTeardown` service on the registry, with "delete, settle or orphan,
 record holds" as one operation.
 
-## CON-021 - Applying the control snapshot to an account incarnation
-
-**Reported by:** sync-engine.
-
-Priority and bandwidth cap reach the account in three places: the
-control-applier closure in `attach.rs` (initial apply, then on change, writing
-both `budget.set_cap` and `account.set_bandwidth_cap`); `open_replacement_admitted`
-(`apply_bandwidth_budget` before the open); and `reattach_account_paced`
-(`set_priority` plus `apply_bandwidth_cap` after the open). The serialization
-trick (holding the watch borrow through the setter) is repeated rather than
-owned. Owner: a `ControlApplier::apply_to(&Incarnation)` used by attach and swap.
-
 ## CON-022 - Ledger mutation: apply then persist, or persist then commit?
 
 **Reported by:** sync-engine.
@@ -998,25 +986,6 @@ Or, Not). Owner: one Gmail query encoder. Lateral, for bifrost-types:
 overlapping variants, so every crate with both search and filters re-translates the
 overlap twice.
 
-## CON-057 - Is a rejected SMTP recipient a failed send?
-
-**Reported by:** smtp-sasl (sibling methods answer oppositely).
-
-`DirectSmtp` (`send_raw*`): the first negative RCPT reply ends the transaction with
-RSET and returns `Err` (after a 421, abort). `DirectLmtp`: a rejected RCPT is
-recorded and the send continues; all rejected returns `Ok(Vec<Response>)` of
-negatives ("Not a failure of the send"). `BatchSmtp` / `BatchLmtp`: per-recipient
-lanes, DATA issued for the accepted subset. IMAP `send_rfc5322`: `Ok` iff any lane
-succeeded, otherwise the first uncertain error wins over the first failed one. The
-SMTP and LMTP direct APIs answer oppositely in sibling methods of one crate, and the
-IMAP projection of a `BatchOutcome` onto send success lives in the consumer. Owner:
-a bifrost-smtp (or `BatchOutcome`) decision, e.g.
-`BatchOutcome::<()>::as_send_result()` or a smtp-side `SubmissionOutcome`, giving
-every consumer the same "committed to someone, do not resend" rule; with the
-single protocol machine of STR-140 the direct-path difference becomes an explicit
-recipient-policy parameter. The IMAP "acceptance uncertain, none acknowledged" case
-is already an owner-ruling item in `notes/todo.md`.
-
 ## CON-060 - Two redirect walkers, two 401-refresh-once paths, two deadlines
 
 **Reported by:** net-dav (the copies differ in policy).
@@ -1057,16 +1026,23 @@ Related: BUG-083, CON-013.
 
 **Reported by:** net-dav.
 
-dav-core `etag::normalize_http_etag`; dav-core `xml::normalize_etag` (the same rule a
-second time in the same crate, both exported); dav-core `etag::prepare_if_match`,
-with its own weak check; `caldav::account::put_condition`; and
-`carddav::account::put_condition` (byte-identical to CalDAV's, a third weak check).
-The validator travels as `String`, in DAV and in `ServerVersion::ETag(String)`, with
-the weak marker kept as text precisely so later code can re-detect it. Type fix: an
-`EntityTag { Strong(String), Weak(String) }` parsed once at the wire, with
-`PutCondition::IfMatch(&StrongTag)`, so a conditional write on a weak tag cannot be
-expressed. Graph's `If-Match` (STR-107), Google People and Google Calendar etags are
-candidates for the same type.
+The DAV half landed: one parser in `dav-core/src/etag.rs`, `EntityTag` and a
+private-field `StrongTag`, and `PutCondition::IfMatch` requires the strong tag.
+Residue: the validator still travels as `String` in `ServerVersion::ETag(String)`
+(bifrost-types) and at the DAV account and snapshot boundaries, with the weak
+marker kept as text so later code re-detects it. Moving `EntityTag` into
+bifrost-types and adopting it for Graph's `If-Match`, Google People and Google
+Calendar etags is the remaining owner change.
+
+## CON-067 - The "restart paging" page-cursor fault is built in three places
+
+**Reported by:** wave 3 reconciler.
+
+`Request(Malformed)` with `InvalidArgument { field: Some("page_cursor") }` is the
+documented signal to restart a page walk from page one, and it is constructed
+separately in IMAP (`account/pim.rs`) and JMAP (`sync/error.rs` and
+`sync/page_cursor.rs`). One constructor in bifrost-types would make it one
+definition every provider calls.
 
 ## CON-065 - Google Drive and OneDrive drive the same resumable-upload protocol separately
 

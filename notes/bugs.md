@@ -114,22 +114,6 @@ a `SyncEvent<ItemOutcome>` stream the engine does not validate, unlike inventory
 batches (`validate_boundary`, terminating as `AccountContract`). Mutation
 streams deserve the same guard. Structural fix: STR-005.
 
-## BUG-008 - `debt()` and `repair_debt()` read the ledger from the store, not from the writer that owns it
-
-**Reported by:** sync-engine (P3).
-
-`SyncEngine::debt` and `repair_debt` call `self.checkpoints.get_ledger`
-directly, but `ack_writer` keeps an authoritative in-memory ledger that can
-differ from the store: `RecordDebt`, `RecordBarrier`, `ResetScope` and both reset
-passes mutate it in place and keep the mutation when the write fails. After a
-transient `put_ledger` failure `debt()` under-reports and `repair_debt` plans
-against a ledger the writer no longer agrees with. Generation-aware discharge
-limits the damage but does not make the enumeration honest. Same habit in
-`engine/backfill.rs`, which reads `store.get_backfill` directly while
-`DiscardBackfillProgress` for the same scope is ordered through the writer.
-Proposal: `WriterRequest::GetLedger` and `GetBackfill`, like `GetChangeCursor`.
-The ledger-mutation discipline behind the divergence is CON-022.
-
 ## BUG-009 - The orphan-teardown retrier and `repair_debt` skip most of the wire-work gate
 
 **Reported by:** sync-engine (P3).
@@ -180,21 +164,6 @@ only recovery code gets `WriterHandle`. Proposal: `WriterHandle` everywhere,
 returning `Result<T, WriterError>` with `WriterError::Gone` distinct from
 `WriterError::Store(Error)`, so each call site states which it tolerates (see
 STR-031 for where the writer protocol should live).
-
-## BUG-012 - Two resume paths with different effects, and engine pause state is never retained
-
-**Reported by:** sync-engine (P3, divergence).
-
-`SyncEngine::resume_account` writes `Run` with a raw `send_replace` and
-publishes `AccountControl::Resume`; `Control::resume` (`SyncControl`) uses
-`set_unless_stopped` and publishes nothing. A consumer following
-`account_control_stream` sees the engine's `Pause(reason)` but never a `Resume`
-if the resume came through `Control`. Engine pause reason and state are only
-broadcast, never retained, so a late subscriber cannot learn the account is
-engine-paused or why (compare `push_health`, a watch). Proposal (sync-engine
-C9): fold it into the per-account slot as a watch,
-`EngineState::{Running, Paused(PauseReason), Stopping}`, so both resumes are one
-transition with one notification.
 
 ## BUG-015 - Proof generations restart at zero every attachment while ledger generations are durable
 
@@ -517,53 +486,6 @@ is dropped); binary sections compare `Vec<u32>` exactly. Proposal: a typed
 `SectionSpec { parts: Vec<u32>, text: Option<Header | HeaderFields(..) | Text |
 Mime> }`, with origin part of the key that owns "same section".
 
-## BUG-035 - Single-command and pipeline paths disagree on NOTIFY after an interleaved NOTIFICATIONOVERFLOW
-
-**Reported by:** imap-connection (live).
-
-"Which session state does this command move?" is answered by
-`driver::run_prepared_command` (a `matches!` chain arming `set_in_logout`,
-`set_in_auth`, `set_in_select`, `set_in_close`, `set_in_unauthenticate`,
-`set_in_notify_set` before the send); `pipeline::apply_pipeline_pre_effects`
-(NOTIFY SET/NONE again, armed at tagged-response arrival rather than before the
-send - its doc says a second copy "is the drift shape this crate has paid for
-before"; it is the second copy); `CommandKind::pipelinable` (an independent list
-of state-moving commands; NOTIFY moves notify flags but is pipelinable, which is
-why the pipeline needs its own hook); `ProtocolState::apply_tagged` (the
-completion half, with per-flag clearing rules, BUG-034); and
-`wire_send::wait_for_continuation` vs the pipeline router's `early_own_ok` (two
-implementations of "an early OK before the `+` must not complete the armed
-effect").
-
-A `* OK [NOTIFICATIONOVERFLOW]` arriving between a NOTIFY SET's send and its
-tagged OK clears the pending registration on the single-command path (armed
-before send, cleared by `apply_untagged`) but not on the pipeline path (armed
-only when the tagged OK arrives, after the overflow was processed), so one server
-sequence leaves NOTIFY registered in one path and unregistered in the other.
-Which is right depends on whether the overflow preceded the server's processing;
-nothing reconciles the copies. Owner: `Command::pending_effect(&self) ->
-Option<PendingEffect>` in `types/command.rs` beside `legal_states`, with
-`pipelinable` derived from it, the armed effect keyed by tag (STR-065), and both
-paths arming through the one function before the first byte.
-
-## BUG-038 - IMAP APPENDLIMIT has two answers for one advertisement
-
-**Reported by:** imap-connection (live disagreement).
-
-`ServerProfile::new` (public, `types/profile.rs`), on a contradictory
-advertisement (bare and numeric forms together), reports
-`AppendLimitPolicy::PerMailbox` and drops the numeric value ("preserve the safer
-bare interpretation"). `append.rs::AdvertisedAppendLimits` plus
-`append_limit_from_advertisement` (enforcement) applies `min(global, mailbox)`. A
-consumer reading `server_profile().append_limit` is told something different from
-what `append` enforces. `validate_requested_status_items`'s APPENDLIMIT gate is a
-third reader (`matches!(cap, AppendLimit(_))`). Owner: `AppendLimitPolicy` grows
-the shape enforcement needs (`PerMailbox { global_ceiling: Option<u64> }`), and
-`append.rs` reads it instead of re-folding capabilities. Lateral: `append_message`
-computes the APPEND deadline, then runs the APPENDLIMIT STATUS preflight with a
-fresh `timeout`, then submits APPEND against the partly spent deadline, so it can
-spend up to twice the caller's timeout - a real bound, not the documented one.
-
 ## BUG-039 - IMAP SELECT swallows unrecognized coded statuses instead of publishing them
 
 **Reported by:** imap-connection.
@@ -681,39 +603,18 @@ scope derives DisableScope(scope)" is a recovery decision, and if `ErrorScope`
 (or the builder) could carry "owned by another principal", `derive` could apply
 it once and the four helpers collapse into a builder call.
 
-## BUG-050 - IMAP hydration and raw reads issue QRESYNC SELECTs and discard the payload
-
-**Reported by:** imap-account.
-
-Every caller of `select_folder` decides what to pass as the cursor: inventory,
-mutation, poller, PIM primitives and search pass `None` (mutation with an explicit
-comment that admission must not replay changes since the consumer's checkpoint).
-`get::run_folder_get` and `blob::run_fetch` pass the registry's hint cursor, so a
-hydration or raw read on a QRESYNC session issues a QRESYNC SELECT whose VANISHED
-and changed-message payload is discarded, and the hint cursor is not advanced from
-it: wasted wire on every hydration batch, and a policy the mutation path
-explicitly rejected. Owner: a `SelectPurpose::{Sync(cursor), Read, Mutate}`
-argument decided once per lane, replacing `(cursor, read_only)` (STR-076).
-
 ## BUG-052 - IMAP `bulk_move` to a DAV-owned folder goes to the IMAP server while `throttle_keys` says IMAP does not own it
 
 **Reported by:** imap-account (live).
 
-`Account::throttle_keys` documents that "the answer must follow the same routing
-decision the operation itself makes". IMAP's `ThrottleWork::Membership(Folder)`
-arm consults `dav_scopes` and declares no key for a DAV-owned folder; `bulk_move`
-with that destination never consults `dav_scopes` (`validated_move_destination`
-accepts any sendable name) and sends a `UID MOVE` to IMAP. The `Scope` arm also
-normalizes through `MailboxName::from_account_id(..).account_id()` while the
-`Membership` arm keys on raw `folder.0`. Root cause: `DavScopeIndex`'s doc says
-"EVERY `CursorScope::Folder` consumer must consult this index" and records that a
-fifth consumer once forgot; `route_scope` answers it, but `folder_from_scope` and
-`MailboxName::from_account_id` turn any `FolderId` into a mailbox without
-routing. Owner: a `RoutedScope` / `ImapFolder` type obtainable only from the
-router, for `CursorScope` and `MembershipScope` alike, making the rule a compile
-error. Smaller: `route_scope` produces a validated `MailboxName` that
-`inventory_stream` and `changes_stream` discard (`Ok(ScopeHandler::Folder(_)) =>
-{}`) and recompute with `folder_from_scope` inside the task.
+The live defect is fixed: `bulk_move` and the membership throttle arm both go
+through `DavScopeIndex::imap_mailbox`. Residue: nothing makes the routing rule a
+compile error. `folder_from_scope` and `MailboxName::from_account_id` still turn
+any `FolderId` into a mailbox without routing, and `route_scope` produces a
+validated `MailboxName` that `inventory_stream` and `changes_stream` discard
+(`Ok(ScopeHandler::Folder(_)) => {}`) and recompute inside the task. Owner: a
+`RoutedScope` / `ImapFolder` type obtainable only from the router, for
+`CursorScope` and `MembershipScope` alike, carried into the tasks.
 
 ## BUG-055 - IMAP `SearchFilter::Has` (attachment filename or type) compiles to a full-text `BODY` search
 
@@ -817,21 +718,11 @@ only the mapping.
 
 **Reported by:** jmap-account (latent, P2).
 
-`state_cache::StateMap = Arc<Mutex<HashMap<String, Option<String>>>>`. The module
-documents a tri-state (absent / probed-empty / known) and then `get` flattens it,
-so no caller can observe the distinction it was built for. About fifteen writer
-sites across `account.rs`, `changes.rs`, `discover.rs`, `mutation.rs` and `pim.rs`
-each choose `set` vs `advance` and what to pass as `expected`. Unguarded writes
-(`pim::send_email_set`, the unguarded branch of
-`mutation::apply_batch_with_version`, `destroy_thread_emails_if_unchanged`) read
-the cache, send the `/set` without `ifInState`, then `advance(expected = cached,
-new = response.newState)`. If another writer changed the account between the
-cached state and this set, the server's `newState` covers that change, and the
-cache jumps over it; the cache is then used as the `ifInState` guard for the next
-`FlagOp::Set` or move (`uses_if_in_state`), whose purpose is to refuse when an
-unobserved concurrent change happened. `SetResponse::old_state()` exists and is
-read nowhere in `sync/`. The correct rule: advance from `oldState` to `newState`,
-and only if the cache currently equals `oldState`. Also `mailbox_states` is
+The laundering defect is fixed: Email cache advances now require the response's
+`oldState -> newState` continuity. Residue, structural: `state_cache::StateMap =
+Arc<Mutex<HashMap<String, Option<String>>>>` documents a tri-state (absent /
+probed-empty / known) and `get` flattens it, and about fifteen writer sites each
+still choose their own transition. Also `mailbox_states` is
 write-only: container create/rename/move/delete, the Mailbox changes walk,
 establishment and the factory maintain it, nothing reads it to decide anything
 (establishment reads it only to CAS against itself; the lifecycle poller has its
@@ -1045,41 +936,6 @@ also refuses: a pairwise-agreement test over two copies. Owner: a typed handle p
 API (STR-121), carrying the surface on every request and in its errors' type; each
 API gets its own classifier feeding one builder funnel.
 
-## BUG-087 - Google Calendar and Drive traffic debits the Gmail per-user quota bucket
-
-**Reported by:** google (live in production), net-dav (confirms, noting the comment says Calendar bills per request while each call debits one Gmail unit from the per-user bucket).
-
-`default_account_net` registers one rate-limit bucket per distinct host. In
-production Gmail, Calendar and Drive all live on `www.googleapis.com`, so Calendar
-"rides the Gmail registration", and Drive does too without mention. The
-registration comment says Calendar "takes the general Google bucket", but in
-production that bucket is the Gmail quota-unit bucket (100 units/s,
-`cost_default` 1), so Calendar and Drive traffic debit Gmail's per-user budget and a
-large Gmail hydration delays calendar reads. bifrost-net already supports two quota
-scopes on one host (`RequestBuilder::quota_scope`), and `reference/net.md` names the
-Gmail per-project vs per-user case as the reason it exists. Owner: the typed surface
-handle (STR-121) stamps `quota_scope(surface)` on every request, and registration
-declares one bucket per surface rather than per host. Two request funnels also
-decide cost and concurrency independently: `execute_if_match` applies the cost from
-`gmail_quota_cost` and the concurrency limit unless the path is `/watch` or
-`/stop`; `execute_builder` applies the concurrency limit only for the `"Gmail API"`
-string and applies NO cost (its comment tells callers to add it themselves);
-`mutation::post_empty_json` builds through the raw funnel only to add the cost back
-by hand, though `client.post_no_content(path, body, replay)` already does exactly
-that. The hunter proposes deleting the second funnel for every Gmail caller; only
-Drive's resumable upload (custom headers, bearer-less, redirects off) needs the raw
-builder.
-
-## BUG-094 - A Gmail Pub/Sub registration loss is classified as a cursor loss
-
-**Reported by:** google (needs a ruling: a classification chosen for lack of vocabulary).
-
-`pubsubSubscriptionDeleted` / `Expired` under `PushSubscribe` map to
-`SyncState(CursorInvalid)`, deriving `RestartScope(Account)`; the context comment
-says this is deliberate. But a lost watch costs only a gap, which push already
-signals (`gap_hint`); the history cursor is still valid. Restarting the scope throws
-away a good cursor because the error model has no push-registration kind.
-
 ## BUG-099 - IMAP and ManageSieve turn every OAuth token-source failure into server-acknowledged `AuthLost`
 
 **Reported by:** smtp-sasl (live; its top-ranked finding).
@@ -1214,15 +1070,6 @@ the same gap. Type fix: a `CoordinatedTokenSource` newtype mintable only by
 JMAP and DAV, making `is_coordinating()` unnecessary; DAV can keep minting headers
 itself through `AccountNet::bearer()` if it attaches the source to its spec.
 
-## BUG-134 - A failed Gmail label refresh lets every queued reader repeat it
-
-**Reported by:** wave 1 fixer (google, lateral).
-
-After the label-cache readers were unified, a refresh that fails leaves the
-cache stale, so readers queued behind the single-flight each issue their own
-`labels.list` in turn during an outage. A failure backoff (or sharing the
-failed result with the waiters) would bound it.
-
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 
 **Reported by:** imap-account; reopened by the wave 1 review.
@@ -1235,13 +1082,31 @@ cursor-free sync mode for such folders (re-inventory on each poll, no durable
 UID cursor, no CursorInvalid loop); the inventory site and `reference/imap.md`
 say so.
 
-## BUG-141 - JMAP `identity_update` and `vacation_set` accept an omitted `updated` answer as success
+## BUG-147 - Gmail `historyNotFound` is cursor loss whatever endpoint answered it
 
-**Reported by:** wave 2 fixer (jmap-account, lateral).
+**Reported by:** wave 3 fixer (google, lateral).
 
-The same false-success shape container rename and move had: the set response is
-read for errors only, so a server that answers neither `updated` nor
-`notUpdated` for the id reads as success.
+`historyNotFound` derives `CursorInvalid` regardless of which endpoint returned
+it, though only the history endpoint's answer means the cursor is gone.
+
+## BUG-148 - A Graph subscription create with a missing or mistyped expiry orphans the subscription
+
+**Reported by:** wave 3 fixer (graph, lateral).
+
+A create response whose `expirationDateTime` is missing or wrongly typed fails
+deserialization, so the returned subscription id is lost before cleanup can
+register it and the server-side subscription is orphaned until it expires.
+Decode the id independently of the expiry, register it, then classify the bad
+expiry.
+
+## BUG-149 - The shared `ContainerRights` cannot express "may share"
+
+**Reported by:** wave 3 fixer (jmap-protocol, lateral).
+
+JMAP's mailbox rights now include RFC 9670 `mayShare`, but
+`bifrost_types::ContainerRights` has no `may_share` field, so a consumer cannot
+learn whether the user may share a folder. Add `may_share: Option<bool>` and fill
+it from JMAP's `rights_from_mailbox`.
 
 ## BUG-142 - Completion markers written by an empty backfill plan still skip inventory
 
@@ -1250,45 +1115,6 @@ read for errors only, so a server that answers neither `updated` nor
 A `Fixed` plan with zero partitions now runs one full inventory, but a durable
 completion marker an empty plan wrote before that fix is still honoured, so
 such a scope never inventories until the marker is cleared. No migration exists.
-
-## BUG-144 - DAV snapshot preservation dedups raw hrefs, so equivalent aliases survive
-
-**Reported by:** wave 2 fixer (dav, lateral).
-
-Query ordering, dedup and the watermark now use `DavHrefKey`, but snapshot
-preservation still dedups on the raw href, so both account snapshot builders
-can keep two spellings of one resource and expose duplicate inventory entries.
-
-## BUG-145 - JMAP advertises attachment upload when the session's upload template is unusable
-
-**Reported by:** wave 2 review (lateral).
-
-An unusable `uploadUrl` template now fails each upload with
-`MalformedSessionUrl` instead of failing the session, but
-`pim_methods.attachment_upload` stays `true`, because capabilities are built
-from the protocol surface rather than the derived session state. The flag
-promises a door that refuses on every call. Feeding the session's upload-URL
-state into the capability builder closes it.
-
-## BUG-146 - Graph public contact, calendar, attachment and poll doors still retry a missing route forever
-
-**Reported by:** wave 2 review (lateral).
-
-Message hydration now reports an unrouted public-folder item as
-`NotFound(Message)` once a complete public-folder discovery pass has run
-without restoring its route. The public contact (`contacts/public.rs`), public
-calendar (`calendar_public.rs`), attachment (`blob.rs`) and public-folder poll
-paths still answer the retryable conflict for the same case. Route them
-through `GraphAccount::missing_public_route_error`.
-
-## BUG-140 - IMAP's search pager does not mark a stale cursor as a page-cursor fault
-
-**Reported by:** wave 1 review (lateral).
-
-JMAP's stale page cursors are now `Request(Malformed)` with cause
-`InvalidArgument { field: Some("page_cursor") }`, the documented "restart from
-page one" signal. IMAP's search pager uses `Request(Malformed)` without that
-field, so a consumer cannot key on one signal across providers.
 
 ## BUG-116 - The HTTP bandwidth meter cannot be handed to the engine or IMAP
 

@@ -1824,7 +1824,7 @@ async fn container_delete_deselects_a_target_left_selected_in_the_pool() {
 
     let mut pooled = account.pool.checkout_any().await.unwrap();
     account
-        .select_folder(&mut pooled, &folder, None, false)
+        .select_folder(&mut pooled, &folder, super::SelectPurpose::Mutate)
         .await
         .unwrap();
     drop(pooled);
@@ -1890,11 +1890,11 @@ async fn an_incomplete_select_still_moves_the_mailbox_affinity() {
 
     let mut pooled = account.pool.checkout_any().await.unwrap();
     account
-        .select_folder(&mut pooled, &inbox, None, false)
+        .select_folder(&mut pooled, &inbox, super::SelectPurpose::Mutate)
         .await
         .unwrap();
     let err = account
-        .select_folder(&mut pooled, &archive, None, false)
+        .select_folder(&mut pooled, &archive, super::SelectPurpose::Mutate)
         .await
         .expect_err("a SELECT without EXISTS is incomplete");
     assert!(
@@ -1941,11 +1941,11 @@ async fn a_refused_select_clears_the_mailbox_affinity() {
 
     let mut pooled = account.pool.checkout_any().await.unwrap();
     account
-        .select_folder(&mut pooled, &inbox, None, false)
+        .select_folder(&mut pooled, &inbox, super::SelectPurpose::Mutate)
         .await
         .unwrap();
     account
-        .select_folder(&mut pooled, &archive, None, false)
+        .select_folder(&mut pooled, &archive, super::SelectPurpose::Mutate)
         .await
         .expect_err("the server refused the SELECT");
     assert_eq!(
@@ -1984,7 +1984,7 @@ async fn deselect_fallback_releases_the_old_connection_before_redialing() {
         session_select(&mut peer, "Archive").await;
     };
     let (result, ()) = tokio::join!(
-        account.select_folder(&mut held, &folder, None, false),
+        account.select_folder(&mut held, &folder, super::SelectPurpose::Mutate),
         script
     );
     result.unwrap();
@@ -2042,7 +2042,7 @@ async fn deselect_target_brings_other_parked_members_off_the_target() {
         let (other, mut other_peer) = tokio::join!(account.pool.checkout_any(), script);
         let mut other = other.unwrap();
         let (result, ()) = tokio::join!(
-            account.select_folder(&mut other, &folder, None, false),
+            account.select_folder(&mut other, &folder, super::SelectPurpose::Mutate),
             session_select(&mut other_peer, "Archive")
         );
         result.unwrap();
@@ -2808,7 +2808,7 @@ async fn a_qresync_run_on_a_member_that_already_selected_never_issues_enable() {
     {
         let mut pooled = account.pool.checkout_for_folder(&inbox()).await.unwrap();
         account
-            .select_folder(&mut pooled, &inbox(), None, true)
+            .select_folder(&mut pooled, &inbox(), super::SelectPurpose::Read)
             .await
             .unwrap();
     }
@@ -5851,12 +5851,12 @@ async fn failed_select_refreshes_affinity_from_driver_identity() {
     });
     let mut pooled = account.pool.checkout_any().await.unwrap();
     account
-        .select_folder(&mut pooled, &inbox, None, false)
+        .select_folder(&mut pooled, &inbox, super::SelectPurpose::Mutate)
         .await
         .unwrap();
     pooled.set_selected_affinity(Some(archive.clone()));
     account
-        .select_folder(&mut pooled, &archive, None, false)
+        .select_folder(&mut pooled, &archive, super::SelectPurpose::Mutate)
         .await
         .expect_err("BAD preserves the driver's previous mailbox");
     assert_eq!(pooled.selected_affinity(), Some(&inbox));

@@ -18,6 +18,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cancel::{Boundary, BoundaryRequest};
 
+/// Retained account run state, including the reason for a pause.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum EngineState {
+    Running,
+    Paused(bifrost_types::PauseReason),
+    Stopping,
+}
+
 /// Concrete `Control` implementation.
 ///
 /// Cloneable so the engine can hand out additional handles (e.g. one
@@ -71,6 +80,9 @@ impl DurableLane {
 
 struct SyncControlInner {
     account: AccountId,
+    engine_state: watch::Sender<EngineState>,
+    control_events:
+        std::sync::Mutex<Option<tokio::sync::broadcast::Sender<bifrost_types::AccountControl>>>,
     boundary: Boundary,
     /// Watch channel carrying the latest persisted checkpoint and the
     /// generation in which quiescence was observed.
@@ -129,6 +141,8 @@ impl SyncControl {
         Self {
             inner: Arc::new(SyncControlInner {
                 account,
+                engine_state: watch::channel(EngineState::Running).0,
+                control_events: std::sync::Mutex::new(None),
                 boundary,
                 checkpoint_tx,
                 durable: std::sync::Mutex::new(HashMap::new()),
@@ -141,6 +155,71 @@ impl SyncControl {
             }),
             admitted: false,
         }
+    }
+
+    pub(crate) fn bind_control_events(
+        &self,
+        events: tokio::sync::broadcast::Sender<bifrost_types::AccountControl>,
+    ) {
+        *self
+            .inner
+            .control_events
+            .lock()
+            .expect("control events lock") = Some(events);
+    }
+
+    /// Latest recovery state, retained for consumers subscribing after an automatic pause.
+    pub fn engine_state(&self) -> watch::Receiver<EngineState> {
+        self.inner.engine_state.subscribe()
+    }
+
+    pub(crate) fn engine_pause(&self, reason: bifrost_types::PauseReason) {
+        let events = self
+            .inner
+            .control_events
+            .lock()
+            .expect("control events lock");
+        if self.inner.boundary.snapshot() == BoundaryRequest::Stop {
+            return;
+        }
+        self.inner
+            .boundary
+            .set_unless_stopped(BoundaryRequest::Pause);
+        // A late subscriber needs the reason a corporate mailbox stopped syncing.
+        self.inner
+            .engine_state
+            .send_replace(EngineState::Paused(reason));
+        if let Some(events) = events.as_ref() {
+            let _ = events.send(bifrost_types::AccountControl::Pause(reason));
+        }
+    }
+
+    pub(crate) fn stop(&self) {
+        let _events = self
+            .inner
+            .control_events
+            .lock()
+            .expect("control events lock");
+        self.inner.boundary.set(BoundaryRequest::Stop);
+        self.inner.engine_state.send_replace(EngineState::Stopping);
+    }
+
+    /// Apply both controls with their watch borrows held through each setter.
+    /// A concurrent policy update must never be overwritten by a saved snapshot.
+    pub(crate) fn apply_to(
+        &self,
+        account: &dyn bifrost_types::Account,
+        budget: Option<&bifrost_net::BandwidthBudget>,
+    ) {
+        let priority = self.inner.priority.borrow();
+        account.set_priority(*priority);
+        drop(priority);
+        self.apply_bandwidth_cap(|cap| {
+            if let Some(budget) = budget {
+                budget.set_cap(cap);
+            }
+            account.set_bandwidth_cap(cap);
+        });
     }
 
     /// A handle for work nested inside `held`, whose own activity
@@ -635,9 +714,7 @@ impl Control for SyncControl {
             // `record_checkpoint` calls that race with us land in the
             // new generation, not the old one.
             let gen_id = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
-            self.inner
-                .boundary
-                .set_unless_stopped(BoundaryRequest::Pause);
+            self.engine_pause(bifrost_types::PauseReason::ConsumerRequested);
             self.publish_quiescence(gen_id);
             self.wait_for_checkpoint_at_or_after(gen_id).await
         })
@@ -674,7 +751,17 @@ impl Control for SyncControl {
     }
 
     fn resume(&self) {
-        self.inner.boundary.set_unless_stopped(BoundaryRequest::Run);
+        let events = self
+            .inner
+            .control_events
+            .lock()
+            .expect("control events lock");
+        if self.inner.boundary.set_unless_stopped(BoundaryRequest::Run) {
+            self.inner.engine_state.send_replace(EngineState::Running);
+            if let Some(events) = events.as_ref() {
+                let _ = events.send(bifrost_types::AccountControl::Resume);
+            }
+        }
     }
 
     fn priority(&self, p: Priority) {
@@ -713,6 +800,37 @@ mod tests {
             priority,
             bandwidth,
         )
+    }
+
+    #[test]
+    fn both_resume_doors_share_retained_state_and_notifications() {
+        let control = control();
+        let (events, mut receiver) = tokio::sync::broadcast::channel(8);
+        control.bind_control_events(events);
+        control.engine_pause(bifrost_types::PauseReason::RetryBudgetExhausted);
+        let state = control.engine_state();
+        assert!(matches!(
+            *state.borrow(),
+            EngineState::Paused(bifrost_types::PauseReason::RetryBudgetExhausted)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(bifrost_types::AccountControl::Pause(_))
+        ));
+        Control::resume(&control);
+        assert!(matches!(*state.borrow(), EngineState::Running));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(bifrost_types::AccountControl::Resume)
+        ));
+        Control::resume(&control);
+        assert!(receiver.try_recv().is_err());
+        control.stop();
+        control.engine_pause(bifrost_types::PauseReason::RetryBudgetExhausted);
+        Control::resume(&control);
+        assert!(matches!(*state.borrow(), EngineState::Stopping));
+        assert_eq!(control.inner.boundary.snapshot(), BoundaryRequest::Stop);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

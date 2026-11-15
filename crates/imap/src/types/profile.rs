@@ -9,9 +9,12 @@ pub enum AppendLimitPolicy {
     /// The server did not advertise APPENDLIMIT.
     #[default]
     NotAdvertised,
-    /// Bare `APPENDLIMIT` was advertised; check selected-mailbox status for
+    /// Bare `APPENDLIMIT` was advertised; query destination mailbox STATUS for
     /// a mailbox-specific limit.
-    PerMailbox,
+    PerMailbox {
+        /// Numeric ceiling also advertised, applied along with the mailbox limit.
+        global_ceiling: Option<u64>,
+    },
     /// `APPENDLIMIT=<n>` advertised a server-wide limit in octets.
     Limit(u64),
 }
@@ -50,10 +53,9 @@ impl ServerProfile {
                 _ => None,
             })
             .collect();
-        // RFC 7889 normally advertises exactly one APPENDLIMIT form. If a
-        // server sends the contradictory bare and numeric forms together,
-        // preserve the safer bare interpretation: the destination mailbox
-        // may be more restrictive than the global-looking value.
+        // Preserve both constraints on contradictory advertisements. A user
+        // expects the size check and the displayed policy to agree, and the
+        // most restrictive advertised limit avoids a preventable rejection.
         let has_mailbox_specific_limit = capabilities
             .iter()
             .any(|cap| matches!(cap, Capability::AppendLimit(None)));
@@ -65,7 +67,9 @@ impl ServerProfile {
             })
             .min();
         let append_limit = if has_mailbox_specific_limit {
-            AppendLimitPolicy::PerMailbox
+            AppendLimitPolicy::PerMailbox {
+                global_ceiling: global_append_limit,
+            }
         } else {
             global_append_limit
                 .map(AppendLimitPolicy::Limit)

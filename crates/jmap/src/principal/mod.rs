@@ -1,6 +1,5 @@
-// The Account impl only uses `PrincipalId` and `ACL` from this module;
-// the full RFC 8621 §6 surface is retained for completeness and for the
-// JMAP Principal/* methods a future stage may expose.
+// Principal/get supplies owner and alias discovery to the Account layer.
+// Remaining Principal methods are retained for protocol use.
 #![allow(dead_code)]
 
 pub(crate) mod availability;
@@ -9,9 +8,9 @@ pub(crate) mod query;
 pub(crate) mod set;
 
 use crate::core::set::{skip_if_empty_list, skip_if_empty_map, skip_if_empty_str};
+use crate::mailbox_rights::ACL;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::Display;
 
 mod marker {
     pub(crate) enum Principal {}
@@ -19,6 +18,11 @@ mod marker {
 /// Strongly-typed Principal ID.
 pub(crate) type PrincipalId = crate::core::id::Id<marker::Principal>;
 
+// The server-admin dialect (secret, dkim, quota, members, acl, domain and
+// list) has no documented capability URI or method contract here. Do not guess
+// one or delete its operations. A split must first identify that contract for
+// read, create, patch and query. Rejecting unknown fields is also inappropriate:
+// RFC objects must tolerate extension properties.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Principal {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,7 +76,7 @@ pub(crate) struct Principal {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PrincipalCreate {
     #[serde(skip)]
-    pub(super) _create_id: Option<usize>,
+    pub(super) _create_id: Option<crate::core::creation::CreationId>,
 
     #[serde(rename = "type")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -247,31 +251,6 @@ crate::core::method::define_property_enum! {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
-#[non_exhaustive]
-pub(crate) enum ACL {
-    #[serde(rename = "mayRename")]
-    Rename = 1,
-    #[serde(rename = "mayDelete")]
-    Delete = 2,
-    #[serde(rename = "mayReadItems")]
-    ReadItems = 3,
-    #[serde(rename = "mayAddItems")]
-    AddItems = 4,
-    #[serde(rename = "maySetKeywords")]
-    SetKeywords = 5,
-    #[serde(rename = "mayRemoveItems")]
-    RemoveItems = 6,
-    #[serde(rename = "mayCreateChild")]
-    CreateChild = 7,
-    #[serde(rename = "mayShare")]
-    Administer = 8,
-    #[serde(rename = "maySubmit")]
-    Submit = 10,
-    #[serde(rename = "maySetSeen")]
-    SetSeen = 11,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub(crate) enum Type {
@@ -321,29 +300,6 @@ impl DKIM {
     }
 }
 
-impl Display for ACL {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl ACL {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            ACL::Rename => "mayRename",
-            ACL::Delete => "mayDelete",
-            ACL::ReadItems => "mayReadItems",
-            ACL::AddItems => "mayAddItems",
-            ACL::SetKeywords => "maySetKeywords",
-            ACL::RemoveItems => "mayRemoveItems",
-            ACL::CreateChild => "mayCreateChild",
-            ACL::Administer => "mayShare",
-            ACL::Submit => "maySubmit",
-            ACL::SetSeen => "maySetSeen",
-        }
-    }
-}
-
 impl crate::core::Object for Principal {
     type Property = Property;
     type Id = PrincipalId;
@@ -368,10 +324,13 @@ impl crate::core::set::SetObject for Principal {
 
 impl crate::core::SetCreate for PrincipalCreate {
     fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
+        self._create_id.as_ref().map(ToString::to_string)
+    }
+    fn set_create_id(&mut self, id: crate::core::creation::CreationId) {
+        self._create_id = Some(id);
     }
 
-    fn new(create_id: Option<usize>) -> Self {
+    fn new(create_id: Option<crate::core::creation::CreationId>) -> Self {
         PrincipalCreate {
             _create_id: create_id,
             ptype: None,

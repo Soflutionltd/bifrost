@@ -7,8 +7,8 @@ use bifrost_dav_core::{
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery, PutCondition};
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{AccountError, AccountOperation, ErrorScope};
-use reqwest::header::{CONTENT_TYPE, ETAG};
 use reqwest::Method;
+use reqwest::header::{CONTENT_TYPE, ETAG};
 
 use crate::CardDavConfig;
 use crate::parse::{
@@ -649,7 +649,7 @@ impl CardDavClient {
         &self,
         url: &str,
         body: String,
-        condition: PutCondition<'_>,
+        condition: PutCondition,
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         self.refuse_directory_access(url, operation)?;
@@ -669,18 +669,11 @@ impl CardDavClient {
         // PUT is an absolute write to a known URL and stays replayable.
         // Unlike `bifrost-caldav`'s `put_event`, no scheduling side effect
         // applies to a vCard.
-        match condition {
-            PutCondition::IfNoneMatch => {
-                request = request
-                    .header("If-None-Match", "*")
-                    .replay(bifrost_net::ReplayPolicy::Never);
-            }
-            PutCondition::IfMatch(etag) => {
-                if let Some(etag) = prepare_if_match(etag) {
-                    request = request.header("If-Match", etag);
-                }
-            }
-            PutCondition::None => {}
+        if matches!(&condition, PutCondition::IfNoneMatch) {
+            request = request.replay(bifrost_net::ReplayPolicy::Never);
+        }
+        if let Some((name, value)) = condition.header() {
+            request = request.header(name, value);
         }
         self.send_status_request(request, operation).await
     }
@@ -1612,7 +1605,7 @@ mod tests {
             .put_vcard(
                 "https://dav.example.test/book/one.vcf",
                 "BEGIN:VCARD\r\nEND:VCARD\r\n".to_string(),
-                PutCondition::IfMatch("v1"),
+                PutCondition::from_etag(Some("v1")),
                 AccountOperation::ContactUpdate,
             )
             .await

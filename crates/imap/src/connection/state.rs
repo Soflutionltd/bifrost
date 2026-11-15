@@ -71,13 +71,13 @@ pub(crate) struct ProtocolState {
     /// Consulted by `apply_tagged` to transition to `Authenticated`
     /// on tagged OK (RFC 3501 Section6.4.2, RFC 9051 Section6.4.2).
     in_close: bool,
-    /// Set to `Some(flags)` while a NOTIFY SET or NOTIFY NONE command
-    /// is in flight. Consulted by `apply_tagged` to update
+    /// Tag-keyed flags for NOTIFY SET or NOTIFY NONE commands in flight.
+    /// Consulted by `apply_tagged` to update
     /// `self.notify` on tagged OK (RFC 5465 Section3). Cleared by both
     /// `apply_tagged` (on completion) and `apply_untagged` (on
     /// NOTIFICATIONOVERFLOW, which takes precedence over the pending
     /// registration).
-    in_notify_set: Option<NotifyFlags>,
+    in_notify_set: std::collections::HashMap<String, NotifyFlags>,
     /// `true` while an UNAUTHENTICATE command is in flight.
     /// Consulted by `apply_tagged` to transition to `NotAuthenticated`
     /// on tagged OK (RFC 8437 Section2).
@@ -113,7 +113,7 @@ impl ProtocolState {
             in_auth: false,
             in_select: None,
             in_close: false,
-            in_notify_set: None,
+            in_notify_set: std::collections::HashMap::new(),
             in_unauthenticate: false,
             transition: None,
         }
@@ -272,15 +272,22 @@ impl ProtocolState {
         self.in_close = val;
     }
 
-    /// Mark a NOTIFY SET or NOTIFY NONE command as in-flight with the
-    /// target notify flags.
-    ///
-    /// Consulted by `apply_tagged` to update `self.notify` on tagged OK
-    /// (RFC 5465 Section3). Cleared by `apply_untagged` on
-    /// NOTIFICATIONOVERFLOW (RFC 5465 Section5.8)  -  overflow takes precedence
-    /// over the pending registration.
-    pub(crate) fn set_in_notify_set(&mut self, flags: Option<NotifyFlags>) {
-        self.in_notify_set = flags;
+    /// Arm a NOTIFY effect before sending, on either dispatch path.
+    /// Only its own completion may consume it. An overflow cancels all
+    /// registrations already in flight: an enterprise client must resume
+    /// polling rather than assume push survived a server-reported loss.
+    pub(crate) fn arm_notify(&mut self, command: &crate::types::Command, tag: &str) {
+        let flags = match command {
+            crate::types::Command::NotifySet(params) => NotifyFlags::from(params),
+            crate::types::Command::NotifyNone => NotifyFlags::default(),
+            _ => return,
+        };
+        self.in_notify_set.insert(tag.to_owned(), flags);
+    }
+
+    /// A command completed before receiving its literal, so it never ran.
+    pub(in crate::connection) fn disarm_notify(&mut self, tag: &str) {
+        self.in_notify_set.remove(tag);
     }
 
     /// Mark an UNAUTHENTICATE command as in-flight.
@@ -308,7 +315,7 @@ impl ProtocolState {
         self.in_auth = false;
         self.in_select = None;
         self.in_close = false;
-        self.in_notify_set = None;
+        self.in_notify_set.clear();
         self.in_unauthenticate = false;
     }
 
@@ -383,7 +390,7 @@ impl ProtocolState {
                 self.notify = NotifyFlags::default();
                 // Cancel any pending NOTIFY SET  -  overflow takes precedence
                 // over the new registration (RFC 5465 Section5.8).
-                self.in_notify_set = None;
+                self.in_notify_set.clear();
             }
             // RFC 5161 Section3.2: `* ENABLED <ext1> <ext2> ...` updates the
             // set of active extensions. Accumulates across multiple ENABLE
@@ -424,7 +431,7 @@ impl ProtocolState {
                 self.notify = NotifyFlags::default();
                 // Cancel any pending NOTIFY SET  -  overflow takes precedence
                 // over the new registration (RFC 5465 Section5.8).
-                self.in_notify_set = None;
+                self.in_notify_set.clear();
             }
             _ => {}
         }
@@ -499,7 +506,7 @@ impl ProtocolState {
             self.enabled.clear();
             // Prevent the pending NOTIFY SET block below from applying
             // stale flags after the session has been reset.
-            self.in_notify_set = None;
+            self.in_notify_set.clear();
             self.in_unauthenticate = false;
             self.transition = Some(SessionTransition {
                 capabilities_supplied,
@@ -512,9 +519,9 @@ impl ProtocolState {
         // RFC 5465 Section3: NOTIFY SET/NONE updates the per-type registration
         // flags on tagged OK. NOTIFICATIONOVERFLOW in the tagged response
         // code was already handled above (clears self.notify AND
-        // self.in_notify_set), so the take() below returns None in that
+        // self.in_notify_set), so the removal below returns None in that
         // case  -  no double-write.
-        if let Some(pending_flags) = self.in_notify_set.take()
+        if let Some(pending_flags) = self.in_notify_set.remove(&t.tag)
             && t.status == crate::types::response::StatusKind::Ok
         {
             self.notify = pending_flags;

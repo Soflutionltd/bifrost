@@ -27,7 +27,7 @@ use crate::{
     Envelope,
     address::Address,
     transport::smtp::{
-        Protocol,
+        Dialect,
         authentication::{
             Credentials, Mechanism, ScramExchange, ScramStep, decode_auth_challenge,
             decode_scram_payload, oauth_mechanism, password_mechanism, resolve_scram_binding,
@@ -161,7 +161,7 @@ pub(crate) struct AsyncSmtpConnection {
     /// Client identity used for EHLO.
     hello_name: ClientId,
     /// Wire protocol used for this connection.
-    protocol: Protocol,
+    protocol: Dialect,
     /// Timeout applied to each async SMTP I/O operation.
     timeout: Option<Duration>,
     /// Reused storage for serializing individual SMTP commands.
@@ -236,7 +236,7 @@ impl AsyncSmtpConnection {
             hello_name,
             tls_parameters,
             local_address,
-            Protocol::Smtp,
+            Dialect::Smtp,
             WireMetering::disabled(),
             #[cfg(feature = "test-support")]
             None,
@@ -251,7 +251,7 @@ impl AsyncSmtpConnection {
         hello_name: &ClientId,
         tls_parameters: Option<TlsParameters>,
         local_address: Option<IpAddr>,
-        protocol: Protocol,
+        protocol: Dialect,
         metering: WireMetering,
         #[cfg(feature = "test-support")] connector: Option<
             crate::transport::smtp::test_support::ScriptedConnector,
@@ -297,7 +297,7 @@ impl AsyncSmtpConnection {
         path: &Path,
         timeout: Option<Duration>,
         hello_name: &ClientId,
-        protocol: Protocol,
+        protocol: Dialect,
         metering: WireMetering,
     ) -> Result<AsyncSmtpConnection, Error> {
         let deadline = AsyncDeadline::new(timeout);
@@ -318,7 +318,7 @@ impl AsyncSmtpConnection {
         hello_name: &ClientId,
         timeout: Option<Duration>,
         setup_budget: TimeoutBudget,
-        protocol: Protocol,
+        protocol: Dialect,
     ) -> Result<AsyncSmtpConnection, Error> {
         let stream = BufReader::new(stream);
         let mut conn = AsyncSmtpConnection {
@@ -346,7 +346,7 @@ impl AsyncSmtpConnection {
     pub(in crate::transport::smtp) async fn from_transcript(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
-        protocol: Protocol,
+        protocol: Dialect,
     ) -> Result<Self, Error> {
         Self::connect_impl(
             AsyncNetworkStream::from_transcript(transcript),
@@ -364,7 +364,7 @@ impl AsyncSmtpConnection {
     pub(in crate::transport::smtp) async fn from_transcript_metered(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
-        protocol: Protocol,
+        protocol: Dialect,
         metering: WireMetering,
     ) -> Result<Self, Error> {
         let mut stream = AsyncNetworkStream::from_transcript(transcript);
@@ -388,7 +388,7 @@ impl AsyncSmtpConnection {
     pub(in crate::transport::smtp) async fn from_transcript_with_peer_certificate(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
-        protocol: Protocol,
+        protocol: Dialect,
         peer_certificate_der: Vec<u8>,
     ) -> Result<Self, Error> {
         let mut stream = AsyncNetworkStream::from_transcript(transcript);
@@ -411,7 +411,7 @@ impl AsyncSmtpConnection {
     pub(in crate::transport::smtp) fn from_raw_stream_for_test(
         stream: Box<dyn super::async_net::AsyncTokioStream>,
         hello_name: &ClientId,
-        protocol: Protocol,
+        protocol: Dialect,
         timeout: Option<Duration>,
     ) -> Self {
         AsyncSmtpConnection {
@@ -431,7 +431,7 @@ impl AsyncSmtpConnection {
     pub(in crate::transport::smtp) async fn from_transcript_with_timeout(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
-        protocol: Protocol,
+        protocol: Dialect,
         timeout: Duration,
     ) -> Result<Self, Error> {
         let deadline = AsyncDeadline::new(Some(timeout));
@@ -556,7 +556,7 @@ impl AsyncSmtpConnection {
         options: &SendOptions,
     ) -> Result<SendProgress, (Error, SendProgress)> {
         let (mail_cmd, rcpt_cmds, progress) =
-            self.build_batch(Protocol::Smtp, from, recipients, email, options)?;
+            self.build_batch(Dialect::Smtp, from, recipients, email, options)?;
         let pipelined = self.server_info().supports_pipelining();
         let mut machine = core::BatchSmtp::new(mail_cmd, rcpt_cmds, pipelined, progress);
         self.drive(&mut machine, email).await
@@ -574,7 +574,7 @@ impl AsyncSmtpConnection {
         options: &SendOptions,
     ) -> Result<SendProgress, (Error, SendProgress)> {
         let (mail_cmd, rcpt_cmds, progress) =
-            self.build_batch(Protocol::Lmtp, from, recipients, email, options)?;
+            self.build_batch(Dialect::Lmtp, from, recipients, email, options)?;
         let mut machine = core::BatchLmtp::new(mail_cmd, rcpt_cmds, progress);
         self.drive(&mut machine, email).await
     }
@@ -584,7 +584,7 @@ impl AsyncSmtpConnection {
     #[allow(clippy::type_complexity)]
     fn build_batch(
         &self,
-        protocol: Protocol,
+        protocol: Dialect,
         from: Option<Address>,
         recipients: Vec<SmtpBatchRecipient>,
         email: &[u8],
@@ -742,11 +742,11 @@ impl AsyncSmtpConnection {
         budget: TimeoutBudget,
     ) -> Result<(), Error> {
         let response = match self.protocol {
-            Protocol::Lmtp => {
+            Dialect::Lmtp => {
                 let command = Lhlo::new(hello_name.clone())?;
                 try_smtp!(self.command_with_budget(command, budget).await, self)
             }
-            _ => {
+            Dialect::Smtp => {
                 let command = Ehlo::new(hello_name.clone())?;
                 try_smtp!(self.command_with_budget(command, budget).await, self)
             }
@@ -1506,7 +1506,7 @@ mod transcript_tests {
     use crate::{
         address::{Address, Envelope},
         transport::smtp::{
-            Protocol,
+            Dialect,
             account_error::{SmtpErrorContext, into_account_error},
             authentication::{Credentials, Mechanism},
             batch::SmtpBatchRecipient,
@@ -1534,7 +1534,7 @@ mod transcript_tests {
         let transcript =
             Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
         let connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let recipients = vec![SmtpBatchRecipient {
@@ -1543,7 +1543,7 @@ mod transcript_tests {
         }];
 
         let Err((error, _progress)) = connection.build_batch(
-            Protocol::Smtp,
+            Dialect::Smtp,
             Some(Address::new_dangerous("sender\r\nRSET", "example.com")),
             recipients,
             b"body",
@@ -1575,7 +1575,7 @@ mod transcript_tests {
         let error = AsyncSmtpConnection::from_transcript(
             transcript,
             &ClientId::Domain("client.example".to_owned()),
-            Protocol::Smtp,
+            Dialect::Smtp,
         )
         .await
         .err()
@@ -1608,7 +1608,7 @@ mod transcript_tests {
                 )
                 .expect("RSET\r\n", "250 reset ok\r\n");
             let mut connection =
-                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp)
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Lmtp)
                     .await
                     .unwrap();
             let statuses = if chunking {
@@ -1625,8 +1625,8 @@ mod transcript_tests {
             transcript.assert_exhausted();
         }
 
-        for protocol in [Protocol::Smtp, Protocol::Lmtp] {
-            let hello_command = if protocol == Protocol::Smtp {
+        for protocol in [Dialect::Smtp, Dialect::Lmtp] {
+            let hello_command = if protocol == Dialect::Smtp {
                 "EHLO client.example\r\n"
             } else {
                 "LHLO client.example\r\n"
@@ -1647,7 +1647,7 @@ mod transcript_tests {
                 AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, protocol)
                     .await
                     .unwrap();
-            let progress = if protocol == Protocol::Smtp {
+            let progress = if protocol == Dialect::Smtp {
                 connection
                     .send_smtp_batch(
                         Some("sender@example.com".parse().unwrap()),
@@ -1688,7 +1688,7 @@ mod transcript_tests {
             .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
             .expect(window, "550 sender rejected\r\n250 recipient ok\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let error = connection.send(&envelope, b"body").await.unwrap_err();
@@ -1700,7 +1700,7 @@ mod transcript_tests {
             .expect(window, "250 sender ok\r\n550 recipient rejected\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let error = connection.send(&envelope, b"body").await.unwrap_err();
@@ -1713,7 +1713,7 @@ mod transcript_tests {
             .expect("DATA\r\n", "554 no data\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let error = connection.send(&envelope, b"body").await.unwrap_err();
@@ -1750,7 +1750,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_raw_stream_for_test(
             Box::new(peer),
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             Some(Duration::from_secs(30)),
         );
 
@@ -1782,7 +1782,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_raw_stream_for_test(
             Box::new(peer),
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             Some(Duration::from_millis(225)),
         );
         connection
@@ -1822,7 +1822,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_raw_stream_for_test(
             Box::new(peer),
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             timeout,
         );
         connection.stream.get_mut().set_metering(WireMetering::new(
@@ -1916,7 +1916,7 @@ mod transcript_tests {
             .expect(HELLO, "250 smtp.example\r\n")
             .expect(mail, "550 sender rejected\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let error = connection.send(&envelope, b"body").await.unwrap_err();
@@ -1931,7 +1931,7 @@ mod transcript_tests {
             .expect(rcpt, "550 recipient rejected\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let error = connection.send(&envelope, b"body").await.unwrap_err();
@@ -1947,7 +1947,7 @@ mod transcript_tests {
             .expect("DATA\r\n", "554 no data\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let error = connection.send(&envelope, b"body").await.unwrap_err();
@@ -1962,7 +1962,7 @@ mod transcript_tests {
             .expect(rcpt, "550 recipient rejected\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let error = connection
@@ -1991,7 +1991,7 @@ mod transcript_tests {
         )
         .unwrap();
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2019,7 +2019,7 @@ mod transcript_tests {
             }
             transcript = transcript.expect(terminator, "250 queued\r\n");
             let mut connection =
-                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                     .await
                     .unwrap();
 
@@ -2033,7 +2033,7 @@ mod transcript_tests {
             .expect("\n", "")
             .expect(".\r\n", "250 queued\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         connection
@@ -2074,7 +2074,7 @@ mod transcript_tests {
             Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
 
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         connection.send(&envelope, b"body").await.unwrap();
@@ -2109,7 +2109,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let outcome = connection
@@ -2156,7 +2156,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let outcome = connection
@@ -2204,7 +2204,7 @@ mod transcript_tests {
             })
             .collect();
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2232,7 +2232,7 @@ mod transcript_tests {
             .expect("EHLO client.example\r\n", "250 smtp.example\r\n")
             .expect("NOOP\r\n", "250 noop\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2264,7 +2264,7 @@ mod transcript_tests {
                 "220 go ahead\r\n250 attacker-controlled capabilities\r\n",
             );
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
@@ -2286,7 +2286,7 @@ mod transcript_tests {
             .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
             .expect("STARTTLS\r\n", "220 ready to start tls\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
@@ -2304,7 +2304,7 @@ mod transcript_tests {
             .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
             .expect("STARTTLS\r\n", "454 TLS temporarily unavailable\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
@@ -2329,7 +2329,7 @@ mod transcript_tests {
         let transcript =
             Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2342,7 +2342,7 @@ mod transcript_tests {
         let hello = ClientId::Domain("client.example".to_owned());
         let transcript =
             Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
-        let connection = AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+        let connection = AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
             .await
             .unwrap();
 
@@ -2359,7 +2359,7 @@ mod transcript_tests {
             .expect(HELLO, "250 smtp.example\r\n")
             .expect("NOOP\r\n", "");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2376,7 +2376,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_transcript_with_timeout(
             transcript,
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             Duration::from_secs(5),
         )
         .await
@@ -2407,7 +2407,7 @@ mod transcript_tests {
             .stall_shutdown();
         // `from_transcript` builds the connection with `timeout: None`.
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2458,7 +2458,7 @@ mod transcript_tests {
             .mail_parameter(MailParameter::Body(MailBodyParameter::EightBitMime));
 
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let response = connection
@@ -2481,7 +2481,7 @@ mod transcript_tests {
             address: crate::address::Address::new_dangerous("üser", "example.com"),
         }];
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2527,7 +2527,7 @@ mod transcript_tests {
         let options =
             SendOptions::new().mail_parameter(MailParameter::Body(MailBodyParameter::BinaryMime));
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2553,7 +2553,7 @@ mod transcript_tests {
         .unwrap();
         let options = SendOptions::new().notify([DsnNotify::Failure]).unwrap();
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2585,7 +2585,7 @@ mod transcript_tests {
         )
         .unwrap();
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2626,7 +2626,7 @@ mod transcript_tests {
         )
         .unwrap();
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2668,7 +2668,7 @@ mod transcript_tests {
         .unwrap();
 
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         assert!(
@@ -2688,11 +2688,10 @@ mod transcript_tests {
         let transcript = Transcript::new("220 smtp.example\r\n")
             .expect(HELLO, "250-smtp.example\r\n250- \r\n250 AUTH PLAIN\r\n");
 
-        let error =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
-                .await
-                .err()
-                .expect("whitespace-only EHLO text must be rejected");
+        let error = AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
+            .await
+            .err()
+            .expect("whitespace-only EHLO text must be rejected");
 
         assert!(error.is_parse(), "expected parse error, got {error:?}");
         transcript.assert_exhausted();
@@ -2708,7 +2707,7 @@ mod transcript_tests {
             .expect_generated(scram_enhanced_success_reply)
             .expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2744,7 +2743,7 @@ mod transcript_tests {
             .expect("AQ==\r\n", "235 authenticated\r\n")
             .expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2773,7 +2772,7 @@ mod transcript_tests {
             .expect(plain, "235 authenticated\r\n")
             .expect(HELLO, "250-smtp.example\r\n250 8BITMIME\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -2840,7 +2839,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_transcript_with_peer_certificate(
             transcript.clone(),
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             usable_peer_certificate(),
         )
         .await
@@ -2882,7 +2881,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_transcript_with_peer_certificate(
             transcript.clone(),
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             usable_peer_certificate(),
         )
         .await
@@ -2902,7 +2901,7 @@ mod transcript_tests {
                 mechanism: Some("SCRAM-SHA-256-PLUS")
             })
         );
-        let account = into_account_error(error, SmtpErrorContext::send(Protocol::Smtp));
+        let account = into_account_error(error, SmtpErrorContext::send(Dialect::Smtp));
         assert!(
             matches!(
                 account.kind(),
@@ -2940,7 +2939,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_transcript_with_peer_certificate(
             transcript.clone(),
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             vec![0x30, 0x01, 0x00],
         )
         .await
@@ -2980,7 +2979,7 @@ mod transcript_tests {
             .expect(plain, "235 authenticated\r\n")
             .expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3019,7 +3018,7 @@ mod transcript_tests {
             )
             .expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3047,7 +3046,7 @@ mod transcript_tests {
             )
             .expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3074,7 +3073,7 @@ mod transcript_tests {
                 "535 rejected\r\n",
             );
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3103,7 +3102,7 @@ mod transcript_tests {
             .expect(format!("AUTH OAUTHBEARER {initial}\r\n"), "334 e30=\r\n")
             .expect("AQ==\r\n", "535 rejected\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3130,7 +3129,7 @@ mod transcript_tests {
         let Err(error) = AsyncSmtpConnection::from_transcript_with_timeout(
             Transcript::silent(),
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             Duration::from_millis(50),
         )
         .await
@@ -3151,7 +3150,7 @@ mod transcript_tests {
         let Err(error) = AsyncSmtpConnection::from_transcript_with_timeout(
             transcript,
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             Duration::from_millis(120),
         )
         .await
@@ -3171,7 +3170,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_transcript_with_timeout(
             transcript,
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             Duration::from_millis(50),
         )
         .await
@@ -3193,7 +3192,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_transcript_with_timeout(
             transcript,
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             Duration::from_secs(2),
         )
         .await
@@ -3236,7 +3235,7 @@ mod transcript_tests {
             recipients.clone(),
         )
         .unwrap();
-        let mut connection = AsyncSmtpConnection::from_transcript(clean, &hello, Protocol::Lmtp)
+        let mut connection = AsyncSmtpConnection::from_transcript(clean, &hello, Dialect::Lmtp)
             .await
             .unwrap();
         assert_eq!(
@@ -3267,7 +3266,7 @@ mod transcript_tests {
             );
         let envelope =
             Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
-        let mut connection = AsyncSmtpConnection::from_transcript(surplus, &hello, Protocol::Lmtp)
+        let mut connection = AsyncSmtpConnection::from_transcript(surplus, &hello, Dialect::Lmtp)
             .await
             .unwrap();
         let error = connection
@@ -3301,7 +3300,7 @@ mod transcript_tests {
         }];
 
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         connection
@@ -3350,7 +3349,7 @@ mod transcript_tests {
             Envelope::new(Some("sender@example.com".parse().unwrap()), addresses).unwrap();
 
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         connection
@@ -3393,7 +3392,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Lmtp)
                 .await
                 .unwrap();
         let outcome = connection
@@ -3436,7 +3435,7 @@ mod transcript_tests {
         )
         .unwrap();
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Lmtp)
                 .await
                 .unwrap();
 
@@ -3458,7 +3457,7 @@ mod transcript_tests {
             address: "first@example.com".parse().unwrap(),
         }];
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3524,7 +3523,7 @@ mod transcript_tests {
             .unwrap()
             .recipient_original_recipient(first_recipient, "rfc822", "alias=first@example.com");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3573,7 +3572,7 @@ mod transcript_tests {
             })
             .collect();
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3609,7 +3608,7 @@ mod transcript_tests {
             address: "first@example.com".parse().unwrap(),
         }];
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3673,7 +3672,7 @@ mod transcript_tests {
             })
             .collect();
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3719,7 +3718,7 @@ mod transcript_tests {
         )
         .unwrap();
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Lmtp)
                 .await
                 .unwrap();
 
@@ -3760,7 +3759,7 @@ mod transcript_tests {
             })
             .collect();
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Lmtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Lmtp)
                 .await
                 .unwrap();
 
@@ -3790,7 +3789,7 @@ mod transcript_tests {
             .expect_then_close(HELLO, "250-smtp.example\r\n250 PIPELI");
 
         let Err(error) =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).await
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp).await
         else {
             panic!("a truncated EHLO reply cannot yield a usable connection");
         };
@@ -3809,7 +3808,7 @@ mod transcript_tests {
             .expect(HELLO, "250 smtp.example\r\n")
             .expect_coalesced("NOOP\r\n", "250 noop ok\r\n421 service closing\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3854,7 +3853,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let outcome = connection
@@ -3912,7 +3911,7 @@ mod transcript_tests {
             .expect("body", "")
             .expect("\r\n.\r\n", "554 Message rejected as spam\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3951,7 +3950,7 @@ mod transcript_tests {
             .expect("body", "452 4.3.1 out of storage\r\n")
             .expect("RSET\r\n", "250 reset ok\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -3991,7 +3990,7 @@ mod transcript_tests {
             .expect("body", "")
             .expect("\r\n.\r\n", "421 closing transmission channel\r\n");
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
 
@@ -4034,7 +4033,7 @@ mod transcript_tests {
             .collect();
 
         let mut connection =
-            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Dialect::Smtp)
                 .await
                 .unwrap();
         let outcome = connection
@@ -4088,7 +4087,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_raw_stream_for_test(
             Box::new(peer),
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             Some(Duration::from_secs(10)),
         );
 
@@ -4135,7 +4134,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_raw_stream_for_test(
             Box::new(SlowSinkPeer::new(usize::MAX, Duration::ZERO)),
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             Some(Duration::from_millis(200)),
         );
         // 1000 B/s against a 200 ms timeout. The first write burns the bucket's
@@ -4283,7 +4282,7 @@ mod transcript_tests {
         let mut connection = AsyncSmtpConnection::from_raw_stream_for_test(
             Box::new(SlowSinkPeer::stalled()),
             &hello,
-            Protocol::Smtp,
+            Dialect::Smtp,
             Some(Duration::from_secs(10)),
         );
 

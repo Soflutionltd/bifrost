@@ -705,8 +705,13 @@ two scopes on one host registered two buckets, refcounted both, and could only
 ever debit one - the other was live and unreachable. `attach_account` builds the
 per-host default from the keys that actually REGISTERED (so a rejected
 declaration cannot point requests at a bucket that does not exist), takes the
-first declaration for each host, and `tracing::warn!`s when a host carries more
-than one, naming `quota_scope` as the way to reach the rest. An account that
+first declaration for each host, and records hosts that carry more than one.
+Declaring several scopes on one host is legitimate (Google declares one per API
+surface on `www.googleapis.com`), so attach does not warn: an operator would see
+noise on every correctly configured attach. Instead `resolve_quota_scope`
+`tracing::warn!`s per request when a request reaches such a host WITHOUT an
+explicit `quota_scope`, the one case that silently debits the first-declared
+bucket, naming `quota_scope` as the way to reach the rest. An account that
 talks to one host under two quotas - the Gmail per-project and per-user shape -
 must say which per request; the declaration order cannot know.
 

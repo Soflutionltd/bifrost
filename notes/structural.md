@@ -1869,26 +1869,6 @@ inside-out, with `Role::None` a wire entry serializing as `""`. Proposal: finish
 `Field<T>`, delete the five `skip_if_*` helpers and `Role::None`, and give
 membership sets their own create/patch type (BUG-061).
 
-## STR-085 - JMAP creation ids and creation references are strings minted in six places
-
-**Reported by:** jmap-protocol.
-
-`SetCreate::create_id` returns `format!("c{id}")` in every object module (eleven
-hand-copied impls plus the macro one); `SetRequest::create` / `create_item` use
-`next_auto_create_id`, whose comment records the collision bug length-based
-assignment caused; `EmailImportRequest::email` mints `i{len}` (length-based);
-`BlobUploadRequest::create_from_*` mints `b{len}` (length-based, the scheme
-`next_auto_create_id` replaced - safe only because no `create_with_id` exists
-there). References (`#c0`) are built with `format!("#{}")` in
-`email_submission/set.rs` (two sites) and `sieve/set.rs`, and in `mailbox/set.rs`
-the reference is minted INTO a server-id type: `MailboxId::new(format!("#{parent_id_ref}"))`,
-`SieveScriptId::new(format!("#..."))`, defeating the `Id<T>` phantom.
-`email_submission::SetArguments`'s doc has the convention backwards. Proposal: a
-`CreationId` newtype in `core/` minted only by the request owning the create map,
-with `.reference() -> CreationRef` (serializes `#cid`), and `IdOrRef<T>` for the
-fields RFC 8620 lets take a reference (`parentId`, `emailId`,
-`onSuccessUpdateEmail` keys, `onSuccessActivateScript`).
-
 ## STR-086 - JMAP states are all `String`; the typed `State` alias is dead
 
 **Reported by:** jmap-protocol.
@@ -2063,27 +2043,6 @@ members, and `client_ws.rs` reaches into `Request`'s `pub(crate)` `using` /
 watch), the transport, and a `WsConnection` (sink, ids, pending, generation)
 owned by the push layer; the request envelope has one encoder both doors call,
 with the WS frame wrapping it.
-
-## STR-093 - JMAP `Principal` mixes RFC and vendor-admin shapes
-
-**Reported by:** jmap-protocol.
-
-`principal/mod.rs::Principal` mixes RFC 9670 (`accounts`, `capabilities`) with a
-server-admin dialect (`secret`, `dkim`, `quota`, `members`, `acl`, principal types
-`domain` and `list`). If the admin dialect is wanted it belongs in its own type
-behind its own capability, so the RFC object decodes strictly (and BUG-062 would
-have been caught).
-
-## STR-094 - JMAP rights vocabularies live in the wrong module
-
-**Reported by:** jmap-protocol.
-
-`principal::ACL` is the Mailbox `shareWith` rights vocabulary (RFC 9670 section 4
-applied to RFC 8621 mailboxes) but lives in the principal module and is imported
-by `mailbox`. `mailbox::MailboxRights` is the same vocabulary again as a struct of
-bools and lacks `mayShare`, which RFC 9670 adds to `myRights`, so a sharing-aware
-caller cannot read it. Move `ACL` next to `Mailbox` and derive `MailboxRights` from
-it.
 
 ## STR-095 - JMAP test layout mirrors review history
 
@@ -2320,33 +2279,6 @@ eventual_consistency)` - use `reqwest::Method` and `RequestOptions { prefer,
 consistency }`. `execute_aux` takes a `Resource` only to `debug_assert!` it is
 `Unmetered`. `throttle_scope_for(_ctx)` ignores its argument and returns a
 constant.
-
-## STR-110 - Graph subscription expiry is a `String` re-parsed on every tick
-
-**Reported by:** graph.
-
-`GraphSubscriptionState::expires_at: String` is re-parsed by
-`webhooks::check_expiry` on every 10-minute pass; `ExpiryCheck::Unparseable` and the
-`warned_unparseable_expiry` latch exist only because the parse is deferred. Parse
-at receipt (`create_subscription` and `renew_subscription` return a
-`jiff::Timestamp`), classifying an unparseable answer once as the provider
-contract violation it is.
-
-## STR-111 - The Graph flag vocabulary is string literals with two alias tables
-
-**Reported by:** graph.
-
-`"\\seen"`, `"\\flagged"` and the case-sensitive `"category:"` prefix are spelled
-independently in `mutate` (`graph_flag_field`, `categories_from_flags`,
-`graph_flag_target`), `get::flags_from_value` and `get::ews_flags`,
-`inventory::tracked_flags_hash` (a different pseudo-flag spelling, `isread=`,
-`flag=`), and `pim::messages`. `graph_flag_field` is documented as "the single
-alias table", but `pim::messages::is_starred_category` is a second one (`$flagged`,
-`\flagged`, `flagged`, `starred`) that differs: it adds `$flagged` and lacks
-`\seen`/`read`. Proposal: `GraphFlag { Read, Flagged, Category(String) }` with
-`parse(&str)` and `token()`, used by both the write and read projections, with the
-starred-category sentinel one variant of the same parse. Related: STR-004,
-BUG-026.
 
 ## STR-112 - The recurrence rule is a `String` that three crates each parse
 
@@ -2633,25 +2565,6 @@ vacation; thread and message hydration; `MailDocument`. Suggested split:
 `compose.rs` (send, drafts, `MailDocument`), `hydrate.rs` (Message and Thread over
 the shared MIME selector), `search.rs` (with one query encoder, CON-053),
 `settings.rs`. The same shape in IMAP and JMAP is STR-079 and STR-104.
-
-## STR-132 - The SMTP/LMTP dialect travels as the error-model `Protocol` enum
-
-**Reported by:** smtp-sasl.
-
-`SmtpInfo::protocol`, `SmtpConnection`/`AsyncSmtpConnection::protocol`,
-`SendProgress::protocol`, `SmtpErrorContext::protocol` and
-`ConnectionOptions::protocol` carry `bifrost_types::error::Protocol` (Imap, Jmap,
-Graph, ...), not a two-valued wire dialect. `SmtpErrorContext::send` opens with
-`assert!(matches!(protocol, Protocol::Smtp | Protocol::Lmtp))`; `SmtpInfo::new`
-and `SmtpInfo::ensure_can_authenticate` each carry a `_ => SMTP_PORT` / `_ =>
-"SMTP"` arm meaning "an IMAP-tagged transport, treat it as SMTP";
-`SendProgress::resolve` has a `debug_assert!(protocol == Protocol::Smtp)` because
-SMTP and LMTP resolve `Accepted` differently. And `SmtpErrorContext` has four
-fields (`operation`, `provider`, `idempotency_override`, `transmission_state`) that
-the only constructor, `send()`, always sets to the same constants - a `Dialect` in
-disguise. Proposal: a crate-local `enum Dialect { Smtp, Lmtp }` (or a type
-parameter, STR-140) with `impl From<Dialect> for Protocol` used only at the
-account-error boundary.
 
 ## STR-133 - SASL errors are prose; SCRAM server errors carry a magic prefix
 
@@ -2972,18 +2885,6 @@ migration; do them as one change that also edits the consumers.
 The engine's retry loops now share `ReconnectBackoff`, but their named policies
 are lazy statics because `bifrost_types::BackoffPolicy` cannot be built in a
 `const`. A `const fn` constructor lets each policy be a plain `const`.
-
-## STR-149 - The DAV cursor carries two version axes and a duplicated collection URL
-
-**Reported by:** net-dav.
-
-The magic bytes carry a version (`CALDAVET1`, `CDAVCTAG1`), and
-`OpaqueChangeState.envelope_version` carries another, set from a
-`CURSOR_ENVELOPE_VERSION = 2` constant repeated in each crate. The collection URL is
-stored both in the `CursorScope::Folder` and in the cursor bytes, and cross-checked
-with `same_dav_url` on every decode. And `token: Option<String>` is a sync-token in
-one dialect and a getctag in the other. Related: BUG-073, STR-007, and Graph's twin
-storage of the folder id (STR-105).
 
 ## STR-150 - A DAV collection is a `CursorScope::Folder`, so IMAP resolves ownership by string collision
 

@@ -280,7 +280,7 @@ async fn run_qresync(
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
     let selected = match account
-        .select_folder(&mut conn, &folder, Some(&cursor), true)
+        .select_folder(&mut conn, &folder, super::SelectPurpose::Sync(&cursor))
         .await
     {
         Ok(selected) => selected,
@@ -461,7 +461,7 @@ async fn run_condstore_with_baseline(
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
     let selected = account
-        .select_folder(&mut conn, &folder, Some(&cursor), true)
+        .select_folder(&mut conn, &folder, super::SelectPurpose::Sync(&cursor))
         .await
         .map_err(|err| select_error(&account, &folder, err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
@@ -616,7 +616,7 @@ async fn run_basic(
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
     let selected = account
-        .select_folder(&mut conn, &folder, Some(&cursor), true)
+        .select_folder(&mut conn, &folder, super::SelectPurpose::Sync(&cursor))
         .await
         .map_err(|err| select_error(&account, &folder, err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;

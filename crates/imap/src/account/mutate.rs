@@ -148,7 +148,7 @@ pub(super) fn mutation_stream(
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     tokio::spawn(async move {
-        let move_destination = match validated_move_destination(&kind) {
+        let move_destination = match validated_move_destination(&account.dav_scopes, &kind) {
             Ok(destination) => destination,
             Err(error) => {
                 // Request validation failed for every target, so the outcomes
@@ -364,16 +364,20 @@ fn sort_mutation_group_entries(
 /// Validate a bulk-move destination before opening any source folder. This
 /// is our own request validation, so every submitted target must fail rather
 /// than being labelled uncertain by the per-folder error path.
-fn validated_move_destination(kind: &MutationKind) -> Result<Option<MailboxName>, AccountError> {
+fn validated_move_destination(
+    dav_scopes: &super::DavScopeIndex,
+    kind: &MutationKind,
+) -> Result<Option<MailboxName>, AccountError> {
     let MutationKind::Move(destination) = kind else {
         return Ok(None);
     };
     let MembershipScope::Folder(destination) = destination else {
         return Err(invalid_move_destination_error());
     };
-    MailboxName::from_account_id(&destination.0)
+    dav_scopes
+        .imap_mailbox(destination)
         .map(Some)
-        .map_err(|_| invalid_move_destination_error())
+        .ok_or_else(invalid_move_destination_error)
 }
 
 /// A folder-level mutation failure that happened before any of the folder's
@@ -410,7 +414,7 @@ async fn open_folder_for_mutation(
     // as the opportunistic STORE guard rather than refreshing it from a
     // mutation's own QRESYNC SELECT before testing for a conflict.
     let selected = account
-        .select_folder(&mut conn, folder, None, false)
+        .select_folder(&mut conn, folder, super::SelectPurpose::Mutate)
         .await
         .map_err(|error| FolderOpenFailure {
             bytes_in: conn
@@ -1983,11 +1987,30 @@ mod tests {
     }
 
     #[test]
+    fn dav_owned_bulk_move_destination_is_rejected_before_folder_work() {
+        let destination = bifrost_types::FolderId("https://dav.example.test/books/".into());
+        let (index, _) = super::super::DavScopeIndex::build(
+            vec![destination.clone()],
+            Vec::new(),
+            &std::collections::HashSet::new(),
+        );
+        let kind = MutationKind::Move(MembershipScope::Folder(destination));
+        let error = validated_move_destination(&index, &kind)
+            .expect_err("mail cannot be moved into a DAV collection");
+        assert_eq!(error.operation(), Some(AccountOperation::BulkMove));
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+    }
+
+    #[test]
     fn invalid_bulk_move_destination_is_rejected_before_folder_work() {
         let kind = MutationKind::Move(MembershipScope::Folder(bifrost_types::FolderId(
             "IN\r\nBOX".to_owned(),
         )));
-        let err = validated_move_destination(&kind).expect_err("CRLF cannot be sent as a mailbox");
+        let err = validated_move_destination(&super::super::DavScopeIndex::default(), &kind)
+            .expect_err("CRLF cannot be sent as a mailbox");
         assert!(matches!(
             err.kind(),
             AccountErrorKind::Request(RequestErrorKind::Malformed)

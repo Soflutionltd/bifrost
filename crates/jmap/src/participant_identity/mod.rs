@@ -52,7 +52,7 @@ pub(crate) struct ParticipantIdentity {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ParticipantIdentityCreate {
     #[serde(skip)]
-    pub(super) _create_id: Option<usize>,
+    pub(super) _create_id: Option<crate::core::creation::CreationId>,
 
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,10 +112,13 @@ impl crate::core::set::SetObject for ParticipantIdentity {
 
 impl crate::core::SetCreate for ParticipantIdentityCreate {
     fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
+        self._create_id.as_ref().map(ToString::to_string)
+    }
+    fn set_create_id(&mut self, id: crate::core::creation::CreationId) {
+        self._create_id = Some(id);
     }
 
-    fn new(create_id: Option<usize>) -> Self {
+    fn new(create_id: Option<crate::core::creation::CreationId>) -> Self {
         ParticipantIdentityCreate {
             _create_id: create_id,
             name: None,

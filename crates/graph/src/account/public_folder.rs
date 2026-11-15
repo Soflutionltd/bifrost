@@ -1112,10 +1112,14 @@ pub(crate) fn public_folder_inventory_stream(
         };
 
         let Some(routing) = account.public_folder_routing(&folder).await else {
-            let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
-                .with_scope(ErrorScope::Cursor(scope.clone()));
-            yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
-                super::cursor::CursorError::Unsupported, ctx));
+            yield bifrost_types::InventoryEvent::Terminated(
+                account.missing_public_collection_route_error(
+                    AccountOperation::SyncInventory,
+                    &folder,
+                    ErrorScope::Cursor(scope.clone()),
+                    bifrost_types::ResourceKind::Mailbox,
+                    &folder.0,
+                ));
             return;
         };
         let owner = MailboxId(routing.anchor_mailbox.clone());
@@ -1477,6 +1481,10 @@ pub(crate) fn public_folder_changes_stream(
             return;
         };
 
+        // A resumed poll already owns durable routing in its cursor. Do not
+        // gate it on the discovery map: an Outlook user expects a saved public
+        // folder to keep syncing while hierarchy discovery is unavailable.
+        // Live EWS errors remain authoritative for a vanished folder.
         let owner = MailboxId(pf.routing.anchor_mailbox.clone());
         let folder = FolderId(pf.folder_id.clone());
 

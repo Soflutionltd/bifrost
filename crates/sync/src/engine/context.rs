@@ -172,7 +172,6 @@ impl SlotContext {
             control: &self.control,
             account_control_tx: &self.account_control_tx,
             throttles: &self.throttles,
-            boundary_tx: &self.boundary_tx,
             capabilities: &self.capabilities,
             subscriptions: &self.subscriptions,
             account_generation_tx: &self.account_generation_tx,

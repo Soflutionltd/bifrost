@@ -26,7 +26,8 @@ use super::common::*;
 use super::hydrate::*;
 use super::threads::*;
 
-pub(super) const STARRED_CATEGORY: &str = "$flagged";
+#[cfg(test)]
+pub(super) use crate::account::flags::STARRED_CATEGORY;
 pub(super) const PR_LAST_VERB_EXECUTED_ALIAS: &str = "PR_LAST_VERB_EXECUTED";
 pub(super) const PR_LAST_VERB_EXECUTED_GRAPH_ID: &str = "Integer 0x1081";
 
@@ -299,10 +300,7 @@ pub(super) fn graph_importance_body(level: Importance) -> Value {
 }
 
 pub(super) fn is_starred_category(category: &str) -> bool {
-    category.eq_ignore_ascii_case(STARRED_CATEGORY)
-        || category.eq_ignore_ascii_case("\\flagged")
-        || category.eq_ignore_ascii_case("flagged")
-        || category.eq_ignore_ascii_case("starred")
+    crate::account::flags::GraphFlag::is_starred_category(category)
 }
 
 pub(super) fn categories_from_value(value: &Value) -> Vec<String> {

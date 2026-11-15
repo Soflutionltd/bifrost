@@ -1959,9 +1959,25 @@ fn resolve_quota_scope(
 ) -> String {
     match override_ {
         Some(scope) => scope.to_owned(),
-        None => host
-            .map_or("", |host| account.rate_scope_for(host))
-            .to_owned(),
+        None => {
+            // Only an unscoped request to a multi-scope host is ambiguous.
+            // Warn here, per request, rather than at attach: an operator
+            // should hear about the misrouted request, not about a correct
+            // per-surface declaration.
+            if let Some(host) = host
+                && account.has_ambiguous_rate_scope(host)
+            {
+                tracing::warn!(
+                    host = %host,
+                    default_scope = %account.rate_scope_for(host),
+                    "request reached a host with several declared quota scopes \
+                     without RequestBuilder::quota_scope; debiting the \
+                     first-declared scope",
+                );
+            }
+            host.map_or("", |host| account.rate_scope_for(host))
+                .to_owned()
+        }
     }
 }
 

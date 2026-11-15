@@ -65,7 +65,6 @@ impl Fixture {
             control: &slot.control,
             account_control_tx: &slot.account_control_tx,
             throttles: &slot.throttles,
-            boundary_tx: &slot.boundary_tx,
             capabilities: &slot.capabilities,
             subscriptions: &self.engine.subscriptions,
             account_generation_tx: &slot.account_generation_tx,

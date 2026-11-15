@@ -90,6 +90,11 @@ impl GraphSubscriptionGroup {
 #[derive(Debug, Clone)]
 pub(crate) struct GraphSubscriptionState {
     pub(crate) server_id: String,
+    // Retain malformed server expiry alongside server_id, rather than fail
+    // creation before registration and orphan a subscription with a known id.
+    // Outlook users expect push to recover: the renewal fallback keeps coverage
+    // alive and this row reachable for close/unsubscribe. Parse-at-receipt must
+    // first preserve both properties on its failure path.
     pub(crate) expires_at: String,
     pub(crate) resource: String,
     /// The cursor scopes this one subscription covers.

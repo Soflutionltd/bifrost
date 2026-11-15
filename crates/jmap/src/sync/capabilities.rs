@@ -123,6 +123,8 @@ pub(crate) struct CoreLimits {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PimSupport {
+    /// The derived session upload template is usable.
+    pub(crate) attachment_upload: bool,
     pub(crate) submission: bool,
     /// `urn:ietf:params:jmap:submission` `maxDelayedSend` (seconds).
     /// `> 0` means the server accepts FUTURERELEASE hold parameters and
@@ -303,7 +305,7 @@ pub(crate) fn build(
             set_importance: true,
             set_is_read: true,
             send_message: support.submission,
-            attachment_upload: true,
+            attachment_upload: support.attachment_upload,
             host_attachment: false,
             draft_create: true,
             draft_update: true,
@@ -427,6 +429,7 @@ mod tests {
         let (caps, limits) = build(
             &session,
             PimSupport {
+                attachment_upload: true,
                 submission: true,
                 max_delayed_send: 0,
                 foreign_submission: false,
@@ -515,6 +518,7 @@ mod tests {
         let err = build(
             &session,
             PimSupport {
+                attachment_upload: true,
                 submission: false,
                 max_delayed_send: 0,
                 foreign_submission: false,
@@ -574,6 +578,7 @@ mod tests {
     /// A server that advertises none of the optional PIM families.
     fn no_pim_support() -> PimSupport {
         PimSupport {
+            attachment_upload: true,
             submission: false,
             max_delayed_send: 0,
             foreign_submission: false,
@@ -589,6 +594,16 @@ mod tests {
     /// does not support push) there is no in-process push channel, and
     /// the engine must be told so rather than subscribing into a
     /// transport that cannot deliver.
+    #[test]
+    fn unusable_upload_template_disables_only_attachment_upload() {
+        let mut support = no_pim_support();
+        support.attachment_upload = false;
+        let (caps, _) = build(&session_with(256, false), support).unwrap();
+        assert!(!caps.pim_methods.attachment_upload);
+        assert!(caps.pim_methods.draft_create);
+        assert!(caps.pim_methods.message_hydrate);
+    }
+
     #[test]
     fn a_session_without_websocket_push_advertises_no_push() {
         let (caps, _) = build(&session_with(256, false), no_pim_support()).unwrap();
@@ -1104,6 +1119,7 @@ mod tests {
 
     fn pim_support(max_delayed_send: usize) -> PimSupport {
         PimSupport {
+            attachment_upload: true,
             submission: true,
             max_delayed_send,
             foreign_submission: false,

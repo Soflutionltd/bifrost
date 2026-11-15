@@ -1,6 +1,7 @@
 use super::{ACLPatch, MailboxCreate, MailboxId, MailboxPatch, Role, SetArguments};
+use crate::core::creation::{CreationId, IdOrRef};
 use crate::core::field::Field;
-use crate::principal::ACL;
+use crate::mailbox::ACL;
 use std::collections::HashMap;
 
 impl MailboxCreate {
@@ -10,12 +11,14 @@ impl MailboxCreate {
     }
 
     pub(crate) fn parent_id(&mut self, parent_id: Option<impl Into<MailboxId>>) -> &mut Self {
-        self.parent_id = parent_id.map(std::convert::Into::into);
+        self.parent_id = parent_id.map(|id| IdOrRef::Id(id.into()));
         self
     }
 
     pub(crate) fn parent_id_ref(&mut self, parent_id_ref: &str) -> &mut Self {
-        self.parent_id = Some(MailboxId::new(format!("#{parent_id_ref}")));
+        self.parent_id = Some(IdOrRef::Reference(
+            CreationId::named(parent_id_ref).reference(),
+        ));
         self
     }
 
@@ -61,14 +64,16 @@ impl MailboxPatch {
 
     pub(crate) fn parent_id(&mut self, parent_id: Option<impl Into<MailboxId>>) -> &mut Self {
         self.parent_id = match parent_id {
-            Some(parent_id) => Field::Value(parent_id.into()),
+            Some(parent_id) => Field::Value(IdOrRef::Id(parent_id.into())),
             None => Field::Null,
         };
         self
     }
 
     pub(crate) fn parent_id_ref(&mut self, parent_id_ref: &str) -> &mut Self {
-        self.parent_id = Field::Value(MailboxId::new(format!("#{parent_id_ref}")));
+        self.parent_id = Field::Value(IdOrRef::Reference(
+            CreationId::named(parent_id_ref).reference(),
+        ));
         self
     }
 

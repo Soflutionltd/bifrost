@@ -164,7 +164,8 @@ impl BlobUploadRequest {
         text: impl Into<String>,
         type_: Option<impl Into<String>>,
     ) -> String {
-        let create_id = format!("b{}", self.create.len());
+        let create_id =
+            crate::core::creation::CreationId::next('b', Some(&self.create)).into_string();
         self.create.insert(
             create_id.clone(),
             BlobUploadCreate {
@@ -181,7 +182,8 @@ impl BlobUploadRequest {
         base64: impl Into<String>,
         type_: Option<impl Into<String>>,
     ) -> String {
-        let create_id = format!("b{}", self.create.len());
+        let create_id =
+            crate::core::creation::CreationId::next('b', Some(&self.create)).into_string();
         self.create.insert(
             create_id.clone(),
             BlobUploadCreate {
@@ -203,7 +205,8 @@ impl BlobUploadRequest {
         length: Option<u64>,
         type_: Option<impl Into<String>>,
     ) -> String {
-        let create_id = format!("b{}", self.create.len());
+        let create_id =
+            crate::core::creation::CreationId::next('b', Some(&self.create)).into_string();
         self.create.insert(
             create_id.clone(),
             BlobUploadCreate {
@@ -225,7 +228,8 @@ impl BlobUploadRequest {
         data: Vec<DataSource>,
         type_: Option<impl Into<String>>,
     ) -> String {
-        let create_id = format!("b{}", self.create.len());
+        let create_id =
+            crate::core::creation::CreationId::next('b', Some(&self.create)).into_string();
         self.create.insert(
             create_id.clone(),
             BlobUploadCreate {

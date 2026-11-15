@@ -45,10 +45,16 @@ async fn routing(
         .await
         .map(|route| route.headers())
         .ok_or_else(|| {
-            graph_error::stale_local_state_error(
+            account.missing_public_collection_route_error(
                 operation,
+                &FolderId(folder.to_string()),
                 ErrorScope::ContactCollection,
-                format!("public contact folder {folder} has no routing entry"),
+                // Contact, matching what `ContactCollection.resource()`
+                // reports: an Outlook user sees a vanished address book in
+                // the contacts UI, so a consumer routing on either the kind
+                // or the scope must reach the same contacts handling.
+                bifrost_types::ResourceKind::Contact,
+                folder,
             )
         })
 }

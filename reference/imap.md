@@ -105,7 +105,7 @@ requires protected PartialCommit reconciliation with CheckTarget and ObserveOnly
 without dedupe. This changes the fallback error shape from the former bare leaf;
 no error classification or transmission evidence is invented.
 
-APPEND resolves APPENDLIMIT (RFC 7889) before writing anything: a numeric `APPENDLIMIT=<n>` capability is a global limit, a bare `APPENDLIMIT` sends a preflight `STATUS <mailbox> (APPENDLIMIT)`, and a server advertising both gets the most restrictive of the two. The STATUS reply is read from `items` *and* `ambiguous`, since NOTIFY STATUS makes the solicited reply wire-identical to a notification. Because that STATUS is a preflight, its failures are restamped `TransmissionState::Unsent` relative to the APPEND, as is a deadline that expires before submission: APPEND is non-idempotent, and leaking the helper's `InFlight` / `Acknowledged` evidence would send `DraftCreate` recovery down the reconcile path for a message no server ever saw.
+APPEND resolves APPENDLIMIT (RFC 7889) before writing anything. The policy is read in one place, `ServerProfile::append_limit` (`AppendLimitPolicy`), which the profile, APPEND enforcement and the STATUS `APPENDLIMIT` item gate all share: a numeric `APPENDLIMIT=<n>` capability is `Limit(n)`, a global limit; a bare `APPENDLIMIT` is `PerMailbox { global_ceiling }` and sends a preflight `STATUS <mailbox> (APPENDLIMIT)`; a server advertising both keeps the numeric value as `global_ceiling`, and enforcement applies the minimum of that ceiling and the mailbox value, so the size check and the displayed policy agree. The STATUS preflight and the APPEND submission share one absolute deadline rather than each starting a fresh timeout. The STATUS reply is read from `items` *and* `ambiguous`, since NOTIFY STATUS makes the solicited reply wire-identical to a notification. Because that STATUS is a preflight, its failures are restamped `TransmissionState::Unsent` relative to the APPEND, as is a deadline that expires before submission: APPEND is non-idempotent, and leaking the helper's `InFlight` / `Acknowledged` evidence would send `DraftCreate` recovery down the reconcile path for a message no server ever saw.
 
 ## Connection state machine
 
@@ -325,8 +325,9 @@ that command's bytes (the server has ended its parsing state, so the remainder
 would read as a new command) and the batch continues. A tagged `OK` there is
 the same non-fatal `ProtocolMissing` as outside a pipeline, recorded in that
 command's result slot (the consumer is discarded, never finalized, because
-finalizing would report success for a command that never ran; its pre-effects
-such as a NOTIFY registration are skipped) and the remainder abandoned like a
+finalizing would report success for a command that never ran; its own NOTIFY
+registration is disarmed by tag, leaving the other commands' pending
+registrations in place) and the remainder abandoned like a
 `NO`. It is safe because the send phase is sequential while a literal is
 synchronizing: the only batch bytes on the wire are earlier commands (complete)
 and this command's first line, and no later command has been written for the
@@ -401,7 +402,18 @@ layer of the stream, so a departing caller withdraws it instead (see
 Which ongoing NOTIFY response types a registration can produce is derived in
 one place, `types::notify::NotifyFlags`, built directly from the
 `NotifySetParams` (`From<&NotifySetParams>`); the STATUS indicator only asks
-for the initial snapshot and sets no ongoing flag. LIST-EXTENDED derives its
+for the initial snapshot and sets no ongoing flag. The flags a NOTIFY SET or
+NOTIFY NONE will install are armed before the command is sent, on both the
+single-command and the pipeline path (`ProtocolState::arm_notify`), keyed by
+that command's tag; only that tag's tagged `OK` installs them, so two
+registrations in one pipeline cannot consume each other's effect. A
+NOTIFICATIONOVERFLOW (untagged or as a tagged response code) clears the active
+flags and every pending registration: an enterprise client must fall back to
+polling rather than assume push survived a server-reported loss. A tagged `OK`
+that arrives before a synchronizing literal was granted disarms only that
+command's NOTIFY effect (`disarm_notify` in the pipeline router; the
+single-command path clears all pending effects, which is the same thing with
+one command on the wire). LIST-EXTENDED derives its
 marker-filtering policy inside its consumer from the selection options
 (`ListExtendedConsumer::new`): with SUBSCRIBED, `\NonExistent` / `\NoAccess`
 are legitimate solicited results and are not reclassified as NOTIFY events,
@@ -886,7 +898,7 @@ race cannot be closed by this client.
   `imapthread1`/`imapthread2` handles retain their explicit UID snapshot
   semantics and remain the fallback when neither key exists.
 - Search messages: UID SEARCH across selectable folders, `SearchFilter::In` restricting the selected mailbox. Thread search is advertised only with `THREAD=REFERENCES`, returning synthetic thread ids containing folder, UIDVALIDITY, and member UIDs.
-- Search paging (`pim::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. A changed UIDVALIDITY on the cursor's folder fails `ConcurrencyConflict` (repeat the walk); an undecodable cursor, a cursor outside the `SearchFilter::In` restriction, and a zero limit are `Request(Malformed)`. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
+- Search paging (`pim::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. An undecodable cursor and a cursor outside the `SearchFilter::In` restriction are `Request(Malformed)` with cause `InvalidArgument { field: Some("page_cursor") }`, the shared signal (JMAP uses it too) to restart from page one. A changed UIDVALIDITY on the cursor's folder stays `ConcurrencyConflict` (repeat the walk), scoped to that folder's cursor: the cursor was valid when issued and the server replaced the mailbox under it, and `Malformed` would derive ClientBug and report a server-side epoch change as an application defect. An Outlook user whose mailbox was rebuilt expects the search to simply run again; a consumer restarts paging on either error. How UIDVALIDITY changes are classified elsewhere in the account is a separate open question. A zero limit is `Request(Malformed)` without that cursor marker. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
 - Containers: LIST-backed enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE (checks `STATUS MESSAGES`, refuses non-empty mailboxes).
 - Quota: `GETQUOTAROOT`, mapped from STORAGE units to bytes when QUOTA is advertised. The account probes the Inbox role when it exists; otherwise it chooses the first selectable folder by display name, wire octets, and encoding mode. Hydration: one-shot message FETCH and synthetic thread hydration.
 - Draft create/discard: APPEND to Drafts with `\Draft` when a delimiter-aware Drafts role and UIDPLUS or active IMAP4rev2 are present (create returns the APPENDUID-derived id); discard is advertised on every server and removes through the shared removal path above. Draft bodies use the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles rejected as `AttachmentUpload`), preserving the `Bcc:` header in the saved draft.
@@ -1611,3 +1623,18 @@ retains its one-or-two-digit day syntax; APPEND retains its fixed-width syntax.
 Envelope Message-ID and In-Reply-To extraction delegates to the shared MIME
 HeaderMap parser, so quoted or commented angle brackets cannot displace a
 structural identifier.
+
+## SELECT purpose and mail membership admission
+
+Account SELECT callers pass `SelectPurpose`: `Sync(cursor)` for the three
+changes strategies, `Read` for inventory, hydration, raw reads, polling and
+PIM reads, and `Mutate` for writes. Only `Sync` may carry QRESYNC parameters.
+Hydration and raw reads do not consume replay payloads or advance checkpoints,
+so they must not request cached changes that would be discarded.
+
+Bulk mail moves validate destination ownership before opening any source
+folder. `DavScopeIndex::imap_mailbox` rejects DAV-owned collections and invalid
+mailbox ids, and provides the canonical mailbox identity for both move
+admission and membership throttle keys. Enterprise users expect a mail move
+into an address book or calendar to fail locally without mail effects at that
+collection's URL. Valid IMAP destinations retain their existing move behavior.

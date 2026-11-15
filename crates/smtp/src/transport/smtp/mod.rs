@@ -197,7 +197,25 @@ pub(crate) use self::client::WireMetering;
 // pub: the "no cap" sentinel for `bandwidth_metering`.
 pub use self::client::UNLIMITED_BANDWIDTH;
 
-pub(crate) use bifrost_types::error::Protocol;
+/// Wire dialect used by SMTP transport configuration and protocol machines.
+/// Other account protocols cannot configure an SMTP connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Dialect {
+    /// SMTP has one final status for all accepted recipients.
+    Smtp,
+    /// LMTP has one final status per accepted recipient.
+    Lmtp,
+}
+
+impl From<Dialect> for bifrost_types::error::Protocol {
+    fn from(dialect: Dialect) -> Self {
+        match dialect {
+            Dialect::Smtp => Self::Smtp,
+            Dialect::Lmtp => Self::Lmtp,
+        }
+    }
+}
 
 #[cfg(feature = "tokio")]
 // pub: async SMTP and LMTP transports are the tokio user-facing API.
@@ -231,6 +249,9 @@ mod async_transport;
 // pub: users select credential kinds and explicit SASL mechanisms.
 pub mod authentication;
 mod batch;
+
+// pub: composed accounts share the SMTP-owned submission interpretation.
+pub use batch::{SubmissionStatus, submission_status};
 mod client;
 mod commands;
 mod connection_url;
@@ -283,12 +304,12 @@ pub enum PortTls {
 
 /// Default TCP port shared by transport builders, URLs and composed accounts.
 /// LMTP has no assigned TLS ports and retains its deployed port 24 convention.
-pub const fn default_port(protocol: Protocol, tls: PortTls) -> u16 {
+pub const fn default_port(protocol: Dialect, tls: PortTls) -> u16 {
     match (protocol, tls) {
-        (Protocol::Lmtp, _) => LMTP_PORT,
-        (_, PortTls::Plaintext) => SMTP_PORT,
-        (_, PortTls::StartTls) => SUBMISSION_PORT,
-        (_, PortTls::Implicit) => SUBMISSIONS_PORT,
+        (Dialect::Lmtp, _) => LMTP_PORT,
+        (Dialect::Smtp, PortTls::Plaintext) => SMTP_PORT,
+        (Dialect::Smtp, PortTls::StartTls) => SUBMISSION_PORT,
+        (Dialect::Smtp, PortTls::Implicit) => SUBMISSIONS_PORT,
     }
 }
 
@@ -311,7 +332,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 struct SmtpInfo {
     /// Wire protocol used for this connection.
-    protocol: Protocol,
+    protocol: Dialect,
     /// Name sent during EHLO
     hello_name: ClientId,
     /// Server we are connecting to
@@ -346,9 +367,9 @@ struct SmtpInfo {
 impl Default for SmtpInfo {
     fn default() -> Self {
         Self {
-            protocol: Protocol::Smtp,
+            protocol: Dialect::Smtp,
             server: "localhost".to_owned(),
-            port: default_port(Protocol::Smtp, PortTls::Plaintext),
+            port: default_port(Dialect::Smtp, PortTls::Plaintext),
             unix_socket: None,
             hello_name: ClientId::default(),
             credentials: None,
@@ -370,7 +391,7 @@ enum MechanismChoice {
 }
 
 impl SmtpInfo {
-    fn new<T: Into<String>>(server: T, protocol: Protocol) -> Self {
+    fn new<T: Into<String>>(server: T, protocol: Dialect) -> Self {
         let port = default_port(protocol, PortTls::Plaintext);
         Self {
             protocol,
@@ -403,9 +424,8 @@ impl SmtpInfo {
             Ok(())
         } else {
             let protocol = match self.protocol {
-                Protocol::Smtp => "SMTP",
-                Protocol::Lmtp => "LMTP",
-                _ => "SMTP",
+                Dialect::Smtp => "SMTP",
+                Dialect::Lmtp => "LMTP",
             };
             Err(error::policy(format!(
                 "refusing to authenticate over an unencrypted {protocol} connection"

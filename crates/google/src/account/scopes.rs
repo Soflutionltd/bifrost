@@ -51,14 +51,14 @@ impl ScopeSnapshot {
 
 pub(crate) struct ScopeCacheState {
     snapshot: RwLock<ScopeSnapshot>,
-    refresh: Mutex<()>,
+    refresh: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl ScopeCacheState {
     pub(crate) fn new(snapshot: ScopeSnapshot) -> Self {
         Self {
             snapshot: RwLock::new(snapshot),
-            refresh: Mutex::new(()),
+            refresh: Mutex::new(None),
         }
     }
 }
@@ -332,13 +332,21 @@ pub(crate) async fn scope_snapshot_or_refresh(
         return Ok(current);
     }
 
-    let _refresh = cache.refresh.lock().await;
+    let mut refresh = cache.refresh.lock().await;
     let current = snapshot(cache);
     if !current.is_stale() {
         return Ok(current);
     }
 
-    match refresh_scope_snapshot_locked(client, cache).await {
+    // Reuse known folders during the failure cooldown. With no vocabulary,
+    // wait for admission instead: inventing an empty label set could make a
+    // user's flag edit silently do nothing.
+    if current.fetched_at.is_some()
+        && refresh.is_some_and(|deadline| deadline > tokio::time::Instant::now())
+    {
+        return Ok(current);
+    }
+    match refresh_scope_snapshot_locked(client, cache, &mut refresh).await {
         Ok(snapshot) => Ok(snapshot),
         // A label-list refresh does not invalidate a previously fetched view.
         // Outlook users can keep browsing known folders during an outage; the
@@ -359,8 +367,8 @@ pub(crate) async fn refresh_scope_snapshot(
     client: &GmailClient,
     cache: &ScopeCache,
 ) -> crate::Result<ScopeSnapshot> {
-    let _refresh = cache.refresh.lock().await;
-    refresh_scope_snapshot_locked(client, cache).await
+    let mut refresh = cache.refresh.lock().await;
+    refresh_scope_snapshot_locked(client, cache, &mut refresh).await
 }
 
 /// Mark the vocabulary stale after a label mutation. Keep the previous labels
@@ -378,8 +386,24 @@ pub(crate) async fn invalidate_scope_snapshot(cache: &ScopeCache) {
 async fn refresh_scope_snapshot_locked(
     client: &GmailClient,
     cache: &ScopeCache,
+    retry_at: &mut Option<tokio::time::Instant>,
 ) -> crate::Result<ScopeSnapshot> {
-    let snapshot = fetch_scope_snapshot(client).await?;
+    // All fetchers, including forced lifecycle polls, share failure admission.
+    // A failed refresh must not let queued readers hammer an unavailable API.
+    // Hold the single-flight lock during the wait so only one reader retries.
+    if let Some(deadline) = *retry_at {
+        tokio::time::sleep_until(deadline).await;
+    }
+    let snapshot = match fetch_scope_snapshot(client).await {
+        Ok(snapshot) => {
+            *retry_at = None;
+            snapshot
+        }
+        Err(failure) => {
+            *retry_at = Some(tokio::time::Instant::now() + LIFECYCLE_POLL_INTERVAL);
+            return Err(failure);
+        }
+    };
     if let Ok(mut guard) = cache.snapshot.write() {
         *guard = snapshot.clone();
     } else {

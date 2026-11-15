@@ -1344,7 +1344,7 @@ pub(crate) fn stale_local_state_error(
     .expect("valid account error classification")
 }
 
-/// A public-folder item whose folder a COMPLETE discovery pass did not find.
+/// A public resource whose folder a COMPLETE discovery pass did not find.
 ///
 /// Ruling (wave 2): before discovery has completed, a missing route is local
 /// state not yet restored, reported by [`stale_local_state_error`] as a
@@ -1352,30 +1352,28 @@ pub(crate) fn stale_local_state_error(
 /// folder, the folder is no longer readable to this user (deleted, moved out
 /// of reach, or permission withdrawn). An enterprise Outlook user then expects
 /// the item to stop being retried and to drop out of view, as the server's
-/// own `ErrorItemNotFound` would make it: `NotFound(Message)`, refused before
+/// own `ErrorItemNotFound` would make it: typed `NotFound`, refused before
 /// any request.
 #[must_use]
-pub(crate) fn unroutable_public_item_error(
+pub(crate) fn unroutable_public_resource_error(
     operation: AccountOperation,
+    scope: ErrorScope,
+    kind: ResourceKind,
     id: &str,
     detail: impl Into<String>,
 ) -> AccountError {
     AccountErrorBuilder::new(
-        AccountErrorKind::NotFound(ResourceKind::Message),
+        AccountErrorKind::NotFound(kind),
         Cause::Request(RequestCause::NotFound {
-            what: ResourceKind::Message,
+            what: kind,
             id: Some(id.to_owned()),
         }),
     )
-    .push_cause(Cause::Attempt(bifrost_types::AttemptCause::new(
-        bifrost_types::TransmissionState::Unsent,
-    )))
+    .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(operation)
     .provider(Provider::Microsoft)
     .protocol(Protocol::Graph)
-    .scope(ErrorScope::Message {
-        id: id.to_owned().into(),
-    })
+    .scope(scope)
     .text(DiagnosticText::support_only(detail.into()))
     .try_build()
     .expect("valid account error classification")

@@ -103,6 +103,9 @@ impl Harness {
         tokio::spawn(async move {
             while let Some(request) = writer_rx.recv().await {
                 match request {
+                    WriterRequest::GetBackfill { done, .. } => {
+                        let _ = done.send(Ok(None));
+                    }
                     WriterRequest::ScopeBarrierBlocked { done, .. } => {
                         let _ = done.send(false);
                     }
@@ -155,7 +158,6 @@ impl Harness {
             ctx.clone(),
             BackfillWiring {
                 live: Arc::new(LiveSupersedes::new()),
-                store: Arc::new(crate::cursor::InMemoryCheckpointStore::new()),
                 registry: Arc::clone(&registry),
                 config: BackfillConfig::default(),
                 fusion_owned_scopes: HashSet::new(),

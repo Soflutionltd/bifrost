@@ -66,12 +66,14 @@ async fn routing(
         .await
         .map(|r| r.headers())
         .ok_or_else(|| {
-            graph_error::stale_local_state_error(
+            account.missing_public_collection_route_error(
                 op,
+                &FolderId(folder.into()),
                 ErrorScope::Calendar {
                     id: foreign::public_calendar(folder),
                 },
-                "public calendar has no routing entry",
+                bifrost_types::ResourceKind::Calendar,
+                &foreign::public_calendar(folder).0,
             )
         })
 }
