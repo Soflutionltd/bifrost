@@ -658,10 +658,8 @@ async fn scope_barrier_blocked(writer: &mpsc::Sender<WriterRequest>, scope: Curs
 /// complete, and the ceiling the delay doubles towards.
 pub(super) const BACKFILL_RETRY_INITIAL: Duration = Duration::from_secs(5);
 pub(super) const BACKFILL_RETRY_CAP: Duration = Duration::from_secs(300);
-static BACKFILL_BACKOFF: std::sync::LazyLock<bifrost_types::BackoffPolicy> =
-    std::sync::LazyLock::new(|| {
-        bifrost_types::BackoffPolicy::new(BACKFILL_RETRY_INITIAL, BACKFILL_RETRY_CAP, false)
-    });
+const BACKFILL_BACKOFF: bifrost_types::BackoffPolicy =
+    bifrost_types::BackoffPolicy::new(BACKFILL_RETRY_INITIAL, BACKFILL_RETRY_CAP, false);
 
 /// Which scope incarnations the orchestrator's rescan still owes a
 /// cold-start pass.
@@ -931,7 +929,7 @@ impl BackfillScan {
         // the retry starts.
         let (backoff, until) = self.failed.entry(key).or_insert_with(|| {
             (
-                crate::backoff::ReconnectBackoff::new(*BACKFILL_BACKOFF),
+                crate::backoff::ReconnectBackoff::new(BACKFILL_BACKOFF),
                 tokio::time::Instant::now(),
             )
         });

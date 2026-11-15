@@ -139,24 +139,6 @@ Owner: derive the capability from the lanes (`None` iff no lanes; in-process iff
 any `Connection` lane), or one `effective_push_lanes(&dyn Account)` in
 `bifrost-types`.
 
-## CON-005 - Partitions of `RecoveryClass` decided outside its crate
-
-**Reported by:** types (LATENT).
-
-- `google/src/account/error.rs::requires_stream_termination`: which classes
-  leave per-item lanes and end the stream; `_ => true`.
-- `dav-core/src/error.rs::recovery_rank`: which class dominates a multi-leg
-  failure; `_ => u8::MAX`.
-
-The google hunter adds that `requires_stream_termination` is used by mutation,
-inventory hydration and `get_stream`.
-
-Both are questions about the type itself, answered where `#[non_exhaustive]`
-makes them non-exhaustive. Owner: methods on `RecoveryClass`
-(`is_item_local()`, `severity()`) beside `is_terminal()`, where a new variant is
-a compile error. The hunter expects other crates make the per-item vs
-stream-terminal call implicitly; naming it is how to find them.
-
 ## CON-006 - Capability flag vs the method's own refusal
 
 **Reported by:** types (LATENT; `PimMethodSupport` was ruled 2026-10-03 to stay, and nothing here proposes removing it).
@@ -518,16 +500,6 @@ and `persist_ack_request` mutates in place before an `apply_transition` that can
 fail. Owner: make the rule a type - `ledger.accrue(..)` for monotone, sticky
 debt; `ledger.stage(..) -> Staged` for policy and proof, committed by the
 successful write. The read-side divergence this causes is BUG-008.
-
-## CON-023 - The shape of `EngineDirective` is shadowed in the engine
-
-**Reported by:** sync-engine.
-
-`DirectiveKey` (`engine/bulk.rs`) and `directive_target_scope`
-(`recovery.rs`) are two engine-side shadows of `EngineDirective`'s shape, kept
-in step by hand. Both are protocol-neutral facts about a `bifrost-types` enum.
-Owner: `EngineDirective::target_scope()` and `EngineDirective::identity()` in
-`bifrost-types`.
 
 ## CON-024 - What does an inventory front end do with one page?
 

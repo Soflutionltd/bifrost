@@ -811,10 +811,10 @@ fn next_tag(tag: &str) -> String {
 async fn notify_overflow_cancels_pending_registration_on_both_send_branches() {
     use super::{ConsumerErased, SubBatch, encode_command, run_pipeline_batch};
     use crate::connection::{ImapStream, dispatch, state::ProtocolState, stream, wire::WireReader};
+    use crate::types::response::{GreetingResponse, GreetingStatus};
     use crate::types::{
         Capability, Command, MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams,
     };
-    use crate::types::response::{GreetingResponse, GreetingStatus};
     use tokio::io::AsyncWriteExt;
 
     for synchronizing in [false, true] {

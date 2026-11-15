@@ -1638,3 +1638,6 @@ mailbox ids, and provides the canonical mailbox identity for both move
 admission and membership throttle keys. Enterprise users expect a mail move
 into an address book or calendar to fail locally without mail effects at that
 collection's URL. Valid IMAP destinations retain their existing move behavior.
+
+Container sharing authority is projected from the MYRIGHTS `a` (Administer)
+right into `ContainerRights::may_share`.

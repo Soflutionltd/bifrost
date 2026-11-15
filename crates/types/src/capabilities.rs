@@ -57,7 +57,7 @@ pub enum PushCapability {
     /// lives on the Account; the receiver is wired by the consumer
     /// and feeds the `InvalidationSink`. The account's `Registration`
     /// lane only maintains the rows.
-    WebhookOrEwsStream,
+    Webhook,
     /// Protocol exposes no push primitive; engine falls back to
     /// poll-only scheduling.
     None,

@@ -185,7 +185,7 @@ impl PushLanes {
             RecoveryPlan::Engine(d) => {
                 let restart = matches!(d, EngineDirective::RestartAccount);
                 pending.push_back(ReopenRequest::PushRecovery {
-                    scope: recovery::directive_target_scope(&d),
+                    scope: d.target_scope(),
                     error,
                     generation,
                 });

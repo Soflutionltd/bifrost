@@ -365,7 +365,7 @@ pub(crate) fn mutation_error(
     ctx: GmailErrorContext,
 ) -> Result<Vec<ItemOutcome<MutationSuccess>>, AccountError> {
     let account_error = into_account_error(error, ctx);
-    if requires_stream_termination(&account_error) {
+    if !account_error.recovery().is_item_local() {
         return Err(account_error);
     }
 
@@ -539,33 +539,6 @@ pub(crate) fn merge_delete_fallback_error(
 // ---------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------
-
-/// Decide whether a recovery result must leave per-object lanes and
-/// terminate the current stream. Mutation, inventory hydration, and object
-/// hydration share this partition so recovery requiring caller or engine
-/// action is not reported as a permanent failure of one object.
-pub(crate) fn requires_stream_termination(err: &AccountError) -> bool {
-    use bifrost_types::RecoveryClass;
-    match err.recovery() {
-        RecoveryClass::Retry(_)
-        | RecoveryClass::Reconcile(_)
-        | RecoveryClass::Engine(_)
-        | RecoveryClass::AuthLost
-        | RecoveryClass::NeedsAdminConsent { .. }
-        | RecoveryClass::NeedsPolicyChange
-        | RecoveryClass::NoPermission { .. } => true,
-        RecoveryClass::Unsupported(_)
-        | RecoveryClass::ClientBug
-        | RecoveryClass::ProviderContractViolation
-        | RecoveryClass::ProviderRefused
-        | RecoveryClass::UnknownPermanent
-        | RecoveryClass::InternalFailure => false,
-        // RecoveryClass is non-exhaustive. A newly introduced class must
-        // retain its recovery verdict at the stream boundary until its
-        // per-item or stream-level behavior is deliberately classified here.
-        _ => true,
-    }
-}
 
 fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -> AccountError {
     if let bifrost_net::Error::LocalHold { ref key, .. } = net_error {

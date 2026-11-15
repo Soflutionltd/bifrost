@@ -40,7 +40,7 @@ pub(crate) fn build_capabilities(
             PushConfig::None => PushCapability::None,
             // This shared capability name denotes webhook delivery here;
             // EWS streaming is the separate in-process arm below.
-            PushConfig::Webhook(_) => PushCapability::WebhookOrEwsStream,
+            PushConfig::Webhook(_) => PushCapability::Webhook,
             PushConfig::EwsStreaming => PushCapability::InProcess,
         },
         mutation: MutationCapabilities {
@@ -216,7 +216,7 @@ mod tests {
     fn graph_subscription_capabilities_are_out_of_process() {
         let caps = build_capabilities(PushMode::GraphSubscriptions);
         assert_eq!(caps.blob_range, BlobRangeSupport::Conditional);
-        assert_eq!(caps.push, PushCapability::WebhookOrEwsStream);
+        assert_eq!(caps.push, PushCapability::Webhook);
         assert!(!caps.push_in_process());
         assert_eq!(
             caps.mutation.concurrency,

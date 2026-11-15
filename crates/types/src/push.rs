@@ -237,11 +237,19 @@ impl BackoffPolicy {
     /// `initial` below one millisecond is raised to one millisecond; `max`
     /// below `initial` is raised to `initial`. The only constructor.
     #[must_use]
-    pub fn new(initial: Duration, max: Duration, jitter: bool) -> Self {
-        let initial = initial.max(Duration::from_millis(1));
+    pub const fn new(initial: Duration, max: Duration, jitter: bool) -> Self {
+        let initial = if initial.as_nanos() < 1_000_000 {
+            Duration::from_millis(1)
+        } else {
+            initial
+        };
         Self {
             initial,
-            max: max.max(initial),
+            max: if max.as_nanos() < initial.as_nanos() {
+                initial
+            } else {
+                max
+            },
             jitter,
         }
     }

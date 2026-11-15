@@ -31,7 +31,7 @@ fn inbox() -> Vec<CursorScope> {
 /// A push-capable account named `label` whose first `failures` teardowns fail.
 fn pushing(label: &str, log: &Arc<PushLog>, failures: usize) -> Arc<StubAccount> {
     let mut caps = common::caps();
-    caps.push = PushCapability::WebhookOrEwsStream;
+    caps.push = PushCapability::Webhook;
     Arc::new(StubAccount {
         caps,
         push_label: label.to_owned(),
@@ -287,7 +287,7 @@ async fn a_subscription_the_consumer_tore_down_is_not_resurrected_by_reopen() {
 /// the named ones, however often it is asked.
 fn strict_refusing(label: &str, log: &Arc<PushLog>, refused: &[&str]) -> Arc<StubAccount> {
     let mut caps = common::caps();
-    caps.push = PushCapability::WebhookOrEwsStream;
+    caps.push = PushCapability::Webhook;
     Arc::new(StubAccount {
         caps,
         push_label: label.to_owned(),

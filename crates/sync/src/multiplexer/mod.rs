@@ -750,11 +750,8 @@ enum LifecycleTermination {
 const LIFECYCLE_RECONNECT_MIN: Duration = Duration::from_secs(30);
 const LIFECYCLE_RECONNECT_MAX: Duration = Duration::from_secs(480);
 
-// The shared policy constructor validates at runtime, so this named policy is lazy.
-static LIFECYCLE_BACKOFF: std::sync::LazyLock<bifrost_types::BackoffPolicy> =
-    std::sync::LazyLock::new(|| {
-        bifrost_types::BackoffPolicy::new(LIFECYCLE_RECONNECT_MIN, LIFECYCLE_RECONNECT_MAX, false)
-    });
+const LIFECYCLE_BACKOFF: bifrost_types::BackoffPolicy =
+    bifrost_types::BackoffPolicy::new(LIFECYCLE_RECONNECT_MIN, LIFECYCLE_RECONNECT_MAX, false);
 
 fn lifecycle_retry_wait(
     error: &AccountError,
@@ -985,7 +982,7 @@ impl Multiplexer {
         // full channel behind a busy listener never outlives the multiplexer.
         // A plain `JoinHandle` would detach the reader on drop instead.
         let _lifecycle_guard = AbortOnDrop(tokio::spawn(async move {
-            let mut backoff = crate::backoff::ReconnectBackoff::new(*LIFECYCLE_BACKOFF);
+            let mut backoff = crate::backoff::ReconnectBackoff::new(LIFECYCLE_BACKOFF);
             let mut carry = false;
             loop {
                 if carry {
@@ -1790,9 +1787,7 @@ async fn handle_drive_outcome(
             exit: None,
         },
         Ok(ChangesEvent::Terminated(error)) => {
-            use crate::recovery::{
-                RecoveryPlan, directive_target_scope, plan_recovery, retry_delay,
-            };
+            use crate::recovery::{RecoveryPlan, plan_recovery, retry_delay};
             // Dispatch via `plan_recovery` so the closed `RecoveryPlan`
             // drives the branch. Retry and reconcile keep the poll
             // loop alive; engine directives hand off to the reopen
@@ -1851,7 +1846,7 @@ async fn handle_drive_outcome(
                     }
                 }
                 RecoveryPlan::Engine(directive) => {
-                    let directive_scope = directive_target_scope(&directive);
+                    let directive_scope = directive.target_scope();
                     let request = ReopenRequest::Recovery {
                         scope: directive_scope,
                         error: original,

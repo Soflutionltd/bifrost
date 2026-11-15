@@ -1876,3 +1876,6 @@ Destroy reassertion remains safe on stable Gmail ids even when a permission
 refusal leads to TRASH fallback. An uncertain delete should converge to absence
 for the user. Each reassertion may pay another 50-unit batchDelete refusal before
 the fallback; a reported Downgraded result is not replayed by reassertion.
+
+Streaming error boundaries use `RecoveryClass::is_item_local` from bifrost-types
+to decide whether an item failure must terminate the stream.

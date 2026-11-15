@@ -2878,14 +2878,6 @@ migration; do them as one change that also edits the consumers.
   for every host including the departing one, as the docs warn. Type fix:
   `CrossOrigin { Any, AllowList(set), Forbidden }`.
 
-## STR-156 - `BackoffPolicy` has no const constructor
-
-**Reported by:** wave 1 fixer (sync).
-
-The engine's retry loops now share `ReconnectBackoff`, but their named policies
-are lazy statics because `bifrost_types::BackoffPolicy` cannot be built in a
-`const`. A `const fn` constructor lets each policy be a plain `const`.
-
 ## STR-150 - A DAV collection is a `CursorScope::Folder`, so IMAP resolves ownership by string collision
 
 **Reported by:** net-dav.

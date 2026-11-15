@@ -21,7 +21,7 @@ pub mod subscription;
 
 use crate::cancel::{BoundaryRequest, BoundaryView};
 use crate::multiplexer::{ChangeDelivery, MultiplexerEvent, ReopenRequest};
-use crate::recovery::{RecoveryPlan, ThrottleBucket, directive_target_scope, plan_recovery};
+use crate::recovery::{RecoveryPlan, ThrottleBucket, plan_recovery};
 use bifrost_types::{
     AccountId, CursorScope, InvalidationSink, SinkPush, SyncEvent, Warning, WarningKind, WatchEvent,
 };
@@ -151,7 +151,7 @@ pub(crate) fn route_watch_event(
                 // current generation here would label an event that may
                 // predate a reattach with the replacement's identity.
                 return match target.reopen_tx.try_send(ReopenRequest::Recovery {
-                    scope: directive_target_scope(&directive),
+                    scope: directive.target_scope(),
                     error,
                     generation: None,
                 }) {

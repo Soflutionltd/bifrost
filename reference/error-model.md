@@ -779,3 +779,12 @@ without targets or text. Consented exports add role-tagged targets, completeness
 step ids and compensation references/outcomes. Internal exports add sibling and
 compensation cause summaries. Submission and CloudFile scopes identify those
 resources; UploadSession deliberately carries no credential-bearing URL.
+
+`RecoveryClass::is_item_local` owns the per-item versus stream termination
+partition. `severity` owns failed-leg dominance: retry, reconcile/engine,
+permanent failure, permission/policy/consent, authentication loss, then
+cancellation. Cancellation ends its owning operation and cannot authorize a
+retry. Both projections exhaustively classify variants in bifrost-types.
+`EngineDirective::target_scope` and `identity` likewise own directive shape
+projections; identity retains kind and target while grouping downgrade payloads
+and operator reasons within a campaign.

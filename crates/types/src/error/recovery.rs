@@ -45,6 +45,49 @@ pub enum RecoveryClass {
 }
 
 impl RecoveryClass {
+    /// Whether a failure can stay in a per-item result without ending its stream.
+    /// Retry, remediation and cancellation must reach the stream owner.
+    #[must_use]
+    pub fn is_item_local(&self) -> bool {
+        match self {
+            Self::Unsupported(_)
+            | Self::ClientBug
+            | Self::ProviderContractViolation
+            | Self::ProviderRefused
+            | Self::UnknownPermanent
+            | Self::InternalFailure => true,
+            Self::Cancelled
+            | Self::Retry(_)
+            | Self::Reconcile(_)
+            | Self::Engine(_)
+            | Self::AuthLost
+            | Self::NeedsAdminConsent { .. }
+            | Self::NeedsPolicyChange
+            | Self::NoPermission { .. } => false,
+        }
+    }
+
+    /// Dominance when combining failed legs, from retry through authentication loss.
+    /// Cancellation wins: the owning operation has ended and must not be retried.
+    #[must_use]
+    pub fn severity(&self) -> u8 {
+        match self {
+            Self::Retry(_) => 0,
+            Self::Reconcile(_) | Self::Engine(_) => 1,
+            Self::Unsupported(_)
+            | Self::ClientBug
+            | Self::ProviderContractViolation
+            | Self::ProviderRefused
+            | Self::UnknownPermanent
+            | Self::InternalFailure => 2,
+            Self::NeedsAdminConsent { .. }
+            | Self::NeedsPolicyChange
+            | Self::NoPermission { .. } => 3,
+            Self::AuthLost => 4,
+            Self::Cancelled => u8::MAX,
+        }
+    }
+
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Retry(_))
@@ -97,6 +140,55 @@ pub enum EngineDirective {
     /// a scoped `Warning::OperatorAttentionNeeded`. Siblings keep syncing;
     /// the account is NOT paused and auth is NOT treated as lost.
     DisableScope(CursorScope),
+}
+
+/// Directive kind and target used for campaign deduplication.
+/// Payload details of strategy downgrades and operator reasons do not create
+/// another action within the same campaign.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum EngineDirectiveIdentity {
+    RestartScope(CursorScope),
+    RestartAccount,
+    DowngradeStrategy,
+    DowngradeCapabilityForScope(CursorScope),
+    SchemaIncompatible,
+    OperatorOverrideRequired,
+    DisableScope(CursorScope),
+}
+
+impl EngineDirective {
+    /// The single scope affected, or `None` for account-wide directives.
+    #[must_use]
+    pub fn target_scope(&self) -> Option<CursorScope> {
+        match self {
+            Self::RestartScope(scope)
+            | Self::DowngradeCapabilityForScope(scope)
+            | Self::DisableScope(scope) => Some(scope.clone()),
+            Self::RestartAccount
+            | Self::DowngradeStrategy(_)
+            | Self::SchemaIncompatible
+            | Self::OperatorOverrideRequired { .. } => None,
+        }
+    }
+
+    /// Identity of one action within a recovery campaign.
+    #[must_use]
+    pub fn identity(&self) -> EngineDirectiveIdentity {
+        match self {
+            Self::RestartScope(scope) => EngineDirectiveIdentity::RestartScope(scope.clone()),
+            Self::RestartAccount => EngineDirectiveIdentity::RestartAccount,
+            Self::DowngradeStrategy(_) => EngineDirectiveIdentity::DowngradeStrategy,
+            Self::DowngradeCapabilityForScope(scope) => {
+                EngineDirectiveIdentity::DowngradeCapabilityForScope(scope.clone())
+            }
+            Self::SchemaIncompatible => EngineDirectiveIdentity::SchemaIncompatible,
+            Self::OperatorOverrideRequired { .. } => {
+                EngineDirectiveIdentity::OperatorOverrideRequired
+            }
+            Self::DisableScope(scope) => EngineDirectiveIdentity::DisableScope(scope.clone()),
+        }
+    }
 }
 
 /// Provider-supplied hint for when a retry may be attempted. The hint
@@ -1017,6 +1109,167 @@ mod tests {
 
     fn chain(cause: Cause) -> CauseChain {
         CauseChain::new(vec![cause])
+    }
+
+    /// One instance of every `RecoveryClass` variant with its expected
+    /// severity and item-locality. `class_table_is_exhaustive` stops this table
+    /// from silently missing a variant added later.
+    fn class_table() -> Vec<(RecoveryClass, u8, bool)> {
+        let retry = RecoveryClass::Retry(RetryAdvice::new(
+            RetryDisposition::SameRequest,
+            None,
+            RetryReason::Transport,
+            None,
+        ));
+        let reconcile = RecoveryClass::Reconcile(ReconcileAdvice {
+            reason: ReconcileReason::PartialCommit,
+            guidance: ReconcileGuidance {
+                actions: vec![ReconcileAction::CheckTarget],
+            },
+            retry_hint: None,
+            throttle_scope: None,
+        });
+        vec![
+            (retry, 0, false),
+            (reconcile, 1, false),
+            (
+                RecoveryClass::Engine(EngineDirective::RestartAccount),
+                1,
+                false,
+            ),
+            (
+                RecoveryClass::Unsupported(AccountOperation::EventSearch),
+                2,
+                true,
+            ),
+            (RecoveryClass::ClientBug, 2, true),
+            (RecoveryClass::ProviderContractViolation, 2, true),
+            (RecoveryClass::ProviderRefused, 2, true),
+            (RecoveryClass::UnknownPermanent, 2, true),
+            (RecoveryClass::InternalFailure, 2, true),
+            (
+                RecoveryClass::NeedsAdminConsent { needed: "scope" },
+                3,
+                false,
+            ),
+            (RecoveryClass::NeedsPolicyChange, 3, false),
+            (RecoveryClass::NoPermission { resource: None }, 3, false),
+            (RecoveryClass::AuthLost, 4, false),
+            (RecoveryClass::Cancelled, u8::MAX, false),
+        ]
+    }
+
+    /// Compile-time guard: adding a `RecoveryClass` variant breaks this match,
+    /// pointing at `class_table` as the place that must learn it.
+    #[test]
+    fn class_table_is_exhaustive() {
+        for (class, _, _) in class_table() {
+            match class {
+                RecoveryClass::Cancelled
+                | RecoveryClass::Retry(_)
+                | RecoveryClass::Reconcile(_)
+                | RecoveryClass::Engine(_)
+                | RecoveryClass::AuthLost
+                | RecoveryClass::NeedsAdminConsent { .. }
+                | RecoveryClass::NeedsPolicyChange
+                | RecoveryClass::NoPermission { .. }
+                | RecoveryClass::Unsupported(_)
+                | RecoveryClass::ClientBug
+                | RecoveryClass::ProviderContractViolation
+                | RecoveryClass::ProviderRefused
+                | RecoveryClass::UnknownPermanent
+                | RecoveryClass::InternalFailure => {}
+            }
+        }
+        assert_eq!(class_table().len(), 14, "one row per variant");
+    }
+
+    /// Exact ranks, not just pairwise order: swapping any two tiers, merging
+    /// reconcile into retry, or dropping Cancelled below AuthLost all fail.
+    #[test]
+    fn severity_ranks_every_recovery_class() {
+        for (class, expected, _) in class_table() {
+            assert_eq!(class.severity(), expected, "{class:?}");
+        }
+        assert!(RecoveryClass::Cancelled.severity() > RecoveryClass::AuthLost.severity());
+    }
+
+    /// Only permanent per-object failures stay in an item lane; retry,
+    /// reconcile, engine action, remediation and cancellation must all reach
+    /// the stream owner. A partition keyed on `is_terminal` would fail here on
+    /// AuthLost, the consent classes and Cancelled.
+    #[test]
+    fn is_item_local_partitions_every_recovery_class() {
+        for (class, _, local) in class_table() {
+            assert_eq!(class.is_item_local(), local, "{class:?}");
+        }
+    }
+
+    fn every_directive() -> Vec<(EngineDirective, Option<CursorScope>)> {
+        let inbox = CursorScope::Folder(crate::FolderId("inbox".into()));
+        vec![
+            (
+                EngineDirective::RestartScope(inbox.clone()),
+                Some(inbox.clone()),
+            ),
+            (EngineDirective::RestartAccount, None),
+            (
+                EngineDirective::DowngradeStrategy(StrategyDowngrade::QResyncToCondstore),
+                None,
+            ),
+            (
+                EngineDirective::DowngradeCapabilityForScope(inbox.clone()),
+                Some(inbox.clone()),
+            ),
+            (EngineDirective::SchemaIncompatible, None),
+            (
+                EngineDirective::OperatorOverrideRequired {
+                    reason: "x".to_owned(),
+                },
+                None,
+            ),
+            (EngineDirective::DisableScope(inbox.clone()), Some(inbox)),
+        ]
+    }
+
+    #[test]
+    fn target_scope_is_right_for_every_directive() {
+        for (directive, expected) in every_directive() {
+            assert_eq!(directive.target_scope(), expected, "{directive:?}");
+        }
+    }
+
+    /// Directives sharing a target (the three folder-scoped ones on one
+    /// folder, the four account-wide ones) must keep distinct identities, so
+    /// keying dedupe on the target alone fails. Payload differences inside one
+    /// kind collapse, and the same kind on another scope stays distinct.
+    #[test]
+    fn identity_distinguishes_directives_that_share_a_target() {
+        let directives = every_directive();
+        for (i, (a, _)) in directives.iter().enumerate() {
+            for (b, _) in &directives[i + 1..] {
+                assert_ne!(a.identity(), b.identity(), "{a:?} vs {b:?}");
+            }
+        }
+        assert_eq!(
+            EngineDirective::DowngradeStrategy(StrategyDowngrade::QResyncToCondstore).identity(),
+            EngineDirective::DowngradeStrategy(StrategyDowngrade::CondstoreToBasic).identity(),
+        );
+        assert_eq!(
+            EngineDirective::OperatorOverrideRequired {
+                reason: "a".to_owned()
+            }
+            .identity(),
+            EngineDirective::OperatorOverrideRequired {
+                reason: "b".to_owned()
+            }
+            .identity(),
+        );
+        let sent = CursorScope::Folder(crate::FolderId("sent".into()));
+        assert_ne!(
+            EngineDirective::RestartScope(CursorScope::Account).identity(),
+            EngineDirective::RestartScope(sent).identity(),
+        );
     }
 
     fn transport_chain(state: TransmissionState) -> CauseChain {

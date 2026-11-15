@@ -1626,3 +1626,6 @@ Filter create/update and the raw-send blob upload leave only unreferenced
 server-collected temporary storage before the set; they need no separate
 partial-commit producer. Calendar/contact writes each use one set call.
 Bulk streams already preserve per-item lanes and carry no failed siblings.
+
+Mailbox `mayShare` is projected into `ContainerRights::may_share`, including
+false when the server omits the optional sharing right.

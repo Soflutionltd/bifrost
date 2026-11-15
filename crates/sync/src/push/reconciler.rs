@@ -389,9 +389,7 @@ impl Reconciler {
                     return Ok(());
                 }
                 ChangesEvent::Terminated(error) => {
-                    use crate::recovery::{
-                        RecoveryPlan, directive_target_scope, plan_recovery, retry_delay,
-                    };
+                    use crate::recovery::{RecoveryPlan, plan_recovery, retry_delay};
                     let original = error.clone();
                     match plan_recovery(error) {
                         // Retry and Reconcile both record their deadline in the
@@ -448,8 +446,8 @@ impl Reconciler {
                             continue;
                         }
                         RecoveryPlan::Engine(directive) => {
-                            let directive_scope = directive_target_scope(&directive);
-                            // `directive_target_scope` IS the blast radius:
+                            let directive_scope = directive.target_scope();
+                            // `EngineDirective::target_scope` IS the blast radius:
                             // `Some(scope)` names a single scope to reset, so
                             // the rest of this hint's scopes are unaffected
                             // and must still be swept; `None` is account-wide

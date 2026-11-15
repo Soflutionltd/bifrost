@@ -7,8 +7,8 @@
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause, Cause,
-    DiagnosticText, Protocol, ProtocolErrorKind, RecoveryClass, RequestCause, RequestErrorKind,
-    ResourceKind, ServerCause, ServerErrorKind, StateCause, TransmissionState, TransportCause,
+    DiagnosticText, Protocol, ProtocolErrorKind, RequestCause, RequestErrorKind, ResourceKind,
+    ServerCause, ServerErrorKind, StateCause, TransmissionState, TransportCause,
     TransportErrorKind, TransportKind, WireCause,
 };
 use reqwest::StatusCode;
@@ -408,16 +408,15 @@ fn status_error_for(
         .expect("valid account error classification")
 }
 
-// This is a DAV aggregation policy, not a general ordering of engine actions.
+// This fold chooses a failed leg, not a general ordering of engine actions.
 // Its production inputs are multiget, filtered-query and directory-query legs:
 // HTTP failures, malformed XML, and member statuses. Cursor invalidation is
 // minted only by CalDAV sync_events, a single sync-collection REPORT whose
 // error propagates directly to the account; it never enters this fold. Neither
 // these legs nor their net context (which has no cursor scope) mint DisableScope.
-// Moving this policy onto RecoveryClass would imply an ordering valid for
-// unrelated engine directives without a reachable mixed-leg case to define it.
+// Shared severity orders remediation classes, not individual engine actions.
 // If a cursor-bearing leg is added, preserve its scope/action explicitly rather
-// than assuming this local severity table can order restart and termination.
+// than assuming severity can order restart and termination.
 /// Keep whichever of two errors a consumer most needs to act on.
 ///
 /// A multi-leg REPORT can fail several ways at once; the surviving error is the
@@ -429,33 +428,10 @@ pub fn worse_recovery(
     candidate: AccountError,
 ) -> Option<AccountError> {
     match current {
-        Some(existing)
-            if recovery_rank(existing.recovery()) >= recovery_rank(candidate.recovery()) =>
-        {
+        Some(existing) if existing.recovery().severity() >= candidate.recovery().severity() => {
             Some(existing)
         }
         _ => Some(candidate),
-    }
-}
-
-#[must_use]
-pub fn recovery_rank(class: &RecoveryClass) -> u8 {
-    match class {
-        RecoveryClass::AuthLost => 4,
-        RecoveryClass::NeedsAdminConsent { .. }
-        | RecoveryClass::NeedsPolicyChange
-        | RecoveryClass::NoPermission { .. } => 3,
-        RecoveryClass::Retry(_) => 0,
-        RecoveryClass::Reconcile(_) | RecoveryClass::Engine(_) => 1,
-        RecoveryClass::Unsupported(_)
-        | RecoveryClass::ClientBug
-        | RecoveryClass::ProviderContractViolation
-        | RecoveryClass::ProviderRefused
-        | RecoveryClass::UnknownPermanent
-        | RecoveryClass::InternalFailure => 2,
-        // RecoveryClass is non-exhaustive. An unknown future class must win
-        // rather than being silently ranked below a known terminal failure.
-        _ => u8::MAX,
     }
 }
 
@@ -593,6 +569,7 @@ pub fn should_fallback_discovery(error: &AccountError, protocol: DavProtocol) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bifrost_types::RecoveryClass;
 
     #[test]
     fn status_headers_preserve_retry_timing_and_account_throttle_scope() {
@@ -1036,67 +1013,6 @@ mod tests {
             contact.kind(),
             AccountErrorKind::NotFound(ResourceKind::Contact)
         ));
-    }
-
-    /// Migrated from `bifrost-caldav` with the ranking it pins. It was the
-    /// stronger of the two copies - it enumerates every nameable variant rather
-    /// than sampling three - so it is the one that survived the merge.
-    ///
-    /// The `_ =>` arm cannot be pinned hermetically: `RecoveryClass` is
-    /// `#[non_exhaustive]` and lives in `bifrost-types`, so no test outside it
-    /// can name a variant this `match` does not already list. What is pinnable
-    /// is that every variant we CAN name ranks strictly below the sentinel,
-    /// which is what makes an unknown one win by construction.
-    #[test]
-    fn recovery_ranks_order_from_retryable_up_to_auth_lost() {
-        use bifrost_types::{EngineDirective, RetryAdvice, RetryDisposition, RetryReason};
-
-        let retry = RecoveryClass::Retry(RetryAdvice::new(
-            RetryDisposition::SameRequest,
-            None,
-            RetryReason::Transport,
-            None,
-        ));
-        let engine = RecoveryClass::Engine(EngineDirective::RestartAccount);
-        let terminal = [
-            RecoveryClass::Unsupported(AccountOperation::EventSearch),
-            RecoveryClass::ClientBug,
-            RecoveryClass::ProviderContractViolation,
-            RecoveryClass::ProviderRefused,
-            RecoveryClass::UnknownPermanent,
-            // Named, so it ranks with the permanent failures rather than
-            // falling to the unknown-class sentinel that outranks AuthLost.
-            RecoveryClass::InternalFailure,
-        ];
-        let consent = [
-            RecoveryClass::NeedsAdminConsent { needed: "scope" },
-            RecoveryClass::NeedsPolicyChange,
-            RecoveryClass::NoPermission { resource: None },
-        ];
-
-        assert!(recovery_rank(&retry) < recovery_rank(&engine));
-        for class in &terminal {
-            assert!(
-                recovery_rank(&engine) < recovery_rank(class),
-                "{class:?} must outrank an engine directive"
-            );
-            for stronger in &consent {
-                assert!(
-                    recovery_rank(class) < recovery_rank(stronger),
-                    "{stronger:?} must outrank {class:?}"
-                );
-            }
-        }
-        for class in &consent {
-            assert!(
-                recovery_rank(class) < recovery_rank(&RecoveryClass::AuthLost),
-                "AuthLost must outrank {class:?}"
-            );
-            // Every named variant sits below the catch-all sentinel, so an
-            // unknown future class escalates rather than being buried.
-            assert!(recovery_rank(class) < u8::MAX);
-        }
-        assert!(recovery_rank(&RecoveryClass::AuthLost) < u8::MAX);
     }
 
     /// A retryable failure in one leg must never bury a reauthorization in

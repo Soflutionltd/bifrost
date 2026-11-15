@@ -11,10 +11,6 @@
 //!   to compile here, not silently routes to terminal.
 //! - `retry_delay` resolves a `RetryAdvice` to a concrete `Duration`
 //!   using the cause's [`RetryHint`] when present.
-//! - `directive_target_scope` resolves the `CursorScope` an
-//!   [`EngineDirective`] targets, when any. Its required catch-all
-//!   defaults an unknown future variant to account-wide until a human
-//!   adds the appropriate scope-bearing arm.
 //! - `restart_scope_error` constructs the single account-error shape
 //!   the engine itself emits when synthesizing a `RestartScope`
 //!   directive for a fresh establishment of one scope. Scope lifecycle
@@ -134,44 +130,6 @@ pub(crate) fn reconcile_delay(
     advice
         .retry_hint
         .map_or(fallback, |hint| hint.min_delay(now))
-}
-
-/// True when `directive` targets a single cursor scope. Used by the
-/// multiplexer to populate `ReopenRequest::Recovery::scope`.
-///
-/// `EngineDirective` is `#[non_exhaustive]` from `bifrost-types`, so the
-/// `_ =>` arm is required for compilation. New variants land here as
-/// account-wide by default; review this match when extending
-/// `EngineDirective` to decide whether a new variant deserves a scope.
-#[must_use]
-pub(crate) fn directive_target_scope(directive: &EngineDirective) -> Option<CursorScope> {
-    match directive {
-        EngineDirective::RestartScope(scope)
-        | EngineDirective::DowngradeCapabilityForScope(scope)
-        | EngineDirective::DisableScope(scope) => Some(scope.clone()),
-        EngineDirective::DowngradeStrategy(_)
-        | EngineDirective::RestartAccount
-        | EngineDirective::SchemaIncompatible
-        | EngineDirective::OperatorOverrideRequired { .. } => None,
-        // `EngineDirective` is `#[non_exhaustive]` from `bifrost-types`, so
-        // this wildcard is REQUIRED for compilation across the crate
-        // boundary even though every current variant is named above. A new
-        // scope-bearing variant still defaults account-wide here until a
-        // human adds its arm.
-        //
-        // Ruled sufficient rather than merely tolerated, and the reasons are
-        // why no further machinery is owed here: the account-wide default is
-        // the CONSERVATIVE direction (it is never narrower than the directive
-        // asked for, so a new variant degrades to doing too much rather than
-        // too little); `DirectiveKey::Other` bounds how coarse the dedupe can
-        // get to the pre-existing behaviour; and `handle_engine_directive`
-        // carries a required fallback that LOGS an unhandled variant, so a
-        // new one is visible in operation rather than silent. Making this a
-        // compile error instead would mean dropping `#[non_exhaustive]` from
-        // a public, re-exported `bifrost-types` enum - an API-stability
-        // change far larger than the footgun it would close.
-        _ => None,
-    }
 }
 
 /// Build a sync-state cursor-invalid error scoped to a single cursor.
@@ -1021,28 +979,22 @@ mod tests {
     }
 
     #[test]
-    fn directive_target_scope_picks_scope_bound_directives() {
+    fn engine_directive_target_scope_reaches_sync_with_account_scope() {
         let scope = CursorScope::Account;
         assert_eq!(
-            directive_target_scope(&EngineDirective::RestartScope(scope.clone())),
+            EngineDirective::RestartScope(scope.clone()).target_scope(),
             Some(scope.clone())
         );
         assert_eq!(
-            directive_target_scope(&EngineDirective::DowngradeCapabilityForScope(scope.clone())),
+            EngineDirective::DowngradeCapabilityForScope(scope.clone()).target_scope(),
             Some(scope.clone())
         );
         assert_eq!(
-            directive_target_scope(&EngineDirective::DisableScope(scope.clone())),
+            EngineDirective::DisableScope(scope.clone()).target_scope(),
             Some(scope)
         );
-        assert_eq!(
-            directive_target_scope(&EngineDirective::RestartAccount),
-            None
-        );
-        assert_eq!(
-            directive_target_scope(&EngineDirective::SchemaIncompatible),
-            None
-        );
+        assert_eq!(EngineDirective::RestartAccount.target_scope(), None);
+        assert_eq!(EngineDirective::SchemaIncompatible.target_scope(), None);
     }
 
     #[test]

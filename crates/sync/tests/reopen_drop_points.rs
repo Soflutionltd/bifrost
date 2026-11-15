@@ -40,7 +40,7 @@ fn parked_forever() -> Arc<tokio::sync::Notify> {
 
 fn push_caps() -> bifrost_types::AccountCapabilities {
     let mut caps = common::caps();
-    caps.push = PushCapability::WebhookOrEwsStream;
+    caps.push = PushCapability::Webhook;
     caps
 }
 

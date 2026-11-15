@@ -3301,8 +3301,8 @@ fn container_from_mailbox(
 }
 
 /// Map the JMAP `Mailbox/myRights` object onto the unified
-/// [`ContainerRights`]. JMAP always emits every member as a concrete
-/// boolean when it emits the object at all, so each maps to `Some(_)`.
+/// [`ContainerRights`]. Each decoded boolean maps to `Some(_)`; older
+/// servers omitting `mayShare` grant no sharing authority, so it is false.
 fn rights_from_mailbox(rights: &MailboxRights) -> ContainerRights {
     ContainerRights {
         may_read_items: Some(rights.may_read_items()),
@@ -3314,6 +3314,18 @@ fn rights_from_mailbox(rights: &MailboxRights) -> ContainerRights {
         may_rename: Some(rights.may_rename()),
         may_delete: Some(rights.may_delete()),
         may_submit: Some(rights.may_submit()),
+        may_share: Some(rights.may_share()),
+    }
+}
+
+#[cfg(test)]
+mod sharing_rights_tests {
+    #[test]
+    fn sharing_authority_reaches_container_rights() {
+        for allowed in [true, false] {
+            let rights = serde_json::from_value(serde_json::json!({"mayShare": allowed})).unwrap();
+            assert_eq!(super::rights_from_mailbox(&rights).may_share, Some(allowed));
+        }
     }
 }
 

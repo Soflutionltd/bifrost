@@ -888,17 +888,6 @@ production; the scripted wire accepts any bearer. The axis belongs in net: eithe
 `TokenSource::current(&Audience)`, with Graph constructing its Outlook-origin
 requests with the Outlook audience. Related: STR-113 (cloud-aware origins).
 
-## BUG-078 - A default-constructed Graph account advertises webhook push with no lane and refuses every subscribe
-
-**Reported by:** graph (live).
-
-The advertise-without-a-lane defect is fixed (Graph now derives capability,
-lanes and subscribe from one `PushConfig`). Residue, a naming fix in
-`bifrost-types`: `PushCapability::WebhookOrEwsStream` is documented as Graph
-webhooks only, and Graph's EWS streaming maps to `InProcess`, so "OrEwsStream"
-in the published name is false. Rename it (renaming is ruled fine). The
-workspace-level form is CON-004.
-
 ## BUG-086 - Google stamps Calendar, People and Drive errors as Gmail, and names the wrong OAuth scope for them
 
 **Reported by:** google (live; its headline), net-dav (independently flagged `execute_builder`'s string service with its `_ => ApiSurface::Drive` default, and asked that it take `ApiSurface`).
@@ -1098,15 +1087,6 @@ deserialization, so the returned subscription id is lost before cleanup can
 register it and the server-side subscription is orphaned until it expires.
 Decode the id independently of the expiry, register it, then classify the bad
 expiry.
-
-## BUG-149 - The shared `ContainerRights` cannot express "may share"
-
-**Reported by:** wave 3 fixer (jmap-protocol, lateral).
-
-JMAP's mailbox rights now include RFC 9670 `mayShare`, but
-`bifrost_types::ContainerRights` has no `may_share` field, so a consumer cannot
-learn whether the user may share a folder. Add `may_share: Option<bool>` and fill
-it from JMAP's `rights_from_mailbox`.
 
 ## BUG-142 - Completion markers written by an empty backfill plan still skip inventory
 

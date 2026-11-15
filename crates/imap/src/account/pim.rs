@@ -2754,6 +2754,8 @@ fn rights_from_myrights(rights: &MailboxRights) -> ContainerRights {
         may_rename: Some(mailbox_admin),
         may_delete: Some(mailbox_admin),
         may_submit: Some(rights.contains(AclRight::Post)),
+        // ACL administration is the authority to grant or revoke folder access.
+        may_share: Some(rights.contains(AclRight::Administer)),
     }
 }
 

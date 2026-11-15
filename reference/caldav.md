@@ -1107,7 +1107,7 @@ What moved: `DavRequest` / `DavResponse` / `DavBody`, `settle_body`,
 `url_origin`, `origin_is_secure`, the etag helpers (`response_etag`,
 `normalize_http_etag`, `prepare_if_match`) and `PutCondition`, the whole
 status-to-`AccountError` ladder with its constructors, and
-`worse_recovery` / `recovery_rank`.
+`worse_recovery` (using `RecoveryClass::severity` for dominance).
 
 `status_error` and `parse_error` stamp an `Attempt(Acknowledged)`. Every status
 the ladder classifies is one the server sent - on the response line, or as the
@@ -1512,3 +1512,5 @@ legacy type scopes, which have no URL, and folder scopes validate it before
 polling. The shared optional token is storage only: CalDAV interprets it as a
 sync-token and CardDAV as a ctag. Neither token is interchangeable with the
 other dialect's token.
+
+DAV failed-leg dominance delegates to `RecoveryClass::severity` in bifrost-types.

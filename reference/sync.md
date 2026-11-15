@@ -3684,9 +3684,9 @@ a uniform addition from zero through one quarter of the base delay, seeded by
 UUID entropy rather than wall-clock resolution. The base starts at 1s and caps
 at 5min; jitter may extend that cap by one quarter. The attempt budget is three.
 The three reopen loops, lifecycle reconnects and backfill retries all use this
-same pacing implementation. Named engine policies are lazy statics because
-`BackoffPolicy::new` is not a const constructor; provider push policies remain
-provider supplied. Lifecycle (30s to 480s) and backfill (5s to 300s) disable
+same pacing implementation. Named engine policies are constants built with
+`BackoffPolicy::new`; provider push policies remain provider supplied.
+Lifecycle (30s to 480s) and backfill (5s to 300s) disable
 jitter. Backfill reaches its 300s cap rather than stopping at 160s.
 `AttemptBudget` and `CumulativeWaitBudget` distinguish the reopen count from
 the independent 300s repair hold budget. Per-scope re-establishment
@@ -4181,3 +4181,8 @@ from being overwritten by a stale snapshot. The optional slot bandwidth budget
 is updated under the same bandwidth borrow. Pre-open budget application stays
 separate because a replacement account does not exist yet; it uses the same
 snapshot discipline. The two controls are independent, not one atomic pair.
+
+Directive scope and campaign deduplication use `EngineDirective::target_scope`
+and `identity` from bifrost-types. Distinct directive kinds on the same scope
+remain distinct actions. Strategy details and operator reasons do not split
+one kind into multiple campaign actions.

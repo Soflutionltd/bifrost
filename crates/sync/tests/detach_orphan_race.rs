@@ -28,7 +28,7 @@ fn inbox() -> Vec<CursorScope> {
 
 fn pushing(label: &str, log: &Arc<PushLog>, failures: usize) -> Arc<StubAccount> {
     let mut caps = common::caps();
-    caps.push = PushCapability::WebhookOrEwsStream;
+    caps.push = PushCapability::Webhook;
     Arc::new(StubAccount {
         caps,
         push_label: label.to_owned(),

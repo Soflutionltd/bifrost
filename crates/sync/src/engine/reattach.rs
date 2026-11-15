@@ -723,7 +723,7 @@ async fn handle_schema_incompatible(
         *entry = (*entry).max(epoch);
         ctx.cursors.delete(&scope);
     }
-    let mut backoff = crate::backoff::ReconnectBackoff::new(*REOPEN_BACKOFF);
+    let mut backoff = crate::backoff::ReconnectBackoff::new(REOPEN_BACKOFF);
     let mut last = None;
     for attempt in 0..REOPEN_RETRY_BUDGET.0 {
         if attempt > 0 {
@@ -799,12 +799,8 @@ pub(super) async fn sleep_unless_shutdown(delay: Duration, shutdown: &Cancellati
     }
 }
 
-// BackoffPolicy::new is not const upstream; keep named policies lazy rather
-// than duplicating its validation or changing the types crate from this layer.
-static REOPEN_BACKOFF: std::sync::LazyLock<bifrost_types::BackoffPolicy> =
-    std::sync::LazyLock::new(|| {
-        bifrost_types::BackoffPolicy::new(Duration::from_secs(1), Duration::from_secs(300), true)
-    });
+const REOPEN_BACKOFF: bifrost_types::BackoffPolicy =
+    bifrost_types::BackoffPolicy::new(Duration::from_secs(1), Duration::from_secs(300), true);
 struct CumulativeWaitBudget(Duration);
 const REPAIR_WAIT_BUDGET: CumulativeWaitBudget = CumulativeWaitBudget(Duration::from_secs(300));
 
@@ -1027,7 +1023,7 @@ async fn re_establish_scope_with_backoff(
     control: &SyncControl,
     walk_fence: u64,
 ) {
-    let mut backoff = crate::backoff::ReconnectBackoff::new(*REOPEN_BACKOFF);
+    let mut backoff = crate::backoff::ReconnectBackoff::new(REOPEN_BACKOFF);
     let mut last_account_error: Option<AccountError> = None;
     let mut pacing = RepairPacing::default();
     for attempt in 0..REOPEN_RETRY_BUDGET.0 {
@@ -2207,7 +2203,7 @@ pub(super) fn accepted_push_scopes(result: &bifrost_types::PushSubscription) -> 
 /// caller must not run follow-up repairs against an account that did not
 /// restart.
 async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
-    let mut backoff = crate::backoff::ReconnectBackoff::new(*REOPEN_BACKOFF);
+    let mut backoff = crate::backoff::ReconnectBackoff::new(REOPEN_BACKOFF);
     let mut last_error: Option<AccountError> = None;
     let mut attempt = 0;
     let mut pacing = RepairPacing::default();

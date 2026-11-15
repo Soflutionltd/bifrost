@@ -517,6 +517,8 @@ freezing the derived operation plan. Telemetry and support tiers export the
 record at their respective consent levels; see `reference/error-model.md`.
 
 `push.rs` defines normalized `BackoffPolicy` values for engine-owned pacing.
+Its const constructor preserves the one-millisecond floor and raises a smaller
+maximum to the initial delay.
 
 ## Push sessions
 
@@ -541,3 +543,8 @@ angle brackets inside quoted strings and nested comments. The free function
 same scanner and retains a trimmed bare-value
 fallback when there is no structural opening angle bracket. Empty or unfinished
 structural brackets do not become bare identifiers.
+
+`ContainerRights::may_share` reports authority to change folder sharing. JMAP
+projects `mayShare`, IMAP projects ACL administration, and EWS EffectiveRights
+leaves it unknown. `PushCapability::Webhook` describes Graph webhooks; EWS
+streaming uses `InProcess`.

@@ -358,7 +358,7 @@ pub(crate) fn inventory_stream_cancellable(
                         ) {
                             continue;
                         }
-                        if error::requires_stream_termination(&account_error) {
+                        if !account_error.recovery().is_item_local() {
                             // The recovery class needs stream-level action,
                             // such as retry, reconciliation, cursor recovery,
                             // or account authorization repair. Do not turn it
@@ -630,7 +630,7 @@ pub(crate) fn get_stream_cancellable(
                         err,
                         error::GmailErrorContext::hydrate_message(id_for_error.clone()),
                     );
-                    if error::requires_stream_termination(&account_error) {
+                    if !account_error.recovery().is_item_local() {
                         if stream_error.is_none() {
                             stream_error = Some(account_error);
                         }

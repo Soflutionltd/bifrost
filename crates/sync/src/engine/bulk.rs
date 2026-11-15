@@ -537,8 +537,7 @@ impl SyncEngine {
                         if let bifrost_types::RecoveryClass::Engine(directive) = error.recovery()
                             && should_forward_engine_recovery(&mut forwarded_directives, directive)
                         {
-                            directives
-                                .push((crate::recovery::directive_target_scope(directive), error));
+                            directives.push((directive.target_scope(), error));
                         }
                     }
                     if let Some(error) = report.termination {
@@ -776,10 +775,7 @@ impl SyncEngine {
                                     &mut forwarded_directives,
                                     &directive,
                                 ) {
-                                    directives.push((
-                                        crate::recovery::directive_target_scope(&directive),
-                                        error,
-                                    ));
+                                    directives.push((directive.target_scope(), error));
                                 }
                                 blocked_by_engine = true;
                             }
@@ -939,10 +935,7 @@ impl SyncEngine {
                                     &mut forwarded_directives,
                                     &directive,
                                 ) {
-                                    directives.push((
-                                        crate::recovery::directive_target_scope(&directive),
-                                        original,
-                                    ));
+                                    directives.push((directive.target_scope(), original));
                                 }
                                 blocked_by_engine = true;
                                 for id in &remaining {
@@ -1568,46 +1561,6 @@ pub(super) fn classify_item_outcome(
     }
 }
 
-/// Campaign-scoped dedupe identity for an engine directive: the directive's
-/// own variant plus the scope it targets.
-///
-/// Keying on the target scope alone is wrong in both directions. Every
-/// account-wide directive would collapse onto `None`, so the first
-/// `RestartAccount` in a mixed batch would suppress a later
-/// `OperatorOverrideRequired` or `SchemaIncompatible`; and `RestartScope`,
-/// `DowngradeCapabilityForScope` and `DisableScope` on one folder would
-/// collapse onto each other even though they ask the engine for three
-/// different things.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum DirectiveKey {
-    RestartScope(CursorScope),
-    RestartAccount,
-    DowngradeStrategy,
-    DowngradeCapabilityForScope(CursorScope),
-    SchemaIncompatible,
-    OperatorOverrideRequired,
-    DisableScope(CursorScope),
-    /// `EngineDirective` is `#[non_exhaustive]`; an unnamed future variant
-    /// dedupes by its resolved target only, which is never coarser than the
-    /// old behavior.
-    Other(Option<CursorScope>),
-}
-
-fn directive_key(directive: &EngineDirective) -> DirectiveKey {
-    match directive {
-        EngineDirective::RestartScope(scope) => DirectiveKey::RestartScope(scope.clone()),
-        EngineDirective::RestartAccount => DirectiveKey::RestartAccount,
-        EngineDirective::DowngradeStrategy(_) => DirectiveKey::DowngradeStrategy,
-        EngineDirective::DowngradeCapabilityForScope(scope) => {
-            DirectiveKey::DowngradeCapabilityForScope(scope.clone())
-        }
-        EngineDirective::SchemaIncompatible => DirectiveKey::SchemaIncompatible,
-        EngineDirective::OperatorOverrideRequired { .. } => DirectiveKey::OperatorOverrideRequired,
-        EngineDirective::DisableScope(scope) => DirectiveKey::DisableScope(scope.clone()),
-        other => DirectiveKey::Other(crate::recovery::directive_target_scope(other)),
-    }
-}
-
 /// Deliver one action's engine directives to the reopen listener. Returns
 /// `false` if shutdown interrupted delivery.
 ///
@@ -1647,10 +1600,10 @@ async fn forward_campaign_directives(
 /// the reopen listener needs one request per distinct directive, not one per
 /// failed object - and not one per campaign either.
 pub(super) fn should_forward_engine_recovery(
-    forwarded: &mut HashSet<DirectiveKey>,
+    forwarded: &mut HashSet<bifrost_types::EngineDirectiveIdentity>,
     directive: &EngineDirective,
 ) -> bool {
-    forwarded.insert(directive_key(directive))
+    forwarded.insert(directive.identity())
 }
 
 pub(super) fn counters_from_outcomes(

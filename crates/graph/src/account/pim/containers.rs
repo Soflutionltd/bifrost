@@ -227,6 +227,8 @@ pub(super) fn rights_from_effective_rights(
         may_rename: Some(rights.modify),
         may_delete: Some(rights.delete),
         may_submit: None,
+        // EWS EffectiveRights does not report permission to change the ACL.
+        may_share: None,
     }
 }
 

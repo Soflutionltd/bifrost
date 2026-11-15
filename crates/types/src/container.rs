@@ -169,6 +169,8 @@ pub struct ContainerRights {
     pub may_delete: Option<bool>,
     /// `maySubmit`: may submit (send) messages from this mailbox.
     pub may_submit: Option<bool>,
+    /// May change sharing permissions; `None` means the provider did not report it.
+    pub may_share: Option<bool>,
 }
 
 /// Wire-level provenance for a container or label id.

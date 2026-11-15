@@ -3249,10 +3249,7 @@ fn per_item_engine_failure_returns_the_directive_for_forwarding() {
     )
     .expect("engine recovery must be forwarded");
 
-    assert_eq!(
-        crate::recovery::directive_target_scope(&directive),
-        Some(scope)
-    );
+    assert_eq!(directive.target_scope(), Some(scope));
     assert!(forwarded.recovery().requires_engine_action());
     assert_eq!(
         outcomes.get(&bifrost_types::ObjectId("message".into())),
@@ -3309,8 +3306,7 @@ fn mixed_batch_directives_are_not_suppressed_by_a_shared_target() {
             "{directive:?} must reach the reopen listener on its own"
         );
         assert!(
-            crate::recovery::directive_target_scope(&directive).is_none()
-                || crate::recovery::directive_target_scope(&directive) == Some(inbox.clone()),
+            directive.target_scope().is_none() || directive.target_scope() == Some(inbox.clone()),
             "test fixture must exercise the two colliding target groups"
         );
     }
@@ -3955,7 +3951,7 @@ async fn the_detach_race_cleanup_bumps_the_push_topology_after_its_delete() {
     let scopes = vec![CursorScope::Folder(FolderId("inbox".into()))];
     let log = Arc::new(PushLog::default());
     let mut caps = crate::test_common::caps();
-    caps.push = PushCapability::WebhookOrEwsStream;
+    caps.push = PushCapability::Webhook;
     let account = Arc::new(StubAccount {
         caps,
         push_label: "first".to_owned(),

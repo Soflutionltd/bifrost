@@ -1016,12 +1016,11 @@ session's start or `close()`.
 - `blob_range: Conditional` (per-handle: fileAttachments support `Range` against
   `/$value`, item/referenceAttachments do not, carried by
   `BlobHandle::capabilities::supports_range`); `blob_digest_pre_download: false`.
-- `push` depends on `PushConfig`: `None` -> `None`, `Webhook(endpoint)` -> `WebhookOrEwsStream`
+- `push` depends on `PushConfig`: `None` -> `None`, `Webhook(endpoint)` -> `Webhook`
   (out-of-process: subscription CRUD on the Account, HTTPS receiver wired by the
   consumer into the engine `InvalidationSink`; `push_in_process()` false);
   `EwsStreaming` -> `InProcess` (the EWS `Connection` lane's sessions yield
-  `Invalidated` from `push_stream`; `push_in_process()` true). The shared
-  `WebhookOrEwsStream` spelling is retained, but Graph uses it only for webhooks.
+  `Invalidated` from `push_stream`; `push_in_process()` true).
 - `mutation.concurrency: ExpectedVersion` enables mail flags and contact/event
   update and delete, with mail move/destroy disabled.
   `bulk_set_flags_if_version` sends the target's ETag in the message PATCH's
