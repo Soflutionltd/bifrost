@@ -12,7 +12,8 @@
 //! evidence and parsed `RetryHint`. Where Gmail has a more precise
 //! interpretation (Gmail JSON error reason, history-id staleness,
 //! cursor envelope failure), this module builds directly with
-//! `AccountErrorBuilder` and attaches `WireCause::Gmail(signal)`.
+//! `AccountErrorBuilder` and attaches the surface's wire cause
+//! (`WireCause::Gmail`, `GoogleCalendar`, `GooglePeople` or `GoogleDrive`).
 //!
 //! Audit boundary: the 2026-07 google bug sweep did NOT line-audit this
 //! module; it was skipped as already test-dense. A later auditor should read
@@ -540,17 +541,21 @@ pub(crate) fn merge_delete_fallback_error(
 // Internal helpers
 // ---------------------------------------------------------------------
 
-// Shared enums cannot name the non-mail Google APIs yet. Do not claim these
-// failures came from Gmail, or mislead users into granting mail permissions.
+// The provider identifies the account vendor; the protocol identifies the API.
 fn provider_for(ctx: &GmailErrorContext) -> Option<Provider> {
-    (ctx.surface == crate::quota::ApiSurface::Gmail).then_some(Provider::Gmail)
+    Some(if ctx.surface == crate::quota::ApiSurface::Gmail {
+        Provider::Gmail
+    } else {
+        Provider::Google
+    })
 }
 
 fn protocol_for(ctx: &GmailErrorContext) -> Protocol {
-    if ctx.surface == crate::quota::ApiSurface::Gmail {
-        Protocol::Gmail
-    } else {
-        Protocol::Unknown
+    match ctx.surface {
+        crate::quota::ApiSurface::Gmail => Protocol::Gmail,
+        crate::quota::ApiSurface::Calendar => Protocol::GoogleCalendar,
+        crate::quota::ApiSurface::People => Protocol::GooglePeople,
+        crate::quota::ApiSurface::Drive => Protocol::GoogleDrive,
     }
 }
 
@@ -755,9 +760,13 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
         .unwrap_or_else(|| status.to_string());
     builder = builder.native_code(native);
 
-    if ctx.surface == crate::quota::ApiSurface::Gmail {
-        builder = builder.push_cause(Cause::Wire(WireCause::Gmail(signal.clone())));
-    }
+    let wire = match ctx.surface {
+        crate::quota::ApiSurface::Gmail => WireCause::Gmail(signal.clone()),
+        crate::quota::ApiSurface::Calendar => WireCause::GoogleCalendar(signal.clone()),
+        crate::quota::ApiSurface::People => WireCause::GooglePeople(signal.clone()),
+        crate::quota::ApiSurface::Drive => WireCause::GoogleDrive(signal.clone()),
+    };
+    builder = builder.push_cause(Cause::Wire(wire));
     builder = builder.text(DiagnosticText::support_only(format!(
         "{} response",
         resp.service
@@ -1488,8 +1497,27 @@ mod tests {
                 ),
             );
             let translated = into_account_error(error, ctx);
-            assert_eq!(translated.provider(), None);
-            assert_eq!(translated.protocol(), Some(Protocol::Unknown));
+            assert_eq!(translated.provider(), Some(Provider::Google));
+            let expected_protocol = match surface {
+                crate::quota::ApiSurface::Calendar => Protocol::GoogleCalendar,
+                crate::quota::ApiSurface::People => Protocol::GooglePeople,
+                crate::quota::ApiSurface::Drive => Protocol::GoogleDrive,
+                crate::quota::ApiSurface::Gmail => unreachable!(),
+            };
+            assert_eq!(translated.protocol(), Some(expected_protocol));
+            assert!(translated.chain().iter().any(|cause| matches!(
+                (surface, cause),
+                (
+                    crate::quota::ApiSurface::Calendar,
+                    Cause::Wire(WireCause::GoogleCalendar(_))
+                ) | (
+                    crate::quota::ApiSurface::People,
+                    Cause::Wire(WireCause::GooglePeople(_))
+                ) | (
+                    crate::quota::ApiSurface::Drive,
+                    Cause::Wire(WireCause::GoogleDrive(_))
+                )
+            )));
             assert_eq!(
                 translated.kind(),
                 &AccountErrorKind::Authorization(AccessErrorKind::InsufficientScope)

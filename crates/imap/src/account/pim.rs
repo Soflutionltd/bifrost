@@ -2665,17 +2665,7 @@ impl<T> SearchPager<T> {
 /// retrying the same page. The shared page_cursor field is the signal JMAP
 /// uses too, so consumers restart paging the same way across providers.
 fn search_page_cursor_error(op: AccountOperation, detail: impl Into<String>) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("page_cursor"),
-            message: Some(DiagnosticText::support_only(detail.into())),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(op)
-    .try_build()
-    .expect("valid account error classification")
+    AccountError::invalid_page_cursor(op, Protocol::Imap, detail)
 }
 
 /// The cursor's folder answered with a different UIDVALIDITY, so the UID

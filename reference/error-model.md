@@ -24,7 +24,8 @@ Accessors (all `&self`, cheap): `kind`, `recovery`,
 `suggested_remediation`, `scope`, `operation`, `provider`, `protocol`,
 `message_key`, `chain`, plus the diagnostic projections below.
 `Display` prints `"{message_key} ({kind:?})"` - never free-form
-provider text. `StdError::source()` bridges to `chain.outermost()` so
+provider text. `StdError::source()` bridges to `chain.outermost()` (or the retained original
+AccountError for a foreign-scope revocation) so
 `?`-chaining and `anyhow`-style walkers reach the primary cause. Rust's
 `StdError` source interface is linear and cannot represent the remaining
 sibling evidence; the full ordered chain is available through `chain()` and
@@ -47,7 +48,9 @@ Derived fields recompute on `try_build`. Builder overrides
 (`idempotency_override`, `throttle_scope`) are preserved across the
 round-trip, as is a `ServerCause` retry hint because it lives in the
 chain. Reclassifying to a
-different primary kind/cause requires a fresh `AccountErrorBuilder::new`.
+different primary kind/cause requires a fresh `AccountErrorBuilder::new`, except
+for the types-owned foreign-scope revocation constructor, which prepends its
+state cause while preserving the original classification prefix boundary.
 
 `AccountError::unsupported(operation, protocol)` is the canonical local refusal
 constructor. It stamps kind, matching request cause, operation and protocol through
@@ -788,3 +791,23 @@ retry. Both projections exhaustively classify variants in bifrost-types.
 `EngineDirective::target_scope` and `identity` likewise own directive shape
 projections; identity retains kind and target while grouping downgrade payloads
 and operator reasons within a campaign.
+
+## Shared revocation and page cursor constructors
+
+`AccountError::revoke_foreign_scope(scope, owner)` converts only PermissionDenied
+on a foreign-owned scope to ScopeRevoked / DisableScope. Other errors and primary
+scopes pass unchanged. The original AccountError remains the standard error source
+through decoration; its classification prefix, complete cause chain, partial-commit
+record and diagnostics also remain in the
+revocation's support evidence. An enterprise Outlook user losing a delegated
+folder expects their own mailbox to remain usable.
+
+`AccountError::invalid_page_cursor(operation, protocol, detail)` owns the
+Request(Malformed) / InvalidArgument field `page_cursor` signal. Consumers restart
+only that caller-owned page walk from page one. Stale saved results should reload,
+not clear durable sync state.
+
+Non-mail Google errors use Provider::Google and Protocol::{GoogleCalendar,
+GooglePeople, GoogleDrive}, with matching WireCause variants retaining the
+structured Google reason vocabulary currently represented by GmailSignal. Gmail
+retains its existing provider, protocol and wire identities.

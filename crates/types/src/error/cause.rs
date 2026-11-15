@@ -560,6 +560,9 @@ pub enum WireCause {
     Imap(ImapResponseCode),
     Smtp(EnhancedStatusCode),
     Gmail(GmailSignal),
+    GoogleCalendar(GmailSignal),
+    GooglePeople(GmailSignal),
+    GoogleDrive(GmailSignal),
     MalformedResponse {
         protocol: Protocol,
         detail: Option<DiagnosticText>,
@@ -571,6 +574,9 @@ impl WireCause {
         match self {
             Self::Graph(GraphSignal::Unknown { code })
             | Self::Jmap(JmapMethod::Unknown { code })
+            | Self::GoogleCalendar(GmailSignal::Unknown { code })
+            | Self::GooglePeople(GmailSignal::Unknown { code })
+            | Self::GoogleDrive(GmailSignal::Unknown { code })
             | Self::Gmail(GmailSignal::Unknown { code }) => Some(code.as_str()),
             Self::Imap(ImapResponseCode::Unknown {
                 value: Some(value), ..
@@ -583,6 +589,9 @@ impl WireCause {
             Self::Graph(_)
             | Self::Jmap(_)
             | Self::Imap(_)
+            | Self::GoogleCalendar(_)
+            | Self::GooglePeople(_)
+            | Self::GoogleDrive(_)
             | Self::Gmail(_)
             | Self::MalformedResponse { detail: None, .. } => None,
         }
@@ -594,7 +603,10 @@ impl WireCause {
             Self::Jmap(method) => Some(method.code()),
             Self::Imap(code) => Some(code.code()),
             Self::Smtp(code) => code.enhanced.as_ref().map(DiagnosticText::as_str),
-            Self::Gmail(signal) => Some(signal.code()),
+            Self::Gmail(signal)
+            | Self::GoogleCalendar(signal)
+            | Self::GooglePeople(signal)
+            | Self::GoogleDrive(signal) => Some(signal.code()),
             Self::MalformedResponse { .. } => None,
         }
     }
@@ -605,6 +617,9 @@ impl WireCause {
             Self::Graph(_)
             | Self::Jmap(_)
             | Self::Imap(_)
+            | Self::GoogleCalendar(_)
+            | Self::GooglePeople(_)
+            | Self::GoogleDrive(_)
             | Self::Gmail(_)
             | Self::MalformedResponse { .. } => None,
         }

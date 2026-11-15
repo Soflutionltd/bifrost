@@ -1930,11 +1930,9 @@ same encoder.
 Response and decode errors retain a typed Gmail, Calendar, People or Drive
 service. Raw builder dispatch also takes that enum rather than a string with a
 Drive fallback. Error translation preserves Gmail provider/protocol/wire signals
-only for Gmail. The shared error enums cannot identify the other Google APIs:
-those errors currently omit provider, use Protocol::Unknown, retain native
-reason/status and HTTP evidence, and name their API in response diagnostics.
-They never fabricate a Gmail wire cause. Accurate Google provider and API
-protocol/wire variants require a shared-types change. The account's primary
+for Gmail, and stamps Provider::Google with API-specific protocol and wire
+variants for Calendar, People and Drive. Native reason/status, HTTP evidence
+and API response diagnostics survive translation. The account's primary
 protocol remains Gmail; this does not split the account into per-API handles.
 
 Insufficient-permission scopes follow the API surface: Calendar calendar-list
@@ -1952,3 +1950,11 @@ unusable provider value before creating an upload session. Enterprise users
 expect a malformed mailbox value to prevent sharing, rather than select a
 possibly unrelated organization. Identity matching remains ASCII-insensitive
 and does not reinterpret aliases.
+
+## API error identities
+
+Calendar, People and Drive errors stamp Provider::Google and their respective
+Protocol::GoogleCalendar, GooglePeople or GoogleDrive. Structured response reasons
+carry matching WireCause variants, including unknown reasons. Gmail retains its
+existing Gmail identities. Transport errors use the same context API identity;
+API-specific OAuth scopes and Gmail-only project budget attribution are preserved.

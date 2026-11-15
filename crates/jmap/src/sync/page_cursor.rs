@@ -456,7 +456,7 @@ pub(super) fn cursor_error(operation: AccountOperation, message: String) -> Acco
     // Restart only this caller-owned walk. Invalid page state must never clear
     // an enterprise user's account-wide durable mail or sync checkpoints, which
     // is what `SyncState(SchemaIncompatible)` would have directed the engine to do.
-    invalid_argument(operation, "page_cursor", message)
+    AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Jmap, message)
 }
 
 pub(super) fn invalid_argument(

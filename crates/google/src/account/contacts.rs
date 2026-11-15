@@ -284,7 +284,7 @@ pub(crate) fn update(
             Some(_) => {
                 return Err(AccountError::unsupported(
                     AccountOperation::ContactUpdate,
-                    bifrost_types::error::Protocol::Gmail,
+                    bifrost_types::error::Protocol::GooglePeople,
                 ));
             }
         };
@@ -292,7 +292,7 @@ pub(crate) fn update(
         if expected.is_some() && (patch.photo.is_some() || update_fields.is_empty()) {
             return Err(AccountError::unsupported(
                 AccountOperation::ContactUpdate,
-                bifrost_types::error::Protocol::Gmail,
+                bifrost_types::error::Protocol::GooglePeople,
             ));
         }
         // Pure-local guards first: fail an invalid request cheaply, before
@@ -1813,11 +1813,11 @@ mod tests {
         let telemetry = error.telemetry_fields();
         assert_eq!(telemetry.status, Some(403));
         assert_eq!(telemetry.request_id, Some("people-req-9"));
-        // A People failure carries no Gmail wire signal: it is not a Gmail
-        // fault and must not send the user to grant mail permissions.
-        assert!(!error.chain().iter().any(|cause| matches!(
+        // A People failure carries the People wire signal, not Gmail's: it is
+        // not a Gmail fault and must not send the user to grant mail permissions.
+        assert!(error.chain().iter().any(|cause| matches!(
             cause,
-            bifrost_types::Cause::Wire(bifrost_types::WireCause::Gmail(_))
+            bifrost_types::Cause::Wire(bifrost_types::WireCause::GooglePeople(_))
         )));
         assert!(
             error

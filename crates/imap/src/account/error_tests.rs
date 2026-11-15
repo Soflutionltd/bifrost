@@ -392,6 +392,21 @@ fn shared_folder_permission_loss_derives_disable_scope() {
             .support_text
             .contains(&"no perm")
     );
+    let original = std::error::Error::source(&account)
+        .unwrap()
+        .downcast_ref::<bifrost_types::AccountError>()
+        .unwrap();
+    assert_eq!(
+        original.kind(),
+        &AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied),
+    );
+    assert_eq!(account.protocol(), original.protocol());
+    assert!(
+        original
+            .chain()
+            .iter()
+            .all(|cause| { account.chain().iter().any(|retained| retained == cause) })
+    );
 }
 
 #[test]

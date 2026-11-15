@@ -1129,34 +1129,6 @@ fn throttle_scope_for() -> Option<ThrottleScope> {
     Some(ThrottleScope::Account)
 }
 
-/// Build a `SyncState(ScopeRevoked)` error scoped to one foreign
-/// (shared/delegate) mailbox's folder scope. With the scope attached,
-/// the central `derive` resolves it to
-/// `Engine(DisableScope(scope))` - the engine quarantines just that
-/// cursor scope without escalating to account-wide auth loss. The owning
-/// mailbox rides as support-only diagnostic text for telemetry.
-#[must_use]
-pub(crate) fn graph_scope_revoked(
-    scope: CursorScope,
-    owner: &MailboxId,
-    operation: AccountOperation,
-) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
-        Cause::State(StateCause::ScopeRevoked),
-    )
-    .protocol(Protocol::Graph)
-    .provider(Provider::Microsoft)
-    .operation(operation)
-    .scope(ErrorScope::Cursor(scope))
-    .text(DiagnosticText::support_only(format!(
-        "shared mailbox access revoked (owner {})",
-        owner.0,
-    )))
-    .try_build()
-    .expect("valid account error classification")
-}
-
 /// Map a per-scope failure for a foreign (shared/delegate) mailbox.
 /// When the scope belongs to a shared mailbox (`owner.is_some()`) and
 /// the failure classifies as permission-denied (the class that would
@@ -1173,17 +1145,7 @@ pub(crate) fn graph_shared_scope_error(
     owner: Option<&MailboxId>,
     ctx: GraphErrorContext,
 ) -> AccountError {
-    if let Some(owner) = owner {
-        let account_error = into_account_error(error, ctx.clone());
-        if matches!(
-            account_error.kind(),
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
-        ) {
-            return graph_scope_revoked(scope.clone(), owner, ctx.operation);
-        }
-        return account_error;
-    }
-    into_account_error(error, ctx)
+    into_account_error(error, ctx).revoke_foreign_scope(scope.clone(), owner)
 }
 
 /// EWS twin of `graph_shared_scope_error`. A public folder always has
@@ -1200,17 +1162,7 @@ pub(crate) fn ews_shared_scope_error(
     owner: Option<&MailboxId>,
     ctx: GraphErrorContext,
 ) -> AccountError {
-    if let Some(owner) = owner {
-        let account_error = ews_error_to_account_error(error, ctx.clone());
-        if matches!(
-            account_error.kind(),
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
-        ) {
-            return graph_scope_revoked(scope.clone(), owner, ctx.operation);
-        }
-        return account_error;
-    }
-    ews_error_to_account_error(error, ctx)
+    ews_error_to_account_error(error, ctx).revoke_foreign_scope(scope.clone(), owner)
 }
 
 /// Build an `AccountError` for an operation this account does not support.
@@ -2777,6 +2729,21 @@ mod tests {
             RecoveryClass::Engine(EngineDirective::DisableScope(scope.clone()))
         );
         assert_eq!(err.scope(), Some(&ErrorScope::Cursor(scope)));
+        let original = std::error::Error::source(&err)
+            .unwrap()
+            .downcast_ref::<AccountError>()
+            .unwrap();
+        assert_eq!(
+            original.kind(),
+            &AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+        );
+        assert_eq!(err.protocol(), original.protocol());
+        assert!(
+            original
+                .chain()
+                .iter()
+                .all(|cause| { err.chain().iter().any(|retained| retained == cause) })
+        );
     }
 
     #[test]
@@ -2804,6 +2771,21 @@ mod tests {
         assert_eq!(
             *err.recovery(),
             RecoveryClass::Engine(EngineDirective::DisableScope(scope))
+        );
+        let original = std::error::Error::source(&err)
+            .unwrap()
+            .downcast_ref::<AccountError>()
+            .unwrap();
+        assert_eq!(
+            original.kind(),
+            &AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+        );
+        assert_eq!(err.protocol(), original.protocol());
+        assert!(
+            original
+                .chain()
+                .iter()
+                .all(|cause| { err.chain().iter().any(|retained| retained == cause) })
         );
     }
 

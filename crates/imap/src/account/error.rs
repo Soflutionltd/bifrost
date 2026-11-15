@@ -57,8 +57,6 @@ pub(crate) struct ImapErrorContext {
     /// classification produces; it never replaces the classification, so
     /// the `RecoveryClass` derivation still sees the real failure.
     pub(crate) extra_text: Vec<DiagnosticText>,
-    /// Registry ownership, used only to quarantine folder permission loss.
-    pub(crate) shared_owner: Option<bifrost_types::MailboxId>,
 }
 
 impl ImapErrorContext {
@@ -70,7 +68,6 @@ impl ImapErrorContext {
             idempotency_override: None,
             transmission_state: None,
             extra_text: Vec::new(),
-            shared_owner: None,
         }
     }
 
@@ -176,23 +173,6 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
     // is `ErrorScope::Cursor(Folder(id))` rather than
     // `ErrorScope::Mailbox { id }`.
     let scope_for_kind = ctx.scope.clone();
-    // Losing a shared folder must leave the user's own mailbox usable.
-    // Keep the denial as secondary cause evidence behind the revocation.
-    let revoked = ctx.shared_owner.is_some()
-        && matches!(
-            kind,
-            AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied)
-        );
-    let original_cause = revoked.then(|| primary_cause.clone());
-    let (kind, primary_cause) = if revoked {
-        (
-            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
-            Cause::State(StateCause::ScopeRevoked),
-        )
-    } else {
-        (kind, primary_cause)
-    };
-
     let mut builder = match kind {
         // Classification tables return parts so they can retain wire evidence.
         AccountErrorKind::Unsupported(operation) => {
@@ -202,9 +182,6 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
     }
     .operation(ctx.operation);
 
-    if let Some(cause) = original_cause {
-        builder = builder.push_cause(cause);
-    }
     if let Some(scope) = scope_for_kind {
         builder = builder.scope(scope);
     }
@@ -404,7 +381,6 @@ pub(crate) fn shared_folder_error(
     ctx: ImapErrorContext,
 ) -> AccountError {
     let mut ctx = ctx;
-    ctx.shared_owner = shared_owner.cloned();
     if let Some(owner) = shared_owner {
         ctx.extra_text.push(DiagnosticText::support_only(format!(
             "shared folder {} (owner {})",
@@ -412,13 +388,9 @@ pub(crate) fn shared_folder_error(
             owner.0,
         )));
     }
-    // Only the revocation needs the folder scope (it derives DisableScope of
-    // that folder). Any other failure on a shared folder keeps the caller's
-    // scope, exactly as it would on a personal folder.
-    if shared_owner.is_some() && permission_denied(&error, &ctx) {
-        ctx = ctx.with_folder_scope(folder);
-    }
-    into_account_error(error, ctx)
+    // The target folder is separate from the original error's scope: only
+    // revocation widens an item-local denial to quarantine its shared folder.
+    into_account_error(error, ctx).revoke_foreign_scope(super::folder_scope(folder), shared_owner)
 }
 
 // ---------------------------------------------------------------------

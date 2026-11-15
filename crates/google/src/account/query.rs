@@ -107,7 +107,8 @@ pub(super) fn condition_query(
             } else {
                 Err(invalid(
                     op,
-                    "Gmail filters cannot store another provider's expression",
+                    "Gmail filters accept only Provider::Gmail expressions; \
+                     Provider::Google names the non-mail Google APIs",
                 ))
             }
         }

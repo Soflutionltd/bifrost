@@ -922,16 +922,6 @@ marker kept as text so later code re-detects it. Moving `EntityTag` into
 bifrost-types and adopting it for Graph's `If-Match`, Google People and Google
 Calendar etags is the remaining owner change.
 
-## CON-067 - The "restart paging" page-cursor fault is built in three places
-
-**Reported by:** wave 3 reconciler.
-
-`Request(Malformed)` with `InvalidArgument { field: Some("page_cursor") }` is the
-documented signal to restart a page walk from page one, and it is constructed
-separately in IMAP (`account/pim.rs`) and JMAP (`sync/error.rs` and
-`sync/page_cursor.rs`). One constructor in bifrost-types would make it one
-definition every provider calls.
-
 ## CON-065 - Google Drive and OneDrive drive the same resumable-upload protocol separately
 
 **Reported by:** net-dav (the copies disagree).

@@ -1765,3 +1765,9 @@ dials read this same policy. Warning delivery state is protected by the same
 mutex; the inventory ticket still restores a claimed warning when its output
 channel closes. It represents delivery ownership, not another negotiation state.
 Each connection's committed ENABLE profile remains the wire authority.
+
+Shared-folder PermissionDenied quarantine delegates to
+`AccountError::revoke_foreign_scope`, preserving the complete original error as
+its source and retaining cause and diagnostic evidence. Losing a delegated folder
+must leave an enterprise Outlook user's own mailbox usable. Search page cursor
+refusals use `AccountError::invalid_page_cursor`: restart only the caller's walk.

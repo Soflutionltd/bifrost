@@ -1476,7 +1476,7 @@ percent-encoding a raw `\u{1f}` id into the URL.
 Revocation isolation: `graph_shared_scope_error(error, scope, owner, ctx)`
 quarantines just the foreign scope when the failure is
 `Authorization(PermissionDenied)` and `owner.is_some()` ->
-`graph_scope_revoked` -> `ScopeRevoked` -> `Engine(DisableScope(scope))`. A
+`AccountError::revoke_foreign_scope` -> `ScopeRevoked` -> `Engine(DisableScope(scope))`. A
 primary scope (`owner == None`) stays terminal `NoPermission`. Wired at the
 `inventory_stream`/`changes_stream` per-scope fetch-failure boundary.
 
@@ -2888,3 +2888,9 @@ only there. A category called `read` remains a literal category; `$flagged` does
 not become a new bulk flag alias. The inventory fingerprint deliberately keeps
 its raw provider-state vocabulary: missing versus false `isRead`, and complete
 versus notFlagged, must remain distinguishable even when hydrated flags coincide.
+
+REST and EWS shared-scope PermissionDenied quarantine both use
+`AccountError::revoke_foreign_scope`, retaining the original error as its source
+and preserving cause and diagnostic evidence, including the EWS protocol stamp.
+Losing a delegated folder must leave an enterprise Outlook user's own mailbox
+usable. Primary scopes and other errors keep their original classification.

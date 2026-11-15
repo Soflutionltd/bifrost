@@ -1335,7 +1335,7 @@ arrived) and, unless its primary cause already is one, the typed
   `UnknownPermanent`.
 - `Method(forbidden)` -> `Authorization(PermissionDenied)` ->
   `NoPermission`. For a foreign (shared) `Folder` scope,
-  `shared_scope_error` intercepts this into `jmap_scope_revoked` ->
+  `shared_scope_error` intercepts this into `AccountError::revoke_foreign_scope` ->
   `SyncState(ScopeRevoked)` -> `Engine(DisableScope(scope))` (quarantine
   one scope, not the account); a primary scope stays terminal.
 - `Problem(limit)` -> `Server(RateLimited)` w/ `throttle_scope`;
@@ -1770,3 +1770,9 @@ boundary. A typed reason requires a bifrost-types contract change. Native-code
 telemetry remains reserved for provider codes. Send-as routing preserves its
 precedence: feature availability, scheduled-send support, known mailbox, then
 that mailbox's submission capability.
+
+Shared-account PermissionDenied quarantine uses
+`AccountError::revoke_foreign_scope`, retaining the original error as its source
+and its cause and diagnostic evidence. Losing a delegated folder must leave an
+enterprise Outlook user's own mailbox usable. Page cursor refusals use the shared
+`AccountError::invalid_page_cursor` signal: reload only the caller-owned walk.

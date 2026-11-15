@@ -529,20 +529,13 @@ pub(crate) fn search_cursor_account_mismatch(
 ) -> AccountError {
     let cursor_owner = super::foreign::owner_label(cursor_owner);
     let filter_owner = super::foreign::owner_label(filter_owner);
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("page_cursor"),
-            message: Some(DiagnosticText::support_only(format!(
-                "search page cursor belongs to account {cursor_owner}, \
-                 but this filter routes to account {filter_owner}"
-            ))),
-        }),
+    AccountError::invalid_page_cursor(
+        operation,
+        Protocol::Jmap,
+        format!(
+            "search page cursor belongs to account {cursor_owner}, but this filter routes to account {filter_owner}"
+        ),
     )
-    .protocol(Protocol::Jmap)
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
 }
 
 /// The `Email/query` result set moved between the page that minted the
@@ -964,33 +957,6 @@ fn set_error_type_to_jmap_method(error_type: SetErrorType) -> Option<JmapMethod>
     }
 }
 
-/// Build a `SyncState(ScopeRevoked)` error scoped to one foreign
-/// (shared/delegate) account mailbox's `Folder` scope. With the scope
-/// attached, the central `derive` resolves it to
-/// `Engine(DisableScope(scope))` - the engine quarantines just that
-/// cursor scope without escalating account-wide. The owning account
-/// rides as support-only diagnostic text for telemetry.
-#[must_use]
-pub(crate) fn jmap_scope_revoked(
-    scope: CursorScope,
-    owner: &bifrost_types::MailboxId,
-    operation: AccountOperation,
-) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
-        Cause::State(StateCause::ScopeRevoked),
-    )
-    .protocol(Protocol::Jmap)
-    .operation(operation)
-    .scope(ErrorScope::Cursor(scope))
-    .text(DiagnosticText::support_only(format!(
-        "shared account access revoked (owner {})",
-        owner.0,
-    )))
-    .try_build()
-    .expect("valid account error classification")
-}
-
 /// A `Folder` scope that parses as a foreign (shared/delegate) mailbox
 /// but whose account is no longer registered (the share/delegation
 /// disappeared from the session since the cursor was seeded). The scope
@@ -1034,17 +1000,7 @@ pub(crate) fn shared_scope_error(
     owner: Option<&bifrost_types::MailboxId>,
     ctx: JmapErrorContext,
 ) -> AccountError {
-    if let Some(owner) = owner {
-        let account_error = into_account_error(err, ctx.clone());
-        if matches!(
-            account_error.kind(),
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
-        ) {
-            return jmap_scope_revoked(scope.clone(), owner, ctx.operation);
-        }
-        return account_error;
-    }
-    into_account_error(err, ctx)
+    into_account_error(err, ctx).revoke_foreign_scope(scope.clone(), owner)
 }
 
 // ---- internal helpers --------------------------------------------------
@@ -2363,6 +2319,21 @@ mod tests {
             RecoveryClass::Engine(EngineDirective::DisableScope(scope.clone()))
         );
         assert_eq!(err.scope(), Some(&ErrorScope::Cursor(scope)));
+        let original = std::error::Error::source(&err)
+            .unwrap()
+            .downcast_ref::<AccountError>()
+            .unwrap();
+        assert_eq!(
+            original.kind(),
+            &AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+        );
+        assert_eq!(err.protocol(), original.protocol());
+        assert!(
+            original
+                .chain()
+                .iter()
+                .all(|cause| { err.chain().iter().any(|retained| retained == cause) })
+        );
     }
 
     #[test]

@@ -362,7 +362,12 @@ impl AccountOperation {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum Provider {
+    /// The account vendor for the non-mail Google APIs (Calendar, People,
+    /// Drive). Gmail stays the provider for Google mail and for server-side
+    /// filters, including `FilterCondition::ProviderExpression`.
+    Google,
     Fastmail,
+    /// Google mail, and the provider a Gmail filter expression must name.
     Gmail,
     Microsoft,
     Icloud,
@@ -373,6 +378,9 @@ pub enum Provider {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum Protocol {
+    GoogleCalendar,
+    GooglePeople,
+    GoogleDrive,
     Jmap,
     Imap,
     CardDav,

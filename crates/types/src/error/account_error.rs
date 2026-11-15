@@ -23,6 +23,7 @@ pub struct AccountError {
 
 #[derive(Clone, Debug)]
 struct AccountErrorInner {
+    original_error: Option<AccountError>,
     partial_commit: Option<Arc<PartialCommit>>,
     leg_recovery: RecoveryClass,
     kind: AccountErrorKind,
@@ -56,9 +57,80 @@ impl AccountError {
         .expect("valid unsupported account error classification")
     }
 
+    /// A stale caller-owned page cursor asks the consumer to restart that walk.
+    #[must_use]
+    pub fn invalid_page_cursor(
+        operation: AccountOperation,
+        protocol: Protocol,
+        detail: impl Into<String>,
+    ) -> Self {
+        // An Outlook user expects stale results to reload. This signal targets
+        // only the page walk, never the account's durable sync checkpoints.
+        super::builder::AccountErrorBuilder::new(
+            AccountErrorKind::Request(super::kind::RequestErrorKind::Malformed),
+            super::cause::Cause::Request(super::cause::RequestCause::InvalidArgument {
+                field: Some("page_cursor"),
+                message: Some(super::diagnostic::DiagnosticText::support_only(
+                    detail.into(),
+                )),
+            }),
+        )
+        .operation(operation)
+        .protocol(protocol)
+        .try_build()
+        .expect("valid page cursor classification")
+    }
+
+    /// Quarantine a denied foreign scope while retaining the original evidence.
+    /// Non-permission errors and scopes without a foreign owner pass unchanged.
+    #[must_use]
+    pub fn revoke_foreign_scope(
+        self,
+        scope: crate::CursorScope,
+        owner: Option<&crate::MailboxId>,
+    ) -> Self {
+        let Some(owner) = owner else {
+            return self;
+        };
+        if self.kind()
+            != &AccountErrorKind::Authorization(super::kind::AccessErrorKind::PermissionDenied)
+        {
+            return self;
+        }
+        // Losing a delegated folder must not disable an Outlook user's own
+        // mailbox. Preserve every original cause and diagnostic for support.
+        // Retain the classification prefix too: historical evidence added by
+        // decoration must not become evidence of a new in-flight operation.
+        let builder =
+            super::builder::AccountErrorBuilder::from_rebuild(super::builder::RebuildParts {
+                original_error: Some(self.clone()),
+                partial_commit: self.inner.partial_commit.clone(),
+                kind: AccountErrorKind::SyncState(super::kind::SyncStateErrorKind::ScopeRevoked),
+                primary_cause: super::cause::Cause::State(super::cause::StateCause::ScopeRevoked),
+                chain_extras: self.chain().iter().cloned().collect(),
+                classification_cause_count: self.inner.classification_cause_count + 1,
+                scope: Some(ErrorScope::Cursor(scope)),
+                operation: self.inner.operation,
+                provider: self.inner.provider,
+                protocol: self.inner.protocol,
+                diagnostics: self.inner.diagnostics.clone(),
+                idempotency_override: self.inner.idempotency_override,
+                throttle_scope: self.inner.throttle_scope,
+                throttle_budgets: self.inner.throttle_budgets.clone(),
+            });
+        builder
+            .text(super::diagnostic::DiagnosticText::support_only(format!(
+                "shared scope access revoked (owner {})",
+                owner.0,
+            )))
+            .try_build()
+            .expect("valid foreign scope revocation")
+    }
+
     pub(crate) fn from_parts(parts: AccountErrorParts) -> Self {
         Self {
             inner: Arc::new(AccountErrorInner {
+                original_error: parts.original_error,
                 partial_commit: parts.partial_commit,
                 leg_recovery: parts.leg_recovery,
                 kind: parts.kind,
@@ -252,6 +324,7 @@ impl AccountError {
         let mut causes = inner.chain.into_vec();
         let primary_cause = causes.remove(0);
         super::builder::AccountErrorBuilder::from_rebuild(super::builder::RebuildParts {
+            original_error: inner.original_error,
             partial_commit: inner.partial_commit,
             kind: inner.kind,
             primary_cause,
@@ -277,11 +350,15 @@ impl fmt::Display for AccountError {
 
 impl StdError for AccountError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        Some(self.inner.chain.outermost())
+        match &self.inner.original_error {
+            Some(original) => Some(original),
+            None => Some(self.inner.chain.outermost()),
+        }
     }
 }
 
 pub(crate) struct AccountErrorParts {
+    pub original_error: Option<AccountError>,
     pub partial_commit: Option<Arc<PartialCommit>>,
     pub leg_recovery: RecoveryClass,
     pub kind: AccountErrorKind,
@@ -605,5 +682,149 @@ mod unsupported_constructor_tests {
             super::super::cause::RequestCause::Unsupported { operation: op }
         ) if *op == operation)
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_constructor_tests {
+    use super::*;
+    use crate::{
+        AccessCause, AccessErrorKind, AccountErrorBuilder, AttemptCause, Cause, CursorScope,
+        DiagnosticText, EngineDirective, FolderId, MailboxId, RequestCause, RequestErrorKind,
+        TransmissionState,
+    };
+
+    #[test]
+    fn foreign_revocation_preserves_original_source_and_support_evidence() {
+        let scope = CursorScope::Folder(FolderId("shared".into()));
+        let owner = MailboxId("delegate".into());
+        let original = AccountErrorBuilder::new(
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+            Cause::Access(AccessCause::PermissionDenied { resource: None }),
+        )
+        .protocol(Protocol::Ews)
+        .provider(Provider::Microsoft)
+        .operation(AccountOperation::SyncChanges)
+        .status(Some(403))
+        .request_id("request")
+        .trace_id("trace")
+        .native_code("denied")
+        .text(DiagnosticText::support_only("original detail"))
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )))
+        .try_build()
+        .unwrap();
+        let revoked = original
+            .clone()
+            .revoke_foreign_scope(scope.clone(), Some(&owner))
+            .into_builder()
+            .text(DiagnosticText::support_only("decoration"))
+            .try_build()
+            .unwrap();
+        assert_eq!(
+            revoked.recovery(),
+            &RecoveryClass::Engine(EngineDirective::DisableScope(scope))
+        );
+        assert_eq!(revoked.protocol(), original.protocol());
+        assert_eq!(revoked.provider(), original.provider());
+        assert_eq!(revoked.operation(), original.operation());
+        let source = revoked
+            .source()
+            .unwrap()
+            .downcast_ref::<AccountError>()
+            .unwrap();
+        assert_eq!(source.kind(), original.kind());
+        assert_eq!(source.chain(), original.chain());
+        assert_eq!(revoked.telemetry_fields().request_id, Some("request"));
+        assert_eq!(revoked.telemetry_fields().trace_id, Some("trace"));
+        assert_eq!(revoked.telemetry_fields().status, Some(403));
+        assert_eq!(revoked.telemetry_fields().native_code, Some("denied"));
+        assert!(
+            original
+                .chain()
+                .iter()
+                .all(|cause| revoked.chain().iter().any(|retained| retained == cause))
+        );
+        assert!(
+            revoked
+                .support_consented()
+                .support_text
+                .contains(&"original detail")
+        );
+        let historical = AccountErrorBuilder::new(
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+            Cause::Access(AccessCause::PermissionDenied { resource: None }),
+        )
+        .try_build()
+        .unwrap()
+        .into_builder()
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::InFlight,
+        )))
+        .try_build()
+        .unwrap();
+        let historical = historical.revoke_foreign_scope(CursorScope::Account, Some(&owner));
+        assert_eq!(
+            crate::Application::from_leaf(&historical),
+            crate::Application::NotApplied
+        );
+        let primary = original
+            .clone()
+            .revoke_foreign_scope(CursorScope::Account, None);
+        assert_eq!(primary.kind(), original.kind());
+        assert_eq!(primary.chain(), original.chain());
+        let unrelated = AccountError::unsupported(AccountOperation::Search, Protocol::Imap);
+        let unchanged = unrelated
+            .clone()
+            .revoke_foreign_scope(CursorScope::Account, Some(&owner));
+        assert_eq!(unchanged.kind(), unrelated.kind());
+        assert_eq!(unchanged.chain(), unrelated.chain());
+    }
+
+    #[test]
+    fn foreign_revocation_suggests_no_account_remediation() {
+        // A removed share must read as "shared folder no longer available"
+        // (the scope-revoked message key), never as a prompt to reauthorize
+        // or to contact support about the user's own account. The original
+        // denial's ContactProviderSupport must not leak through the chain.
+        let owner = MailboxId("delegate".into());
+        let original = AccountErrorBuilder::new(
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+            Cause::Access(AccessCause::PermissionDenied { resource: None }),
+        )
+        .operation(AccountOperation::SyncChanges)
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )))
+        .try_build()
+        .unwrap();
+        assert!(original.suggested_remediation().is_some());
+        let revoked = original
+            .revoke_foreign_scope(CursorScope::Folder(FolderId("shared".into())), Some(&owner));
+        assert_eq!(revoked.suggested_remediation(), None);
+        assert_eq!(revoked.message_key(), "syncstate.scope-revoked");
+    }
+
+    #[test]
+    fn page_cursor_constructor_targets_only_the_callers_walk() {
+        let error = AccountError::invalid_page_cursor(
+            AccountOperation::Search,
+            Protocol::Imap,
+            "stale page",
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
+        assert_eq!(error.operation(), Some(AccountOperation::Search));
+        assert_eq!(error.protocol(), Some(Protocol::Imap));
+        assert!(error.scope().is_none());
+        assert!(
+            matches!(error.chain().outermost(), Cause::Request(RequestCause::InvalidArgument {
+            field: Some("page_cursor"), message: Some(detail),
+        }) if detail.as_str() == "stale page")
+        );
+        assert!(!matches!(error.recovery(), RecoveryClass::Engine(_)));
     }
 }

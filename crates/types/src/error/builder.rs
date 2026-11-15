@@ -129,6 +129,7 @@ impl fmt::Display for AccountErrorBuildError {
 impl std::error::Error for AccountErrorBuildError {}
 
 pub(crate) struct RebuildParts {
+    pub original_error: Option<AccountError>,
     pub partial_commit: Option<Arc<PartialCommit>>,
     pub kind: AccountErrorKind,
     pub primary_cause: Cause,
@@ -146,6 +147,7 @@ pub(crate) struct RebuildParts {
 
 #[derive(Clone, Debug)]
 pub struct AccountErrorBuilder {
+    original_error: Option<AccountError>,
     partial_commit: Option<PartialCommitBuilder>,
     partial_commit_duplicate: bool,
     kind: AccountErrorKind,
@@ -166,6 +168,7 @@ impl AccountErrorBuilder {
     #[must_use]
     pub fn new(kind: AccountErrorKind, primary_cause: Cause) -> Self {
         Self {
+            original_error: None,
             partial_commit: None,
             partial_commit_duplicate: false,
             kind,
@@ -194,6 +197,7 @@ impl AccountErrorBuilder {
     #[must_use]
     pub(crate) fn from_rebuild(parts: RebuildParts) -> Self {
         Self {
+            original_error: parts.original_error,
             partial_commit: parts.partial_commit.map(|r| r.builder()),
             partial_commit_duplicate: false,
             kind: parts.kind,
@@ -470,6 +474,7 @@ impl AccountErrorBuilder {
         let message_key = message_key::derive(&self.kind);
 
         Ok(AccountError::from_parts(AccountErrorParts {
+            original_error: self.original_error,
             partial_commit,
             leg_recovery,
             kind: self.kind,

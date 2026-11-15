@@ -215,7 +215,7 @@ pub(crate) fn update(
             .map(|version| {
                 version
                     .expected_etag(
-                        bifrost_types::Protocol::Gmail,
+                        bifrost_types::Protocol::GoogleCalendar,
                         AccountOperation::EventUpdate,
                         false,
                     )
@@ -233,7 +233,7 @@ pub(crate) fn update(
         {
             return Err(AccountError::unsupported(
                 AccountOperation::EventUpdate,
-                bifrost_types::Protocol::Gmail,
+                bifrost_types::Protocol::GoogleCalendar,
             ));
         }
         let has_field_patch = event_patch_has_non_move_fields(&patch);
@@ -337,7 +337,7 @@ pub(crate) fn delete_if_version(
             .as_ref()
             .map(|version| {
                 version.expected_etag(
-                    bifrost_types::Protocol::Gmail,
+                    bifrost_types::Protocol::GoogleCalendar,
                     AccountOperation::EventDelete,
                     false,
                 )
@@ -382,7 +382,7 @@ pub(crate) fn rsvp_if_version(
             .as_ref()
             .map(|version| {
                 version.expected_etag(
-                    bifrost_types::Protocol::Gmail,
+                    bifrost_types::Protocol::GoogleCalendar,
                     AccountOperation::EventRsvp,
                     false,
                 )
@@ -666,8 +666,8 @@ fn decode_cross_calendar_cursor(
                 bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Unsent),
             ))
             .operation(AccountOperation::EventSearch)
-            .provider(bifrost_types::Provider::Gmail)
-            .protocol(bifrost_types::Protocol::Gmail)
+            .provider(bifrost_types::Provider::Google)
+            .protocol(bifrost_types::Protocol::GoogleCalendar)
             .text(bifrost_types::DiagnosticText::support_only(
                 "cross-calendar search cursor references a calendar no longer listed; \
                  restart the search",
@@ -2524,8 +2524,8 @@ mod tests {
         assert_eq!(telemetry.request_id, Some("req-77"));
         // A Calendar failure must not claim Gmail as provider or wire: the
         // user would be sent to grant mail permissions for a calendar fault.
-        assert_eq!(telemetry.provider, None);
-        assert_eq!(telemetry.protocol, Some(Protocol::Unknown));
+        assert_eq!(telemetry.provider, Some(bifrost_types::Provider::Google));
+        assert_eq!(telemetry.protocol, Some(Protocol::GoogleCalendar));
         assert!(telemetry.native_code.is_some());
         assert!(
             error
@@ -2541,10 +2541,10 @@ mod tests {
         );
 
         assert!(
-            !error
+            error
                 .chain()
                 .iter()
-                .any(|cause| matches!(cause, Cause::Wire(WireCause::Gmail(_))))
+                .any(|cause| matches!(cause, Cause::Wire(WireCause::GoogleCalendar(_))))
         );
 
         let requests = script.requests();

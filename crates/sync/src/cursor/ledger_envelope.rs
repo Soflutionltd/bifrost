@@ -57,6 +57,12 @@
 //! Version 7 adds Submission, CloudFile and UploadSession scopes (tags 11-13);
 //! older versions reject them.
 //!
+//! Version 8 adds the `ControlWaitEnded` account error kind (kind tag 11);
+//! older versions reject it.
+//!
+//! Version 9 adds Google provider (tag 6) and Calendar, People and Drive
+//! protocols (tags 10-12); older versions reject those tags.
+//!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
 //! checkpoint codec owns that layout and its migration chain, and a second
@@ -122,7 +128,7 @@ use crate::error::Error;
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 8;
+pub const LEDGER_ENVELOPE_VERSION: u32 = 9;
 
 /// Lowest ledger envelope version still readable by this engine.
 ///
@@ -309,7 +315,7 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
 /// one.
 ///
 /// A no-op while every version in the readable window shares one layout
-/// (versions 4 through 8 only widened the error vocabulary). It exists as the
+/// (versions 4 through 9 only widened the error vocabulary). It exists as the
 /// named boundary anyway, for the same reason `migrate_change_cursor` does:
 /// the codec is the only place in the workspace that may hold ledger state in
 /// an older shape, so a fixup written anywhere else spreads knowledge of a dead
@@ -719,7 +725,7 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<AccountError, Error> {
     };
     let provider = match reader.u8()? {
         0 => None,
-        1 => Some(decode_provider(reader.u8()?)?),
+        1 => Some(decode_provider(reader.u8()?, reader.version)?),
         other => {
             return Err(Error::Other(format!(
                 "ledger envelope: unknown provider tag {other}"
@@ -728,7 +734,7 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<AccountError, Error> {
     };
     let protocol = match reader.u8()? {
         0 => None,
-        1 => Some(decode_protocol(reader.u8()?)?),
+        1 => Some(decode_protocol(reader.u8()?, reader.version)?),
         other => {
             return Err(Error::Other(format!(
                 "ledger envelope: unknown protocol tag {other}"
@@ -1188,11 +1194,12 @@ fn encode_provider(provider: Provider) -> u8 {
         Provider::Icloud => 3,
         Provider::Yahoo => 4,
         Provider::Custom => 5,
+        Provider::Google => 6,
         _ => panic!("ledger envelope: unknown provider variant"),
     }
 }
 
-fn decode_provider(tag: u8) -> Result<Provider, Error> {
+fn decode_provider(tag: u8, version: u32) -> Result<Provider, Error> {
     Ok(match tag {
         0 => Provider::Fastmail,
         1 => Provider::Gmail,
@@ -1200,6 +1207,7 @@ fn decode_provider(tag: u8) -> Result<Provider, Error> {
         3 => Provider::Icloud,
         4 => Provider::Yahoo,
         5 => Provider::Custom,
+        6 if version >= 9 => Provider::Google,
         other => return Err(unknown_tag("provider", other)),
     })
 }
@@ -1216,11 +1224,14 @@ fn encode_protocol(protocol: Protocol) -> u8 {
         Protocol::Ews => 7,
         Protocol::CalDav => 8,
         Protocol::Unknown => 9,
+        Protocol::GoogleCalendar => 10,
+        Protocol::GooglePeople => 11,
+        Protocol::GoogleDrive => 12,
         _ => panic!("ledger envelope: unknown protocol variant"),
     }
 }
 
-fn decode_protocol(tag: u8) -> Result<Protocol, Error> {
+fn decode_protocol(tag: u8, version: u32) -> Result<Protocol, Error> {
     Ok(match tag {
         0 => Protocol::Jmap,
         1 => Protocol::Imap,
@@ -1232,6 +1243,9 @@ fn decode_protocol(tag: u8) -> Result<Protocol, Error> {
         7 => Protocol::Ews,
         8 => Protocol::CalDav,
         9 => Protocol::Unknown,
+        10 if version >= 9 => Protocol::GoogleCalendar,
+        11 if version >= 9 => Protocol::GooglePeople,
+        12 if version >= 9 => Protocol::GoogleDrive,
         other => return Err(unknown_tag("protocol", other)),
     })
 }
@@ -1864,6 +1878,40 @@ mod tests {
 #[cfg(test)]
 mod partial_commit_scope_tests {
     use super::*;
+    #[test]
+    fn google_api_error_digests_require_version_nine() {
+        assert_eq!(LEDGER_ENVELOPE_VERSION, 9);
+        for protocol in [
+            Protocol::GoogleCalendar,
+            Protocol::GooglePeople,
+            Protocol::GoogleDrive,
+        ] {
+            let error = AccountError::unsupported(AccountOperation::Search, protocol)
+                .into_builder()
+                .provider(Provider::Google)
+                .request_id("google-request")
+                .try_build()
+                .unwrap();
+            let mut bytes = Vec::new();
+            encode_error(&mut bytes, &error);
+            let restored = decode_error(&mut Reader::new(&bytes, 9)).unwrap();
+            assert_eq!(restored.provider(), Some(Provider::Google));
+            assert_eq!(restored.protocol(), Some(protocol));
+            assert_eq!(
+                restored.telemetry_fields().request_id,
+                Some("google-request")
+            );
+            for version in MIN_MIGRATABLE_LEDGER..9 {
+                assert!(decode_error(&mut Reader::new(&bytes, version)).is_err());
+                assert!(decode_protocol(encode_protocol(protocol), version).is_err());
+                assert!(decode_provider(encode_provider(Provider::Google), version).is_err());
+                let mut legacy = encode_ledger(&DebtLedger::new());
+                legacy[4..8].copy_from_slice(&version.to_le_bytes());
+                assert!(decode_ledger(&legacy).is_ok());
+            }
+        }
+    }
+
     #[test]
     fn ledger_control_wait_ended_v8_tag_round_trips() {
         const { assert!(LEDGER_ENVELOPE_VERSION >= 8) };

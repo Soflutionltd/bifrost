@@ -384,39 +384,6 @@ lane and duplicates it, and `DavAttach::Degraded { transient }` is a dead field.
 classified `AccountError` that decided it. The search half (one folder's failure
 fails the whole page) is already an owner-ruling item in `notes/todo.md`.
 
-## BUG-046 - Revoked shares on IMAP PIM, search and hydration paths escalate to account-wide loss; every quarantine helper drops the original evidence
-
-**Reported by:** imap-account (live), graph.
-
-The graph hunter reports the same four copies and adds two facts. All four
-translate the error, test `kind == Authorization(PermissionDenied)`, and replace
-the result with a freshly built `SyncState(ScopeRevoked)` - discarding the
-original's status, request id, trace id, attempt cause and wire signal, so a
-quarantined share exports no request id to support. And a fifth, different answer
-sits in Graph's `scopes::discover_cursor_scopes_inner`: a foreign mailbox's
-`PermissionDenied` during discovery becomes a skipped scope plus a
-`Warning(OperatorAttentionNeeded)`, while every other error fails the whole
-discovery, a primary-mailbox outage included. Its owner:
-`AccountError::revoke_foreign_scope(self, scope, owner) -> AccountError` in
-`bifrost-types`, keeping the original chain as the revoked error's cause.
-
-The IMAP half is fixed: every IMAP path that touches a shared folder now
-quarantines a revoked share as a scoped revocation and keeps the original
-cause, wire code, attempt evidence and diagnostics. What remains is the
-cross-crate owner below.
-
-Across the workspace the same decision has four copies:
-`imap::error::shared_folder_error`, `jmap::sync::error::shared_scope_error`,
-`graph::graph_error::graph_shared_scope_error` and `ews_shared_scope_error`, each
-with a sibling `*_scope_revoked` builder differing only in protocol stamp and
-text. Owners at two levels: in IMAP, the SELECT is the chokepoint every lane
-passes, so `ImapAccount::select_folder` (or a `SelectedFolder` checkout type it
-returns) should carry the registry's ownership fact and return the
-already-classified error; across crates, "PermissionDenied on a foreign-owned
-scope derives DisableScope(scope)" is a recovery decision, and if `ErrorScope`
-(or the builder) could carry "owned by another principal", `derive` could apply
-it once and the four helpers collapse into a builder call.
-
 ## BUG-052 - IMAP `bulk_move` to a DAV-owned folder goes to the IMAP server while `throttle_keys` says IMAP does not own it
 
 **Reported by:** imap-account (live).
@@ -676,26 +643,6 @@ production; the scripted wire accepts any bearer. The axis belongs in net: eithe
 `TokenSource::current(&Audience)`, with Graph constructing its Outlook-origin
 requests with the Outlook audience. Related: STR-113 (cloud-aware origins).
 
-## BUG-086 - Google stamps Calendar, People and Drive errors as Gmail, and names the wrong OAuth scope for them
-
-**Reported by:** google (live; its headline), net-dav (independently flagged `execute_builder`'s string service with its `_ => ApiSurface::Drive` default, and asked that it take `ApiSurface`).
-
-The mis-stamping is fixed: requests carry a typed service identity, non-Gmail
-errors no longer claim Gmail, and each API names its own OAuth scope. Residue:
-bifrost-types has no Google provider or per-API protocol and wire variants, so a
-Calendar, People or Drive error now goes out as `Protocol::Unknown` with no
-provider and no wire cause, which is honest but uninformative. Add the
-variants in bifrost-types and stamp them here.
-
-Whether a response may stamp the Gmail project budget is decided twice - at
-observation time keyed on the URL's surface (`send_recorded`), and at translation
-time keyed on the context's surface (`translate_response`, and
-`translate_net_error`'s `LocalHold` arm) - held in step by
-`quota::tests::check_surface`, which forges headers to prove the context-side copy
-also refuses: a pairwise-agreement test over two copies. Owner: a typed handle per
-API (STR-121), carrying the surface on every request and in its errors' type; each
-API gets its own classifier feeding one builder funnel.
-
 ## BUG-099 - IMAP and ManageSieve turn every OAuth token-source failure into server-acknowledged `AuthLost`
 
 **Reported by:** smtp-sasl (live; its top-ranked finding).
@@ -836,14 +783,6 @@ potential busy loop. The wave review believed the boundary and the control's
 running state are the same channel, which would make it unreachable, but that
 was not verified. Waiting on the control's running state before `continue`
 removes the possibility.
-
-## BUG-165 - The Google cross-calendar search cursor error is still stamped as Gmail
-
-**Reported by:** wave 7 green pass (lateral).
-
-`account/calendar.rs` builds the cross-calendar search cursor error with
-`Provider::Gmail` and `Protocol::Gmail`, against the rule the rest of the crate
-now follows that only the Gmail surface carries Gmail attribution.
 
 ## BUG-160 - Google contacts hides a first-page authorization failure as an empty directory
 

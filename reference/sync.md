@@ -3478,7 +3478,10 @@ tags as corruption; existing tags and layouts are unchanged. Version 6 adds
 without that tag and rejecting the tag in older-version rows. Version 7 adds
 Submission, CloudFile and UploadSession scopes (tags 11, 12 and 13), rejected
 by older readers. Version 8 adds the `ControlWaitEnded` account error kind
-(kind tag 11), rejected in older-version rows.
+(kind tag 11), rejected in older-version rows. Version 9 adds Google provider
+(tag 6) and GoogleCalendar, GooglePeople and GoogleDrive protocols (tags 10-12).
+Versions 3 through 8 remain readable, but reject these new tags as corruption.
+Existing tags and layouts are unchanged; the readable minimum remains 3.
 
 Decode VALIDATES, never heals: a duplicated entry, barrier or lineage key,
 trailing bytes, a lineage that is not flat (a parent naming itself or an entry
@@ -3508,7 +3511,8 @@ bytes without leaking. So `last_error` and `BarrierIncident::evidence` persist
 as a digest - the exact classification (`AccountErrorKind`, `ErrorScope`,
 operation, provider, protocol) plus the whole `DiagnosticInfo` - rebuilt through
 `AccountErrorBuilder` with the canonical `Cause` its kind demands. Secondary
-cause payloads, `idempotency_override`, `throttle_scope` and the partial-commit
+cause payloads, the retained original error source, `idempotency_override`,
+`throttle_scope` and the partial-commit
 record do not survive. Ledger errors are coverage/repair evidence, never write
 replay inputs; synthesized causes cannot validate a historical write record.
 
