@@ -40,6 +40,10 @@ pub enum Error {
     /// inspect recovery, scope, operation, provider, and diagnostics.
     #[error("cursor establishment terminated")]
     EstablishCursorTerminated(#[source] AccountError),
+    /// Cursor-establishing inventory reached no numbered receiver. The walk
+    /// remains unfinished and can be replayed under the owner's retry budget.
+    #[error("inventory publication reached no numbered receiver")]
+    InventoryUndelivered,
     /// Checkpoint persistence failed.
     #[error("checkpoint store rejected the write: {0}")]
     CheckpointStore(String),

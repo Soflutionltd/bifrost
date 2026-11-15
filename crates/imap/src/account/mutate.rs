@@ -367,7 +367,7 @@ fn validated_move_destination(
     };
     dav_scopes
         .imap_mailbox(destination)
-        .map(Some)
+        .map(|folder| Some(folder.into_mailbox()))
         .ok_or_else(invalid_move_destination_error)
 }
 
@@ -1205,6 +1205,13 @@ fn modified_uids(code: Option<&ResponseCode>) -> Option<CompactUidSet> {
     }
 }
 
+// AccountOperation::skips_absent_target requires confirmed subject absence.
+// IMAP ignores nonexistent UIDs in successful UID STORE/COPY/MOVE commands;
+// neither tagged OK nor omission from MODIFIED proves which UID was present.
+// Keep the acknowledged command verdict here rather than inventing Skipped
+// from a stale cache. A missing folder/destination and a changed UIDVALIDITY
+// also do not establish subject absence and retain their errors. Outlook users
+// must not lose a real move failure because the destination disappeared.
 /// The verdict for one UID under one STORE answer.
 fn mutation_verdict(
     uid: u32,

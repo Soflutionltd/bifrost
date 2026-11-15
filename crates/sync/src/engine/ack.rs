@@ -51,7 +51,7 @@ pub(super) fn take_ack_writer(workers: &mut Vec<WorkerTask>) -> Option<WorkerTas
 /// per-account but the log stream is not: in a multi-account process an
 /// unattributed "worker exceeded detach timeout" says only that some worker
 /// somewhere wedged, which is not actionable. Every other teardown line in
-/// `detach_inner` carries `account = ?account_id`; this one matches them.
+/// `DetachingAccount::run` carries `account = ?account_id`; this one matches them.
 ///
 /// The ROLE rides every line for the same reason. It is captured before the
 /// match because `worker.join` moves into the timeout call.
@@ -169,7 +169,9 @@ pub(super) async fn restore_proof_order(
     store: &DynCheckpointStore,
 ) -> Result<PendingCoverage, Error> {
     let ledger = store.get_ledger(account_id).await?;
-    Ok(PendingCoverage::from_durable_ledger(&ledger))
+    let mut coverage = PendingCoverage::from_durable_ledger(&ledger);
+    coverage.account = Some(account_id.clone());
+    Ok(coverage)
 }
 
 /// Ack writer task. One per attached account. Receives `AckRequest`
@@ -1627,6 +1629,11 @@ async fn persist_ack_request(
         // acknowledgement was honoured. The sentinel simply does not become
         // durable, so the next attach re-walks instead of skipping the scope.
         if reason == CompletionRefusal::WalkNotWhole {
+            // Deliberately discard the candidate's proof as well as its resume
+            // position. A terminal cumulative report from an unwhole walk cannot
+            // certify that the consumer received the ground it claims covered.
+            // Retain accrued debt in the live ledger: an Outlook user expects
+            // missing pages to be offered again, never healed by an empty marker.
             // The rows this walk left behind are a resume position PAST a hole,
             // so they go, and the attempt that wrote them is fenced with them.
             // Withholding the marker alone would leave an `OpenPages` re-attach

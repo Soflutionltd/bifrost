@@ -793,7 +793,14 @@ impl std::fmt::Display for AuthPolicyFailure {
                 if idx > 0 {
                     f.write_str(", ")?;
                 }
-                write!(f, "{} ({})", rejection.mechanism.name(), rejection.reason)?;
+                // Reuse offer spelling so SASL LOGIN and the LOGIN command
+                // remain distinguishable in support diagnostics.
+                let mechanism = if rejection.mechanism == AuthMechanism::ImapLogin {
+                    OfferedAuthentication::LoginCommand
+                } else {
+                    OfferedAuthentication::Sasl(rejection.mechanism)
+                };
+                write!(f, "{} ({})", mechanism, rejection.reason)?;
             }
             Ok(())
         }

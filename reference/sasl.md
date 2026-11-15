@@ -288,3 +288,6 @@ capability disappearance; both protocols treat a wire rejection as final.
 - A typed public auth-outcome surface (which mechanism + binding were used, or a
   typed failure reason) is not built; the protocol crates map into their
   existing error types. Not scheduled.
+
+SCRAM server-final parsing rejects an empty `e=` and a message containing both
+`e=` and `v=` as protocol faults before interpreting a typed server refusal.

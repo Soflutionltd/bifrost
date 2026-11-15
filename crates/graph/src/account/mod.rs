@@ -784,6 +784,17 @@ impl GraphAccountFactory {
         }
     }
 
+    /// Configure credentials for the selected cloud's Outlook audience.
+    /// Every open and reopen retains this source for EWS and Autodiscover.
+    /// A source already configured on the input GraphClient also suffices.
+    #[must_use]
+    pub fn with_outlook_source(mut self, source: Arc<dyn bifrost_net::TokenSource>) -> Self {
+        // Enterprise administrators expect configured Exchange credentials to
+        // reach public folders, delegate discovery and streaming notifications.
+        self.client = self.client.with_outlook_source(source);
+        self
+    }
+
     /// Opt in to Exchange public-folder discovery, and say which folders may
     /// SYNC. Default off entirely: no existing Graph account pays the
     /// Autodiscover round-trips.

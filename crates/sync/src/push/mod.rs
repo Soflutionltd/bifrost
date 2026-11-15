@@ -108,7 +108,9 @@ impl InvalidationSink for InvalidationSinkInner {
 }
 
 pub(crate) fn broadcast(target: &SinkTarget, event: SyncEvent<bifrost_types::Change>) {
-    target.delivery.publish_unacked(MultiplexerEvent::unacked(
+    // Push status is advisory; no cursor or acknowledgement depends on delivery.
+    // Callers supply status events, never checkpoint-bearing data.
+    let _ = target.delivery.publish_unacked(MultiplexerEvent::unacked(
         EventScope::Account,
         Arc::new(event),
     ));

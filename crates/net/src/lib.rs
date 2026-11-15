@@ -84,7 +84,9 @@ pub use error::{
 pub use hold::{Held, HoldDeadline, HoldKind, SharedHold};
 pub use http::Method;
 pub use metered_stream::MeteredStream;
-pub use net::{AccountNet, AccountSpec, Net, ResponseHeadersTimeout, SessionUrl};
+pub use net::{
+    AccountNet, AccountSpec, Net, ResponseHeadersTimeout, SessionRequestBuilder, SessionUrl,
+};
 pub use rate::{RateGeneration, RateLimit, RateLimitGovernor, RequestCost};
 pub use redirect::{
     CrossOrigin, DEFAULT_MAX_HOPS, FollowRedirects, HopCredential, HopPolicy, MethodRewrite,

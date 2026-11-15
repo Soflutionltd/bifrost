@@ -167,10 +167,12 @@ pub(crate) fn move_placement_patch(destination: &str, source: Option<&str>) -> L
         .collect();
     if let Some(source) = source {
         let redundant = is_archive_id(source)
-            || source.eq_ignore_ascii_case(destination)
+            // Opaque user ids are exact: Outlook users moving between labels
+            // that differ only in case still expect the source label removed.
+            || GmailLabelId::parse(source) == GmailLabelId::parse(destination)
             || remove_label_ids
                 .iter()
-                .any(|id| id.eq_ignore_ascii_case(source));
+                .any(|id| GmailLabelId::parse(id) == GmailLabelId::parse(source));
         if !redundant {
             remove_label_ids.push(source.to_string());
         }
@@ -554,6 +556,10 @@ fn is_known_flag(flag: &str, labels: &[GmailLabel]) -> bool {
         || user_label_id_from_flag(flag, labels).is_some()
 }
 
+// System flag spelling is case-insensitive, but opaque label ids and names
+// retain exact case, matching the write lookup. Users must not edit another
+// label merely because its id differs only in case. Renames are handled by
+// user_label_id_from_flag, which deliberately ignores the advisory name.
 fn eq_flag(left: &str, right: &str) -> bool {
     GmailFlag::parse(left) == GmailFlag::parse(right)
 }
@@ -628,6 +634,23 @@ mod tests {
 
     fn set(items: &[&str]) -> HashSet<String> {
         items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn flag_equality_preserves_label_case_and_system_aliases() {
+        assert!(eq_flag("\\Seen", "\\sEeN"));
+        assert!(eq_flag(
+            "$gmail-label:Label_1:Work",
+            "$gmail-label:Label_1:Work"
+        ));
+        assert!(!eq_flag(
+            "$gmail-label:Label_1:Work",
+            "$gmail-label:label_1:Work"
+        ));
+        assert!(!eq_flag(
+            "$gmail-label:Label_1:Work",
+            "$gmail-label:Label_1:work"
+        ));
     }
 
     fn target_snapshot() -> super::super::scopes::ScopeSnapshot {
@@ -877,6 +900,27 @@ mod tests {
             vec![LABEL_SPAM.to_string(), LABEL_TRASH.to_string()],
             "a lowercased INBOX must not ask Gmail to remove the container it is moving into"
         );
+    }
+
+    #[test]
+    fn move_source_label_identity_preserves_user_id_case() {
+        let patch = move_placement_patch("Label_42", Some("label_42"));
+        assert_eq!(patch.add_label_ids, vec!["Label_42".to_string()]);
+        assert_eq!(
+            patch.remove_label_ids,
+            vec!["INBOX", "SPAM", "TRASH", "label_42"]
+        );
+        let same = move_placement_patch("Label_42", Some("Label_42"));
+        assert_eq!(same.remove_label_ids, vec!["INBOX", "SPAM", "TRASH"]);
+    }
+
+    #[test]
+    fn move_source_system_label_identity_ignores_case() {
+        let same = move_placement_patch("inbox", Some("INBOX"));
+        assert_eq!(same.add_label_ids, vec!["INBOX"]);
+        assert_eq!(same.remove_label_ids, vec!["SPAM", "TRASH"]);
+        let implied = move_placement_patch("Label_42", Some("inbox"));
+        assert_eq!(implied.remove_label_ids, vec!["INBOX", "SPAM", "TRASH"]);
     }
 
     #[test]

@@ -1043,10 +1043,9 @@ pub(super) async fn emit_backfill_complete(
 ) -> MarkerOutcome {
     let control = &publisher.control;
     let shutdown = &publisher.shutdown;
-    assert!(
-        Arc::ptr_eq(publisher.coverage(), lane.coverage()),
-        "backfill lane ledger changed"
-    );
+    if !publisher.shares_lane_ledger(lane) {
+        return MarkerOutcome::Withheld;
+    }
     let _activity = loop {
         if !control.wait_until_running(shutdown).await {
             return MarkerOutcome::ShuttingDown;

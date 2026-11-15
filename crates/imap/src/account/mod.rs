@@ -285,7 +285,7 @@ impl ImapAccount {
         // Classification stays at each operation's error boundary: SELECT is
         // not the last command that can discover a withdrawn share. Preserve
         // the raw error here for strategy downgrade and preflight restamping.
-        let options = self.select_options(purpose);
+        let options = self.select_options(purpose)?;
         let result = conn
             .connection()
             .select_for_sync(&folder, &options, self.command_timeout())
@@ -298,7 +298,7 @@ impl ImapAccount {
         Ok(result)
     }
 
-    fn select_options(&self, purpose: SelectPurpose<'_>) -> SelectOptions {
+    fn select_options(&self, purpose: SelectPurpose<'_>) -> Result<SelectOptions, Error> {
         let (cursor, mut options) = match purpose {
             SelectPurpose::Sync(cursor) => (Some(cursor), SelectOptions::read_only()),
             SelectPurpose::Read => (None, SelectOptions::read_only()),
@@ -319,11 +319,11 @@ impl ImapAccount {
             // individual UIDs only to re-coalesce them is the entire cost of
             // building the QRESYNC operand.
             let known_uids = crate::types::UidSet::from_ranges(known_uids.ranges());
-            options = options
-                .with_qresync(validity, modseq, known_uids)
-                .expect("compact cached UID ranges are finite");
+            // Cached state must fail through the operation boundary if the
+            // wire operand validator refuses it, rather than panic at runtime.
+            options = options.with_qresync(validity, modseq, known_uids)?;
         }
-        options
+        Ok(options)
     }
 
     pub(crate) fn cursor_from_select(
@@ -959,7 +959,7 @@ impl Account for ImapAccount {
         if let Some(contacts) = &self.contacts {
             return contacts.contact_autocomplete(query, limit);
         }
-        unsupported_future(AccountOperation::ContactSearch)
+        unsupported_future(AccountOperation::ContactAutocomplete)
     }
 
     fn directory_search(
@@ -1098,7 +1098,7 @@ impl Account for ImapAccount {
         if let Some(calendars) = &self.calendars {
             return calendars.event_autocomplete(query, limit);
         }
-        unsupported_future(AccountOperation::EventSearch)
+        unsupported_future(AccountOperation::EventAutocomplete)
     }
 
     fn thread_hydrate(
@@ -1337,223 +1337,291 @@ fn measured_bytes_delta(current: u64, previous: &mut u64) -> u64 {
     bytes_in
 }
 
-pub(crate) fn folder_from_scope(
-    scope: &CursorScope,
-    op: bifrost_types::AccountOperation,
-) -> Result<MailboxName, AccountError> {
-    match scope {
-        CursorScope::Folder(folder) => MailboxName::from_account_id(&folder.0).map_err(|e| {
-            error::into_account_error(Error::from(e), error::ImapErrorContext::operation(op))
-        }),
-        _ => Err(error::unsupported(op)),
-    }
-}
+use scope_router::{DavScopeIndex, DavScopeOwner, ImapFolder, ScopeHandler, route_scope};
+#[cfg(test)]
+use scope_router::{
+    test_folder_from_scope as folder_from_scope, test_route_typed_scope as route_typed_scope,
+};
 
-/// Which composed sub-account owns a composed `CursorScope::Folder`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DavScopeOwner {
-    Contacts,
-    Calendars,
-}
+// Only this module can mint an ImapFolder; tasks cannot bypass scope ownership.
+mod scope_router {
+    use super::*;
 
-/// Ownership index for legacy bare folder scopes from composed DAV accounts.
-///
-/// `FolderId` carries no protocol namespace and an IMAP mailbox name is an
-/// arbitrary string, so "this folder id appears in the CardDAV href set" is
-/// NOT by itself evidence that the scope belongs to CardDAV: a mailbox named
-/// exactly like a collection href would be delegated away and never sync as
-/// mail. Rather than leave that to a membership test at every routing call,
-/// the index is built once at open and made unambiguous there:
-///
-/// - an id equal to a known IMAP mailbox name is NOT indexed, so the mailbox
-///   keeps its own scope and DAV can never steal it;
-/// - an id claimed by both sub-accounts is NOT indexed, so the tie is never
-///   resolved silently in favour of contacts.
-///
-/// Both exclusions are classified open-time skips. Discovery filters the
-/// losing legacy collections instead of scheduling work against another owner.
-///
-/// **EVERY `CursorScope::Folder` consumer must consult this index**, not only
-/// the four sync lanes. That is the sharpest lesson this seam has paid for: a
-/// round routed the sync lanes correctly and missed `push_subscribe`, a fifth
-/// consumer, so a DAV collection href - a syntactically valid mailbox name -
-/// was admitted as an IDLE mailbox watch. It cost no data (polling is never
-/// suppressed on push coverage) but it was reported in the succeeded lane that
-/// `bifrost-sync` trusts, it burned one of four IDLE budget slots, and it
-/// handed a worker a SELECT that can never succeed. A NEW consumer of `Folder`
-/// scopes must be checked against this index before it ships.
-///
-/// Newly discovered DAV collections use FolderType with Contact or CalendarEvent,
-/// so equal URL strings cannot collide with mail or the other DAV dialect.
-/// This index retains legacy Folder routing. Losing legacy collections are
-/// classified open-time skips and are filtered from cursor discovery.
-#[derive(Debug, Default)]
-pub(crate) struct DavScopeIndex {
-    owners: std::collections::HashMap<bifrost_types::FolderId, DavScopeOwner>,
-}
-
-impl DavScopeIndex {
-    /// Mail membership must use the same ownership and canonical identity as
-    /// sync routing. Enterprise users expect a mail move into an address book
-    /// or calendar to fail locally, never to create mail effects at that URL.
-    pub(crate) fn imap_mailbox(&self, folder: &bifrost_types::FolderId) -> Option<MailboxName> {
-        if self.owner(folder).is_some() {
-            return None;
-        }
-        MailboxName::from_account_id(&folder.0).ok()
-    }
-
-    pub(crate) fn build(
-        contact_folders: Vec<bifrost_types::FolderId>,
-        calendar_folders: Vec<bifrost_types::FolderId>,
-        imap_mailboxes: &std::collections::HashSet<String>,
-    ) -> (Self, Vec<bifrost_types::SkippedScope>) {
-        let contested: std::collections::HashSet<&bifrost_types::FolderId> = contact_folders
-            .iter()
-            .filter(|folder| calendar_folders.contains(folder))
-            .collect();
-        let mut owners = std::collections::HashMap::new();
-        let mut skipped = Vec::new();
-        let candidates = contact_folders
-            .iter()
-            .map(|folder| (folder, DavScopeOwner::Contacts))
-            .chain(
-                calendar_folders
-                    .iter()
-                    .map(|folder| (folder, DavScopeOwner::Calendars)),
-            );
-        for (folder, owner) in candidates {
-            if imap_mailboxes.contains(&folder.0) {
-                skipped.push(collision_skip(
-                    owner,
-                    format!(
-                        "composed DAV collection {:?} has the same identity as an IMAP \
-                         mailbox; the IMAP mailbox keeps the scope and this collection \
-                         will not sync",
-                        folder.0
-                    ),
-                ));
-                continue;
-            }
-            if contested.contains(folder) {
-                // Each losing sub-account reports its own collection: the
-                // CardDAV half under ContactCollection, the CalDAV half under
-                // CalendarCollection, so neither gap hides behind the other.
-                skipped.push(collision_skip(
-                    owner,
-                    format!(
-                        "composed DAV collection {:?} is claimed by both the CardDAV \
-                         and the CalDAV sub-account; neither will sync it",
-                        folder.0
-                    ),
-                ));
-                continue;
-            }
-            owners.insert(folder.clone(), owner);
-        }
-        (Self { owners }, skipped)
-    }
-
-    pub(crate) fn owner(&self, folder: &bifrost_types::FolderId) -> Option<DavScopeOwner> {
-        self.owners.get(folder).copied()
-    }
-}
-
-// A collection excluded from routing must be visible as a classified gap:
-// enterprise users expect a missing address book or calendar to be reported
-// at open. It is named under the LOSING sub-account's collection scope, never
-// `Cursor(Folder(_))`: in the mailbox-collision case that folder scope is the
-// IMAP mailbox's own, which does sync, and a consumer would read the mailbox
-// as skipped. The collection URL rides in support-only detail. The cause is a
-// configuration conflict (two sources claiming one identity), which an
-// administrator fixes, so it classifies as `Request(Malformed)` - the same
-// answer Graph gives an unconfigured shared mailbox - not `Internal`, which
-// would ask the user to report a bifrost bug.
-fn collision_skip(owner: DavScopeOwner, detail: String) -> bifrost_types::SkippedScope {
-    let scope = match owner {
-        DavScopeOwner::Contacts => bifrost_types::ErrorScope::ContactCollection,
-        DavScopeOwner::Calendars => bifrost_types::ErrorScope::CalendarCollection,
-    };
-    bifrost_types::SkippedScope {
-        scope: scope.clone(),
-        error: account_error_with(
-            Error::InvalidInput(detail.into()),
-            error::ImapErrorContext::operation(AccountOperation::Discover).with_scope(scope),
-        ),
-    }
-}
-
-/// Where a `CursorScope`'s sync work is serviced: IMAP itself for a
-/// folder scope, or a composed sub-account for a typed scope.
-pub(crate) enum ScopeHandler<'a> {
-    /// IMAP itself owns this folder scope.
-    Folder(MailboxName),
-    /// A composed sub-account owns this typed scope.
-    Delegate(&'a Arc<dyn Account>),
-}
-
-/// Resolve a `CursorScope` to the handler that services its sync work.
-///
-/// `Folder(_)` scopes route to IMAP via `folder_from_scope`. The two
-/// typed scopes IMAP can compose - `Type(Contact)` and
-/// `Type(CalendarEvent)` - route to the matching sub-account when one is
-/// attached, else `Unsupported`. Every other scope (including the
-/// unrelated `FolderType` object types) falls through to `Unsupported`, preserving the
-/// non-exhaustive guarantee.
-pub(crate) fn route_scope<'a>(
-    account: &'a ImapAccount,
-    scope: &CursorScope,
-    op: bifrost_types::AccountOperation,
-) -> Result<ScopeHandler<'a>, AccountError> {
-    if let CursorScope::Folder(folder) = scope {
-        // The index is disjoint from the IMAP mailbox set and from itself by
-        // construction (see `DavScopeIndex::build`), so a hit here can never
-        // be a real IMAP mailbox and can never be claimed by both sub-accounts.
-        match account.dav_scopes.owner(folder) {
-            Some(DavScopeOwner::Contacts) => {
-                return account
-                    .contacts
-                    .as_ref()
-                    .map(ScopeHandler::Delegate)
-                    .ok_or_else(|| error::unsupported(op));
-            }
-            Some(DavScopeOwner::Calendars) => {
-                return account
-                    .calendars
-                    .as_ref()
-                    .map(ScopeHandler::Delegate)
-                    .ok_or_else(|| error::unsupported(op));
-            }
-            None => {}
+    fn folder_from_scope(
+        scope: &CursorScope,
+        op: bifrost_types::AccountOperation,
+    ) -> Result<MailboxName, AccountError> {
+        match scope {
+            CursorScope::Folder(folder) => MailboxName::from_account_id(&folder.0).map_err(|e| {
+                error::into_account_error(Error::from(e), error::ImapErrorContext::operation(op))
+            }),
+            _ => Err(error::unsupported(op)),
         }
     }
-    route_typed_scope(
-        scope,
-        account.contacts.as_ref(),
-        account.calendars.as_ref(),
-        op,
-    )
-}
 
-/// Pure, account-free core of [`route_scope`]. Keyed only on the scope
-/// and the two optional sub-account handles so it tests in isolation and
-/// is reusable beyond IMAP (brick 10's `compose` extraction calls this).
-pub(crate) fn route_typed_scope<'a>(
-    scope: &CursorScope,
-    contacts: Option<&'a Arc<dyn Account>>,
-    calendars: Option<&'a Arc<dyn Account>>,
-    op: bifrost_types::AccountOperation,
-) -> Result<ScopeHandler<'a>, AccountError> {
-    use bifrost_types::account_compose::{ScopeTarget, route_typed_scope as route_generic};
+    /// Which composed sub-account owns a composed `CursorScope::Folder`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum DavScopeOwner {
+        Contacts,
+        Calendars,
+    }
 
-    // The generic helper decides self-vs-delegate keyed only on the
-    // scope; IMAP maps the `This` case onto its own folder handler
-    // (validating the mailbox name) and mints the `Unsupported` error in
-    // its own vocabulary when a typed scope has no matching sub.
-    match route_generic(scope, contacts, calendars) {
-        Some(ScopeTarget::This) => Ok(ScopeHandler::Folder(folder_from_scope(scope, op)?)),
-        Some(ScopeTarget::Delegate(sub)) => Ok(ScopeHandler::Delegate(sub)),
-        None => Err(error::unsupported(op)),
+    /// Ownership index for legacy bare folder scopes from composed DAV accounts.
+    ///
+    /// `FolderId` carries no protocol namespace and an IMAP mailbox name is an
+    /// arbitrary string, so "this folder id appears in the CardDAV href set" is
+    /// NOT by itself evidence that the scope belongs to CardDAV: a mailbox named
+    /// exactly like a collection href would be delegated away and never sync as
+    /// mail. Rather than leave that to a membership test at every routing call,
+    /// the index is built once at open and made unambiguous there:
+    ///
+    /// - an id equal to a known IMAP mailbox name is NOT indexed, so the mailbox
+    ///   keeps its own scope and DAV can never steal it;
+    /// - an id claimed by both sub-accounts is NOT indexed, so the tie is never
+    ///   resolved silently in favour of contacts.
+    ///
+    /// Both exclusions are classified open-time skips. Discovery filters the
+    /// losing legacy collections instead of scheduling work against another owner.
+    ///
+    /// **EVERY `CursorScope::Folder` consumer must consult this index**, not only
+    /// the four sync lanes. That is the sharpest lesson this seam has paid for: a
+    /// round routed the sync lanes correctly and missed `push_subscribe`, a fifth
+    /// consumer, so a DAV collection href - a syntactically valid mailbox name -
+    /// was admitted as an IDLE mailbox watch. It cost no data (polling is never
+    /// suppressed on push coverage) but it was reported in the succeeded lane that
+    /// `bifrost-sync` trusts, it burned one of four IDLE budget slots, and it
+    /// handed a worker a SELECT that can never succeed. A NEW consumer of `Folder`
+    /// scopes must be checked against this index before it ships.
+    ///
+    /// Newly discovered DAV collections use FolderType with Contact or CalendarEvent,
+    /// so equal URL strings cannot collide with mail or the other DAV dialect.
+    /// This index retains legacy Folder routing. Losing legacy collections are
+    /// classified open-time skips and are filtered from cursor discovery.
+    #[derive(Debug, Default)]
+    pub(crate) struct DavScopeIndex {
+        owners: std::collections::HashMap<bifrost_types::FolderId, DavScopeOwner>,
+    }
+
+    impl DavScopeIndex {
+        /// Admit PIM containers through the same ownership boundary as sync.
+        /// Enterprise users expect a calendar or address book destination to be
+        /// refused locally before any IMAP copy, search or hierarchy command.
+        pub(super) fn imap_container(
+            &self,
+            container: &bifrost_types::ContainerId,
+            op: AccountOperation,
+        ) -> Result<ImapFolder, AccountError> {
+            let folder = bifrost_types::FolderId(container.0.clone());
+            if self.owner(&folder).is_some() {
+                return Err(error::unsupported(op));
+            }
+            MailboxName::from_account_id(&container.0)
+                .map(ImapFolder)
+                .map_err(|e| error::pim_malformed(op, e.to_string()))
+        }
+
+        /// Mail membership must use the same ownership and canonical identity as
+        /// sync routing. Enterprise users expect a mail move into an address book
+        /// or calendar to fail locally, never to create mail effects at that URL.
+        pub(crate) fn imap_mailbox(&self, folder: &bifrost_types::FolderId) -> Option<ImapFolder> {
+            // Container admission owns DAV exclusion and mailbox parsing. The
+            // operation only labels the error, which membership callers discard.
+            self.imap_container(
+                &bifrost_types::ContainerId(folder.0.clone()),
+                AccountOperation::BulkMove,
+            )
+            .ok()
+        }
+
+        pub(crate) fn build(
+            contact_folders: Vec<bifrost_types::FolderId>,
+            calendar_folders: Vec<bifrost_types::FolderId>,
+            imap_mailboxes: &std::collections::HashSet<String>,
+        ) -> (Self, Vec<bifrost_types::SkippedScope>) {
+            let contested: std::collections::HashSet<&bifrost_types::FolderId> = contact_folders
+                .iter()
+                .filter(|folder| calendar_folders.contains(folder))
+                .collect();
+            let mut owners = std::collections::HashMap::new();
+            let mut skipped = Vec::new();
+            let candidates = contact_folders
+                .iter()
+                .map(|folder| (folder, DavScopeOwner::Contacts))
+                .chain(
+                    calendar_folders
+                        .iter()
+                        .map(|folder| (folder, DavScopeOwner::Calendars)),
+                );
+            for (folder, owner) in candidates {
+                if imap_mailboxes.contains(&folder.0) {
+                    skipped.push(collision_skip(
+                        owner,
+                        format!(
+                            "composed DAV collection {:?} has the same identity as an IMAP \
+                             mailbox; the IMAP mailbox keeps the scope and this collection \
+                             will not sync",
+                            folder.0
+                        ),
+                    ));
+                    continue;
+                }
+                if contested.contains(folder) {
+                    // Each losing sub-account reports its own collection: the
+                    // CardDAV half under ContactCollection, the CalDAV half under
+                    // CalendarCollection, so neither gap hides behind the other.
+                    skipped.push(collision_skip(
+                        owner,
+                        format!(
+                            "composed DAV collection {:?} is claimed by both the CardDAV \
+                             and the CalDAV sub-account; neither will sync it",
+                            folder.0
+                        ),
+                    ));
+                    continue;
+                }
+                owners.insert(folder.clone(), owner);
+            }
+            (Self { owners }, skipped)
+        }
+
+        pub(crate) fn owner(&self, folder: &bifrost_types::FolderId) -> Option<DavScopeOwner> {
+            self.owners.get(folder).copied()
+        }
+    }
+
+    // A collection excluded from routing must be visible as a classified gap:
+    // enterprise users expect a missing address book or calendar to be reported
+    // at open. It is named under the LOSING sub-account's collection scope, never
+    // `Cursor(Folder(_))`: in the mailbox-collision case that folder scope is the
+    // IMAP mailbox's own, which does sync, and a consumer would read the mailbox
+    // as skipped. The collection URL rides in support-only detail. The cause is a
+    // configuration conflict (two sources claiming one identity), which an
+    // administrator fixes, so it classifies as `Request(Malformed)` - the same
+    // answer Graph gives an unconfigured shared mailbox - not `Internal`, which
+    // would ask the user to report a bifrost bug.
+    fn collision_skip(owner: DavScopeOwner, detail: String) -> bifrost_types::SkippedScope {
+        let scope = match owner {
+            DavScopeOwner::Contacts => bifrost_types::ErrorScope::ContactCollection,
+            DavScopeOwner::Calendars => bifrost_types::ErrorScope::CalendarCollection,
+        };
+        bifrost_types::SkippedScope {
+            scope: scope.clone(),
+            error: account_error_with(
+                Error::InvalidInput(detail.into()),
+                error::ImapErrorContext::operation(AccountOperation::Discover).with_scope(scope),
+            ),
+        }
+    }
+
+    /// An IMAP mailbox admitted by the scope router, retained across task spawning.
+    /// Enterprise users expect DAV folders never to become IMAP SELECT targets.
+    #[derive(Debug, Clone)]
+    pub(crate) struct ImapFolder(MailboxName);
+
+    impl ImapFolder {
+        pub(crate) fn into_mailbox(self) -> MailboxName {
+            self.0
+        }
+    }
+
+    impl std::ops::Deref for ImapFolder {
+        type Target = MailboxName;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    /// Where a `CursorScope`'s sync work is serviced: IMAP itself for a
+    /// folder scope, or a composed sub-account for a typed scope.
+    pub(crate) enum ScopeHandler<'a> {
+        /// IMAP itself owns this folder scope.
+        Folder(ImapFolder),
+        /// A composed sub-account owns this typed scope.
+        Delegate(&'a Arc<dyn Account>),
+    }
+
+    /// Resolve a `CursorScope` to the handler that services its sync work.
+    ///
+    /// `Folder(_)` scopes route to IMAP via `folder_from_scope`. The two
+    /// typed scopes IMAP can compose - `Type(Contact)` and
+    /// `Type(CalendarEvent)` - route to the matching sub-account when one is
+    /// attached, else `Unsupported`. Every other scope (including the
+    /// unrelated `FolderType` object types) falls through to `Unsupported`, preserving the
+    /// non-exhaustive guarantee.
+    pub(crate) fn route_scope<'a>(
+        account: &'a ImapAccount,
+        scope: &CursorScope,
+        op: bifrost_types::AccountOperation,
+    ) -> Result<ScopeHandler<'a>, AccountError> {
+        if let CursorScope::Folder(folder) = scope {
+            // The index is disjoint from the IMAP mailbox set and from itself by
+            // construction (see `DavScopeIndex::build`), so a hit here can never
+            // be a real IMAP mailbox and can never be claimed by both sub-accounts.
+            match account.dav_scopes.owner(folder) {
+                Some(DavScopeOwner::Contacts) => {
+                    return account
+                        .contacts
+                        .as_ref()
+                        .map(ScopeHandler::Delegate)
+                        .ok_or_else(|| error::unsupported(op));
+                }
+                Some(DavScopeOwner::Calendars) => {
+                    return account
+                        .calendars
+                        .as_ref()
+                        .map(ScopeHandler::Delegate)
+                        .ok_or_else(|| error::unsupported(op));
+                }
+                None => {}
+            }
+        }
+        route_typed_scope(
+            scope,
+            account.contacts.as_ref(),
+            account.calendars.as_ref(),
+            op,
+        )
+    }
+
+    // Ownership was checked by route_scope before this private typed dispatch.
+    fn route_typed_scope<'a>(
+        scope: &CursorScope,
+        contacts: Option<&'a Arc<dyn Account>>,
+        calendars: Option<&'a Arc<dyn Account>>,
+        op: bifrost_types::AccountOperation,
+    ) -> Result<ScopeHandler<'a>, AccountError> {
+        use bifrost_types::account_compose::{ScopeTarget, route_typed_scope as route_generic};
+
+        // The generic helper decides self-vs-delegate keyed only on the
+        // scope; IMAP maps the `This` case onto its own folder handler
+        // (validating the mailbox name) and mints the `Unsupported` error in
+        // its own vocabulary when a typed scope has no matching sub.
+        match route_generic(scope, contacts, calendars) {
+            Some(ScopeTarget::This) => Ok(ScopeHandler::Folder(ImapFolder(folder_from_scope(
+                scope, op,
+            )?))),
+            Some(ScopeTarget::Delegate(sub)) => Ok(ScopeHandler::Delegate(sub)),
+            None => Err(error::unsupported(op)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_folder_from_scope(
+        scope: &CursorScope,
+        op: bifrost_types::AccountOperation,
+    ) -> Result<MailboxName, AccountError> {
+        folder_from_scope(scope, op)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_route_typed_scope<'a>(
+        scope: &CursorScope,
+        contacts: Option<&'a Arc<dyn Account>>,
+        calendars: Option<&'a Arc<dyn Account>>,
+        op: bifrost_types::AccountOperation,
+    ) -> Result<ScopeHandler<'a>, AccountError> {
+        route_typed_scope(scope, contacts, calendars, op)
     }
 }
 

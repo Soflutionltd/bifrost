@@ -12,7 +12,8 @@ impl SyncEngine {
     /// alongside partial accounting. Preflight failures return `Err`.
     ///
     /// Mutation accounting consumes `ItemOutcome<MutationSuccess>` and
-    /// dispatches per-item failures via [`crate::recovery::dispatch_stream_failure`]:
+    /// classifies per-item failures via [`crate::recovery::plan_recovery`] after
+    /// observing shared throttle holds:
     ///
     /// - `Retry { SameRequest | AfterAuthRefresh }` -> retry queue.
     /// - `Retry { AfterStateRefresh }` and `Reconcile { CheckTarget }`
@@ -809,7 +810,7 @@ impl SyncEngine {
                                             Some(crate::recovery::reconcile_delay(
                                                 advice,
                                                 std::time::SystemTime::now(),
-                                                Duration::from_secs(1),
+                                                crate::recovery::HINTLESS_RETRY_WAIT,
                                             ))
                                         }
                                         bifrost_types::RecoveryClass::Retry(advice)
@@ -821,7 +822,7 @@ impl SyncEngine {
                                             Some(crate::recovery::retry_delay(
                                                 advice,
                                                 std::time::SystemTime::now(),
-                                                Duration::from_secs(1),
+                                                crate::recovery::HINTLESS_RETRY_WAIT,
                                             ))
                                         }
                                         _ => None,
@@ -894,7 +895,7 @@ impl SyncEngine {
                                             + crate::recovery::retry_delay(
                                                 &advice,
                                                 std::time::SystemTime::now(),
-                                                Duration::from_secs(1),
+                                                crate::recovery::HINTLESS_RETRY_WAIT,
                                             ),
                                     );
                                 }
@@ -907,7 +908,7 @@ impl SyncEngine {
                                         + crate::recovery::reconcile_delay(
                                             &advice,
                                             std::time::SystemTime::now(),
-                                            Duration::from_secs(1),
+                                            crate::recovery::HINTLESS_RETRY_WAIT,
                                         ),
                                 );
                                 let mut wants_dedupe = false;
@@ -1033,7 +1034,7 @@ impl SyncEngine {
                         + crate::recovery::retry_delay(
                             &advice,
                             std::time::SystemTime::now(),
-                            Duration::from_secs(1),
+                            crate::recovery::HINTLESS_RETRY_WAIT,
                         );
                 }
             }
@@ -1439,7 +1440,7 @@ pub(super) fn unresolved_readback_ids(
 /// an id whose provider named a later deadline. Ties keep the incumbent.
 fn keep_longer_advice(current: &mut Option<RetryAdvice>, candidate: RetryAdvice) {
     let now = std::time::SystemTime::now();
-    let fallback = Duration::from_secs(1);
+    let fallback = crate::recovery::HINTLESS_RETRY_WAIT;
     let candidate_delay = crate::recovery::retry_delay(&candidate, now, fallback);
     match current {
         Some(existing)
@@ -1509,7 +1510,10 @@ pub(super) fn classify_item_outcome(
         ItemOutcome::Failed(failure) => {
             let id = bifrost_types::ObjectId(failure.item.0);
             let original = failure.error.clone();
-            match crate::recovery::dispatch_stream_failure(failure.error, throttles, account_id) {
+            // Per-item accounting is not a failed stream: retain provider advice
+            // and shared holds without emitting one recovery log per item.
+            crate::recovery::observe_failure_throttles(throttles, account_id, &failure.error);
+            match crate::recovery::plan_recovery(failure.error) {
                 RecoveryPlan::Retry(advice) => {
                     // A per-item 429 (Graph files them per `$batch`
                     // subresponse) carries the same shared deadline a

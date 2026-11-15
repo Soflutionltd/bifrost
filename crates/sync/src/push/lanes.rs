@@ -165,14 +165,17 @@ impl PushLanes {
         generation: crate::types::AccountGeneration,
         pending: &mut VecDeque<ReopenRequest>,
     ) -> (Duration, bool, bool) {
+        // Name the same hintless floor as other recovery owners. The lane
+        // takes the maximum with reconnect backoff, so this is not an extra
+        // sleep and does not reset consecutive-failure pacing.
         match recovery::dispatch_stream_failure(error.clone(), &self.throttles, &self.account_id) {
             RecoveryPlan::Retry(a) => (
-                recovery::retry_delay(&a, SystemTime::now(), Duration::ZERO),
+                recovery::retry_delay(&a, SystemTime::now(), recovery::HINTLESS_RETRY_WAIT),
                 false,
                 false,
             ),
             RecoveryPlan::Reconcile(a) => (
-                recovery::reconcile_delay(&a, SystemTime::now(), Duration::ZERO),
+                recovery::reconcile_delay(&a, SystemTime::now(), recovery::HINTLESS_RETRY_WAIT),
                 false,
                 false,
             ),

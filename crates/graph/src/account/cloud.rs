@@ -650,6 +650,11 @@ async fn upload_chunks(
         let status = response.status;
         match status.as_u16() {
             200 | 201 => {
+                window.admit_completion().map_err(|_| {
+                    contract_violation(
+                        "OneDrive upload completed before every byte was sent".to_owned(),
+                    )
+                })?;
                 let item: DriveItemResponse = serde_json::from_slice(response.body.as_ref())
                     .map_err(|e| GraphError::Json {
                         message: format!("OneDrive upload drive item JSON body: {e}"),

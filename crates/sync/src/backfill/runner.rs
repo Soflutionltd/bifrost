@@ -361,11 +361,10 @@ impl BackfillRunner {
         lane: Option<&crate::engine::lane::LaneGate>,
         walk_fence: crate::cursor::ScopeFence,
     ) -> Result<BackfillPartitionOutcome, Error> {
-        if let Some(gate) = lane {
-            assert!(
-                Arc::ptr_eq(publisher.coverage(), gate.coverage()),
-                "backfill lane ledger changed"
-            );
+        if let Some(gate) = lane
+            && !publisher.shares_lane_ledger(gate)
+        {
+            return Err(Error::Other("backfill lane ledger mismatch".into()));
         }
         let control = &publisher.control;
         let writer_tx = &publisher.writer_tx;
@@ -488,7 +487,9 @@ impl BackfillRunner {
                             bytes_in: batch.bytes_in,
                             checkpoint: None,
                         };
-                        delivery.publish_unacked(MultiplexerEvent::unacked(
+                        // This checkpoint-free barrier never completes the walk,
+                        // regardless of whether an advisory batch has a receiver.
+                        let _ = delivery.publish_unacked(MultiplexerEvent::unacked(
                             EventScope::Cursor(scope.clone()),
                             Arc::new(SyncEvent::Batch(synthetic)),
                         ));

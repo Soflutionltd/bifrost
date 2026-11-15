@@ -262,7 +262,7 @@ impl DavDispatch {
 
     /// Turn a native id into an absolute request URL.
     ///
-    /// An absolute href is returned verbatim. A root-relative href (`/cal/x`)
+    /// An absolute HTTP(S) href is returned verbatim. A root-relative href (`/cal/x`)
     /// replaces the base's path, which is what RFC 3986 says and what a server
     /// naming such an href in a Multi-Status means. A RELATIVE href lands under
     /// the configured base path.
@@ -277,11 +277,21 @@ impl DavDispatch {
     /// done, so the two branches now agree on the shape they share.
     #[must_use]
     pub fn resolve_url(&self, href: &str) -> String {
-        if Url::parse(href).is_ok() {
+        let parsed = Url::parse(href).ok();
+        if parsed
+            .as_ref()
+            .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
+        {
             return href.to_string();
         }
+        // Native DAV ids name HTTP resources. Users expect scheme-like names
+        // such as mailto:one.ics to stay beneath their configured collection,
+        // rather than selecting a different transport. The ./ makes Url::join
+        // treat a non-HTTP scheme as path text instead of an absolute URI.
+        let relative = parsed.map(|_| format!("./{href}"));
+        let join_href = relative.as_deref().unwrap_or(href);
         if let Some(base) = self.join_base()
-            && let Ok(resolved) = base.join(href)
+            && let Ok(resolved) = base.join(join_href)
         {
             return resolved.to_string();
         }
@@ -1336,6 +1346,17 @@ mod tests {
             "an absolute href is returned verbatim"
         );
 
+        for href in ["mailto:one.ics", "urn:uuid:one", "ftp://other.test/one.ics"] {
+            assert_eq!(
+                dispatch.resolve_url(href),
+                format!("https://dav.example.test/dav/{href}")
+            );
+        }
+        assert_eq!(
+            dispatch.resolve_url("HTTPS://other.example.test/cal/one.ics"),
+            "HTTPS://other.example.test/cal/one.ics"
+        );
+
         // The fallback branch, reached only when the base does not parse, must
         // give a relative id the same shape.
         let unparseable = dispatch_at(scripted_dav_net(&dav_script_empty()), "not a url/dav");
@@ -2292,7 +2313,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_retry_history_keeps_a_hint_absent_from_the_final_response() {
+    fn exhausted_retry_history_does_not_become_terminal_advice_for_a_final_response_without_one() {
         let dispatch = scripted_dispatch(scripted_dav_net(&dav_script_empty()));
         let request = DavRequest::new(Method::GET, BASE);
         let error = dispatch
@@ -2311,11 +2332,22 @@ mod tests {
                     stop_reason: bifrost_net::RetryStopReason::AttemptBudget,
                 }),
             )
-            .expect_err("exhaustion keeps its retry history");
-        assert!(error.chain().iter().any(|cause| matches!(cause,
+            .expect_err("exhaustion surfaces the final response");
+        // Terminal retry advice comes only from the final response; an earlier
+        // hint stays history, so a stale 300s wait cannot be imposed on a
+        // response that carried none.
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
             bifrost_types::Cause::Server(bifrost_types::ServerCause::Unavailable {
-                retry_hint: Some(bifrost_types::RetryHint::After(delay)),
-            }) if *delay == std::time::Duration::from_secs(300))));
+                retry_hint: None,
+            })
+        )));
+        assert!(!error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Server(bifrost_types::ServerCause::Unavailable {
+                retry_hint: Some(_),
+            })
+        )));
     }
 
     struct PendingTokenSource;

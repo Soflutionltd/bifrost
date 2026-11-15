@@ -66,6 +66,7 @@ pub struct ScopeWalkDriver {
     // those published capabilities instead of collapsing distinct lifetimes.
     /// Set once the source can produce nothing further, for any reason.
     exhausted: bool,
+    awaiting_outcome: bool,
     completed: bool,
     total_seen: WalkTotal,
     /// The window most recently handed out, so an open-ended walk knows where
@@ -97,6 +98,7 @@ impl ScopeWalkDriver {
             source,
             walk: BackfillScopeWalk::new(),
             exhausted: false,
+            awaiting_outcome: false,
             completed: true,
             total_seen: WalkTotal(0),
             pending_to: None,
@@ -106,20 +108,35 @@ impl ScopeWalkDriver {
     /// The next partition to walk, or `None` if the scope must not be walked
     /// any further in this pass.
     pub fn next_partition(&mut self) -> Option<InventoryPartition> {
-        if self.exhausted || self.walk.stopped() {
+        if self.exhausted || self.walk.stopped() || self.awaiting_outcome {
             return None;
         }
-        match &mut self.source {
-            PartitionSource::Fixed(partitions) => partitions.next(),
+        let next = match &mut self.source {
+            PartitionSource::Fixed(partitions) => {
+                let next = partitions.next();
+                if next.is_none() {
+                    self.exhausted = true;
+                }
+                next
+            }
             PartitionSource::OpenPages { from, chunk } => {
-                let to = from.saturating_add(*chunk);
+                let to = from.saturating_add((*chunk).max(1));
+                if to == *from {
+                    // MoreBeyond at the representable limit cannot prove exhaustion.
+                    // Leave the scope pending instead of repeating an empty window.
+                    self.completed = false;
+                    self.exhausted = true;
+                    return None;
+                }
                 // `to` saturates upward from `from`, so the window is always
                 // ordered; a refusal would only end the walk.
                 let window = bifrost_types::PageWindow::new(*from, to)?;
                 self.pending_to = Some(to);
                 Some(InventoryPartition::Page(window))
             }
-        }
+        };
+        self.awaiting_outcome = next.is_some();
+        next
     }
 
     /// Fold one partition's outcome back in.
@@ -127,6 +144,7 @@ impl ScopeWalkDriver {
     /// Returns the scope-level verdict, though callers driving the loop through
     /// `next_partition` do not need to inspect it: a stop is already recorded.
     pub fn fold(&mut self, outcome: &BackfillPartitionOutcome) -> ScopeWalkStep {
+        self.awaiting_outcome = false;
         self.total_seen.observe(outcome);
         if !outcome.complete {
             // The partition finished but left coverage obligations open.
@@ -177,7 +195,7 @@ impl ScopeWalkDriver {
     /// Whether the scope may be marked complete and its sentinel emitted.
     #[must_use]
     pub fn completed(&self) -> bool {
-        self.completed
+        self.completed && self.exhausted && !self.awaiting_outcome
     }
 
     /// Whether the walk ended because a barrier stopped the scope.
@@ -249,6 +267,34 @@ mod tests {
         assert_eq!(failed.next_partition(), Some(InventoryPartition::Full));
         failed.fail();
         assert!(!failed.completed());
+    }
+
+    #[test]
+    fn completion_requires_enumeration_and_folded_outcomes() {
+        let mut driver = ScopeWalkDriver::fixed(Vec::new());
+        assert!(!driver.completed());
+        assert!(driver.next_partition().is_some());
+        assert!(driver.next_partition().is_none());
+        assert!(!driver.completed());
+        let _ = driver.fold(&exhausted(0));
+        assert!(driver.next_partition().is_none());
+        assert!(driver.completed());
+    }
+
+    #[test]
+    fn more_beyond_the_page_limit_leaves_the_walk_pending() {
+        let mut driver = ScopeWalkDriver::open_pages(u32::MAX - 1, 10);
+        assert!(driver.next_partition().is_some());
+        let _ = driver.fold(&clean(0));
+        assert!(driver.next_partition().is_none());
+        assert!(!driver.completed());
+        let mut zero_chunk = ScopeWalkDriver::open_pages(0, 0);
+        assert_eq!(
+            zero_chunk.next_partition(),
+            Some(InventoryPartition::Page(
+                bifrost_types::PageWindow::new(0, 1).expect("nonempty window")
+            ))
+        );
     }
 
     fn fixed_three() -> ScopeWalkDriver {

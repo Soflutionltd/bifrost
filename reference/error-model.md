@@ -446,7 +446,12 @@ An attempt appended after `into_builder` is diagnostic evidence only.
 its arrival: `Unspecified` (the `AttemptCause::new` default) or
 `UnreadableSuccess` (`AttemptCause::unreadable_success()`, always
 `Acknowledged`): a success status arrived and its body could not be read.
-`derive` ignores it; partial-commit application reads it (below). Only a
+`derive` ignores it; partial-commit application reads it (below).
+JMAP response decode failures retain this evidence for reads as well as writes:
+an answer arrived even when unreadable. Their `Protocol(ParseFailed)` kind
+still derives terminal `ProviderContractViolation`, not a transport retry.
+Transmission evidence describes what happened; protocol classification decides
+whether another attempt is useful. Only a
 producer that knows the status was a success stamps it - Google's post-200
 `JsonDecode`/`Base64` and Graph's `GraphError::Json`. A decoded refusal whose
 body broke the contract (an IMAP tagged `BAD` response code, a malformed Graph
@@ -570,7 +575,8 @@ wildcard arm would let stale consumer policy silently apply to a new
 lane. `MutationSuccess::{Applied, Skipped, Downgraded { actual }}` is the
 mutation success payload, and the three are distinct answers to
 distinct questions: `Applied` means the target is in the requested
-state, `Skipped` means it already was and nothing was done, and
+state, `Skipped` means no write was needed or the subject was confirmed absent under
+`AccountOperation::skips_absent_target`, and nothing was done by this call;
 `Downgraded` means the provider accepted a WEAKER operation - a real write
 landed, but not the one requested, and `actual: MutationEffect` says
 what weaker operation landed.
@@ -636,6 +642,15 @@ recovery fields (disposition/reason/throttle for retry,
 reason/actions/throttle for reconcile, none for terminal) via the
 `recovery_fields` / `recovery_discriminant` matches in
 `account_error.rs`.
+
+Historical sync debt uses the same text visibility distinction without
+reconstructing live error advice. `SyncEngine::debt` removes support-only text
+from its inspection snapshot; `debt_support_consented` retains it and requires
+user consent. Both entries and barrier incidents follow this rule. The store
+codec retains full historical diagnostics for persistence. A debt snapshot is
+not a telemetry export: unconditional telemetry must still omit all free-form
+text, including user-safe text. No cause chain is reconstructed for either
+inspection tier.
 
 ## Scope, operation, provider, protocol
 
@@ -875,3 +890,7 @@ scope lifting; hintless budgets and mailbox holds get `HINTLESS_HOLD_WAIT`
 holds require a hint. Unresolved mailbox identities and operation-only advice
 remain `CurrentOperation`, which paces repair without widening shared holds.
 The engine supplies account identity and anchors hints on its monotonic clock.
+
+`compose::validate_send_recipients` and `SendRequest::validate_recipients`
+require a protocol identity for their local empty-send refusal. Neutral MIME
+callers use `Unknown` and account boundaries supply their own identity.

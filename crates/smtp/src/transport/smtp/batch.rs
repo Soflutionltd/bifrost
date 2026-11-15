@@ -58,8 +58,9 @@ pub fn submission_status(outcome: &BatchOutcome<()>) -> SubmissionStatus<'_> {
     if !outcome.succeeded().is_empty() {
         SubmissionStatus::Committed
     } else if let Some(lane) = outcome.uncertain().first() {
-        // Whether this becomes a send error or an uncertain receipt is a
-        // caller policy still awaiting a decision. Keep that choice explicit.
+        // With no acknowledged recipient, preserve the first uncertain error.
+        // The submission facade returns it for reconciliation; other batch
+        // callers choose their own UI and retry policy.
         SubmissionStatus::AcceptanceUncertain(&lane.error)
     } else if let Some(lane) = outcome.failed().first() {
         SubmissionStatus::Rejected(&lane.error)

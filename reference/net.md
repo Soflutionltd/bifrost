@@ -134,8 +134,17 @@ authentication, redacts transport-generated URL error text and disables redirect
 in one operation. `SessionUrl::new` declares sensitivity, not URL admission;
 providers still validate scheme, host and upload surface before constructing it.
 Its `Debug` and `Display` redact the credential, and it exposes no raw URL getter.
-The returned request builder retains ordinary body, deadline, replay and accounting
-controls. Callers must retain these session policies when customizing it.
+The returned `SessionRequestBuilder` exposes body, header, retry, timeout and replay
+controls plus buffered send. Conversion into `RequestBuilder` supports shared
+dispatch funnels while retaining locked redirect and hop policies; automatic
+account bearer injection stays disabled. Calling `hop_policy` or
+`follow_redirects` after conversion records a deferred `Error::InvalidRequest`
+with the setter's name as `field`, even when the requested redirect policy is
+`Disabled`. The first deferred configuration error wins, and both buffered and
+streaming sends return it before admission or dispatch. Session error redaction
+preserves that field. A shared funnel must see that its policy was refused;
+enterprise users expect the upload credential and payload to remain on the
+provider-admitted destination.
 Graph's anonymous auxiliary requests and both Drive session sends use this door;
 Outlook audience selection and provider upload sequencing remain provider-owned.
 
@@ -1689,13 +1698,15 @@ preserves the ledger. The send loop transfers its ledger without recording the
 terminal response twice. Account-error translation consumes this ledger;
 translated diagnostic cause chains do not decide replay safety.
 `RequestEvidence::new` admits synthetic history with a typed commit verdict and
-never weakens evidence discovered in that history.
+never weakens evidence discovered in that history. The internal supplied-ledger
+constructor retains that same strongest-verdict invariant.
 
 `RetryStopReason::{AttemptBudget, ReplayForbidden}` distinguishes exhausted
 attempts from replay-policy refusal; replay refusal wins when both apply.
 `RateLimited.retry_after`, `RetryBudgetExhausted.retry_after_history` and
 `RefreshFailed.retry_after` all store `RetryHint`. The transport caps only the
-wait it performs, preserving uncapped server advice for consumers.
+wait it performs, preserving uncapped server advice for consumers. Terminal retry
+advice comes only from the final response; historical hints remain diagnostics.
 `HoldKind` deliberately remains a restricted rate/quota classification because
 generic unavailable/server errors cannot create timed holds. Its `server_kind`
 and `server_cause` projections own conversion into the shared error model.
@@ -1727,6 +1738,8 @@ refusal and retains its suspended stream state and request ordering.
 Content-Range encoding and final-window detection. `ChunkWindow::resume_with`
 accepts a provider decoder and error translator; `admit_resume` also supports
 provider parsers that expose a separately tested offset-admission boundary.
+Completion responses are refused until the submitted window reaches the total
+length, so a premature success cannot silently truncate an uploaded file.
 Offsets cannot regress, skip unsent bytes, stall, or acknowledge the whole file
 without a completion response. No-progress classification is explicit:
 `NoProgress::LocalLimit` for Drive's legal resend response and
@@ -1748,7 +1761,7 @@ Cloning copies the set, so DAV discovery cannot widen a sibling protocol leg.
 not grant authority over another account's configured origins.
 
 `AccountSpec::trusted_origins` optionally restricts automatic account bearer
-injection. A configured empty set refuses all destinations. The shared request
+injection and caller-supplied Authorization headers. A configured empty set refuses all destinations. The shared request
 loop checks it on every authenticated hop before token lookup, including after
 retagging. `None` retains protocol-owned admission for existing consumers.
 `HopPolicy` remains the admission authority for credentials it selects, including
@@ -1772,3 +1785,6 @@ are positive and `None` is unlimited. `AccountNet::set_bandwidth_cap` extracts
 the numeric value into the shared budget. The lower-level `BandwidthBudget`
 retains its numeric constructor/setter and zero-clamping behavior for transport
 admission callers; it cannot introduce zero through the typed account setter.
+
+Registry identities `HoldKey`, `LimitKey` and `QuotaScope` support typed ordering.
+`QuotaScope` exposes string access explicitly through `as_str`, without Deref.

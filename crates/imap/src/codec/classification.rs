@@ -92,6 +92,19 @@ solicited_rows! {
 /// the pipeline admits. Repeating relaxation closes overlaps such as LIST /
 /// LIST-STATUS / STATUS without a second hand-maintained family list.
 pub(crate) fn untagged_routing_key(cmd: CommandKind) -> CommandKind {
+    static KEYS: std::sync::OnceLock<std::collections::HashMap<CommandKind, CommandKind>> =
+        std::sync::OnceLock::new();
+    let keys = KEYS.get_or_init(|| {
+        SOLICITED_OWNER_GROUPS
+            .iter()
+            .flat_map(|group| group.iter().copied())
+            .map(|owner| (owner, compute_routing_key(owner)))
+            .collect()
+    });
+    keys.get(&cmd).copied().unwrap_or(cmd)
+}
+
+fn compute_routing_key(cmd: CommandKind) -> CommandKind {
     if !cmd.pipelinable() {
         return cmd;
     }

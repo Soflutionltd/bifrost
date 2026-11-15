@@ -1454,6 +1454,8 @@ pub(crate) fn public_folder_changes_stream(
     parsed: Result<super::scope::GraphScope, super::cursor::CursorError>,
 ) -> AccountStream<SyncEvent<Change>> {
     Box::pin(async_stream::stream! {
+        // Terminated is the sole terminal event on failure. A following Done
+        // would falsely tell the consumer that this poll completed.
         let scope = cursor.scope.clone();
         let payload = match decode_cursor(&cursor) {
             Ok(payload) => payload,
@@ -1461,7 +1463,6 @@ pub(crate) fn public_folder_changes_stream(
                 let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
                     .with_scope(ErrorScope::Cursor(scope.clone()));
                 yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                yield SyncEvent::Done(None);
                 return;
             }
         };
@@ -1475,7 +1476,6 @@ pub(crate) fn public_folder_changes_stream(
                 .with_scope(ErrorScope::Cursor(scope.clone()));
             yield SyncEvent::Terminated(cursor_error_to_account_error(
                 super::cursor::CursorError::ScopeMismatch, ctx));
-            yield SyncEvent::Done(None);
             return;
         }
         let GraphCursorPayload::PublicFolder(pf) = payload else {
@@ -1484,7 +1484,6 @@ pub(crate) fn public_folder_changes_stream(
                 .with_scope(ErrorScope::Cursor(scope.clone()));
             yield SyncEvent::Terminated(cursor_error_to_account_error(
                 super::cursor::CursorError::SchemaIncompatible, ctx));
-            yield SyncEvent::Done(None);
             return;
         };
 
@@ -1503,7 +1502,6 @@ pub(crate) fn public_folder_changes_stream(
                 let ctx = GraphErrorContext::ews(AccountOperation::SyncChanges)
                     .with_scope(ErrorScope::Cursor(scope.clone()));
                 yield SyncEvent::Terminated(ews_shared_scope_error(error, &scope, None, ctx));
-                yield SyncEvent::Done(None);
                 return;
             }
         };
@@ -1522,7 +1520,6 @@ pub(crate) fn public_folder_changes_stream(
                     .with_scope(ErrorScope::Cursor(scope.clone()));
                 yield SyncEvent::Terminated(ews_shared_scope_error(
                     error, &scope, Some(&owner), ctx));
-                yield SyncEvent::Done(None);
                 return;
             }
         };
@@ -1543,7 +1540,6 @@ pub(crate) fn public_folder_changes_stream(
                         .with_scope(ErrorScope::Cursor(scope.clone()));
                     yield SyncEvent::Terminated(ews_shared_scope_error(
                         error, &scope, Some(&owner), ctx));
-                    yield SyncEvent::Done(None);
                     return;
                 }
             }
@@ -1568,7 +1564,6 @@ pub(crate) fn public_folder_changes_stream(
                 };
                 yield SyncEvent::Terminated(ews_shared_scope_error(
                     incomplete, &scope, Some(&owner), ctx));
-                yield SyncEvent::Done(None);
                 return;
             }
             PollOutcome::Apply { changes, warnings, cursor: advanced_pf } => {
@@ -1591,7 +1586,6 @@ pub(crate) fn public_folder_changes_stream(
                         let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
                             .with_scope(ErrorScope::Cursor(scope.clone()));
                         yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                        yield SyncEvent::Done(None);
                         return;
                     }
                 };

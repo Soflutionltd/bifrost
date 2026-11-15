@@ -148,7 +148,12 @@ pub(crate) fn draft_send(
         let to = checked_address_list(headers, "To", operation)?;
         let cc = checked_address_list(headers, "Cc", operation)?;
         let bcc = checked_address_list(headers, "Bcc", operation)?;
-        bifrost_types::compose::validate_send_recipients(&to, &cc, &bcc)?;
+        bifrost_types::compose::validate_send_recipients(
+            &to,
+            &cc,
+            &bcc,
+            bifrost_types::Protocol::Gmail,
+        )?;
         // Validate the stored recipient snapshot without rewriting the draft.
         // Users expect empty or unrepresentable recipients to fail before send.
         // Gmail has no conditional drafts.send: a concurrent editor can still
@@ -249,7 +254,12 @@ fn validate_header_recipients(
             )
         })
     };
-    bifrost_types::compose::validate_send_recipients(&read("To")?, &read("Cc")?, &read("Bcc")?)
+    bifrost_types::compose::validate_send_recipients(
+        &read("To")?,
+        &read("Cc")?,
+        &read("Bcc")?,
+        bifrost_types::Protocol::Gmail,
+    )
 }
 
 async fn attachment_inlines(
@@ -438,7 +448,12 @@ fn render_message(
     require_recipient: bool,
 ) -> Result<String, AccountError> {
     if require_recipient {
-        bifrost_types::compose::validate_send_recipients(&doc.to, &doc.cc, &doc.bcc)?;
+        bifrost_types::compose::validate_send_recipients(
+            &doc.to,
+            &doc.cc,
+            &doc.bcc,
+            bifrost_types::Protocol::Gmail,
+        )?;
     }
     if !doc.attachments_uploaded.is_empty() {
         return Err(unsupported(

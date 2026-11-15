@@ -165,6 +165,8 @@ pub enum Capability {
     /// Gmail extension capability for `X-GM-*` FETCH attributes.
     XGmExt1,
     /// `AUTH=<mechanism>` (e.g. `AUTH=PLAIN`, `AUTH=XOAUTH2`) (RFC 3501 Section 7.2.1).
+    // This enum is reachable only inside the private types module. Its SASL
+    // payload is not part of bifrost-imap's exported account API.
     Auth(bifrost_sasl::MechanismName),
     /// Unrecognized capability  -  preserved verbatim.
     // Only the parser mints unknown tokens; known spellings use known variants.

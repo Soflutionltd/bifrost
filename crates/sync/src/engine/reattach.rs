@@ -55,7 +55,7 @@ pub(crate) struct RecoveryContext<'a> {
 
 /// Dispatch an `AccountError` to the engine's recovery machinery.
 ///
-/// Routes through `dispatch_stream_failure` so the closed `RecoveryPlan` enum
+/// Projects already dispatched failures through `plan_recovery` so `RecoveryPlan`
 /// drives the dispatch. The `scope` argument is the worker's
 /// convenience-suggested scope: scope-bound directives use the
 /// directive's own scope when present; account-wide directives ignore
@@ -74,16 +74,15 @@ pub(crate) async fn handle_account_error(
     error: AccountError,
 ) -> RecoveryFollowUp {
     use crate::recovery::RecoveryPlan;
-    // Clone so we can log structured fields after dispatch consumes
-    // the value.
-    let plan =
-        crate::recovery::dispatch_stream_failure(error.clone(), ctx.throttles, ctx.account_id);
+    // The originating drive, push lane, or deferred-inventory owner already
+    // recorded throttle and telemetry effects. Repeating dispatch here moves
+    // relative hold deadlines forward just because the listener was queued.
+    let plan = crate::recovery::plan_recovery(error.clone());
     let mut deferred = RecoveryFollowUp::None;
     match plan {
         RecoveryPlan::Retry(advice) => {
             // The reopen listener is a serialization point for real
-            // engine directives. Record any shared throttle deadline,
-            // but never sleep here: no failed operation is retried
+            // engine directives. Never sleep here: no failed operation is retried
             // after such a sleep, and blocking this task would hold
             // RestartScope / RestartAccount requests behind an inert
             // provider Retry-After delay.
@@ -1412,6 +1411,11 @@ impl ReattachGuard {
     }
 
     /// Close whatever account is owed, and stop owing it once the close returned.
+    /// Unlike attach/detach best-effort cleanup, this is not a bounded close:
+    /// cancellation leaves the obligation on the guard for retire_stranded.
+    /// Using close_within here would abandon an unfinished close and disarm that
+    /// obligation on timeout. Keep this ownership contract until reattach and
+    /// its dropped-future cleanup have a shared abandonment policy.
     async fn close_owed(&mut self) -> Result<(), AccountError> {
         let Some(account) = self.close_owed.clone() else {
             return Ok(());
@@ -2666,7 +2670,7 @@ pub(super) async fn establishment(
 ///
 /// `walk_fence` is the scope fence the CALLER's ownership of this
 /// establishment began under; this function never reads `scope_fence` itself.
-/// It awaits the writer's store read and `pacing.wait` before either fusion,
+/// It awaits the writer's store read and `pacing.admit` before either fusion,
 /// and a deletion landing in those awaits raises the fence: a reading taken
 /// here would adopt that deletion as the walk's own, so a stale resume stream
 /// would publish and install past every conditional check. Every install is
@@ -2689,13 +2693,6 @@ async fn run_establish(
     pacing: &mut RepairPacing,
     walk_fence: crate::cursor::ScopeFence,
 ) -> Result<EstablishOrigin, Error> {
-    pacing.wait(ctx, Some(account), Some(&scope)).await?;
-    pacing.failed_keys = crate::recovery::declared_keys(
-        account,
-        account_id,
-        bifrost_types::ThrottleWork::Scope(&scope),
-    );
-    pacing.local_deadline = None;
     let result = async {
         let _activity = control.begin_activity().ok_or(Error::Paused)?;
         // Only a reattach passes an attempt. Its resume read claims a still
@@ -2717,6 +2714,17 @@ async fn run_establish(
             }
             Err(other) => return Err(other),
         };
+        // Durable row classification is local work, not a provider attempt.
+        // Diagnose an unreadable row before spending the provider wait budget.
+        if let Some(cursor) = &stored {
+            crate::recovery::classify_envelope(
+                cursor,
+                crate::recovery::CursorOrigin::Stored,
+                bifrost_types::AccountOperation::EstablishCursor,
+                &scope,
+            )
+            .map_err(Error::Account)?;
+        }
         let origin = if stored.is_some() {
             EstablishOrigin::ResumedStored
         } else {
@@ -2729,6 +2737,14 @@ async fn run_establish(
         if coverage.scope_fence(&scope) != walk_fence {
             return Err(Error::Superseded);
         }
+        // Only consume the previous failure's local hold after admission has
+        // honored it; a stored row read must not erase retry pacing.
+        pacing.failed_keys = crate::recovery::declared_keys(
+            account,
+            account_id,
+            bifrost_types::ThrottleWork::Scope(&scope),
+        );
+        pacing.local_deadline = None;
         let decision = establishment(account, &scope, stored).await?;
         drop(admitted);
         let (classified_as_inventory, resume_stream) = match decision {
@@ -2779,6 +2795,9 @@ async fn run_establish(
             crate::multiplexer::FusionOutcome::Established
             | crate::multiplexer::FusionOutcome::NoCursor => Ok(origin),
             crate::multiplexer::FusionOutcome::Invalidated => Err(Error::Superseded),
+            // Lost delivery is unfinished establishment, not successful NoCursor.
+            // Keep it in the owner's bounded retry policy.
+            crate::multiplexer::FusionOutcome::Undelivered => Err(Error::InventoryUndelivered),
             crate::multiplexer::FusionOutcome::Terminated(error) => {
                 Err(Error::EstablishCursorTerminated(error))
             }

@@ -126,7 +126,7 @@ impl HeaderMap {
         let bcc = self
             .addresses_checked("bcc")
             .map_err(|_| "unsupported Bcc address")?;
-        crate::compose::validate_send_recipients(&to, &cc, &bcc)
+        crate::compose::validate_send_recipients(&to, &cc, &bcc, crate::Protocol::Unknown)
             .map_err(|_| "send requires at least one recipient")?;
         // Multiple authors have no single author mailbox; retain the explicit
         // transmitting agent as the only unambiguous reverse path in that case.

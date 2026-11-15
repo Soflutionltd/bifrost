@@ -14,6 +14,14 @@ Body diagnostics use net's shared byte cap and truncation marker.
 
 Every request declares its `ReplayPolicy`; the table lives at the call sites.
 Unabsorbed DELETEs and calendar updates are Never; read batches are Idempotent.
+Batch write legs are always Never, including unconditional PATCH and DELETE.
+An absolute PATCH may overwrite an intervening edit; a property DELETE may
+remove a recreated value, and a repeated resource DELETE can turn an earlier
+success into a 404. Moves and permanent deletion use POST and also reconcile
+uncertain outcomes. Guarded writes cannot replay an already consumed validator.
+The generic batch boundary has neither an owner's absence policy nor proof that
+no intervening edit occurred. Enterprise users expect uncertain writes to be
+reconciled before another write, even when the desired value is absolute.
 Absolute by-id renames, filter updates and deferred-send timestamps deliberately
 use Idempotent despite the enclosing operation table's conservative default.
 EWS reads are Idempotent; streaming reads disable net network retries so a
@@ -123,9 +131,9 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   behind a transport Result would lose earlier commits on a later failure.
   Correlation and projection remain separate because hydration, reaction reads
   and partial-commit writes expose different outcome contracts. Absence policy
-  controls 404 success only; every successful targeted write invalidates its
+  controls 404 skips only; every successful targeted write invalidates its
   cached validator independently. Outer replay is Idempotent only when every
-  leg permits replay, otherwise Never, including guarded writes and moves.
+  leg is a replayable read, otherwise Never for every write leg.
 - `batch_routing.rs` - `partition_routable`, the pure per-item split every
   `$batch` chunk builder runs before it sends: ids whose subrequest was
   built, and ids whose subrequest could not be built at all (a stale
@@ -793,15 +801,25 @@ base infers an unusable Outlook base, with no production fallback. Shared
 clients retain the same cloud. An enterprise Outlook user expects Exchange
 reads to stay in the configured cloud.
 
-`GraphClient::with_outlook_source(source)` configures a separate OAuth source
-for the selected cloud's Outlook audience before opening accounts. EWS buffered
-and streaming requests and bearer Autodiscover requests select that source
-through net's `HopPolicy`, after exact Outlook-origin admission on every hop.
+`GraphClient::with_outlook_source(source)` or
+`GraphAccountFactory::with_outlook_source(source)` configures a separate OAuth
+source for the selected cloud's Outlook audience before opening accounts.
+The factory retains the configured client and source across open and reopen;
+a source on the input client also suffices. EWS buffered and streaming requests
+and bearer Autodiscover requests select that source through net's `HopPolicy`,
+after exact Outlook-origin admission on every hop.
 The Graph source remains exclusive to REST. When the two configured bases share
 an origin, the Graph source remains the default for that single service origin;
-otherwise a missing Outlook source fails locally before dispatch. Anonymous
-upload requests select neither source. Derived clients retain the Outlook source
-and its coordinated refresh cache. Selecting a cloud configures endpoints; it
+otherwise a missing Outlook source fails locally before dispatch as
+`SyncState(OperatorOverrideNeeded)`, asking the administrator to configure the
+service source. It is neither malformed caller input nor loss of Graph
+credentials. The account error boundary stamps the refused operation and scope
+onto the typed hop-policy error. An unusable configured Outlook origin at
+hop admission uses the same operator-override classification: an enterprise
+Outlook user needs administrator configuration, not corrected caller input.
+Refused targets on a usable origin retain their request refusal classification.
+Anonymous upload requests select neither source.
+Derived clients retain the Outlook source and its coordinated refresh cache. Selecting a cloud configures endpoints; it
 does not acquire or exchange tokens. Enterprise Outlook users expect Exchange
 features to use Exchange credentials without disclosing a Graph token there.
 
@@ -814,8 +832,9 @@ authority for every leg; Graph still gates every target independently.
 Each configured base (the api-base, the Outlook origin) is parsed into
 a `Base` at construction: http or https, a host, and no userinfo, or it is
 stored as unusable and every request on that surface fails closed before any
-byte (`Request(Malformed)`, consumer configuration; the published
-constructors stay infallible). A target is resolved against a base - a path
+byte (`Request(Malformed)` at the base admission boundary; Outlook hop
+admission instead reports `SyncState(OperatorOverrideNeeded)` for the unusable
+configuration, as above; the published constructors stay infallible). A target is resolved against a base - a path
 starting with `/` is concatenated (an RFC 3986 join would drop `/v1.0`), any
 other text that parses as an absolute URL is taken as is, anything else is
 concatenated with a slash - and the decision is made on the FINAL parsed URL:
@@ -1013,7 +1032,7 @@ mailboxes always install.
   always evict the target's cached validator, including PATCHes, moves and
   extended-property clears. Successful direct draft writes, deferred-send
   stamps and scheduled-send cancellation also evict. Bulk 412 responses evict
-  before retry, and moves, tombstones, 404 destroy skips, and confirmed destroys
+  before retry, and moves, tombstones, 404 message skips, and confirmed destroys
   evict their old-id keys). It is
   a `HashMap<Arc<str>, _>` paired with a `BTreeMap<u64, Arc<str>>` of recency
   tickets, so insert / hit / evict are each one hash lookup plus a couple of
@@ -2687,7 +2706,7 @@ Batch readers reject numeric statuses outside 100..=999 as acknowledged
 `Protocol(ContractViolation)` errors rather than substituting a retryable 500.
 
 `mutation_item_outcome` projects per-id `$batch` responses onto `ItemOutcome`:
-2xx -> `Succeeded(Applied)`, 404-on-destroy -> `Succeeded(Skipped)`, 412 ->
+2xx -> `Succeeded(Applied)`, 404-on-absorbable-message-operation -> `Succeeded(Skipped)`, 412 ->
 `Failed(ConcurrencyConflict)`, 429/other -> `Failed` carrying `Protocol::Graph`
 + `AttemptCause(Acknowledged)` + wire signal. Before projection, bulk mutation
 responses update the etag cache: flag writes record the returned etag or evict
@@ -3150,3 +3169,36 @@ validated by the shared grammar; its text-only accessor still needs a fallible
 Graph-name projection. Public-calendar EWS GetItem hydration has its own named
 20-item local bound, independent of the Graph JSON batch limit; fixtures consume
 that same bound.
+
+Resumable upload completion is accepted only after the submitted chunk reaches
+the full payload length. A premature success is a provider contract violation,
+because users expect a successful attachment upload to contain every byte.
+
+Public-folder change polls emit exactly one terminal event: failure emits
+`Terminated` and returns; successful completion emits `Done` with its checkpoint.
+Cursor decoding retains `ProtocolMismatch`, `FutureVersion`, `RetiredVersion`,
+`Malformed` and `ScopeMismatch` at the account error boundary. The first
+four currently share account schema recovery; readable scope mismatches retain
+the scope restart policy.
+
+### Blob range admission and absent message subjects
+
+`account/blob.rs` admits ranges only for a decoded File locator, independently
+of caller-supplied `BlobHandle::capabilities`. Item, Reference, Ews, EwsItem and
+Unknown locators refuse OpenBlobRange before transport or non-byte-stream warnings.
+File locator ranges remain usable with stale false capability hints. Locator kind
+is provider routing metadata, not authentication or cryptographic provenance;
+Graph still validates the requested resource. Gmail's JSON/base64 attachment API
+and JMAP's current transport hook refuse ranges independently of handle hints.
+
+`AccountOperation::skips_absent_target` owns the absent-subject ruling described
+in `reference/types.md`. Bulk flags/moves/destroy and PIM message PATCH/move apply
+it to 404 answers, including message-scoped NotFound during validator preflight. A move response
+needs native ErrorItemNotFound to establish subject absence: a bare 404 or
+folder-not-found answer may instead name its destination and retains its error.
+Unsupported public-folder routes are refused before those observations. Missing
+destinations are errors. PIM read-modify-write resolution skips vanished subjects
+without shifting a surviving message's routing id. A 404 invalidates its cached
+validator and contributes no committed partial-effect step. Property-clear absence
+continues to be accepted as an already cleared property, also without a committed
+write. Single-operation Result doors return Ok for skips without claiming Applied.

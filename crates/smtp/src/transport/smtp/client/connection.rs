@@ -635,6 +635,12 @@ impl SmtpConnection {
             return self.auth_legacy(mechanism, credentials);
         }
 
+        // OAuth incompatibility is a local policy refusal, never a password fallback.
+        if matches!(credentials, Credentials::OAuth2 { .. }) {
+            return Err(error::policy("no compatible authentication mechanism")
+                .with_phase(SmtpCommandPhase::Auth { mechanism: None }));
+        }
+
         let scram_candidate = mechanisms.iter().any(|mechanism| {
             matches!(
                 mechanism,

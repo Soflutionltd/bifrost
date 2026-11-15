@@ -126,15 +126,30 @@ pub(crate) fn delete_thread(
             .as_ref()
             .is_some_and(|id| id.0.eq_ignore_ascii_case(LABEL_TRASH))
         {
-            return client.delete_thread(&thread.0).await.map_err(|e| {
-                account_error_for(
-                    e,
-                    mutation_context(
-                        &MutationTarget::Thread(thread.clone()),
-                        bifrost_types::AccountOperation::DeleteThread,
-                    ),
-                )
-            });
+            let operation = bifrost_types::AccountOperation::DeleteThread;
+            return match client.delete_thread(&thread.0).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let error = account_error_for(
+                        error,
+                        mutation_context(&MutationTarget::Thread(thread.clone()), operation),
+                    );
+                    // DELETE has no label operand: a missing thread is the subject.
+                    // Outlook users expect it gone without claiming a new write.
+                    if operation.skips_absent_target()
+                        && matches!(
+                            error.kind(),
+                            bifrost_types::AccountErrorKind::NotFound(
+                                bifrost_types::ResourceKind::Thread
+                            )
+                        )
+                    {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                }
+            };
         }
         let (add, remove) = move_container_patch(&ContainerId(LABEL_TRASH.to_string()), None);
         modify_target(
@@ -181,6 +196,9 @@ async fn modify_target(
     if add_labels.is_empty() && remove_labels.is_empty() {
         return Ok(());
     }
+    // `skips_absent_target` requires confirmed subject absence. A modify 404
+    // can name a label operand instead, even for one target. Keep the error:
+    // Outlook users must see a missing destination rather than a false success.
     let ctx = mutation_context(&target, operation);
     match target {
         MutationTarget::Message(id) => {

@@ -574,7 +574,8 @@ fn event_from_jmap(
     let raw_end =
         end_from_start_duration(raw_start, duration.as_str(), is_all_day).ok_or_else(|| {
             to_acct_err(operation)(crate::Error::NotParsable(
-                "JSCalendar event end is outside the representable range".into(),
+                "JSCalendar event start is invalid or its end is outside the representable range"
+                    .into(),
             ))
         })?;
     let timezone = event.time_zone().as_value().map(ToString::to_string);
@@ -1910,18 +1911,6 @@ fn jmap_utc_filter_time(
         .map_err(|error| malformed_time(AccountOperation::EventsInRange, field, error.into()))
 }
 
-#[cfg(test)]
-fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> bool {
-    EventRange {
-        calendar_id: event.calendar_id.clone(),
-        start: start.clone(),
-        end: end.clone(),
-        page_cursor: None,
-        limit: None,
-    }
-    .admits(event)
-}
-
 /// Render an instant for the shared `EventTime` layer, which spells the
 /// UTC offset out as `+00:00` rather than `Z`.
 fn shared_rfc3339(at: Timestamp) -> String {
@@ -1938,6 +1927,10 @@ fn local_datetime(value: &str) -> Option<Timestamp> {
 
 fn end_from_start_duration(start: &str, duration: &str, is_all_day: bool) -> Option<String> {
     let offset = duration.parse::<CalendarDuration>().ok()?.signed()?;
+    // Validate the whole start before an all-day projection discards its time.
+    if !start.is_empty() {
+        classify_time(start)?;
+    }
     // Overflow must reject this event, not fabricate a zero-length appointment.
     if (is_all_day || start.len() == 10)
         && let Ok(date) =
@@ -1965,7 +1958,9 @@ fn end_from_start_duration(start: &str, duration: &str, is_all_day: bool) -> Opt
                 .to_string(),
         );
     }
-    Some(start.to_string())
+    // Missing start is the shared unknown-time sentinel. Invalid nonempty
+    // starts must fail hydration rather than fabricate an appointment end.
+    start.is_empty().then(String::new)
 }
 
 #[cfg(test)]
@@ -2768,6 +2763,19 @@ mod tests {
     }
 
     #[test]
+    fn end_from_duration_rejects_invalid_start_but_preserves_absence() {
+        for all_day in [false, true] {
+            for start in ["not a time", "2026-99-99", "2026-06-02T99:99:99"] {
+                assert_eq!(end_from_start_duration(start, "PT90M", all_day), None);
+            }
+            assert_eq!(
+                end_from_start_duration("", "PT90M", all_day),
+                Some(String::new())
+            );
+        }
+    }
+
+    #[test]
     fn jmap_local_datetime_reads_as_shared_rfc3339() {
         assert_eq!(
             shared_time_from_jmap("2026-06-02T12:00:00", false),
@@ -2856,11 +2864,14 @@ mod tests {
     fn range_filter_uses_overlap_not_lexicographic_start() {
         let event = event("2026-06-01T23:00:00Z", "2026-06-02T01:00:00Z", false);
 
-        assert!(event_in_range(
-            &event,
-            &time("2026-06-02T00:00:00Z"),
-            &time("2026-06-02T23:59:59Z")
-        ));
+        assert!(
+            EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-02T00:00:00Z"),
+                time("2026-06-02T23:59:59Z"),
+            )
+            .admits(&event)
+        );
     }
 
     #[test]
@@ -2869,11 +2880,14 @@ mod tests {
         // start 2026-06-02, end 2026-06-03.
         let event = event("2026-06-02", "2026-06-03", true);
 
-        assert!(event_in_range(
-            &event,
-            &time("2026-06-02T00:00:00Z"),
-            &time("2026-06-03T00:00:00Z")
-        ));
+        assert!(
+            EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-02T00:00:00Z"),
+                time("2026-06-03T00:00:00Z"),
+            )
+            .admits(&event)
+        );
     }
 
     #[test]
@@ -2882,8 +2896,13 @@ mod tests {
         let after = event("2026-06-03T00:00:00Z", "2026-06-03T01:00:00Z", false);
         let start = time("2026-06-02T00:00:00Z");
         let end = time("2026-06-03T00:00:00Z");
-        assert!(!event_in_range(&before, &start, &end));
-        assert!(!event_in_range(&after, &start, &end));
+        assert!(
+            !EventRange::new(before.calendar_id.clone(), start.clone(), end.clone(),)
+                .admits(&before)
+        );
+        assert!(
+            !EventRange::new(after.calendar_id.clone(), start.clone(), end.clone(),).admits(&after)
+        );
     }
 
     #[test]

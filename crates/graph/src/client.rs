@@ -30,9 +30,9 @@ const GRAPH_HOST: &str = "graph.microsoft.com";
 
 /// Paired Microsoft service endpoints, including private deployments.
 ///
-/// This is the extension point for per-service token audiences once the shared
-/// transport can select an audience. For now the supplied token source must be
-/// accepted by each enabled surface; selecting a cloud does not acquire tokens.
+/// Configure the Graph and Outlook token sources separately when these service
+/// origins differ. Selecting a cloud configures endpoints and does not acquire
+/// or exchange credentials.
 #[derive(Clone, Debug)]
 pub struct MicrosoftCloud {
     graph: Base,
@@ -106,7 +106,7 @@ pub struct GraphClient {
 /// Both admission and throttle attribution are views of this same mailbox.
 struct MailboxIdentity {
     budget: bifrost_types::ThrottleBudget,
-    concurrency_key: String,
+    concurrency_key: bifrost_net::LimitKey,
 }
 
 struct ClientInner {
@@ -876,12 +876,11 @@ impl GraphClient {
             concurrency_key: bifrost_net::LimitKey::namespaced(
                 "graph.outlook",
                 &[&origin, &concurrency_owner],
-            )
-            .to_string(),
+            ),
         }
     }
 
-    fn concurrency_key(&self, net: &AccountNet) -> String {
+    fn concurrency_key(&self, net: &AccountNet) -> bifrost_net::LimitKey {
         self.fix_primary_account(&net.account().0);
         self.mailbox_identity().concurrency_key
     }
@@ -891,7 +890,7 @@ impl GraphClient {
         resource: &Resource,
         net: &AccountNet,
     ) -> Vec<(bifrost_net::ConcurrencyLimit, usize)> {
-        let mut groups = std::collections::BTreeMap::<String, usize>::new();
+        let mut groups = std::collections::BTreeMap::<bifrost_net::LimitKey, usize>::new();
         match resource {
             Resource::Outlook => {
                 groups.insert(self.concurrency_key(net), 1);
@@ -1383,9 +1382,9 @@ impl GraphClient {
             AuxTarget::Bearer(url) => account_net
                 .request(method, url.as_str())
                 .hop_policy(self.outlook_auth()),
-            AuxTarget::Anonymous(url) => {
-                account_net.session_request(method, &bifrost_net::SessionUrl::new(url.as_str()))
-            }
+            AuxTarget::Anonymous(url) => account_net
+                .session_request(method, &bifrost_net::SessionUrl::new(url.as_str()))
+                .into(),
         };
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
@@ -1839,6 +1838,24 @@ struct OutlookAuth {
     source: Option<bifrost_net::CoordinatedTokenSource>,
 }
 
+/// The one refusal for Outlook service configuration an administrator must
+/// fix: a missing Outlook-audience token source or an invalid Outlook origin.
+/// An enterprise Outlook user cannot repair either by changing caller input or
+/// reauthorizing the Graph token, so both are `SyncState(OperatorOverrideNeeded)`.
+fn outlook_configuration_refusal(reason: String) -> bifrost_net::Error {
+    let error = bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::SyncState(
+            bifrost_types::SyncStateErrorKind::OperatorOverrideNeeded,
+        ),
+        bifrost_types::Cause::State(bifrost_types::StateCause::OperatorOverrideNeeded { reason }),
+    )
+    .protocol(bifrost_types::Protocol::Ews)
+    .provider(bifrost_types::Provider::Microsoft)
+    .try_build()
+    .expect("valid configuration refusal");
+    bifrost_net::Error::HopPolicy(Box::new(error))
+}
+
 impl bifrost_net::HopPolicy for OutlookAuth {
     fn admit(
         &self,
@@ -1847,17 +1864,20 @@ impl bifrost_net::HopPolicy for OutlookAuth {
     ) -> Result<bifrost_net::HopCredential, bifrost_net::Error> {
         self.base
             .admit(next.as_str())
-            .map_err(|reason| bifrost_net::Error::InvalidRequest {
-                field: "outlook_origin",
-                detail: reason.to_string(),
+            .map_err(|reason| match reason {
+                Refusal::InvalidBase(detail) => outlook_configuration_refusal(format!(
+                    "Configure a valid Outlook origin: {detail}"
+                )),
+                reason @ Refusal::Target(_) => bifrost_net::Error::InvalidRequest {
+                    field: "outlook_origin",
+                    detail: reason.to_string(),
+                },
             })?;
-        let source = self
-            .source
-            .clone()
-            .ok_or_else(|| bifrost_net::Error::InvalidRequest {
-                field: "outlook_source",
-                detail: "Exchange requests require an Outlook-audience token source".into(),
-            })?;
+        let source = self.source.clone().ok_or_else(|| {
+            outlook_configuration_refusal(
+                "Configure an Outlook-audience token source for Exchange features".into(),
+            )
+        })?;
         Ok(bifrost_net::HopCredential::Bearer(source))
     }
 }
@@ -2026,10 +2046,27 @@ mod tests {
             .expect("fixture URL");
         assert!(matches!(
             client.outlook_auth().admit(None, &url),
-            Err(bifrost_net::Error::InvalidRequest {
-                field: "outlook_source",
-                ..
-            })
+            Err(bifrost_net::Error::HopPolicy(error))
+                if matches!(error.kind(), bifrost_types::AccountErrorKind::SyncState(
+                    bifrost_types::SyncStateErrorKind::OperatorOverrideNeeded
+                ))
+        ));
+    }
+
+    #[test]
+    fn invalid_outlook_origin_requires_operator_configuration() {
+        let policy = OutlookAuth {
+            base: Base::parse("not a URL"),
+            source: None,
+        };
+        let url = reqwest::Url::parse("https://outlook.office365.com/EWS/Exchange.asmx")
+            .expect("fixture URL");
+        assert!(matches!(
+            bifrost_net::HopPolicy::admit(&policy, None, &url),
+            Err(bifrost_net::Error::HopPolicy(error))
+                if matches!(error.kind(), bifrost_types::AccountErrorKind::SyncState(
+                    bifrost_types::SyncStateErrorKind::OperatorOverrideNeeded
+                ))
         ));
     }
 

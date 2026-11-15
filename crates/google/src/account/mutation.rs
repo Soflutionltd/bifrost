@@ -976,6 +976,11 @@ fn is_not_found(error: &GmailError) -> bool {
     // roughly 2n requests without establishing which id was malformed. Until
     // Gmail gives item-specific evidence or documents a local id grammar, a
     // generic 400 stays a batch failure.
+    // AccountOperation::skips_absent_target applies only to confirmed subject
+    // absence. Do not turn this predicate into a skip decision: Outlook users
+    // must see a missing destination label as an error, including after the
+    // request has been bisected to one message. batchDelete likewise has no
+    // per-id answer from which to infer which subjects were already absent.
     // A status-only 404 still cannot distinguish an absent message from an
     // absent label: batchModify supplies no per-id result, so singleton
     // classification can be wrong if Gmail uses 404 for either resource.

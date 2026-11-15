@@ -527,6 +527,57 @@ impl Drop for AccountNetInner {
 #[derive(Clone)]
 pub struct SessionUrl(String);
 
+/// Restricted builder for provider-admitted credential URLs.
+///
+/// Account bearer injection is disabled, redirects are disabled, and transport
+/// URL diagnostics are redacted. Conversion into [`RequestBuilder`] preserves
+/// these settings. Its hop-policy and redirect-policy setters then record a
+/// deferred [`Error::InvalidRequest`] rather than changing the locked policy.
+#[must_use = "request builders do nothing unless sent"]
+pub struct SessionRequestBuilder(RequestBuilder);
+
+impl SessionRequestBuilder {
+    /// Append a header, retaining any invalid-header error until send.
+    /// Caller-provided Authorization headers are still sent unchanged.
+    pub fn header(self, name: &str, value: &str) -> Self {
+        Self(self.0.header(name, value))
+    }
+
+    /// Set the request body to raw bytes.
+    pub fn body(self, body: bytes::Bytes) -> Self {
+        Self(self.0.body(body))
+    }
+
+    /// Override the account's retry policy for this request.
+    pub fn retry(self, retry: crate::RetryPolicy) -> Self {
+        Self(self.0.retry(retry))
+    }
+
+    /// Override the total deadline, including admission, retries and body drain.
+    pub fn timeout(self, timeout: std::time::Duration) -> Self {
+        Self(self.0.timeout(timeout))
+    }
+
+    /// Declare whether the transport may replay this wire request.
+    pub fn replay(self, replay: crate::ReplayPolicy) -> Self {
+        Self(self.0.replay(replay))
+    }
+
+    /// Send with the locked session policy and return the buffered response.
+    /// Deferred configuration errors are returned before dispatch; transport
+    /// URL diagnostics are redacted on every error path.
+    #[must_use = "request futures do nothing unless awaited or polled"]
+    pub async fn send(self) -> Result<crate::Response, crate::Error> {
+        self.0.send().await
+    }
+}
+
+impl From<SessionRequestBuilder> for RequestBuilder {
+    fn from(builder: SessionRequestBuilder) -> Self {
+        builder.0
+    }
+}
+
 impl SessionUrl {
     /// Mark a provider session URL as a credential after provider admission.
     #[must_use]
@@ -617,16 +668,15 @@ impl AccountNet {
     /// disables redirects together. Users expect an upload credential and its
     /// payload to stay on the provider-admitted destination.
     ///
-    /// The returned builder is the general one, so a caller could still call
-    /// `follow_redirects`, `hop_policy` or bearer setters afterwards. Session
-    /// callers must only add per-request options (headers, body, retry,
-    /// timeout); re-enabling any of the three policies defeats this door.
-    #[must_use]
-    pub fn session_request(&self, method: http::Method, url: &SessionUrl) -> RequestBuilder {
-        self.request(method, &url.0)
-            .without_bearer_auth()
-            .credential_url()
-            .follow_redirects(crate::FollowRedirects::Disabled)
+    /// Only payload, deadline, replay and accounting controls are exposed.
+    pub fn session_request(&self, method: http::Method, url: &SessionUrl) -> SessionRequestBuilder {
+        SessionRequestBuilder(
+            self.request(method, &url.0)
+                .without_bearer_auth()
+                .credential_url()
+                .follow_redirects(crate::FollowRedirects::Disabled)
+                .lock_session(),
+        )
     }
 
     /// Start a `POST` request.
@@ -1016,10 +1066,10 @@ pub struct AccountSpec {
     /// A retained source owns its proactive refresh and backoff policy.
     /// `None` expresses an account that does not use bearer auth.
     pub token_source: Option<Arc<dyn TokenSource>>,
-    /// Exact destinations for automatic account bearer injection.
+    /// Exact destinations for automatic bearers and caller Authorization headers.
     /// `None` leaves admission to the protocol leg. Composed handles and
     /// JMAP session endpoints cannot infer credential authority from redirects.
-    /// A configured empty set refuses every automatic bearer destination.
+    /// A configured empty set refuses every such credential destination.
     /// HopPolicy credentials have their own per-leg admission authority.
     pub trusted_origins: Option<crate::TrustedOrigins>,
     /// Default retry policy.
@@ -1096,7 +1146,7 @@ impl AccountSpec {
 /// which is the RFC 9110 `bytes=N-` open-ended form. `length = Some(n)`
 /// means `bytes=start-(start+n-1)` inclusive.
 ///
-/// A `length = Some(0)` request is rejected upstream by
+/// A `length = Some(0)` request returns an empty stream upstream in
 /// `AccountNet::download_stream`; the encoder treats `Some(0)` as a
 /// local invalid range and returns `Error::RangeNotHonored` with
 /// `RangeFailureKind::LocalInvalid`.

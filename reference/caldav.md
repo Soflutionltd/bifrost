@@ -641,7 +641,9 @@ Supported calendar primitives:
   `estimated_total` is the number of candidate resources the server named -
   an upper bound on the items, not a count of them. A short or empty page that
   still carries a cursor is normal.
-  The local guard is `EventRange::admits`, shared with JMAP. It compares
+  `EventRange::new(calendar_id, start, end)` constructs an unlimited first
+  window without validating provider time forms. The local guard is
+  `EventRange::admits`, shared with JMAP. It compares
   explicit nonrecurring instant intervals, retaining recurring masters (RRULE
   or RDATE), floating times and unknown ends for the provider's decision.
   UNTIL bounds occurrence starts, not ends, and explicit dates can extend a
@@ -1606,5 +1608,20 @@ bound their ends and RDATE can extend a series.
 Only authenticated discovery widens this per-leg set; cross-origin HTTPS homes
 remain supported and an HTTPS base still refuses discovered plaintext homes.
 Cloned dispatchers copy admission state so another protocol leg is not widened.
-Absolute native hrefs are recognized by URL parsing, including uppercase schemes;
-relative native hrefs retain configured-base directory resolution.
+Absolute HTTP(S) native hrefs are recognized by URL parsing, including uppercase
+schemes. Non-HTTP(S) scheme-like native ids, such as `mailto:one.ics`, are
+relative path text beneath the configured base, never another transport. This
+keeps an enterprise user's resource in the configured DAV collection. Root-relative
+and other relative native hrefs retain their existing resolution rules.
+
+
+
+The shared `AccountOperation::skips_absent_target` returns false for `EventUpdate`
+and `EventDelete`. Updates and conditional deletes preserve failures, including
+missing destinations: an Outlook user needs to know that an edit was not applied.
+Unconditional delete currently diverges: the client's `delete_event` absorbs
+404/410 before the account door sees them. This is coupled to replay after a
+landed DELETE, which can itself return 404. The account door cannot distinguish
+that committed attempt from prior absence, and a preflight read would add a race.
+Aligning this door requires changing the client/dispatch replay contract, rather
+than manufacturing NotFound or successful writes at the account boundary.

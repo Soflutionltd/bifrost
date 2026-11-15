@@ -32,13 +32,14 @@ use bifrost_net::{
 };
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, BatchFailure, BatchItemId,
-    BatchSuccess, Cause, CursorScope, DiagnosticText, ErrorScope, InternalCause, InternalErrorKind,
-    ItemOutcome, JmapMethod, MutationSuccess, Protocol, ProtocolErrorKind, RequestCause,
-    RequestErrorKind, ResourceKind, RetryHint, ServerCause, ServerErrorKind, StateCause, SyncEvent,
-    SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause, TransportErrorKind,
-    TransportKind, WireCause,
+    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
+    ErrorScope, InternalCause, InternalErrorKind, JmapMethod, Protocol, ProtocolErrorKind,
+    RequestCause, RequestErrorKind, ResourceKind, RetryHint, ServerCause, ServerErrorKind,
+    StateCause, SyncEvent, SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause,
+    TransportErrorKind, TransportKind, WireCause,
 };
+#[cfg(test)]
+use bifrost_types::{BatchSuccess, ItemOutcome, MutationSuccess};
 
 use crate::core::error::{JMAPError, MethodErrorType, ProblemDetails, ProblemType};
 use crate::core::set::{SetError, SetErrorType};
@@ -726,38 +727,6 @@ pub(crate) fn contract_violation(
         .expect("valid account error classification")
 }
 
-/// Per-item classification for `Email/set` outcomes. Returns
-/// `Succeeded(Skipped)` when the set error is an absorbed notFound
-/// (the per-item NotFound absorption policy for bulk mutations); all
-/// other set errors map to a `Failed` lane with a full `AccountError`.
-#[must_use]
-pub(crate) fn classify_set_item(
-    set_error: SetError<String>,
-    ctx: JmapErrorContext,
-    item: BatchItemId,
-    item_scope: Option<ErrorScope>,
-) -> ItemOutcome<MutationSuccess> {
-    let absorb = matches!(
-        set_error.error_type(),
-        &SetErrorType::NotFound | &SetErrorType::BlobNotFound
-    ) && matches!(
-        ctx.operation,
-        AccountOperation::UpdateFlags
-            | AccountOperation::BulkMove
-            | AccountOperation::BulkDestroy
-            | AccountOperation::SetKeyword
-            | AccountOperation::SetIsRead
-            | AccountOperation::AddToContainer
-            | AccountOperation::RemoveFromContainer
-    );
-    if absorb {
-        ItemOutcome::Succeeded(BatchSuccess::new(item, MutationSuccess::Skipped))
-    } else {
-        let error = set_error_to_account_error(set_error, ctx, item_scope);
-        ItemOutcome::Failed(BatchFailure::new(item, error))
-    }
-}
-
 /// Convert a JMAP `SetError` to an `AccountError`. When `item_scope`
 /// is present, the resource-bearing classifications (NotFound,
 /// PermissionDenied) derive their resource from it.
@@ -1047,6 +1016,10 @@ fn build_with(
 
 // Provenance is stamped where JSON is decoded, never inferred from operation
 // context. An unreadable success may hide an accepted enterprise mail write.
+// Reads also received an answer: removing acknowledgement would falsify the
+// evidence. ParseFailed remains ProviderContractViolation under the shared
+// classifier, not a retryable transport failure. Enterprise users should see
+// the malformed server response rather than an automatic retry loop.
 fn decode_error(
     error: serde_json::Error,
     call_id: Option<String>,
@@ -2532,6 +2505,7 @@ mod tests {
             })
         };
         // Decode provenance proves an answer at every operation boundary.
+        assert_eq!(err.recovery(), &RecoveryClass::ProviderContractViolation);
         assert_eq!(attempt(&err), Some(TransmissionState::Acknowledged));
         let ctx = JmapErrorContext::send(AccountOperation::Send);
         let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
@@ -2631,13 +2605,12 @@ mod tests {
     }
 
     #[test]
-    fn classify_set_item_absorbs_notfound_for_bulk_destroy() {
+    fn live_mail_set_skips_notfound_for_bulk_destroy() {
         let set: SetError<String> = serde_json::from_str(r#"{"type":"notFound"}"#).unwrap();
-        let outcome = classify_set_item(
-            set,
-            JmapErrorContext::new(AccountOperation::BulkDestroy),
-            BatchItemId("msg-1".into()),
-            Some(ErrorScope::Message { id: "msg-1".into() }),
+        let outcome = super::super::mail_set::classify_set_response(
+            Err(crate::Error::Set(set)),
+            bifrost_types::ObjectId("msg-1".into()),
+            AccountOperation::BulkDestroy,
         );
         assert!(matches!(
             outcome,
@@ -2649,13 +2622,12 @@ mod tests {
     }
 
     #[test]
-    fn classify_set_item_fails_for_real_error() {
+    fn live_mail_set_fails_for_real_error() {
         let set: SetError<String> = serde_json::from_str(r#"{"type":"rateLimit"}"#).unwrap();
-        let outcome = classify_set_item(
-            set,
-            JmapErrorContext::new(AccountOperation::UpdateFlags),
-            BatchItemId("msg-2".into()),
-            None,
+        let outcome = super::super::mail_set::classify_set_response(
+            Err(crate::Error::Set(set)),
+            bifrost_types::ObjectId("msg-2".into()),
+            AccountOperation::UpdateFlags,
         );
         match outcome {
             ItemOutcome::Failed(failure) => {
@@ -3171,42 +3143,47 @@ mod tests {
         }
     }
 
-    /// Per-item NotFound absorption is scoped to the bulk/idempotent
-    /// operations that can tolerate a vanished object. Every other
+    /// The live mail-set boundary skips confirmed absent mail subjects
+    /// under the shared operation policy. Every other
     /// operation must surface the miss as a failure - absorbing a
     /// `notFound` on a create or a send would report success for work
     /// the server never did.
     #[test]
-    fn not_found_absorption_is_limited_to_idempotent_bulk_operations() {
+    fn live_mail_set_absence_uses_subject_policy_and_retains_missing_blobs() {
         let absorbing = [
             AccountOperation::UpdateFlags,
             AccountOperation::BulkMove,
             AccountOperation::BulkDestroy,
             AccountOperation::SetKeyword,
             AccountOperation::SetIsRead,
+            AccountOperation::SetImportance,
             AccountOperation::AddToContainer,
             AccountOperation::RemoveFromContainer,
         ];
         for operation in absorbing {
             for code in ["notFound", "blobNotFound"] {
-                let outcome = classify_set_item(
-                    set_error(code),
-                    JmapErrorContext::new(operation),
-                    BatchItemId("msg-1".to_string()),
-                    Some(ErrorScope::Message {
-                        id: ("msg-1".to_string()).into(),
-                    }),
+                let outcome = super::super::mail_set::classify_set_response(
+                    Err(crate::Error::Set(set_error(code))),
+                    bifrost_types::ObjectId("msg-1".into()),
+                    operation,
                 );
-                assert!(
-                    matches!(
-                        outcome,
-                        ItemOutcome::Succeeded(BatchSuccess {
-                            output: MutationSuccess::Skipped,
-                            ..
-                        })
-                    ),
-                    "{operation:?} / {code}"
-                );
+                if code == "notFound" {
+                    assert!(
+                        matches!(
+                            outcome,
+                            ItemOutcome::Succeeded(BatchSuccess {
+                                output: MutationSuccess::Skipped,
+                                ..
+                            })
+                        ),
+                        "{operation:?} / {code}"
+                    );
+                } else {
+                    assert!(
+                        matches!(outcome, ItemOutcome::Failed(_)),
+                        "{operation:?} must retain missing input content"
+                    );
+                }
             }
         }
 
@@ -3214,15 +3191,12 @@ mod tests {
             AccountOperation::Send,
             AccountOperation::DraftCreate,
             AccountOperation::ContainerCreate,
-            AccountOperation::SetImportance,
+            AccountOperation::EventUpdate,
         ] {
-            let outcome = classify_set_item(
-                set_error("notFound"),
-                JmapErrorContext::new(operation),
-                BatchItemId("msg-1".to_string()),
-                Some(ErrorScope::Message {
-                    id: ("msg-1".to_string()).into(),
-                }),
+            let outcome = super::super::mail_set::classify_set_response(
+                Err(crate::Error::Set(set_error("notFound"))),
+                bifrost_types::ObjectId("msg-1".into()),
+                operation,
             );
             assert!(
                 matches!(outcome, ItemOutcome::Failed(_)),

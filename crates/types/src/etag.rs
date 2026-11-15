@@ -25,6 +25,8 @@ impl StrongTag {
 impl EntityTag {
     #[must_use]
     pub fn parse(value: &str) -> Self {
+        // Classify padded weak tokens conservatively without rewriting opaque
+        // provider bytes. HTTP admission below still rejects that whitespace.
         if value
             .trim()
             .get(..2)
@@ -72,9 +74,9 @@ impl EntityTag {
         let value = self.as_str();
         let content = match self {
             Self::Weak(_) if strong => return false,
-            Self::Weak(_) => match value.strip_prefix("W/") {
-                Some(value) => value,
-                None => return false,
+            Self::Weak(_) => match value.get(..2) {
+                Some(prefix) if prefix.eq_ignore_ascii_case("W/") => &value[2..],
+                _ => return false,
             },
             Self::Strong(_) => value,
         };
@@ -128,10 +130,25 @@ mod tests {
     }
 
     #[test]
+    fn padded_tokens_preserve_bytes_but_are_not_http_preconditions() {
+        for value in [" W/\"weak\" ", " w/\"weak\" ", " \"strong\" "] {
+            let tag = EntityTag::parse(value);
+            assert_eq!(tag.as_str(), value);
+            assert!(!tag.valid_http(false));
+            assert!(!tag.valid_http(true));
+        }
+        assert!(matches!(
+            EntityTag::parse(" w/\"weak\" "),
+            EntityTag::Weak(_)
+        ));
+    }
+
+    #[test]
     fn http_admission_keeps_provider_precondition_rules() {
         assert!(EntityTag::parse("normalized").valid_http(true));
         assert!(!EntityTag::parse("normalized").valid_http(false));
         assert!(EntityTag::parse("W/\"weak\"").valid_http(false));
+        assert!(EntityTag::parse("w/\"weak\"").valid_http(false));
         assert!(!EntityTag::parse("W/\"weak\"").valid_http(true));
         assert!(!EntityTag::parse("w/\"weak\"").valid_http(true));
         assert!(!EntityTag::parse("bad\r\nvalue").valid_http(true));

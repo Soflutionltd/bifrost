@@ -38,8 +38,15 @@ pub(crate) fn stream<T: HttpTransport>(
                 state::JmapCursorError::CursorEnvelopeUnknown => {
                     bifrost_types::CursorDecodeFault::FutureVersion
                 }
-                state::JmapCursorError::Other(_) => bifrost_types::CursorDecodeFault::ScopeMismatch,
-                _ => bifrost_types::CursorDecodeFault::Malformed,
+                // A readable scope disagreement restarts only that scope. Keep
+                // this exhaustive so new faults cannot inherit that policy.
+                state::JmapCursorError::ScopeMismatch => {
+                    bifrost_types::CursorDecodeFault::ScopeMismatch
+                }
+                state::JmapCursorError::UnsupportedScope
+                | state::JmapCursorError::SchemaIncompatible => {
+                    bifrost_types::CursorDecodeFault::Malformed
+                }
             };
             return Box::pin(async_stream::stream! {
                 yield super::error::terminated(

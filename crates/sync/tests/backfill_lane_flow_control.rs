@@ -1687,7 +1687,15 @@ async fn the_live_driver_refuses_a_backfill_checkpoint() {
     let scope = CursorScope::Account;
     let mut stub = common::StubAccount::new(vec![scope.clone()]);
     let hook_scope = scope.clone();
+    // The first poll runs as soon as attach has spawned its workers, which can
+    // be before this test subscribes; a termination broadcast then reaches
+    // nobody. Offer the offending batch from the second poll on, which is
+    // always a cadence tick later and so after the subscription below.
+    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     stub.changes_hook = Some(Arc::new(move |_cursor| {
+        if polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Vec::new();
+        }
         vec![SyncEvent::Batch(Batch {
             items: Vec::new(),
             page_boundary: PageBoundary::Final,
@@ -2175,7 +2183,7 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
 /// `a_departure_during_teardown_records_no_loss` (in `multiplexer::tests`) calls
 /// `ChangeDelivery::begin_teardown` directly, so it pins what the sweep does
 /// once the flag is set and says nothing about where the flag gets set. Deleting
-/// the `begin_teardown` call from `detach_inner`, or moving it below the worker
+/// the `begin_teardown` call from `DetachingAccount::begin`, or moving it below the worker
 /// awaits, leaves that test green. This one drives the real `SyncEngine::detach`
 /// and drops the receiver while the call is in flight.
 ///
@@ -2195,7 +2203,7 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
 /// both ablations. A parked INVENTORY stream, which a later version used, stopped
 /// holding the window when the fusion walk gained its shutdown arm.
 ///
-/// How the window is ENTERED deterministically: `detach_inner` removes the slot,
+/// How the window is ENTERED deterministically: `detach` removes the slot,
 /// calls `begin_teardown`, publishes `Stop` and cancels the token with NO await
 /// between them, so the slot's absence from `engine.accounts` is proof that the
 /// flag is already set - under the current ordering. Under either

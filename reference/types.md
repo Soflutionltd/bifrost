@@ -579,6 +579,10 @@ streaming uses `InProcess`.
 
 ## Calendar range guard
 
+`EventRange::new(calendar_id, start, end)` constructs a first window with no
+page cursor or result limit. It preserves the supplied bounds without validation;
+provider query boundaries retain responsibility for supported time forms.
+
 `EventRange::admits` is the shared defensive guard used by CalDAV and JMAP
 range reads after provider selection. It rejects provably disjoint timed,
 nonrecurring intervals with explicit offset-bearing bounds and ends. Ends are
@@ -619,6 +623,9 @@ original token bytes. `ServerVersion::ETag`, `ContactCard.etag` and
 `CalendarEvent.etag` carry this type. HTTP caller-token validation lives on the
 shared type; a token without a weak marker still needs syntax validation before
 it is accepted as an HTTP precondition. `StrongTag` has a private field.
+Weak marker recognition and HTTP admission both accept `W/` and `w/`.
+Classification ignores surrounding whitespace conservatively, but HTTP admission
+rejects it; `as_str` always retains the original bytes for opaque provider tokens.
 
 ## Durable evidence and tag ownership
 
@@ -722,3 +729,25 @@ The fixed snapshot schema expresses transitions in `changed`, leaving `added`
 and `removed` empty. A committed reattach publishes a nonempty delta through
 `AccountControl::CapabilitiesChanged`; a provider detecting a change before a
 replacement open may still have no second snapshot for its error's delta.
+
+## Absent mutation subjects
+
+`AccountOperation::skips_absent_target` owns an exhaustive per-operation ruling.
+Flag, starred, replied, forwarded, MDN, keyword, label, category, extended-property,
+importance and read-state edits, bulk and thread moves/deletes, container membership
+edits and draft discard skip a confirmed absent subject. An enterprise Outlook
+user expects mail deleted elsewhere gone from view, without an error or a false
+claim that this call changed it. Reads, sends, uploads, creates, scheduling changes,
+settings and non-mail edits retain NotFound: absence cannot supply requested
+content, deliver mail or confirm those edits. Missing destinations and input blobs
+are never evidence that the subject is absent. This policy does not authorize
+blind replay after an ambiguous write.
+
+Graph bulk and PIM message writes and JMAP's shared mail-set classifier consume
+this owner. A skip is `MutationSuccess::Skipped`, never an applied write or a
+committed partial-effect step. Other provider adapters must explicitly apply the
+policy where they establish subject absence.
+
+Recipient validation accepts the calling `Protocol` and stamps empty-send
+refusals. Provider-neutral MIME rendering and header resolution pass `Unknown`;
+account boundaries stamp their protocol when propagating renderer failures.

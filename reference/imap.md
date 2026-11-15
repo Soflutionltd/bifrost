@@ -1385,9 +1385,9 @@ other callers are not touched; they are in use, possibly in the target itself.
 ### Shared / other-user folders (A5c)
 
 Failed NAMESPACE and per-prefix LIST commands preserve their classified discovery
-errors in the open result and subsequent container snapshots. ErrorScope has no
-namespace-prefix variant, so these use account scope rather than inventing a
-mailbox identity for a prefix. A failed NAMESPACE keeps the rediscovery capability
+errors in the open result and subsequent container snapshots. Failed NAMESPACE
+uses account scope; a failed per-prefix LIST uses `ErrorScope::Namespace` with
+that prefix rather than inventing a mailbox identity. A failed NAMESPACE keeps the rediscovery capability
 flag true: an enterprise user expects a later reattach to recover missing shares,
 and a failed probe is not evidence of a personal-only server. MYRIGHTS remains
 advisory because SELECT is authoritative.
@@ -1421,8 +1421,8 @@ choice preserves personal mailbox access. Once fallback COPY has committed,
 a subsequent STORE/EXPUNGE failure belongs to the source. Personal-only
 permission loss stays account-level terminal `NoPermission`. Guarded STORE
 access refusals are classified before the completed result is flattened into
-per-UID concurrency outcomes. Its result type retains status and response code,
-but does not retain the server's response text. ACL rights are advisory (gate
+per-UID concurrency outcomes. Its result type retains status, response code and
+the server's response text. ACL rights are advisory (gate
 discovery only); `NO [ACL]` stays authoritative per-mutation.
 
 Fallback MOVE's partial-commit diagnostics retain source and destination folder
@@ -1889,7 +1889,9 @@ refusals use `AccountError::invalid_page_cursor`: restart only the caller's walk
 
 IMAP and ManageSieve token lookups share `account::error::oauth_token_error`,
 which classifies through `bifrost_net::token_source_account_error` - the same
-owner SMTP's token lookup uses. The internal `Error::OAuthToken` retains net's preclassified `AccountError`;
+owner SMTP's token lookup uses. Both currently carry `Protocol::Imap`, matching
+the other ManageSieve translations because the shared `Protocol` taxonomy has no
+ManageSieve variant. The internal `Error::OAuthToken` retains net's preclassified `AccountError`;
 the account boundary decorates it with the caller's operation, provider and
 scope without inventing an IMAP acknowledgement. A token endpoint outage or
 lost refresh driver retains retry recovery; actual credential loss retains
@@ -1925,8 +1927,9 @@ parses MYRIGHTS once into MailboxRights; pim delegates its projection.
 
 ## Selected mailbox numeric observations
 
-SELECT assembly normalizes zero UIDVALIDITY and UIDNEXT to absence. The
-completion validator already refuses missing or zero UIDVALIDITY, and the
+SELECT assembly ignores zero UIDVALIDITY and UIDNEXT observations, preserving
+an earlier nonzero value. Completion validation uses the same rule and refuses
+a selection with no nonzero UIDVALIDITY, and the
 account helper also refuses zero for directly constructed selections. Raw
 response decoding retains wire numbers; accepting a wire sentinel does not
 make it a usable mailbox epoch. Enterprise users expect a server with an
@@ -2114,3 +2117,72 @@ conversion, HOLDUNTIL and recipient receipt projection to
 field, login credential inheritance, account budget/meter, default From and
 save-to-Sent policy. Its scripted submission connector still reaches the same
 SMTP builder. Local envelope validation errors now identify SMTP as their protocol.
+
+SELECT option assembly propagates cached QRESYNC operand validation failures as
+internal IMAP errors to the operation's classification boundary rather than
+panicking. Composed contact and event autocomplete forward to their configured
+account; absent composition, refusals identify `ContactAutocomplete` and
+`EventAutocomplete` respectively.
+
+### Codec and negotiation operand boundaries
+
+NOTIFY MessageNew FETCH attributes use the same capability admission as FETCH,
+for both typed attributes and raw extension syntax, at snapshot and live driver
+admission. SEARCH MODSEQ construction refuses values above the 63-bit ceiling
+and continues to admit zero. Gmail X-GM-MSGID and X-GM-THRID observations accept
+the full unsigned 64-bit range, including the tolerated quoted form.
+
+Pipeline routing components are computed once from the solicited owner sets
+and cached; command submission only looks up the resulting key. ENABLE results
+concatenate every ENABLED frame in arrival order, matching live negotiation's
+adoption of every frame. Enterprise users expect callers to recognize every
+mode the server enabled, rather than mistake a later frame for a refusal.
+
+Authentication rejection diagnostics use AUTH=LOGIN for SASL LOGIN and LOGIN
+for the IMAP command, sharing the offered-authentication display owner. The raw
+Capability enum and its MechanismName payload remain internal through the
+private types module; neither is part of the exported account surface.
+
+### FETCH chunk identity and routed task admission
+
+Body FETCH merge keys use the case-insensitive borrowed `SectionSpec` identity
+and the exact optional origin. `None` (a whole section) and `Some(0)` (a partial
+section starting at zero) remain distinct. Binary merge keys likewise include
+the numeric part path and optional origin. A later non-NIL value fills a NIL
+observation only at the same key; an existing payload is retained. Section wire
+syntax remains lossless rather than being rebuilt from a restricted grammar.
+Enterprise users expect fetched chunks to survive response folding. Draft send
+folds split responses for its requested UID and requires a whole-message body,
+never a partial chunk.
+
+The private `account::scope_router` module owns `ImapFolder` construction.
+Cursor routing and membership routing through `DavScopeIndex::imap_mailbox`
+both return this admitted mailbox type. Inventory and changes tasks receive
+that value from the entry point and consume it rather than decoding their
+scope again. The raw scope decoder and typed dispatch are private to the router;
+only test adapters expose their isolated classification paths. Enterprise users
+expect composed DAV collections never to become IMAP SELECT or move targets.
+
+PIM container operands also enter through `DavScopeIndex::imap_container` in
+`account::scope_router`. Copy destinations, removal sources, hierarchy operands
+and nested search container restrictions reject DAV-owned legacy collection ids
+before issuing IMAP commands. Malformed mailbox identities retain the caller's
+operation. The existing IMAP-wins collision policy remains the ownership rule.
+
+Hydration consumes only a matching FETCH section and origin using the same
+`BodySection::same_fetch_key` identity as response merging. Whole MIME requires
+an empty section with no origin; previews require an empty section with origin
+zero. Header selection matches HEADER case-insensitively with no origin, while
+a metadata-only projection consumes no body. Unrelated payloads remain intact.
+The PIM request and response paths share `body_for_hydration`; generic MIME
+hydration uses the whole-message selector. Enterprise users expect the requested
+message bytes rather than an unsolicited part or a chunk from another offset.
+
+The shared `AccountOperation::skips_absent_target` policy requires confirmed
+subject absence. The mutation engine cannot infer that from tagged OK on UID
+STORE, COPY or MOVE: nonexistent UIDs are ignored, and absence from MODIFIED is
+not evidence of existence or absence. It retains command-level acknowledged
+success rather than inventing a per-UID skip from the MODSEQ cache. Missing
+folders, missing destinations and UIDVALIDITY changes retain their errors;
+none establishes subject absence. An Outlook user must still see a move refused
+because its destination disappeared.

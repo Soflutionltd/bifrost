@@ -330,6 +330,8 @@ pub enum DischargeEvidence {
     /// cursor bridge that will report its removal, or out of scope. Emits
     /// nothing to the consumer: absence from an old inventory snapshot is not a
     /// deletion to apply against current state.
+    /// The free-form detail is support-only. Inspection without consent clears
+    /// it while retaining the fact that irrelevance was proved.
     ProvedIrrelevant { detail: String },
     /// Superseded by the children it was split into. The parent is closed so it
     /// cannot be replayed or double-counted; the debt lives on in the children.
@@ -631,8 +633,40 @@ impl DebtLedger {
         Self::default()
     }
 
+    /// Inspection without support consent. User-safe text and bounded tokens
+    /// remain available; support-only free text stays in the durable ledger.
+    pub(crate) fn without_support_text(mut self) -> Self {
+        for entry in self.entries.values_mut() {
+            // Repair evidence may contain provider or object text too. Users
+            // inspecting sync debt have not consented to a support export.
+            if let ProofStatus::Discharged {
+                evidence: DischargeEvidence::ProvedIrrelevant { detail },
+            } = &mut entry.proof
+            {
+                detail.clear();
+            }
+            entry
+                .last_error
+                .diagnostics
+                .text
+                .retain(bifrost_types::DiagnosticText::is_user_safe);
+        }
+        for barrier in self.barriers.values_mut() {
+            barrier
+                .evidence
+                .diagnostics
+                .text
+                .retain(bifrost_types::DiagnosticText::is_user_safe);
+        }
+        self
+    }
+
     /// Include terminal entries and compacted history: compaction must not
     /// reset the durable ordering when the last open obligation disappears.
+    // Compacted audits are never evicted: audit_for appends one per scope and
+    // fold_discharged merges into it. An empty proved set therefore cannot lose
+    // the highest compacted generation. If audits become bounded, persist a
+    // separate high-water mark before adding eviction (and version its codec).
     pub(crate) fn latest_generation(&self) -> crate::cursor::WalkGeneration {
         self.entries
             .values()
@@ -870,6 +904,11 @@ impl DebtLedger {
         for obligation in barriers {
             let key = obligation.key().clone();
             if let Some(incident) = self.barriers.remove(&key) {
+                // Also protect decisions in snapshots written before incidents
+                // inherited the retained entry's policy at record time.
+                let retained_policy = self.entries.get(&key).and_then(|entry| {
+                    (!matches!(entry.policy, EntryPolicy::Automatic)).then(|| entry.policy.clone())
+                });
                 self.entries.insert(
                     key.clone(),
                     LedgerEntry {
@@ -877,7 +916,7 @@ impl DebtLedger {
                         domain: report.domain.clone(),
                         generation,
                         proof: ProofStatus::Unresolved,
-                        policy: match incident.policy {
+                        policy: retained_policy.unwrap_or(match incident.policy {
                             BarrierPolicy::Waived {
                                 by,
                                 at_unix_seconds,
@@ -885,11 +924,11 @@ impl DebtLedger {
                                 by,
                                 at_unix_seconds,
                             },
-                            // Preserve the incident's policy even if an existing
-                            // waived entry with the same key authorized crossing.
+                            // record_barrier carries any retained operator decision
+                            // into this incident before it can replace an entry.
                             BarrierPolicy::Undecided => EntryPolicy::Automatic,
                             BarrierPolicy::OperatorBlocked => EntryPolicy::OperatorBlocked,
-                        },
+                        }),
                         target: None,
                         parent: None,
                         first_seen_unix_seconds: now,
@@ -1249,7 +1288,25 @@ impl DebtLedger {
     /// Idempotent per key: hitting the same wall on every attach must not
     /// accumulate incidents, and must not reset an operator's decision about
     /// it.
-    pub fn record_barrier(&mut self, incident: BarrierIncident) {
+    pub fn record_barrier(&mut self, mut incident: BarrierIncident) {
+        // A repeated wall may arrive after its waiver was converted into debt.
+        // An enterprise operator expects that recorded decision to survive the
+        // next inventory. Copy it to the incident before crossing can replace it.
+        if let Some(entry) = self.entries.get(&incident.key) {
+            match &entry.policy {
+                EntryPolicy::Waived {
+                    by,
+                    at_unix_seconds,
+                } => {
+                    incident.policy = BarrierPolicy::Waived {
+                        by: by.clone(),
+                        at_unix_seconds: *at_unix_seconds,
+                    };
+                }
+                EntryPolicy::OperatorBlocked => incident.policy = BarrierPolicy::OperatorBlocked,
+                EntryPolicy::Automatic => {}
+            }
+        }
         match self.barriers.get_mut(&incident.key) {
             Some(existing) => {
                 existing.generation = existing.generation.max(incident.generation);
@@ -1971,10 +2028,26 @@ mod tests {
             crate::cursor::WalkGeneration::for_test(2),
             600
         ));
+        // A later walk records the incident again after its first crossing
+        // moved the waiver from the barrier map to the accepted-loss entry.
+        ledger.record_barrier(BarrierIncident {
+            key: key.clone(),
+            domain: report.domain.clone(),
+            generation: crate::cursor::WalkGeneration::for_test(3),
+            failure_label: "unidentifiable-value".into(),
+            evidence: error().into(),
+            policy: BarrierPolicy::Undecided,
+            resume_from: None,
+        });
         assert!(
             ledger.cross_waived_barriers(&report, crate::cursor::WalkGeneration::for_test(2), 600),
             "a cumulative Done report must not recreate the barrier crossed by its batch"
         );
+        assert!(matches!(
+            &ledger.entry(&key).expect("accepted-loss entry").policy,
+            EntryPolicy::Waived { by, at_unix_seconds }
+                if by.0 == "operator" && at_unix_seconds.0 == 500
+        ));
         assert!(
             ledger
                 .entry(&key)
@@ -3306,6 +3379,58 @@ mod tests {
             u64::try_from(super::COMPACTION_THRESHOLD).expect("threshold fits a u64")
         );
         assert!(ledger.completion_permitted(&scope()));
+    }
+
+    #[test]
+    fn debt_inspection_redacts_support_text_without_mutating_evidence() {
+        let mut ledger = DebtLedger::new();
+        ledger.ingest(
+            &InventoryCoverageReport::degraded(time_domain(0, 1), vec![object("owed")]),
+            crate::cursor::WalkGeneration::for_test(1),
+            0,
+        );
+        let entry = ledger.entries.values_mut().next().expect("entry");
+        entry.last_error.diagnostics.text = vec![
+            DiagnosticText::user_safe("user visible"),
+            DiagnosticText::support_only("private support detail"),
+        ];
+        entry.proof = ProofStatus::Discharged {
+            evidence: DischargeEvidence::ProvedIrrelevant {
+                detail: "private repair detail".into(),
+            },
+        };
+        let inspected = ledger.clone().without_support_text();
+        let text = &inspected
+            .entries()
+            .next()
+            .expect("entry")
+            .last_error
+            .diagnostics
+            .text;
+        assert_eq!(text, &[DiagnosticText::user_safe("user visible")]);
+        assert!(matches!(
+            &inspected.entries().next().expect("entry").proof,
+            ProofStatus::Discharged {
+                evidence: DischargeEvidence::ProvedIrrelevant { detail },
+            } if detail.is_empty()
+        ));
+        assert!(matches!(
+            &ledger.entries().next().expect("entry").proof,
+            ProofStatus::Discharged {
+                evidence: DischargeEvidence::ProvedIrrelevant { detail },
+            } if detail == "private repair detail"
+        ));
+        assert_eq!(
+            ledger
+                .entries()
+                .next()
+                .expect("entry")
+                .last_error
+                .diagnostics
+                .text
+                .len(),
+            2
+        );
     }
 
     /// Hitting the same wall every attach must not accumulate incidents or

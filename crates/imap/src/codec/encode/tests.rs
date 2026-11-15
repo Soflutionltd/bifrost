@@ -8399,8 +8399,10 @@ fn typed_search_capability_requirements_follow_keys_and_raw_declarations() {
         .unwrap();
     let criteria = crate::types::SearchCriteria::new().not(&body);
     assert!(admit_and_encode("A001", &Command::Search { criteria }, &options).is_ok());
-    let criteria = crate::types::SearchCriteria::new()
-        .or(&body, &crate::types::SearchCriteria::new().mod_seq(4));
+    let criteria = crate::types::SearchCriteria::new().or(
+        &body,
+        &crate::types::SearchCriteria::new().mod_seq(4).unwrap(),
+    );
     assert!(matches!(
         admit_and_encode("A001", &Command::Search { criteria }, &options),
         Err(crate::Error::MissingCapability(_))

@@ -98,7 +98,7 @@ pub fn send_request_to_rfc5322(
     if !request.attachments_uploaded.is_empty() {
         return Err(unsupported(AccountOperation::AttachmentUpload));
     }
-    request.validate_recipients()?;
+    request.validate_recipients(crate::Protocol::Unknown)?;
 
     let from = request.from.clone().unwrap_or_else(|| default_from.clone());
     let message_id = generate_message_id(&from);

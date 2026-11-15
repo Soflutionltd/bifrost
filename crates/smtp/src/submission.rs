@@ -196,6 +196,21 @@ impl Submission {
         }
         let mut not_accepted = locally_failed;
         not_accepted.extend(not_accepted_recipients(&envelope.recipients, &outcome));
+        #[cfg(feature = "tracing")]
+        if !not_accepted.is_empty() {
+            tracing::warn!(
+                delivered = outcome.succeeded().len(),
+                failed = not_accepted
+                    .iter()
+                    .filter(|r| matches!(r.outcome, RecipientOutcome::Failed))
+                    .count(),
+                uncertain = not_accepted
+                    .iter()
+                    .filter(|r| matches!(r.outcome, RecipientOutcome::Uncertain))
+                    .count(),
+                "SMTP submission partially accepted"
+            );
+        }
         Ok(SubmissionReceipt {
             recipients_not_accepted: not_accepted,
         })
@@ -263,6 +278,8 @@ fn submission_invalid(detail: &str) -> AccountError {
             detail: DiagnosticText::support_only(detail),
         }),
     )
+    // The SMTP facade owns envelope and HOLDUNTIL validation, even when
+    // composed into IMAP. Support needs the failing transport vocabulary.
     .protocol(Protocol::Smtp)
     .operation(AccountOperation::Send)
     .text(DiagnosticText::support_only(detail))

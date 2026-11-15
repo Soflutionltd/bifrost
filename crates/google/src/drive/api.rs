@@ -9,11 +9,11 @@ pub(crate) struct DriveApi<'a>(pub(crate) &'a GmailClient);
 impl DriveApi<'_> {
     pub(crate) async fn execute_builder(
         &self,
-        builder: bifrost_net::RequestBuilder,
+        builder: impl Into<bifrost_net::RequestBuilder>,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<bifrost_net::Response> {
         self.0
-            .execute_builder(builder, ApiSurface::Drive, replay)
+            .execute_builder(builder.into(), ApiSurface::Drive, replay)
             .await
     }
 

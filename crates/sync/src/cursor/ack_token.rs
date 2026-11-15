@@ -9,7 +9,9 @@ use super::{
 };
 use crate::Error;
 
-const HEADER: &[u8] = b"bifrost-ack\x01";
+// Version 2 authenticates account identity. Only version 2 is readable: version
+// 1 has no account binding and cannot safely be replayed by an account writer.
+const HEADER: &[u8] = b"bifrost-ack\x02";
 
 /// Encode the whole token beside the consumer transaction it acknowledges.
 /// `key` is an application-owned persistent secret, stored separately from the
@@ -23,6 +25,13 @@ const HEADER: &[u8] = b"bifrost-ack\x01";
 #[must_use]
 pub fn encode_ack_token(token: &AckToken, key: &[u8; 32]) -> Vec<u8> {
     let mut out = HEADER.to_vec();
+    match &token.1.account {
+        None => out.push(0),
+        Some(account) => {
+            out.push(1);
+            blob(&mut out, account.0.as_bytes());
+        }
+    }
     out.extend_from_slice(&token.0.0.to_le_bytes());
     out.extend_from_slice(&token.1.claim.generation.to_le_bytes());
     match token.1.walk_watermark {
@@ -92,6 +101,13 @@ pub fn decode_ack_token(bytes: &[u8], key: &[u8; 32]) -> Result<AckToken, Error>
     if reader.take(HEADER.len())? != HEADER {
         return Err(Error::SchemaIncompatible);
     }
+    let account = match reader.byte()? {
+        0 => None,
+        1 => Some(bifrost_types::AccountId(
+            String::from_utf8(reader.blob()?.to_vec()).map_err(|_| invalid())?,
+        )),
+        _ => return Err(invalid()),
+    };
     let number = PublicationNumber(reader.u64()?);
     let generation = WalkGeneration::restore(reader.u64()?);
     let walk_watermark = match reader.byte()? {
@@ -115,6 +131,7 @@ pub fn decode_ack_token(bytes: &[u8], key: &[u8; 32]) -> Result<AckToken, Error>
     Ok(AckToken(
         number,
         std::sync::Arc::new(PublicationReceipt {
+            account,
             checkpoint,
             claim: CoverageClaim {
                 reports: Vec::new(),
@@ -229,6 +246,26 @@ mod tests {
                 repair: b"repair".to_vec(),
             }],
         )
+    }
+
+    #[test]
+    fn account_binding_survives_encoding_and_rejects_foreign_replay() {
+        let mut issuing = PendingCoverage::new();
+        issuing.account = Some(bifrost_types::AccountId("account-a".into()));
+        let token = issuing.publish_without_report(issuing.next_generation());
+        let restored = decode_ack_token(&encode_ack_token(&token, &KEY), &KEY).expect("restore");
+        let mut foreign = PendingCoverage::new();
+        foreign.account = Some(bifrost_types::AccountId("account-b".into()));
+        assert!(matches!(
+            foreign.claim_repair(restored.clone()),
+            ClaimLookup::Unknown
+        ));
+        let mut same = PendingCoverage::new();
+        same.account = issuing.account.clone();
+        assert!(matches!(
+            same.claim_repair(restored),
+            ClaimLookup::Replay(_)
+        ));
     }
 
     #[test]

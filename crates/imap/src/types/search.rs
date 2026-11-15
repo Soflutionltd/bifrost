@@ -707,13 +707,14 @@ impl SearchCriteria {
     /// `"MODSEQ" [entry-name entry-type-req] SP mod-sequence-valzer`
     ///
     /// `mod-sequence-valzer` is a 63-bit unsigned integer (0 to 2^63-1),
-    /// but `u64` is accepted here since the server enforces the range.
+    /// and values outside that range return an invalid-input error locally.
     ///
     /// Requires [`Capability::Condstore`](crate::types::Capability::Condstore).
-    #[must_use]
-    pub fn mod_seq(self, value: u64) -> Self {
-        // RFC 7162 Section 3.1.5: simple MODSEQ form.
-        self.push_number("MODSEQ", value)
+    pub fn mod_seq(self, value: u64) -> Result<Self, crate::Error> {
+        let value = super::ModSeqValzer::new(value).ok_or_else(|| {
+            crate::Error::InvalidInput("SEARCH MODSEQ exceeds the 63-bit protocol ceiling".into())
+        })?;
+        Ok(self.push_number("MODSEQ", value.get()))
     }
 
     // -----------------------------------------------------------------------

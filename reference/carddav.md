@@ -804,7 +804,7 @@ the two dialects reduce to a single
 `CardDavClient` is a newtype over the shared `DavDispatch`, which owns the HTTP
 client, credentials, the admitted-origin credential gate, the per-hop net
 policy and the generic WebDAV verbs. Native-id resolution is
-shared too: `DavDispatch::resolve_url` returns an absolute href verbatim, lets a
+shared too: `DavDispatch::resolve_url` returns an absolute HTTP(S) href verbatim, lets a
 root-relative href replace the base path per RFC 3986, and resolves a relative
 href UNDER the configured base path rather than beside it. `reference/caldav.md`,
 "How `resolve_url` turns a native id into a request URL", carries the rule and
@@ -1033,3 +1033,20 @@ DAV discovery qualifies collection scopes with `ObjectType::Contact` using
 and the other DAV dialect even when their strings match. Legacy bare folder
 and type scopes remain accepted; collection-qualified cursors validate the
 payload URL and report full coverage just like legacy folder cursors.
+
+Non-HTTP(S) scheme-like native ids passed to `DavDispatch::resolve_url` are
+relative path text beneath the configured base, matching CalDAV. Users expect
+such resources to stay in the configured DAV collection, not select another
+transport. HTTP(S) scheme recognition is case-insensitive.
+
+
+
+The shared `AccountOperation::skips_absent_target` returns false for `ContactUpdate`
+and `ContactDelete`. Updates and conditional deletes preserve failures, including
+missing destinations: an Outlook user needs to know that an edit was not applied.
+Unconditional delete currently diverges: the client's `delete_vcard` absorbs
+404/410 before the account door sees them. This is coupled to replay after a
+landed DELETE, which can itself return 404. The account door cannot distinguish
+that committed attempt from prior absence, and a preflight read would add a race.
+Aligning this door requires changing the client/dispatch replay contract, rather
+than manufacturing NotFound or successful writes at the account boundary.

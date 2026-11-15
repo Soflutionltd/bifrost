@@ -866,7 +866,8 @@ impl InventoryEntry {
     ///
     /// Consumers must compare the complete entry, not only `fingerprint`:
     /// memberships and threading/header projections can change without a
-    /// provider changing flags, size, or its version token.
+    /// provider changing flags or its version token. Size is already part of
+    /// the fingerprint comparison.
     #[must_use]
     pub fn differs_from(&self, other: &Self) -> bool {
         // Exhaustive destructuring makes each new projection an explicit diff choice.

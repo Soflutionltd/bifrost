@@ -43,7 +43,7 @@ async fn attach(account_id: &AccountId, stub: Arc<common::StubAccount>) -> SyncE
 /// The gate is never notified, so the provider's close is hung for good. Without
 /// the clamp `detach` never returns and the outer timeout below is what fires -
 /// which is the ablation: remove the `tokio::time::timeout` around `close()` in
-/// `detach_inner` and this test fails on "the detach is clamped, not hung".
+/// `close_within` and this test fails on "the detach is clamped, not hung".
 ///
 /// The elapsed assertion is what separates this from the refusal case in the
 /// next test: a clamped hang spends the whole budget, a refusal spends none of

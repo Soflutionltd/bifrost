@@ -14,7 +14,10 @@ pub enum Error {
     MissingFrom,
     /// Missing to in envelope
     MissingTo,
-    /// Can only be one from in envelope
+    /// Multiple From authors without a single Sender.
+    /// Retained publicly and still produced by the message builder for that
+    /// invalid header combination. Multiple authors with one Sender are valid;
+    /// checked header-derived envelope conversion reports its own `InvalidInput`.
     TooManyFrom,
     /// Invalid email: missing at
     EmailMissingAt,

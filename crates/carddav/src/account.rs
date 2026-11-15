@@ -1249,6 +1249,9 @@ impl Account for CardDavAccount {
         })
     }
 
+    // AccountOperation::ContactUpdate.skips_absent_target() is false: Outlook
+    // users need to know that an edit to a vanished contact was not applied.
+    // Preserve fetch, PUT and relocation failures, including missing destinations.
     fn contact_update(
         &self,
         contact: ContactId,
@@ -1337,6 +1340,13 @@ impl Account for CardDavAccount {
         })
     }
 
+    // AccountOperation::ContactDelete.skips_absent_target() is false, but the
+    // client's delete_vcard absorbs 404/410 before this door sees them. That
+    // is coupled to replay: a retry after a landed DELETE can itself return
+    // 404. Do not fake policy compliance with a preflight existence probe or
+    // turn Ok into NotFound here; neither can distinguish that committed write
+    // from prior absence. Conformance needs a client/dispatch replay change.
+    // Conditional delete below already preserves the caller's failure.
     fn contact_delete(&self, contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
         let client = Arc::clone(&self.client);
         Box::pin(async move {

@@ -593,6 +593,12 @@ async fn upload_file_chunked_progress(
         }
         match status {
             200 | 201 => {
+                window.admit_completion().map_err(|_| {
+                    Error::provider_response(
+                        ProviderFault::ContractViolation,
+                        "resumable upload completed before every byte was sent".to_owned(),
+                    )
+                })?;
                 let file: GDriveFileResponse = serde_json::from_slice(response.body.as_ref())
                     .map_err(|source| Error::JsonDecode {
                         service: ApiSurface::Drive,

@@ -1,6 +1,8 @@
 //! ETag normalization and conditional-write preparation.
 //!
-//! Both DAV crates carried these three functions byte for byte.
+//! DAV adapters delegate token classification to bifrost-types. Keep these
+//! string-facing helpers as adapters for XML snapshots and HTTP callers; they
+//! do not maintain a second strong/weak parser.
 
 use reqwest::header::HeaderMap;
 

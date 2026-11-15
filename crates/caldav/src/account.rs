@@ -1148,6 +1148,9 @@ impl Account for CalDavAccount {
         })
     }
 
+    // AccountOperation::EventUpdate.skips_absent_target() is false: Outlook
+    // users need to know that an edit to a vanished event was not applied.
+    // Preserve fetch, PUT and relocation failures, including missing destinations.
     fn event_update(
         &self,
         event: EventId,
@@ -1226,6 +1229,13 @@ impl Account for CalDavAccount {
         })
     }
 
+    // AccountOperation::EventDelete.skips_absent_target() is false, but the
+    // client's delete_event absorbs 404/410 before this door sees them. That
+    // is coupled to replay: a retry after a landed DELETE can itself return
+    // 404. Do not fake policy compliance with a preflight existence probe or
+    // turn Ok into NotFound here; neither can distinguish that committed write
+    // from prior absence. Conformance needs a client/dispatch replay change.
+    // Conditional delete below already preserves the caller's failure.
     fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>> {
         let client = Arc::clone(&self.client);
         Box::pin(async move {
@@ -2295,18 +2305,6 @@ fn cursor_error(message: impl Into<String>) -> AccountError {
         .text(DiagnosticText::support_only(message))
         .try_build()
         .expect("valid account error classification")
-}
-
-#[cfg(test)]
-fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> bool {
-    EventRange {
-        calendar_id: event.calendar_id.clone(),
-        start: start.clone(),
-        end: end.clone(),
-        page_cursor: None,
-        limit: None,
-    }
-    .admits(event)
 }
 
 fn caldav_query_time(time: &EventTime) -> Option<String> {
@@ -3557,44 +3555,56 @@ mod tests {
     fn range_filter_includes_all_day_on_window_start() {
         let event = event("2026-06-02", "2026-06-03", true);
 
-        assert!(event_in_range(
-            &event,
-            &time("2026-06-02T00:00:00Z"),
-            &time("2026-06-03T00:00:00Z")
-        ));
+        assert!(
+            EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-02T00:00:00Z"),
+                time("2026-06-03T00:00:00Z"),
+            )
+            .admits(&event)
+        );
     }
 
     #[test]
     fn range_filter_keeps_all_day_dates_when_the_window_has_an_offset() {
         let event = event("2026-06-02", "2026-06-03", true);
 
-        assert!(event_in_range(
-            &event,
-            &time("2026-06-01T23:30:00+02:00"),
-            &time("2026-06-02T01:00:00+02:00")
-        ));
+        assert!(
+            EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-01T23:30:00+02:00"),
+                time("2026-06-02T01:00:00+02:00"),
+            )
+            .admits(&event)
+        );
     }
 
     #[test]
     fn range_filter_includes_event_that_started_before_window() {
         let event = event("2026-06-01T23:00:00Z", "2026-06-02T01:00:00Z", false);
 
-        assert!(event_in_range(
-            &event,
-            &time("2026-06-02T00:00:00Z"),
-            &time("2026-06-02T23:59:59Z")
-        ));
+        assert!(
+            EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-02T00:00:00Z"),
+                time("2026-06-02T23:59:59Z"),
+            )
+            .admits(&event)
+        );
     }
 
     #[test]
     fn range_filter_excludes_event_after_window() {
         let event = event("2026-06-04T00:00:00Z", "2026-06-04T01:00:00Z", false);
 
-        assert!(!event_in_range(
-            &event,
-            &time("2026-06-02T00:00:00Z"),
-            &time("2026-06-03T00:00:00Z")
-        ));
+        assert!(
+            !EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-02T00:00:00Z"),
+                time("2026-06-03T00:00:00Z"),
+            )
+            .admits(&event)
+        );
     }
 
     /// RFC 4791 s9.9: a zero-length instant on the window's start is inside
@@ -3604,11 +3614,14 @@ mod tests {
     fn range_filter_includes_a_zero_length_event_on_the_window_start() {
         let event = event("2026-06-02T00:00:00Z", "2026-06-02T00:00:00Z", false);
 
-        assert!(event_in_range(
-            &event,
-            &time("2026-06-02T00:00:00Z"),
-            &time("2026-06-03T00:00:00Z")
-        ));
+        assert!(
+            EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-02T00:00:00Z"),
+                time("2026-06-03T00:00:00Z"),
+            )
+            .admits(&event)
+        );
     }
 
     /// The same instant on the window's END is outside it: the window is
@@ -3617,11 +3630,14 @@ mod tests {
     fn range_filter_excludes_a_zero_length_event_on_the_window_end() {
         let event = event("2026-06-03T00:00:00Z", "2026-06-03T00:00:00Z", false);
 
-        assert!(!event_in_range(
-            &event,
-            &time("2026-06-02T00:00:00Z"),
-            &time("2026-06-03T00:00:00Z")
-        ));
+        assert!(
+            !EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-02T00:00:00Z"),
+                time("2026-06-03T00:00:00Z"),
+            )
+            .admits(&event)
+        );
     }
 
     /// And one instant before the window starts is outside it, so the
@@ -3630,11 +3646,14 @@ mod tests {
     fn range_filter_excludes_a_zero_length_event_just_before_the_window() {
         let event = event("2026-06-01T23:59:59Z", "2026-06-01T23:59:59Z", false);
 
-        assert!(!event_in_range(
-            &event,
-            &time("2026-06-02T00:00:00Z"),
-            &time("2026-06-03T00:00:00Z")
-        ));
+        assert!(
+            !EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-02T00:00:00Z"),
+                time("2026-06-03T00:00:00Z"),
+            )
+            .admits(&event)
+        );
     }
 
     #[test]
@@ -3644,11 +3663,14 @@ mod tests {
         // has_an_offset`), so the half-open end boundary is pinned with instants.
         let event = event("2026-06-01T00:00:00Z", "2026-06-02T00:00:00Z", false);
 
-        assert!(!event_in_range(
-            &event,
-            &time("2026-06-02T00:00:00Z"),
-            &time("2026-06-03T00:00:00Z")
-        ));
+        assert!(
+            !EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-02T00:00:00Z"),
+                time("2026-06-03T00:00:00Z"),
+            )
+            .admits(&event)
+        );
     }
 
     #[test]
@@ -3714,11 +3736,14 @@ mod tests {
             "FREQ=WEEKLY",
         );
 
-        assert!(event_in_range(
-            &event,
-            &time("2026-06-01T00:00:00Z"),
-            &time("2026-06-08T00:00:00Z")
-        ));
+        assert!(
+            EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-01T00:00:00Z"),
+                time("2026-06-08T00:00:00Z"),
+            )
+            .admits(&event)
+        );
     }
 
     #[test]
@@ -3731,11 +3756,14 @@ mod tests {
             "FREQ=WEEKLY;UNTIL=20260525T120000Z",
         );
 
-        assert!(event_in_range(
-            &event,
-            &time("2026-06-01T00:00:00Z"),
-            &time("2026-06-08T00:00:00Z")
-        ));
+        assert!(
+            EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-01T00:00:00Z"),
+                time("2026-06-08T00:00:00Z"),
+            )
+            .admits(&event)
+        );
     }
 
     #[test]
@@ -3746,11 +3774,14 @@ mod tests {
             "FREQ=WEEKLY",
         );
 
-        assert!(event_in_range(
-            &event,
-            &time("2026-06-01T00:00:00Z"),
-            &time("2026-06-08T00:00:00Z")
-        ));
+        assert!(
+            EventRange::new(
+                event.calendar_id.clone(),
+                time("2026-06-01T00:00:00Z"),
+                time("2026-06-08T00:00:00Z"),
+            )
+            .admits(&event)
+        );
     }
 
     #[test]

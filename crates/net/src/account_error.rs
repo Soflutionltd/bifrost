@@ -236,7 +236,7 @@ pub fn into_account_error_with_throttle_scope(
                 response.status,
                 &response.headers,
                 &response.body,
-                retry_after_history.last().copied(),
+                parse_retry_after_hint(response.headers.get(RETRY_AFTER)),
                 throttle_scope,
             ),
             // DEFENSIVE ARM, unreachable from the retry loop. `request.rs`
@@ -866,11 +866,10 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
         })),
         Error::RetryBudgetExhausted {
             final_response: Some(response),
-            retry_after_history,
             ..
         } => server_cause_from_status(
             response.status.as_u16(),
-            retry_after_history.last().copied(),
+            parse_retry_after_hint(response.headers.get(RETRY_AFTER)),
         ),
         Error::RetryBudgetExhausted {
             final_response: None,

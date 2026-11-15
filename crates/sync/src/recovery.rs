@@ -7,8 +7,8 @@
 //!
 //! - `plan_recovery` collapses a derived `RecoveryClass` into a closed
 //!   four-arm `RecoveryPlan` so the engine never variant-matches the
-//!   open `RecoveryClass` enum directly. Adding a future variant fails
-//!   to compile here, not silently routes to terminal.
+//!   open `RecoveryClass` enum directly. Unknown nonterminal variants stop
+//!   for operator attention rather than panic or authorize replay.
 //! - `retry_delay` resolves a `RetryAdvice` to a concrete `Duration`
 //!   using the cause's [`RetryHint`] when present.
 //! - `restart_scope_error` constructs the single account-error shape
@@ -59,9 +59,8 @@ use bifrost_types::{
 use bifrost_types::MailboxId;
 
 /// Closed four-arm plan derived from a `RecoveryClass`. Every engine
-/// dispatch site routes through [`plan_recovery`] so an added
-/// `RecoveryClass` variant fails to compile here rather than silently
-/// landing in the terminal arm.
+/// dispatch site routes through [`plan_recovery`]. The upstream enum is
+/// non-exhaustive, so unknown nonterminal advice fails closed.
 #[derive(Debug, Clone)]
 pub(crate) enum RecoveryPlan {
     Retry(RetryAdvice),
@@ -75,36 +74,23 @@ pub(crate) enum RecoveryPlan {
 /// to [`Fatal::try_from`]; engine sites that need to retain a copy for
 /// telemetry should clone before calling.
 ///
-/// Branching uses the four mutually-exclusive helpers on
-/// `RecoveryClass` (`is_retryable`, `requires_reconciliation`,
-/// `requires_engine_action`, `is_terminal`). The wildcard at the end
-/// is unreachable because the helpers cover every variant; we panic
-/// rather than silently choose a default if a future helper bug
-/// breaks the invariant.
+/// Match the advice directly, without relying on parallel classification helpers.
+/// The upstream enum is non-exhaustive. A future nonterminal variant must not
+/// panic a worker or silently authorize replay; stop for operator attention.
 pub(crate) fn plan_recovery(error: AccountError) -> RecoveryPlan {
-    let recovery = error.recovery();
-    if recovery.is_retryable() {
-        match recovery.clone() {
-            RecoveryClass::Retry(advice) => RecoveryPlan::Retry(advice),
-            other => unreachable!("is_retryable lied about {other:?}"),
-        }
-    } else if recovery.requires_reconciliation() {
-        match recovery.clone() {
-            RecoveryClass::Reconcile(advice) => RecoveryPlan::Reconcile(advice),
-            other => unreachable!("requires_reconciliation lied about {other:?}"),
-        }
-    } else if recovery.requires_engine_action() {
-        match recovery.clone() {
-            RecoveryClass::Engine(directive) => RecoveryPlan::Engine(directive),
-            other => unreachable!("requires_engine_action lied about {other:?}"),
-        }
-    } else {
-        // Terminal. `Fatal::try_from` rejects non-terminal errors;
-        // because `is_terminal` returned true here, the conversion
-        // always succeeds.
-        let fatal = Fatal::try_from(error)
-            .expect("is_terminal returned true but Fatal::try_from rejected the error");
-        RecoveryPlan::Terminal(fatal)
+    match error.recovery().clone() {
+        RecoveryClass::Retry(advice) => RecoveryPlan::Retry(advice),
+        RecoveryClass::Reconcile(advice) => RecoveryPlan::Reconcile(advice),
+        RecoveryClass::Engine(directive) => RecoveryPlan::Engine(directive),
+        _ => match Fatal::try_from(error) {
+            Ok(fatal) => RecoveryPlan::Terminal(fatal),
+            Err(error) => RecoveryPlan::Engine(EngineDirective::OperatorOverrideRequired {
+                reason: format!(
+                    "unsupported recovery classification: {:?}",
+                    error.recovery()
+                ),
+            }),
+        },
     }
 }
 
@@ -119,9 +105,9 @@ pub(crate) const REOPEN_WAIT: Duration = Duration::from_secs(30);
 
 /// Dispatch a failed stream before applying its lane's execution policy.
 ///
-/// One second without a hint prevents a failed read from spinning. Provider
-/// hints remain authoritative; lifecycle and transport reconnect backoffs may
-/// impose a larger local floor. Record every failed leg, even when the original
+/// Retrying lanes use one second without a hint to prevent a failed read from
+/// spinning. Provider hints remain unchanged; lifecycle and transport reconnect
+/// backoffs may impose a larger local floor. Record every failed leg, even when the original
 /// operation is terminal: stopping replay does not cancel a sibling's throttle.
 /// An enterprise mail user expects a transient outage to retry without flooding
 /// the server, and unrelated folders to keep progressing.
@@ -157,28 +143,9 @@ pub(crate) fn dispatch_stream_failure(
         operation = ?view.operation,
         "dispatching stream failure"
     );
-    let mut plan = plan_recovery(error);
-    // Resolve absolute hints once, before a lane queues or waits. All lanes
-    // receive the same timing decision, including failures without a hint.
-    let now = SystemTime::now();
-    match &mut plan {
-        RecoveryPlan::Retry(advice) => {
-            advice.retry_hint = Some(bifrost_types::RetryHint::After(retry_delay(
-                advice,
-                now,
-                HINTLESS_RETRY_WAIT,
-            )));
-        }
-        RecoveryPlan::Reconcile(advice) => {
-            advice.retry_hint = Some(bifrost_types::RetryHint::After(reconcile_delay(
-                advice,
-                now,
-                HINTLESS_RETRY_WAIT,
-            )));
-        }
-        RecoveryPlan::Engine(_) | RecoveryPlan::Terminal(_) => {}
-    }
-    plan
+    // Timing fallback belongs to the lane that actually retries. Preserve None
+    // so consumers can distinguish provider advice from local pacing.
+    plan_recovery(error)
 }
 
 /// Observe primary, sibling and cleanup throttles through the same owner.
@@ -870,24 +837,26 @@ mod tests {
     }
 
     #[test]
-    fn stream_dispatch_supplies_one_second_without_provider_timing() {
+    fn stream_dispatch_preserves_absent_provider_timing() {
         let bucket = ThrottleBucket::new();
         let account = AccountId("a".into());
         let now = SystemTime::UNIX_EPOCH;
         match dispatch_stream_failure(build_retry(), &bucket, &account) {
             RecoveryPlan::Retry(advice) => {
+                assert_eq!(advice.retry_hint, None);
                 assert_eq!(
-                    retry_delay(&advice, now, Duration::ZERO),
-                    Duration::from_secs(1)
+                    retry_delay(&advice, now, HINTLESS_RETRY_WAIT),
+                    HINTLESS_RETRY_WAIT
                 );
             }
             other => panic!("expected retry, got {other:?}"),
         }
         match dispatch_stream_failure(build_reconcile(), &bucket, &account) {
             RecoveryPlan::Reconcile(advice) => {
+                assert_eq!(advice.retry_hint, None);
                 assert_eq!(
-                    reconcile_delay(&advice, now, Duration::ZERO),
-                    Duration::from_secs(1)
+                    reconcile_delay(&advice, now, HINTLESS_RETRY_WAIT),
+                    HINTLESS_RETRY_WAIT
                 );
             }
             other => panic!("expected reconcile, got {other:?}"),

@@ -161,8 +161,9 @@ impl RequestEvidence {
         evidence
     }
 
-    pub(crate) fn from_ledger(attempts: Vec<Error>, ledger: AttemptLedger) -> Self {
+    pub(crate) fn from_ledger(attempts: Vec<Error>, mut ledger: AttemptLedger) -> Self {
         let mut evidence = Self::new(attempts, ledger.verdict());
+        ledger.retain_commit(evidence.verdict());
         evidence.ledger = ledger;
         evidence
     }
@@ -220,6 +221,19 @@ impl RequestEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supplied_ledger_cannot_weaken_nested_commit_evidence() {
+        let inner = RequestEvidence::new(Vec::new(), CommitEvidence::MayHaveCommitted);
+        let evidence = RequestEvidence::from_ledger(
+            vec![Error::AttemptHistory {
+                source: Box::new(Error::Cancelled),
+                evidence: inner,
+            }],
+            AttemptLedger::default(),
+        );
+        assert_eq!(evidence.verdict(), CommitEvidence::MayHaveCommitted);
+    }
 
     #[test]
     fn public_evidence_flattens_history_without_weakening_its_verdict() {

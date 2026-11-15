@@ -112,6 +112,33 @@ pub struct BodySection {
     pub data: Option<Bytes>,
 }
 
+/// Borrowed section identity. Wire spelling is retained because section syntax
+/// may contain quoted header names; folding protocol case does not rewrite it.
+/// Keep the existing decoder/encoder syntax boundary rather than introducing a
+/// second restrictive parser here: raw extension operands remain supported.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SectionSpec<'a>(&'a str);
+
+impl PartialEq for SectionSpec<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(other.0)
+    }
+}
+
+impl Eq for SectionSpec<'_> {}
+
+impl BodySection {
+    pub(crate) fn specification(&self) -> SectionSpec<'_> {
+        SectionSpec(&self.section)
+    }
+
+    /// Partial chunks at different offsets are distinct observations. An
+    /// enterprise user expects every fetched chunk to survive response merging.
+    pub(crate) fn same_fetch_key(&self, other: &Self) -> bool {
+        self.specification() == other.specification() && self.origin == other.origin
+    }
+}
+
 /// FETCH item attributes the client can request
 /// (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5).
 #[non_exhaustive]

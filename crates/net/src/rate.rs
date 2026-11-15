@@ -261,7 +261,7 @@ impl RateLimitGovernor {
     }
 
     /// Decrement the attach count for one `(host, quota_scope)` bucket.
-    pub fn unregister_scoped(&self, host: &str, quota_scope: &str) {
+    pub fn unregister_scoped(&self, host: &str, quota_scope: impl Into<crate::QuotaScope>) {
         let mut map = self.buckets.lock().expect("rate-governor lock poisoned");
         let key = RateKey::new(host, quota_scope);
         let drop_it = match map.get_mut(&key) {
@@ -292,7 +292,11 @@ impl RateLimitGovernor {
 
     /// Look up the default cost for one `(host, quota_scope)` bucket.
     #[must_use]
-    pub fn cost_default_for_scoped(&self, host: &str, quota_scope: &str) -> Option<u32> {
+    pub fn cost_default_for_scoped(
+        &self,
+        host: &str,
+        quota_scope: impl Into<crate::QuotaScope>,
+    ) -> Option<u32> {
         let map = self.buckets.lock().expect("rate-governor lock poisoned");
         map.get(&RateKey::new(host, quota_scope))
             .map(|b| b.cost_default)
@@ -342,7 +346,7 @@ impl RateLimitGovernor {
     pub fn acquire_generation_scoped(
         &self,
         host: &str,
-        quota_scope: &str,
+        quota_scope: impl Into<crate::QuotaScope>,
         cost: u32,
     ) -> Pin<
         Box<
@@ -484,7 +488,7 @@ impl RateLimitGovernor {
     pub fn refund_scoped(
         &self,
         host: &str,
-        quota_scope: &str,
+        quota_scope: impl Into<crate::QuotaScope>,
         cost: u32,
         generation: RateGeneration,
     ) {

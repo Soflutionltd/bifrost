@@ -264,12 +264,20 @@ pub fn verify_server_final(server_final: &str, expected_signature: &[u8]) -> Res
     use base64::Engine;
 
     validate_scram_attributes(server_final)?;
-    if let Some(error) = scram_field(server_final, 'e')? {
+    let error = scram_field(server_final, 'e')?;
+    let verifier = scram_field(server_final, 'v')?;
+    // RFC 5802 server-final is an error OR a verifier, never both.
+    if error.is_some_and(str::is_empty) || (error.is_some() && verifier.is_some()) {
+        return Err(SaslError::Protocol(
+            "SCRAM server-final requires a non-empty error or a verifier, exclusively".into(),
+        ));
+    }
+    if let Some(error) = error {
         return Err(SaslError::ServerRejected(
             crate::ScramServerError::from_token(error),
         ));
     }
-    let verifier = scram_field(server_final, 'v')?
+    let verifier = verifier
         .ok_or_else(|| SaslError::Protocol("SCRAM server-final message missing verifier".into()))?;
     let actual = base64::engine::general_purpose::STANDARD
         .decode(verifier)
@@ -890,6 +898,16 @@ mod tests {
         // Signature mismatch is a protocol-class failure, not ServerRejected.
         let err = verify_server_final(&server_final, &expected).unwrap_err();
         assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn verify_server_final_rejects_empty_or_conflicting_error() {
+        for message in ["e=", "e=,v=AA==", "e=invalid-proof,v=AA=="] {
+            assert!(matches!(
+                verify_server_final(message, &[0]),
+                Err(SaslError::Protocol(_))
+            ));
+        }
     }
 
     #[test]

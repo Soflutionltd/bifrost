@@ -68,6 +68,22 @@ use crate::push::{InvalidationSinkInner, RegisteredSubscription, SubscriptionReg
 use crate::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
 use crate::types::{AccountSlot, BackfillConfig, EngineConfig, WorkerTask};
 
+/// Result of a bounded best-effort close. Callers own logging and lifecycle
+/// cleanup; timing out drops only this close future, not their cleanup task.
+enum CloseOutcome {
+    Closed,
+    Refused(AccountError),
+    TimedOut,
+}
+
+async fn close_within(account: &dyn Account, timeout: Duration) -> CloseOutcome {
+    match tokio::time::timeout(timeout, account.close()).await {
+        Ok(Ok(())) => CloseOutcome::Closed,
+        Ok(Err(error)) => CloseOutcome::Refused(error),
+        Err(_) => CloseOutcome::TimedOut,
+    }
+}
+
 mod ack;
 mod attach;
 mod backfill;
@@ -289,6 +305,310 @@ fn scope_local_establish_failure(error: &AccountError) -> bool {
     )
 }
 
+/// Owns teardown independently of the caller's future. Users cancelling a
+/// detach still expect the account to stop, and a later attach must not race
+/// the old incarnation's writer, close or registry cleanup.
+struct DetachingAccount {
+    slot: Arc<AccountSlot>,
+    teardown_writer: Option<mpsc::Sender<WriterRequest>>,
+    timeout: Duration,
+    subscriptions: Arc<SubscriptionRegistry>,
+    sink: Arc<InvalidationSinkInner>,
+    budget: BudgetGate,
+    backfill_registry: Arc<BackfillRegistry>,
+    throttles: Arc<crate::recovery::ThrottleBucket>,
+    bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
+}
+
+impl DetachingAccount {
+    /// Synchronous teardown signals. `detach` calls this before spawning
+    /// `run`, with no await after removing the slot, so a slot absent from
+    /// the account map always has its departure sweep already inert.
+    fn begin(&self) {
+        let slot = &self.slot;
+        // From here the departure sweep is inert: a consumer receiver dropped
+        // anywhere in the teardown window behaves as one dropped after `detach`
+        // returns. See `PendingCoverage::release_undelivered` for the ruling.
+        // Through the delivery gate, so a sweep already running finishes -
+        // discard request included - before the flag is observed.
+        slot.delivery.begin_teardown(&slot.coverage);
+        // Ask running workers to checkpoint cleanly, then stop.
+        slot.control.stop();
+        // Trip shutdown before awaiting workers. Some account-level
+        // workers park on the shutdown token rather than the boundary
+        // watch, so waiting first would always run to detach_timeout.
+        slot.shutdown.cancel();
+        // And pulse the capacity wake, so a producer parked on the backfill
+        // bound leaves through its shutdown arm at once. The cancel alone is
+        // enough - the wait selects on the token - but a cold start parked at the
+        // bound behind a consumer that stopped acknowledging is exactly the case
+        // that would otherwise be awaited for the whole `detach_timeout` and then
+        // aborted mid-partition, so it is worth being explicit about.
+        slot.coverage.wake_capacity();
+    }
+
+    async fn run(self, account_id: &AccountId) -> Result<(), Error> {
+        let slot = &self.slot;
+        let teardown_writer = self.teardown_writer;
+
+        // Await spawned workers up to the configured timeout. Each
+        // stored worker owns both its join and abort handles so a
+        // timeout cannot detach a task and let it run forever.
+        let timeout = self.timeout;
+        let mut drained: Vec<WorkerTask> = {
+            let mut workers = slot.workers.lock().expect("worker list lock poisoned");
+            workers.drain(..).collect()
+        };
+        // Wait for stream workers before the writer so final worker-held ack
+        // sender clones can close naturally and the writer can drain
+        // everything it received. Identify the writer structurally: spawn
+        // order is not part of the teardown contract.
+        let ack_worker = take_ack_writer(&mut drained);
+        let deadline = tokio::time::Instant::now() + timeout;
+        for worker in drained {
+            await_worker_until(deadline, worker, account_id).await;
+        }
+        // Every loss recorded during this attachment asked for that scope's
+        // backfill rows to be dropped, and the walk drains those requests at its
+        // own end - but the orchestrator returns on shutdown from INSIDE its
+        // partition loop, so a detach between a loss and the end of the walk
+        // never reaches that drain. The rows left behind point past the hole and
+        // carry no marker above them: harmless for a `Fixed` plan, which re-walks
+        // everything, and a permanent hole for `OpenPages`, which resumes from
+        // them. This is the last moment the writer is still alive, so it is where
+        // the outstanding requests are settled.
+        //
+        // What this drain settles is every loss recorded BEFORE teardown began.
+        // A consumer receiver dropped after this point - during the drain, after
+        // it, or after `detach` returns - records nothing: the departure sweep
+        // went inert at `begin_teardown` above, because a loss it would record
+        // here is one the writer can no longer act on, and the pages it would
+        // be about are the consumer's by contract (delivered but unacknowledged
+        // at detach is the consumer's to have persisted or to forfeit, exactly
+        // as at a crash). Ruled 2026-09-06; the full reasoning and the cost of
+        // the alternative are at `PendingCoverage::release_undelivered`.
+        //
+        // The writer phase - this drain and the writer await below - gets a FRESH
+        // `detach_timeout` rather than the remainder of the worker deadline, for
+        // the same reason `Account::close()` does. Detach is documented as "up to
+        // `detach_timeout` of worker awaits PLUS the trailing phases", and a
+        // single shared deadline silently zeroes whichever phase runs last: a
+        // provider stream that neither yields nor ends parks a worker until the
+        // deadline wherever its poll has no shutdown arm (the deferred-inventory
+        // worker's membership refresh is one such poll), and the writer then reached `await_worker_until` with `remaining == 0`
+        // and was aborted IMMEDIATELY, without draining. That is precisely the
+        // "writer aborted with unpersisted work" outcome the two-phase ordering
+        // and `take_ack_writer` exist to prevent, reached by a different route.
+        // A straggler worker must not be able to spend the drain's budget.
+        //
+        // WORST CASE. `detach` is now bounded by four sequential budgets, each
+        // one `detach_timeout`: the worker awaits, this writer phase, the wait
+        // for an in-flight reattach's reopen lock, and `Account::close()`. So at
+        // most 4 * `detach_timeout` (20s by default), and only when a wedged
+        // worker, a wedged store, a wedged reattach and a wedged provider close
+        // all coincide. Recorded in `reference/sync.md`, because a
+        // consumer calling `detach` on the way out of a process is bounding its
+        // own shutdown by that number.
+        //
+        // Both awaits are clamped, like every other teardown step. A store whose
+        // `delete_backfill` or `put_ledger` hangs must not hang `detach` with it;
+        // the rows it leaves behind are the same rows an aborted writer would
+        // have left.
+        let writer_deadline = tokio::time::Instant::now() + timeout;
+        if let Some(writer) = teardown_writer {
+            for scope in slot.coverage.take_backfill_discards() {
+                let (done, recv) = oneshot::channel();
+                let request = WriterRequest::DiscardBackfillProgress {
+                    scope: scope.clone(),
+                    done,
+                };
+                match tokio::time::timeout_at(writer_deadline, writer.send(request)).await {
+                    Ok(Ok(())) => {}
+                    // The writer is already gone: nothing left to settle to.
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "bifrost.sync.backfill",
+                            account = ?account_id,
+                            scope = ?scope,
+                            "detach timeout reached before the writer accepted the discard \
+                             of a walk that lost pages; a later attach may resume past them"
+                        );
+                        break;
+                    }
+                }
+                match tokio::time::timeout_at(writer_deadline, recv).await {
+                    Ok(Ok(Err(error))) => {
+                        tracing::warn!(
+                            target: "bifrost.sync.backfill",
+                            account = ?account_id,
+                            scope = ?scope,
+                            error = %error,
+                            "could not drop the backfill rows of a walk that lost pages before \
+                             detaching; a later attach may resume past them"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "bifrost.sync.backfill",
+                            account = ?account_id,
+                            scope = ?scope,
+                            "detach timeout reached while the store dropped the backfill rows \
+                             of a walk that lost pages; a later attach may resume past them"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        // The writer drains on its OWN budget, and a writer that exhausts it is
+        // answered explicitly rather than by falling through the generic
+        // straggler path. The two situations differ: a worker aborted at the
+        // worker deadline was asked to stop and would not, while a writer that
+        // cannot finish draining inside a full fresh `detach_timeout` is either
+        // blocked in the durable store or still waiting on its request channel.
+        // The ENGINE's senders are all gone by then - every stream worker has
+        // exited and the teardown sender was dropped above - but
+        // `BackfillCheckpointWriter` is published and owns a sender of its own, so
+        // a consumer that retains one keeps the channel open past the engine and
+        // the writer can exhaust this budget with a healthy store. Either way the
+        // treatment is to abort (nothing else is available: the account is
+        // gone, no caller can reach the writer for a retry, and holding the
+        // teardown open longer only lengthens the bound above), but the LOG says
+        // which requests are being forfeited, because the acknowledged work it
+        // was carrying is exactly what the drain exists to persist, and an
+        // operator seeing this line needs to know the account resumes from an
+        // older checkpoint on the next attach. Redelivery, not loss - a
+        // consumer's acknowledgement is durable only once the writer says so.
+        if let Some(worker) = ack_worker {
+            await_ack_writer_until(writer_deadline, worker, account_id).await;
+        }
+
+        // Serialize against a consumer-driven `reattach`. It is not a worker,
+        // and the shutdown cancel above only stops it at its next check. The
+        // writer phase already waited for it incidentally - an in-flight
+        // reattach holds a clone of the writer's sender, so the writer cannot
+        // drain until it returns or the writer phase times out - but only for
+        // that one budget; a reattach outlasting it raced the close below.
+        // Reattach holds this lock from its
+        // open through the swap and the close of the account it replaced, so
+        // taken here, around the load and the close, the two orderings are
+        // both whole. A reattach already in flight finishes first, closing the
+        // old account itself, and `current` is then its replacement, which this
+        // closes. One that has not opened yet waits on the lock and then sees
+        // the cancelled shutdown token and opens nothing. Loading `current`
+        // without the lock let detach close the old account while a reattach
+        // swapped in a replacement nobody would ever close, and then the
+        // reattach closed the old account a second time.
+        //
+        // Clamped like every other await here, on a FRESH `detach_timeout`: a
+        // reattach parked inside a provider open or establish must not hang
+        // detach. On expiry the close proceeds without the lock - the race is
+        // open again, but only for a reattach that already overran a full
+        // timeout - and the log says so.
+        let _reopen_guard =
+            match tokio::time::timeout(self.timeout, Arc::clone(&slot.reopen_lock).lock_owned())
+                .await
+            {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    tracing::warn!(
+                        target: "bifrost.sync.reopen",
+                        account = ?account_id,
+                        timeout = ?self.timeout,
+                        "a reattach held the reopen lock past the detach timeout; closing the \
+                         current account without waiting for it, so a replacement it installs \
+                         may be left unclosed"
+                    );
+                    None
+                }
+            };
+        let current = slot.current.load_full();
+        // Clamped, like every other await in this teardown: a provider whose
+        // `close()` never returns must not hang `detach` itself, which is the
+        // one call a consumer has for getting rid of an account.
+        //
+        // The budget is a FRESH `detach_timeout` rather than the `deadline` the
+        // worker awaits and the discard drain share, and that is deliberate.
+        // Detach has always been "up to `detach_timeout` of worker awaits PLUS
+        // `close()`", so sharing the deadline would silently take the close
+        // budget away whenever a straggler worker had already spent it: a
+        // perfectly healthy close needing one wire round trip would be reported
+        // as hung and its connection abandoned, on a path where nothing was
+        // wrong. The clamp exists to bound a hang, not to starve a slow close.
+        //
+        // What a timed-out close MEANS here is exactly what a FAILED close
+        // already means, and that is the reason it is treated identically:
+        // warn, and carry on to the registry cleanup with the handle dropped
+        // alongside the slot. There is no third option available to it. The
+        // slot left the engine account map before this task was spawned, so no caller
+        // can reach the handle for a retry; `detach`'s contract does not report
+        // close failure to its caller, since the account is gone either way;
+        // and retaining the handle for a later attempt would mean keeping a
+        // dead incarnation's connection reachable under an id a fresh `attach`
+        // may already have claimed. Provider-side resources that a hung close
+        // did not release are in the same position as those a failed close did
+        // not release: the drop of the last `Arc<dyn Account>` is what is left,
+        // and the log line is what tells an operator it happened. The two get
+        // DISTINCT messages, because "the provider refused" and "the provider
+        // never answered" want different follow-up.
+        match close_within(current.as_ref().as_ref(), self.timeout).await {
+            CloseOutcome::Closed => {}
+            CloseOutcome::Refused(e) => {
+                tracing::warn!(target: "bifrost.sync.changes", error=?e, "account close failed");
+            }
+            CloseOutcome::TimedOut => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    account = ?account_id,
+                    timeout = ?self.timeout,
+                    "account close exceeded the detach timeout; abandoning the handle. \
+                     Provider-side resources it holds are released only when the \
+                     connection itself drops"
+                );
+            }
+        }
+        // Drop the push registry records for this incarnation.
+        //
+        // Nothing can reach them after this point - `unsubscribe_push`
+        // rejects with `AccountNotAttached` and reattach only runs on an
+        // attached slot - so leaving them behind does not preserve a
+        // teardown opportunity; it only means a later attach of the same
+        // `AccountId` inherits handles minted by a dead connection and
+        // hands them to the provider as if they were live. A handle whose
+        // connection is gone is not retryable, so dropping is strictly
+        // better than carrying.
+        //
+        // This does NOT delete the server-side subscriptions: per
+        // `reference/types.md` that stays the consumer's job via
+        // `SyncEngine::unsubscribe_push` BEFORE detach. Records still
+        // present here mean that call never happened, so the provider will
+        // hold live subscriptions until it expires them on its own
+        // schedule (24h for Graph). That is a consumer bug the contract
+        // cannot prevent, so it is reported rather than silently absorbed.
+        let stranded = self.subscriptions.take(account_id);
+        if !stranded.is_empty() {
+            tracing::warn!(
+                target: "bifrost.sync.push",
+                account = ?account_id,
+                count = stranded.len(),
+                "detached with live push subscriptions still registered; call \
+                 SyncEngine::unsubscribe_push before detach or the provider \
+                 keeps delivering until they expire",
+            );
+        }
+        self.sink.unregister(account_id);
+        self.budget.forget(account_id);
+        self.backfill_registry.forget_account(account_id);
+        self.throttles.forget_account(account_id);
+        if let Some(meter) = &self.bandwidth_meter {
+            meter.forget_account(account_id);
+        }
+        Ok(())
+    }
+}
+
 impl SyncEngine {
     /// Share account payload budgets with every Net and protocol factory.
     #[must_use]
@@ -313,9 +633,9 @@ impl SyncEngine {
         account_id: &AccountId,
         token: crate::cursor::AckToken,
     ) -> Result<(), Error> {
-        // The token binds checkpoint and lane, but currently carries no account
-        // identity. The caller still selects the account; a foreign change token
-        // is indistinguishable from that account's prior-attachment replay.
+        // The token binds checkpoint, lane and account identity. The caller still
+        // selects the account; that account's ledger answers a foreign token as
+        // unknown rather than replaying it as a prior attachment's receipt.
         let Some(checkpoint) = token.checkpoint().cloned() else {
             return self.ack_repair(account_id, token).await;
         };
@@ -386,12 +706,25 @@ impl SyncEngine {
     /// Everything this account still owes: obligations no walk has resolved and
     /// regions its cursor cannot cross.
     /// Error evidence is retained as `crate::cursor::ErrorDigest`: classification,
-    /// scope, operation, provider, protocol and diagnostics, without live recovery advice.
+    /// scope, operation, provider, protocol and user-safe diagnostics, without live recovery advice.
+    /// Support-only text requires `debt_support_consented`.
     ///
     /// The enumeration surface. `get_backfill` cannot serve it - that returns
     /// one selected row, so it could never list what a scope owes across all
     /// its partitions - and durable debt nothing can list is only half a fix.
     pub async fn debt(&self, account_id: &AccountId) -> Result<crate::cursor::DebtLedger, Error> {
+        self.debt_support_consented(account_id)
+            .await
+            .map(crate::cursor::DebtLedger::without_support_text)
+    }
+
+    /// Full historical debt diagnostics, including support-only free text.
+    /// Call only after obtaining the user's consent to a support export.
+    /// No cause chain or live recovery advice is reconstructed.
+    pub async fn debt_support_consented(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<crate::cursor::DebtLedger, Error> {
         // A user inspecting debt must see obligations even when persistence failed.
         // Detached accounts have no writer and expose their durable snapshot.
         let tx = self
@@ -609,7 +942,7 @@ impl SyncEngine {
         // Cancel the engine root BEFORE the sequential cleanup, not after it.
         //
         // Every slot's shutdown token is a child of this one (`engine/attach.rs`),
-        // so this trips the same token `detach_inner` cancels per account - only
+        // so this trips the same token `DetachingAccount::begin` cancels per account - only
         // earlier, and for all accounts at once. Cancelling afterwards meant the
         // LAST account of N was still fully operational (polling, publishing,
         // writing) for up to `N - 1` worst-case detaches after the consumer
@@ -699,6 +1032,10 @@ impl SyncEngine {
     /// push subscriptions; call [`Self::unsubscribe_push`] first for that,
     /// or [`Self::detach_with_teardown`] to do both in one step.
     ///
+    /// Cancellation leaves teardown running in an owned task, retaining the
+    /// lifecycle reservation until registry cleanup completes. This requires
+    /// the Tokio runtime to remain alive.
+    ///
     /// Detach is the LAST point at which that call is possible: it drops
     /// this incarnation's push registry records, and afterwards
     /// `unsubscribe_push` rejects with `AccountNotAttached`. Records still
@@ -715,19 +1052,42 @@ impl SyncEngine {
         // the transition: for an in-flight attach the slot is not
         // installed yet, and for an in-flight detach it is already
         // gone, so `AccountNotAttached` is the honest answer either way.
-        {
+        let slot = {
             let mut guard = self.lifecycle_inflight.lock().await;
             if guard.contains(account_id) || !self.accounts.contains_key(account_id) {
                 return Err(Error::AccountNotAttached(account_id.clone()));
             }
+            let Some((_, slot)) = self.accounts.remove(account_id) else {
+                return Err(Error::AccountNotAttached(account_id.clone()));
+            };
             guard.insert(account_id.clone());
-        }
-        let result = self.detach_inner(account_id).await;
-        {
-            let mut guard = self.lifecycle_inflight.lock().await;
-            guard.remove(account_id);
-        }
-        result
+            slot
+        };
+        // No await between claiming the reservation and spawning its owner:
+        // even a caller dropped before the task's first poll cannot strand it.
+        let teardown = DetachingAccount {
+            slot,
+            teardown_writer: self.ack_senders.remove(account_id).map(|(_, tx)| tx),
+            timeout: self.config.detach_timeout,
+            subscriptions: Arc::clone(&self.subscriptions),
+            sink: Arc::clone(&self.sink),
+            budget: self.scheduler.budget(),
+            backfill_registry: Arc::clone(&self.backfill_registry),
+            throttles: Arc::clone(&self.throttles),
+            bandwidth_meter: self.bandwidth_meter.clone(),
+        };
+        teardown.begin();
+        let lifecycle = Arc::clone(&self.lifecycle_inflight);
+        let account_id = account_id.clone();
+        // Dropping this join handle only detaches the task. The reservation is
+        // released after ALL teardown, including when this final wait is cancelled.
+        tokio::spawn(async move {
+            let result = teardown.run(&account_id).await;
+            lifecycle.lock().await.remove(&account_id);
+            result
+        })
+        .await
+        .map_err(|error| Error::Other(format!("detach task failed: {error}")))?
     }
 
     /// Tear down the account's server-side push subscriptions, then detach
@@ -756,302 +1116,6 @@ impl SyncEngine {
     pub async fn detach_with_teardown(&self, account_id: &AccountId) -> Result<(), Error> {
         let teardown = self.unsubscribe_push(account_id).await;
         self.detach(account_id).await.and(teardown)
-    }
-
-    /// Teardown body. Runs under the lifecycle guard taken by
-    /// [`Self::detach`]; every registry cleanup at the tail assumes no
-    /// other incarnation of this id can exist while it runs.
-    async fn detach_inner(&self, account_id: &AccountId) -> Result<(), Error> {
-        let Some((_, slot)) = self.accounts.remove(account_id) else {
-            return Err(Error::AccountNotAttached(account_id.clone()));
-        };
-        // Drop the public ack sender so no new consumer acks enter
-        // during teardown. Worker-held clones remain alive long enough
-        // to flush their final checkpoint to the ack writer.
-        //
-        // The removed sender is KEPT here rather than discarded: teardown still
-        // has one durable request to make (the backfill discards below), and
-        // looking the key up again after removing it is a lookup that can only
-        // ever answer `None`. It is dropped before the writer is awaited, so it
-        // cannot hold the writer's channel open past its own drain.
-        let teardown_writer = self.ack_senders.remove(account_id).map(|(_, tx)| tx);
-        // From here the departure sweep is inert: a consumer receiver dropped
-        // anywhere in the teardown window behaves as one dropped after `detach`
-        // returns. See `PendingCoverage::release_undelivered` for the ruling.
-        // Through the delivery gate, so a sweep already running finishes -
-        // discard request included - before the flag is observed.
-        slot.delivery.begin_teardown(&slot.coverage);
-        // Ask running workers to checkpoint cleanly, then stop.
-        slot.control.stop();
-        // Trip shutdown before awaiting workers. Some account-level
-        // workers park on the shutdown token rather than the boundary
-        // watch, so waiting first would always run to detach_timeout.
-        slot.shutdown.cancel();
-        // And pulse the capacity wake, so a producer parked on the backfill
-        // bound leaves through its shutdown arm at once. The cancel alone is
-        // enough - the wait selects on the token - but a cold start parked at the
-        // bound behind a consumer that stopped acknowledging is exactly the case
-        // that would otherwise be awaited for the whole `detach_timeout` and then
-        // aborted mid-partition, so it is worth being explicit about.
-        slot.coverage.wake_capacity();
-
-        // Await spawned workers up to the configured timeout. Each
-        // stored worker owns both its join and abort handles so a
-        // timeout cannot detach a task and let it run forever.
-        let timeout = self.config.detach_timeout;
-        let mut drained: Vec<WorkerTask> = {
-            let mut workers = slot.workers.lock().expect("worker list lock poisoned");
-            workers.drain(..).collect()
-        };
-        // Wait for stream workers before the writer so final worker-held ack
-        // sender clones can close naturally and the writer can drain
-        // everything it received. Identify the writer structurally: spawn
-        // order is not part of the teardown contract.
-        let ack_worker = take_ack_writer(&mut drained);
-        let deadline = tokio::time::Instant::now() + timeout;
-        for worker in drained {
-            await_worker_until(deadline, worker, account_id).await;
-        }
-        // Every loss recorded during this attachment asked for that scope's
-        // backfill rows to be dropped, and the walk drains those requests at its
-        // own end - but the orchestrator returns on shutdown from INSIDE its
-        // partition loop, so a detach between a loss and the end of the walk
-        // never reaches that drain. The rows left behind point past the hole and
-        // carry no marker above them: harmless for a `Fixed` plan, which re-walks
-        // everything, and a permanent hole for `OpenPages`, which resumes from
-        // them. This is the last moment the writer is still alive, so it is where
-        // the outstanding requests are settled.
-        //
-        // What this drain settles is every loss recorded BEFORE teardown began.
-        // A consumer receiver dropped after this point - during the drain, after
-        // it, or after `detach` returns - records nothing: the departure sweep
-        // went inert at `begin_teardown` above, because a loss it would record
-        // here is one the writer can no longer act on, and the pages it would
-        // be about are the consumer's by contract (delivered but unacknowledged
-        // at detach is the consumer's to have persisted or to forfeit, exactly
-        // as at a crash). Ruled 2026-09-06; the full reasoning and the cost of
-        // the alternative are at `PendingCoverage::release_undelivered`.
-        //
-        // The writer phase - this drain and the writer await below - gets a FRESH
-        // `detach_timeout` rather than the remainder of the worker deadline, for
-        // the same reason `Account::close()` does. Detach is documented as "up to
-        // `detach_timeout` of worker awaits PLUS the trailing phases", and a
-        // single shared deadline silently zeroes whichever phase runs last: a
-        // provider stream that neither yields nor ends parks a worker until the
-        // deadline wherever its poll has no shutdown arm (the deferred-inventory
-        // worker's membership refresh is one such poll), and the writer then reached `await_worker_until` with `remaining == 0`
-        // and was aborted IMMEDIATELY, without draining. That is precisely the
-        // "writer aborted with unpersisted work" outcome the two-phase ordering
-        // and `take_ack_writer` exist to prevent, reached by a different route.
-        // A straggler worker must not be able to spend the drain's budget.
-        //
-        // WORST CASE. `detach` is now bounded by four sequential budgets, each
-        // one `detach_timeout`: the worker awaits, this writer phase, the wait
-        // for an in-flight reattach's reopen lock, and `Account::close()`. So at
-        // most 4 * `detach_timeout` (20s by default), and only when a wedged
-        // worker, a wedged store, a wedged reattach and a wedged provider close
-        // all coincide. Recorded in `reference/sync.md`, because a
-        // consumer calling `detach` on the way out of a process is bounding its
-        // own shutdown by that number.
-        //
-        // Both awaits are clamped, like every other teardown step. A store whose
-        // `delete_backfill` or `put_ledger` hangs must not hang `detach` with it;
-        // the rows it leaves behind are the same rows an aborted writer would
-        // have left.
-        let writer_deadline = tokio::time::Instant::now() + timeout;
-        if let Some(writer) = teardown_writer {
-            for scope in slot.coverage.take_backfill_discards() {
-                let (done, recv) = oneshot::channel();
-                let request = WriterRequest::DiscardBackfillProgress {
-                    scope: scope.clone(),
-                    done,
-                };
-                match tokio::time::timeout_at(writer_deadline, writer.send(request)).await {
-                    Ok(Ok(())) => {}
-                    // The writer is already gone: nothing left to settle to.
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        tracing::warn!(
-                            target: "bifrost.sync.backfill",
-                            account = ?account_id,
-                            scope = ?scope,
-                            "detach timeout reached before the writer accepted the discard \
-                             of a walk that lost pages; a later attach may resume past them"
-                        );
-                        break;
-                    }
-                }
-                match tokio::time::timeout_at(writer_deadline, recv).await {
-                    Ok(Ok(Err(error))) => {
-                        tracing::warn!(
-                            target: "bifrost.sync.backfill",
-                            account = ?account_id,
-                            scope = ?scope,
-                            error = %error,
-                            "could not drop the backfill rows of a walk that lost pages before \
-                             detaching; a later attach may resume past them"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        tracing::warn!(
-                            target: "bifrost.sync.backfill",
-                            account = ?account_id,
-                            scope = ?scope,
-                            "detach timeout reached while the store dropped the backfill rows \
-                             of a walk that lost pages; a later attach may resume past them"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-        // The writer drains on its OWN budget, and a writer that exhausts it is
-        // answered explicitly rather than by falling through the generic
-        // straggler path. The two situations differ: a worker aborted at the
-        // worker deadline was asked to stop and would not, while a writer that
-        // cannot finish draining inside a full fresh `detach_timeout` is either
-        // blocked in the durable store or still waiting on its request channel.
-        // The ENGINE's senders are all gone by then - every stream worker has
-        // exited and the teardown sender was dropped above - but
-        // `BackfillCheckpointWriter` is published and owns a sender of its own, so
-        // a consumer that retains one keeps the channel open past the engine and
-        // the writer can exhaust this budget with a healthy store. Either way the
-        // treatment is to abort (nothing else is available: the account is
-        // gone, no caller can reach the writer for a retry, and holding the
-        // teardown open longer only lengthens the bound above), but the LOG says
-        // which requests are being forfeited, because the acknowledged work it
-        // was carrying is exactly what the drain exists to persist, and an
-        // operator seeing this line needs to know the account resumes from an
-        // older checkpoint on the next attach. Redelivery, not loss - a
-        // consumer's acknowledgement is durable only once the writer says so.
-        if let Some(worker) = ack_worker {
-            await_ack_writer_until(writer_deadline, worker, account_id).await;
-        }
-
-        // Serialize against a consumer-driven `reattach`. It is not a worker,
-        // and the shutdown cancel above only stops it at its next check. The
-        // writer phase already waited for it incidentally - an in-flight
-        // reattach holds a clone of the writer's sender, so the writer cannot
-        // drain until it returns or the writer phase times out - but only for
-        // that one budget; a reattach outlasting it raced the close below.
-        // Reattach holds this lock from its
-        // open through the swap and the close of the account it replaced, so
-        // taken here, around the load and the close, the two orderings are
-        // both whole. A reattach already in flight finishes first, closing the
-        // old account itself, and `current` is then its replacement, which this
-        // closes. One that has not opened yet waits on the lock and then sees
-        // the cancelled shutdown token and opens nothing. Loading `current`
-        // without the lock let detach close the old account while a reattach
-        // swapped in a replacement nobody would ever close, and then the
-        // reattach closed the old account a second time.
-        //
-        // Clamped like every other await here, on a FRESH `detach_timeout`: a
-        // reattach parked inside a provider open or establish must not hang
-        // detach. On expiry the close proceeds without the lock - the race is
-        // open again, but only for a reattach that already overran a full
-        // timeout - and the log says so.
-        let _reopen_guard = match tokio::time::timeout(
-            self.config.detach_timeout,
-            Arc::clone(&slot.reopen_lock).lock_owned(),
-        )
-        .await
-        {
-            Ok(guard) => Some(guard),
-            Err(_) => {
-                tracing::warn!(
-                    target: "bifrost.sync.reopen",
-                    account = ?account_id,
-                    timeout = ?self.config.detach_timeout,
-                    "a reattach held the reopen lock past the detach timeout; closing the \
-                     current account without waiting for it, so a replacement it installs \
-                     may be left unclosed"
-                );
-                None
-            }
-        };
-        let current = slot.current.load_full();
-        // Clamped, like every other await in this teardown: a provider whose
-        // `close()` never returns must not hang `detach` itself, which is the
-        // one call a consumer has for getting rid of an account.
-        //
-        // The budget is a FRESH `detach_timeout` rather than the `deadline` the
-        // worker awaits and the discard drain share, and that is deliberate.
-        // Detach has always been "up to `detach_timeout` of worker awaits PLUS
-        // `close()`", so sharing the deadline would silently take the close
-        // budget away whenever a straggler worker had already spent it: a
-        // perfectly healthy close needing one wire round trip would be reported
-        // as hung and its connection abandoned, on a path where nothing was
-        // wrong. The clamp exists to bound a hang, not to starve a slow close.
-        //
-        // What a timed-out close MEANS here is exactly what a FAILED close
-        // already means, and that is the reason it is treated identically:
-        // warn, and carry on to the registry cleanup with the handle dropped
-        // alongside the slot. There is no third option available to it. The
-        // slot left `self.accounts` at the top of this function, so no caller
-        // can reach the handle for a retry; `detach`'s contract does not report
-        // close failure to its caller, since the account is gone either way;
-        // and retaining the handle for a later attempt would mean keeping a
-        // dead incarnation's connection reachable under an id a fresh `attach`
-        // may already have claimed. Provider-side resources that a hung close
-        // did not release are in the same position as those a failed close did
-        // not release: the drop of the last `Arc<dyn Account>` is what is left,
-        // and the log line is what tells an operator it happened. The two get
-        // DISTINCT messages, because "the provider refused" and "the provider
-        // never answered" want different follow-up.
-        match tokio::time::timeout(self.config.detach_timeout, current.close()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(target: "bifrost.sync.changes", error=?e, "account close failed");
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "bifrost.sync.changes",
-                    account = ?account_id,
-                    timeout = ?self.config.detach_timeout,
-                    "account close exceeded the detach timeout; abandoning the handle. \
-                     Provider-side resources it holds are released only when the \
-                     connection itself drops"
-                );
-            }
-        }
-        // Drop the push registry records for this incarnation.
-        //
-        // Nothing can reach them after this point - `unsubscribe_push`
-        // rejects with `AccountNotAttached` and reattach only runs on an
-        // attached slot - so leaving them behind does not preserve a
-        // teardown opportunity; it only means a later attach of the same
-        // `AccountId` inherits handles minted by a dead connection and
-        // hands them to the provider as if they were live. A handle whose
-        // connection is gone is not retryable, so dropping is strictly
-        // better than carrying.
-        //
-        // This does NOT delete the server-side subscriptions: per
-        // `reference/types.md` that stays the consumer's job via
-        // `SyncEngine::unsubscribe_push` BEFORE detach. Records still
-        // present here mean that call never happened, so the provider will
-        // hold live subscriptions until it expires them on its own
-        // schedule (24h for Graph). That is a consumer bug the contract
-        // cannot prevent, so it is reported rather than silently absorbed.
-        let stranded = self.subscriptions.take(account_id);
-        if !stranded.is_empty() {
-            tracing::warn!(
-                target: "bifrost.sync.push",
-                account = ?account_id,
-                count = stranded.len(),
-                "detached with live push subscriptions still registered; call \
-                 SyncEngine::unsubscribe_push before detach or the provider \
-                 keeps delivering until they expire",
-            );
-        }
-        self.sink.unregister(account_id);
-        self.scheduler.budget().forget(account_id);
-        self.backfill_registry.forget_account(account_id);
-        self.throttles.forget_account(account_id);
-        if let Some(meter) = &self.bandwidth_meter {
-            meter.forget_account(account_id);
-        }
-        Ok(())
     }
 
     /// Reopen and fully reattach an account slot. Scope and membership

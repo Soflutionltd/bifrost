@@ -186,6 +186,7 @@ pub enum Error {
         /// Preserved final response when one was received.
         final_response: Option<FinalResponse>,
         /// Lossless server `Retry-After` hints observed across attempts, in order.
+        /// Diagnostic history only; current advice comes from final_response.
         retry_after_history: Vec<RetryHint>,
         /// Why another wire attempt was refused.
         stop_reason: RetryStopReason,

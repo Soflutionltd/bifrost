@@ -43,10 +43,10 @@ impl BatchLeg {
                 headers.append(name, value);
             }
         }
-        let replay = if method == Method::PATCH {
+        let replay = if method == Method::GET || method == Method::HEAD {
             ReplayPolicy::IdempotentUnlessConditional
         } else {
-            ReplayPolicy::for_method(&method)
+            ReplayPolicy::Never
         };
         Some(Self {
             method,
@@ -60,9 +60,14 @@ impl BatchLeg {
     }
 }
 
-/// PATCH is an absolute by-id write; other methods use the net method default.
-/// Guard presence is evaluated from the typed headers before any retry policy
-/// is attached to the outer POST.
+/// Only read legs permit uncertain replay at this generic boundary.
+/// An absolute PATCH can overwrite an intervening edit, even without a guard.
+/// DELETE may clear a property recreated after the first attempt, and replayed
+/// resource deletion can report 404 after success unless its owner absorbs it.
+/// Permanent deletion and moves use POST and cannot be blindly repeated either.
+/// Outlook users expect one write, with uncertain outcomes reconciled before
+/// another write. Even desired-state clears remain conservative here: this
+/// boundary has neither their absence policy nor concurrency guarantees.
 pub(crate) fn subrequest_replayable(item: &BatchRequestItem) -> bool {
     BatchLeg::decode(item).is_some_and(|leg| leg.replayable())
 }

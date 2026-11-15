@@ -12,8 +12,7 @@ use super::envelope::UidBaseline;
 
 use super::{
     BATCH_ITEMS, CompactUidSet, FolderCursor, ImapAccount, ScopeHandler, batch, decode_cursor,
-    encode_cursor, encode_object_id, folder_from_scope, folder_scope, membership_scope,
-    route_scope, terminated_event,
+    encode_cursor, encode_object_id, folder_scope, membership_scope, route_scope, terminated_event,
 };
 
 // Admission and advertised cost must agree before any connection is acquired.
@@ -43,16 +42,16 @@ pub(crate) fn describe_cursor(account: &ImapAccount, cursor: &ChangeCursor) -> C
     // A typed scope owned by a sub-account is described by that
     // sub-account; only IMAP folder cursors fall through to the
     // strategy/cost classification below.
-    if let Ok(ScopeHandler::Delegate(sub)) = route_scope(
+    let folder = match route_scope(
         account,
         &cursor.scope,
         bifrost_types::AccountOperation::SyncChanges,
     ) {
-        return sub.describe_cursor(cursor);
-    }
+        Ok(ScopeHandler::Delegate(sub)) => return sub.describe_cursor(cursor),
+        Ok(ScopeHandler::Folder(folder)) => Some(folder),
+        Err(_) => None,
+    };
     let decoded = decode_cursor(cursor);
-    let folder =
-        folder_from_scope(&cursor.scope, bifrost_types::AccountOperation::SyncChanges).ok();
     let freshness = folder
         .as_ref()
         .and_then(|folder| account.folders.get(folder))
@@ -100,7 +99,7 @@ pub(crate) fn changes_stream(
     };
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     let task = tokio::spawn(async move {
-        match run_changes(account.clone(), cursor, tx.clone()).await {
+        match run_changes(account.clone(), cursor, folder.clone(), tx.clone()).await {
             Ok(()) | Err(ChangeError::ChannelDropped) => {}
             Err(ChangeError::Account(err)) => {
                 let _ = tx.send(terminated_event(err)).await;
@@ -204,12 +203,10 @@ fn select_error(account: &ImapAccount, folder: &MailboxName, err: crate::Error) 
 async fn run_changes(
     account: ImapAccount,
     change_cursor: ChangeCursor,
+    folder: super::ImapFolder,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
-    let folder = folder_from_scope(
-        &change_cursor.scope,
-        bifrost_types::AccountOperation::SyncChanges,
-    )?;
+    let folder = folder.into_mailbox();
     let cursor = decode_cursor(&change_cursor)?;
     match ChangePlan::for_cursor(&cursor, account.qresync_enabled()) {
         ChangePlan::RefuseIncomplete => Err(super::error::incomplete_uid_baseline(&folder).into()),

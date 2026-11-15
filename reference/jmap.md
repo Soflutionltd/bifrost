@@ -1075,7 +1075,7 @@ short batch cannot be held to end-of-input by a busy one; the wait is capped
 at the same input volume a full batch already accepts. A route holding only
 locally-rejected targets emits them without probing Email state.
 
-`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back observes current state; eligible targets may reassert within bounds). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so unguarded idempotent flag work retries, guarded flag work reconciles with CheckTarget only, and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. `SetResponse::created`/`updated`/`destroyed`, and the create maps of `Email/import`, `*/copy` and `Blob/upload`, report an omission as `Error::IdUnanswered`, as do omitted parse and blob-copy answers; `IdNotFound` is reserved for explicit misses: an omitted create may have landed, so it is never the terminal `MissingField` of a create that came back without its id. That second case - a success-map entry whose id is absent or empty - is refused by every create reader through `error::require_created_id`, as `Protocol(MissingField)` with `Attempt(Acknowledged)` evidence (still terminal `ProviderContractViolation`); no create returns an empty `ServerFilterId`, `ContainerId`, `EventId`, `ContactId`, `EmailId` or submission id as success. The single-set filter, mailbox, event and contact creates return that leaf bare, with no committed-unidentified partial-commit record; the multi-step send and draft doors wrap it in theirs. Every direct single-id reader and the shared mail-set classifier translate the request-stamped answer through the ordinary account error boundary. No caller supplies a substitute method name or guessed guard. Guarded unanswered writes narrow idempotency; unguarded writes retain the operation's recovery advice. Send cleanup reports an unanswered destroy as `CompensationOutcome::Unconfirmed`. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through `classify_set_item`. Empty additive/subtractive flag operations, wholly empty patches, and patches naming the same flag in both sets are rejected up front as `Terminated(Request(Malformed))` rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
+`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back observes current state; eligible targets may reassert within bounds). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so unguarded idempotent flag work retries, guarded flag work reconciles with CheckTarget only, and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. `SetResponse::created`/`updated`/`destroyed`, and the create maps of `Email/import`, `*/copy` and `Blob/upload`, report an omission as `Error::IdUnanswered`, as do omitted parse and blob-copy answers; `IdNotFound` is reserved for explicit misses: an omitted create may have landed, so it is never the terminal `MissingField` of a create that came back without its id. That second case - a success-map entry whose id is absent or empty - is refused by every create reader through `error::require_created_id`, as `Protocol(MissingField)` with `Attempt(Acknowledged)` evidence (still terminal `ProviderContractViolation`); no create returns an empty `ServerFilterId`, `ContainerId`, `EventId`, `ContactId`, `EmailId` or submission id as success. The single-set filter, mailbox, event and contact creates return that leaf bare, with no committed-unidentified partial-commit record; the multi-step send and draft doors wrap it in theirs. Every direct single-id reader and the shared mail-set classifier translate the request-stamped answer through the ordinary account error boundary. No caller supplies a substitute method name or guessed guard. Guarded unanswered writes narrow idempotency; unguarded writes retain the operation's recovery advice. Send cleanup reports an unanswered destroy as `CompensationOutcome::Unconfirmed`. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through the mail-set classifier `classify_set_response`. Empty additive/subtractive flag operations, wholly empty patches, and patches naming the same flag in both sets are rejected up front as `Terminated(Request(Malformed))` rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
 
 ### PIM primitives and conveniences
 
@@ -1401,8 +1401,13 @@ discovery ordering remain unchanged.
 `sync/error.rs::into_account_error(error, ctx)` is the single translation boundary: it consumes `crate::Error` plus a `JmapErrorContext { operation, scope, .. }` and emits an `AccountError` via `AccountErrorBuilder`, routing `(AccountErrorKind, Cause)` plus operation, scope, and any `AttemptCause` through `bifrost-types::recovery::derive` (central `RecoveryClass`; no private `to_recovery` table).
 
 The request contract is one of `Plain`, `StateRead(CursorScope)`,
-`AnchoredQuery(CursorScope)` or `Send`. Only `Send` adds envelope-decode
-acknowledgement and evidence-less transport in-flight evidence. A plain request
+`AnchoredQuery(CursorScope)` or `Send`. Only `Send` adds evidence-less
+transport in-flight evidence. Decode errors carry acknowledgement at every
+operation: a malformed answer still arrived. `Protocol(ParseFailed)` remains
+terminal `ProviderContractViolation`, including reads; the shared classifier
+uses the protocol fault rather than acknowledgement to decide retryability.
+Repeatedly retrying a malformed server response would hide the calendar or mail
+failure from the enterprise user. A plain request
 may still carry a diagnostic scope without acquiring state-read or anchor
 recovery. Provider identity is unset at this generic JMAP boundary.
 
@@ -1929,7 +1934,8 @@ forms are distinct, and durations enforce unit order and week-only syntax.
 Fractional seconds up to nanosecond precision survive time/duration conversion.
 The Account adapter parses shared times before constructing these wire values.
 A missing inbound duration keeps its PT0S default; malformed or numerically
-unrepresentable duration or overflowing end calculation fails single-event
+unrepresentable duration, invalid nonempty start or overflowing end calculation
+fails single-event
 hydration with Protocol(ParseFailed) instead of fabricating a zero-length event.
 List and range reads retain valid siblings and report rejected events in
 `Page::failed_ids`: an enterprise Outlook user expects the calendar to remain
@@ -1956,3 +1962,22 @@ is Protocol(PartialResponse) with Acknowledged transmission evidence, retaining
 retry/reconciliation rather than declaring a terminal missing field. Unknown
 FlagOp variants are local Unsupported refusals, including the defensive patch
 builder path; they do not describe malformed provider data.
+
+JMAP persisted cursor scope disagreement has a dedicated `ScopeMismatch` fault.
+The changes-stream mapping exhaustively matches cursor faults: only a readable
+scope disagreement restarts that scope; malformed state requires schema recovery.
+Calendar range guard callers can construct an unlimited first window with
+`EventRange::new(calendar_id, start, end)`, then call the shared `admits` guard.
+
+The mail-set classifier reads `AccountOperation::skips_absent_target` for native
+notFound responses. blobNotFound retains its error: missing input content does
+not prove that the mutation subject vanished. Skips never become committed writes.
+
+The JMAP send boundary passes `Protocol::Jmap` to shared recipient validation
+so its local empty-send refusal retains the account protocol.
+
+
+`sync/error.rs` has no separate per-item set classifier. Its mutation-classifier
+tests exercise the live `sync/mail_set.rs::classify_set_response` boundary,
+including missing input blobs retaining errors for operations that skip absent
+subjects. This keeps test expectations on the policy used by real mutations.

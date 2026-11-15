@@ -3294,7 +3294,7 @@ mod tests {
     #[test]
     fn bulk_projection_skips_a_resource_without_vevent() {
         // The listing lanes must not fabricate an empty event for a VTODO
-        // sharing the collection: `event_in_range` waves through an event
+        // sharing the collection: `EventRange::admits` admits an event
         // with an empty start, so the phantom would reach the consumer and
         // then fail to open, `event_get` having rejected the same body.
         let events = events_from_ical(

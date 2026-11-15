@@ -77,9 +77,19 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
 1. Take the per-account lifecycle guard
    (`AsyncMutex<HashSet<AccountId>>` on `engine.lifecycle_inflight`)
    and reject duplicate / racing attaches with
-   `Error::AccountAlreadyAttached`. The guard is released on both
-   success and failure paths so a failed `attach_inner` does not
-   strand the slot. `detach` holds the same guard for its whole
+   `Error::AccountAlreadyAttached`. The guard is released on
+   success, failure and cancellation paths. Before slot installation,
+   `AttachingWriter` owns the reservation, opened account, bandwidth budget and
+   early checkpoint writer. Cancellation transfers them to an asynchronous
+   cleanup task. The writer gets `detach_timeout` to drain and is aborted if
+   it exceeds that bound, including when a retained sender keeps its channel
+   open. Account close then gets a fresh `detach_timeout` before the reservation
+   is released. As on detach, abort can forfeit unpersisted acknowledgements
+   and cause redelivery. Cleanup uses the runtime handle captured by attach,
+   so dropping the attach future outside an entered runtime does not panic.
+   The captured Tokio runtime must remain alive to execute cleanup.
+   A failed `attach_inner` does not strand the slot. `detach` holds the same
+   guard for its whole
    teardown (see below), so an attach racing a detach of the same id is
    refused rather than admitted into that window.
 2. When a bandwidth registry is configured, acquire a strong account budget
@@ -126,7 +136,11 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
    membership index for push-hint routing. `scope_covers_membership`
    in `engine/attach.rs` is the engine-policy mapping (account-wide
    cursors cover every membership; folder-typed cursors cover the
-   matching folder; query cursors cover the matching query).
+   matching folder; query cursors cover the matching query). A `Mailbox`
+   membership only matches a type-qualified folder or type cursor for Email,
+   Mailbox or Thread. Contact and calendar types cannot claim it by string
+   equality. `Folder` memberships have no type tag and retain exact FolderId
+   matching; their identity cannot disambiguate equal mail and DAV folder ids.
 6. Spawn workers: ack writer, control applier, push reconciler,
    push lane supervisor, multiplexer,
    backfill orchestrator, deferred-inventory worker (if any),
@@ -238,13 +252,25 @@ true: the incarnation is attached and draining. A racing detach, and an
 attach still in flight, both yield `AccountNotAttached`. Pinned by
 `tests/attach_schema_recovery.rs::attach_cannot_land_inside_an_in_flight_detach`.
 
+Once detach claims the reservation and removes the slot, it synchronously
+raises the teardown signals (`DetachingAccount::begin`: inert departure sweep,
+`Stop`, shutdown cancel, capacity wake) and spawns an owned `DetachingAccount`
+task before its next await, so a slot absent from the account map always has
+its departure sweep inert. Cancelling the
+caller, including before that task's first poll or during its final lifecycle
+lock acquisition, leaves teardown running. The task owns the removed slot,
+writer sender and registry handles, and releases the reservation only after
+registry cleanup finishes. Merely releasing the reservation on cancellation
+would let a replacement race old workers and old registry cleanup. Cleanup
+requires the Tokio runtime to remain alive.
+
 `shutdown(self)` cancels the engine-root token FIRST, then enumerates attached
 accounts and calls `detach` for each (logging but not failing on per-account
 errors). Strongly preferred over relying on `Drop`, which can only fire a
 best-effort sync cancel.
 
 Cancel-first is load-bearing. Every slot's shutdown token is a child of the root
-(`engine/attach.rs`), so the cancel trips the same token `detach_inner` cancels
+(`engine/attach.rs`), so the cancel trips the same token `DetachingAccount::begin` cancels
 per account, only earlier and for all accounts at once. Cancelling AFTER the
 sequential loop - which is what it did - left the last of `N` accounts fully
 operational (polling, publishing, writing) for up to
@@ -746,8 +772,8 @@ change, so it is an owner-level proposal rather than hardening work.
 Attach starts the ack writer before cursor discovery and establishment, after
 restoring the durable coverage proof order. Its cursor reads, schema reset and
 fresh cursor persistence use `WriterHandle`; no attach-time durable mutation
-bypasses the writer. Until slot installation an abort-on-drop owner retains the
-writer task, so a setup failure or cancellation cannot detach it. Registrations
+bypasses the writer. Until slot installation `AttachingWriter` retains the
+writer task, so setup failure or cancellation transfers it to bounded cleanup. Registrations
 remain unpublished until discovery and establishment succeed. Deferred inventory
 captures the current coverage fence after any schema reset, since the writer's
 reset advances that fence even when no producer has started.
@@ -3032,10 +3058,11 @@ The token's receipt and claim fields,
 and all receipt-minting methods, are crate-private. `number()` exposes only
 compact identity; `checkpoint()` exposes the immutable checkpoint for inspection.
 The event's public scope and checkpoint remain diagnostic views; acknowledging
-never takes them as input. Account identity is still selected by the caller;
-tokens are not account-bound. A foreign change token cannot be distinguished
-from a prior attachment's replay, so applications must retain the account beside
-the token. Backfill takes the conservative withholding path for both.
+never takes them as input. Account writers bind the receipt to their account id
+before any publication. A caller must supply that same account when
+acknowledging; a foreign account token is refused before live claim lookup or
+receipt replay, including after process restart. Backfill still conservatively
+withholds resume rows issued by a prior attachment.
 
 `encode_ack_token(token, key)` and `decode_ack_token(bytes, key)` live beside
 `encode_envelope` and `encode_ledger`. The application supplies a persistent
@@ -3615,8 +3642,15 @@ instead of drifting.
 
 `LedgerEntry::last_error` and `BarrierIncident::evidence` hold the public
 `cursor::ErrorDigest`, also reachable through `SyncEngine::debt`. It retains
-kind, scope, operation, provider, protocol and the complete `DiagnosticInfo`,
-including text visibility. These fields are historical operator evidence; the
+kind, scope, operation, provider, protocol and the complete `DiagnosticInfo`
+in durable storage, including text visibility. `SyncEngine::debt` returns an
+inspection snapshot with support-only text removed from both entries and
+barriers. `DischargeEvidence::ProvedIrrelevant { detail }` is also support-only:
+inspection clears that free-form string while retaining the discharge kind.
+Durable storage and the consented snapshot retain the original detail.
+`debt_support_consented` returns the full historical evidence and
+requires the caller to obtain user consent before calling or exporting it.
+The classification and debt identity remain inspectable without support consent. These fields are historical operator evidence; the
 engine does not reconstruct a cause or expose invented recovery advice or
 message keys. Enterprise users inspecting incomplete synchronization need the
 observed classification and diagnostics. Recovery, secondary causes, original
@@ -3627,8 +3661,10 @@ The move to `ErrorDigest` left the error record's byte layout unchanged and
 took no version bump. Every version in the readable window decodes through the
 existing migration chain; versions outside the readable window return `Error::SchemaIncompatible`. Invalid tags,
 malformed diagnostic tokens and contradictory ledger state return `Error::Other`.
-No cursor scope is invented while decoding an error digest. Diagnostics still
-require the caller's consent policy before export.
+No cursor scope is invented while decoding an error digest. Store codecs retain
+full evidence and are persistence interfaces, not unconditional telemetry
+exports. The default debt snapshot is for user inspection, not telemetry:
+telemetry must still exclude all free-form text, including user-safe text.
 
 The `AccountOperation::ledger_tag`, `ObjectType::cursor_tag` and
 `ProtocolKind::cursor_tag` encoders live in bifrost-types, with exhaustive
@@ -3798,10 +3834,10 @@ variant; the engine dispatches every termination through
 `crate::recovery::plan_recovery(error)`, which collapses
 `AccountError::recovery()` into the closed
 `RecoveryPlan { Retry, Reconcile, Engine, Terminal(Fatal) }` enum.
-Adding a future `RecoveryClass` variant fails to compile in
-`plan_recovery` (the four mutually-exclusive helpers cover the
-case, but the closed `RecoveryPlan` enum enforces the dispatch
-surface). `Engine(EngineDirective::*)` directives drive
+`RecoveryClass` is non-exhaustive, so this boundary cannot enforce
+compile-time exhaustiveness. It matches the three actionable advice variants
+directly, validates terminal errors with `Fatal::try_from`, and routes unknown
+nonterminal advice to operator override rather than panicking or replaying. `Engine(EngineDirective::*)` directives drive
 `restart-scope` / `restart-account` / `downgrade-strategy` /
 `downgrade-capability` / `schema-clear` / `operator-override` /
 `disable-scope` flows. `DisableScope` quarantines a single cursor scope
@@ -4555,10 +4591,12 @@ Publication numbers retain their separate instance identity.
 ### Shared stream failure dispatch
 
 `recovery::dispatch_stream_failure` owns classification, structured recovery
-telemetry, throttle observation for primary/sibling/cleanup legs, and resolution
-of retry/reconcile hints. Hintless failures receive one second. It returns the
-closed `RecoveryPlan` with timed advice so campaigns retain disposition and
-read-back guidance. `observe_failure_throttles` also serves uncertain items and
+telemetry and throttle observation for primary/sibling/cleanup legs. It returns
+the closed `RecoveryPlan` with provider advice unchanged, including absent hints.
+Retrying lanes resolve their own one-second hintless fallback, so campaigns
+retain disposition, read-back guidance and the source of timing advice.
+Per-item mutation failures observe shared holds and classify without emitting
+one stream-failure log per item. `observe_failure_throttles` also serves uncertain items and
 read-back failures without authorizing replay. Item classification observes the
 error once; its caller does not record it again.
 
@@ -4599,7 +4637,7 @@ and `CursorDecodeFault::builder`), rather than provider-specific recovery tables
 `ThrottleBucket` owns its mutex. `observe(account, error)` is the single
 observation implementation: it consumes `AccountError::throttle_holds()`,
 records shareable targets and returns the longest local deadline, including
-operation-only holds. Repair uses that same deadline; dispatch retains its
+operation-only holds. Repair uses that same deadline; retrying lanes own their
 one-second hintless retry and reconcile pacing. Existing recorder functions
 are forwarding entry points for their callers.
 
@@ -4623,3 +4661,110 @@ can update account affordances after negotiation. Pre-open capability errors
 may carry no delta because the replacement snapshot is not available yet.
 Bandwidth control watches and snapshots carry `Option<BandwidthCap>` throughout;
 only application to the shared net budget extracts the positive numeric rate.
+
+Fusion establishment stops without installing a terminal cursor when any page,
+including a checkpoint-free page or Done, reaches no numbered receiver. Retiring
+an unreachable publication does not certify its prefix. `FusionOutcome::Undelivered`
+keeps deferred inventory in its own queue; before each scope walk the worker
+waits for a numbered subscriber without spending retries or polling the provider.
+A subscriber joining after attach returns can therefore establish the scope,
+and no consumer means no inventory churn. A reset or deletion still supersedes
+the queued item through its fence and lifecycle epoch. Invalidated walks go to
+establishment-if-absent; recovery-originated walks use their bounded retry policy. It is distinct from a successfully completed `NoCursor`
+walk. A subsequent walk must replay that prefix. PagePublisher refuses missing or unsupported checkpoints;
+unregistered checkpoint events are refused with a diagnostic. A mismatched
+backfill lane ledger returns a runner error or withholds the completion marker,
+rather than panicking a worker.
+
+Attach and reattach recovery ownership:
+
+- The reopen listener projects an already dispatched error with `plan_recovery`;
+  it does not record throttle holds or dispatch telemetry a second time. Deferred
+  inventory records those effects before forwarding its fusion termination, as
+  the other stream owners do. Fusion retains termination publication ownership.
+- Re-establishment reads and classifies a stored row before provider pacing.
+  Admission owns the wait before provider work and consumes the preceding local
+  hold only after honoring it. Inventory fusion has its own subsequent admission,
+  so a hold learned during establishment still applies before opening inventory.
+
+Cursor and backfill inspection contracts:
+
+- `DebtLedger::latest_generation` includes all terminal rows and per-scope
+  discharge audits. Audits currently have no eviction path: `audit_for` adds
+  scopes and `fold_discharged` merges generations. A bounded audit cache would
+  require a separately persisted generation high-water mark before eviction.
+- `ScopeWalkDriver::completed` requires source exhaustion and folded outcomes,
+  not merely eligibility to complete. Only one partition can await its outcome
+  at a time. Open-page chunks are at least one page; `MoreBeyond` at
+  `u32::MAX` ends the pass with the scope pending because no representable
+  next window proves exhaustion.
+- Re-recording a barrier inherits a retained entry's operator decision.
+  Crossing also preserves the retained decision when restoring an older
+  snapshot that contains both forms of the key. The operator's accepted loss
+  must not silently revert to automatic debt on the next walk.
+- `LaneGate::clone` shares account capacity and warning state but allocates an
+  independent `BackfillAdmission` permit slot. A clone represents another pass;
+  use an `Arc<LaneGate>` to share the same pass with a helper task.
+- Account writers bind every issued acknowledgement receipt to their account
+  id and check that binding before resolving live claims or restart replay.
+  Acknowledgement token format version 2 authenticates this account id.
+  Its decode window is version 2 only: version 1 cannot be migrated safely
+  because it contains no account identity. The ledger envelope layout and
+  decode window are unchanged. Standalone unbound coverage registries remain
+  usable together, but their receipts are refused by account-bound writers.
+- Standalone `PendingCoverage::supersede` changes live claims only. It cannot
+  update token bytes already stored by a consumer. Restart-safe supersession
+  uses registration's fold before the survivor is published. Each token retains
+  its cumulative evidence so any saved page can still be acknowledged after
+  restart; replacing that evidence with a compact reference requires a durable
+  evidence owner and a separately defined acknowledgement contract.
+
+### Change delivery ledger identity
+
+`ChangeDelivery::subscribe` binds its first coverage ledger. A later subscription
+with a different ledger is refused with an immediately closed, unnumbered
+receiver and an error log. It cannot receive publications, open the subscriber
+gate, retire registrations or route acknowledgements against a substitute
+ledger. Existing subscriptions and their bound ledger remain intact.
+
+Conversely, a ledger already bound to another delivery gate refuses binding,
+including after that gate has departed. `subscribe` logs the refusal and returns
+the same closed, unnumbered receiver before installing the ledger or issuing a
+receiver number. The original gate's receiver numbers and outstanding
+publications cannot be attributed to the new gate; users get a refused stream
+rather than misrouted acknowledgement accounting. The refused gate remains free
+to subscribe with its own ledger.
+
+### Close and publication outcomes
+
+`engine::close_within` owns the timeout mapping for attach cleanup and detach.
+Its internal `CloseOutcome` distinguishes completion, provider refusal (with the
+original `AccountError`), and timeout. Each caller retains its log target and
+continues its own cleanup after refusal or timeout. The helper neither spawns
+cleanup nor releases lifecycle reservations; the existing owned cleanup tasks
+retain those responsibilities through writer drain and registry cleanup.
+
+Reattach's `close_owed` is not bounded by this helper. It retains the close
+obligation until the provider returns, and cancellation transfers that obligation
+to `retire_stranded`. A timeout that cleared the obligation would introduce a
+new abandonment policy. The push retirement wait is bounded separately and does
+not bound the subsequent provider close.
+
+Unfinished inventory establishment that reaches no numbered receiver returns
+`Error::InventoryUndelivered`, rather than a string-valued `Other`. The existing
+bounded retry paths still handle it as an engine failure, without inventing an
+account recovery classification or treating the walk as complete. Other error
+variants retain their existing shapes.
+
+Push lane retry and reconcile delays explicitly use `recovery::HINTLESS_RETRY_WAIT`
+when advice carries no hint. The lane takes the maximum of this delay and its
+consecutive-failure reconnect backoff, rather than sleeping twice. Users expect
+a disconnected transport to retry with pacing even without a provider hint.
+
+`ChangeDelivery::publish_unacked` returns `UnackedPublication`: `Refused` for
+checkpoint or publication evidence, `NoReceivers` for an empty broadcast, or
+`Published(count)` for broadcast acceptance. The count does not certify numbered
+receiver delivery. Refusal still logs and sends nothing. Warning, termination,
+push status and checkpoint-free barrier callers intentionally discard the
+outcome: these advisory events cannot carry acknowledgement evidence and never
+advance a cursor or complete a barrier walk based on broadcast acceptance.

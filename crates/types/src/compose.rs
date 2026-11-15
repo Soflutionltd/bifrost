@@ -235,9 +235,13 @@ pub struct SendRequest {
 }
 
 impl SendRequest {
-    /// Reject a send with no To, Cc or Bcc recipients before provider I/O.
-    pub fn validate_recipients(&self) -> Result<(), crate::AccountError> {
-        validate_send_recipients(&self.to, &self.cc, &self.bcc)
+    /// Reject a send with no To, Cc or Bcc recipients before provider I/O,
+    /// retaining the calling protocol on the local refusal.
+    pub fn validate_recipients(
+        &self,
+        protocol: crate::Protocol,
+    ) -> Result<(), crate::AccountError> {
+        validate_send_recipients(&self.to, &self.cc, &self.bcc, protocol)
     }
 }
 
@@ -247,6 +251,7 @@ pub fn validate_send_recipients(
     to: &[Address],
     cc: &[Address],
     bcc: &[Address],
+    protocol: crate::Protocol,
 ) -> Result<(), crate::AccountError> {
     use crate::error::{
         AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, DiagnosticText,
@@ -262,6 +267,7 @@ pub fn validate_send_recipients(
             }),
         )
         .operation(AccountOperation::Send)
+        .protocol(protocol)
         .try_build()
         .expect("valid account error classification"));
     }
@@ -618,12 +624,13 @@ mod recipient_validation_tests {
     #[test]
     fn empty_send_is_malformed_but_each_recipient_lane_is_sufficient() {
         let error = SendRequest::default()
-            .validate_recipients()
+            .validate_recipients(crate::Protocol::Jmap)
             .expect_err("empty send");
         assert_eq!(
             *error.kind(),
             crate::AccountErrorKind::Request(crate::RequestErrorKind::Malformed)
         );
+        assert_eq!(error.protocol(), Some(crate::Protocol::Jmap));
         for lane in 0..3 {
             let mut request = SendRequest::default();
             let recipients = match lane {
@@ -632,7 +639,9 @@ mod recipient_validation_tests {
                 _ => &mut request.bcc,
             };
             recipients.push(Address::bare("recipient@example.test"));
-            request.validate_recipients().expect("recipient present");
+            request
+                .validate_recipients(crate::Protocol::Jmap)
+                .expect("recipient present");
         }
     }
 }

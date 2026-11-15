@@ -88,7 +88,7 @@ fn harness() -> Harness {
 
 /// `Stop` published while the drive is parked on the provider ends it.
 ///
-/// This is the detach case: `detach_inner` publishes `Stop` on the boundary
+/// This is the detach case: `DetachingAccount::begin` publishes `Stop` on the boundary
 /// before it cancels the slot, so the boundary is the signal that is reliably
 /// set by the time it matters.
 #[tokio::test]

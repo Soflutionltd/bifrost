@@ -251,6 +251,13 @@ fn open_blob_inner_stream(
                 return;
             }
         };
+        // Handle metadata is advisory and caller-constructible. Only the
+        // provider locator's file kind has a REST byte-range representation.
+        if range.is_some() && locator.kind != GraphBlobKind::File {
+            yield SyncEvent::Terminated(unsupported_range_error());
+            yield SyncEvent::Done(None);
+            return;
+        }
         if locator.kind == GraphBlobKind::Reference || locator.kind == GraphBlobKind::EwsItem {
             yield SyncEvent::Warning(warning_blob_not_byte_stream(&ObjectId(locator.message_id)));
             yield SyncEvent::Done(None);
@@ -258,14 +265,9 @@ fn open_blob_inner_stream(
         }
         // A public-folder attachment is an EWS SOAP read, not a Graph REST
         // `$value` byte stream: Graph cannot address an EWS AttachmentId at
-        // all. Ranged reads are refused below (the handle never advertises
-        // range support), so only the whole-attachment path reaches here.
+        // all. Ranged reads are refused above from the locator kind, so only
+        // the whole-attachment path reaches here.
         if locator.kind == GraphBlobKind::Ews {
-            if range.is_some() {
-                yield SyncEvent::Terminated(unsupported_range_error());
-                yield SyncEvent::Done(None);
-                return;
-            }
             let mut stream = open_ews_blob_stream(account, locator);
             while let Some(event) = stream.next().await {
                 yield event;
@@ -277,11 +279,6 @@ fn open_blob_inner_stream(
         } else {
             AccountOperation::OpenBlob
         };
-        if range.is_some() && !handle.capabilities.supports_range {
-            yield SyncEvent::Terminated(unsupported_range_error());
-            yield SyncEvent::Done(None);
-            return;
-        }
 
         let mut stream = match fetch_blob_stream(&account, &locator, range).await {
             Ok(stream) => stream,
@@ -673,7 +670,9 @@ mod tests {
         }]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         let message = ObjectId("AAMkmsg".to_string());
-        let handle = file_handle(&message, "att1");
+        let mut handle = file_handle(&message, "att1");
+        // A stale caller hint cannot disable a file locator's range support.
+        handle.capabilities.supports_range = false;
         let range = ByteRange {
             start: 2,
             length: Some(5),
@@ -703,6 +702,39 @@ mod tests {
             requests[0].url
         );
         assert_eq!(requests[0].range, Some(range));
+    }
+
+    #[tokio::test]
+    async fn forged_range_hints_cannot_enable_non_file_locators() {
+        for kind in [
+            GraphBlobKind::Item,
+            GraphBlobKind::Reference,
+            GraphBlobKind::Ews,
+            GraphBlobKind::EwsItem,
+            GraphBlobKind::Unknown,
+        ] {
+            let client = GraphClient::new("token");
+            let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+            let mut handle = file_handle(&ObjectId("message".into()), "attachment");
+            let mut locator = decode_locator(&handle).unwrap();
+            locator.kind = kind;
+            handle.id = BlobId(serde_json::to_string(&locator).unwrap());
+            handle.capabilities.supports_range = true;
+            let events = drain(open_blob_range_stream(
+                account,
+                handle,
+                ByteRange {
+                    start: 0,
+                    length: Some(1),
+                },
+            ))
+            .await;
+            assert!(matches!(events.first(), Some(SyncEvent::Terminated(error))
+                if error.operation() == Some(AccountOperation::OpenBlobRange)
+                    && matches!(error.kind(), AccountErrorKind::Unsupported(AccountOperation::OpenBlobRange))));
+            assert!(matches!(events.last(), Some(SyncEvent::Done(None))));
+            assert!(client.take_download_requests().is_empty());
+        }
     }
 
     /// Graph answers `405 Method Not Allowed` for an attachment that has no

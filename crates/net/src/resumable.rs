@@ -38,6 +38,16 @@ impl ChunkWindow {
         self.end == self.total
     }
 
+    /// A completion response cannot acknowledge bytes never submitted.
+    /// Enterprise users expect a successful upload to contain the entire file.
+    pub fn admit_completion(&self) -> Result<(), UploadRefusal> {
+        if self.is_final() {
+            Ok(())
+        } else {
+            Err(UploadRefusal::IncompleteCompletion)
+        }
+    }
+
     /// Decode at the provider boundary, then admit the authoritative offset.
     /// Never guess the sent window's end: that would silently skip file bytes.
     pub fn resume_with<E>(
@@ -132,6 +142,10 @@ mod tests {
         let first = driver.next_window(0).expect("first attempt");
         assert_eq!(first.content_range(), "bytes 0-5/10");
         assert!(!first.is_final());
+        assert_eq!(
+            first.admit_completion(),
+            Err(UploadRefusal::IncompleteCompletion)
+        );
         let offset = first
             .resume_with(
                 || Ok::<_, UploadRefusal>(4),
@@ -142,6 +156,7 @@ mod tests {
         let second = driver.next_window(offset).expect("second attempt");
         assert_eq!(second.content_range(), "bytes 4-9/10");
         assert!(second.is_final());
+        assert_eq!(second.admit_completion(), Ok(()));
         assert!(matches!(
             driver.next_window(5),
             Err(UploadRefusal::AttemptBudget)

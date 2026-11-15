@@ -27,6 +27,11 @@ impl SyncEngine {
     // the engine exposes this read-only passthrough cluster as the
     // consumer's single door to hydration.
     //
+    // This is the consumer's direct door, not background sync work. Pausing
+    // synchronization must still let an enterprise user open a message or send
+    // a composed reply. Keep engine pause, admission and holds out of this path;
+    // the caller owns retries and the provider transport still enforces limits.
+    //
     // Two deliberate properties:
     //
     // - Every method resolves the handle through `live_account`, i.e.

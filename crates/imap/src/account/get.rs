@@ -14,7 +14,7 @@ use futures::StreamExt;
 use crate::types::FetchAttr;
 use crate::types::{FetchResponse, MailboxName};
 
-use super::hydration::{BodySelection, FetchSelection, decode_body};
+use super::hydration::{BodySelection, FetchSelection, decode_selected_body};
 use super::inventory::{fetch_to_inventory, flags_set};
 #[cfg(test)]
 use super::pim::PREVIEW_FETCH_BYTES;
@@ -409,7 +409,10 @@ fn attrs_for_projection(projection: Projection, include_modseq: bool) -> Vec<Fet
 enum HydrationKind {
     Flags,
     Metadata,
-    Mime,
+    // The section the projection asked for. A header or preview projection
+    // gets back a differently keyed section than a whole-message one, so the
+    // decoder must be told which to take or it finds nothing.
+    Mime(BodySelection),
 }
 
 fn projection_plan(
@@ -445,7 +448,7 @@ fn projection_plan(
                 modseq: false,
                 body: BodySelection::Headers,
             },
-            HydrationKind::Mime,
+            HydrationKind::Mime(BodySelection::Headers),
         ),
         Projection::Preview(count) => (
             FetchSelection {
@@ -455,7 +458,7 @@ fn projection_plan(
                 modseq: false,
                 body: BodySelection::Preview(count),
             },
-            HydrationKind::Mime,
+            HydrationKind::Mime(BodySelection::Preview(count)),
         ),
         Projection::TextOnly => (
             FetchSelection {
@@ -465,7 +468,7 @@ fn projection_plan(
                 modseq: false,
                 body: BodySelection::Whole,
             },
-            HydrationKind::Mime,
+            HydrationKind::Mime(BodySelection::Whole),
         ),
         Projection::Full | Projection::FullWithBlobs => (
             FetchSelection {
@@ -475,7 +478,7 @@ fn projection_plan(
                 modseq: false,
                 body: BodySelection::Whole,
             },
-            HydrationKind::Mime,
+            HydrationKind::Mime(BodySelection::Whole),
         ),
         // Future projections require an explicit wire selection and converter;
         // asking only for FLAGS must never fabricate a successful empty body.
@@ -527,8 +530,8 @@ fn hydrate_planned(
             fetch,
             shared_owner,
         )?),
-        HydrationKind::Mime => {
-            let body = decode_body(&mut fetch).ok_or_else(|| {
+        HydrationKind::Mime(selection) => {
+            let body = decode_selected_body(&mut fetch, selection).ok_or_else(|| {
                 crate::Error::ProtocolMissing("FETCH response lacked the requested body".into())
             })?;
             HydratedObjectKind::RawMime(body)
@@ -642,13 +645,13 @@ pub(super) fn merge_fetch_response(existing: &mut FetchResponse, later: FetchRes
         if existing
             .body_sections
             .iter()
-            .any(|held| held.section.eq_ignore_ascii_case(&section.section) && held.data.is_some())
+            .any(|held| held.same_fetch_key(&section) && held.data.is_some())
         {
             continue;
         }
         existing
             .body_sections
-            .retain(|held| !held.section.eq_ignore_ascii_case(&section.section));
+            .retain(|held| !held.same_fetch_key(&section));
         existing.body_sections.push(section);
     }
     for (section, size) in later.binary_sizes {
@@ -662,13 +665,14 @@ pub(super) fn merge_fetch_response(existing: &mut FetchResponse, later: FetchRes
         existing.binary_sizes.push((section, size));
     }
     for section in later.binary_sections {
-        if existing
-            .binary_sections
-            .iter()
-            .any(|held| held.section == section.section)
-        {
+        if existing.binary_sections.iter().any(|held| {
+            held.section == section.section && held.origin == section.origin && held.data.is_some()
+        }) {
             continue;
         }
+        existing
+            .binary_sections
+            .retain(|held| held.section != section.section || held.origin != section.origin);
         existing.binary_sections.push(section);
     }
 }
@@ -841,7 +845,13 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            hydrate_planned(&folder(), 9, fetch, HydrationKind::Mime, None),
+            hydrate_planned(
+                &folder(),
+                9,
+                fetch,
+                HydrationKind::Mime(BodySelection::Whole),
+                None
+            ),
             Err(crate::Error::ProtocolMissing(_))
         ));
     }
@@ -1024,6 +1034,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn body_merge_retains_origins_and_only_replaces_matching_nil() {
+        let mut first = body_section("TEXT", b"first");
+        first.origin = Some(0);
+        let mut second = body_section("text", b"second");
+        second.origin = Some(5);
+        let mut missing = second.clone();
+        missing.data = None;
+        let mut fetch = FetchResponse {
+            body_sections: vec![first.clone(), missing],
+            ..Default::default()
+        };
+        merge_fetch_response(
+            &mut fetch,
+            FetchResponse {
+                body_sections: vec![second.clone(), body_section("TEXT", b"whole")],
+                ..Default::default()
+            },
+        );
+        assert_eq!(fetch.body_sections.len(), 3);
+        assert_eq!(fetch.body_sections[0], first);
+        assert_eq!(fetch.body_sections[1], second);
+        assert_eq!(fetch.body_sections[2].origin, None);
+    }
+
+    #[test]
+    fn binary_merge_retains_origins_and_replaces_matching_nil() {
+        use crate::types::fetch::BinarySection;
+        let first = BinarySection {
+            section: vec![1],
+            origin: Some(0),
+            data: Some(bytes::Bytes::from_static(b"a")),
+        };
+        let second = BinarySection {
+            section: vec![1],
+            origin: Some(1),
+            data: Some(bytes::Bytes::from_static(b"b")),
+        };
+        let mut missing = second.clone();
+        missing.data = None;
+        let mut fetch = FetchResponse {
+            binary_sections: vec![first.clone(), missing],
+            ..Default::default()
+        };
+        merge_fetch_response(
+            &mut fetch,
+            FetchResponse {
+                binary_sections: vec![second.clone()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(fetch.binary_sections, vec![first, second]);
+    }
+
     // A server is free to append an unsolicited FLAGS-only FETCH for a UID
     // it has already answered fully. Folding it in must not blank the body
     // that the solicited response carried.
@@ -1122,8 +1186,10 @@ mod tests {
             2,
             "the section the first response lacked is adopted",
         );
-        let object = fetch_to_hydrated(&folder(), 9, first, Projection::Preview(16), None)
-            .expect("uid present");
+        // These sections carry no partial origin, so they answer a whole-message
+        // request; a preview projection now takes only the origin-0 section.
+        let object =
+            fetch_to_hydrated(&folder(), 9, first, Projection::Full, None).expect("uid present");
         match object.kind {
             HydratedObjectKind::RawMime(bytes) => {
                 assert_eq!(bytes.as_ref(), &b"Subject: hi\r\n\r\npreview body"[..]);

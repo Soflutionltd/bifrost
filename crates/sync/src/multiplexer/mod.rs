@@ -305,16 +305,35 @@ impl PagePublisher {
         &self.coverage
     }
 
+    /// The one refusal for a backfill lane whose gate numbers publications
+    /// against a different ledger than this publisher. Every backfill entry
+    /// point checks here, logs once, and refuses rather than panicking, so a
+    /// user sees a stalled walk instead of a crashed sync engine.
+    #[must_use]
+    pub(crate) fn shares_lane_ledger(&self, lane: &crate::engine::lane::LaneGate) -> bool {
+        let same = Arc::ptr_eq(&self.coverage, lane.coverage());
+        if !same {
+            tracing::error!("refusing backfill lane bound to a different coverage ledger");
+        }
+        same
+    }
+
     pub(crate) fn publish_marker(
         &self,
         mut event: MultiplexerEvent,
         watermark: crate::cursor::UndeliveredMark,
         fence: crate::cursor::ScopeFence,
     ) -> bool {
-        let checkpoint = event.checkpoint.clone().expect("marker checkpoint");
+        let checkpoint = match event.checkpoint.clone() {
+            Some(checkpoint @ bifrost_types::Checkpoint::Backfill(_)) => checkpoint,
+            _ => {
+                tracing::error!("refusing invalid backfill marker");
+                return false;
+            }
+        };
         let scope = match &checkpoint {
             bifrost_types::Checkpoint::Backfill(cursor) => cursor.scope.clone(),
-            _ => unreachable!("backfill marker checkpoint"),
+            _ => return false,
         };
         let Ok(id) = self
             .control
@@ -342,12 +361,18 @@ impl PagePublisher {
         claim: crate::cursor::CoverageClaim,
         fence: crate::cursor::ScopeFence,
     ) -> Result<bool, crate::cursor::CoverageClaim> {
-        let checkpoint = event.checkpoint.clone().expect("page checkpoint");
+        let Some(checkpoint) = event.checkpoint.clone() else {
+            tracing::error!("refusing page without checkpoint");
+            return Err(claim);
+        };
         let backfill = matches!(checkpoint, bifrost_types::Checkpoint::Backfill(_));
         let scope = match &checkpoint {
             bifrost_types::Checkpoint::Backfill(cursor) => cursor.scope.clone(),
             bifrost_types::Checkpoint::Change(cursor) => cursor.scope.clone(),
-            _ => unreachable!("unsupported checkpoint"),
+            _ => {
+                tracing::error!("refusing unsupported page checkpoint");
+                return Err(claim);
+            }
         };
         let id = self
             .control
@@ -410,6 +435,20 @@ impl SubscriberState {
     }
 }
 
+/// Outcome of a publication that carries no acknowledgement obligation.
+/// Receiver counts are broadcast counts, not proof of numbered delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[must_use]
+pub enum UnackedPublication {
+    /// The broadcast accepted the event for this many receivers.
+    Published(usize),
+    /// No broadcast receiver was present.
+    NoReceivers,
+    /// The event carried checkpoint or publication evidence and was not sent.
+    Refused,
+}
+
 impl ChangeDelivery {
     #[must_use]
     pub fn new(tx: broadcast::Sender<MultiplexerEvent>) -> Self {
@@ -427,22 +466,29 @@ impl ChangeDelivery {
 
     /// Publish data or status that carries no acknowledgement obligation.
     /// A producer cannot bypass registration by smuggling a checkpoint here.
-    pub fn publish_unacked(&self, event: MultiplexerEvent) {
+    /// Returns refusal, absence of receivers, or broadcast acceptance. Acceptance
+    /// does not certify numbered delivery and cannot justify cursor advancement.
+    pub fn publish_unacked(&self, event: MultiplexerEvent) -> UnackedPublication {
         let payload_unacked = match event.event.as_ref() {
             SyncEvent::Batch(batch) => batch.checkpoint.is_none(),
             SyncEvent::Done(checkpoint) => checkpoint.is_none(),
             _ => true,
         };
-        assert!(
-            event.checkpoint.is_none() && event.publication.is_none() && payload_unacked,
-            "unacknowledged events cannot carry a checkpoint or publication"
-        );
-        let _ = self.tx.send(event);
+        if event.checkpoint.is_some() || event.publication.is_some() || !payload_unacked {
+            tracing::error!("refusing unregistered checkpoint publication");
+            return UnackedPublication::Refused;
+        }
+        match self.tx.send(event) {
+            Ok(receivers) => UnackedPublication::Published(receivers),
+            Err(_) => UnackedPublication::NoReceivers,
+        }
     }
 
     /// Announce a warning without an acknowledgement obligation.
     pub fn publish_warning(&self, scope: EventScope, warning: bifrost_types::Warning) {
-        self.publish_unacked(MultiplexerEvent::unacked(
+        // This constructor cannot carry checkpoint evidence. Status delivery is
+        // advisory and does not advance a cursor when no receiver is present.
+        let _ = self.publish_unacked(MultiplexerEvent::unacked(
             scope,
             Arc::new(SyncEvent::Warning(warning)),
         ));
@@ -450,7 +496,9 @@ impl ChangeDelivery {
 
     /// Announce termination without an acknowledgement obligation.
     pub fn publish_terminated(&self, scope: EventScope, error: bifrost_types::AccountError) {
-        self.publish_unacked(MultiplexerEvent::unacked(
+        // This constructor cannot carry checkpoint evidence. Status delivery is
+        // advisory and does not advance a cursor when no receiver is present.
+        let _ = self.publish_unacked(MultiplexerEvent::unacked(
             scope,
             Arc::new(SyncEvent::Terminated(error)),
         ));
@@ -560,7 +608,10 @@ impl ChangeDelivery {
     /// is what lets it.
     ///
     /// The first subscription binds the coverage ledger; all later ones must
-    /// use the same Arc. Numbered receivers always participate in that ledger.
+    /// use the same Arc. A mismatch is refused with an immediately closed,
+    /// unnumbered receiver, leaving the existing ledger and subscribers intact.
+    /// A ledger already bound to another delivery gate is refused the same way.
+    /// Numbered receivers always participate in the bound ledger.
     pub fn subscribe(
         self: &Arc<Self>,
         control: Option<crate::control::SyncControl>,
@@ -569,14 +620,30 @@ impl ChangeDelivery {
         let mut state = self.guard();
         // One delivery gate cannot number receivers against different ledgers.
         // Binding under the send/depart lock preserves the existing lock order.
-        if let Some(bound) = &state.coverage {
-            assert!(
-                Arc::ptr_eq(bound, &coverage),
-                "delivery coverage ledger changed"
-            );
+        let refusal = if let Some(bound) = &state.coverage {
+            (!Arc::ptr_eq(bound, &coverage))
+                .then_some("refusing change subscription with a different coverage ledger")
+        } else if !coverage.bind_delivery(self) {
+            Some(
+                "refusing change subscription with a coverage ledger bound to another delivery gate",
+            )
         } else {
-            coverage.bind_delivery(self);
             state.coverage = Some(Arc::clone(&coverage));
+            None
+        };
+        if let Some(reason) = refusal {
+            // A substitute ledger or gate would route lag and departure accounting
+            // away from the publications actually delivered. Users expect
+            // a refused stream, never acknowledgements against another account.
+            tracing::error!("{reason}");
+            let (tx, inner) = broadcast::channel(1);
+            drop(tx);
+            return ChangesReceiver {
+                inner: Some(inner),
+                control: None,
+                subscription: None,
+                coverage: None,
+            };
         }
         // Subscribe INSIDE the lock: a receiver created here is numbered against
         // exactly the set of batches already sent, with no window in which a
@@ -3125,13 +3192,19 @@ mod tests {
         );
     }
 
-    #[test]
-    #[should_panic(expected = "delivery coverage ledger changed")]
-    fn numbered_subscribers_cannot_split_between_coverage_ledgers() {
+    #[tokio::test]
+    async fn numbered_subscribers_cannot_split_between_coverage_ledgers() {
         let h = delivery_harness(4);
         let _first = h.subscribe();
         let other = Arc::new(crate::cursor::PendingCoverage::new());
-        let _second = h.delivery.subscribe(None, other);
+        let mut second = h.delivery.subscribe(None, other);
+        assert!(matches!(
+            second.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        assert!(second.subscription.is_none());
+        assert!(second.coverage.is_none());
+        assert!(h.delivery.has_numbered_subscriber());
     }
 
     impl Delivery {
@@ -3490,7 +3563,7 @@ mod tests {
 
         // Overflow the one-slot ring under both receivers.
         for text in ["overwritten", "retained"] {
-            h.delivery.publish_unacked(warning_event(text));
+            let _ = h.delivery.publish_unacked(warning_event(text));
         }
 
         let lag = observer.try_recv().expect("lag becomes an event");

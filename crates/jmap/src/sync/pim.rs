@@ -293,7 +293,7 @@ impl SetProgress {
                     error: failure.error,
                 });
             }
-            // `classify_set_response` / `classify_set_item` never produce
+            // The mail-set classifier `mail_set::classify_set_response` never produces
             // this lane today. Should they start to, the honest record is
             // an uncertain application, never a panic in a user's write.
             bifrost_types::ItemOutcome::Uncertain(uncertain) => {
@@ -667,7 +667,7 @@ pub(crate) fn send_message<T: HttpTransport>(
                 native.to_owned()
             }
         };
-        request.validate_recipients()?;
+        request.validate_recipients(bifrost_types::Protocol::Jmap)?;
         let personal_identity = request.identity.clone();
         let identity = if let Some(foreign) = foreign.as_ref() {
             let selected = foreign_sending_identity(&mail, request.identity.as_ref()).await?;

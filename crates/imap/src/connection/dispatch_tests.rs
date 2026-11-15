@@ -592,13 +592,19 @@ fn enable_consumer_captures_extensions() {
         &ctx,
     );
 
+    consumer.on_response(
+        UntaggedResponse::Enabled(vec!["UTF8=ACCEPT".into()]),
+        notify,
+        &ctx,
+    );
+
     let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
 
     assert_eq!(
         result
             .output
             .expect("tagged OK must yield the ENABLED list"),
-        vec!["CONDSTORE", "QRESYNC"]
+        vec!["CONDSTORE", "QRESYNC", "UTF8=ACCEPT"]
     );
 
     // The solicited `* ENABLED` must NOT leak into reclassified_as_events.

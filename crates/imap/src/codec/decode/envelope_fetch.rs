@@ -350,7 +350,20 @@ fn gmail_label(input: &[u8], utf8_mode: crate::codec::utf7::WireMode) -> IResult
 /// is accepted rather than dropping the connection over a shape that carries
 /// the same value.
 fn gmail_id(input: &[u8]) -> IResult<&[u8], u64> {
-    alt((number64, delimited(char('"'), number64, char('"')))).parse(input)
+    fn unsigned(input: &[u8]) -> IResult<&[u8], u64> {
+        let (rest, digits) = digit1(input)?;
+        let value = std::str::from_utf8(digits)
+            .ok()
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .ok_or_else(|| {
+                nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+        Ok((rest, value))
+    }
+    alt((unsigned, delimited(char('"'), unsigned, char('"')))).parse(input)
 }
 
 /// Separator before a FETCH attribute value.
@@ -1055,5 +1068,22 @@ mod label_encoding_tests {
         for utf8 in [false, true] {
             assert_eq!(gmail_label(b"\\Inbox", utf8.into()).unwrap().1, "\\Inbox");
         }
+    }
+}
+
+#[cfg(test)]
+mod gmail_id_tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_ids_retain_the_full_range() {
+        for input in [
+            b"18446744073709551615".as_slice(),
+            b"\"18446744073709551615\"",
+        ] {
+            assert_eq!(gmail_id(input), Ok((b"".as_slice(), u64::MAX)));
+        }
+        assert!(gmail_id(b"18446744073709551616").is_err());
+        assert!(gmail_id(b"\"18446744073709551616\"").is_err());
     }
 }

@@ -224,7 +224,7 @@ impl BackfillAdmission {
 /// The producer's door onto the bound: the account's publication ledger (which
 /// IS the capacity ledger), the token a park must be able to end through, and
 /// the account's scheduler admission.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LaneGate {
     coverage: Arc<PendingCoverage>,
     capacity: usize,
@@ -234,6 +234,24 @@ pub struct LaneGate {
     /// the rate limit is about the ACCOUNT's log and a gate is cloned per
     /// partition pass.
     park_warned_at: Arc<Mutex<Option<tokio::time::Instant>>>,
+}
+
+// Capacity and warning state belong to the account; admission belongs to one
+// pass. Sharing the permit slot lets a cloned pass release another pass's budget.
+impl Clone for LaneGate {
+    fn clone(&self) -> Self {
+        Self {
+            coverage: Arc::clone(&self.coverage),
+            capacity: self.capacity,
+            shutdown: self.shutdown.clone(),
+            admission: Arc::new(BackfillAdmission::new(
+                self.admission.scheduler.clone(),
+                self.admission.account_id.clone(),
+                self.admission.control.clone(),
+            )),
+            park_warned_at: Arc::clone(&self.park_warned_at),
+        }
+    }
 }
 
 /// A cancelled partition future must release the gate's stored budget too.
@@ -1103,6 +1121,20 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cloned_passes_have_independent_admission_slots() {
+        // Three per-account permits leave two in the sync pool once the
+        // mutation share is carved out; two simultaneous admissions need both.
+        let h = harness_with_budget(1, 3, 3);
+        let other = h.gate.clone();
+        h.gate.admit().await.expect("first admission");
+        other.admit().await.expect("second admission");
+        other.release_admission();
+        assert!(h.gate.admission().is_held());
+        assert!(!other.admission().is_held());
+        h.gate.release_admission();
+    }
+
     /// FINDING 3 of the previous round, kept: a producer parked mid-partition
     /// must give the budget back, or the live lane starves on a minimal budget.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1110,13 +1142,15 @@ mod tests {
         let h = harness_with_budget(1, 2, 2);
         h.publish(&page(&scope_a(), "page:0:10", 1), 1);
 
-        h.gate.admit().await.expect("admission");
-        assert!(h.gate.admission().is_held());
-        let gate = h.gate.clone();
-        let parked = tokio::spawn(async move { gate.wait_for_capacity_holding_admission().await });
+        let gate = Arc::new(h.gate.clone());
+        gate.admit().await.expect("admission");
+        assert!(gate.admission().is_held());
+        let parked_gate = Arc::clone(&gate);
+        let parked =
+            tokio::spawn(async move { parked_gate.wait_for_capacity_holding_admission().await });
 
         let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while h.gate.admission().is_held() {
+            while gate.admission().is_held() {
                 tokio::task::yield_now().await;
             }
         })

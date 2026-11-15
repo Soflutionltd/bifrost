@@ -725,6 +725,28 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
             session.validate_list_extended_request(&patterns, selection_options, return_options)?;
         }
         Command::NotifySet(params) => {
+            // Notification payloads need the same extensions as explicit FETCH.
+            // Users expect unsupported requests to fail before registration.
+            for group in &params.event_groups {
+                for event in group.events() {
+                    if let crate::types::notify::NotifyEvent::MessageNew { fetch_attrs } = event {
+                        for attr in fetch_attrs {
+                            match attr {
+                                crate::types::notify::NotifyFetchAttribute::Attribute(attr) => {
+                                    session.validate_fetch_items(
+                                        &crate::types::fetch::FetchItems::Attributes(vec![
+                                            attr.clone(),
+                                        ]),
+                                    )?;
+                                }
+                                crate::types::notify::NotifyFetchAttribute::Raw(text) => {
+                                    session.validate_fetch_wire(text)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if params.event_groups.iter().any(|group| {
                 matches!(
                     group.filter(),
@@ -1065,5 +1087,41 @@ mod tests {
             crate::codec::encode::WireCommand::coalesce_unsegmented(&[writer.finish().unwrap()])
                 .is_none()
         );
+    }
+    #[test]
+    fn notify_fetch_payloads_share_fetch_admission() {
+        use crate::types::notify::NotifyFetchAttribute;
+        use crate::types::{
+            FetchAttr, MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams,
+        };
+
+        for attr in [
+            NotifyFetchAttribute::Attribute(FetchAttr::ModSeq),
+            NotifyFetchAttribute::Raw("MODSEQ".into()),
+        ] {
+            let cmd = Command::NotifySet(NotifySetParams::new(
+                vec![NotifyEventGroup::new(
+                    MailboxFilter::Selected,
+                    vec![
+                        NotifyEvent::MessageNew {
+                            fetch_attrs: vec![attr],
+                        },
+                        NotifyEvent::MessageExpunge,
+                    ],
+                )],
+                false,
+            ));
+            assert!(matches!(
+                check(&cmd, &snapshot(vec![Capability::Notify], &[])),
+                Err(Error::MissingCapability(_))
+            ));
+            assert!(
+                check(
+                    &cmd,
+                    &snapshot(vec![Capability::Notify, Capability::Condstore], &[])
+                )
+                .is_ok()
+            );
+        }
     }
 }

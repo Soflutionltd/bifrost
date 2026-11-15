@@ -46,6 +46,9 @@ pub enum FusionOutcome {
     /// Inventory completed without yielding a cursor; the engine emits
     /// a Warning.
     NoCursor,
+    /// A page reached no numbered receiver. No terminal cursor was installed;
+    /// the owner must arrange another establishment, not treat this as Done.
+    Undelivered,
     /// Inventory terminated with an account error. Carries the full
     /// `AccountError` so the caller dispatches through
     /// `error.recovery()`.
@@ -56,6 +59,8 @@ pub enum FusionOutcome {
 enum Forwarded {
     /// Sent on the delivery (with its publication, if it carried a checkpoint).
     Published,
+    /// Nobody capable of acknowledging received this page. Retry the walk.
+    Undelivered,
     /// Registration refused after a reset; the writer must retain this debt.
     Refused(crate::cursor::CoverageClaim),
 }
@@ -242,7 +247,7 @@ impl InventoryFusion {
                             checkpoint: Some(cp),
                             publication: None,
                         };
-                        if let Err(claim) = self.publisher.publish_page(
+                        match self.publisher.publish_page(
                             me,
                             crate::cursor::CoverageClaim::new(
                                 completion.coverage.clone(),
@@ -250,7 +255,11 @@ impl InventoryFusion {
                             ),
                             self.expected_fence,
                         ) {
-                            return self.refused(&scope, delivery, claim).await;
+                            Ok(true) => {}
+                            // Retiring a publication does not authorize installing its
+                            // cursor. A user must see this page before sync skips it.
+                            Ok(false) => return Ok(FusionOutcome::Undelivered),
+                            Err(claim) => return self.refused(&scope, delivery, claim).await,
                         }
                     }
                     let outcome = self.finalize(scope.clone(), checkpoint).await?;
@@ -306,6 +315,7 @@ impl InventoryFusion {
                             .await?;
                         match self.forward_inventory_batch(delivery, &scope, &batch, None) {
                             Ok(Forwarded::Published) => {}
+                            Ok(Forwarded::Undelivered) => return Ok(FusionOutcome::Undelivered),
                             Ok(Forwarded::Refused(claim)) => {
                                 return self.refused(&scope, delivery, claim).await;
                             }
@@ -319,6 +329,7 @@ impl InventoryFusion {
                     walk.accept(checkpoint.clone());
                     match self.forward_inventory_batch(delivery, &scope, &batch, checkpoint) {
                         Ok(Forwarded::Published) => {}
+                        Ok(Forwarded::Undelivered) => return Ok(FusionOutcome::Undelivered),
                         Ok(Forwarded::Refused(claim)) => {
                             return self.refused(&scope, delivery, claim).await;
                         }
@@ -516,15 +527,19 @@ impl InventoryFusion {
             publication: None,
         };
         if checkpoint.is_some() {
-            if let Err(claim) = self.publisher.publish_page(
+            match self.publisher.publish_page(
                 me,
                 crate::cursor::CoverageClaim::new(batch.coverage.clone(), self.generation),
                 self.expected_fence,
             ) {
-                return Ok(Forwarded::Refused(claim));
+                Ok(true) => {}
+                Ok(false) => return Ok(Forwarded::Undelivered),
+                Err(claim) => return Ok(Forwarded::Refused(claim)),
             }
-        } else {
-            tx.publish_unacked(me);
+        } else if !tx.publish_acknowledgeable(me) {
+            // Even a checkpoint-free page belongs to the prefix certified by
+            // Done. Stop now so a later cursor cannot skip its lost objects.
+            return Ok(Forwarded::Undelivered);
         }
         Ok(Forwarded::Published)
     }
@@ -671,6 +686,44 @@ mod tests {
             (view, p, b),
         )
     }
+    #[tokio::test]
+    async fn undelivered_done_does_not_install_a_cursor() {
+        let (fusion, _delivery, _observer, _views) = guarded_fusion();
+        let stream = Box::pin(futures::stream::iter(vec![clean_done()]));
+        let outcome = fusion
+            .run_stream(CursorScope::Account, stream)
+            .await
+            .expect("walk");
+        assert!(matches!(outcome, FusionOutcome::Undelivered));
+        assert!(fusion.cursors.snapshot(&CursorScope::Account).is_none());
+        assert_eq!(fusion.publisher.coverage.pending_checkpoints(), 0);
+    }
+
+    #[tokio::test]
+    async fn undelivered_prefix_stops_before_reading_done() {
+        for checkpoint in [false, true] {
+            let (fusion, _delivery, mut observer, _views) = guarded_fusion();
+            let stream = Box::pin(futures::stream::iter(vec![
+                page(checkpoint, false),
+                clean_done(),
+            ]));
+            let outcome = fusion
+                .run_stream(CursorScope::Account, stream)
+                .await
+                .expect("walk");
+            assert!(matches!(outcome, FusionOutcome::Undelivered));
+            assert!(fusion.cursors.snapshot(&CursorScope::Account).is_none());
+            // An observer alone is not a consumer that can acknowledge. Done
+            // must not even be read after the lost prefix, with or without a
+            // page checkpoint.
+            assert!(matches!(
+                observer.try_recv().expect("page").event.as_ref(),
+                SyncEvent::Batch(_)
+            ));
+            assert!(observer.try_recv().is_err());
+        }
+    }
+
     fn clean_done() -> bifrost_types::InventoryEvent {
         bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(
             bifrost_types::CoverageDomain::full(CursorScope::Account),
@@ -766,6 +819,10 @@ mod tests {
     #[tokio::test]
     async fn a_fusion_done_under_a_moved_fence_is_neither_published_nor_installed() {
         let (fusion, _delivery, mut rx, _views) = guarded_fusion();
+        let _numbered = fusion.publisher.delivery.subscribe(
+            Some(fusion.publisher.control.clone()),
+            Arc::clone(fusion.publisher.coverage()),
+        );
         let coverage = Arc::clone(&fusion.publisher.coverage);
         let stream = futures::stream::unfold(0, move |n| {
             let coverage = Arc::clone(&coverage);

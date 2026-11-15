@@ -252,9 +252,9 @@ async fn submit_batch_with_version(
 
     // A public-folder item is a raw EWS `ItemId` (or the destination is a
     // discovered public folder), and no Graph REST route can address it:
-    // `/me/messages/{itemId}` answers `ErrorItemNotFound`, which SetFlags and
-    // Move would report as `NotFound(Message)` and Destroy as `Skipped`,
-    // both false claims that the item is gone. This crate has no EWS write
+    // `/me/messages/{itemId}` answers `ErrorItemNotFound`, which mail
+    // writes would report as `Skipped`,
+    // a false claim that the item is gone. This crate has no EWS write
     // arm, so each such id is refused locally, per item, before the etag
     // cache or a caller version can authorize the wrong endpoint. Siblings
     // of the chunk still go to `$batch`.
@@ -567,7 +567,7 @@ fn reconcile_mutation_responses(
             item.status,
             headers,
             body,
-            if matches!(kind, MutationKind::Destroy) {
+            if skips_absent_write(operation_for_kind(kind), item.body.as_ref()) {
                 crate::account::batch::AbsentMeans::Success
             } else {
                 crate::account::batch::AbsentMeans::Failure
@@ -601,7 +601,8 @@ fn reconcile_mutation_responses(
 }
 
 /// Fetch etags for ids that require one but don't have a cached value.
-/// Returns per-item `ItemOutcome::Failed` for ids where the fetch fails.
+/// Returns per-item `ItemOutcome::Failed` for ids where the fetch fails, and
+/// `MutationSuccess::Skipped` for subjects the fetch proved absent.
 async fn refresh_missing_etags(
     account: &GraphAccount,
     ids: &[ObjectId],
@@ -649,6 +650,12 @@ async fn refresh_missing_etags(
                     )));
                 }
             }
+            Err(error) if skips_absent_message(&error, operation_for_kind(kind)) => {
+                failed.push(ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
+                    BatchItemId(id.0.clone()),
+                    MutationSuccess::Skipped,
+                )));
+            }
             Err(error) => {
                 failed.push(ItemOutcome::Failed(BatchFailure::new(
                     BatchItemId(id.0.clone()),
@@ -659,6 +666,43 @@ async fn refresh_missing_etags(
     }
 
     failed
+}
+
+/// Move URLs name both a source and destination. A bare 404 cannot prove
+/// which vanished; only Graph's item-not-found answer establishes subject
+/// absence. An Outlook user still needs an error for a missing destination.
+pub(crate) fn skips_absent_write(operation: AccountOperation, body: Option<&Value>) -> bool {
+    if !operation.skips_absent_target() {
+        return false;
+    }
+    if matches!(
+        operation,
+        AccountOperation::BulkMove
+            | AccountOperation::MoveThread
+            | AccountOperation::AddToContainer
+    ) {
+        return body
+            .and_then(|body| body.get("error"))
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str)
+            == Some("ErrorItemNotFound");
+    }
+    true
+}
+
+/// Apply subject absence policy to a by-message observation, never a folder
+/// lookup or an unsupported route. Outlook users expect vanished mail removed
+/// from view even when it disappears before the write's validator preflight.
+pub(crate) fn skips_absent_message(
+    error: &bifrost_types::AccountError,
+    operation: AccountOperation,
+) -> bool {
+    operation.skips_absent_target()
+        && matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message)
+        )
+        && matches!(error.scope(), Some(ErrorScope::Message { .. }))
 }
 
 fn requires_etag(kind: &MutationKind) -> bool {
@@ -727,10 +771,19 @@ pub(crate) async fn fetch_message_observation(
         client.api_path_prefix(),
         bifrost_net::url::encode_path_component(parsed.native_id()),
     );
-    let value = client
-        .get_json(Resource::Outlook, &path)
-        .await
-        .map_err(|error| into_account_error(error, context))?;
+    let value = match client.get_json(Resource::Outlook, &path).await {
+        Ok(value) => value,
+        Err(error) => {
+            if error.response_status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                account
+                    .etag_index
+                    .write()
+                    .await
+                    .observe(&id.0, super::EtagObservation::Invalidated);
+            }
+            return Err(into_account_error(error, context));
+        }
+    };
     if let Some(etag) = graph_etag(&value) {
         account.etag_index.write().await.insert(id.0.clone(), etag);
     }
@@ -1627,6 +1680,64 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcome_item(&outcomes[0]), "m0");
         assert!(matches!(outcomes[0], ItemOutcome::Succeeded(_)));
+    }
+
+    #[test]
+    fn vanished_flags_and_move_subjects_skip_but_missing_destinations_fail() {
+        for (kind, body, skipped) in [
+            (
+                MutationKind::SetFlags(FlagOp::Set(HashSet::new())),
+                None,
+                true,
+            ),
+            (
+                MutationKind::Move(MembershipScope::Mailbox(bifrost_types::MailboxId(
+                    "folder".into(),
+                ))),
+                Some(json!({"error": {"code": "ErrorItemNotFound"}})),
+                true,
+            ),
+            (
+                MutationKind::Move(MembershipScope::Mailbox(bifrost_types::MailboxId(
+                    "folder".into(),
+                ))),
+                Some(json!({"error": {"code": "ErrorFolderNotFound"}})),
+                false,
+            ),
+            (
+                MutationKind::Move(MembershipScope::Mailbox(bifrost_types::MailboxId(
+                    "folder".into(),
+                ))),
+                None,
+                false,
+            ),
+        ] {
+            let ids = [ObjectId("message".into())];
+            let mut outcomes = Vec::new();
+            reconcile_mutation_responses(
+                &ids,
+                vec![(
+                    0,
+                    crate::types::BatchResponseItem {
+                        id: "0".into(),
+                        status: 404,
+                        headers: None,
+                        body,
+                    },
+                )],
+                &kind,
+                &mut outcomes,
+                &|_| None,
+                &[false],
+            );
+            assert_eq!(outcomes.len(), 1);
+            if skipped {
+                assert!(matches!(&outcomes[0], ItemOutcome::Succeeded(success)
+                    if matches!(success.output, MutationSuccess::Skipped)));
+            } else {
+                assert!(matches!(&outcomes[0], ItemOutcome::Failed(_)));
+            }
+        }
     }
 
     #[tokio::test]
@@ -2633,7 +2744,9 @@ mod tests {
             GraphETag::from_odata_annotation("etag"),
         );
         account.client.script_rest([
-            crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NOT_FOUND),
+            // A 404 preflight now means the message vanished and is skipped, so
+            // the preflight failure kept here must be a different refusal.
+            crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::FORBIDDEN),
             crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::BAD_REQUEST),
         ]);
         let events = submit_batch(

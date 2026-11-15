@@ -13,7 +13,7 @@ fn encode_key(namespace: &str, components: &[&str]) -> String {
 macro_rules! registry_key {
     ($name:ident) => {
         /// Opaque registry identity. Use `namespaced` for provider-owned keys.
-        #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name(String);
 
         impl $name {
@@ -64,7 +64,7 @@ registry_key!(HoldKey);
 registry_key!(LimitKey);
 
 /// Rate bucket scope, independent of the host that owns the bucket.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum QuotaScope {
     /// Share the host-wide compatibility bucket.
@@ -96,13 +96,6 @@ impl From<String> for QuotaScope {
         } else {
             Self::Named(scope)
         }
-    }
-}
-
-impl std::ops::Deref for QuotaScope {
-    type Target = str;
-    fn deref(&self) -> &str {
-        self.as_str()
     }
 }
 

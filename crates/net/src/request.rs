@@ -430,9 +430,17 @@ struct RequestBuilderInner {
     /// The request URL is itself a credential: every error this request
     /// returns passes through [`Error::redact_request_text`].
     credential_url: bool,
+    // Session URL admission covers exactly one destination. Shared dispatch
+    // funnels may customize accounting, but cannot widen credential authority.
+    session_policy: bool,
 }
 
 impl RequestBuilder {
+    pub(crate) fn lock_session(mut self) -> Self {
+        self.inner.session_policy = true;
+        self
+    }
+
     /// Declare that the request URL is itself a credential (a
     /// pre-authenticated upload session URL). Every error `send` returns,
     /// and every error `send_streaming` returns or yields from its body,
@@ -463,9 +471,23 @@ impl RequestBuilder {
 
     /// Supply protocol admission, credential and header policy to the shared walk.
     /// A policy replaces automatic account bearer injection and caller Authorization.
+    ///
+    /// On a converted session builder, records a deferred [`Error::InvalidRequest`]
+    /// with field `hop_policy`; `send` / `send_streaming` refuse before dispatch.
     #[must_use]
     pub fn hop_policy(mut self, policy: Arc<dyn crate::HopPolicy>) -> Self {
-        self.inner.hop_policy = Some(policy);
+        if self.inner.session_policy {
+            // A dispatch funnel must learn that its policy was refused, while
+            // the upload credential stays on the provider-admitted destination.
+            if self.inner.pending_error.is_none() {
+                self.inner.pending_error = Some(Error::InvalidRequest {
+                    field: "hop_policy",
+                    detail: "session request hop policy is locked".to_owned(),
+                });
+            }
+        } else {
+            self.inner.hop_policy = Some(policy);
+        }
         self
     }
 
@@ -514,6 +536,7 @@ impl RequestBuilder {
                 redirect_guard: None,
                 hop_policy: None,
                 credential_url: false,
+                session_policy: false,
             },
         }
     }
@@ -683,9 +706,24 @@ impl RequestBuilder {
     /// upload URL is the standing case - where following a hop would send
     /// the body somewhere the caller never admitted. `Enabled(policy)`
     /// substitutes `policy` for the account's for this request's walk.
+    ///
+    /// On a converted session builder, records a deferred [`Error::InvalidRequest`]
+    /// with field `follow_redirects`, even for `Disabled`; `send` /
+    /// `send_streaming` refuse before dispatch. The session policy stays locked.
     #[must_use]
     pub fn follow_redirects(mut self, policy: FollowRedirects) -> Self {
-        self.inner.follow_redirects = Some(policy);
+        if self.inner.session_policy {
+            // Refuse explicitly even when the supplied policy also disables
+            // redirects: a funnel must not mistake a locked setter for success.
+            if self.inner.pending_error.is_none() {
+                self.inner.pending_error = Some(Error::InvalidRequest {
+                    field: "follow_redirects",
+                    detail: "session request redirect policy is locked".to_owned(),
+                });
+            }
+        } else {
+            self.inner.follow_redirects = Some(policy);
+        }
         self
     }
 
@@ -1121,6 +1159,7 @@ pub(crate) async fn send_streaming_inner(
         hop_policy,
         // Applied by `send` and `send_streaming` around this function.
         credential_url: _,
+        session_policy: _,
     } = builder.inner;
 
     // Surface any deferred error from a fluent setter (e.g. `json()`
@@ -1231,12 +1270,11 @@ pub(crate) async fn send_streaming_inner(
             };
             // Per-leg HopPolicy admission above is authoritative for its own
             // source, including Outlook and DAV on composed account handles.
-            // Ordinary account bearers must pass account admission before lookup.
-            // With no account token source no bearer would be injected, so
-            // there is no credential to protect and nothing to refuse.
+            // Account bearers and caller Authorization headers must pass account
+            // admission before lookup or dispatch. HopPolicy owns its credentials.
             if hop_policy.is_none()
-                && auth_for_next_hop
-                && account.token_source().is_some()
+                && (headers.contains_key(AUTHORIZATION)
+                    || (auth_for_next_hop && account.token_source().is_some()))
                 && let Some(origins) = &account.inner.trusted_origins
             {
                 let _admitted = origins.admit(&url)?;
@@ -1473,7 +1511,7 @@ pub(crate) async fn send_streaming_inner(
                         pending_response = None;
                         if status == StatusCode::TOO_MANY_REQUESTS {
                             return Err(Error::RateLimited {
-                                retry_after: retry_after_history.last().copied(),
+                                retry_after,
                                 final_response: evidence,
                             });
                         }
@@ -2107,7 +2145,7 @@ fn cost_override_for_hop(
 fn recompute_cost_units(
     governor: &crate::rate::RateLimitGovernor,
     host: Option<&str>,
-    quota_scope: &str,
+    quota_scope: &crate::QuotaScope,
     cost_override: Option<u32>,
 ) -> u32 {
     match cost_override {
@@ -2221,6 +2259,133 @@ mod tests {
 
     fn hv(value: &str) -> HeaderValue {
         HeaderValue::from_str(value).expect("test header value")
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn converted_session_builder_keeps_redirects_disabled() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LOCATION,
+            HeaderValue::from_static("https://other.test/upload"),
+        );
+        let script = ScriptedDispatch::new([canned_with_headers(
+            StatusCode::TEMPORARY_REDIRECT,
+            headers,
+            b"redirect",
+        )]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+        let builder: RequestBuilder = account
+            .session_request(
+                reqwest::Method::PUT,
+                &crate::SessionUrl::new("https://session.test/upload"),
+            )
+            .body(Bytes::from_static(b"payload"))
+            .into();
+        assert!(builder.inner.session_policy);
+        assert!(!builder.inner.bearer_auth);
+        let response = builder.send().await.expect("unfollowed redirect");
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(script.requests().len(), 1);
+
+        // Enabling redirects after conversion is refused, not ignored: the
+        // locked session policy must never be silently weakened or dropped.
+        let refused_script = ScriptedDispatch::new([canned(StatusCode::OK, b"unreached")]);
+        let account = scripted_account(
+            &refused_script,
+            NetConfig::default(),
+            Vec::new(),
+            two_attempts(),
+        );
+        let builder: RequestBuilder = account
+            .session_request(
+                reqwest::Method::PUT,
+                &crate::SessionUrl::new("https://session.test/upload"),
+            )
+            .into();
+        let error = builder
+            .follow_redirects(FollowRedirects::Enabled(Default::default()))
+            .send()
+            .await
+            .err()
+            .expect("deferred invalid request");
+        assert!(matches!(
+            error.terminal(),
+            Error::InvalidRequest {
+                field: "follow_redirects",
+                ..
+            }
+        ));
+        assert!(refused_script.requests().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn final_response_without_retry_after_does_not_reuse_an_earlier_hint() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            let script = ScriptedDispatch::new([
+                canned_with_headers(status, headers, b"first"),
+                canned(status, b"last"),
+            ]);
+            let account =
+                scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+            let error = account
+                .get("https://retry.test/resource")
+                .send()
+                .await
+                .err()
+                .expect("retry budget must exhaust");
+            match error.terminal() {
+                Error::RateLimited { retry_after, .. } => assert!(retry_after.is_none()),
+                Error::RetryBudgetExhausted {
+                    final_response: Some(response),
+                    retry_after_history,
+                    ..
+                } => {
+                    assert_eq!(retry_after_history.len(), 1);
+                    assert!(parse_retry_after_hint(response.headers.get(RETRY_AFTER)).is_none());
+                }
+                other => panic!("unexpected retry result: {other:?}"),
+            }
+            assert_eq!(script.requests().len(), 2);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn trusted_origins_gate_checks_explicit_and_automatic_credentials() {
+        for explicit in [false, true] {
+            let script = ScriptedDispatch::new([canned(StatusCode::OK, b"ok")]);
+            let source = if explicit {
+                None
+            } else {
+                Some(Arc::new(StaticTokenSource::new("test", None)) as Arc<dyn crate::TokenSource>)
+            };
+            let mut spec = crate::AccountSpec::new(source);
+            let mut origins = crate::TrustedOrigins::default();
+            origins.trust("https://allowed.test").unwrap();
+            spec.trusted_origins = Some(origins);
+            let account = crate::test_support::scripted_net(&script, NetConfig::default())
+                .attach_account(crate::AccountId("origin-gate".to_owned()), spec);
+            let mut request = account.get("https://denied.test/resource");
+            if explicit {
+                request = request
+                    .without_bearer_auth()
+                    .header("Authorization", "Basic secret");
+            }
+            assert!(request.send().await.is_err());
+            assert!(script.requests().is_empty());
+            let mut request = account.get("https://allowed.test/resource");
+            if explicit {
+                request = request
+                    .without_bearer_auth()
+                    .header("Authorization", "Basic secret");
+            }
+            assert!(request.send().await.is_ok());
+            assert_eq!(script.requests().len(), 1);
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -3617,22 +3782,37 @@ mod tests {
         });
 
         assert_eq!(
-            recompute_cost_units(&governor, Some("cost.test"), "", Some(9)),
+            recompute_cost_units(
+                &governor,
+                Some("cost.test"),
+                &crate::QuotaScope::HostOnly,
+                Some(9)
+            ),
             9,
             "an explicit .cost(n) wins over the host default"
         );
         assert_eq!(
-            recompute_cost_units(&governor, Some("cost.test"), "", None),
+            recompute_cost_units(
+                &governor,
+                Some("cost.test"),
+                &crate::QuotaScope::HostOnly,
+                None
+            ),
             5,
             "without an override the host's registered default applies"
         );
         assert_eq!(
-            recompute_cost_units(&governor, Some("unknown.test"), "", None),
+            recompute_cost_units(
+                &governor,
+                Some("unknown.test"),
+                &crate::QuotaScope::HostOnly,
+                None
+            ),
             1,
             "an unregistered host falls back to one unit"
         );
         assert_eq!(
-            recompute_cost_units(&governor, None, "", None),
+            recompute_cost_units(&governor, None, &crate::QuotaScope::HostOnly, None),
             1,
             "an unparseable URL has no host bucket and costs one unit"
         );

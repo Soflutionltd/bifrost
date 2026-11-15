@@ -252,6 +252,20 @@ pub struct EventRange {
 }
 
 impl EventRange {
+    /// Construct a calendar window without pagination or a result limit.
+    /// Bounds are retained verbatim; providers validate their supported time
+    /// forms when executing the query. `admits` remains a conservative guard.
+    #[must_use]
+    pub fn new(calendar_id: CalendarId, start: EventTime, end: EventTime) -> Self {
+        Self {
+            calendar_id,
+            start,
+            end,
+            page_cursor: None,
+            limit: None,
+        }
+    }
+
     /// Defensive overlap guard for provider-selected candidates, not a recurrence
     /// expander or a replacement for the provider's range query. `true` means
     /// overlap is possible; it does not prove an occurrence exists in the window.

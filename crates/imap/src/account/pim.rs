@@ -252,7 +252,11 @@ async fn add_to_container_inner(
     if !account.capabilities.pim_methods.add_to_container {
         return Err(super::error::unsupported(AccountOperation::AddToContainer).into());
     }
-    let destination = folder_from_container(&container, AccountOperation::AddToContainer)?;
+    let destination = folder_from_container(
+        &account.dav_scopes,
+        &container,
+        AccountOperation::AddToContainer,
+    )?;
     // Members already in the destination are not copied into it again.
     let ids = resolved_targets(
         account,
@@ -287,7 +291,11 @@ async fn remove_from_container_inner(
     if !account.capabilities.pim_methods.remove_from_container {
         return Err(super::error::unsupported(AccountOperation::RemoveFromContainer).into());
     }
-    let source = folder_from_container(&container, AccountOperation::RemoveFromContainer)?;
+    let source = folder_from_container(
+        &account.dav_scopes,
+        &container,
+        AccountOperation::RemoveFromContainer,
+    )?;
     let ids = resolved_targets(
         account,
         &target,
@@ -818,14 +826,12 @@ async fn fetch_full_message(
         .map_err(err)?;
     responses
         .into_iter()
-        .find(|fetch| fetch.uid == Some(decoded.uid))
-        .and_then(|fetch| {
-            fetch
-                .body_sections
-                .into_iter()
-                .find(|section| section.section.is_empty())
-                .and_then(|section| section.data)
+        .filter(|fetch| fetch.uid == Some(decoded.uid))
+        .reduce(|mut held, later| {
+            super::get::merge_fetch_response(&mut held, later);
+            held
         })
+        .and_then(|mut fetch| super::hydration::decode_body(&mut fetch))
         .ok_or_else(|| {
             pim_malformed(
                 AccountOperation::DraftSend,
@@ -1099,7 +1105,7 @@ pub(crate) fn search(
         if !account.capabilities.pim_methods.search {
             return Err(super::error::unsupported(AccountOperation::Search));
         }
-        let plan = search_plan(&request, AccountOperation::Search)?;
+        let plan = search_plan(&account.dav_scopes, &request, AccountOperation::Search)?;
         let mut pager = SearchPager::new(&request, plan.folder.as_ref(), AccountOperation::Search)?;
         for folder in pager.folders(search_folders(&account, plan.folder.as_ref())) {
             if pager.is_full() {
@@ -1150,7 +1156,11 @@ pub(crate) fn search_messages(
         if !account.capabilities.pim_methods.search_messages {
             return Err(super::error::unsupported(AccountOperation::SearchMessages));
         }
-        let plan = search_plan(&request, AccountOperation::SearchMessages)?;
+        let plan = search_plan(
+            &account.dav_scopes,
+            &request,
+            AccountOperation::SearchMessages,
+        )?;
         let mut pager = SearchPager::new(
             &request,
             plan.folder.as_ref(),
@@ -1240,7 +1250,13 @@ pub(crate) fn container_create(
         )?;
         let authority = parent
             .as_ref()
-            .map(|parent| folder_from_container(parent, AccountOperation::ContainerCreate))
+            .map(|parent| {
+                folder_from_container(
+                    &account.dav_scopes,
+                    parent,
+                    AccountOperation::ContainerCreate,
+                )
+            })
             .transpose()?;
         let err = |error| {
             account.folder_error(
@@ -1273,7 +1289,11 @@ pub(crate) fn container_rename(
     _style: Option<bifrost_types::ContainerStyle>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let folder = folder_from_container(&container, AccountOperation::ContainerRename)?;
+        let folder = folder_from_container(
+            &account.dav_scopes,
+            &container,
+            AccountOperation::ContainerRename,
+        )?;
         let new_name =
             renamed_sibling(&account, &folder, &name, AccountOperation::ContainerRename)?;
         let err = folder_err(&account, &folder, AccountOperation::ContainerRename);
@@ -1303,7 +1323,11 @@ pub(crate) fn container_move(
     new_parent: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let folder = folder_from_container(&container, AccountOperation::ContainerMove)?;
+        let folder = folder_from_container(
+            &account.dav_scopes,
+            &container,
+            AccountOperation::ContainerMove,
+        )?;
         let leaf = leaf_name(&account, &folder);
         let new_name = child_name(
             &account,
@@ -1313,7 +1337,9 @@ pub(crate) fn container_move(
         )?;
         let destination = new_parent
             .as_ref()
-            .map(|parent| folder_from_container(parent, AccountOperation::ContainerMove))
+            .map(|parent| {
+                folder_from_container(&account.dav_scopes, parent, AccountOperation::ContainerMove)
+            })
             .transpose()?;
         let err = folder_err(&account, &folder, AccountOperation::ContainerMove);
         let mut conn = account.pool.checkout_any().await.map_err(err)?;
@@ -1344,7 +1370,11 @@ pub(crate) fn container_delete(
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let folder = folder_from_container(&container, AccountOperation::ContainerDelete)?;
+        let folder = folder_from_container(
+            &account.dav_scopes,
+            &container,
+            AccountOperation::ContainerDelete,
+        )?;
         let err = folder_err(&account, &folder, AccountOperation::ContainerDelete);
         let mut conn = account.pool.checkout_any().await.map_err(err)?;
         conn.deselect_target(&folder, account.command_timeout())
@@ -1543,7 +1573,11 @@ async fn move_native_thread(
     if !account.capabilities.pim_methods.add_to_container {
         return Err(super::error::unsupported(AccountOperation::AddToContainer).into());
     }
-    let destination = folder_from_container(&target, AccountOperation::AddToContainer)?;
+    let destination = folder_from_container(
+        &account.dav_scopes,
+        &target,
+        AccountOperation::AddToContainer,
+    )?;
     let removal = match source {
         Some(source) => {
             if !account.capabilities.pim_methods.remove_from_container {
@@ -1551,7 +1585,11 @@ async fn move_native_thread(
                     super::error::unsupported(AccountOperation::RemoveFromContainer).into(),
                 );
             }
-            let source = folder_from_container(&source, AccountOperation::RemoveFromContainer)?;
+            let source = folder_from_container(
+                &account.dav_scopes,
+                &source,
+                AccountOperation::RemoveFromContainer,
+            )?;
             resolve_thread_members(
                 account,
                 thread,
@@ -1600,7 +1638,8 @@ pub(crate) fn delete_thread(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         if let Some(current) = current {
-            let folder = folder_from_container(&current, AccountOperation::BulkMove)?;
+            let folder =
+                folder_from_container(&account.dav_scopes, &current, AccountOperation::BulkMove)?;
             // Ruling: a folder whose OWN role is Trash deletes in place, not
             // only the account's resolved Trash. An Outlook user emptying an
             // item from anything shown as Deleted Items expects it gone: a
@@ -2076,10 +2115,14 @@ fn valid_uids(
 }
 
 fn folder_from_container(
+    scopes: &super::DavScopeIndex,
+
     container: &ContainerId,
     op: AccountOperation,
 ) -> Result<MailboxName, AccountError> {
-    MailboxName::from_account_id(&container.0).map_err(|e| pim_malformed(op, e.to_string()))
+    scopes
+        .imap_container(container, op)
+        .map(super::ImapFolder::into_mailbox)
 }
 
 fn imap_flag_for_keyword(keyword: &str) -> Flag {
@@ -2092,9 +2135,13 @@ struct SearchPlan {
     folder: Option<MailboxName>,
 }
 
-fn search_plan(request: &SearchRequest, op: AccountOperation) -> Result<SearchPlan, AccountError> {
+fn search_plan(
+    scopes: &super::DavScopeIndex,
+    request: &SearchRequest,
+    op: AccountOperation,
+) -> Result<SearchPlan, AccountError> {
     let mut plan = match &request.filter {
-        Some(filter) => criteria_from_filter(filter, op)?,
+        Some(filter) => criteria_from_filter(scopes, filter, op)?,
         None => CriteriaPart {
             criteria: SearchCriteria::new().all(),
             folder: None,
@@ -2194,6 +2241,8 @@ struct CriteriaPart {
 }
 
 fn criteria_from_filter(
+    scopes: &super::DavScopeIndex,
+
     filter: &SearchFilter,
     op: AccountOperation,
 ) -> Result<CriteriaPart, AccountError> {
@@ -2213,7 +2262,7 @@ fn criteria_from_filter(
         }
         SearchFilter::In(container) => Ok(CriteriaPart {
             criteria: SearchCriteria::new().all(),
-            folder: Some(folder_from_container(container, op)?),
+            folder: Some(folder_from_container(scopes, container, op)?),
         }),
         SearchFilter::Labeled(LabelId(label)) => leaf(SearchCriteria::new().keyword(label), op),
         SearchFilter::DateRange { after, before } => {
@@ -2233,10 +2282,10 @@ fn criteria_from_filter(
                 folder: None,
             })
         }
-        SearchFilter::And(filters) => combine_and(filters, op),
-        SearchFilter::Or(filters) => combine_or(filters, op),
+        SearchFilter::And(filters) => combine_and(scopes, filters, op),
+        SearchFilter::Or(filters) => combine_or(scopes, filters, op),
         SearchFilter::Not(filter) => {
-            let inner = criteria_from_filter(filter, op)?;
+            let inner = criteria_from_filter(scopes, filter, op)?;
             Ok(CriteriaPart {
                 criteria: SearchCriteria::new().not(&SearchCriteria::new().group(inner.criteria)),
                 folder: inner.folder,
@@ -2258,13 +2307,15 @@ fn leaf(
 }
 
 fn combine_and(
+    scopes: &super::DavScopeIndex,
+
     filters: &[SearchFilter],
     op: AccountOperation,
 ) -> Result<CriteriaPart, AccountError> {
     let mut criteria = Vec::new();
     let mut folder = None;
     for filter in filters {
-        let part = criteria_from_filter(filter, op)?;
+        let part = criteria_from_filter(scopes, filter, op)?;
         folder = merge_folder(folder, part.folder, op)?;
         if part.criteria != "ALL" {
             criteria.push(part.criteria);
@@ -2283,6 +2334,8 @@ fn combine_and(
 }
 
 fn combine_or(
+    scopes: &super::DavScopeIndex,
+
     filters: &[SearchFilter],
     op: AccountOperation,
 ) -> Result<CriteriaPart, AccountError> {
@@ -2294,7 +2347,7 @@ fn combine_or(
     }
     let mut parts = Vec::new();
     for filter in filters {
-        let part = criteria_from_filter(filter, op)?;
+        let part = criteria_from_filter(scopes, filter, op)?;
         // A folder restriction (`In`) nested inside an `Or` cannot be
         // expressed in a single-mailbox IMAP SEARCH: SEARCH runs against
         // the currently-selected mailbox, so hoisting the `In` folder to
@@ -2710,7 +2763,7 @@ fn child_name(
     let Some(parent) = parent else {
         return MailboxName::new(leaf.to_owned()).map_err(|e| pim_malformed(op, e.to_string()));
     };
-    let parent_folder = folder_from_container(parent, op)?;
+    let parent_folder = folder_from_container(&account.dav_scopes, parent, op)?;
     let delimiter = account
         .folders
         .get(&parent_folder)
@@ -2779,9 +2832,9 @@ async fn refresh_folders(
     Ok(())
 }
 
-fn attrs_for_hydration(projection: HydrationProjection) -> Vec<FetchAttr> {
-    use super::hydration::{BodySelection, FetchSelection};
-    let body = match projection {
+fn body_for_hydration(projection: HydrationProjection) -> super::hydration::BodySelection {
+    use super::hydration::BodySelection;
+    match projection {
         HydrationProjection::Headers => BodySelection::None,
         HydrationProjection::Preview(limit) => BodySelection::Preview(limit),
         HydrationProjection::Full | HydrationProjection::FullWithBlobs => BodySelection::Whole,
@@ -2790,13 +2843,16 @@ fn attrs_for_hydration(projection: HydrationProjection) -> Vec<FetchAttr> {
         // defined in bifrost-types needs a wildcard even when the named arms
         // are exhaustive in practice.
         _ => BodySelection::None,
-    };
-    FetchSelection {
+    }
+}
+
+fn attrs_for_hydration(projection: HydrationProjection) -> Vec<FetchAttr> {
+    super::hydration::FetchSelection {
         flags: true,
         envelope: true,
         size: true,
         modseq: false,
-        body,
+        body: body_for_hydration(projection),
     }
     .attributes()
 }
@@ -2809,7 +2865,8 @@ fn fetch_to_message(
 ) -> Option<Message> {
     let uid = fetch.uid?;
     let envelope = fetch.envelope.clone();
-    let raw_body = super::hydration::decode_body(&mut fetch);
+    let raw_body =
+        super::hydration::decode_selected_body(&mut fetch, body_for_hydration(projection));
     let parsed = raw_body.as_deref().map(parse_message);
     let decoded = parsed.as_ref().map(|message| {
         select_body_with(
@@ -3059,9 +3116,33 @@ mod tests {
     // rides along, and that it is the *caller's* operation rather than a
     // hardcoded one.
     #[test]
+    fn pim_containers_and_nested_search_refuse_dav_ownership() {
+        let container = ContainerId("https://example.test/contacts/".into());
+        let (scopes, _) = super::super::DavScopeIndex::build(
+            vec![bifrost_types::FolderId(container.0.clone())],
+            Vec::new(),
+            &std::collections::HashSet::new(),
+        );
+        let err = folder_from_container(&scopes, &container, AccountOperation::AddToContainer)
+            .expect_err("a DAV destination must not reach IMAP");
+        assert_eq!(err.operation(), Some(AccountOperation::AddToContainer));
+        let filter = SearchFilter::And(vec![SearchFilter::In(container)]);
+        assert!(criteria_from_filter(&scopes, &filter, AccountOperation::Search).is_err());
+        assert!(
+            folder_from_container(
+                &scopes,
+                &ContainerId("INBOX".into()),
+                AccountOperation::AddToContainer,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn locally_malformed_pim_errors_carry_the_calling_operation() {
         // Id / cursor / mailbox-name decode.
         let err = folder_from_container(
+            &super::super::DavScopeIndex::default(),
             &ContainerId("INBOX\r\nNOOP".to_owned()),
             AccountOperation::BulkMove,
         )
@@ -3098,6 +3179,7 @@ mod tests {
         // unconditionally. Drive each through `Search` so a reverted
         // threading shows up as the wrong op, not merely as `None`.
         let err = search_plan(
+            &super::super::DavScopeIndex::default(),
             &SearchRequest::provider("(UNSEEN"),
             AccountOperation::Search,
         )
@@ -3105,6 +3187,7 @@ mod tests {
         assert_eq!(err.operation(), Some(AccountOperation::Search));
 
         let err = combine_and(
+            &super::super::DavScopeIndex::default(),
             &[
                 SearchFilter::In(ContainerId("Archive".to_owned())),
                 SearchFilter::In(ContainerId("Sent".to_owned())),
@@ -3115,6 +3198,7 @@ mod tests {
         assert_eq!(err.operation(), Some(AccountOperation::Search));
 
         let err = combine_or(
+            &super::super::DavScopeIndex::default(),
             &[
                 SearchFilter::In(ContainerId("Archive".to_owned())),
                 SearchFilter::From("a@b.test".to_owned()),
@@ -3558,7 +3642,11 @@ body text\r\n";
             SearchFilter::In(ContainerId("Archive".to_owned())),
             SearchFilter::From("a@b.test".to_owned()),
         ]);
-        let err = match criteria_from_filter(&filter, AccountOperation::SearchMessages) {
+        let err = match criteria_from_filter(
+            &super::super::DavScopeIndex::default(),
+            &filter,
+            AccountOperation::SearchMessages,
+        ) {
             Err(err) => err,
             Ok(_) => panic!("OR with In must be rejected"),
         };
@@ -3573,7 +3661,11 @@ body text\r\n";
             SearchFilter::In(ContainerId("Archive".to_owned())),
             SearchFilter::From("a@b.test".to_owned()),
         ]);
-        let part = match criteria_from_filter(&filter, AccountOperation::SearchMessages) {
+        let part = match criteria_from_filter(
+            &super::super::DavScopeIndex::default(),
+            &filter,
+            AccountOperation::SearchMessages,
+        ) {
             Ok(part) => part,
             Err(_) => panic!("AND with In is accepted"),
         };
@@ -4006,12 +4098,17 @@ body text\r\n";
 
     #[test]
     fn search_plan_defaults_to_all_and_carries_the_folder_restriction() {
-        let plan =
-            search_plan(&SearchRequest::default(), AccountOperation::SearchMessages).expect("plan");
+        let plan = search_plan(
+            &super::super::DavScopeIndex::default(),
+            &SearchRequest::default(),
+            AccountOperation::SearchMessages,
+        )
+        .expect("plan");
         assert_eq!(plan.criteria, "ALL");
         assert!(plan.folder.is_none());
 
         let plan = search_plan(
+            &super::super::DavScopeIndex::default(),
             &SearchRequest::filter(SearchFilter::In(ContainerId("Archive".to_owned()))),
             AccountOperation::SearchMessages,
         )
@@ -4026,6 +4123,7 @@ body text\r\n";
     #[test]
     fn search_plan_quotes_filter_operands() {
         let plan = search_plan(
+            &super::super::DavScopeIndex::default(),
             &SearchRequest::filter(SearchFilter::Subject("quarterly \"report\"".to_owned())),
             AccountOperation::SearchMessages,
         )
@@ -4037,6 +4135,7 @@ body text\r\n";
     fn search_plan_substitutes_or_conjoins_the_provider_query() {
         // With no structured filter the raw query replaces the ALL.
         let plan = search_plan(
+            &super::super::DavScopeIndex::default(),
             &SearchRequest::provider("  UNSEEN  "),
             AccountOperation::SearchMessages,
         )
@@ -4047,11 +4146,17 @@ body text\r\n";
         // IMAP's implicit AND (RFC 3501 Section 6.4.4).
         let mut request = SearchRequest::filter(SearchFilter::From("a@b.test".to_owned()));
         request.provider_query = Some("UNSEEN".to_owned());
-        let plan = search_plan(&request, AccountOperation::SearchMessages).expect("plan");
+        let plan = search_plan(
+            &super::super::DavScopeIndex::default(),
+            &request,
+            AccountOperation::SearchMessages,
+        )
+        .expect("plan");
         assert_eq!(plan.criteria, "FROM \"a@b.test\" UNSEEN");
 
         // A whitespace-only raw query is ignored entirely.
         let plan = search_plan(
+            &super::super::DavScopeIndex::default(),
             &SearchRequest::provider("   "),
             AccountOperation::SearchMessages,
         )
@@ -4063,6 +4168,7 @@ body text\r\n";
     fn search_plan_rejects_structurally_unsafe_provider_queries() {
         for raw in [")", "(UNSEEN", "SUBJECT \"unterminated", "BODY {4}"] {
             let err = search_plan(
+                &super::super::DavScopeIndex::default(),
                 &SearchRequest::provider(raw),
                 AccountOperation::SearchMessages,
             )
@@ -4073,12 +4179,14 @@ body text\r\n";
             );
         }
         let plan = search_plan(
+            &super::super::DavScopeIndex::default(),
             &SearchRequest::provider("OR (FROM \"a\\\\\\\"b\") (SUBJECT \"{4}\")"),
             AccountOperation::SearchMessages,
         )
         .expect("balanced query");
         assert_eq!(plan.criteria, "OR (FROM \"a\\\\\\\"b\") (SUBJECT \"{4}\")");
         let plan = search_plan(
+            &super::super::DavScopeIndex::default(),
             &SearchRequest::provider("FROM"),
             AccountOperation::SearchMessages,
         )
@@ -4092,6 +4200,7 @@ body text\r\n";
     #[test]
     fn and_and_or_combinators_produce_the_expected_criteria_shapes() {
         let and = combine_and(
+            &super::super::DavScopeIndex::default(),
             &[
                 SearchFilter::From("a@b.test".to_owned()),
                 SearchFilter::Subject("hi".to_owned()),
@@ -4103,6 +4212,7 @@ body text\r\n";
 
         // An `In`-only conjunction degenerates to ALL plus the folder.
         let folder_only = combine_and(
+            &super::super::DavScopeIndex::default(),
             &[SearchFilter::In(ContainerId("Archive".to_owned()))],
             AccountOperation::SearchMessages,
         )
@@ -4116,6 +4226,7 @@ body text\r\n";
         // RFC 3501 OR takes exactly two search-keys, so a three-way OR
         // has to nest.
         let or = combine_or(
+            &super::super::DavScopeIndex::default(),
             &[
                 SearchFilter::From("a@b.test".to_owned()),
                 SearchFilter::From("c@d.test".to_owned()),
@@ -4130,9 +4241,13 @@ body text\r\n";
         );
 
         assert_eq!(
-            combine_or(&[], AccountOperation::SearchMessages)
-                .expect("empty or")
-                .criteria,
+            combine_or(
+                &super::super::DavScopeIndex::default(),
+                &[],
+                AccountOperation::SearchMessages
+            )
+            .expect("empty or")
+            .criteria,
             "ALL"
         );
     }
@@ -4142,6 +4257,7 @@ body text\r\n";
         // IMAP SEARCH runs against one selected mailbox, so a filter
         // naming two folders has no faithful single-command encoding.
         let err = combine_and(
+            &super::super::DavScopeIndex::default(),
             &[
                 SearchFilter::In(ContainerId("Archive".to_owned())),
                 SearchFilter::In(ContainerId("Sent".to_owned())),
@@ -4156,6 +4272,7 @@ body text\r\n";
         // The same folder twice is not a conflict.
         assert!(
             combine_and(
+                &super::super::DavScopeIndex::default(),
                 &[
                     SearchFilter::In(ContainerId("Archive".to_owned())),
                     SearchFilter::In(ContainerId("Archive".to_owned())),
@@ -4169,6 +4286,7 @@ body text\r\n";
     #[test]
     fn not_wraps_its_inner_criteria_and_keeps_the_folder() {
         let part = criteria_from_filter(
+            &super::super::DavScopeIndex::default(),
             &SearchFilter::Not(Box::new(SearchFilter::And(vec![
                 SearchFilter::In(ContainerId("Archive".to_owned())),
                 SearchFilter::From("a@b.test".to_owned()),
@@ -4381,7 +4499,7 @@ body text\r\n";
 
     #[test]
     fn preview_projection_extracts_text_from_a_multipart_prefix() {
-        let fetch = crate::types::FetchResponse { uid: Some(2), body_sections: vec![crate::types::fetch::BodySection { section: String::new(), origin: None, data: Some(b"Content-Type: multipart/alternative; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\npreview prose\r\n--x--\r\n".to_vec().into()) }], ..Default::default() };
+        let fetch = crate::types::FetchResponse { uid: Some(2), body_sections: vec![crate::types::fetch::BodySection { section: String::new(), origin: Some(0), data: Some(b"Content-Type: multipart/alternative; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\npreview prose\r\n--x--\r\n".to_vec().into()) }], ..Default::default() };
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
         let message = fetch_to_message(&folder, 9, fetch, HydrationProjection::Preview(200))
             .expect("uid present");

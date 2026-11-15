@@ -155,6 +155,9 @@ impl ImapErrorContext {
 
 /// Preserve the shared OAuth classification for IMAP and ManageSieve.
 pub(crate) fn oauth_token_error(error: bifrost_net::Error) -> Error {
+    // Protocol currently has no ManageSieve variant. Keep the account's IMAP
+    // identity consistently with the other ManageSieve translations until the
+    // shared protocol taxonomy can represent that transport distinctly.
     // The operation is a placeholder: into_account_error restamps the
     // caller's operation, scope and provider when it surfaces this error.
     let classified =
@@ -310,6 +313,8 @@ pub(crate) fn sieve_account_error(
         Se::InvalidInput(message) => Error::InvalidInput(message.into()),
         Se::AuthPolicy(failure) => Error::AuthPolicy(failure),
         Se::Auth { message, mechanism } => Error::auth_with_mechanism(message, None, mechanism),
+        // The shared protocol taxonomy has no ManageSieve identity; this
+        // retains the same IMAP account identity as other sieve failures.
         Se::OAuthToken(error) => oauth_token_error(error),
         Se::Sasl(error) => Error::from(error),
     };

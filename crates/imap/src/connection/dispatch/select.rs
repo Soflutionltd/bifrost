@@ -295,12 +295,12 @@ fn validate_select_responses(
                 status: UntaggedStatus::Ok,
                 code: Some(ResponseCode::UidValidity(value)),
                 ..
-            } => Some(*value),
+            } if *value != 0 => Some(*value),
             _ => None,
         })
         .next_back();
     let validity = match tagged.code.as_ref() {
-        Some(ResponseCode::UidValidity(value)) => Some(*value),
+        Some(ResponseCode::UidValidity(value)) if *value != 0 => Some(*value),
         _ => untagged_validity,
     };
     if validity.is_none_or(|value| value == 0) {
@@ -450,10 +450,15 @@ fn extract_selected_code(
         // sentinel into a usable mailbox identity. Users expect a broken
         // server epoch to fail before inventory can publish unusable ids.
         ResponseCode::UidValidity(v) => {
-            *uid_validity = crate::types::UidValidity::new(*v).map(crate::types::UidValidity::get);
+            // A later invalid observation must not erase a usable epoch.
+            if let Some(value) = crate::types::UidValidity::new(*v) {
+                *uid_validity = Some(value.get());
+            }
         }
         ResponseCode::UidNext(v) => {
-            *uid_next = std::num::NonZeroU32::new(*v).map(std::num::NonZeroU32::get);
+            if let Some(value) = std::num::NonZeroU32::new(*v) {
+                *uid_next = Some(value.get());
+            }
         }
         ResponseCode::PermanentFlags(f) => permanent_flags.clone_from(f),
         ResponseCode::HighestModSeq(v) => {
@@ -536,6 +541,39 @@ mod tests {
         assert!(validate_select_responses(&inputs, &tagged, false, &default_ctx()).is_ok());
         tagged.code = Some(ResponseCode::UidValidity(0));
         assert!(validate_select_responses(&inputs, &tagged, false, &default_ctx()).is_err());
+    }
+
+    #[test]
+    fn later_zero_codes_preserve_valid_selection_numbers() {
+        let mut inputs = vec![
+            UntaggedResponse::Flags(vec![]),
+            UntaggedResponse::Exists(0),
+            UntaggedResponse::Recent(0),
+        ];
+        for code in [
+            ResponseCode::UidValidity(9),
+            ResponseCode::UidNext(12),
+            ResponseCode::UidValidity(0),
+            ResponseCode::UidNext(0),
+        ] {
+            inputs.push(UntaggedResponse::Status {
+                status: UntaggedStatus::Ok,
+                code: Some(code),
+                text: String::new(),
+            });
+        }
+        for code in [ResponseCode::UidValidity(0), ResponseCode::UidNext(0)] {
+            let tagged = TaggedResponse {
+                tag: "A001".into(),
+                status: StatusKind::Ok,
+                code: Some(code),
+                text: String::new(),
+            };
+            assert!(validate_select_responses(&inputs, &tagged, false, &default_ctx()).is_ok());
+            let selected = build_selected_mailbox(&inputs, &tagged, false);
+            assert_eq!(selected.uid_validity, Some(9));
+            assert_eq!(selected.uid_next, Some(12));
+        }
     }
 
     fn default_ctx() -> ConsumerContext<'static> {

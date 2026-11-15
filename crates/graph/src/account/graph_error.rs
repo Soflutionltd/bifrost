@@ -247,16 +247,31 @@ fn net_to_account_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> Acc
         }
     }
     stamp_budget(
-        apply_idempotency_override(
-            bifrost_net::into_account_error_with_throttle_scope(
-                net,
-                ctx.to_net_ctx(),
-                throttle_scope_for(),
-            ),
-            ctx,
-        ),
+        apply_idempotency_override(net_transport_error(net, ctx), ctx),
         ctx,
     )
+}
+
+/// A typed hop-policy refusal is created before its operation and cursor scope
+/// are known. Add the account boundary context without changing its recovery.
+fn net_transport_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> AccountError {
+    let error = bifrost_net::into_account_error_with_throttle_scope(
+        net,
+        ctx.to_net_ctx(),
+        throttle_scope_for(),
+    );
+    let builder = error
+        .into_builder()
+        .protocol(ctx.protocol)
+        .operation(ctx.operation)
+        .provider(Provider::Microsoft);
+    let builder = match &ctx.scope {
+        Some(scope) => builder.scope(scope.clone()),
+        None => builder,
+    };
+    builder
+        .try_build()
+        .expect("valid contextual transport error")
 }
 
 fn is_throttle(kind: &AccountErrorKind) -> bool {
@@ -342,14 +357,9 @@ fn apply_idempotency_override(error: AccountError, ctx: &GraphErrorContext) -> A
 pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext) -> AccountError {
     debug_assert!(matches!(ctx.protocol, Protocol::Ews));
     match error {
-        EwsError::Transport(net) => apply_idempotency_override(
-            bifrost_net::into_account_error_with_throttle_scope(
-                net,
-                ctx.to_net_ctx(),
-                throttle_scope_for(),
-            ),
-            &ctx,
-        ),
+        EwsError::Transport(net) => {
+            apply_idempotency_override(net_transport_error(net, &ctx), &ctx)
+        }
         EwsError::HttpStatus { status, body } => {
             // Wrap the raw HTTP failure as a Graph-style response so
             // the standard status-fallback classification applies,
@@ -1393,7 +1403,7 @@ pub(crate) fn id_translation_refused(
 ///
 /// `CursorProtocolMismatch`, `CursorEnvelopeUnknown`, and
 /// `SchemaIncompatible` map to `SyncState(SchemaIncompatible)` so the
-/// engine can restart the scope with a cleared cursor, and so does
+/// engine can rebuild the account's durable cursor state, and so does
 /// `Decode`: cursor bytes that do not decode are the caller's durable state,
 /// refused before any request, never a provider fault. `Unsupported`
 /// maps to `Unsupported(EstablishCursor)`. `Encode` (a local serialization
@@ -1414,17 +1424,28 @@ pub(crate) fn cursor_error_to_account_error(
     // instead of quarantining one folder. The other arms want the scope for
     // the ordinary reason: these errors are raised per cursor, and the
     // support export has to name which.
-    let builder = match error {
-        CursorError::ProtocolMismatch
-        | CursorError::EnvelopeUnknown
-        | CursorError::SchemaIncompatible
-        | CursorError::Decode(_) => bifrost_types::CursorDecodeFault::Malformed
+    // Keep decode reasons distinct even when they share a recovery policy.
+    let decode_detail = error.to_string();
+    let decode_builder = |fault: bifrost_types::CursorDecodeFault| {
+        fault
             .builder(ctx.protocol, ctx.operation)
             .provider(Provider::Microsoft)
-            .text(DiagnosticText::support_only(error.to_string())),
-        CursorError::ScopeMismatch => bifrost_types::CursorDecodeFault::ScopeMismatch
-            .builder(ctx.protocol, ctx.operation)
-            .provider(Provider::Microsoft),
+            .text(DiagnosticText::support_only(decode_detail))
+    };
+    let builder = match error {
+        CursorError::ProtocolMismatch => {
+            decode_builder(bifrost_types::CursorDecodeFault::ProtocolMismatch)
+        }
+        CursorError::EnvelopeUnknown => {
+            decode_builder(bifrost_types::CursorDecodeFault::FutureVersion)
+        }
+        CursorError::SchemaIncompatible => {
+            decode_builder(bifrost_types::CursorDecodeFault::RetiredVersion)
+        }
+        CursorError::Decode(_) => decode_builder(bifrost_types::CursorDecodeFault::Malformed),
+        CursorError::ScopeMismatch => {
+            decode_builder(bifrost_types::CursorDecodeFault::ScopeMismatch)
+        }
         CursorError::CalendarWindowExpired | CursorError::InventoryInProgress => base_builder(
             &ctx,
             AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
@@ -3036,10 +3057,10 @@ mod replay_tests {
     fn subrequest_replayable_follows_the_declaration_rule_and_fails_closed() {
         for (method, header, expected) in [
             ("GET", None, true),
-            ("PATCH", None, true),
+            ("PATCH", None, false),
             ("PATCH", Some("v1"), false),
             ("POST", None, false),
-            ("DELETE", None, true),
+            ("DELETE", None, false),
             ("bad method", None, false),
             ("PATCH", Some("bad\nvalue"), false),
         ] {

@@ -555,7 +555,11 @@ async fn writer_boundary_case(stored_inventory: bool, exhaust: bool) {
     let WriterRequest::GetChangeCursor { done, .. } = request else {
         panic!("cursor read")
     };
-    fixture.hold(if exhaust { 250 } else { 20 });
+    // Admission now follows the stored-cursor read, so a hold that elapsed
+    // while the engine awaited the writer is not charged to the allowance.
+    // Only the hold observed after the response is, and it must exceed the
+    // whole 300s allowance on its own to exhaust it.
+    fixture.hold(if exhaust { 350 } else { 20 });
     let stored = stored_inventory.then(|| common::cursor_for(&SCOPE, b"inventory"));
     done.send(Ok(stored)).expect("answer cursor read");
     tokio::select! { biased; _ = &mut establish => panic!("writer response bypassed new hold"), () = turns() => {} }

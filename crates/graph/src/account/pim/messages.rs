@@ -384,7 +384,17 @@ pub(super) async fn resolve_target_values(
     match target {
         MutationTarget::Message(id) => {
             refuse_public_write(&id, operation)?;
-            let value = fetch_message_value(account, &id, select).await?;
+            let value = match crate::account::mutate::fetch_message_observation(
+                account, &id, select, operation,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) if crate::account::mutate::skips_absent_message(&error, operation) => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(error),
+            };
             Ok(vec![ResolvedMessage {
                 routing_id: id,
                 value,
@@ -553,15 +563,26 @@ pub(super) async fn move_messages(
             ));
         }
     }
-    let values = message_values_for_ids(account, ids, "id,changeKey").await?;
     let mut requests = Vec::new();
     let mut targets = Vec::new();
-    // `ids[i]` is the caller-supplied (possibly foreign-encoded) routing
-    // id; `values[i]` is its fetched value (etag). Route the request by
-    // the routing id so a shared-mailbox message moves under
-    // `/users/{owner}`.
-    for (id, value) in ids.iter().zip(values.iter()) {
-        let etag = graph_etag(value).ok_or_else(|| {
+    // Keep each routing id beside its observation when vanished subjects are
+    // skipped; zipping a filtered value list with the original ids misroutes.
+    for id in ids {
+        let value = match crate::account::mutate::fetch_message_observation(
+            account,
+            id,
+            "id,changeKey",
+            operation,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) if crate::account::mutate::skips_absent_message(&error, operation) => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let etag = graph_etag(&value).ok_or_else(|| {
             pim_protocol_error(
                 operation,
                 Some(ErrorScope::Message {
@@ -634,7 +655,11 @@ async fn submit_message_write_chunks(
         operation,
         effect,
         replay,
-        crate::account::batch::AbsentMeans::Failure,
+        if operation.skips_absent_target() {
+            crate::account::batch::AbsentMeans::Success
+        } else {
+            crate::account::batch::AbsentMeans::Failure
+        },
     )
     .await
 }
@@ -677,18 +702,6 @@ async fn submit_message_write_chunks_with_absence(
         }
     }
     Ok(progress)
-}
-
-pub(super) async fn message_values_for_ids(
-    account: &GraphAccount,
-    ids: &[ObjectId],
-    select: &str,
-) -> Result<Vec<Value>, AccountError> {
-    let mut values = Vec::new();
-    for id in ids {
-        values.push(fetch_message_value(account, id, select).await?);
-    }
-    Ok(values)
 }
 
 /// Submit one `$batch` of writes and return typed progress, never a record:
@@ -802,14 +815,25 @@ async fn submit_write_batch_resource(
             item.status,
             headers,
             body,
-            absent,
+            if operation.skips_absent_target()
+                && !crate::account::mutate::skips_absent_write(operation, item.body.as_ref())
+            {
+                crate::account::batch::AbsentMeans::Failure
+            } else {
+                absent
+            },
             bifrost_types::BatchItemId(item.id.clone()),
             operation,
             scope,
             target.as_ref().and_then(|id| account.budget_for_object(id)),
         );
         match outcome {
-            bifrost_types::ItemOutcome::Succeeded(_) => {
+            bifrost_types::ItemOutcome::Succeeded(success) => {
+                // A vanished subject satisfies the view policy without this
+                // request applying a write. Never claim a committed step.
+                if matches!(success.output, bifrost_types::MutationSuccess::Skipped) {
+                    continue;
+                }
                 if let Ok(index) = item.id.parse::<usize>() {
                     let new_id = item
                         .body
@@ -1156,7 +1180,7 @@ mod replay_tests {
 }
 
 /// Typed progress of one or more `$batch` submissions, indexed by request
-/// position. `committed` holds every 2xx (and destroy-404) sub-request with
+/// position. `committed` holds every applied 2xx sub-request with
 /// the new id a successful move returned, owner-qualified for a shared
 /// mailbox; `failed` holds every refused, uncertain or missing sub-request
 /// with its own leaf and application. Unsent requests appear in neither.

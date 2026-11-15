@@ -482,3 +482,22 @@ fn a_missing_mandatory_response_is_not_connection_fatal() {
     assert!(!Error::ProtocolMissing("x".into()).is_connection_fatal());
     assert!(Error::Protocol("x".into()).is_connection_fatal());
 }
+
+#[test]
+fn login_rejections_distinguish_sasl_from_command() {
+    let failure = AuthPolicyFailure::new(
+        vec!["AUTH=LOGIN".into(), "LOGIN".into()],
+        [
+            crate::types::AuthMechanism::Login,
+            crate::types::AuthMechanism::ImapLogin,
+        ]
+        .into_iter()
+        .map(|mechanism| {
+            AuthMechanismRejection::new(mechanism, AuthMechanismRejectionReason::DisabledByPolicy)
+        })
+        .collect(),
+    );
+    let rendered = failure.to_string();
+    assert!(rendered.contains("AUTH=LOGIN ("));
+    assert!(rendered.contains(", LOGIN ("));
+}

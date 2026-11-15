@@ -576,7 +576,10 @@ ids retain the caller's exact casing.
 An optional `source` is the one part the destination cannot imply - a
 user label being filed out of - and it joins the same
 `removeLabelIds`. It is skipped when it is the synthetic `archive`,
-equal to the destination, or already implied.
+equal to the destination, or already implied. Identity compares known system
+labels without ASCII case sensitivity, but compares opaque user label ids
+exactly. Moving between user ids that differ only in case removes the source;
+enterprise Outlook users expect filing out of one label to remove that label.
 
 Composition renders MIME through the shared `bifrost-types::mime`
 serializer (`render_rfc5322`, shared with IMAP send) and sends the
@@ -2129,3 +2132,25 @@ that refusal contract if the shared target vocabulary grows.
 Response headers retain `bifrost_types::RetryHint` directly. Delta-seconds are
 resolved once using the observer clock with checked addition, and HTTP dates
 retain their absolute instant; translation does not maintain another retry enum.
+
+Resumable upload completion is accepted only after the submitted chunk reaches
+the full payload length. A premature success is a provider contract violation,
+because users expect a successful attachment upload to contain every byte.
+
+Gmail flag equality recognizes system flag spelling case-insensitively. Generic
+`$gmail-label:<id>:<name>` flags compare both fields with exact case, matching
+opaque provider ids rather than merging distinct labels. Write lookup still
+ignores the advisory name so a server rename does not block an edit.
+
+Gmail resolved-recipient validation stamps `Protocol::Gmail` on empty-send
+refusals, including raw header and patched-draft paths.
+
+
+Gmail absent-target handling requires subject-specific evidence before applying
+`AccountOperation::skips_absent_target`. Label `batchModify` and single-message
+or thread modify 404 responses can name a missing label operand; even singleton
+bisection does not disambiguate them, so these remain errors. `batchDelete` has
+no per-id response and cannot report which subjects were already absent. Direct
+thread DELETE has no label operand: `DeleteThread` absorbs `NotFound(Thread)`
+as `Ok(())`, without recording a committed write. An Outlook user expects a
+vanished thread gone from view but a missing destination reported as an error.

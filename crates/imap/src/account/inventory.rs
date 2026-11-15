@@ -11,7 +11,7 @@ use crate::types::{FetchAttr, FetchResponse, MailboxName, UidSet};
 
 use super::{
     BATCH_ITEMS, CompactUidSet, ImapAccount, ScopeHandler, batch, encode_cursor, encode_object_id,
-    folder_from_scope, folder_scope, membership_scope, route_scope, terminated_event,
+    folder_scope, membership_scope, route_scope, terminated_event,
 };
 
 pub(crate) fn establish_initial_cursor(
@@ -63,6 +63,7 @@ pub(crate) fn inventory_stream(
         match run_inventory(
             account.clone(),
             scope.clone(),
+            folder.clone(),
             tx.clone(),
             &ticket,
             &task_ledger,
@@ -241,7 +242,8 @@ impl From<ChannelDropped> for InventoryError {
 
 async fn run_inventory(
     account: ImapAccount,
-    scope: CursorScope,
+    _scope: CursorScope,
+    folder: super::ImapFolder,
     tx: tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
     qresync_warning: &QresyncWarningTicket,
     obligations: &ObligationLedger,
@@ -259,13 +261,7 @@ async fn run_inventory(
         .await
         .map_err(|_| ChannelDropped)?;
     }
-    // `folder_from_scope` already returns a classified `AccountError`
-    // (`Unsupported` for a non-folder scope, `Request(Malformed)` for an
-    // unsendable name). Stringifying it into `Error::Protocol` would
-    // re-derive it as a provider contract violation at the boundary, which
-    // is exactly what the producer-preserves-classification rule forbids.
-    let folder = folder_from_scope(&scope, bifrost_types::AccountOperation::SyncInventory)
-        .map_err(InventoryError::Account)?;
+    let folder = folder.into_mailbox();
     let shared_owner = account
         .folders
         .get(&folder)

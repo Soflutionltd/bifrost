@@ -81,7 +81,7 @@ pub(crate) enum JmapCursorError {
     CursorProtocolMismatch,
     CursorEnvelopeUnknown,
     SchemaIncompatible,
-    Other(String),
+    ScopeMismatch,
 }
 
 impl JmapScopeRepr {
@@ -304,9 +304,7 @@ pub(crate) fn decode_cursor(
             state_string,
         } => {
             if scope.to_cursor_scope() != cursor.scope {
-                return Err(JmapCursorError::Other(
-                    "JMAP cursor payload scope does not match ChangeCursor scope".to_string(),
-                ));
+                return Err(JmapCursorError::ScopeMismatch);
             }
             Ok((scope, state_string))
         }
@@ -524,7 +522,7 @@ mod tests {
         };
         assert!(matches!(
             decode_cursor(&crossed),
-            Err(JmapCursorError::Other(_))
+            Err(JmapCursorError::ScopeMismatch)
         ));
     }
 
@@ -547,7 +545,7 @@ mod tests {
         };
         assert!(matches!(
             decode_cursor(&crossed),
-            Err(JmapCursorError::Other(_))
+            Err(JmapCursorError::ScopeMismatch)
         ));
     }
 

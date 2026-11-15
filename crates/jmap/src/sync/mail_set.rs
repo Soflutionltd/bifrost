@@ -84,7 +84,23 @@ pub(super) fn classify_set_response(
             let item_scope = Some(ErrorScope::Message {
                 id: (id.0.clone()).into(),
             });
-            super::error::classify_set_item(set_error, ctx, BatchItemId(id.0.clone()), item_scope)
+            // Only notFound names the mutation subject. blobNotFound names
+            // missing input content and cannot establish that the mail is gone.
+            if matches!(
+                set_error.error_type(),
+                crate::core::set::SetErrorType::NotFound
+            ) && operation.skips_absent_target()
+            {
+                ItemOutcome::Succeeded(BatchSuccess::new(
+                    BatchItemId(id.0.clone()),
+                    MutationSuccess::Skipped,
+                ))
+            } else {
+                ItemOutcome::Failed(BatchFailure::new(
+                    BatchItemId(id.0.clone()),
+                    super::error::set_error_to_account_error(set_error, ctx, item_scope),
+                ))
+            }
         }
         Err(err) => ItemOutcome::Failed(BatchFailure::new(
             BatchItemId(id.0.clone()),
@@ -124,4 +140,33 @@ pub(crate) async fn probe_email_state<T: HttpTransport>(
         ));
     }
     Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_subject_policy_distinguishes_mail_edits_from_missing_inputs() {
+        for (operation, error_type, skipped) in [
+            (AccountOperation::UpdateFlags, "notFound", true),
+            (AccountOperation::BulkMove, "notFound", true),
+            (AccountOperation::SetKeyword, "notFound", true),
+            (AccountOperation::DraftSend, "notFound", false),
+            (AccountOperation::UpdateFlags, "blobNotFound", false),
+        ] {
+            let error = serde_json::from_value(serde_json::json!({"type": error_type})).unwrap();
+            let outcome = classify_set_response(
+                Err(crate::Error::Set(error)),
+                ObjectId("message".into()),
+                operation,
+            );
+            if skipped {
+                assert!(matches!(outcome, ItemOutcome::Succeeded(success)
+                    if matches!(success.output, MutationSuccess::Skipped)));
+            } else {
+                assert!(matches!(outcome, ItemOutcome::Failed(_)));
+            }
+        }
+    }
 }

@@ -293,6 +293,103 @@ pub enum AccountOperation {
 }
 
 impl AccountOperation {
+    /// Whether a confirmed absent mutation subject is `MutationSuccess::Skipped`.
+    ///
+    /// Outlook users expect vanished mail to leave the view when moving,
+    /// deleting or editing its presentation, without an error or a claim that
+    /// this call applied the edit. Discarding an absent draft is likewise done.
+    /// Reads, sends, scheduling changes and non-mail edits retain NotFound:
+    /// absence cannot supply content, deliver mail or confirm the requested edit.
+    /// This applies to the subject only, never a missing destination or blob.
+    #[must_use]
+    pub const fn skips_absent_target(self) -> bool {
+        match self {
+            Self::UpdateFlags
+            | Self::SetStarred
+            | Self::MarkReplied
+            | Self::MarkForwarded
+            | Self::MarkMdnSent
+            | Self::BulkMove
+            | Self::BulkDestroy
+            | Self::MoveThread
+            | Self::DeleteThread
+            | Self::AddToContainer
+            | Self::RemoveFromContainer
+            | Self::SetKeyword
+            | Self::SetLabelMembership
+            | Self::SetCategory
+            | Self::SetExtendedProperty
+            | Self::SetImportance
+            | Self::SetIsRead
+            | Self::DraftDiscard => true,
+            Self::CategoryDefinitionsList
+            | Self::MessageReactionsRead
+            | Self::Discover
+            | Self::EstablishCursor
+            | Self::DiscoverCursorScopes
+            | Self::DiscoverMemberships
+            | Self::ScopeLifecycle
+            | Self::SyncInventory
+            | Self::SyncChanges
+            | Self::Hydrate
+            | Self::HydrateThread
+            | Self::HydrateMessage
+            | Self::OpenBlob
+            | Self::OpenBlobRange
+            | Self::OpenRawRfc822
+            | Self::PushSubscribe
+            | Self::PushUnsubscribe
+            | Self::PushStream
+            | Self::Send
+            | Self::AttachmentUpload
+            | Self::HostAttachment
+            | Self::DraftCreate
+            | Self::DraftUpdate
+            | Self::DraftSend
+            | Self::CancelScheduledSend
+            | Self::RescheduleSend
+            | Self::Search
+            | Self::SearchMessages
+            | Self::ContainersList
+            | Self::ContainerCreate
+            | Self::ContainerRename
+            | Self::ContainerMove
+            | Self::ContainerDelete
+            | Self::IdentitiesList
+            | Self::IdentityUpdate
+            | Self::VacationGet
+            | Self::VacationSet
+            | Self::QuotaGet
+            | Self::FiltersList
+            | Self::FilterCreate
+            | Self::FilterUpdate
+            | Self::FilterDelete
+            | Self::FilterValidate
+            | Self::AddressBooksList
+            | Self::ContactsList
+            | Self::ContactGet
+            | Self::ContactCreate
+            | Self::ContactUpdate
+            | Self::ContactDelete
+            | Self::ContactSearch
+            | Self::ContactAutocomplete
+            | Self::DirectorySearch
+            | Self::DirectoryGroupsList
+            | Self::DirectoryGroupExpand
+            | Self::CalendarsList
+            | Self::EventsInRange
+            | Self::EventGet
+            | Self::EventCreate
+            | Self::EventUpdate
+            | Self::EventDelete
+            | Self::EventRsvp
+            | Self::EventSearch
+            | Self::EventAutocomplete
+            | Self::Close
+            | Self::Expunge => false,
+        }
+    }
+
     #[must_use]
     pub fn is_idempotent(self) -> bool {
         // The non-idempotent set is every operation whose blind same-request

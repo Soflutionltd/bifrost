@@ -531,7 +531,7 @@ fn real_world_header_search() {
 fn mod_seq_simple() {
     // RFC 7162 Section 3.1.5: simple MODSEQ form with a mod-sequence value.
     assert_eq!(
-        SearchCriteria::new().mod_seq(12345).as_str(),
+        SearchCriteria::new().mod_seq(12345).unwrap().as_str(),
         "MODSEQ 12345"
     );
 }
@@ -539,21 +539,24 @@ fn mod_seq_simple() {
 #[test]
 fn mod_seq_zero() {
     // RFC 7162 Section 3.1.5: zero is a valid mod-sequence-valzer.
-    assert_eq!(SearchCriteria::new().mod_seq(0).as_str(), "MODSEQ 0");
+    assert_eq!(
+        SearchCriteria::new().mod_seq(0).unwrap().as_str(),
+        "MODSEQ 0"
+    );
 }
 
 #[test]
 fn mod_seq_combined_with_unseen() {
     // MODSEQ combined with other criteria via AND semantics
     // (RFC 3501 Section 6.4.4).
-    let c = SearchCriteria::new().unseen().mod_seq(100);
+    let c = SearchCriteria::new().unseen().mod_seq(100).unwrap();
     assert_eq!(c.as_str(), "UNSEEN MODSEQ 100");
 }
 
 #[test]
 fn mod_seq_large_value() {
     // RFC 7162 Section 3.1.5: mod-sequence-valzer can be up to 63 bits.
-    let c = SearchCriteria::new().mod_seq(9_999_999_999_999);
+    let c = SearchCriteria::new().mod_seq(9_999_999_999_999).unwrap();
     assert_eq!(c.as_str(), "MODSEQ 9999999999999");
 }
 
@@ -859,4 +862,19 @@ fn search_dates_share_append_calendar_rules() {
     for date in ["30-Feb-2025", "29-Feb-1900", "31-Apr-2025", "0-Jan-2025"] {
         assert!(validate_imap_date(date).is_err(), "{date}");
     }
+}
+
+#[test]
+fn modseq_refuses_values_above_protocol_ceiling() {
+    assert!(
+        SearchCriteria::new()
+            .mod_seq(crate::types::ModSeq::MAX)
+            .is_ok()
+    );
+    assert!(
+        SearchCriteria::new()
+            .mod_seq(crate::types::ModSeq::MAX + 1)
+            .is_err()
+    );
+    assert!(SearchCriteria::new().mod_seq(u64::MAX).is_err());
 }

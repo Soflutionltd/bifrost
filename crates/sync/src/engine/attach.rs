@@ -3,14 +3,75 @@
 
 use super::*;
 
-/// Until slot installation the attach future owns the only writer task. An
-/// error or cancellation must not detach a background durable-state owner.
-struct AttachingWriter(Option<tokio::task::JoinHandle<()>>);
+/// Owns pre-installation cleanup even when the caller drops attach. Keep the
+/// lifecycle reservation through bounded writer drain and account close. A retained
+/// sender must not prevent the user from attaching this account again forever.
+struct AttachingWriter {
+    lifecycle: Option<(
+        Arc<AsyncMutex<std::collections::HashSet<AccountId>>>,
+        AccountId,
+    )>,
+    account: Option<Arc<dyn Account>>,
+    writer: Option<tokio::task::JoinHandle<()>>,
+    close_timeout: Duration,
+    runtime: tokio::runtime::Handle,
+    bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
+}
+
+impl AttachingWriter {
+    fn launch_cleanup(&mut self) -> tokio::task::JoinHandle<()> {
+        let lifecycle = self.lifecycle.take();
+        let account = self.account.take();
+        let writer = self.writer.take();
+        let close_timeout = self.close_timeout;
+        let bandwidth_budget = self.bandwidth_budget.take();
+        self.runtime.spawn(async move {
+            // Workers or consumer-owned checkpoint handles can retain senders
+            // after setup fails. As on detach, bound the drain so a retained
+            // handle cannot reserve this account forever. A timed-out writer
+            // forfeits unpersisted acknowledgements, allowing redelivery.
+            if let Some(mut writer) = writer
+                && tokio::time::timeout(close_timeout, &mut writer)
+                    .await
+                    .is_err()
+            {
+                writer.abort();
+                tracing::warn!(
+                    target: "bifrost.sync.attach",
+                    timeout = ?close_timeout,
+                    "ack writer did not drain while unwinding attach; aborted with \
+                     potentially unpersisted checkpoints"
+                );
+            }
+            if let Some(account) = account {
+                match close_within(account.as_ref(), close_timeout).await {
+                    CloseOutcome::Closed => {}
+                    CloseOutcome::Refused(error) => tracing::warn!(
+                        target: "bifrost.sync.attach",
+                        error = ?error,
+                        "account close failed while unwinding attach"
+                    ),
+                    CloseOutcome::TimedOut => tracing::warn!(
+                        target: "bifrost.sync.attach",
+                        timeout = ?close_timeout,
+                        "account close timed out while unwinding attach"
+                    ),
+                }
+            }
+            drop(bandwidth_budget);
+            if let Some((inflight, account_id)) = lifecycle {
+                inflight.lock().await.remove(&account_id);
+            }
+        })
+    }
+}
 
 impl Drop for AttachingWriter {
     fn drop(&mut self) {
-        if let Some(writer) = &self.0 {
-            writer.abort();
+        if self.lifecycle.is_some() {
+            // Dropping the join handle detaches cleanup, rather than cancelling
+            // it along with the attach future. Ownership moved before spawning.
+            drop(self.launch_cleanup());
         }
     }
 }
@@ -46,12 +107,20 @@ impl SyncEngine {
             }
             guard.insert(account_id.clone());
         }
-        let result = self.attach_inner(account_id.clone(), factory).await;
-        // Always release the in-flight guard, success or failure.
-        {
-            let mut guard = self.lifecycle_inflight.lock().await;
-            guard.remove(&account_id);
+        let mut cleanup = AttachingWriter {
+            lifecycle: Some((Arc::clone(&self.lifecycle_inflight), account_id.clone())),
+            account: None,
+            writer: None,
+            close_timeout: self.config.detach_timeout,
+            runtime: tokio::runtime::Handle::current(),
+            bandwidth_budget: None,
+        };
+        let result = self.attach_inner(account_id, factory, &mut cleanup).await;
+        if result.is_ok() {
+            cleanup.account = None;
         }
+        // The spawned owner survives cancellation during this final wait too.
+        let _ = cleanup.launch_cleanup().await;
         result
     }
 
@@ -59,14 +128,15 @@ impl SyncEngine {
         &self,
         account_id: AccountId,
         factory: Arc<dyn AccountFactory>,
+        cleanup: &mut AttachingWriter,
     ) -> Result<SyncControl, Error> {
-        // Acquire before open so every protocol leg sees the slot policy while
-        // opening. A failed open releases this strong owner by RAII.
         let bandwidth_budget = self.bandwidth_registry.as_ref().map(|registry| {
             let budget = registry.budget(account_id.clone());
             budget.set_cap(None);
             budget
         });
+        // Cleanup retains the budget through writer drain and account close.
+        cleanup.bandwidth_budget = bandwidth_budget.clone();
         let OpenedAccount {
             account: opened,
             skipped_scopes,
@@ -74,27 +144,17 @@ impl SyncEngine {
             .open(account_id.clone())
             .await
             .map_err(Error::OpenFailed)?;
+        cleanup.account = Some(Arc::clone(&opened));
         log_open_skips(&account_id, &skipped_scopes, "attach");
-        let cleanup = Arc::clone(&opened);
-        let result = self
-            .attach_opened(
-                account_id,
-                factory,
-                opened,
-                skipped_scopes,
-                bandwidth_budget,
-            )
-            .await;
-        if result.is_err()
-            && let Err(error) = cleanup.close().await
-        {
-            tracing::warn!(
-                target: "bifrost.sync.attach",
-                error = ?error,
-                "account close failed while unwinding attach"
-            );
-        }
-        result
+        self.attach_opened(
+            account_id,
+            factory,
+            opened,
+            skipped_scopes,
+            bandwidth_budget,
+            cleanup,
+        )
+        .await
     }
 
     async fn attach_opened(
@@ -104,6 +164,7 @@ impl SyncEngine {
         opened: Arc<dyn Account>,
         skipped_scopes: Vec<SkippedScope>,
         bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
+        cleanup: &mut AttachingWriter,
     ) -> Result<SyncControl, Error> {
         // The open-time skip lane, kept live for the slot's lifetime:
         // reopen replaces it with the replacement open's answer, and
@@ -172,13 +233,13 @@ impl SyncEngine {
 
         let (ack_tx, ack_rx) = mpsc::channel::<WriterRequest>(256);
         let writer = WriterHandle::new(ack_tx.clone());
-        let mut attaching_writer = AttachingWriter(Some(tokio::spawn(ack_writer(
+        cleanup.writer = Some(tokio::spawn(ack_writer(
             account_id.clone(),
             Arc::clone(&self.checkpoints),
             control.clone(),
             Arc::clone(&pending_coverage),
             ack_rx,
-        ))));
+        )));
 
         // Drive cursor establishment per scope. We do this before
         // spawning stream workers because multiplexer + backfill
@@ -354,7 +415,7 @@ impl SyncEngine {
         // all fallible discovery and establishment operations have completed.
         spawn(
             crate::types::WorkerRole::AckWriter,
-            attaching_writer.0.take().expect("attach owns writer"),
+            cleanup.writer.take().expect("attach owns writer"),
         );
 
         // Control applier: forwards priority and bandwidth-cap
@@ -849,12 +910,23 @@ pub(super) async fn discover_scopes_from(account: &dyn Account) -> Result<Vec<Cu
 /// membership; folder-typed cursors cover only the matching folder;
 /// query cursors cover only the matching query.
 pub(super) fn scope_covers_membership(scope: &CursorScope, membership: &MembershipScope) -> bool {
-    use bifrost_types::FolderId;
+    use bifrost_types::{FolderId, ObjectType};
     match (scope, membership) {
         // Account-wide cursors cover every membership.
-        (CursorScope::Account, _) | (CursorScope::Type(_), _) => true,
+        (CursorScope::Account, _) => true,
+        // A DAV type must not claim mail solely because its id matches.
+        (CursorScope::Type(ty), MembershipScope::Mailbox(_)) => {
+            matches!(
+                ty,
+                ObjectType::Email | ObjectType::Mailbox | ObjectType::Thread
+            )
+        }
+        (CursorScope::Type(_), _) => true,
         // Folder-typed cursors cover the matching folder only.
         (CursorScope::Folder(folder), MembershipScope::Folder(m)) => folder == m,
+        // Folder memberships carry no object type. Preserve exact FolderId
+        // matching here; unlike Mailbox, this variant cannot distinguish DAV
+        // from mail without a richer membership identity.
         (CursorScope::FolderType { folder, .. }, MembershipScope::Folder(m)) => folder == m,
         // Folder-typed cursors over an arbitrary folder match mailbox
         // memberships that share the same id: the side index compares
@@ -866,10 +938,15 @@ pub(super) fn scope_covers_membership(scope: &CursorScope, membership: &Membersh
         (
             CursorScope::FolderType {
                 folder: FolderId(folder_id),
-                ..
+                ty,
             },
             MembershipScope::Mailbox(mbx),
-        ) => folder_id == &mbx.0,
+        ) => {
+            matches!(
+                ty,
+                ObjectType::Email | ObjectType::Mailbox | ObjectType::Thread
+            ) && folder_id == &mbx.0
+        }
         // Query cursors cover the same query membership.
         (CursorScope::Query(q), MembershipScope::Query(mq)) => q == mq,
         _ => false,
@@ -891,9 +968,6 @@ pub(super) async fn run_deferred_inventory_establishment(
     let shutdown = ctx.shutdown.clone();
     let throttles = Arc::clone(&ctx.throttles);
     let writer_tx = ctx.writer_tx.clone();
-    if !wait_for_real_subscriber(&ctx.delivery, &ctx.subscriber_notify, &shutdown).await {
-        return;
-    }
     // The walks run one after another, so a scope held by a throttle on IT
     // ALONE (a key the account declares for that scope, such as one mailbox's
     // budget) goes to the back of the queue instead of being slept on: the
@@ -904,6 +978,12 @@ pub(super) async fn run_deferred_inventory_establishment(
     let mut held_in_a_row = 0_usize;
     let mut earliest_hold: Option<std::time::Duration> = None;
     'queue: while let Some(inventory) = queue.pop_front() {
+        // Subscription is not permanent: the last reader may leave during a
+        // walk or between scopes. Keep undelivered work here until a reader
+        // joins, without spending recovery retries or polling the provider.
+        if !wait_for_real_subscriber(&ctx.delivery, &ctx.subscriber_notify, &shutdown).await {
+            return;
+        }
         let scope = inventory.scope().clone();
         if shutdown.is_cancelled() {
             return;
@@ -1016,11 +1096,15 @@ pub(super) async fn run_deferred_inventory_establishment(
             break result;
         };
         match outcome {
-            // A reset or deletion of the scope closed while the item waited or
-            // walked. Whoever closed it owns nothing for an unregistered scope,
-            // so hand it to the listener, which establishes it only if it is
-            // still absent and its lifecycle epoch has not moved since attach.
-            // Sent with no admission or activity held.
+            Ok(crate::multiplexer::FusionOutcome::Undelivered) => {
+                // Preserve Start versus Resume and the fence. If a reset or
+                // deletion superseded this walk, the next queue turn hands it
+                // to the listener instead of resurrecting an obsolete cursor.
+                queue.push_back(inventory);
+            }
+            // A reset or deletion superseded the walk. Hand it to the listener
+            // with no admission or activity held; it establishes only if the
+            // scope is absent and its lifecycle epoch has not moved since attach.
             Ok(crate::multiplexer::FusionOutcome::Invalidated) => {
                 let request = ReopenRequest::EstablishIfAbsent {
                     scope,
@@ -1059,6 +1143,13 @@ pub(super) async fn run_deferred_inventory_establishment(
                 );
             }
             Ok(crate::multiplexer::FusionOutcome::Terminated(error)) => {
+                // Fusion publishes the termination; this owner records its
+                // recovery effects once before forwarding to the listener.
+                let _ = crate::recovery::dispatch_stream_failure(
+                    error.clone(),
+                    &ctx.throttles,
+                    &account_id,
+                );
                 ctx.recover(Some(scope.clone()), error, Some(walked_generation))
                     .await;
             }
@@ -1163,6 +1254,66 @@ mod tests {
     use super::*;
     use crate::cursor::CheckpointStore;
     use crate::test_common as common;
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_attach_cleanup_bounds_a_writer_with_a_retained_sender() {
+        let id = AccountId("failed-attach-retained-sender".into());
+        let lifecycle = Arc::new(AsyncMutex::new(std::collections::HashSet::from([
+            id.clone()
+        ])));
+        let (sender, mut receiver) = mpsc::channel::<()>(1);
+        let writer = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+        let abort = writer.abort_handle();
+        let mut cleanup = AttachingWriter {
+            lifecycle: Some((Arc::clone(&lifecycle), id.clone())),
+            account: None,
+            writer: Some(writer),
+            close_timeout: Duration::from_secs(1),
+            runtime: tokio::runtime::Handle::current(),
+            bandwidth_budget: None,
+        };
+        let task = cleanup.launch_cleanup();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("retained sender must not block cleanup")
+            .expect("cleanup task");
+        assert!(!lifecycle.lock().await.contains(&id));
+        // Join cancellation is asynchronous; yield until the writer observes it.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer aborted");
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn attaching_cleanup_can_be_dropped_outside_an_entered_runtime() {
+        let id = AccountId("attach-drop-outside-runtime".into());
+        let lifecycle = Arc::new(AsyncMutex::new(std::collections::HashSet::from([
+            id.clone()
+        ])));
+        let cleanup = AttachingWriter {
+            lifecycle: Some((Arc::clone(&lifecycle), id.clone())),
+            account: None,
+            writer: None,
+            close_timeout: Duration::from_secs(1),
+            runtime: tokio::runtime::Handle::current(),
+            bandwidth_budget: None,
+        };
+        std::thread::spawn(move || drop(cleanup))
+            .join()
+            .expect("drop must not panic");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lifecycle.lock().await.contains(&id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("captured runtime executes cleanup");
+    }
 
     #[tokio::test]
     async fn attach_defers_a_resume_stream_rejected_by_its_classifier() {

@@ -1203,10 +1203,12 @@ sent, with those other recipients reported on its receipt; retrying the entire
 message would duplicate delivery. With none acknowledged,
 `AcceptanceUncertain(&AccountError)` preserves the first uncertain error,
 `Rejected(&AccountError)` preserves the first failed error only when there is no
-uncertainty, and `Empty` identifies a batch without outcomes. Whether uncertain
-acceptance becomes a send error or an uncertain receipt remains a caller policy
-awaiting an owner decision. The helper deliberately supplies no `Result`
-projection for that case.
+uncertainty, and `Empty` identifies a batch without outcomes. The helper leaves
+the `Result` projection to its caller. The account submission facade returns
+`Err` with a clone of the first uncertain error when no recipient acknowledged
+acceptance, preserving uncertainty so the caller can reconcile before retrying.
+It does not return an uncertain receipt in that case. Other direct batch callers
+retain their own UI and retry policy.
 
 The direct APIs retain their distinct contracts. Direct SMTP's single
 `Response` cannot retain recipient refusals alongside partial delivery, so it
@@ -1246,3 +1248,19 @@ IMAP keeps credential inheritance, default From and Sent-folder policy.
 
 Blocking OAuth snapshot contention uses `TokenSnapshot::contention_account_error`
 for transient authentication recovery, without fabricating a network failure.
+
+OAuth credentials with no allowed advertised OAuth mechanism fail locally with
+a policy error in both drivers before certificate resolution or password
+selection. A token must never enter the password authentication ladder.
+
+`MessageError::TooManyFrom` remains public and is still produced by the message
+builder for multiple authors without Sender. Multiple authors with one Sender
+are valid; header-derived envelope conversion instead returns `InvalidInput`
+for invalid author/Sender combinations.
+
+The submission facade stamps its own malformed-envelope and HOLDUNTIL failures
+with `Protocol::Smtp`: SMTP owns those validations even in an IMAP-composed
+account. With the optional `tracing` feature, committed partial submissions
+emit a warning with delivered, failed and uncertain counts and no addresses.
+`jiff` is optional and enabled by `tokio` for HOLDUNTIL formatting; the facade
+itself additionally requires `account-error`.

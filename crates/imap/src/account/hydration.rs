@@ -85,9 +85,31 @@ pub(super) fn push_native_thread_attrs(
 /// hydration APIs start here; one returns these bytes and the other parses
 /// them through `bifrost_types::mime`.
 pub(super) fn decode_body(fetch: &mut FetchResponse) -> Option<bytes::Bytes> {
+    decode_selected_body(fetch, BodySelection::Whole)
+}
+
+/// Consume only the requested section and origin. Enterprise users expect a
+/// complete message to contain its own bytes, never an unsolicited part or a
+/// partial chunk that happened to arrive first. Preserve other observations.
+pub(super) fn decode_selected_body(
+    fetch: &mut FetchResponse,
+    selection: BodySelection,
+) -> Option<bytes::Bytes> {
+    let (section, origin) = match selection {
+        BodySelection::None => return None,
+        BodySelection::Headers => ("HEADER", None),
+        BodySelection::Preview(_) => ("", Some(0)),
+        BodySelection::Whole => ("", None),
+    };
+    let requested = crate::types::fetch::BodySection {
+        section: section.to_owned(),
+        origin,
+        data: None,
+    };
     fetch
         .body_sections
         .iter_mut()
+        .filter(|section| section.same_fetch_key(&requested))
         .find_map(|section| section.data.take())
 }
 
@@ -242,11 +264,8 @@ mod tests {
         assert!(selection.needs_body_budget());
     }
 
-    // `decode_body` replaced two different extractors: one consumed
-    // `body_sections` by value, the other borrowed the first section's data.
-    // Both took the FIRST section carrying data, skipping any that carry none.
     #[test]
-    fn decode_body_takes_the_first_section_that_actually_carries_data() {
+    fn decode_body_takes_only_the_requested_whole_message() {
         use crate::types::fetch::BodySection;
 
         let mut fetch = FetchResponse {
@@ -254,7 +273,7 @@ mod tests {
                 BodySection {
                     section: "HEADER".to_owned(),
                     origin: None,
-                    data: None,
+                    data: Some(b"wrong headers".to_vec().into()),
                 },
                 BodySection {
                     section: String::new(),
@@ -274,8 +293,7 @@ mod tests {
             Some(b"payload".as_slice())
         );
 
-        // Nothing to decode is `None`, not an empty body: the generic path
-        // turns that into empty bytes while PIM skips MIME parsing entirely.
+        // Missing requested data is absent, never an unrelated payload.
         let mut empty = FetchResponse::default();
         assert_eq!(decode_body(&mut empty), None);
 
@@ -288,6 +306,54 @@ mod tests {
             ..FetchResponse::default()
         };
         assert_eq!(decode_body(&mut all_absent), None);
+    }
+
+    #[test]
+    fn selected_body_keeps_origins_distinct_and_preserves_other_payloads() {
+        use crate::types::fetch::BodySection;
+        let mut fetch = FetchResponse {
+            body_sections: vec![
+                BodySection {
+                    section: String::new(),
+                    origin: Some(7),
+                    data: Some("later".into()),
+                },
+                BodySection {
+                    section: String::new(),
+                    origin: None,
+                    data: Some("whole".into()),
+                },
+                BodySection {
+                    section: String::new(),
+                    origin: Some(0),
+                    data: Some("prefix".into()),
+                },
+                BodySection {
+                    section: "header".into(),
+                    origin: None,
+                    data: Some("headers".into()),
+                },
+            ],
+            ..FetchResponse::default()
+        };
+        assert_eq!(decode_selected_body(&mut fetch, BodySelection::None), None);
+        assert_eq!(
+            decode_selected_body(&mut fetch, BodySelection::Preview(1)).as_deref(),
+            Some(b"prefix".as_slice())
+        );
+        assert_eq!(
+            decode_body(&mut fetch).as_deref(),
+            Some(b"whole".as_slice())
+        );
+        assert_eq!(
+            decode_selected_body(&mut fetch, BodySelection::Headers).as_deref(),
+            Some(b"headers".as_slice())
+        );
+        assert_eq!(decode_body(&mut fetch), None);
+        assert_eq!(
+            fetch.body_sections[0].data.as_deref(),
+            Some(b"later".as_slice())
+        );
     }
 
     #[test]

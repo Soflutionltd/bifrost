@@ -829,8 +829,10 @@ impl Consumer for EnableConsumer {
         _ctx: &ConsumerContext,
     ) {
         match resp {
-            UntaggedResponse::Enabled(exts) if self.caps.is_none() => {
-                self.caps = Some(exts);
+            UntaggedResponse::Enabled(exts) => {
+                // Every frame updates live negotiation; return that same full
+                // observation so callers do not mistake enabled modes for refusals.
+                self.caps.get_or_insert_with(Vec::new).extend(exts);
             }
             other => self.buffered.push(other),
         }

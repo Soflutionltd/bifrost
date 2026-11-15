@@ -51,6 +51,7 @@ use bifrost_types::{Checkpoint, CursorScope, InventoryCoverageReport};
 /// the batch using `encode_ack_token`, not only its numeric identity.
 #[derive(Debug, Clone)]
 pub struct PublicationReceipt {
+    pub(crate) account: Option<bifrost_types::AccountId>,
     pub(crate) replay: Option<Vec<super::DebtLedger>>,
     /// The exact checkpoint lane this receipt may acknowledge. `None` is the
     /// repair lane, which intentionally has no checkpoint.
@@ -165,6 +166,9 @@ impl std::fmt::Display for PublicationNumber {
 /// ordering, and [`PendingCoverage::minted_here`] can tell a replay from a
 /// prior attachment apart from anything this one issued.
 ///
+/// Account writers bind the receipt to an account before publishing. Replay
+/// checks that identity before resolving either live or restored evidence.
+///
 /// Receipt-based ack replay is otherwise scoped to a single `PendingCoverage`
 /// instance per attachment, so across a detach and re-attach a late ack of a
 /// PRIOR incarnation's publication replays from its receipt. For a CHANGE cursor
@@ -197,13 +201,14 @@ impl AckToken {
 
 impl PartialEq for AckToken {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.0 == other.0 && self.1.account == other.1.account
     }
 }
 impl Eq for AckToken {}
 impl std::hash::Hash for AckToken {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state);
+        self.1.account.hash(state);
     }
 }
 impl PartialOrd for AckToken {
@@ -213,7 +218,13 @@ impl PartialOrd for AckToken {
 }
 impl Ord for AckToken {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
+        self.0.cmp(&other.0).then_with(|| {
+            self.1
+                .account
+                .as_ref()
+                .map(|account| &account.0)
+                .cmp(&other.1.account.as_ref().map(|account| &account.0))
+        })
     }
 }
 
@@ -485,6 +496,11 @@ struct BoundaryEntry {
     /// the growth is over the whole scope's backfill. A consumer that never
     /// acknowledges therefore retains one `AckToken`, and with it one
     /// `PublicationReceipt` and its whole coverage claim, per page of the walk.
+    /// The cumulative claim is also intentional restart evidence: an application
+    /// can save any page token and retry its acknowledgement after a crash. A
+    /// number-only receipt would lose both that page's debt and its coverage
+    /// proof. Bounding this requires a durable evidence owner and a new token
+    /// contract, not dropping evidence from tokens already handed out.
     /// Filed rather than fixed: dropping a read subsumed page's receipt claim once
     /// every eligible reader has read it would bound this, at the cost of the
     /// departure sweep no longer being able to judge that page's completion
@@ -689,6 +705,7 @@ pub(crate) const PENDING_BOUNDARY_CAP: usize = 1024;
 /// Per-account publication registry.
 #[derive(Debug)]
 pub struct PendingCoverage {
+    pub(crate) account: Option<bifrost_types::AccountId>,
     ledger: Mutex<Ledger>,
     delivery_owner: Mutex<Option<std::sync::Weak<crate::multiplexer::ChangeDelivery>>>,
     next: AtomicU64,
@@ -736,13 +753,13 @@ impl Default for PendingCoverage {
     fn default() -> Self {
         let segment = NEXT_LEDGER_ID.fetch_add(1, Ordering::Relaxed);
         Self {
+            account: None,
             ledger: Mutex::new(Ledger::default()),
             delivery_owner: Mutex::new(None),
             next: AtomicU64::new(segment << Self::SEGMENT_SHIFT),
             segment,
-            // Proof order is still attachment-local. Restored durable proof
-            // generations do not seed this counter; typing does not change
-            // that existing cross-attachment ordering policy.
+            // Standalone registries start at zero. The account writer restores
+            // durable proof order before installing any producers.
             next_generation: AtomicU64::new(0),
             undelivered: Mutex::new(HashMap::new()),
             discard_requests: Mutex::new(HashSet::new()),
@@ -778,22 +795,25 @@ impl PendingCoverage {
     // Membership numbers are local to one delivery gate. Keep its weak identity
     // even after departure so a second gate cannot reuse numbers in this ledger.
     // This lock never reaches back into delivery; lock order stays delivery first.
+    #[must_use]
     pub(crate) fn bind_delivery(
         &self,
         delivery: &std::sync::Arc<crate::multiplexer::ChangeDelivery>,
-    ) {
+    ) -> bool {
         let mut owner = self
             .delivery_owner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let candidate = std::sync::Arc::downgrade(delivery);
         if let Some(bound) = owner.as_ref() {
-            assert!(
-                bound.ptr_eq(&candidate),
-                "coverage ledger already bound to another delivery gate"
-            );
+            // Refuse even if the original gate has departed: its receiver
+            // numbers and outstanding publications still belong to this ledger.
+            // Rebinding could let another gate's reads or departures settle them.
+            // Users expect a refused stream rather than misrouted acknowledgements.
+            bound.ptr_eq(&candidate)
         } else {
             *owner = Some(candidate);
+            true
         }
     }
 
@@ -873,6 +893,7 @@ impl PendingCoverage {
     /// the boundary registration - from ever existing separately.
     pub(crate) fn publish(&self, claim: CoverageClaim) -> AckToken {
         let receipt = PublicationReceipt {
+            account: self.account.clone(),
             replay: None,
             checkpoint: None,
             claim: claim.clone(),
@@ -937,6 +958,7 @@ impl PendingCoverage {
         lane: Lane,
     ) -> Result<AckToken, CoverageClaim> {
         let receipt = PublicationReceipt {
+            account: self.account.clone(),
             replay: None,
             checkpoint: Some(checkpoint.clone()),
             claim: claim.clone(),
@@ -1232,7 +1254,7 @@ impl PendingCoverage {
     /// any state about the attachment that minted it.
     #[must_use]
     pub fn minted_here(&self, id: &AckToken) -> bool {
-        id.0.0 >> Self::SEGMENT_SHIFT == self.segment
+        id.1.account == self.account && id.0.0 >> Self::SEGMENT_SHIFT == self.segment
     }
 
     /// Record that a publication's batch has actually been BROADCAST, and how
@@ -2009,7 +2031,14 @@ impl PendingCoverage {
     // survivor receipt already handed to a consumer. Restart replay therefore
     // cannot recover this later fold. Production checkpoint publication folds
     // before freezing the receipt in register_lane_in instead.
+    // A receipt already saved in an external transaction cannot be changed by
+    // this registry. Mutating shared memory would only fix same-process clones,
+    // not saved bytes. This method remains a live-registry operation; durable
+    // supersession must use register's fold before publishing the survivor.
     pub fn supersede(&self, superseded: AckToken, survivor: AckToken) {
+        if superseded.1.account != self.account || survivor.1.account != self.account {
+            return;
+        }
         let mut ledger = self.guard();
         let Some(old) = ledger.claims.remove(&superseded) else {
             return;
@@ -2046,6 +2075,11 @@ impl PendingCoverage {
     }
 
     fn claim_in(&self, id: AckToken, lane: &Lane) -> ClaimLookup {
+        // Check before numeric identity, live claims, or replay fallback. Process
+        // restarts can reuse numeric segments; account identity is durable.
+        if id.1.account != self.account {
+            return ClaimLookup::Unknown;
+        }
         let mut ledger = self.guard();
         // The fence is checked before the live claims, not only after them: a
         // publication registered DURING a scope reset's store deletes is still
@@ -2155,6 +2189,9 @@ impl PendingCoverage {
     }
 
     fn settle_in(&self, id: AckToken, lane: Lane) {
+        if id.1.account != self.account {
+            return;
+        }
         let mut ledger = self.guard();
         let watermark = ledger.persisted.entry(lane).or_insert(id.clone());
         if *watermark < id {
@@ -2266,15 +2303,17 @@ pub type Publications = PendingCoverage;
 #[cfg(test)]
 mod tests {
     #[test]
-    #[should_panic(expected = "coverage ledger already bound to another delivery gate")]
     fn a_ledger_cannot_share_receiver_numbers_between_delivery_gates() {
         let ledger = super::PendingCoverage::new();
         let (tx, _) = tokio::sync::broadcast::channel(1);
         let first = std::sync::Arc::new(crate::multiplexer::ChangeDelivery::new(tx.clone()));
         let second = std::sync::Arc::new(crate::multiplexer::ChangeDelivery::new(tx));
-        ledger.bind_delivery(&first);
-        ledger.bind_delivery(&first);
-        ledger.bind_delivery(&second);
+        assert!(ledger.bind_delivery(&first));
+        assert!(ledger.bind_delivery(&first));
+        assert!(!ledger.bind_delivery(&second));
+        assert!(ledger.bind_delivery(&first));
+        drop(first);
+        assert!(!ledger.bind_delivery(&second));
     }
 
     use super::{ClaimLookup, CoverageClaim, Lane, PendingCoverage};
