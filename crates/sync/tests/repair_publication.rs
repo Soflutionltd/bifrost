@@ -68,7 +68,6 @@ async fn recovered_ids_are_published_under_their_own_scope() {
                 entry: Box::new(InventoryEntry {
                     id,
                     memberships: Vec::new(),
-                    size: None,
                     blob_id: None,
                     fingerprint: bifrost_types::Fingerprint {
                         server_version: bifrost_types::ServerVersion::Unavailable,

@@ -224,59 +224,6 @@ impl Reconciler {
                 );
                 continue;
             }
-            // An ACCOUNT-WIDE hold blocks every scope equally, so sleeping it
-            // out inline stalls nothing that could otherwise run. Re-checked
-            // after waking: a longer deadline can land mid-sleep.
-            while let Some(wait) =
-                crate::recovery::account_throttle_wait(&self.throttles, &self.account_id)
-            {
-                tracing::debug!(
-                    target: "bifrost.sync.reconcile",
-                    account = ?self.account_id,
-                    scope = ?scope,
-                    wait_secs = wait.as_secs(),
-                    "reconcile deferred by shared throttle deadline"
-                );
-                tokio::select! {
-                    () = self.shutdown.cancelled() => return Ok(()),
-                    () = tokio::time::sleep(wait) => {}
-                }
-            }
-            // A SCOPE-LOCAL hold defers this scope alone; the sweep carries on.
-            let keys = self.scope_keys(&scope);
-            if crate::recovery::throttle_wait(&self.throttles, &self.account_id, &keys).is_some() {
-                deferred.insert(scope);
-                continue;
-            }
-            let _admission = tokio::select! {
-                () = self.shutdown.cancelled() => return Ok(()),
-                permit = self.scheduler.admit(
-                    self.account_id.clone(),
-                    self.control.priority_snapshot(),
-                    crate::scheduler::WorkKind::Sync,
-                ) => match permit {
-                    Ok(permit) => permit,
-                    Err(error) => {
-                        // Same rule as E6: one scope's failure must not
-                        // abandon its siblings in this sweep.
-                        tracing::warn!(
-                            target: "bifrost.sync.scheduler",
-                            scope = ?scope,
-                            %error,
-                            "push admission refused; skipping this scope for the sweep"
-                        );
-                        continue;
-                    }
-                },
-            };
-            // Admission can park, and a hold recorded meanwhile predates this
-            // drive. Re-check with the permit in hand; on a hold, release it
-            // and defer, rather than carry a permit across a throttle wait.
-            if crate::recovery::throttle_wait(&self.throttles, &self.account_id, &keys).is_some() {
-                drop(_admission);
-                deferred.insert(scope);
-                continue;
-            }
             // Same reasoning as the poll loop's: the drive's own boundary arm
             // answers `Stop` and `Pause`, and this covers root cancellation
             // arriving before this account's detach publishes `Stop`.
@@ -295,7 +242,9 @@ impl Reconciler {
                 driven = self
                 .cursors
                 .with_drive(&scope, |cursor, registry_generation| {
-                    let account_swap = self.account.load_full();
+                    let account_swap = Arc::clone(&self.account);
+                    let scheduler = self.scheduler.clone();
+                    let shutdown = self.shutdown.clone();
                     let cursors = Arc::clone(&self.cursors);
                     let delivery = Arc::clone(&self.delivery);
                     let boundary = self.boundary.clone();
@@ -304,22 +253,25 @@ impl Reconciler {
                     let throttles = Arc::clone(&self.throttles);
                     let account_id = self.account_id.clone();
                     async move {
-                        // The LAST check before the wire: `with_drive` can park
-                        // on the drive lease after admission, and a hold
-                        // recorded meanwhile predates this drive. The keys are
-                        // asked of the account this drive runs against, not
-                        // cached across the waits: a reopen can change them.
+                        let gate = crate::engine::drive_start::DriveStart {
+                            current: &account_swap, control: &control, scheduler: &scheduler,
+                            throttles: &throttles, account_id: &account_id, shutdown: &shutdown,
+                        };
+                        let admitted = match gate.admit_drive(
+                            bifrost_types::ThrottleWork::Scope(&scope),
+                            crate::scheduler::WorkKind::Sync,
+                        ).await {
+                            Ok(admitted) => admitted,
+                            Err(refusal) => return Err(refusal),
+                        };
+                        if cursors.drive_generation(&scope) != registry_generation {
+                            return Err(crate::engine::drive_start::StartRefused::Paused);
+                        }
+                        let account_swap = &admitted.incarnation;
                         let account: &dyn Account = account_swap.as_ref().as_ref();
                         let final_keys = crate::recovery::declared_keys(
-                            account,
-                            &account_id,
-                            bifrost_types::ThrottleWork::Scope(&scope),
+                            account, &account_id, bifrost_types::ThrottleWork::Scope(&scope),
                         );
-                        if crate::recovery::throttle_wait(&throttles, &account_id, &final_keys)
-                            .is_some()
-                        {
-                            return (final_keys, None);
-                        }
                         let outcome = drive_changes_stream(
                             account,
                             scope,
@@ -335,29 +287,23 @@ impl Reconciler {
                         // throttled drive's hint is kept is a question about
                         // THIS account's declaration, not the one computed
                         // before admission.
-                        (
-                            final_keys,
-                            Some((registry_generation, account_swap.generation(), outcome)),
-                        )
+                        Ok((final_keys, (registry_generation, account_swap.generation(), outcome)))
                     }
                 }) => driven,
             };
-            let (keys, driven) = match driven {
-                Some((keys, driven)) => (keys, Some(driven)),
-                None => (keys, None),
+            let (keys, (drive_generation, incarnation, outcome)) = match driven {
+                None => continue,
+                Some(Ok(driven)) => driven,
+                Some(Err(crate::engine::drive_start::StartRefused::ShuttingDown)) => return Ok(()),
+                Some(Err(crate::engine::drive_start::StartRefused::Paused)) => {
+                    work.intent.scopes.insert(scope);
+                    return Ok(());
+                }
+                Some(Err(crate::engine::drive_start::StartRefused::Held { .. })) => {
+                    deferred.insert(scope);
+                    continue;
+                }
             };
-            drop(_admission);
-            // No result: the scope is gone, or left mid-drive. Either way it is
-            // not ours to re-drive, and its siblings in this hint still are.
-            let Some(driven) = driven else {
-                continue;
-            };
-            // Held at the last check: defer it like any other held scope.
-            let Some(outcome) = driven else {
-                deferred.insert(scope);
-                continue;
-            };
-            let (drive_generation, incarnation, outcome) = outcome;
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 // An account error already carries a complete recovery
@@ -449,9 +395,9 @@ impl Reconciler {
                             // wastes wire calls against cursors it is about
                             // to discard.
                             let account_wide = directive_scope.is_none();
-                            // Nothing is held here: admission was dropped
-                            // above, the lease ended with `with_drive`, and
-                            // the drive's activity guard ended inside it. So
+                            // Nothing is held here: admission and activity
+                            // ended inside the lease-protected closure, and
+                            // the lease ended with `with_drive`. So
                             // a full channel behind a listener parked in
                             // `wait_until_running` stalls only this task and
                             // cannot keep a pause or `checkpoint_now` from

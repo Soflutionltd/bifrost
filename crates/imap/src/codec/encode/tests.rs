@@ -28,36 +28,38 @@ fn admit_and_encode_to_buf(
 /// generous set of capabilities that allows all commands to encode.
 fn opts(literal_mode: LiteralMode, utf8_mode: bool) -> EncodeOptions {
     EncodeOptions {
-        utf8_mode,
+        utf8_mode: utf8_mode.into(),
         literal_mode,
         // Include all commonly needed capabilities so existing tests
         // do not fail due to the new prerequisite checks.
-        capabilities: vec![
-            Capability::Imap4Rev1,
-            Capability::StartTls,
-            Capability::Idle,
-            Capability::Enable,
-            Capability::Condstore,
-            Capability::QResync,
-            Capability::Move,
-            Capability::Unselect,
-            Capability::Unauthenticate,
-            Capability::Namespace,
-            Capability::Id,
-            Capability::Metadata,
-            Capability::CompressDeflate,
-            Capability::Quota,
-            Capability::QuotaSet,
-            Capability::Acl,
-            Capability::Notify,
-            Capability::UidPlus,
-            Capability::CreateSpecialUse,
-            Capability::LiteralPlus,
-            Capability::LiteralMinus,
-            Capability::Sort,
-            Capability::from_imap_str("THREAD=REFERENCES"),
-        ],
-        enabled: Vec::new(),
+        session: crate::types::profile::SessionCapabilities::new(
+            vec![
+                Capability::Imap4Rev1,
+                Capability::StartTls,
+                Capability::Idle,
+                Capability::Enable,
+                Capability::Condstore,
+                Capability::QResync,
+                Capability::Move,
+                Capability::Unselect,
+                Capability::Unauthenticate,
+                Capability::Namespace,
+                Capability::Id,
+                Capability::Metadata,
+                Capability::CompressDeflate,
+                Capability::Quota,
+                Capability::QuotaSet,
+                Capability::Acl,
+                Capability::Notify,
+                Capability::UidPlus,
+                Capability::CreateSpecialUse,
+                Capability::LiteralPlus,
+                Capability::LiteralMinus,
+                Capability::Sort,
+                Capability::from_imap_str("THREAD=REFERENCES"),
+            ],
+            Vec::new(),
+        ),
     }
 }
 
@@ -116,7 +118,7 @@ fn fragment(mode: LiteralMode, write: impl FnOnce(&mut CommandWriter)) -> Vec<u8
 fn assert_string_nul_rejected(data: &[u8]) {
     let mut w = CommandWriter::new(&default_opts());
     w.raw(b"A001 X ");
-    w.string(data, false);
+    w.string(data, crate::codec::utf7::WireMode::ModifiedUtf7);
     w.raw(b"\r\n");
     assert!(matches!(
         w.finish(),
@@ -135,11 +137,13 @@ fn try_fragment(
 }
 
 fn push_quoted_or_literal(buf: &mut BytesMut, data: &[u8], mode: LiteralMode) {
-    buf.extend_from_slice(&fragment(mode, |w| w.string(data, false)));
+    buf.extend_from_slice(&fragment(mode, |w| {
+        w.string(data, crate::codec::utf7::WireMode::ModifiedUtf7);
+    }));
 }
 
 fn push_quoted_or_literal_utf8(buf: &mut BytesMut, data: &[u8], utf8: bool, mode: LiteralMode) {
-    buf.extend_from_slice(&fragment(mode, |w| w.string(data, utf8)));
+    buf.extend_from_slice(&fragment(mode, |w| w.string(data, (utf8).into())));
 }
 
 fn push_metadata_value(buf: &mut BytesMut, data: &[u8], mode: LiteralMode) {
@@ -161,7 +165,7 @@ fn push_login(
     mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     buf.extend_from_slice(&try_fragment(mode, |w| {
-        encode_login(w, tag, user, pass, utf8)
+        encode_login(w, tag, user, pass, (utf8).into())
     })?);
     Ok(())
 }
@@ -178,7 +182,7 @@ fn push_select_or_examine(
     mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     buf.extend_from_slice(&try_fragment(mode, |w| {
-        encode_select_or_examine(w, tag, cmd, mailbox, condstore, qresync, utf8)
+        encode_select_or_examine(w, tag, cmd, mailbox, condstore, qresync, (utf8).into())
     })?);
     Ok(())
 }
@@ -195,7 +199,7 @@ fn push_getmetadata(
     mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     buf.extend_from_slice(&try_fragment(mode, |w| {
-        encode_getmetadata(w, tag, mailbox, entries, max_size, depth, utf8)
+        encode_getmetadata(w, tag, mailbox, entries, max_size, depth, (utf8).into())
     })?);
     Ok(())
 }
@@ -211,9 +215,13 @@ fn push_getmetadata(
 /// RFC 6855 `UTF8=ACCEPT` enable, which is what selects the `UTF8 (` wrapper.
 fn append_opts(literal_mode: LiteralMode, utf8: bool) -> EncodeOptions {
     let mut o = opts(literal_mode, utf8);
-    o.capabilities.push(Capability::MultiAppend);
+    std::sync::Arc::make_mut(&mut o.session)
+        .capabilities
+        .push(Capability::MultiAppend);
     if utf8 {
-        o.enabled.push("UTF8=ACCEPT".to_owned());
+        std::sync::Arc::make_mut(&mut o.session)
+            .enabled
+            .insert(Capability::from_imap_str("UTF8=ACCEPT"));
     }
     o
 }
@@ -311,13 +319,15 @@ fn append_wire(
 #[test]
 fn encode_enable_uses_imap4rev2_base_capability() {
     let opts = EncodeOptions {
-        utf8_mode: false,
+        utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
         literal_mode: LiteralMode::Synchronizing,
-        capabilities: vec![Capability::Imap4Rev2],
-        enabled: Vec::new(),
+        session: crate::types::profile::SessionCapabilities::new(
+            vec![Capability::Imap4Rev2],
+            Vec::new(),
+        ),
     };
     let cmd = Command::Enable {
-        capabilities: vec!["QRESYNC".to_owned()],
+        capabilities: vec![Capability::QResync],
     };
     let encoded = encode_command("A001", &cmd, &opts).unwrap();
     assert_eq!(&encoded.to_vec()[..], b"A001 ENABLE QRESYNC\r\n");
@@ -326,10 +336,12 @@ fn encode_enable_uses_imap4rev2_base_capability() {
 #[test]
 fn encode_options_treats_list_status_as_imap4rev2_base_capability() {
     let opts = EncodeOptions {
-        utf8_mode: false,
+        utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
         literal_mode: LiteralMode::Synchronizing,
-        capabilities: vec![Capability::Imap4Rev2],
-        enabled: Vec::new(),
+        session: crate::types::profile::SessionCapabilities::new(
+            vec![Capability::Imap4Rev2],
+            Vec::new(),
+        ),
     };
 
     assert!(opts.has_capability(&Capability::ListStatus));
@@ -346,10 +358,12 @@ fn encode_options_capability_answers_match_the_authority() {
 
     for (capabilities, enabled) in connection_states() {
         let opts = EncodeOptions {
-            utf8_mode: false,
+            utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
             literal_mode: LiteralMode::Synchronizing,
-            capabilities: capabilities.clone(),
-            enabled: enabled.clone(),
+            session: crate::types::profile::SessionCapabilities::new(
+                capabilities.clone(),
+                enabled.clone(),
+            ),
         };
         for capability in every_capability() {
             assert_eq!(
@@ -365,10 +379,12 @@ fn encode_options_capability_answers_match_the_authority() {
     }
 
     let qresync_only = EncodeOptions {
-        utf8_mode: false,
+        utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
         literal_mode: LiteralMode::Synchronizing,
-        capabilities: vec![Capability::QResync],
-        enabled: Vec::new(),
+        session: crate::types::profile::SessionCapabilities::new(
+            vec![Capability::QResync],
+            Vec::new(),
+        ),
     };
     assert!(qresync_only.has_condstore());
 }
@@ -2720,7 +2736,9 @@ fn append_utf8_extension_wraps_every_message_of_a_multiappend() {
 fn audit_finding6_append_header_uses_literal8_for_binary_append() {
     let msgs = [append_nul_msg(12)];
     let mut o = append_opts(LiteralMode::Synchronizing, false);
-    o.capabilities.push(Capability::Binary);
+    std::sync::Arc::make_mut(&mut o.session)
+        .capabilities
+        .push(Capability::Binary);
     assert_eq!(
         append_wire("A001", "INBOX", &msgs, false, &o),
         "A001 APPEND \"INBOX\" ~{12}\r\n<12>\r\n"
@@ -2772,7 +2790,9 @@ fn multiappend_nul_body_without_binary_is_refused_in_any_position() {
 fn append_literal8_plus_marker_matrix() {
     let binary = |mode: LiteralMode| {
         let mut o = append_opts(mode, false);
-        o.capabilities.push(Capability::Binary);
+        std::sync::Arc::make_mut(&mut o.session)
+            .capabilities
+            .push(Capability::Binary);
         o
     };
     let small = [append_nul_msg(100)];
@@ -2825,14 +2845,16 @@ fn append_literal8_plus_marker_matrix() {
 
     // Pure rev2 with BINARY advertised: literal8 is always synchronizing.
     let rev2_binary = EncodeOptions {
-        utf8_mode: true,
+        utf8_mode: crate::codec::utf7::WireMode::Utf8,
         literal_mode: LiteralMode::LiteralMinus,
-        capabilities: vec![
-            Capability::Imap4Rev2,
-            Capability::MultiAppend,
-            Capability::Binary,
-        ],
-        enabled: Vec::new(),
+        session: crate::types::profile::SessionCapabilities::new(
+            vec![
+                Capability::Imap4Rev2,
+                Capability::MultiAppend,
+                Capability::Binary,
+            ],
+            Vec::new(),
+        ),
     };
     assert_eq!(
         append_wire("A", "INBOX", &small, false, &rev2_binary),
@@ -2848,10 +2870,12 @@ fn append_literal8_plus_marker_matrix() {
 #[test]
 fn rev2_does_not_imply_binary_for_append() {
     let rev2 = EncodeOptions {
-        utf8_mode: true,
+        utf8_mode: crate::codec::utf7::WireMode::Utf8,
         literal_mode: LiteralMode::LiteralMinus,
-        capabilities: vec![Capability::Imap4Rev2],
-        enabled: Vec::new(),
+        session: crate::types::profile::SessionCapabilities::new(
+            vec![Capability::Imap4Rev2],
+            Vec::new(),
+        ),
     };
     let err = append_command("A", "INBOX", &[append_nul_msg(100)], false, &rev2)
         .expect_err("pure rev2 without BINARY cannot carry a NUL body");
@@ -3949,10 +3973,12 @@ fn append_shape_and_capability_validation() {
 #[test]
 fn append_rev2_uses_utf8_mailbox_without_the_utf8_wrapper() {
     let rev2 = EncodeOptions {
-        utf8_mode: true,
+        utf8_mode: crate::codec::utf7::WireMode::Utf8,
         literal_mode: LiteralMode::Synchronizing,
-        capabilities: vec![Capability::Imap4Rev2],
-        enabled: Vec::new(),
+        session: crate::types::profile::SessionCapabilities::new(
+            vec![Capability::Imap4Rev2],
+            Vec::new(),
+        ),
     };
     let msgs = [append_msg(&[], None, 3)];
     assert_eq!(
@@ -4142,7 +4168,7 @@ fn encode_quoted_escapes_backslash_and_dquote() {
 fn encode_string_rejects_nul_without_rewriting_the_command() {
     let mut w = CommandWriter::new(&opts(LiteralMode::Synchronizing, true));
     w.raw(b"A001 X ");
-    w.string(b"hello\x00world", true);
+    w.string(b"hello\x00world", crate::codec::utf7::WireMode::Utf8);
     w.raw(b"\r\n");
 
     assert!(matches!(
@@ -4962,7 +4988,9 @@ fn literal8_must_not_use_non_sync_plus() {
 fn utf8_wrapped_literal8_gets_plus_only_with_binary() {
     let msgs = [append_msg(&[], None, 100)];
     let mut o = append_opts(LiteralMode::LiteralPlus, true);
-    o.capabilities.push(Capability::Binary);
+    std::sync::Arc::make_mut(&mut o.session)
+        .capabilities
+        .push(Capability::Binary);
     assert_eq!(
         append_wire("A001", "INBOX", &msgs, false, &o),
         "A001 APPEND \"INBOX\" UTF8 (~{100+}\r\n<100>)\r\n"
@@ -5661,12 +5689,16 @@ fn writer_literal8_non_synchronizing_needs_binary_and_rev1() {
 
     // LITERAL+ with BINARY on rev1: non-synchronizing.
     let mut binary = opts(LiteralMode::LiteralPlus, false);
-    binary.capabilities.push(Capability::Binary);
+    std::sync::Arc::make_mut(&mut binary.session)
+        .capabilities
+        .push(Capability::Binary);
     assert_eq!(literal8(&binary), vec![b"A001 X ~{3+}\r\nabc\r\n".to_vec()]);
 
     // LITERAL- with BINARY: small literal8 is non-synchronizing too.
     let mut minus_binary = opts(LiteralMode::LiteralMinus, false);
-    minus_binary.capabilities.push(Capability::Binary);
+    std::sync::Arc::make_mut(&mut minus_binary.session)
+        .capabilities
+        .push(Capability::Binary);
     assert_eq!(
         literal8(&minus_binary),
         vec![b"A001 X ~{3+}\r\nabc\r\n".to_vec()]
@@ -5674,10 +5706,12 @@ fn writer_literal8_non_synchronizing_needs_binary_and_rev1() {
 
     // BINARY on an active rev2 connection: rev2 literal8 has no `+` form.
     let rev2 = EncodeOptions {
-        utf8_mode: true,
+        utf8_mode: crate::codec::utf7::WireMode::Utf8,
         literal_mode: LiteralMode::LiteralPlus,
-        capabilities: vec![Capability::Imap4Rev2, Capability::Binary],
-        enabled: Vec::new(),
+        session: crate::types::profile::SessionCapabilities::new(
+            vec![Capability::Imap4Rev2, Capability::Binary],
+            Vec::new(),
+        ),
     };
     assert_eq!(
         literal8(&rev2),
@@ -5794,7 +5828,9 @@ fn criteria_literal8_follows_the_literal8_rule() {
     );
 
     let mut binary = opts(LiteralMode::LiteralPlus, false);
-    binary.capabilities.push(Capability::Binary);
+    std::sync::Arc::make_mut(&mut binary.session)
+        .capabilities
+        .push(Capability::Binary);
     let encoded = uid_search("BODY ~{1}\r\nx", &binary).unwrap();
     assert_eq!(encoded.to_vec(), b"A001 UID SEARCH BODY ~{1+}\r\nx\r\n");
 }
@@ -6386,10 +6422,12 @@ fn an_encoder_capability_refusal_names_the_command_and_the_capability() {
         vanished: false,
     };
     let no_condstore = EncodeOptions {
-        utf8_mode: false,
+        utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
         literal_mode: LiteralMode::Synchronizing,
-        capabilities: vec![Capability::Imap4Rev1],
-        enabled: Vec::new(),
+        session: crate::types::profile::SessionCapabilities::new(
+            vec![Capability::Imap4Rev1],
+            Vec::new(),
+        ),
     };
     let err = admit_and_encode("A001", &cmd, &no_condstore).unwrap_err();
     assert_eq!(
@@ -8129,7 +8167,7 @@ fn listed_mailbox_wire_octets_survive_select_encoding() {
         let mut response = format!("* LIST () \"/\" {{{}}}\r\n", raw.len()).into_bytes();
         response.extend_from_slice(raw);
         response.extend_from_slice(b"\r\n");
-        let (rest, response) = parse_response_utf8(&response, utf8).unwrap();
+        let (rest, response) = parse_response_utf8(&response, (utf8).into()).unwrap();
         assert!(rest.is_empty());
         let Response::Untagged(response) = response else {
             panic!("expected LIST")
@@ -8169,11 +8207,12 @@ fn listed_mailbox_wire_octets_survive_select_encoding() {
 fn mailbox_identity_distinguishes_equal_display_names() {
     use crate::codec::decode::parse_response_utf8;
     use crate::types::response::{Response, UntaggedResponse};
-    let parse = |raw: &[u8], utf8| {
+    let parse = |raw: &[u8], utf8: bool| {
         let mut response = format!("* LIST () NIL {{{}}}\r\n", raw.len()).into_bytes();
         response.extend_from_slice(raw);
         response.extend_from_slice(b"\r\n");
-        let (_, Response::Untagged(response)) = parse_response_utf8(&response, utf8).unwrap()
+        let (_, Response::Untagged(response)) =
+            parse_response_utf8(&response, (utf8).into()).unwrap()
         else {
             panic!("expected LIST")
         };
@@ -8299,7 +8338,7 @@ fn mailbox_encoding_preserves_inbox_children_and_correlation() {
     for utf8 in [false, true] {
         for spelling in ["inbox/Sub", "inbox.Sub", "inbox-Sub", "inbox_Sub", "inbox"] {
             let target = MailboxName::new(spelling).unwrap();
-            let bytes = commands::encode_mailbox_name(&target, utf8).unwrap();
+            let bytes = commands::encode_mailbox_name(&target, (utf8).into()).unwrap();
             let expected = if spelling == "inbox" {
                 "INBOX"
             } else {
@@ -8354,7 +8393,7 @@ fn typed_search_control_and_marker_bytes_remain_operand_data() {
 #[test]
 fn typed_search_capability_requirements_follow_keys_and_raw_declarations() {
     let mut options = default_opts();
-    options.capabilities = vec![Capability::Imap4Rev1];
+    std::sync::Arc::make_mut(&mut options.session).capabilities = vec![Capability::Imap4Rev1];
     let body = crate::types::SearchCriteria::new()
         .body("MODSEQ OLDER $")
         .unwrap();
@@ -8377,7 +8416,7 @@ fn typed_search_capability_requirements_follow_keys_and_raw_declarations() {
 #[test]
 fn typed_fetch_preserves_header_operands_during_admission() {
     let mut options = default_opts();
-    options.capabilities = vec![Capability::Imap4Rev1];
+    std::sync::Arc::make_mut(&mut options.session).capabilities = vec![Capability::Imap4Rev1];
     let cmd = Command::UidFetch {
         sequence_set: SequenceSet::new("1").unwrap(),
         items: vec![crate::types::FetchAttr::BodySection {

@@ -42,7 +42,8 @@ pub(crate) fn public_folder_routing_from_settings(
 /// Autodiscover-enumerated delegates into a single deduplicated list.
 /// Config entries come first and win ordering; every entry in the merged
 /// set (config first, discovered appended) is empty-dropped and deduped
-/// by exact string uniformly - a blank config entry seeds no client, and
+/// by ASCII-case-insensitive address, preserving the first spelling - a blank
+/// config entry seeds no client, and
 /// a delegate named both in config and by discovery (or discovered
 /// twice) is not seeded twice. Every discovered alternative mailbox is
 /// kept regardless of `mailbox_type` - the routing layer keys on the

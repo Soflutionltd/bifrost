@@ -1,6 +1,8 @@
 use std::error::Error as StdError;
 use std::fmt::{self, Display, Formatter};
-use std::time::{Duration, SystemTime};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::SystemTime;
 
 use bifrost_types::AccountOperation;
 use bytes::Bytes;
@@ -29,41 +31,22 @@ impl Display for Base64Encoding {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-#[allow(clippy::enum_variant_names)] // each variant names the Google API it denotes
-pub(crate) enum GmailService {
-    GmailApi,
-    CalendarApi,
-    PeopleApi,
-    DriveApi,
-}
+use crate::quota::ApiSurface;
 
-impl From<crate::quota::ApiSurface> for GmailService {
-    fn from(surface: crate::quota::ApiSurface) -> Self {
-        match surface {
-            crate::quota::ApiSurface::Gmail => Self::GmailApi,
-            crate::quota::ApiSurface::Calendar => Self::CalendarApi,
-            crate::quota::ApiSurface::People => Self::PeopleApi,
-            crate::quota::ApiSurface::Drive => Self::DriveApi,
-        }
-    }
-}
-
-impl Display for GmailService {
+impl Display for ApiSurface {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::GmailApi => f.write_str("Gmail API"),
-            Self::CalendarApi => f.write_str("Calendar API"),
-            Self::PeopleApi => f.write_str("People API"),
-            Self::DriveApi => f.write_str("Drive API"),
+            Self::Gmail => f.write_str("Gmail API"),
+            Self::Calendar => f.write_str("Calendar API"),
+            Self::People => f.write_str("People API"),
+            Self::Drive => f.write_str("Drive API"),
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GmailResponseHeaders {
-    pub(crate) retry_after: Option<RetryAfter>,
+    pub(crate) retry_after: Option<bifrost_types::RetryHint>,
     pub(crate) retry_at: Option<SystemTime>,
     pub(crate) project: Option<crate::quota::ProjectObservation>,
     pub(crate) request_id: Option<String>,
@@ -82,18 +65,14 @@ impl GmailResponseHeaders {
     }
 
     fn parse_headers(headers: &HeaderMap, now: Option<SystemTime>) -> Self {
-        // Keep the private quota carrier while sharing all header parsing.
-        let retry_after = bifrost_net::request::parse_retry_after_hint(headers.get(RETRY_AFTER))
-            .and_then(|hint| match hint {
-                bifrost_types::RetryHint::After(delta) => Some(RetryAfter::Delta(delta)),
-                bifrost_types::RetryHint::At(at) => Some(RetryAfter::At(at)),
-                _ => None,
-            });
+        let retry_after = bifrost_net::request::parse_retry_after_hint(headers.get(RETRY_AFTER));
         Self {
-            retry_at: retry_after.and_then(|hint| match (hint, now) {
-                (RetryAfter::At(at), _) => Some(at),
-                (hint, Some(now)) => hint.resolve(now),
-                (RetryAfter::Delta(_), None) => None,
+            retry_at: retry_after.and_then(|hint| match hint {
+                bifrost_types::RetryHint::At(at) => Some(at),
+                bifrost_types::RetryHint::After(delta) => {
+                    now.and_then(|now| now.checked_add(delta))
+                }
+                _ => None,
             }),
             retry_after,
             project: None,
@@ -102,22 +81,6 @@ impl GmailResponseHeaders {
                 &["x-goog-request-id", "x-google-request-id", "x-request-id"],
             ),
             trace_id: trace_id_from_headers(headers),
-        }
-    }
-}
-
-/// Retain the provider's syntax as well as its once-resolved deadline.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RetryAfter {
-    Delta(Duration),
-    At(SystemTime),
-}
-
-impl RetryAfter {
-    fn resolve(self, now: SystemTime) -> Option<SystemTime> {
-        match self {
-            Self::Delta(delta) => now.checked_add(delta),
-            Self::At(at) => Some(at),
         }
     }
 }
@@ -166,7 +129,7 @@ fn trace_id_from_headers(headers: &HeaderMap) -> Option<String> {
 
 #[derive(Debug)]
 pub(crate) struct GmailResponseError {
-    pub(crate) service: GmailService,
+    pub(crate) service: ApiSurface,
     pub(crate) status: u16,
     pub(crate) headers: GmailResponseHeaders,
     pub(crate) body: Bytes,
@@ -421,7 +384,7 @@ pub(crate) enum Error {
     Response(Box<GmailResponseError>),
     /// JSON decoding of a successful Gmail response failed.
     JsonDecode {
-        service: GmailService,
+        service: ApiSurface,
         source: serde_json::Error,
     },
     /// Gmail body or raw-message base64 data could not be decoded.
@@ -438,13 +401,14 @@ pub(crate) enum Error {
 
 #[derive(Debug)]
 pub(crate) struct ObservedNetError {
+    pub(crate) surface: ApiSurface,
     pub(crate) error: bifrost_net::Error,
     pub(crate) headers: GmailResponseHeaders,
 }
 
 impl Error {
     pub(crate) fn response_from_parts(
-        service: GmailService,
+        service: ApiSurface,
         status: u16,
         headers: GmailResponseHeaders,
         body: Bytes,
@@ -606,13 +570,13 @@ mod tests {
             reqwest::header::HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
         );
         let parsed = GmailResponseHeaders::from_headers_at(&headers, now);
-        assert_eq!(parsed.retry_after, Some(RetryAfter::At(at)));
+        assert_eq!(parsed.retry_after, Some(bifrost_types::RetryHint::At(at)));
         assert_eq!(parsed.retry_at, Some(at));
         headers.insert(RETRY_AFTER, reqwest::header::HeaderValue::from_static("30"));
         let parsed = GmailResponseHeaders::from_headers_at(&headers, now);
         assert_eq!(
             parsed.retry_after,
-            Some(RetryAfter::Delta(Duration::from_secs(30)))
+            Some(bifrost_types::RetryHint::After(Duration::from_secs(30)))
         );
         assert_eq!(parsed.retry_at, Some(now + Duration::from_secs(30)));
         let unobserved = GmailResponseHeaders::from_headers(&headers);
@@ -658,7 +622,7 @@ mod tests {
     fn response_truncates_long_body() {
         let body = Bytes::from(vec![b'x'; MAX_BODY_EXCERPT_BYTES + 64]);
         let err = Error::response_from_parts(
-            GmailService::GmailApi,
+            ApiSurface::Gmail,
             400,
             GmailResponseHeaders::default(),
             body,

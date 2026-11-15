@@ -23,7 +23,7 @@ use bifrost_types::{
     RequestErrorKind, RsvpStatus,
 };
 use jiff::tz::{Offset, TimeZone};
-use jiff::{SignedDuration, Span, Timestamp, civil};
+use jiff::{Span, Timestamp, civil};
 use serde_json::{Map, Value, json};
 
 use crate::account::Account as JmapProtoAccount;
@@ -557,6 +557,8 @@ fn event_from_jmap(
         .unwrap_or_else(|| CalendarId(String::new()));
     let is_all_day = event.show_without_time().unwrap_or(false);
     let raw_start = event.start().unwrap_or_default();
+    // List and range reads report projection failures through failed_ids and
+    // keep valid siblings: an Outlook user must still see the rest of the calendar.
     // Missing duration means PT0S. Malformed or unrepresentable duration is
     // not zero: users must not see a different end silently fabricated.
     let duration = event
@@ -569,7 +571,12 @@ fn event_from_jmap(
             "JSCalendar duration is outside the representable range".into(),
         )));
     }
-    let raw_end = end_from_start_duration(raw_start, duration.as_str(), is_all_day);
+    let raw_end =
+        end_from_start_duration(raw_start, duration.as_str(), is_all_day).ok_or_else(|| {
+            to_acct_err(operation)(crate::Error::NotParsable(
+                "JSCalendar event end is outside the representable range".into(),
+            ))
+        })?;
     let timezone = event.time_zone().as_value().map(ToString::to_string);
     let start = EventTime {
         value: shared_time_from_jmap(raw_start, is_all_day),
@@ -1929,35 +1936,36 @@ fn local_datetime(value: &str) -> Option<Timestamp> {
     Offset::UTC.to_timestamp(naive).ok()
 }
 
-fn end_from_start_duration(start: &str, duration: &str, is_all_day: bool) -> String {
-    let offset = duration
-        .parse::<CalendarDuration>()
-        .ok()
-        .and_then(|duration| duration.signed())
-        .unwrap_or(SignedDuration::ZERO);
+fn end_from_start_duration(start: &str, duration: &str, is_all_day: bool) -> Option<String> {
+    let offset = duration.parse::<CalendarDuration>().ok()?.signed()?;
+    // Overflow must reject this event, not fabricate a zero-length appointment.
     if (is_all_day || start.len() == 10)
         && let Ok(date) =
             civil::Date::strptime("%Y-%m-%d", start.split('T').next().unwrap_or(start))
     {
-        // `EventTime`'s all-day end is exclusive: end = start + duration
-        // days (a P1D JSCalendar all-day event, start D, ends D+1).
+        // All-day ends are exclusive and round partial days upward.
         let nanos = offset.as_nanos();
         let nanos_per_day = 86_400_i128 * 1_000_000_000;
         let days = nanos / nanos_per_day + i128::from(nanos % nanos_per_day != 0);
-        let end = Span::new()
-            .try_days(i64::try_from(days).unwrap_or(i64::MAX))
-            .and_then(|span| date.checked_add(span))
-            .unwrap_or(date);
-        return end.strftime("%Y-%m-%d").to_string();
+        let span = Span::new().try_days(i64::try_from(days).ok()?).ok()?;
+        return Some(
+            date.checked_add(span)
+                .ok()?
+                .strftime("%Y-%m-%d")
+                .to_string(),
+        );
     }
     if let Ok(start) = start.parse::<Timestamp>() {
-        return shared_rfc3339(start.checked_add(offset).unwrap_or(start));
+        return Some(shared_rfc3339(start.checked_add(offset).ok()?));
     }
     if let Some(start) = local_datetime(start) {
-        let end = start.checked_add(offset).unwrap_or(start);
-        return Offset::UTC.to_datetime(end).to_string();
+        return Some(
+            Offset::UTC
+                .to_datetime(start.checked_add(offset).ok()?)
+                .to_string(),
+        );
     }
-    start.to_string()
+    Some(start.to_string())
 }
 
 #[cfg(test)]
@@ -2749,12 +2757,12 @@ mod tests {
     #[test]
     fn end_from_duration_handles_timed_and_all_day_events() {
         assert_eq!(
-            end_from_start_duration("2026-06-02T12:00:00Z", "PT90M", false),
+            end_from_start_duration("2026-06-02T12:00:00Z", "PT90M", false).unwrap(),
             "2026-06-02T13:30:00+00:00"
         );
         // Exclusive end: start 2026-06-02 + P3D = 2026-06-05.
         assert_eq!(
-            end_from_start_duration("2026-06-02", "P3D", true),
+            end_from_start_duration("2026-06-02", "P3D", true).unwrap(),
             "2026-06-05"
         );
     }
@@ -3740,11 +3748,11 @@ mod tests {
         );
         // The exclusive all-day end still lands a day out from either form.
         assert_eq!(
-            end_from_start_duration("2026-06-02T00:00:00", "P1D", true),
+            end_from_start_duration("2026-06-02T00:00:00", "P1D", true).unwrap(),
             "2026-06-03"
         );
         assert_eq!(
-            end_from_start_duration("2026-06-02", "P1D", true),
+            end_from_start_duration("2026-06-02", "P1D", true).unwrap(),
             "2026-06-03"
         );
     }
@@ -4629,7 +4637,7 @@ mod tests {
         .unwrap();
         assert_eq!(duration, "PT0.125000000S");
         assert_eq!(
-            end_from_start_duration("2026-06-02T12:00:00", duration.as_str(), false),
+            end_from_start_duration("2026-06-02T12:00:00", duration.as_str(), false).unwrap(),
             "2026-06-02T12:00:00.125"
         );
     }

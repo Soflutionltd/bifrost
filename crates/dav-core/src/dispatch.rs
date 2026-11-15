@@ -36,7 +36,7 @@ use crate::error::{
     DavProtocol, item_status_error, local_error, response_read_error, status_error, transport_error,
 };
 use crate::transport::{
-    DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body, url_origin,
+    DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body,
 };
 
 /// Credentials as the dispatcher needs them.
@@ -126,7 +126,7 @@ pub struct DavDispatch {
     net: AccountNet,
     base_url: String,
     credentials: DispatchCredentials,
-    trusted_origins: Vec<String>,
+    trusted_origins: bifrost_net::TrustedOrigins,
     protocol: DavProtocol,
     request_guard: Option<Arc<dyn DavRequestGuard>>,
     byte_tally: Option<DavByteTally>,
@@ -189,7 +189,9 @@ impl DavDispatch {
         protocol: DavProtocol,
     ) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
-        let trusted_origins = url_origin(&base_url).into_iter().collect();
+        let mut trusted_origins = bifrost_net::TrustedOrigins::default();
+        // An invalid base leaves an empty, fail-closed credential policy.
+        let _ = trusted_origins.trust(&base_url);
         Self {
             net,
             base_url,
@@ -275,7 +277,7 @@ impl DavDispatch {
     /// done, so the two branches now agree on the shape they share.
     #[must_use]
     pub fn resolve_url(&self, href: &str) -> String {
-        if href.starts_with("http://") || href.starts_with("https://") {
+        if Url::parse(href).is_ok() {
             return href.to_string();
         }
         if let Some(base) = self.join_base()
@@ -318,21 +320,18 @@ impl DavDispatch {
     /// the account is shared or a home request can be in flight.
     pub fn admit_discovered_urls(&mut self, urls: impl IntoIterator<Item = String>) {
         for url in urls {
-            let Some(origin) = url_origin(&url) else {
-                continue;
-            };
             if origin_is_secure(&self.base_url) && !origin_is_secure(&url) {
                 continue;
             }
-            if !self.trusted_origins.contains(&origin) {
-                self.trusted_origins.push(origin);
-            }
+            // Enterprise DAV deployments delegate homes across HTTPS origins.
+            // Only authenticated discovery widens this leg's copied policy.
+            let _ = self.trusted_origins.trust(&url);
         }
     }
 
     #[must_use]
     pub fn is_trusted_url(&self, url: &str) -> bool {
-        url_origin(url).is_some_and(|origin| self.trusted_origins.contains(&origin))
+        self.trusted_origins.admit(url).is_ok()
     }
 
     /// Build the per-request auth headers.

@@ -73,6 +73,7 @@ mod attach;
 mod backfill;
 mod bulk;
 mod context;
+pub(crate) mod drive_start;
 pub mod lane;
 mod maintenance;
 mod orphan_teardown;
@@ -111,7 +112,7 @@ pub struct SyncEngine {
     /// account so `Control::bandwidth_observed` returns a real reading.
     bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
     bandwidth_registry: Option<Arc<bifrost_net::BandwidthRegistry>>,
-    /// Per-account ack senders; consumers call `ack_checkpoint` to
+    /// Per-account ack senders; consumers call `ack` to
     /// durably persist a cursor for a specific scope.
     ack_senders: DashMap<AccountId, mpsc::Sender<WriterRequest>>,
     /// Per-account in-flight lifecycle guard, held for the whole of
@@ -304,28 +305,26 @@ impl SyncEngine {
         SyncEngineBuilder::new()
     }
 
-    /// Durably persist a checkpoint for the given account and scope.
-    /// Consumers call this AFTER they have written the corresponding
-    /// items into their own store. The engine acks (`auto = false`) so
-    /// the ack writer can distinguish consumer-driven acks from the
-    /// engine's own auto-ack path.
-    ///
-    /// `publication` is the `MultiplexerEvent::publication` that arrived with
-    /// this checkpoint. It cannot be inferred from the checkpoint value,
-    /// because two distinct publications can carry equal checkpoints while
-    /// proving different coverage - so passing the wrong one, or none, would
-    /// apply another publication's coverage claim to this checkpoint. An
-    /// unrecognized publication is rejected rather than assumed complete.
-    /// The scope must match the checkpoint scope; a mismatch is rejected
-    /// before enqueueing and cannot change provisional or durable state.
-    pub async fn ack_checkpoint(
+    /// Acknowledge a publication after committing its items to the consumer store.
+    /// Persist the token with that transaction using `encode_ack_token` when
+    /// acknowledgement may need to replay after a writer restart.
+    pub async fn ack(
         &self,
         account_id: &AccountId,
-        scope: CursorScope,
-        checkpoint: Checkpoint,
-        publication: Option<crate::cursor::PublicationId>,
+        token: crate::cursor::AckToken,
     ) -> Result<(), Error> {
-        ack::validate_ack_scope(&scope, &checkpoint)?;
+        // The token binds checkpoint and lane, but currently carries no account
+        // identity. The caller still selects the account; a foreign change token
+        // is indistinguishable from that account's prior-attachment replay.
+        let Some(checkpoint) = token.checkpoint().cloned() else {
+            return self.ack_repair(account_id, token).await;
+        };
+        let scope = match &checkpoint {
+            Checkpoint::Change(cursor) => cursor.scope.clone(),
+            Checkpoint::Backfill(checkpoint) => checkpoint.scope.clone(),
+            _ => return Err(Error::SchemaIncompatible),
+        };
+        let publication = Some(token);
         let tx = self
             .ack_senders
             .get(account_id)
@@ -364,10 +363,10 @@ impl SyncEngine {
     /// Acknowledge an event publication that intentionally has no checkpoint.
     /// Repair notifications use this path so coverage debt is discharged only
     /// after the consumer has durably accepted the recovered object ids.
-    pub async fn ack_publication(
+    async fn ack_repair(
         &self,
         account_id: &AccountId,
-        publication: crate::cursor::PublicationId,
+        publication: crate::cursor::AckToken,
     ) -> Result<(), Error> {
         let tx = self
             .ack_senders
@@ -442,17 +441,6 @@ impl SyncEngine {
             .get(account_id)
             .map(|r| r.value().clone())
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let ledger = ack::WriterHandle::new(writer_tx.clone())
-            .get_ledger()
-            .await?;
-        if max_requests == 0 || ledger.repairable().next().is_none() {
-            return Ok(0);
-        }
-        let scopes = ledger
-            .repairable()
-            .take(max_requests)
-            .map(|entry| entry.domain.scope.clone())
-            .collect::<Vec<_>>();
         let gate = maintenance::MaintenanceGate {
             control: &slot.control,
             scheduler: &slot.scheduler,
@@ -464,12 +452,59 @@ impl SyncEngine {
             // Caller-driven: wait out a pause or checkpoint barrier.
             wait_for_run: true,
         };
-        let (account, _activity, _admission) = gate.acquire(&scopes).await?;
-        // The gate may have waited out a pause or checkpoint; the ledger read
-        // before it can be stale, so plan the pass from a fresh one.
-        let ledger = ack::WriterHandle::new(writer_tx.clone())
-            .get_ledger()
-            .await?;
+        let (account, _activity, _admission, ledger) = loop {
+            let ledger = ack::WriterHandle::new(writer_tx.clone())
+                .get_ledger()
+                .await?;
+            if max_requests == 0 || ledger.repairable().next().is_none() {
+                return Ok(0);
+            }
+            let scopes = ledger
+                .repairable()
+                .take(max_requests)
+                .map(|entry| entry.domain.scope.clone())
+                .collect::<Vec<_>>();
+            let (_account, activity, admission) = gate.acquire(&scopes).await?;
+            // The writer read is another internal wait. Its answer may name
+            // different scopes, and a reopen or hold may have landed meanwhile.
+            let ledger = ack::WriterHandle::new(writer_tx.clone())
+                .get_ledger()
+                .await?;
+            let scopes = ledger
+                .repairable()
+                .take(max_requests)
+                .map(|entry| entry.domain.scope.clone())
+                .collect::<Vec<_>>();
+            let checked = slot.drive_start(account_id).recheck(|account| {
+                scopes
+                    .iter()
+                    .flat_map(|scope| {
+                        crate::recovery::declared_keys(
+                            account,
+                            account_id,
+                            bifrost_types::ThrottleWork::Scope(scope),
+                        )
+                    })
+                    .collect()
+            });
+            match checked {
+                Ok(account) => break (account, activity, admission, ledger),
+                Err(drive_start::StartRefused::ShuttingDown) => return Err(Error::ShuttingDown),
+                Err(drive_start::StartRefused::Paused) => {
+                    drop(admission);
+                    drop(activity);
+                    continue;
+                }
+                Err(drive_start::StartRefused::Held { until, .. }) => {
+                    drop(admission);
+                    drop(activity);
+                    tokio::select! {
+                        () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                        () = tokio::time::sleep_until(until) => {}
+                    }
+                }
+            }
+        };
         let observe = |error: &AccountError| {
             crate::recovery::observe_failure_throttles(&slot.throttles, account_id, error);
         };
@@ -1047,6 +1082,7 @@ impl SyncEngine {
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let writer = WriterHandle::new(writer_tx);
         let ctx = RecoveryContext {
+            scheduler: &slot.scheduler,
             deferred_schema_reset: &slot.deferred_schema_reset,
             bandwidth_budget: slot.bandwidth_budget.as_ref(),
             factory: &slot.factory,

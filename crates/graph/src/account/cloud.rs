@@ -297,16 +297,6 @@ pub(crate) fn host_attachment(
     meta: CloudUploadMeta,
 ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
     Box::pin(async move {
-        if meta.size != bytes.len() as u64 {
-            return Err(invalid_account_error(
-                AccountOperation::HostAttachment,
-                format!(
-                    "declared size {} does not match payload length {}",
-                    meta.size,
-                    bytes.len()
-                ),
-            ));
-        }
         if bytes.is_empty() {
             return Err(invalid_account_error(
                 AccountOperation::HostAttachment,
@@ -1235,12 +1225,7 @@ mod tests {
             let error = host_attachment(
                 account,
                 payload.clone(),
-                CloudUploadMeta::new(
-                    "a.txt",
-                    "text/plain",
-                    payload.len() as u64,
-                    ShareScope::Organization,
-                ),
+                CloudUploadMeta::new("a.txt", "text/plain", ShareScope::Organization),
             )
             .await
             .expect_err("the upload URL is refused");
@@ -1364,12 +1349,7 @@ mod tests {
         let hosted = host_attachment(
             account,
             payload.clone(),
-            CloudUploadMeta::new(
-                "report #1.pdf",
-                "application/pdf",
-                payload.len() as u64,
-                ShareScope::Organization,
-            ),
+            CloudUploadMeta::new("report #1.pdf", "application/pdf", ShareScope::Organization),
         )
         .await
         .expect("hosting succeeds");
@@ -1429,12 +1409,7 @@ mod tests {
         let error = host_attachment(
             account,
             payload.clone(),
-            CloudUploadMeta::new(
-                "a.txt",
-                "text/plain",
-                payload.len() as u64,
-                ShareScope::Organization,
-            ),
+            CloudUploadMeta::new("a.txt", "text/plain", ShareScope::Organization),
         )
         .await
         .expect_err("the upload fails");
@@ -1633,12 +1608,7 @@ mod tests {
         let error = host_attachment(
             account,
             payload.clone(),
-            CloudUploadMeta::new(
-                "a.txt",
-                "text/plain",
-                payload.len() as u64,
-                ShareScope::Organization,
-            ),
+            CloudUploadMeta::new("a.txt", "text/plain", ShareScope::Organization),
         )
         .await
         .expect_err("the upload fails");
@@ -1690,12 +1660,7 @@ mod tests {
         let error = host_attachment(
             account,
             payload.clone(),
-            CloudUploadMeta::new(
-                "a.txt",
-                "text/plain",
-                payload.len() as u64,
-                ShareScope::Organization,
-            ),
+            CloudUploadMeta::new("a.txt", "text/plain", ShareScope::Organization),
         )
         .await
         .expect_err("the upload fails");

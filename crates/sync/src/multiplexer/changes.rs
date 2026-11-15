@@ -11,7 +11,7 @@
 //!
 //! The driver does NOT persist the cursor to `CheckpointStore`. The
 //! consumer is responsible for calling
-//! `SyncEngine::ack_checkpoint(account, checkpoint)` after they have
+//! `SyncEngine::ack(account, token)` after they have
 //! durably persisted the batch items in their own store. Only then does
 //! the engine persist the cursor.
 //!
@@ -79,7 +79,7 @@ pub enum ChangesEvent {
 ///
 /// The in-memory cursor registry is updated when a checkpoint arrives;
 /// the durable `CheckpointStore` write happens through
-/// `SyncEngine::ack_checkpoint`, not here. See module docs for the
+/// `SyncEngine::ack`, not here. See module docs for the
 /// rationale.
 ///
 /// This driver deliberately does NOT feed `LiveSupersedes`. Having
@@ -87,7 +87,7 @@ pub enum ChangesEvent {
 /// is not a sound basis for suppressing the object's inventory copy;
 /// see the `LiveSupersedes` type docs for the full argument.
 ///
-/// A published change checkpoint always carries its `PublicationId`. The claim
+/// A published change checkpoint always carries its `AckToken`. The claim
 /// that it does not was raised and REFUTED with evidence, so do not re-file it:
 /// the `publish` closure sets the publication whenever `control` and
 /// `checkpoint` are both present, both production callers
@@ -224,7 +224,7 @@ pub async fn drive_changes_stream(
         };
         // Broadcast (item + checkpoint) together. Subscribers persist
         // `(items, checkpoint)` atomically in their own store, then
-        // call `SyncEngine::ack_checkpoint` to durably advance the
+        // call `SyncEngine::ack` to durably advance the
         // engine's cursor.
         // Register the outstanding checkpoint BEFORE publishing it.
         // A consumer that receives, persists and acks between the send
@@ -425,7 +425,7 @@ fn post_publish_boundary(request: BoundaryRequest, has_checkpoint: bool) -> Opti
 }
 
 /// Ack request: scope + checkpoint the engine should durably persist.
-/// Consumers send these through `SyncEngine::ack_checkpoint` after
+/// Consumers send these through `SyncEngine::ack` after
 /// their own item store commits the matching batch.
 pub struct AckRequest {
     pub scope: CursorScope,
@@ -439,12 +439,12 @@ pub struct AckRequest {
     /// publication's coverage claim gets applied to another's checkpoint.
     ///
     /// `None` only for engine-internal acks that carry no coverage claim.
-    pub publication: Option<crate::cursor::PublicationId>,
+    pub publication: Option<crate::cursor::AckToken>,
     /// Diagnostic provenance flag: `true` labels an engine-generated ack,
     /// and `false` labels a consumer ack in tracing. This flag does not
     /// change acknowledgement validation or persistence.
     pub auto: bool,
-    /// Completion channel for consumer-driven acks. `ack_checkpoint`
+    /// Completion channel for consumer-driven acks. `ack`
     /// waits on this so it returns only after the checkpoint store
     /// has accepted or rejected the write.
     pub complete: Option<oneshot::Sender<Result<(), Error>>>,
@@ -633,13 +633,13 @@ pub enum WriterRequest {
     /// existence notification it still does not know the object is there.
     ApplyRepair {
         resolutions: Vec<crate::repair::RepairResolution>,
-        publication: Option<crate::cursor::PublicationId>,
+        publication: Option<crate::cursor::AckToken>,
         done: oneshot::Sender<Result<(), Error>>,
     },
     /// Confirm that the consumer durably accepted a publication with no
     /// checkpoint, such as a repair notification batch.
     AcknowledgePublication {
-        publication: crate::cursor::PublicationId,
+        publication: crate::cursor::AckToken,
         done: oneshot::Sender<Result<(), Error>>,
     },
     /// Operator action on one obligation or barrier occurrence.

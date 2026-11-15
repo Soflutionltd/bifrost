@@ -209,3 +209,25 @@ fn _dyn_safe(_: &dyn Account) {}
 
 mod etag;
 pub use etag::{EntityTag, StrongTag};
+
+pub use coverage::{PageWindow, TimeWindow, UidWindow};
+
+/// Positive payload bytes per second. `None` at a cap setter means unlimited.
+/// Use `BandwidthCap::new` to reject zero instead of silently selecting a trickle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BandwidthCap(std::num::NonZeroU64);
+
+impl BandwidthCap {
+    #[must_use]
+    pub const fn new(bytes_per_second: u64) -> Option<Self> {
+        match std::num::NonZeroU64::new(bytes_per_second) {
+            Some(rate) => Some(Self(rate)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}

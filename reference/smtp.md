@@ -1230,3 +1230,19 @@ A single From takes precedence over Sender so a shared mailbox receives its
 own bounces when a delegate sends on its behalf. Multiple authors require a
 single Sender; missing From and Sender retain the null reverse path.
 Unsupported addresses fail conversion rather than silently losing recipients.
+
+## Account submission facade
+
+With `tokio` and `account-error`, `submission::Submission` owns checked shared
+`SubmissionEnvelope` address conversion, absolute HOLDUNTIL formatting, and
+three-lane recipient projection. `SubmissionConfig::new(host, SubmissionTls)`
+selects submission ports and TLS; its public `transport` builder retains every
+SMTP option, including credentials, pool, timeout, meter, shared bandwidth budget
+and scripted connector. `SubmissionCredentials` preserves rotating token sources.
+`submit` returns `SubmissionReceipt::recipients_not_accepted` after any recipient
+commits; when none commits, uncertainty takes precedence over rejection. This
+prevents an enterprise send queue from duplicating mail to accepted recipients.
+IMAP keeps credential inheritance, default From and Sent-folder policy.
+
+Blocking OAuth snapshot contention uses `TokenSnapshot::contention_account_error`
+for transient authentication recovery, without fabricating a network failure.

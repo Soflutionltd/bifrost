@@ -15,7 +15,7 @@ pub(in crate::codec::encode) fn encode_list_status(
     reference: &crate::types::MailboxArgument,
     pattern: &crate::types::MailboxArgument,
     status_items: &crate::types::command_options::StatusItems,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     let status_items = status_items.body("LIST-STATUS status items")?;
     // RFC 3501 Section 5.1.3 / RFC 9051 Section 5.1: encode reference and
@@ -51,7 +51,7 @@ pub(in crate::codec::encode) fn encode_list_extended(
     reference: &crate::types::MailboxArgument,
     patterns: &[crate::types::MailboxArgument],
     return_options: &[crate::types::command_options::ListReturn],
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     if patterns.is_empty() {
         return Err(crate::Error::InvalidInput(
@@ -211,7 +211,7 @@ pub(in crate::codec::encode) fn encode_create_special_use(
     tag: &str,
     mailbox: impl AsRef<[u8]>,
     special_use: &[MailboxAttribute],
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) {
     w.raw(tag.as_bytes());
     w.raw(b" CREATE ");

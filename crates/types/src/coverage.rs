@@ -22,6 +22,84 @@ use crate::cursor::CursorScope;
 use crate::error::AccountError;
 use crate::ids::ObjectId;
 
+/// A half-open time window. Missing bounds mean negative/positive infinity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeWindow {
+    from: Option<i64>,
+    to: Option<i64>,
+}
+
+impl TimeWindow {
+    #[must_use]
+    pub fn new(from: Option<i64>, to: Option<i64>) -> Option<Self> {
+        if matches!((from, to), (Some(a), Some(b)) if a > b) {
+            return None;
+        }
+        Some(Self { from, to })
+    }
+    #[must_use]
+    pub const fn from(self) -> Option<i64> {
+        self.from
+    }
+    #[must_use]
+    pub const fn to(self) -> Option<i64> {
+        self.to
+    }
+}
+
+/// A half-open UID window. u64 permits the exclusive end u32::MAX + 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UidWindow {
+    uid_validity: u32,
+    from: u64,
+    to: u64,
+}
+
+impl UidWindow {
+    #[must_use]
+    pub fn new(uid_validity: u32, from: u64, to: u64) -> Option<Self> {
+        (from <= to && to <= u64::from(u32::MAX) + 1).then_some(Self {
+            uid_validity,
+            from,
+            to,
+        })
+    }
+    #[must_use]
+    pub const fn uid_validity(self) -> u32 {
+        self.uid_validity
+    }
+    #[must_use]
+    pub const fn from(self) -> u64 {
+        self.from
+    }
+    #[must_use]
+    pub const fn to(self) -> u64 {
+        self.to
+    }
+}
+
+/// A half-open positional page window. Empty windows are valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageWindow {
+    from: u32,
+    to: u32,
+}
+
+impl PageWindow {
+    #[must_use]
+    pub fn new(from: u32, to: u32) -> Option<Self> {
+        (from <= to).then_some(Self { from, to })
+    }
+    #[must_use]
+    pub const fn from(self) -> u32 {
+        self.from
+    }
+    #[must_use]
+    pub const fn to(self) -> u32 {
+        self.to
+    }
+}
+
 /// Stable, account-defined identity for one obligation.
 ///
 /// Deliberately separate from the repair or replay token. A token may rotate
@@ -33,6 +111,11 @@ use crate::ids::ObjectId;
 pub struct ObligationKey(pub Vec<u8>);
 
 /// Which provider state an enumeration observed.
+///
+/// Value equality is deliberately retained for persisted ledger round trips and
+/// record deduplication. It does not establish a coverage proof: use
+/// `same_snapshot_as`, which refuses two unnamed snapshots. Making PartialEq
+/// non-reflexive would violate Eq and corrupt derived ledger equality.
 ///
 /// `None` means the account cannot name a stable snapshot for this walk. That
 /// is not a defect - most delta APIs cannot - but it makes positional
@@ -79,21 +162,12 @@ impl SnapshotIdentity {
 pub enum CoverageCoordinate {
     /// The whole scope.
     Full,
-    /// Unix epoch seconds, inclusive-exclusive. `None` is unbounded.
-    TimeRange {
-        from_unix_seconds: Option<i64>,
-        to_unix_seconds: Option<i64>,
-    },
-    /// Inclusive-exclusive UID range within a UIDVALIDITY epoch. The epoch is part of the
-    /// coordinate because UIDs are only comparable inside one.
-    UidRange {
-        uid_validity: u32,
-        from: u64,
-        to: u64,
-    },
-    /// Positional page range, inclusive-exclusive. Meaningful only within one
-    /// snapshot: see [`CoverageDomain::covers`].
-    PageRange { from: u32, to: u32 },
+    /// Half-open Unix epoch-second window.
+    TimeRange(crate::TimeWindow),
+    /// Half-open UID window within one UIDVALIDITY epoch.
+    UidRange(crate::UidWindow),
+    /// Half-open positional window, comparable only within one stable snapshot.
+    PageRange(crate::PageWindow),
     /// A provider-defined region that is not positional. `namespace` scopes the
     /// opaque `region` bytes so two providers cannot collide.
     ProviderRegion { namespace: String, region: Vec<u8> },
@@ -120,33 +194,13 @@ impl CoverageDomain {
 
     /// The extent an [`crate::InventoryPartition`] request covers.
     ///
-    /// `uid_validity` is required for a UID range because UIDs only compare
-    /// inside one epoch, and a partition request does not carry it - the
-    /// account knows it from the folder it opened.
     #[must_use]
-    pub fn for_partition(
-        scope: CursorScope,
-        partition: &crate::InventoryPartition,
-        uid_validity: u32,
-    ) -> Self {
+    pub fn for_partition(scope: CursorScope, partition: &crate::InventoryPartition) -> Self {
         let coordinate = match partition {
             crate::InventoryPartition::Full => CoverageCoordinate::Full,
-            crate::InventoryPartition::Time {
-                from_unix_seconds,
-                to_unix_seconds,
-            } => CoverageCoordinate::TimeRange {
-                from_unix_seconds: *from_unix_seconds,
-                to_unix_seconds: *to_unix_seconds,
-            },
-            crate::InventoryPartition::Uid { from, to } => CoverageCoordinate::UidRange {
-                uid_validity,
-                from: *from,
-                to: *to,
-            },
-            crate::InventoryPartition::Page { from, to } => CoverageCoordinate::PageRange {
-                from: *from,
-                to: *to,
-            },
+            crate::InventoryPartition::Time(window) => CoverageCoordinate::TimeRange(*window),
+            crate::InventoryPartition::Uid(window) => CoverageCoordinate::UidRange(*window),
+            crate::InventoryPartition::Page(window) => CoverageCoordinate::PageRange(*window),
         };
         Self {
             scope,
@@ -179,52 +233,16 @@ impl CoverageDomain {
             // held was either seen again or is genuinely gone.
             (CoverageCoordinate::Full, _) => true,
             (_, CoverageCoordinate::Full) => false,
-            (
-                CoverageCoordinate::TimeRange {
-                    from_unix_seconds: self_from,
-                    to_unix_seconds: self_to,
-                },
-                CoverageCoordinate::TimeRange {
-                    from_unix_seconds: other_from,
-                    to_unix_seconds: other_to,
-                },
-            ) => {
-                lower_bound_covers(*self_from, *other_from)
-                    && upper_bound_covers(*self_to, *other_to)
+            (CoverageCoordinate::TimeRange(a), CoverageCoordinate::TimeRange(b)) => {
+                lower_bound_covers(a.from(), b.from()) && upper_bound_covers(a.to(), b.to())
             }
-            (
-                CoverageCoordinate::UidRange {
-                    uid_validity: self_validity,
-                    from: self_from,
-                    to: self_to,
-                },
-                CoverageCoordinate::UidRange {
-                    uid_validity: other_validity,
-                    from: other_from,
-                    to: other_to,
-                },
-            ) => {
-                // A UIDVALIDITY change renumbers the mailbox. Ranges either
-                // side of it name different objects.
-                self_validity == other_validity && self_from <= other_from && self_to >= other_to
+            (CoverageCoordinate::UidRange(a), CoverageCoordinate::UidRange(b)) => {
+                a.uid_validity() == b.uid_validity() && a.from() <= b.from() && a.to() >= b.to()
             }
-            (
-                CoverageCoordinate::PageRange {
-                    from: self_from,
-                    to: self_to,
-                },
-                CoverageCoordinate::PageRange {
-                    from: other_from,
-                    to: other_to,
-                },
-            ) => {
-                // Page indices over a mutable query are not a durable region.
-                // Page 500..1000 of a later walk may hold entirely different
-                // objects, so repeating the coordinate proves nothing unless
-                // both reports observed the same snapshot.
+            (CoverageCoordinate::PageRange(a), CoverageCoordinate::PageRange(b)) => {
                 self.snapshot.same_snapshot_as(&other.snapshot)
-                    && self_from <= other_from
-                    && self_to >= other_to
+                    && a.from() <= b.from()
+                    && a.to() >= b.to()
             }
             (
                 CoverageCoordinate::ProviderRegion {
@@ -512,7 +530,9 @@ mod tests {
     fn page_domain(from: u32, to: u32, snapshot: SnapshotIdentity) -> CoverageDomain {
         CoverageDomain {
             scope: scope(),
-            coordinate: CoverageCoordinate::PageRange { from, to },
+            coordinate: CoverageCoordinate::PageRange(
+                crate::PageWindow::new(from, to).expect("ordered window"),
+            ),
             snapshot,
         }
     }
@@ -531,28 +551,25 @@ mod tests {
     fn a_narrower_time_window_does_not_cover_a_wider_one() {
         let wide = CoverageDomain {
             scope: scope(),
-            coordinate: CoverageCoordinate::TimeRange {
-                from_unix_seconds: Some(30),
-                to_unix_seconds: Some(90),
-            },
+            coordinate: CoverageCoordinate::TimeRange(
+                crate::TimeWindow::new(Some(30), Some(90)).expect("ordered window"),
+            ),
             snapshot: SnapshotIdentity::unstable(),
         };
         let narrow = CoverageDomain {
             scope: scope(),
-            coordinate: CoverageCoordinate::TimeRange {
-                from_unix_seconds: Some(7),
-                to_unix_seconds: Some(60),
-            },
+            coordinate: CoverageCoordinate::TimeRange(
+                crate::TimeWindow::new(Some(7), Some(60)).expect("ordered window"),
+            ),
             snapshot: SnapshotIdentity::unstable(),
         };
         assert!(!narrow.covers(&wide));
 
         let wider = CoverageDomain {
             scope: scope(),
-            coordinate: CoverageCoordinate::TimeRange {
-                from_unix_seconds: Some(0),
-                to_unix_seconds: None,
-            },
+            coordinate: CoverageCoordinate::TimeRange(
+                crate::TimeWindow::new(Some(0), None).expect("ordered window"),
+            ),
             snapshot: SnapshotIdentity::unstable(),
         };
         assert!(wider.covers(&wide));
@@ -584,20 +601,16 @@ mod tests {
     fn a_uid_range_does_not_cross_a_uidvalidity_change() {
         let old = CoverageDomain {
             scope: scope(),
-            coordinate: CoverageCoordinate::UidRange {
-                uid_validity: 1,
-                from: 1,
-                to: 100,
-            },
+            coordinate: CoverageCoordinate::UidRange(
+                crate::UidWindow::new(1, 1, 100).expect("ordered window"),
+            ),
             snapshot: SnapshotIdentity::unstable(),
         };
         let renumbered = CoverageDomain {
             scope: scope(),
-            coordinate: CoverageCoordinate::UidRange {
-                uid_validity: 2,
-                from: 1,
-                to: 1000,
-            },
+            coordinate: CoverageCoordinate::UidRange(
+                crate::UidWindow::new(2, 1, 1000).expect("ordered window"),
+            ),
             snapshot: SnapshotIdentity::unstable(),
         };
         assert!(!renumbered.covers(&old));

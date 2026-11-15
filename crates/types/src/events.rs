@@ -144,21 +144,12 @@ pub struct Partition(pub Vec<u8>);
 #[non_exhaustive]
 pub enum InventoryPartition {
     Full,
-    /// Time window as Unix epoch seconds, inclusive-exclusive.
-    Time {
-        from_unix_seconds: Option<i64>,
-        to_unix_seconds: Option<i64>,
-    },
-    /// UID range, inclusive-exclusive.
-    Uid {
-        from: u64,
-        to: u64,
-    },
-    /// Count-based page range, inclusive-exclusive.
-    Page {
-        from: u32,
-        to: u32,
-    },
+    /// Half-open Unix epoch-second window.
+    Time(crate::TimeWindow),
+    /// Half-open UID window carrying its UIDVALIDITY epoch.
+    Uid(crate::UidWindow),
+    /// Half-open positional page window.
+    Page(crate::PageWindow),
 }
 
 /// Partitioning modes an Account can honor for a scope.
@@ -173,7 +164,12 @@ pub enum InventoryPartitioning {
     /// Account can honor `InventoryPartition::Uid` ranges. `max_uid`
     /// is optional because some protocol impls only know it after a
     /// folder open; the engine falls back to `Full` when it is absent.
-    UidRange { max_uid: Option<u32> },
+    // This is an inclusive maximum hint, not a requested window: retaining u32
+    // reflects actual UID values, while UidWindow needs u64 for the exclusive end.
+    UidRange {
+        max_uid: Option<u32>,
+        uid_validity: u32,
+    },
     /// Account can honor `InventoryPartition::Page` ranges. `total`
     /// is optional; when absent, the engine walks page windows until a
     /// partition's completion declares [`PartitionEnd::Exhausted`]. A short
@@ -185,6 +181,8 @@ pub enum InventoryPartitioning {
     /// window whose ids all vanished rather than return it empty.
     /// `page_size` lets the account cap engine requests at a
     /// protocol-advertised per-page maximum.
+    // Total and page_size are planning counts, not endpoints. A provider with
+    // no total cannot supply a finite PageWindow until the engine plans a slice.
     PageCount {
         total: Option<u32>,
         page_size: Option<u32>,
@@ -585,8 +583,7 @@ mod inventory_completion_tests {
     fn complete_preserves_the_exact_partition_domain() {
         let domain = CoverageDomain::for_partition(
             CursorScope::Account,
-            &InventoryPartition::Page { from: 10, to: 20 },
-            0,
+            &InventoryPartition::Page(crate::PageWindow::new(10, 20).expect("ordered window")),
         );
         let completion =
             InventoryCompletion::complete(domain.clone(), None, PartitionEnd::MoreBeyond);
@@ -856,10 +853,6 @@ pub enum Change {
 pub struct InventoryEntry {
     pub id: ObjectId,
     pub memberships: Vec<MembershipScope>,
-    /// Message size in bytes. `Option` because Microsoft Graph does
-    /// not expose `size` on the message resource; consumers fall
-    /// back to `(server_version, flags_hash)` for diff there.
-    pub size: Option<u64>,
     pub blob_id: Option<crate::ids::BlobId>,
     pub fingerprint: Fingerprint,
     pub thread_id: Option<crate::ids::ThreadId>,
@@ -876,15 +869,26 @@ impl InventoryEntry {
     /// provider changing flags, size, or its version token.
     #[must_use]
     pub fn differs_from(&self, other: &Self) -> bool {
-        self.id != other.id
-            || self.memberships != other.memberships
-            || self.size != other.size
-            || self.blob_id != other.blob_id
-            || self.fingerprint != other.fingerprint
-            || self.thread_id != other.thread_id
-            || self.message_id != other.message_id
-            || self.references != other.references
-            || self.in_reply_to != other.in_reply_to
+        // Exhaustive destructuring makes each new projection an explicit diff choice.
+        let Self {
+            id,
+            memberships,
+            blob_id,
+            fingerprint,
+            thread_id,
+            message_id,
+            references,
+            in_reply_to,
+        } = self;
+        id != &other.id
+            || !memberships.iter().all(|m| other.memberships.contains(m))
+            || !other.memberships.iter().all(|m| memberships.contains(m))
+            || blob_id != &other.blob_id
+            || fingerprint != &other.fingerprint
+            || thread_id != &other.thread_id
+            || message_id != &other.message_id
+            || references != &other.references
+            || in_reply_to != &other.in_reply_to
     }
 }
 
@@ -987,7 +991,7 @@ pub trait Control: Send + Sync {
     >;
     fn resume(&self);
     fn priority(&self, p: Priority);
-    fn bandwidth_cap(&self, bps: Option<u64>);
+    fn bandwidth_cap(&self, bps: Option<crate::BandwidthCap>);
     fn bandwidth_observed(&self) -> u64;
 }
 
@@ -1017,6 +1021,8 @@ pub enum Priority {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AccountControl {
+    /// Negotiated capabilities changed at a committed replacement open.
+    CapabilitiesChanged(crate::CapabilityDelta),
     Pause(PauseReason),
     Resume,
 }
@@ -1137,7 +1143,6 @@ mod tests {
         let first = InventoryEntry {
             id: ObjectId("message".into()),
             memberships: vec![MembershipScope::Mailbox("inbox".into())],
-            size: Some(10),
             blob_id: None,
             fingerprint: Fingerprint {
                 server_version: ServerVersion::StateAt("same".into()),

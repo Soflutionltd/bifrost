@@ -563,7 +563,6 @@ pub(crate) fn item_to_inventory_entry(
             MembershipScope::Folder(folder.clone()),
             MembershipScope::Mailbox(MailboxId(content_mailbox.to_string())),
         ],
-        size: None,
         blob_id: None,
         fingerprint: Fingerprint {
             server_version: item
@@ -1225,6 +1224,8 @@ pub(crate) fn public_folder_inventory_stream_admitted(
             }
         };
 
+        // Every inventory termination above returns before this success-only tail;
+        // an Outlook user must never see a failed inventory marked complete.
         let checkpoint = Checkpoint::Change(cursor.clone());
         yield super::inventory::inventory_batch(
             entries,

@@ -2222,7 +2222,9 @@ mod tests {
                 max_objects_in_set: 4,
             },
             CursorScope::Type(ObjectType::Email),
-            bifrost_types::InventoryPartition::Page { from: 2, to: 5 },
+            bifrost_types::InventoryPartition::Page(
+                bifrost_types::PageWindow::new(2, 5).expect("ordered window"),
+            ),
             None,
         );
 
@@ -2288,7 +2290,9 @@ mod tests {
                 max_objects_in_set: 4,
             },
             CursorScope::Type(ObjectType::Email),
-            bifrost_types::InventoryPartition::Page { from: 0, to: 2 },
+            bifrost_types::InventoryPartition::Page(
+                bifrost_types::PageWindow::new(0, 2).expect("ordered window"),
+            ),
             None,
         );
 

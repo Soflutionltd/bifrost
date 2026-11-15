@@ -4000,17 +4000,17 @@ async fn a_uid_the_operand_cannot_carry_never_reaches_the_fetch() {
 
 /// The account knob retunes the budget held by every protocol leg.
 #[tokio::test]
-async fn the_bandwidth_cap_knob_updates_the_budget_and_clamps_zero() {
+async fn the_bandwidth_cap_knob_updates_the_budget_and_rejects_zero() {
     use bifrost_types::Account;
     let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
     let account = scripted_account(conn, 1);
     let shared = account.bandwidth_budget.clone();
-    account.set_bandwidth_cap(Some(4096));
+    account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(4096));
     assert_eq!(shared.cap(), Some(4096));
     account.set_bandwidth_cap(None);
     assert_eq!(shared.cap(), None);
-    account.set_bandwidth_cap(Some(0));
-    assert_eq!(shared.cap(), Some(1));
+    assert!(bifrost_types::BandwidthCap::new(0).is_none());
+    assert_eq!(shared.cap(), None);
 }
 
 /// IMAP emits no scope-lifecycle events, but the stream must stay OPEN:

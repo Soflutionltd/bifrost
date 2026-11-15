@@ -227,7 +227,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         .try_build()
         .expect("valid account error classification"),
         crate::Error::CallNotFound(id) => build(
-            AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
+            AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Jmap,
                 detail: Some(DiagnosticText::support_only(format!(
@@ -236,6 +236,10 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             }),
             &ctx,
         )
+        // An omitted call is unanswered, so retry/reconciliation remains possible.
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )))
         .try_build()
         .expect("valid account error classification"),
         crate::Error::UnexpectedMethodResponse {
@@ -261,6 +265,9 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             } else {
                 get_id_unanswered(context.method, &id, ctx)
             }
+        }
+        crate::Error::UnsupportedOperation(reason) => {
+            unsupported_error(ctx.operation, ctx.scope, reason)
         }
         crate::Error::NotParsable(detail) => build(
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),

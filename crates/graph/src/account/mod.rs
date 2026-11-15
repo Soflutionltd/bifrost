@@ -980,7 +980,7 @@ impl Account for GraphAccount {
         }
     }
 
-    fn set_bandwidth_cap(&self, bps: Option<u64>) {
+    fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
         // GraphAccountFactory::open attaches before constructing the account;
         // every client constructor carries a parent Net or an AccountNet.
         match self.client.account_net() {

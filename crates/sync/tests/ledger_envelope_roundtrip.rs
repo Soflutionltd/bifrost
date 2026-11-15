@@ -16,7 +16,8 @@ use bifrost_sync::cursor::ledger_envelope::{
     LEDGER_ENVELOPE_VERSION, decode_ledger, encode_ledger,
 };
 use bifrost_sync::{
-    BarrierIncident, DebtLedger, DischargeEvidence, LedgerEntry, PolicyStatus, ProofStatus,
+    BarrierIncident, BarrierPolicy, DebtLedger, DischargeEvidence, EntryPolicy, LedgerEntry,
+    ProofStatus, UnixSeconds,
 };
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AuthCause,
@@ -112,10 +113,9 @@ fn domain(coordinate: CoverageCoordinate, snapshot: SnapshotIdentity) -> Coverag
 
 fn time_domain(from: i64, to: i64) -> CoverageDomain {
     domain(
-        CoverageCoordinate::TimeRange {
-            from_unix_seconds: Some(from),
-            to_unix_seconds: Some(to),
-        },
+        CoverageCoordinate::TimeRange(
+            bifrost_types::TimeWindow::new(Some(from), Some(to)).expect("ordered window"),
+        ),
         SnapshotIdentity::unstable(),
     )
 }
@@ -264,11 +264,9 @@ fn exhaustive_ledger() -> DebtLedger {
     ledger.ingest(
         &InventoryCoverageReport::degraded(
             domain(
-                CoverageCoordinate::UidRange {
-                    uid_validity: 9,
-                    from: 100,
-                    to: 400,
-                },
+                CoverageCoordinate::UidRange(
+                    bifrost_types::UidWindow::new(9, 100, 400).expect("ordered window"),
+                ),
                 SnapshotIdentity(Some(b"snap-uid".to_vec())),
             ),
             vec![object("retrying-object")],
@@ -281,7 +279,9 @@ fn exhaustive_ledger() -> DebtLedger {
     ledger.ingest(
         &InventoryCoverageReport::degraded(
             domain(
-                CoverageCoordinate::PageRange { from: 0, to: 50 },
+                CoverageCoordinate::PageRange(
+                    bifrost_types::PageWindow::new(0, 50).expect("ordered window"),
+                ),
                 SnapshotIdentity(Some(b"snap-page".to_vec())),
             ),
             vec![object("waived-object")],
@@ -373,7 +373,7 @@ fn exhaustive_ledger() -> DebtLedger {
         generation: walk_generation(7),
         failure_label: "unidentifiable-value".into(),
         evidence: auth_error().into(),
-        policy: PolicyStatus::Retrying { attempts: 0 },
+        policy: BarrierPolicy::Undecided,
         resume_from: None,
     });
     assert!(ledger.waive(&key("crossed-barrier"), "operator@example".into(), 1_800));
@@ -387,7 +387,7 @@ fn exhaustive_ledger() -> DebtLedger {
         generation: walk_generation(8),
         failure_label: "page-boundary-lost".into(),
         evidence: decorated_error().into(),
-        policy: PolicyStatus::Retrying { attempts: 3 },
+        policy: BarrierPolicy::Undecided,
         resume_from: Some(checkpoint()),
     });
     ledger.record_barrier(BarrierIncident {
@@ -396,7 +396,7 @@ fn exhaustive_ledger() -> DebtLedger {
         generation: walk_generation(8),
         failure_label: "unidentifiable-value".into(),
         evidence: auth_error().into(),
-        policy: PolicyStatus::Retrying { attempts: 0 },
+        policy: BarrierPolicy::Undecided,
         resume_from: None,
     });
     assert!(ledger.block(&key("blocked-barrier")));
@@ -501,9 +501,9 @@ fn a_waiver_survives_as_accepted_loss_and_not_as_proof() {
     assert!(entry.policy.is_waived());
     assert_eq!(
         entry.policy,
-        PolicyStatus::Waived {
+        EntryPolicy::Waived {
             by: "operator@example".into(),
-            at_unix_seconds: 1_200,
+            at_unix_seconds: UnixSeconds(1_200),
         },
         "who waived it and when is the whole content of the decision"
     );
@@ -526,8 +526,15 @@ fn a_spent_retry_budget_survives_a_restart() {
 
     let mut restored = roundtrip(&ledger);
     assert_eq!(
+        restored
+            .lineage_budget(&key("budgeted"))
+            .expect("budget")
+            .attempts,
+        2
+    );
+    assert_eq!(
         restored.entry(&key("budgeted")).expect("entry").policy,
-        PolicyStatus::Retrying { attempts: 2 },
+        EntryPolicy::Automatic,
         "two completed attempts must still be charged after a restart"
     );
     assert!(
@@ -536,7 +543,7 @@ fn a_spent_retry_budget_survives_a_restart() {
     );
     assert_eq!(
         restored.entry(&key("budgeted")).expect("entry").policy,
-        PolicyStatus::OperatorBlocked,
+        EntryPolicy::OperatorBlocked,
     );
 }
 
@@ -615,7 +622,7 @@ fn a_barrier_resume_checkpoint_nests_a_cursor_envelope() {
         .expect("resumable barrier");
 
     assert_eq!(barrier.resume_from, Some(checkpoint()));
-    assert_eq!(barrier.policy, PolicyStatus::Retrying { attempts: 3 });
+    assert_eq!(barrier.policy, BarrierPolicy::Undecided);
 }
 
 /// An unreadable durable row must be classified as a SCHEMA problem, in both

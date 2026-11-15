@@ -243,8 +243,10 @@ fn snapshot_supports_matches_the_authority() {
     for (capabilities, enabled) in connection_states() {
         let snap = crate::connection::driver::ConnectionStateSnapshot {
             session_state: SessionState::Authenticated,
-            capabilities: capabilities.clone(),
-            enabled: enabled.clone(),
+            session: crate::types::profile::SessionCapabilities::new(
+                capabilities.clone(),
+                enabled.clone(),
+            ),
             mailbox_selected: false,
             selected: None,
         };

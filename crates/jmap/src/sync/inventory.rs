@@ -457,7 +457,6 @@ pub(crate) fn email_to_inventory(email: Email, state: &str) -> InventoryEntry {
     InventoryEntry {
         id: ObjectId(id),
         memberships,
-        size,
         blob_id,
         fingerprint: Fingerprint {
             server_version: ServerVersion::StateAt(state.to_string()),
@@ -483,7 +482,6 @@ fn mailbox_to_inventory(mailbox: Mailbox, state: &str) -> InventoryEntry {
     InventoryEntry {
         id: ObjectId(id),
         memberships,
-        size: None,
         blob_id: None,
         fingerprint: Fingerprint {
             server_version: ServerVersion::StateAt(state.to_string()),
@@ -582,7 +580,6 @@ mod tests {
         let mut entry = InventoryEntry {
             id: ObjectId("M1".to_string()),
             memberships: Vec::new(),
-            size: Some(10),
             blob_id: Some(BlobId("B1".to_string())),
             fingerprint: Fingerprint {
                 server_version: ServerVersion::StateAt("s1".to_string()),

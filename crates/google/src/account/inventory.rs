@@ -12,7 +12,6 @@ use bifrost_types::{
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
@@ -32,19 +31,6 @@ use super::scopes::{ScopeCache, labels_for_flags};
 const LIST_PAGE_SIZE: u32 = 500;
 const HYDRATE_BATCH_SIZE: usize = 32;
 const MAX_INVENTORY_PAGES: usize = 10_000;
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ListMessagesResponse {
-    #[serde(default)]
-    messages: Vec<GmailMessageStub>,
-    next_page_token: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GmailMessageStub {
-    id: String,
-}
 
 /// Coverage for a checkpoint emitted after `obligations` were observed.
 ///
@@ -258,7 +244,7 @@ pub(crate) fn inventory_stream_cancellable(
             let started = Instant::now();
             let page_result = tokio::select! {
                 () = shutdown.cancelled() => return,
-                result = list_messages_page(&client, page_token.as_deref()) => result,
+                result = client.list_messages(None, Some(LIST_PAGE_SIZE), page_token.as_deref()) => result,
             };
             let page = match page_result {
                 Ok(page) => page,
@@ -688,21 +674,6 @@ impl MessageObligationKey<'_> {
     }
 }
 
-async fn list_messages_page(
-    client: &GmailClient,
-    page_token: Option<&str>,
-) -> crate::Result<ListMessagesResponse> {
-    let path = inventory_list_path(page_token);
-    client.get(&path).await
-}
-
-fn inventory_list_path(page_token: Option<&str>) -> String {
-    format!(
-        "/messages{}",
-        crate::api::mail_list_query(None, Some(LIST_PAGE_SIZE), page_token)
-    )
-}
-
 fn inventory_checkpoint(profile: &GmailProfile) -> crate::Result<Option<Checkpoint>> {
     Ok(Some(Checkpoint::Change(cursor_for_history(
         profile.history_id.0,
@@ -823,7 +794,6 @@ fn inventory_entry_from_message_indexed(
             .iter()
             .map(|label| MembershipScope::Label(LabelId(label.clone())))
             .collect(),
-        size,
         blob_id: None,
         fingerprint: Fingerprint {
             server_version: message.history_id.map_or(ServerVersion::Unavailable, |id| {
@@ -939,7 +909,6 @@ mod tests {
 
         assert_eq!(entry.id, ObjectId("m1".to_owned()));
         assert_eq!(entry.thread_id, Some(ThreadId("thread-m1".to_owned())));
-        assert_eq!(entry.size, Some(2048));
         assert_eq!(entry.fingerprint.size, Some(2048));
         assert_eq!(
             entry.memberships,
@@ -1399,18 +1368,6 @@ mod tests {
         );
         assert_eq!(started.elapsed(), std::time::Duration::ZERO);
         assert_eq!(script.requests().len(), 1);
-    }
-
-    #[test]
-    fn inventory_lists_spam_and_trash_and_encodes_its_page_token() {
-        assert_eq!(
-            inventory_list_path(None),
-            "/messages?includeSpamTrash=true&maxResults=500"
-        );
-        assert_eq!(
-            inventory_list_path(Some("next+page")),
-            "/messages?includeSpamTrash=true&maxResults=500&pageToken=next%2Bpage"
-        );
     }
 
     #[test]

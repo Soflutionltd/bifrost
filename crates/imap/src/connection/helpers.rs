@@ -27,12 +27,12 @@ impl ImapConnection {
 
     /// Caller-friendly server capability profile snapshot.
     ///
-    /// This clones the driver's current capability and ENABLE state. The
+    /// This shares the driver's current capability and ENABLE snapshot. The
     /// result is stale after STARTTLS, authentication, or ENABLE; call this
     /// method again after those transitions before making feature decisions.
     pub fn server_profile(&self) -> crate::types::ServerProfile {
         let snap = self.state_rx.borrow();
-        crate::types::ServerProfile::new(snap.capabilities.clone(), snap.enabled.clone())
+        crate::types::ServerProfile::from_session(std::sync::Arc::clone(&snap.session))
     }
 
     /// Whether the current transport is encrypted.
@@ -247,8 +247,7 @@ impl ImapConnection {
         self.state_rx
             .borrow()
             .enabled
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT"))
+            .contains(&crate::types::Capability::Utf8Accept)
     }
 
     // -----------------------------------------------------------------------

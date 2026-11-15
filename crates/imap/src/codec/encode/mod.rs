@@ -21,7 +21,7 @@ use base64::Engine as _;
 
 #[cfg(test)]
 use crate::types::Command;
-use crate::types::QresyncParams;
+use crate::types::{Capability, QresyncParams};
 
 pub(crate) use commands::list_status_return_option_items;
 #[cfg(test)]
@@ -176,7 +176,11 @@ pub(crate) fn validate_search_criteria_crlf(
 
 /// Write typed SEARCH-family criteria. Strings go through the writer's
 /// quoting/literal rule; a `Raw` escape is written by [`write_criteria`].
-fn write_search(w: &mut CommandWriter, criteria: &crate::types::SearchCriteria, utf8: bool) {
+fn write_search(
+    w: &mut CommandWriter,
+    criteria: &crate::types::SearchCriteria,
+    utf8: crate::codec::utf7::WireMode,
+) {
     use crate::types::search::SearchKey;
     for (index, key) in criteria.keys().iter().enumerate() {
         if index != 0 {
@@ -439,7 +443,7 @@ fn encode_changedsince_modifier(
 fn encode_enable(
     w: &mut CommandWriter,
     tag: &str,
-    capabilities: &[String],
+    capabilities: &[Capability],
 ) -> Result<(), crate::Error> {
     if capabilities.is_empty() {
         return Err(crate::Error::InvalidInput(
@@ -447,13 +451,13 @@ fn encode_enable(
         ));
     }
     for cap in capabilities {
-        validate_atom(cap, "ENABLE capability")?;
+        validate_atom(&cap.to_string(), "ENABLE capability")?;
     }
     w.raw(tag.as_bytes());
     w.raw(b" ENABLE");
     for cap in capabilities {
         w.raw(b" ");
-        w.raw(cap.as_bytes());
+        w.raw(cap.to_string().as_bytes());
     }
     w.raw(b"\r\n");
     Ok(())

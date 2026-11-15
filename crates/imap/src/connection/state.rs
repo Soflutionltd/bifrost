@@ -46,7 +46,7 @@ pub(crate) struct ProtocolState {
     /// observes the terminal completion. Logout remains an independent veto.
     pub(in crate::connection) framing: super::driver::read_loop::Framing,
     /// Cached server capabilities (RFC 3501 Section7.2.1).
-    capabilities: Vec<Capability>,
+    pub(crate) session: std::sync::Arc<crate::types::profile::SessionCapabilities>,
     /// Per-type NOTIFY registration flags (RFC 5465 Section5.1-5.8).
     notify: NotifyFlags,
     /// Currently selected mailbox, if any (RFC 3501 Section3.3).
@@ -57,8 +57,6 @@ pub(crate) struct ProtocolState {
     /// a mailbox has been selected. Reset only by UNAUTHENTICATE, which
     /// starts a new session (RFC 8437 Section 2).
     mailbox_selected: bool,
-    /// Successfully `ENABLE`d extensions (RFC 5161 Section3.2).
-    enabled: Vec<String>,
     /// One effect per command tag, shared by regular and pipeline dispatch.
     pending: std::collections::HashMap<String, PendingEffect>,
     /// Set when a tagged OK completed a LOGIN / AUTHENTICATE or
@@ -90,17 +88,23 @@ pub(in crate::connection) struct SessionTransition {
     pub(in crate::connection) capabilities_supplied: bool,
 }
 
+impl std::ops::Deref for ProtocolState {
+    type Target = crate::types::profile::SessionCapabilities;
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
 impl ProtocolState {
     pub(crate) fn new() -> Self {
         Self {
             state: SessionState::NotAuthenticated,
             tls_active: false,
             framing: super::driver::read_loop::Framing::Untouched,
-            capabilities: Vec::new(),
+            session: Default::default(),
             notify: NotifyFlags::default(),
             selected: None,
             mailbox_selected: false,
-            enabled: Vec::new(),
             pending: std::collections::HashMap::new(),
             transition: None,
         }
@@ -137,8 +141,8 @@ impl ProtocolState {
     }
 
     /// Successfully `ENABLE`d extensions (RFC 5161 Section3.2).
-    pub(crate) fn enabled(&self) -> &[String] {
-        &self.enabled
+    pub(crate) fn enabled(&self) -> &[Capability] {
+        self.enabled.as_slice()
     }
 
     /// Whether any mailbox has been selected in this session (RFC 5161
@@ -154,8 +158,7 @@ impl ProtocolState {
     pub(in crate::connection) fn snapshot(&self) -> super::driver::ConnectionStateSnapshot {
         super::driver::ConnectionStateSnapshot {
             session_state: self.state,
-            capabilities: self.capabilities.clone(),
-            enabled: self.enabled.clone(),
+            session: std::sync::Arc::clone(&self.session),
             mailbox_selected: self.mailbox_selected,
             selected: self.selected.clone(),
         }
@@ -201,7 +204,9 @@ impl ProtocolState {
         // RFC 3501 Section7.2.1: greeting may carry [CAPABILITY] in the
         // response code  -  cache it to avoid an extra round-trip.
         if let Some(ResponseCode::Capability(caps)) = &g.code {
-            self.capabilities.clone_from(caps);
+            std::sync::Arc::make_mut(&mut self.session)
+                .capabilities
+                .clone_from(caps);
         }
 
         // RFC 3501 Section7.1: [ALERT] in the greeting must be presented
@@ -227,7 +232,7 @@ impl ProtocolState {
     /// Used for explicit CAPABILITY command output and post-upgrade
     /// re-fetches (RFC 3501 Section6.2.1).
     pub(in crate::connection) fn apply_capability_fetch(&mut self, caps: Vec<Capability>) {
-        self.capabilities = caps;
+        std::sync::Arc::make_mut(&mut self.session).capabilities = caps;
     }
 
     /// Arm this command's effect after preparation and caller commitment.
@@ -317,7 +322,9 @@ impl ProtocolState {
                 code: Some(ResponseCode::Capability(caps)),
                 ..
             } => {
-                self.capabilities.clone_from(caps);
+                std::sync::Arc::make_mut(&mut self.session)
+                    .capabilities
+                    .clone_from(caps);
             }
             // RFC 5465 Section5.8: NOTIFICATIONOVERFLOW means the server
             // dropped the NOTIFY registration. Clear all per-type flags.
@@ -341,9 +348,9 @@ impl ProtocolState {
             // change, and rolling it back could misdecode later responses.
             UntaggedResponse::Enabled(exts) => {
                 for ext in exts {
-                    if !self.enabled.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-                        self.enabled.push(ext.clone());
-                    }
+                    std::sync::Arc::make_mut(&mut self.session)
+                        .enabled
+                        .insert(Capability::from_imap_str(ext));
                 }
                 // Note: ENABLED is orthogonal to capabilities. The enabled
                 // set is published via ConnectionStateSnapshot automatically.
@@ -361,7 +368,9 @@ impl ProtocolState {
             // RFC 3501 Section7.1 / Section7.2.1: "[CAPABILITY ...]" updates the
             // cached capability set.
             Some(ResponseCode::Capability(caps)) => {
-                self.capabilities.clone_from(caps);
+                std::sync::Arc::make_mut(&mut self.session)
+                    .capabilities
+                    .clone_from(caps);
             }
             // RFC 5465 Section5.8: "[NOTIFICATIONOVERFLOW]" means the server
             // dropped the NOTIFY registration. Clear all per-type flags.
@@ -413,7 +422,7 @@ impl ProtocolState {
                 self.selected = None;
                 self.mailbox_selected = false;
                 self.notify = NotifyFlags::default();
-                self.enabled.clear();
+                std::sync::Arc::make_mut(&mut self.session).enabled.clear();
                 self.pending.clear();
                 self.transition = Some(SessionTransition {
                     capabilities_supplied,

@@ -57,7 +57,7 @@ pub(super) fn encode_login(
     tag: &str,
     user: &str,
     pass: &str,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     validate_login_credential_ascii(user, "user")?;
     validate_login_credential_ascii(pass, "password")?;
@@ -107,7 +107,7 @@ pub(super) fn encode_status(
     tag: &str,
     mailbox: impl AsRef<[u8]>,
     items: &crate::types::command_options::StatusItems,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     let status_items = items.body("STATUS items")?;
     w.raw(tag.as_bytes());
@@ -133,13 +133,13 @@ pub(super) fn encode_search(
     cmd: &str,
     criteria: &crate::types::SearchCriteria,
     return_opts: Option<&[crate::types::command_options::SearchReturn]>,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     criteria.validate_raw(super::LiteralMode::LiteralPlus)?;
     validate_non_empty_search_criteria(criteria, cmd)?;
     // RFC 6855 Section 3: after ENABLE UTF8=ACCEPT, clients MUST NOT issue a
     // SEARCH command that contains a charset specification.
-    if utf8 && search_criteria_starts_with_charset(criteria) {
+    if utf8 == crate::codec::utf7::WireMode::Utf8 && search_criteria_starts_with_charset(criteria) {
         return Err(crate::Error::InvalidInput(
             format!(
                 "{cmd} must not include a CHARSET specification when UTF8=ACCEPT is active \
@@ -253,7 +253,7 @@ pub(super) fn encode_two_arg(
     cmd: &str,
     arg1: &str,
     arg2: impl AsRef<[u8]>,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     // Reject CRLF in the unquoted first argument (typically a sequence set)
     // to prevent command injection (RFC 3501 Section 2.2).
@@ -285,7 +285,7 @@ pub(super) fn encode_two_quoted_args(
     cmd: &str,
     arg1: impl AsRef<[u8]>,
     arg2: impl AsRef<[u8]>,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) {
     w.raw(tag.as_bytes());
     w.raw(b" ");
@@ -481,20 +481,23 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
 /// Encode an arbitrary mailbox name string for the wire.
 ///
 /// INBOX is case-normalized per RFC 3501 Section 5.1.
-/// Non-ASCII characters are MUTF-7 encoded when `utf8` is false,
+/// Non-ASCII characters are MUTF-7 encoded in `WireMode::ModifiedUtf7`,
 /// per RFC 3501 Section 5.1.3.
 ///
 /// Used for LIST/LSUB reference and pattern arguments, NOTIFY filter
 /// mailboxes, and any other site that carries a decoded mailbox name
 /// as `&str` rather than [`MailboxName`].
-pub(crate) fn encode_mailbox_str(name: &str, utf8: bool) -> String {
-    crate::codec::utf7::WireMode::from(utf8).encode(name)
+pub(crate) fn encode_mailbox_str(name: &str, utf8: crate::codec::utf7::WireMode) -> String {
+    utf8.encode(name)
 }
 
 /// Encode a [`MailboxName`] for the wire.
 ///
 /// Replay server octets in their original mode; caller names use canonical encoding.
-pub(super) fn encode_mailbox_name(name: &MailboxName, utf8: bool) -> Result<Vec<u8>, crate::Error> {
+pub(super) fn encode_mailbox_name(
+    name: &MailboxName,
+    utf8: crate::codec::utf7::WireMode,
+) -> Result<Vec<u8>, crate::Error> {
     let bytes = match name.wire_bytes(utf8) {
         Some(bytes) => bytes.to_vec(),
         None if !name.can_reencode() => {
@@ -518,7 +521,7 @@ pub(super) fn encode_mailbox_name(name: &MailboxName, utf8: bool) -> Result<Vec<
 
 pub(super) fn encode_mailbox_argument(
     name: &crate::types::MailboxArgument,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<Vec<u8>, crate::Error> {
     match name {
         crate::types::MailboxArgument::Name(name) => encode_mailbox_name(name, utf8),
@@ -539,7 +542,7 @@ pub(super) fn encode_mailbox_cmd(
     tag: &str,
     cmd: &str,
     mailbox: impl AsRef<[u8]>,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) {
     w.raw(tag.as_bytes());
     w.raw(b" ");
@@ -567,7 +570,7 @@ pub(super) fn encode_select_or_examine(
     mailbox: impl AsRef<[u8]>,
     condstore: bool,
     qresync: Option<&QresyncParams>,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     w.raw(tag.as_bytes());
     w.raw(b" ");

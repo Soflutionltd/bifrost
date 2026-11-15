@@ -57,7 +57,6 @@ pub fn inventory_entry(entry: &SnapshotEntry) -> InventoryEntry {
     InventoryEntry {
         id: ObjectId(entry.uri.clone()),
         memberships: Vec::new(),
-        size: None,
         blob_id: None,
         fingerprint: Fingerprint {
             server_version: entry

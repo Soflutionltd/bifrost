@@ -11,7 +11,7 @@
 //! Two axes, deliberately independent:
 //!
 //! - PROOF is what the system knows: `Unresolved` or `Discharged`.
-//! - POLICY is what the system will do about it: `Retrying`, `OperatorBlocked`
+//! - POLICY is what the system will do about it: `Automatic`, `OperatorBlocked`
 //!   or `Waived`.
 //!
 //! Collapsing them is the mistake this module exists to prevent. A waiver is
@@ -66,7 +66,7 @@ pub enum ProofStatus {
 /// discharged entry - which is what forced compaction to pin discharged roots
 /// and keep process-local parent links for folded keys. Worse, expiry wrote
 /// `OperatorBlocked` onto that discharged root while every open child kept its
-/// own `Retrying` policy, so after the first split the cap was recorded and
+/// own `Automatic` policy, so after the first split the cap was recorded and
 /// never enforced. A row keyed by lineage id, alive exactly while the ledger
 /// retains a member of the lineage, removes both.
 ///
@@ -76,12 +76,12 @@ pub enum ProofStatus {
 /// later (a reopened sibling, say) has to be born blocked, which it can only
 /// be if the spent state is recorded rather than recomputed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct LineageBudget {
+pub struct LineageBudget {
     /// Completed repair outcomes charged to the lineage.
-    pub(crate) attempts: u32,
+    pub attempts: u32,
     /// Whether a charge has reached its budget. Never cleared while the row
     /// lives.
-    pub(crate) exhausted: bool,
+    pub exhausted: bool,
 }
 
 /// The lineage an entry belongs to: its parent when it was split out of one,
@@ -298,9 +298,9 @@ pub enum ReplacementRefusal {
     /// residual, and a child whose key is its lineage id would name itself as
     /// its parent.
     ChildReusesLineageKey,
-    /// The parent is no longer `Retrying`: an operator blocked or waived it, or
+    /// The parent is no longer `Automatic`: an operator blocked or waived it, or
     /// its lineage budget ran out, while this automatic result was in flight.
-    /// Accepting the split would move the debt onto fresh `Retrying` children
+    /// Accepting the split would move the debt onto fresh `Automatic` children
     /// and discharge the only entry carrying that decision. The parent stays
     /// open with its policy intact, and nothing is charged.
     PolicyNoLongerRetrying,
@@ -339,26 +339,65 @@ pub enum DischargeEvidence {
 /// What the system will DO about an obligation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum PolicyStatus {
-    /// Eligible for automatic repair. `attempts` counts COMPLETED repair
-    /// outcomes charged to the obligation's LINEAGE, never attempts merely
-    /// started: a crash after provider work but before the acknowledgement
-    /// must cost a repeated attempt, not a consumed budget.
-    ///
-    /// On a ledger entry this is a VIEW. The count lives in the ledger's
-    /// per-lineage budget, and every mutation rewrites the field on each open
-    /// `Retrying` member from it, so siblings always agree and nothing reads the
-    /// field back to decide anything. On a `BarrierIncident` it is inert.
-    Retrying { attempts: u32 },
+pub enum EntryPolicy {
+    /// Eligible for automatic repair. Completed outcomes are counted only in
+    /// the lineage budget, available through `DebtLedger::lineage_budget`.
+    Automatic,
     /// Automatic work stopped. Still visible, still manually retryable, still
     /// blocking the completion sentinel. NOT abandonment.
     OperatorBlocked,
     /// An operator explicitly accepted this loss. The only terminal policy
     /// state, and the only one a human can put an obligation into.
-    Waived { by: String, at_unix_seconds: i64 },
+    Waived {
+        by: OperatorId,
+        at_unix_seconds: UnixSeconds,
+    },
 }
 
-impl PolicyStatus {
+impl EntryPolicy {
+    #[must_use]
+    pub fn is_waived(&self) -> bool {
+        matches!(self, Self::Waived { .. })
+    }
+}
+
+/// Identity supplied by the operator accepting one occurrence of loss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorId(pub String);
+
+impl From<String> for OperatorId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for OperatorId {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
+}
+
+/// Signed Unix seconds. All historical i64 values remain representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnixSeconds(pub i64);
+
+/// A barrier has no automatic repair attempt or lineage budget. It waits for
+/// coverage or an operator decision before the scope can advance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BarrierPolicy {
+    /// No operator decision has been recorded.
+    Undecided,
+    /// An operator explicitly stopped the walk.
+    OperatorBlocked,
+    /// An operator accepted this occurrence of loss.
+    Waived {
+        by: OperatorId,
+        at_unix_seconds: UnixSeconds,
+    },
+}
+
+impl BarrierPolicy {
     #[must_use]
     pub fn is_waived(&self) -> bool {
         matches!(self, Self::Waived { .. })
@@ -434,7 +473,7 @@ pub struct LedgerEntry {
     /// not itself prove coverage.
     pub generation: crate::cursor::WalkGeneration,
     pub proof: ProofStatus,
-    pub policy: PolicyStatus,
+    pub policy: EntryPolicy,
     /// The account-minted material a repair pass needs to address this.
     ///
     /// Retained because the executor cannot reconstruct a request without it:
@@ -494,7 +533,7 @@ pub struct BarrierIncident {
     pub generation: crate::cursor::WalkGeneration,
     pub failure_label: String,
     pub evidence: ErrorDigest,
-    pub policy: PolicyStatus,
+    pub policy: BarrierPolicy,
     /// The last checkpoint proved to precede the whole barrier region, if the
     /// walk accepted one. Where a later walk resumes from.
     pub resume_from: Option<bifrost_types::Checkpoint>,
@@ -543,6 +582,10 @@ impl AccruingLedger<'_> {
         now: i64,
     ) {
         self.0.ingest_debt_only(report, generation, now);
+    }
+
+    pub(crate) fn replay_ack_debt(&mut self, report: &DebtLedger, now: i64) {
+        self.0.replay_ack_report(report, now, false);
     }
 
     pub(crate) fn record_barrier(&mut self, incident: BarrierIncident) {
@@ -648,7 +691,7 @@ impl DebtLedger {
     /// Every entry's parent is flat (it names neither itself nor an entry that
     /// has a parent - which also rules out every chain and cycle); every
     /// entry's lineage has a row; every row has a retained member; and every
-    /// open `Retrying` member mirrors its unexhausted row. A parent naming an
+    /// open `Automatic` member belongs to an unexhausted row. A parent naming an
     /// ABSENT key is legal: that is a root compaction folded.
     pub(crate) fn validate_lineages(&self) -> Result<(), String> {
         let mut live: BTreeSet<&ObligationKey> = BTreeSet::new();
@@ -673,19 +716,23 @@ impl DebtLedger {
             if !entry.is_open() {
                 continue;
             }
-            if let PolicyStatus::Retrying { attempts } = entry.policy {
-                if budget.exhausted {
-                    return Err("a retrying entry sits in an exhausted lineage".into());
-                }
-                if attempts != budget.attempts {
-                    return Err("a retrying entry disagrees with its lineage budget".into());
-                }
+            if matches!(entry.policy, EntryPolicy::Automatic) && budget.exhausted {
+                return Err("an automatic entry sits in an exhausted lineage".into());
             }
         }
         if self.lineages.keys().any(|lineage| !live.contains(lineage)) {
             return Err("a lineage budget row has no retained member".into());
         }
         Ok(())
+    }
+
+    /// The retained entry's lineage budget. A folded or unknown key has none.
+    /// Counts completed outcomes, never work merely started.
+    #[must_use]
+    pub fn lineage_budget(&self, key: &ObligationKey) -> Option<&LineageBudget> {
+        self.entries
+            .get(key)
+            .and_then(|entry| self.lineages.get(lineage_id(entry)))
     }
 
     /// The per-scope audit table, in its durable order.
@@ -785,7 +832,7 @@ impl DebtLedger {
     pub fn scope_has_blocked_barrier(&self, scope: &bifrost_types::CursorScope) -> bool {
         self.barriers.values().any(|barrier| {
             barrier.domain.scope == *scope
-                && matches!(barrier.policy, PolicyStatus::OperatorBlocked)
+                && matches!(barrier.policy, BarrierPolicy::OperatorBlocked)
         })
     }
 
@@ -830,7 +877,19 @@ impl DebtLedger {
                         domain: report.domain.clone(),
                         generation,
                         proof: ProofStatus::Unresolved,
-                        policy: incident.policy,
+                        policy: match incident.policy {
+                            BarrierPolicy::Waived {
+                                by,
+                                at_unix_seconds,
+                            } => EntryPolicy::Waived {
+                                by,
+                                at_unix_seconds,
+                            },
+                            // Preserve the incident's policy even if an existing
+                            // waived entry with the same key authorized crossing.
+                            BarrierPolicy::Undecided => EntryPolicy::Automatic,
+                            BarrierPolicy::OperatorBlocked => EntryPolicy::OperatorBlocked,
+                        },
                         target: None,
                         parent: None,
                         first_seen_unix_seconds: now,
@@ -909,6 +968,26 @@ impl DebtLedger {
         self.settle_lineages();
     }
 
+    /// Fold one report into a ledger that exists only to carry that report's
+    /// evidence (an acknowledgement token's per-report row): its debt, and its
+    /// proof kept verbatim.
+    ///
+    /// `ingest` would drop the proof of a complete report here, because
+    /// `record_proof` retains only proofs that bear on a currently open entry
+    /// and this ledger holds none. The proof must survive to the restart
+    /// replay, which applies it to the live ledger where the entries are.
+    pub(crate) fn ingest_report_evidence(
+        &mut self,
+        report: &InventoryCoverageReport,
+        generation: crate::cursor::WalkGeneration,
+        now: i64,
+    ) {
+        self.ingest_debt_only(report, generation, now);
+        if report.is_complete() {
+            self.proved.push((generation, report.domain.clone()));
+        }
+    }
+
     /// Fold terminal history into the audit table once the entry map is large.
     ///
     /// Runs at the END of a fold, in the single writer every durable mutation
@@ -939,12 +1018,12 @@ impl DebtLedger {
     ///   the entry map, which compaction bounds - a folded key raised again is
     ///   a fresh gap by the compaction contract;
     /// - a live lineage without a row gets a fresh one;
-    /// - every open `Retrying` member is rewritten from its row: blocked when
-    ///   the row is exhausted, otherwise mirroring the row's count.
+    /// - every open `Automatic` member is blocked when its row is exhausted.
+    ///   Counts live only in that row; entries carry no mirrored counter.
     ///
     /// Waived and `OperatorBlocked` members are never written, so no operator
     /// decision is ever overwritten; and discharged entries are never touched
-    /// at all. There is no path from `OperatorBlocked` back to `Retrying`, so a
+    /// at all. There is no path from `OperatorBlocked` back to `Automatic`, so a
     /// member this blocks stays blocked.
     fn settle_lineages(&mut self) {
         let live: BTreeSet<ObligationKey> = self
@@ -964,12 +1043,8 @@ impl DebtLedger {
                 continue;
             }
             let budget = lineages.get(lineage_id(entry)).copied().unwrap_or_default();
-            if let PolicyStatus::Retrying { attempts } = &mut entry.policy {
-                if budget.exhausted {
-                    entry.policy = PolicyStatus::OperatorBlocked;
-                } else {
-                    *attempts = budget.attempts;
-                }
+            if matches!(entry.policy, EntryPolicy::Automatic) && budget.exhausted {
+                entry.policy = EntryPolicy::OperatorBlocked;
             }
         }
     }
@@ -1075,6 +1150,22 @@ impl DebtLedger {
             .1
     }
 
+    // Restored acknowledgement reports contain only the evidence ingestion uses,
+    // never operator policy or retry state. Keep rediscovery's history and policy
+    // exactly as the ordinary report path does. Proof stays on the staged writer.
+    pub(crate) fn replay_ack_report(&mut self, report: &Self, now: i64, proof: bool) {
+        for restored in report.entries.values() {
+            self.upsert_evidence(restored.clone(), now);
+        }
+        if proof {
+            for (generation, domain) in &report.proved {
+                self.record_proof(domain.clone(), *generation);
+            }
+        }
+        self.compact_if_large();
+        self.settle_lineages();
+    }
+
     fn upsert(
         &mut self,
         obligation: &InventoryObligation,
@@ -1082,51 +1173,36 @@ impl DebtLedger {
         generation: crate::cursor::WalkGeneration,
         now: i64,
     ) {
-        let key = obligation.key().clone();
-        match self.entries.get_mut(&key) {
+        self.upsert_evidence(
+            LedgerEntry {
+                key: obligation.key().clone(),
+                domain: domain.clone(),
+                generation,
+                proof: ProofStatus::Unresolved,
+                policy: EntryPolicy::Automatic,
+                target: InventoryRepairTarget::from_obligation(obligation),
+                parent: None,
+                first_seen_unix_seconds: now,
+                last_error: ErrorDigest::from(obligation.error()),
+            },
+            now,
+        );
+    }
+
+    // Ordinary reports and decoded acknowledgement reports share rediscovery's
+    // policy and history preservation. Only fresh keys start a new lineage.
+    fn upsert_evidence(&mut self, mut restored: LedgerEntry, now: i64) {
+        match self.entries.get_mut(&restored.key) {
             Some(existing) => {
-                // A re-raised obligation keeps its history. Resetting
-                // `first_seen` or the attempt count each time the same broken
-                // object is rediscovered would make any budget unreachable.
-                // Delayed reports must not make an older proof eligible to settle
-                // a gap observed by a newer walk.
-                existing.generation = existing.generation.max(generation);
-                existing.domain = domain.clone();
-                existing.last_error = ErrorDigest::from(obligation.error());
-                // The token may legitimately rotate while naming the same gap,
-                // so the descriptor refreshes even though identity does not.
-                existing.target = InventoryRepairTarget::from_obligation(obligation);
-                // Rediscovery is proof it is still missing, so an earlier
-                // discharge was wrong. Reopen it - but never touch policy: an
-                // operator's waiver stands until the operator revokes it.
+                existing.generation = existing.generation.max(restored.generation);
+                existing.domain = restored.domain;
+                existing.last_error = restored.last_error;
+                existing.target = restored.target;
                 existing.proof = ProofStatus::Unresolved;
             }
             None => {
-                // A key with no entry - never seen, or compacted after proof -
-                // is a new entry with no parent, so its lineage id is its own
-                // key. That id usually has no row and the budget starts from
-                // zero; but a compacted lineage ROOT rediscovered while
-                // children of its lineage are still retained finds their row
-                // and rejoins it. That is deliberate: it is the same
-                // obligation re-raised while its lineage is still being
-                // worked, it is what happened when the root could not fold
-                // under a live child, and resetting there would let a
-                // provider evade the cap by getting the root compacted and
-                // re-raised.
-                self.entries.insert(
-                    key.clone(),
-                    LedgerEntry {
-                        key,
-                        domain: domain.clone(),
-                        generation,
-                        proof: ProofStatus::Unresolved,
-                        policy: PolicyStatus::Retrying { attempts: 0 },
-                        target: InventoryRepairTarget::from_obligation(obligation),
-                        parent: None,
-                        first_seen_unix_seconds: now,
-                        last_error: ErrorDigest::from(obligation.error()),
-                    },
-                );
+                restored.first_seen_unix_seconds = now;
+                self.entries.insert(restored.key.clone(), restored);
             }
         }
     }
@@ -1196,7 +1272,7 @@ impl DebtLedger {
         self.entries.values().filter(|entry| {
             entry.is_open()
                 && entry.target.is_some()
-                && matches!(entry.policy, PolicyStatus::Retrying { .. })
+                && matches!(entry.policy, EntryPolicy::Automatic)
         })
     }
 
@@ -1258,7 +1334,7 @@ impl DebtLedger {
     ///
     /// Returns whether THIS charge exhausted the budget. Exhaustion is sticky -
     /// a later charge with a larger budget does not reopen the lineage - and it
-    /// turns every open `Retrying` member `OperatorBlocked`: automatic work
+    /// turns every open `Automatic` member `OperatorBlocked`: automatic work
     /// stopped, still visible, still blocking. It NEVER yields `Waived` or
     /// `Discharged`: a counter running out is evidence that retrying is not
     /// working, not a decision about what loss is acceptable. Members an
@@ -1338,7 +1414,7 @@ impl DebtLedger {
         // so accepting one against a parent an operator blocked or waived - or
         // whose lineage ran out - while this result was in flight would erase
         // that decision from the live debt.
-        if !matches!(parent.policy, PolicyStatus::Retrying { .. }) {
+        if !matches!(parent.policy, EntryPolicy::Automatic) {
             return Err(ReplacementRefusal::PolicyNoLongerRetrying);
         }
         let root = lineage_id(&parent).clone();
@@ -1450,19 +1526,23 @@ impl DebtLedger {
     ///
     /// Returns whether anything matched.
     pub fn waive(&mut self, key: &ObligationKey, by: String, at_unix_seconds: i64) -> bool {
-        let policy = PolicyStatus::Waived {
-            by,
-            at_unix_seconds,
-        };
+        let by = OperatorId(by);
+        let at_unix_seconds = UnixSeconds(at_unix_seconds);
         let mut waived = false;
         if let Some(entry) = self.entries.get_mut(key) {
             // Policy only. `proof` stays `Unresolved` forever: nothing was
             // proved, somebody decided to live without it.
-            entry.policy = policy.clone();
+            entry.policy = EntryPolicy::Waived {
+                by: by.clone(),
+                at_unix_seconds,
+            };
             waived = true;
         }
         if let Some(barrier) = self.barriers.get_mut(key) {
-            barrier.policy = policy;
+            barrier.policy = BarrierPolicy::Waived {
+                by,
+                at_unix_seconds,
+            };
             waived = true;
         }
         self.settle_lineages();
@@ -1473,11 +1553,11 @@ impl DebtLedger {
     pub fn block(&mut self, key: &ObligationKey) -> bool {
         let mut blocked = false;
         if let Some(entry) = self.entries.get_mut(key) {
-            entry.policy = PolicyStatus::OperatorBlocked;
+            entry.policy = EntryPolicy::OperatorBlocked;
             blocked = true;
         }
         if let Some(barrier) = self.barriers.get_mut(key) {
-            barrier.policy = PolicyStatus::OperatorBlocked;
+            barrier.policy = BarrierPolicy::OperatorBlocked;
             blocked = true;
         }
         self.settle_lineages();
@@ -1491,16 +1571,11 @@ fn domains_may_join(proof: &CoverageDomain, target: &CoverageDomain) -> bool {
     }
     match (&proof.coordinate, &target.coordinate) {
         (CoverageCoordinate::Full, _) => true,
-        (CoverageCoordinate::TimeRange { .. }, CoverageCoordinate::TimeRange { .. }) => true,
-        (
-            CoverageCoordinate::UidRange {
-                uid_validity: a, ..
-            },
-            CoverageCoordinate::UidRange {
-                uid_validity: b, ..
-            },
-        ) => a == b,
-        (CoverageCoordinate::PageRange { .. }, CoverageCoordinate::PageRange { .. }) => {
+        (CoverageCoordinate::TimeRange(_), CoverageCoordinate::TimeRange(_)) => true,
+        (CoverageCoordinate::UidRange(a), CoverageCoordinate::UidRange(b)) => {
+            a.uid_validity() == b.uid_validity()
+        }
+        (CoverageCoordinate::PageRange(_), CoverageCoordinate::PageRange(_)) => {
             proof.snapshot.same_snapshot_as(&target.snapshot)
         }
         (CoverageCoordinate::ProviderRegion { .. }, CoverageCoordinate::ProviderRegion { .. }) => {
@@ -1523,52 +1598,46 @@ fn proof_union_covers(
     }
 
     match &target.coordinate {
-        CoverageCoordinate::TimeRange {
-            from_unix_seconds,
-            to_unix_seconds,
-        } => interval_union_covers(
+        CoverageCoordinate::TimeRange(window) => interval_union_covers(
             proofs.iter().filter_map(|(generation, proof)| {
                 if *generation < minimum_generation || !domains_may_join(proof, target) {
                     return None;
                 }
                 match proof.coordinate {
-                    CoverageCoordinate::TimeRange {
-                        from_unix_seconds,
-                        to_unix_seconds,
-                    } => Some((from_unix_seconds, to_unix_seconds)),
+                    CoverageCoordinate::TimeRange(window) => Some((window.from(), window.to())),
                     _ => None,
                 }
             }),
-            *from_unix_seconds,
-            *to_unix_seconds,
+            window.from(),
+            window.to(),
         ),
-        CoverageCoordinate::UidRange { from, to, .. } => finite_union_covers(
+        CoverageCoordinate::UidRange(window) => finite_union_covers(
             proofs.iter().filter_map(|(generation, proof)| {
                 if *generation < minimum_generation || !domains_may_join(proof, target) {
                     return None;
                 }
                 match proof.coordinate {
-                    CoverageCoordinate::UidRange { from, to, .. } => Some((from, to)),
+                    CoverageCoordinate::UidRange(window) => Some((window.from(), window.to())),
                     _ => None,
                 }
             }),
-            *from,
-            *to,
+            window.from(),
+            window.to(),
         ),
-        CoverageCoordinate::PageRange { from, to } => finite_union_covers(
+        CoverageCoordinate::PageRange(window) => finite_union_covers(
             proofs.iter().filter_map(|(generation, proof)| {
                 if *generation < minimum_generation || !domains_may_join(proof, target) {
                     return None;
                 }
                 match proof.coordinate {
-                    CoverageCoordinate::PageRange { from, to } => {
-                        Some((u64::from(from), u64::from(to)))
+                    CoverageCoordinate::PageRange(window) => {
+                        Some((u64::from(window.from()), u64::from(window.to())))
                     }
                     _ => None,
                 }
             }),
-            u64::from(*from),
-            u64::from(*to),
+            u64::from(window.from()),
+            u64::from(window.to()),
         ),
         CoverageCoordinate::Full | CoverageCoordinate::ProviderRegion { .. } => false,
         _ => false,
@@ -1615,7 +1684,7 @@ fn interval_union_covers(
 #[cfg(test)]
 mod tests {
     use super::{
-        BarrierIncident, DebtLedger, DischargeEvidence, PolicyStatus, ProofStatus,
+        BarrierIncident, BarrierPolicy, DebtLedger, DischargeEvidence, EntryPolicy, ProofStatus,
         ReplacementProgress, ReplacementRefusal,
     };
     use bifrost_types::{
@@ -1652,10 +1721,9 @@ mod tests {
     fn time_domain(from: i64, to: i64) -> CoverageDomain {
         CoverageDomain {
             scope: scope(),
-            coordinate: CoverageCoordinate::TimeRange {
-                from_unix_seconds: Some(from),
-                to_unix_seconds: Some(to),
-            },
+            coordinate: CoverageCoordinate::TimeRange(
+                bifrost_types::TimeWindow::new(Some(from), Some(to)).expect("ordered window"),
+            ),
             snapshot: SnapshotIdentity::unstable(),
         }
     }
@@ -1827,7 +1895,7 @@ mod tests {
             entry.first_seen_unix_seconds, 100,
             "re-raising must not reset history, or no budget is ever reachable"
         );
-        assert_eq!(entry.policy, PolicyStatus::OperatorBlocked);
+        assert_eq!(entry.policy, EntryPolicy::OperatorBlocked);
         assert!(entry.is_open());
     }
 
@@ -1860,7 +1928,7 @@ mod tests {
             generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
             evidence: error().into(),
-            policy: PolicyStatus::Retrying { attempts: 0 },
+            policy: BarrierPolicy::Undecided,
             resume_from: None,
         });
         assert!(!ledger.completion_permitted(&scope()));
@@ -1893,7 +1961,7 @@ mod tests {
             generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
             evidence: error().into(),
-            policy: PolicyStatus::Retrying { attempts: 0 },
+            policy: BarrierPolicy::Undecided,
             resume_from: None,
         });
         assert!(ledger.waive(&key, "operator".into(), 500));
@@ -1926,14 +1994,14 @@ mod tests {
             generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
             evidence: error().into(),
-            policy: PolicyStatus::Retrying { attempts: 0 },
+            policy: BarrierPolicy::Undecided,
             resume_from: None,
         });
 
         assert!(ledger.block(&key));
         assert_eq!(
             ledger.barriers().next().expect("barrier").policy,
-            PolicyStatus::OperatorBlocked
+            BarrierPolicy::OperatorBlocked
         );
         assert!(!ledger.completion_permitted(&scope()));
     }
@@ -1953,7 +2021,7 @@ mod tests {
             generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
             evidence: error().into(),
-            policy: PolicyStatus::Retrying { attempts: 0 },
+            policy: BarrierPolicy::Undecided,
             resume_from: None,
         });
         assert!(
@@ -2070,7 +2138,7 @@ mod tests {
         );
 
         let entry = ledger.entry(&key).expect("entry");
-        assert_eq!(entry.policy, PolicyStatus::OperatorBlocked);
+        assert_eq!(entry.policy, EntryPolicy::OperatorBlocked);
         assert!(entry.is_open(), "a spent budget proves nothing");
         assert!(
             entry.blocks_completion(),
@@ -2114,15 +2182,16 @@ mod tests {
             Some(2),
             "both attempts must accrue to the one lineage"
         );
+        assert_eq!(ledger.lineage_budget(&child).expect("budget").attempts, 2);
         assert_eq!(
             ledger.entry(&child).expect("child").policy,
-            PolicyStatus::Retrying { attempts: 2 },
-            "the open member shows the lineage's count"
+            EntryPolicy::Automatic,
+            "the open member remains automatic"
         );
     }
 
     /// The defect the per-lineage budget closed: expiry used to block only the
-    /// discharged root while the open child kept its own `Retrying` policy, so
+    /// discharged root while the open child kept its own `Automatic` policy, so
     /// `repairable` went on planning it and the cap never bound after the
     /// first split.
     #[test]
@@ -2156,14 +2225,14 @@ mod tests {
         );
         for key in [&a, &b] {
             let entry = ledger.entry(key).expect("member");
-            assert_eq!(entry.policy, PolicyStatus::OperatorBlocked);
+            assert_eq!(entry.policy, EntryPolicy::OperatorBlocked);
             assert!(entry.is_open(), "a spent budget proves nothing");
         }
     }
 
     /// Exhaustion is sticky: a sibling that was closed when the budget ran out
     /// and is later rediscovered rejoins the SPENT lineage, blocked, rather
-    /// than coming back `Retrying`.
+    /// than coming back `Automatic`.
     #[test]
     fn a_member_reopened_into_a_spent_lineage_comes_back_blocked() {
         let mut ledger = DebtLedger::new();
@@ -2200,7 +2269,7 @@ mod tests {
         );
         assert_eq!(
             ledger.entry(&b).expect("reopened").policy,
-            PolicyStatus::OperatorBlocked
+            EntryPolicy::OperatorBlocked
         );
         assert!(
             !ledger.record_attempt(&a, 100),
@@ -2236,12 +2305,12 @@ mod tests {
         assert!(ledger.entry(&a).expect("a").policy.is_waived());
         assert_eq!(
             ledger.entry(&b).expect("b").policy,
-            PolicyStatus::OperatorBlocked
+            EntryPolicy::OperatorBlocked
         );
     }
 
     /// A split that arrives after the operator blocked the parent must not
-    /// move the debt onto fresh `Retrying` children and discharge the only
+    /// move the debt onto fresh `Automatic` children and discharge the only
     /// entry carrying the block.
     #[test]
     fn a_replacement_against_an_operator_decision_is_refused() {
@@ -2266,7 +2335,7 @@ mod tests {
         );
         let entry = ledger.entry(&parent).expect("parent");
         assert!(entry.is_open());
-        assert_eq!(entry.policy, PolicyStatus::OperatorBlocked);
+        assert_eq!(entry.policy, EntryPolicy::OperatorBlocked);
         assert!(ledger.entry(&ObligationKey(b"child".to_vec())).is_none());
     }
 
@@ -2395,7 +2464,7 @@ mod tests {
         );
         assert_eq!(
             ledger.entry(&root).expect("re-raised").policy,
-            PolicyStatus::OperatorBlocked,
+            EntryPolicy::OperatorBlocked,
             "the spent lineage is not reset by folding and re-raising its root"
         );
     }
@@ -2722,7 +2791,7 @@ mod tests {
         );
         assert_eq!(
             ledger.entry(&child).expect("child").policy,
-            PolicyStatus::OperatorBlocked
+            EntryPolicy::OperatorBlocked
         );
     }
 
@@ -2897,7 +2966,7 @@ mod tests {
             } else {
                 ProofStatus::Unresolved
             },
-            policy: PolicyStatus::Retrying { attempts: 0 },
+            policy: EntryPolicy::Automatic,
             target: None,
             parent: parent.map(|key| ObligationKey(key.as_bytes().to_vec())),
             first_seen_unix_seconds: 100,
@@ -2988,8 +3057,8 @@ mod tests {
         assert!(
             ledger_of(open_child(), &[("gone", 3, false)])
                 .validate_lineages()
-                .is_err(),
-            "a retrying member must mirror its row"
+                .is_ok(),
+            "the count is owned by the lineage alone"
         );
         assert!(
             ledger_of(open_child(), &[("gone", 0, true)])
@@ -3041,10 +3110,17 @@ mod tests {
         assert!(!ledger.record_attempt(&a, 1), "folded");
         assert_eq!(
             ledger
+                .lineage_budget(&ObligationKey(b"b".to_vec()))
+                .expect("budget")
+                .attempts,
+            0
+        );
+        assert_eq!(
+            ledger
                 .entry(&ObligationKey(b"b".to_vec()))
                 .expect("b")
                 .policy,
-            PolicyStatus::Retrying { attempts: 0 },
+            EntryPolicy::Automatic,
             "the sibling's lineage was not charged"
         );
     }
@@ -3129,8 +3205,12 @@ mod tests {
             300,
         );
         assert_eq!(
+            ledger.lineage_budget(&a).expect("retained budget").attempts,
+            2
+        );
+        assert_eq!(
             ledger.entry(&a).expect("reopened").policy,
-            PolicyStatus::Retrying { attempts: 2 }
+            EntryPolicy::Automatic
         );
         assert!(
             ledger.record_attempt(&a, 3),
@@ -3239,7 +3319,7 @@ mod tests {
             generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
             evidence: error().into(),
-            policy: PolicyStatus::Retrying { attempts: 0 },
+            policy: BarrierPolicy::Undecided,
             resume_from: None,
         };
         ledger.record_barrier(incident());

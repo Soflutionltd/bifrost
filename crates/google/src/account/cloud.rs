@@ -52,7 +52,7 @@
 //!
 //! Session creation, chunk PUTs and cancel DELETEs all use the guarded
 //! `GmailClient` builder funnel, including its API-surface attribution and
-//! inbound byte accounting. A session Location is accepted only on the HTTPS
+//! inbound byte accounting. A session Location is accepted only on the configured
 //! Drive upload surface; chunk and cancel also check it before dispatch.
 //!
 //! Audit boundary: the 2026-07 google bug sweep did NOT line-audit this
@@ -66,15 +66,16 @@ use bifrost_types::{
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::drive::types::*;
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, CloudUploadMeta, HostedAttachment, ShareScope,
 };
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 
 use crate::account::error::{GmailErrorContext, into_account_error};
 use crate::client::GmailClient;
-use crate::error::{Error, GmailResponseHeaders, GmailService, ProviderFault};
+use crate::error::{Error, GmailResponseHeaders, ProviderFault};
+use crate::quota::ApiSurface;
 
 /// Minimum alignment for upload chunks (256 KiB per Google Drive API spec).
 const GDRIVE_CHUNK_ALIGN: usize = 256 * 1024;
@@ -88,39 +89,6 @@ const GDRIVE_MAX_EXTRA_CHUNK_ATTEMPTS: usize = 8;
 /// unresponsive host would hold the caller's already-failed upload open
 /// indefinitely. Cleanup is allowed to fail; it is not allowed to hang.
 const GDRIVE_CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
-
-const SESSION_URL: &str = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable";
-
-/// The completed file metadata returned after a successful upload.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GDriveFileResponse {
-    id: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    name: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    web_view_link: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    size: Option<String>,
-}
-
-/// Request body for file metadata when creating an upload session.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FileMetadata<'a> {
-    name: &'a str,
-    mime_type: &'a str,
-}
-
-/// Response from getting file metadata with `webViewLink`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FileWebLinkResponse {
-    web_view_link: String,
-}
 
 /// Dispatch entry point wired from the `Account` impl. Drives the whole
 /// upload + link flow on a cloned client handle.
@@ -313,16 +281,6 @@ async fn upload_and_link(
     meta: CloudUploadMeta,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<HostedAttachment, UploadFailure> {
-    if meta.size != bytes.len() as u64 {
-        return Err(UploadFailure::before(Error::invalid_request(
-            AccountOperation::HostAttachment,
-            format!(
-                "declared size {} does not match payload length {}",
-                meta.size,
-                bytes.len()
-            ),
-        )));
-    }
     // Refused here, before the session POST, so the refusal really is of an
     // unsent request. Raised inside the chunk loop instead, it came after a
     // session had been created (and then had to be cancelled).
@@ -342,7 +300,7 @@ async fn upload_and_link(
     // Let session creation finish even during shutdown: interrupting it can
     // discard the only response carrying the URI needed for cleanup. The
     // transport request deadline still bounds this wait.
-    let upload_url = create_upload_session(client, &meta)
+    let upload_url = create_upload_session(client, &meta, bytes.len())
         .await
         .map_err(|error| UploadFailure {
             error,
@@ -426,7 +384,7 @@ async fn cancel_upload_session(
     client: &GmailClient,
     upload_url: &str,
 ) -> Result<(), Option<Error>> {
-    if !reqwest::Url::parse(upload_url).is_ok_and(|url| is_drive_upload_url(&url)) {
+    if !reqwest::Url::parse(upload_url).is_ok_and(|url| client.drive().admits_session(&url)) {
         return Err(None);
     }
     // Not followed, for the same reason as the chunk PUT: the session URI is
@@ -440,9 +398,9 @@ async fn cancel_upload_session(
         .retry(bifrost_net::RetryPolicy::disabled())
         .timeout(GDRIVE_CANCEL_TIMEOUT);
     let outcome = client
+        .drive()
         .execute_builder(
             request,
-            crate::quota::ApiSurface::Drive,
             bifrost_net::ReplayPolicy::IdempotentUnlessConditional,
         )
         .await;
@@ -476,6 +434,7 @@ async fn cancel_upload_session(
 async fn create_upload_session(
     client: &GmailClient,
     meta: &CloudUploadMeta,
+    payload_size: usize,
 ) -> Result<String, Error> {
     let metadata = FileMetadata {
         name: &meta.file_name,
@@ -484,16 +443,13 @@ async fn create_upload_session(
 
     let request = client
         .account_net()
-        .post(SESSION_URL)
+        .post(client.drive().session_url().as_str())
         .header("X-Upload-Content-Type", meta.mime.as_str())
-        .header("X-Upload-Content-Length", &meta.size.to_string())
+        .header("X-Upload-Content-Length", &payload_size.to_string())
         .json(&metadata);
     let response = client
-        .execute_builder(
-            request,
-            crate::quota::ApiSurface::Drive,
-            bifrost_net::ReplayPolicy::Never,
-        )
+        .drive()
+        .execute_builder(request, bifrost_net::ReplayPolicy::Never)
         .await?;
 
     let status = response.status();
@@ -530,23 +486,13 @@ async fn create_upload_session(
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none_or(str::is_empty) {
         return Err(unparseable("is not an http(s) URL with a host"));
     }
-    if !is_drive_upload_url(&url) {
+    if !client.drive().admits_session(&url) {
         return Err(Error::provider_response(
             ProviderFault::ContractViolation,
             "upload session Location is outside the Drive upload surface",
         ));
     }
     Ok(text.to_owned())
-}
-
-fn is_drive_upload_url(url: &reqwest::Url) -> bool {
-    url.scheme() == "https"
-        && url.host_str() == Some("www.googleapis.com")
-        && url.port_or_known_default() == Some(443)
-        && url.username().is_empty()
-        && url.password().is_none()
-        && (url.path() == "/upload/drive/v3/files"
-            || url.path().starts_with("/upload/drive/v3/files/"))
 }
 
 /// Upload the payload in `chunk_size`-aligned chunks against the pre-authenticated
@@ -580,7 +526,7 @@ async fn upload_file_chunked_progress(
     final_chunk: &mut bool,
     chunks: &mut usize,
 ) -> Result<String, Error> {
-    if !reqwest::Url::parse(upload_url).is_ok_and(|url| is_drive_upload_url(&url)) {
+    if !reqwest::Url::parse(upload_url).is_ok_and(|url| client.drive().admits_session(&url)) {
         return Err(Error::provider_response(
             ProviderFault::ContractViolation,
             "upload session is outside the Drive upload surface",
@@ -633,11 +579,8 @@ async fn upload_file_chunked_progress(
             .header("Content-Range", &content_range)
             .body(chunk);
         let response = client
-            .execute_builder(
-                request,
-                crate::quota::ApiSurface::Drive,
-                bifrost_net::ReplayPolicy::Idempotent,
-            )
+            .drive()
+            .execute_builder(request, bifrost_net::ReplayPolicy::Idempotent)
             .await?;
 
         let status = response.status().as_u16();
@@ -652,7 +595,7 @@ async fn upload_file_chunked_progress(
             200 | 201 => {
                 let file: GDriveFileResponse = serde_json::from_slice(response.body.as_ref())
                     .map_err(|source| Error::JsonDecode {
-                        service: GmailService::DriveApi,
+                        service: ApiSurface::Drive,
                         source,
                     })?;
                 return Ok(file.id);
@@ -751,15 +694,15 @@ async fn create_sharing_permission(
     permission_created: &mut bool,
 ) -> Result<String, Error> {
     let file_id = bifrost_net::url::encode_path_component(file_id);
-    let path = format!("https://www.googleapis.com/drive/v3/files/{file_id}/permissions?fields=id");
+    let path = client.drive().permissions_url(&file_id);
     let _perm: serde::de::IgnoredAny = client
+        .drive()
         .post(&path, body, bifrost_net::ReplayPolicy::Never)
         .await?;
 
     *permission_created = true;
-    let link_path =
-        format!("https://www.googleapis.com/drive/v3/files/{file_id}?fields=webViewLink");
-    let file: FileWebLinkResponse = client.get(&link_path).await?;
+    let link_path = client.drive().web_link_url(&file_id);
+    let file: FileWebLinkResponse = client.drive().get(&link_path).await?;
     Ok(file.web_view_link)
 }
 
@@ -784,7 +727,7 @@ fn account_domain(account_email: &str) -> Result<String, Error> {
 
 fn response_error(headers: &reqwest::header::HeaderMap, status: u16, body: Bytes) -> Error {
     let parsed = GmailResponseHeaders::from_headers(headers);
-    Error::response_from_parts(GmailService::DriveApi, status, parsed, body)
+    Error::response_from_parts(ApiSurface::Drive, status, parsed, body)
 }
 
 #[cfg(test)]
@@ -831,13 +774,13 @@ mod tests {
                 ),
                 bifrost_net::HoldKind::QuotaExhausted,
             );
-        let error = create_upload_session(&client, &upload_meta())
+        let error = create_upload_session(&client, &upload_meta(), 7)
             .await
             .expect_err("cross-surface redirect rejected");
         assert!(
             matches!(
                 error,
-                Error::Net(ref net) if matches!(net.terminal(), bifrost_net::Error::RedirectRejected { .. })
+                Error::ObservedNet(ref observed) if matches!(observed.error.terminal(), bifrost_net::Error::RedirectRejected { .. })
             ),
             "unexpected error: {error:?}"
         );
@@ -878,7 +821,7 @@ mod tests {
             },
         ]);
         let client = final_review_held_client(&script);
-        let result = create_upload_session(&client, &upload_meta()).await;
+        let result = create_upload_session(&client, &upload_meta(), 7).await;
         if let Ok(url) = &result {
             let _ = upload_file_chunked(
                 &client,
@@ -961,7 +904,7 @@ mod tests {
     }
 
     fn upload_meta() -> CloudUploadMeta {
-        CloudUploadMeta::new("report.pdf", "application/pdf", 7, ShareScope::Anyone)
+        CloudUploadMeta::new("report.pdf", "application/pdf", ShareScope::Anyone)
     }
 
     fn resume_response(last_byte: usize) -> Canned {
@@ -1719,7 +1662,7 @@ mod tests {
             &scripted_client(&script),
             "no-domain",
             Bytes::from_static(b"payload"),
-            CloudUploadMeta::new("report.pdf", "application/pdf", 7, ShareScope::Organization),
+            CloudUploadMeta::new("report.pdf", "application/pdf", ShareScope::Organization),
         )
         .await
         .expect_err("domain sharing needs a domain");
@@ -1853,12 +1796,7 @@ mod tests {
             &scripted_client(&script),
             "user@example.com",
             Bytes::new(),
-            CloudUploadMeta::new(
-                "empty.bin",
-                "application/octet-stream",
-                0,
-                ShareScope::Anyone,
-            ),
+            CloudUploadMeta::new("empty.bin", "application/octet-stream", ShareScope::Anyone),
         )
         .await
         .expect_err("an empty upload is refused");
@@ -1929,12 +1867,7 @@ mod tests {
             &scripted_client(&script),
             "user@example.com",
             Bytes::from(vec![0; size]),
-            CloudUploadMeta::new(
-                "file",
-                "application/octet-stream",
-                size as u64,
-                ShareScope::Anyone,
-            ),
+            CloudUploadMeta::new("file", "application/octet-stream", ShareScope::Anyone),
         )
         .await
         .unwrap_err();

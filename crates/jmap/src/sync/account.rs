@@ -504,7 +504,7 @@ impl Account for JmapAccount {
         self.client.transport().set_priority(priority);
     }
 
-    fn set_bandwidth_cap(&self, bps: Option<u64>) {
+    fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
         self.client.transport().set_bandwidth_cap(bps);
     }
 
@@ -597,7 +597,7 @@ impl Account for JmapAccount {
         // `uid_validity` is unused: JMAP advertises `Time` / `PageCount`
         // partitioning, never `Uid`, so the UID arm is unreachable from this
         // account.
-        let domain = bifrost_types::CoverageDomain::for_partition(scope.clone(), &partition, 0);
+        let domain = bifrost_types::CoverageDomain::for_partition(scope.clone(), &partition);
         Box::pin(
             inventory::stream_partition(mail, self.core_limits, scope, partition, owner)
                 .map(bifrost_types::lift_complete_walk(domain)),

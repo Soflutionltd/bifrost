@@ -13,20 +13,18 @@
 //! consumer's account identity as well. A rename is a container identity
 //! change; UIDVALIDITY alone cannot establish continuity across one.
 
+use super::error::{ImapErrorContext, folder_of, not_sticky};
+
 use std::num::{NonZeroU32, NonZeroUsize};
 
-use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, ContainerId,
-    DiagnosticText, ErrorScope, ObjectId, Protocol, RequestCause, SyncEvent,
-};
+use bifrost_types::{AccountError, AccountOperation, ContainerId, ObjectId, SyncEvent};
 use bytes::Bytes;
 
 use crate::error::Error;
 use crate::types::{MailboxName, SelectedMailbox};
 
 use super::blob::{BlobError, RawFetchOutcome};
-use super::error::ImapErrorContext;
-use super::{ImapAccount, PooledConn, decode_object_id, encode_object_id, folder_scope};
+use super::{ImapAccount, PooledConn, decode_object_id, encode_object_id};
 
 /// Width of one `UID SEARCH UID lo:hi` window. A window can match at most
 /// this many UIDs, so no single search approaches the connection layer's
@@ -474,21 +472,6 @@ fn nonzero(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).expect("the id decoder rejects zero UIDVALIDITY and UID")
 }
 
-fn folder_of(container: &ContainerId, op: AccountOperation) -> Result<MailboxName, AccountError> {
-    MailboxName::from_account_id(&container.0).map_err(|err| {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(format!("not an IMAP folder identity: {err}")),
-            }),
-        )
-        .protocol(Protocol::Imap)
-        .operation(op)
-        .try_build()
-        .expect("valid account error classification")
-    })
-}
-
 fn folder_error(err: Error, folder: &MailboxName, op: AccountOperation) -> AccountError {
     super::account_error_with(
         err,
@@ -529,23 +512,6 @@ async fn examine(
             ImapErrorContext::operation(op).with_folder_scope(folder),
         )),
     }
-}
-
-/// `Unsupported`, scoped to the folder: a `UIDNOTSTICKY` folder's UIDs do
-/// not persist across selections, so it cannot be tracked by UID.
-fn not_sticky(folder: &MailboxName, op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(op),
-        Cause::Request(RequestCause::Unsupported { operation: op }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(op)
-    .scope(ErrorScope::Cursor(folder_scope(folder)))
-    .text(DiagnosticText::support_only(
-        "folder is UIDNOTSTICKY: its UIDs do not persist across selections",
-    ))
-    .try_build()
-    .expect("valid account error classification")
 }
 
 fn observation(

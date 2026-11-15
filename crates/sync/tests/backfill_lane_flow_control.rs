@@ -55,7 +55,6 @@ fn entry(id: &str) -> InventoryEntry {
     InventoryEntry {
         id: ObjectId(id.into()),
         memberships: Vec::new(),
-        size: None,
         blob_id: None,
         fingerprint: Fingerprint {
             server_version: ServerVersion::Unavailable,
@@ -98,7 +97,7 @@ fn paged_stub(scope: &CursorScope) -> common::StubAccount {
     };
     stub.partition_hook = Some(Arc::new(move |scope, partition| {
         let from = match partition {
-            InventoryPartition::Page { from, .. } => *from,
+            InventoryPartition::Page(window) => window.from(),
             other => panic!("the PageCount plan yields page partitions only: {other:?}"),
         };
         let items: Vec<InventoryEntry> = page_ids(from).iter().map(|id| entry(id)).collect();
@@ -141,7 +140,7 @@ fn open_pages_stub(scope: &CursorScope) -> common::StubAccount {
     };
     stub.partition_hook = Some(Arc::new(move |scope, partition| {
         let from = match partition {
-            InventoryPartition::Page { from, .. } => *from,
+            InventoryPartition::Page(window) => window.from(),
             other => panic!("the PageCount plan yields page partitions only: {other:?}"),
         };
         // Past the end of the inventory the window comes back empty and
@@ -555,7 +554,7 @@ async fn park_the_producer_unread(stub: &Arc<common::StubAccount>) -> usize {
 /// for, which a replacement joining at the ring's tail can never see.
 async fn read_without_acknowledging(
     events: &mut bifrost_sync::ChangesReceiver,
-) -> Vec<(CursorScope, Checkpoint, bifrost_sync::PublicationId)> {
+) -> Vec<(CursorScope, Checkpoint, bifrost_sync::AckToken)> {
     let mut held = Vec::new();
     tokio::time::timeout(Duration::from_secs(10), async {
         while held.len() < LANE {
@@ -569,7 +568,10 @@ async fn read_without_acknowledging(
                 held.push((
                     event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone().expect("checkpointed publication"),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("checkpointed publication"),
                 ));
             }
         }
@@ -619,7 +621,10 @@ async fn a_consumer_that_holds_pages_unread_stalls_the_backfill_producer() {
                 return (
                     event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone().expect("checkpointed publication"),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("checkpointed publication"),
                 );
             }
         }
@@ -646,7 +651,7 @@ async fn a_consumer_that_holds_pages_unread_stalls_the_backfill_producer() {
     // the consumer likes; the ring pressure it would have relieved was already
     // relieved by the read.
     engine
-        .ack_checkpoint(&account_id, page.0, page.1, Some(page.2))
+        .ack(&account_id, page.2)
         .await
         .expect("the ack persists");
     assert_eq!(
@@ -783,11 +788,12 @@ async fn no_backfill_page_is_lost_or_duplicated_under_the_bound() {
             // "it did not" means anything.
             tokio::time::sleep(Duration::from_millis(5)).await;
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -996,7 +1002,7 @@ async fn a_mid_walk_receiver_replacement_does_not_settle_the_scope() {
             if first_page.is_none() {
                 first_page = Some(partition);
             }
-            ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            ack_page_or_fenced(&engine, &account_id, &event).await;
             if completion {
                 walked_at_completion = stub.walked_partitions().len();
                 return;
@@ -1101,7 +1107,7 @@ async fn a_retry_after_lost_pages_restarts_an_open_ended_walk_from_its_beginning
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
             partitions_seen.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
-            ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            ack_page_or_fenced(&engine, &account_id, &event).await;
             if completion {
                 return;
             }
@@ -1134,18 +1140,14 @@ async fn a_retry_after_lost_pages_restarts_an_open_ended_walk_from_its_beginning
 /// is the only tolerated outcome; any other error still fails the test, and a
 /// live-lane acknowledgement is not affected by the fence at all, which is why
 /// these tests never tolerate a failure there.
-async fn ack_page_or_fenced(
-    engine: &SyncEngine,
-    account_id: &AccountId,
-    event: &MultiplexerEvent,
-    checkpoint: &bifrost_types::BackfillCheckpoint,
-) {
+async fn ack_page_or_fenced(engine: &SyncEngine, account_id: &AccountId, event: &MultiplexerEvent) {
     let outcome = engine
-        .ack_checkpoint(
+        .ack(
             account_id,
-            event.scope.cursor().expect("cursor event").clone(),
-            Checkpoint::Backfill(checkpoint.clone()),
-            event.publication.clone(),
+            event
+                .ack_token()
+                .cloned()
+                .expect("acknowledgeable publication"),
         )
         .await;
     if let Err(error) = outcome {
@@ -1246,15 +1248,16 @@ async fn a_page_lost_after_the_marker_was_published_is_refused_at_ack_time() {
         .await
         .expect("the engine's sync permit is obtainable");
     while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), first.recv()).await {
-        let Some(checkpoint) = backfill_checkpoint(&event) else {
+        if backfill_checkpoint(&event).is_none() {
             continue;
-        };
+        }
         engine
-            .ack_checkpoint(
+            .ack(
                 &account_id,
-                event.scope.cursor().expect("cursor event").clone(),
-                Checkpoint::Backfill(checkpoint.clone()),
-                event.publication.clone(),
+                event
+                    .ack_token()
+                    .cloned()
+                    .expect("acknowledgeable publication"),
             )
             .await
             .expect("the ack persists");
@@ -1282,15 +1285,16 @@ async fn a_page_lost_after_the_marker_was_published_is_refused_at_ack_time() {
                 return (
                     event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event.ack_token().cloned(),
                 );
             }
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -1310,7 +1314,7 @@ async fn a_page_lost_after_the_marker_was_published_is_refused_at_ack_time() {
     drop(first);
     // And B acknowledges the marker it was legitimately given.
     engine
-        .ack_checkpoint(&account_id, marker.0, marker.1, marker.2)
+        .ack(&account_id, marker.2.expect("acknowledgeable publication"))
         .await
         .expect("the consumer's acknowledgement is honoured; only the marker is withheld");
 
@@ -1413,13 +1417,14 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
         .await
         .expect("the engine's sync permit is obtainable");
     while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), first.recv()).await {
-        if let Some(checkpoint) = backfill_checkpoint(&event) {
+        if backfill_checkpoint(&event).is_some() {
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -1443,15 +1448,16 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
                 return (
                     event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event.ack_token().cloned(),
                 );
             }
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -1465,7 +1471,7 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
     // faith. The writer refuses it - and that refusal has to travel.
     drop(first);
     engine
-        .ack_checkpoint(&account_id, marker.0, marker.1, marker.2)
+        .ack(&account_id, marker.2.expect("acknowledgeable publication"))
         .await
         .expect("the consumer's acknowledgement is honoured");
     assert!(
@@ -1520,11 +1526,12 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
             let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -1626,7 +1633,7 @@ async fn pages_lost_to_a_lag_withhold_the_completion_marker() {
                 continue;
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
-            ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            ack_page_or_fenced(&engine, &account_id, &event).await;
             if completion {
                 walked_at_completion = stub.walked_partitions().len();
                 return;
@@ -1791,9 +1798,9 @@ async fn a_walk_end_drain_deletes_only_its_own_scopes_rows() {
     let _ = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let event = first.recv().await.expect("the broadcast stays open");
-            let Some(checkpoint) = backfill_checkpoint(&event) else {
+            if backfill_checkpoint(&event).is_none() {
                 continue;
-            };
+            }
             let key = format!("{:?}", event.scope);
             if !held.contains(&key) {
                 // The first page of this scope: left unanswered, so the departure
@@ -1801,7 +1808,7 @@ async fn a_walk_end_drain_deletes_only_its_own_scopes_rows() {
                 held.push(key);
                 continue;
             }
-            ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            ack_page_or_fenced(&engine, &account_id, &event).await;
             // Stop a few pages into the SECOND scope's walk, so that walk is still
             // in flight when the consumer leaves.
             if held.len() == 2 && key == held[1] {
@@ -1831,8 +1838,8 @@ async fn a_walk_end_drain_deletes_only_its_own_scopes_rows() {
     let mut reached = false;
     for _ in 0..4000 {
         while let Ok(event) = second.try_recv() {
-            if let Some(checkpoint) = backfill_checkpoint(&event) {
-                ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            if backfill_checkpoint(&event).is_some() {
+                ack_page_or_fenced(&engine, &account_id, &event).await;
             }
         }
         if !store.deleted().is_empty() {
@@ -1853,8 +1860,8 @@ async fn a_walk_end_drain_deletes_only_its_own_scopes_rows() {
     // cannot run in here.
     for _ in 0..64 {
         while let Ok(event) = second.try_recv() {
-            if let Some(checkpoint) = backfill_checkpoint(&event) {
-                ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            if backfill_checkpoint(&event).is_some() {
+                ack_page_or_fenced(&engine, &account_id, &event).await;
             }
         }
         tokio::task::yield_now().await;
@@ -1921,7 +1928,7 @@ async fn a_page_ack_replayed_across_a_detach_does_not_rebuild_the_resume_positio
     let mut second = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    let mut unflushed: Option<(CursorScope, Checkpoint, bifrost_sync::PublicationId)> = None;
+    let mut unflushed: Option<(CursorScope, Checkpoint, bifrost_sync::AckToken)> = None;
     let mut acked = 0_usize;
     tokio::time::timeout(Duration::from_secs(60), async {
         while acked < 6 {
@@ -1934,16 +1941,21 @@ async fn a_page_ack_replayed_across_a_detach_does_not_rebuild_the_resume_positio
                 unflushed = Some((
                     event.scope.cursor().expect("cursor event").clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone().expect("checkpointed publication"),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("checkpointed publication"),
                 ));
                 return;
             }
-            ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            ack_page_or_fenced(&engine, &account_id, &event).await;
         }
     })
     .await
     .expect("the walk carries on for the replacement");
     let unflushed = unflushed.expect("one page is kept back");
+    let token_bytes = bifrost_sync::encode_ack_token(&unflushed.2, &[7; 32]);
+    drop(unflushed);
 
     engine.detach(&account_id).await.expect("detach succeeds");
     drop(second);
@@ -1960,7 +1972,11 @@ async fn a_page_ack_replayed_across_a_detach_does_not_rebuild_the_resume_positio
     )
     .await;
     engine
-        .ack_checkpoint(&account_id, unflushed.0, unflushed.1, Some(unflushed.2))
+        .ack(
+            &account_id,
+            bifrost_sync::decode_ack_token(&token_bytes, &[7; 32])
+                .expect("restore the persisted acknowledgement"),
+        )
         .await
         .expect("the consumer's replayed acknowledgement is honoured");
     let mut third = engine
@@ -1976,7 +1992,7 @@ async fn a_page_ack_replayed_across_a_detach_does_not_rebuild_the_resume_positio
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
-            ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            ack_page_or_fenced(&engine, &account_id, &event).await;
             if completion {
                 return;
             }
@@ -2052,13 +2068,14 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
         .await
         .expect("the engine's sync permit is obtainable");
     while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), first.recv()).await {
-        if let Some(checkpoint) = backfill_checkpoint(&event) {
+        if backfill_checkpoint(&event).is_some() {
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -2079,11 +2096,12 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -2134,7 +2152,7 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
-            ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            ack_page_or_fenced(&engine, &account_id, &event).await;
             if completion {
                 return;
             }
@@ -2207,7 +2225,7 @@ fn short_open_pages_stub(scope: &CursorScope, windows: u32) -> common::StubAccou
     let end = windows * PAGE;
     stub.partition_hook = Some(Arc::new(move |scope, partition| {
         let from = match partition {
-            InventoryPartition::Page { from, .. } => *from,
+            InventoryPartition::Page(window) => window.from(),
             other => panic!("the PageCount plan yields page partitions only: {other:?}"),
         };
         let items: Vec<InventoryEntry> = if from >= end {
@@ -2332,11 +2350,12 @@ async fn a_departure_inside_a_live_detach_records_no_loss() {
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -2466,10 +2485,10 @@ async fn a_detach_between_the_loss_and_the_walks_end_still_drops_the_rows() {
     tokio::time::timeout(Duration::from_secs(60), async {
         while acked < 4 {
             let event = second.recv().await.expect("the broadcast stays open");
-            let Some(checkpoint) = backfill_checkpoint(&event) else {
+            if backfill_checkpoint(&event).is_none() {
                 continue;
-            };
-            ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            }
+            ack_page_or_fenced(&engine, &account_id, &event).await;
             acked += 1;
         }
     })
@@ -2501,7 +2520,7 @@ async fn a_detach_between_the_loss_and_the_walks_end_still_drops_the_rows() {
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
-            ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            ack_page_or_fenced(&engine, &account_id, &event).await;
             if completion {
                 return;
             }
@@ -2576,13 +2595,14 @@ async fn a_loss_after_the_marker_is_durable_still_forces_a_fresh_walk() {
         .await
         .expect("the engine's sync permit is obtainable");
     while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), first.recv()).await {
-        if let Some(checkpoint) = backfill_checkpoint(&event) {
+        if backfill_checkpoint(&event).is_some() {
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -2604,11 +2624,12 @@ async fn a_loss_after_the_marker_is_durable_still_forces_a_fresh_walk() {
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -2671,7 +2692,7 @@ async fn a_loss_after_the_marker_is_durable_still_forces_a_fresh_walk() {
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
-            ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            ack_page_or_fenced(&engine, &account_id, &event).await;
             if completion {
                 return;
             }
@@ -2738,20 +2759,21 @@ async fn an_incomplete_positional_walk_restarts_after_a_detach() {
     let drain = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let event = second.recv().await.expect("the broadcast stays open");
-            let Some(checkpoint) = backfill_checkpoint(&event) else {
+            if backfill_checkpoint(&event).is_none() {
                 continue;
-            };
+            }
             if stub.walked_partitions().len() > PARTITIONS as usize {
                 // The retry has started; the first walk's durable footprint is
                 // whatever it is now.
                 return;
             }
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -2787,11 +2809,12 @@ async fn an_incomplete_positional_walk_restarts_after_a_detach() {
             let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -2858,16 +2881,17 @@ async fn a_withheld_marker_does_not_abandon_the_accounts_other_scopes() {
     tokio::time::timeout(Duration::from_secs(20), async {
         while pages < 1 {
             let event = first.recv().await.expect("the broadcast stays open");
-            let Some(checkpoint) = backfill_checkpoint(&event) else {
+            if backfill_checkpoint(&event).is_none() {
                 continue;
-            };
+            }
             pages += 1;
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -2901,11 +2925,12 @@ async fn a_withheld_marker_does_not_abandon_the_accounts_other_scopes() {
                 completed.insert(format!("{:?}", checkpoint.scope));
             }
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -2967,15 +2992,16 @@ async fn the_runner_records_pages_that_reached_only_the_sentinel() {
     tokio::time::timeout(Duration::from_secs(20), async {
         while acked < 3 {
             let event = first.recv().await.expect("the broadcast stays open");
-            let Some(checkpoint) = backfill_checkpoint(&event) else {
+            if backfill_checkpoint(&event).is_none() {
                 continue;
-            };
+            }
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -2997,13 +3023,14 @@ async fn the_runner_records_pages_that_reached_only_the_sentinel() {
     // Drain and answer for anything published while we were queueing, so that the
     // departure below really does sweep nothing.
     while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), first.recv()).await {
-        if let Some(checkpoint) = backfill_checkpoint(&event) {
+        if backfill_checkpoint(&event).is_some() {
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -3052,7 +3079,7 @@ async fn the_runner_records_pages_that_reached_only_the_sentinel() {
                 continue;
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
-            ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
+            ack_page_or_fenced(&engine, &account_id, &event).await;
             if completion {
                 walked_at_completion = stub.walked_partitions().len();
                 return;
@@ -3132,11 +3159,12 @@ async fn a_completed_walk_does_not_strand_the_accounts_admission() {
                 completed.insert(format!("{:?}", checkpoint.scope));
             }
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");
@@ -3326,11 +3354,12 @@ async fn an_eagerly_acknowledging_consumer_never_strands_lane_capacity() {
             pages += 1;
             seen.extend(batch_ids(&event));
             engine
-                .ack_checkpoint(
+                .ack(
                     &account_id,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    Checkpoint::Backfill(checkpoint.clone()),
-                    event.publication.clone(),
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
                 )
                 .await
                 .expect("the ack persists");

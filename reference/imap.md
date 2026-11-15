@@ -37,7 +37,12 @@ Equality and hashing distinguish noncanonical wire identities even when their
 display strings coincide, while canonical names compare equal to caller-created
 names. NUL-bearing mailbox wire strings are refused rather than silently
 stripped. Gmail FETCH labels use the negotiated mailbox decoding mode.
-The codec's `utf7::WireMode` owns mailbox display conversion and reports
+The codec's `utf7::WireMode` is also the decoder, encoder and wire reader's
+mode parameter: `ModifiedUtf7` and `Utf8` replace Boolean mode arguments.
+The session capability owner derives that mode, literal mode and BINARY FETCH
+usability together. Mailbox identity adapters accept a value convertible to
+`WireMode`, keeping existing account test inputs at that explicit boundary.
+`WireMode` owns mailbox display conversion and reports
 canonicality at construction. `MailboxName` retains an explicit wire state and
 a cached identity key; equality, hashing and re-encoding admission borrow that
 state without UTF-7 conversion or identity allocation. Mailbox command text
@@ -564,7 +569,19 @@ Buffered `uid_fetch()` uses the driver buffer path directly, not the streaming c
 
 `ServerProfile` answers capability questions without ad-hoc CAPABILITY parsing, built from `state_rx.borrow()` at call time. **Snapshot semantics**: no auto-refresh - refetch after STARTTLS, AUTH, or ENABLE.
 
-"Is capability X usable on this connection?" has ONE authority, `types/profile.rs::supports(capabilities, enabled, capability)`, layered on the rev2-ACTIVE authority `imap4rev2_active`. X is usable when it is advertised, or it is CONDSTORE and QRESYNC is advertised (RFC 7162 Section 3.2.3), or rev2 is active and the RFC 9051 baseline folds it in: ESEARCH, IDLE, MOVE, NAMESPACE, SASL-IR, SEARCHRES, UIDPLUS, UNSELECT, LIST-EXTENDED, LIST-STATUS, STATUS=SIZE, STATUS=DELETED, LITERAL-, SPECIAL-USE, ENABLE. OBJECTID and SAVEDATE are deliberately NOT in the baseline (RFC 9051 defines none of their FETCH items, SEARCH keys, STATUS items or response codes, so a rev2 server that does not advertise them owes none of it), and neither is the BINARY token: rev2 folds in only the FETCH half of RFC 3516 (RFC 9051 Appendix B), not its APPEND extension, so answering the token from rev2 would let an APPEND carry a NUL-bearing `literal8` body a rev2 server may reject. The FETCH half has its own question, `binary_fetch_usable` (BINARY advertised, or rev2 active), which `validate_requested_fetch_items` asks for `BINARY[...]` / `BINARY.PEEK[...]` / `BINARY.SIZE[...]`; `EMAILID` / `THREADID` and `SAVEDATE` FETCH items still require their own advertised capability on rev2. LITERAL+ is deliberately NOT in the baseline: RFC 9051 Appendix E folds in LITERAL- only, so a pure rev2 server takes non-synchronizing literals up to 4096 octets (RFC 9051 Section 4.3) and unbounded ones only when it also advertises LITERAL+ (RFC 7888 Section 4); listing it would tell every caller that such a server accepts a `{N+}` literal of any size. That baseline list is a private function next to `supports` and is the only copy; extensions outside it (CONDSTORE, QRESYNC, SORT, WITHIN, PREVIEW, NOTIFY, MULTIAPPEND, LITERAL+, ...) get no rev2 clause. Every consumer is a thin view over it: `ServerProfile::supports`, `EncodeOptions::has_capability` / `has_condstore` (encoder command admission, including APPEND's MULTIAPPEND and BINARY checks), the connection-handle gates through `connection/auth.rs::snapshot_supports`, and the driver's literal negotiation (`driver::literal_mode` asks the authority for LITERAL+ first, then LITERAL-, else synchronizing, so pure rev2 lands on the 4096-octet LITERAL- behaviour). New gates call one of those views, never `capabilities.contains(..) || rev2`. Checks that deliberately ask something else are the exception and say why at the call site: the non-synchronizing `literal8` form needs an advertised BINARY (which `supports` already answers advertised-only) and additionally a non-rev2 connection (RFC 9051 Section 9 makes rev2 `literal8` synchronizing), and the STATUS `DELETED` item is gated on active rev2 or `QUOTA=RES-MESSAGE` rather than on `supports(StatusDeleted)`. The two agree under rev2 and differ only on rev1, where the authority would also accept an advertised `STATUS=DELETED` token; no RFC defines that token (RFC 9051 Section 6.3.11 makes DELETED a base rev2 item, and the only rev1 route is RFC 9208 Section 4.1.4's `QUOTA=RES-MESSAGE`), so the gate names exactly those two sources. Tests: a test-only oracle in `profile.rs::capability_matrix` classifies every `Capability` variant with an exhaustive match (a new variant does not compile until classified), and matrix tests check the authority, `ServerProfile`, `EncodeOptions` and `snapshot_supports` against it across every rev2-ACTIVE state.
+`types/profile.rs::SessionCapabilities` owns the advertised capabilities and
+confirmed `EnabledSet`, whose entries are parsed `Capability` values with
+case-insensitive identity and insertion deduplication. `ProtocolState`,
+`ConnectionStateSnapshot`, `EncodeOptions` and `ServerProfile` share one `Arc`;
+`ConsumerContext` borrows that same owner. Driver updates use `Arc::make_mut`,
+so published snapshots retain their own coherent negotiation state without
+cloning both lists on every publication or command. AUTH mechanisms and THREAD
+algorithms are iterator projections from the advertised capabilities, not
+additional stored lists. `Command::Enable` retains typed capabilities; raw
+ENABLED response strings remain wire observations and are parsed on adoption.
+
+"Is capability X usable on this connection?" has ONE authority,
+`SessionCapabilities::supports`, layered on its `imap4rev2_active` decision. X is usable when it is advertised, or it is CONDSTORE and QRESYNC is advertised (RFC 7162 Section 3.2.3), or rev2 is active and the RFC 9051 baseline folds it in: ESEARCH, IDLE, MOVE, NAMESPACE, SASL-IR, SEARCHRES, UIDPLUS, UNSELECT, LIST-EXTENDED, LIST-STATUS, STATUS=SIZE, STATUS=DELETED, LITERAL-, SPECIAL-USE, ENABLE. OBJECTID and SAVEDATE are deliberately NOT in the baseline (RFC 9051 defines none of their FETCH items, SEARCH keys, STATUS items or response codes, so a rev2 server that does not advertise them owes none of it), and neither is the BINARY token: rev2 folds in only the FETCH half of RFC 3516 (RFC 9051 Appendix B), not its APPEND extension, so answering the token from rev2 would let an APPEND carry a NUL-bearing `literal8` body a rev2 server may reject. The FETCH half has its own question, `binary_fetch_usable` (BINARY advertised, or rev2 active), which `validate_requested_fetch_items` asks for `BINARY[...]` / `BINARY.PEEK[...]` / `BINARY.SIZE[...]`; `EMAILID` / `THREADID` and `SAVEDATE` FETCH items still require their own advertised capability on rev2. LITERAL+ is deliberately NOT in the baseline: RFC 9051 Appendix E folds in LITERAL- only, so a pure rev2 server takes non-synchronizing literals up to 4096 octets (RFC 9051 Section 4.3) and unbounded ones only when it also advertises LITERAL+ (RFC 7888 Section 4); listing it would tell every caller that such a server accepts a `{N+}` literal of any size. That baseline list is a private function next to `supports` and is the only copy; extensions outside it (CONDSTORE, QRESYNC, SORT, WITHIN, PREVIEW, NOTIFY, MULTIAPPEND, LITERAL+, ...) get no rev2 clause. Every consumer is a thin view over it: `ServerProfile::supports`, `EncodeOptions::has_capability` / `has_condstore` (encoder command admission, including APPEND's MULTIAPPEND and BINARY checks), the connection-handle gates through `connection/auth.rs::snapshot_supports`, and the driver's literal negotiation (`driver::literal_mode` asks the authority for LITERAL+ first, then LITERAL-, else synchronizing, so pure rev2 lands on the 4096-octet LITERAL- behaviour). New gates call one of those views, never `capabilities.contains(..) || rev2`. Checks that deliberately ask something else are the exception and say why at the call site: the non-synchronizing `literal8` form needs an advertised BINARY (which `supports` already answers advertised-only) and additionally a non-rev2 connection (RFC 9051 Section 9 makes rev2 `literal8` synchronizing), and the STATUS `DELETED` item is gated on active rev2 or `QUOTA=RES-MESSAGE` rather than on `supports(StatusDeleted)`. The two agree under rev2 and differ only on rev1, where the authority would also accept an advertised `STATUS=DELETED` token; no RFC defines that token (RFC 9051 Section 6.3.11 makes DELETED a base rev2 item, and the only rev1 route is RFC 9208 Section 4.1.4's `QUOTA=RES-MESSAGE`), so the gate names exactly those two sources. Tests: a test-only oracle in `profile.rs::capability_matrix` classifies every `Capability` variant with an exhaustive match (a new variant does not compile until classified), and matrix tests check the authority, `ServerProfile`, `EncodeOptions` and `snapshot_supports` against it across every rev2-ACTIVE state.
 
 ## Auth
 
@@ -920,7 +937,7 @@ the engine's read-back path.
 - Flag and destroy MODSEQ groups share one checkout. When an earlier group's command leaves it no longer reusable (abandoned by a timeout with the driver still in the exchange, or a dead driver), every later group settles at once as `Unsent` (`Closed` evidence) instead of queuing behind the stalled exchange and withdrawing at its own deadline. No replacement checkout is taken: it would wait on capacity the abandoned member holds until its driver exits, which never happens at `pool_cap = 1` while the checkout is held.
 - `bulk_move` validates the destination mailbox NAME once (syntax via `MailboxName::new`), before any source folder is opened; a syntactically invalid destination fails every target `Request(Malformed)` up front. Existence and selectability are not preflighted: a well-formed but nonexistent destination flows into the per-folder path and surfaces as per-item outcomes from the server's `NO [TRYCREATE]`.
 
-Capabilities advertise `MutationConcurrency::ExpectedVersion(VersionedDoors)` with the mail flag door when CONDSTORE is available and the composed DAV update/delete doors when present. An empty set advertises no caller-version doors. The internal MODSEQ cache is opportunistic (cold cache = unprotected STORE); it does not itself supply a caller-version guarantee. The engine reads back uncertain writes and may reassert declared unversioned targets; this supplies no lost-update guarantee. `mutation.reassertion` declares `set_flags` and `destroy` (see "Flag observation and reassertion capability").
+Capabilities advertise `MutationConcurrency::ExpectedVersion(VersionedDoors)` with the mail flag door when CONDSTORE is available and the composed DAV update/delete/RSVP doors when present. An empty set advertises no caller-version doors. The internal MODSEQ cache is opportunistic (cold cache = unprotected STORE); it does not itself supply a caller-version guarantee. The engine reads back uncertain writes and may reassert declared unversioned targets; this supplies no lost-update guarantee. `mutation.reassertion` declares `set_flags` and `destroy` (see "Flag observation and reassertion capability").
 
 ### PIM primitives
 
@@ -1007,7 +1024,7 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
   supplies explicit submission auth.
 - The send path stays in `bifrost_types::Address` space; the only
   `Address -> bifrost_smtp::Address` conversion is the bare addr-spec
-  reverse-path / recipient conversion at `SubmissionTransport::send_rfc5322`,
+  reverse-path / recipient conversion in `bifrost_smtp::submission::Submission::submit`,
   using the checked SMTP address parser. An invalid reverse path refuses the
   send locally; invalid recipients are failed locally and excluded from RCPT,
   with their failures retained on a successful partial-send receipt. It
@@ -1105,7 +1122,7 @@ CardDAV contact backend too; lookup is enabled only when CardDAV admitted a
 directory gateway, and CardDAV does not support empty-query enumeration.
 CalDAV contributes no directory capabilities. Without the config, the matching flags stay false and primitives return `Unsupported`.
 
-Composition is first-class for sync, not just primitives (subs are full `Arc<dyn Account>`s): `build_capabilities` copies the sub's real contact/calendar `pim_methods` subsets; `route_scope` maps a `CursorScope` to `ScopeHandler::{Folder, Delegate}` and the four sync entry points forward to the sub on `Delegate`; discovery fans sub scopes in (sub errors fold to `Warning`). Routing + fan-in use the reusable `bifrost_types::account_compose` helpers. `open_carddav`/`open_caldav` are fail-soft (`DavAttach::Degraded`, classified via `RecoveryClass`): a DAV open failure degrades to IMAP-only for the cycle and the next reopen retries, so a DAV outage never takes mail offline. The two run JOINED, not in sequence - each is an independent multi-round-trip discovery against its own endpoint with its own client, so awaiting them in turn made every IMAP open pay both latencies. They may complete in either order; attach decisions are applied in a fixed order. A failed DAV open contributes one classified `SkippedScope` to `OpenedAccount::skipped_scopes` (`ContactCollection` / `CalendarCollection`); discovery does not duplicate it as a prose warning. Successful DAV opens cover every discovered collection and forward any factory-reported skips. Ownership collisions likewise contribute classified skips rather than prose warnings. Each names the LOSING sub-account's collection scope (`ContactCollection` / `CalendarCollection`), never `Cursor(Folder(_))`: when a collection href equals an IMAP mailbox name, that folder scope is the mailbox's own, which does sync, and a consumer would read the mailbox as skipped. A href claimed by both sub-accounts reports once per losing sub-account. The collection URL rides in support-only detail, and the gap classifies as a configuration conflict (`Request(Malformed)`, as Graph classifies an unconfigured shared mailbox), not `Internal`, so the user is pointed at configuration rather than asked to report a bug. A failed NAMESPACE, or a failed LIST under one shared-namespace prefix, contributes a `SkippedScope` under `ErrorScope::Account`. Here that scope names the account's shared surface (or the one prefix), NOT the whole account: the personal namespace and every other prefix keep syncing, and mail stays online. bifrost-types has no namespace scope, and no in-workspace reader treats an Account-scoped skip as "the whole account skipped" (bifrost-sync only logs it and exposes it through `open_skipped_scopes`). Consumers must read it the same way. The account retains open-time skips on every `containers_list` snapshot: an enterprise user must see incomplete enumeration rather than infer that missing shares or collections were deleted.
+Composition is first-class for sync, not just primitives (subs are full `Arc<dyn Account>`s): `build_capabilities` delegates contact/directory and calendar capability projection to `bifrost_types::account_compose::merge_capabilities`; `route_scope` maps a `CursorScope` to `ScopeHandler::{Folder, Delegate}` and the four sync entry points forward to the sub on `Delegate`; discovery fans sub scopes in (sub errors fold to `Warning`). Routing, capability projection and fan-in use the reusable `bifrost_types::account_compose` helpers. `open_carddav`/`open_caldav` are fail-soft (`DavAttach::Degraded`, classified via `RecoveryClass`): a DAV open failure degrades to IMAP-only for the cycle and the next reopen retries, so a DAV outage never takes mail offline. The two run JOINED, not in sequence - each is an independent multi-round-trip discovery against its own endpoint with its own client, so awaiting them in turn made every IMAP open pay both latencies. They may complete in either order; attach decisions are applied in a fixed order. A failed DAV open contributes one classified `SkippedScope` to `OpenedAccount::skipped_scopes` (`ContactCollection` / `CalendarCollection`); discovery does not duplicate it as a prose warning. Successful DAV opens cover every discovered collection and forward any factory-reported skips. Ownership collisions likewise contribute classified skips rather than prose warnings. Each names the LOSING sub-account's collection scope (`ContactCollection` / `CalendarCollection`), never `Cursor(Folder(_))`: when a collection href equals an IMAP mailbox name, that folder scope is the mailbox's own, which does sync, and a consumer would read the mailbox as skipped. A href claimed by both sub-accounts reports once per losing sub-account. The collection URL rides in support-only detail, and the gap classifies as a configuration conflict (`Request(Malformed)`, as Graph classifies an unconfigured shared mailbox), not `Internal`, so the user is pointed at configuration rather than asked to report a bug. A failed NAMESPACE, or a failed LIST under one shared-namespace prefix, contributes a `SkippedScope` under `ErrorScope::Account`. Here that scope names the account's shared surface (or the one prefix), NOT the whole account: the personal namespace and every other prefix keep syncing, and mail stays online. bifrost-types has no namespace scope, and no in-workspace reader treats an Account-scoped skip as "the whole account skipped" (bifrost-sync only logs it and exposes it through `open_skipped_scopes`). Consumers must read it the same way. The account retains open-time skips on every `containers_list` snapshot: an enterprise user must see incomplete enumeration rather than infer that missing shares or collections were deleted.
 
 `ConvenienceShape` declares IMAP starred/replied/forwarded as keyword-shaped. `move_thread`/`delete_thread` override the trait defaults via the cloneable account handle (add-then-remove); delete moves to the Trash role unless already in Trash, where it expunges from that mailbox.
 
@@ -1239,7 +1256,8 @@ factory uses `Net::shared_default()` and resolves the IMAP budget from that
 same shared transport's registry. Sharing therefore also holds by default.
 `Account::set_bandwidth_cap` retunes this budget directly; there is no cap
 atomic, sentinel, connection-local token bucket or submission-only budget.
-`None` is unlimited and `Some(0)` clamps to 1 B/s in the shared budget.
+`None` is unlimited; finite account caps use positive `BandwidthCap` values.
+The shared budget receives the extracted rate.
 
 The bootstrap connection, every pool dial and redial, ManageSieve and SMTP
 submission all receive clones of that handle. `WireReader` performs admission
@@ -2055,3 +2073,44 @@ legality test calls the group owner. A bundle alone cannot establish all RFC 546
 legality: non-selected filters cannot request FETCH payloads and selected filters
 cannot contain extension events. Those checks remain with the group constructor.
 NOTIFY FETCH operands retain typed attributes or explicit raw extension syntax.
+
+Contact and calendar primitive forwarding preserves delegate behavior, including
+contact/event autocomplete overrides, directory-group list/expand, and versioned
+RSVP. The shared composition owner exhaustively assigns every PIM field to mail,
+contacts/directory or calendars, so a new field requires an explicit lane choice.
+Versioned RSVP forwards the caller token unchanged; CalDAV can still refuse it.
+An enterprise user expects the attached backend's concurrency protection and
+optional operations to survive composition.
+
+### Account error construction ownership
+
+`account/error.rs` owns IMAP domain error constructors and error decoration,
+including malformed object ids, cursor faults, mutation refusals, search refusal,
+polling and push refusal. Its armed `dead_code` lint covers these helpers as well
+as wire translation. Synthetic error fixtures are in its test-only `test_support`
+module. Submission has its own translation boundary, and shared account-closed,
+unsupported and caller page-cursor classifications remain in bifrost-types.
+
+A successful FETCH with no answer for the requested UID produces
+`NotFound(Message)` with `Acknowledged` attempt evidence for batch hydration,
+message hydration and raw reads alike. Each retains its own operation and the
+exact submitted message id. An enterprise user expects a vanished message to be
+reported as absent, with the server's completed answer preserved as evidence.
+
+Persisted QRESYNC and CONDSTORE MODSEQs must satisfy the same positive 63-bit
+`ModSeq` bound as live command operands. Invalid saved values produce scoped
+`SchemaIncompatible` recovery before command construction; durable state rebuilds
+instead of repeatedly attempting an impossible sync command.
+
+COPYUID partial-copy diagnostics omit message targets with zero UIDVALIDITY or
+zero UID, retaining the source and destination folder targets and the committed
+copy effect as incomplete identity evidence. An enterprise user expects a
+partially completed move reconciled using valid identities, without fabricated
+message ids. The existing 256-entry bound still limits server-controlled detail.
+
+SMTP submission composition delegates TLS modes, submission credentials, envelope
+conversion, HOLDUNTIL and recipient receipt projection to
+`bifrost_smtp::submission`. The IMAP wrapper retains every existing configuration
+field, login credential inheritance, account budget/meter, default From and
+save-to-Sent policy. Its scripted submission connector still reaches the same
+SMTP builder. Local envelope validation errors now identify SMTP as their protocol.

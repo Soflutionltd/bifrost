@@ -148,7 +148,7 @@ pub(crate) fn barrier_incidents(
                     generation,
                     failure_label: failure_label.clone(),
                     evidence: error.clone().into(),
-                    policy: crate::cursor::PolicyStatus::Retrying { attempts: 0 },
+                    policy: crate::cursor::BarrierPolicy::Undecided,
                     resume_from: resume_from.clone(),
                 })
         })

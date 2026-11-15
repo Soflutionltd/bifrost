@@ -209,25 +209,6 @@ the canonical refusal (`caps.pim_methods.gate(AccountOperation::X)?`,
 method once and generating the flag field, the operation variant and the
 default refusal.
 
-## CON-010 - How are a composite account's capabilities merged?
-
-**Reported by:** types.
-
-Only IMAP composes sub-accounts and only IMAP knows how to merge their
-`AccountCapabilities`. `account_compose.rs` claims to be the reusable
-composition layer ("tomorrow JMAP / Graph") but holds no capability merge. See
-STR-016 for where the composition layer should live.
-
-The imap-account hunter describes the merge: `build_capabilities` copies each
-contact and calendar `PimMethodSupport` field and each
-`MutationConcurrency::ExpectedVersion` field from the sub-accounts by hand, and
-`mod.rs` forwards each contact/calendar method by hand; `event_rsvp` concurrency
-is hard-coded `false` and `event_rsvp_if_version` is not forwarded (harmless while
-CalDAV refuses tokens, but nothing ties the two). Every new PIM field needs a
-remembered edit. Its proposal: group `PimMethodSupport` and the expected-version
-table by lane (`contacts: ContactMethods`, `calendars: CalendarMethods`), so
-composition is one assignment per lane and new fields arrive automatically.
-
 ## CON-011 - Are `ObjectType::Event` and `ObjectType::CalendarEvent` the same domain?
 
 **Reported by:** types (LATENT disagreement), graph.
@@ -268,30 +249,6 @@ this provider budget held right now" with different keys, clocks and lifetimes,
 and an error from a net local hold is recorded into the engine bucket a second
 time. Decide which store owns provider holds and feed the other from it.
 Related: CON-009 (budget declared vs stamped).
-
-## CON-014 - May the engine start wire work for this account now? (the drive-start gate)
-
-**Reported by:** sync-engine.
-
-The protocol: (1) boundary is `Run`; (2) activity registered; (3) account-wide
-holds slept out first; (4) the current account's declared keys checked; (5)
-admission taken; (6) keys re-checked against the freshly loaded incarnation
-after admission; (7) the fence re-checked; (8) on a hold, the permit released.
-Written by hand in the poll loop (and again inside the `with_drive` closure),
-the push reconciler, the backfill orchestrator, the partition runner through
-`LaneGate`, the deferred inventory worker, the campaign scheduler, and
-`RepairPacing::wait` with `restart_account`. Each copy carries its own
-admission-refusal backoff (cadence, 1s, 100ms, or a `record_attempt` ramp).
-`orphan_teardown.rs`, `repair_debt` and the passthrough cluster skip some or all
-of it (BUG-009, BUG-014). The "drive-start granularity" guarantee is held
-together by about seven parallel copies.
-
-Owner: one `DriveStart` primitive on the slot,
-`admit_drive(work: ThrottleWork, kind: WorkKind) -> Result<Admitted { permit,
-activity, incarnation }, Held { scope_local: bool, until }>`, owning steps 1-8
-and re-checking after every internal wait. Lanes keep only their reaction to
-`Held { scope_local: true }` (requeue, defer or park). Orphan teardown and
-repair go through it too.
 
 ## CON-016 - Which cursor scopes does a membership map to, and back?
 
@@ -394,6 +351,14 @@ positional vs account-supplied) stays per front end.
 ## CON-047 - May this URL carry the account credential?
 
 **Reported by:** graph.
+
+Partly landed in wave 15: `crates/net/src/url.rs` has `TrustedOrigins` and a
+net-minted `AdmittedUrl`, Graph and DAV admit through them, and an optional
+`AccountSpec::trusted_origins` is checked before automatic bearer lookup.
+Residue: an `AccountSpec` without `trusted_origins` still relies on each
+protocol's own admission, because composed handles and JMAP session endpoints
+have no complete account-wide authority set yet, so bearer-carrying requests
+are not required to take an `AdmittedUrl`. The original account:
 
 net attaches the bearer to the first request whatever its host (stated in Graph's
 `origin.rs` module doc) and leaves admission to each crate: Graph (`origin.rs`)

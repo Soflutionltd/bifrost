@@ -752,8 +752,8 @@ fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) -> crate::Result<()> {
         // mutation stream. Retain a second refusal here so a future internal
         // caller cannot turn an unhandled operation into a successful no-op.
         _ => {
-            return Err(crate::Error::NotParsable(
-                "JMAP flag patch received an unsupported FlagOp variant".to_string(),
+            return Err(crate::Error::UnsupportedOperation(
+                "JMAP flag patch received an unsupported FlagOp variant",
             ));
         }
     }

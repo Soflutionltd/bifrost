@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use crate::Result;
-use crate::client::GmailClient;
+pub(crate) use crate::transport::GmailApi;
 use crate::types::{
     GmailAttachmentData, GmailDraft, GmailFilter, GmailHistoryResponse, GmailLabel, GmailMessage,
     GmailProfile, GmailSendAs, GmailThread, GmailThreadStub, GmailVacationSettings,
@@ -9,7 +9,7 @@ use crate::types::{
     ListThreadsResponse,
 };
 
-impl GmailClient {
+impl GmailApi {
     pub(crate) async fn get_profile(&self) -> Result<GmailProfile> {
         self.get("/profile").await
     }
@@ -221,7 +221,7 @@ impl GmailClient {
             .await?;
         let transferred_size = u64::try_from(response.body.len()).unwrap_or(u64::MAX);
         let attachment =
-            super::client::parse_json_response(response, crate::quota::ApiSurface::Gmail).await?;
+            crate::client::parse_json_response(response, crate::quota::ApiSurface::Gmail).await?;
         Ok((attachment, transferred_size))
     }
 
@@ -395,6 +395,25 @@ mod tests {
         assert_eq!(
             mail_list_query(Some(".."), None, None),
             "?includeSpamTrash=true&q=.."
+        );
+    }
+}
+
+#[cfg(test)]
+mod inventory_query_tests {
+    use super::mail_list_query;
+    #[test]
+    fn inventory_lists_spam_and_trash_and_encodes_its_page_token() {
+        assert_eq!(
+            format!("/messages{}", mail_list_query(None, Some(500), None)),
+            "/messages?includeSpamTrash=true&maxResults=500"
+        );
+        assert_eq!(
+            format!(
+                "/messages{}",
+                mail_list_query(None, Some(500), Some("next+page"))
+            ),
+            "/messages?includeSpamTrash=true&maxResults=500&pageToken=next%2Bpage"
         );
     }
 }

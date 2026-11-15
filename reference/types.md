@@ -289,9 +289,11 @@ tracked state but no flags encode that state as `key=value` pseudo-flags. The
 value is comparable within one provider and object namespace only.
 
 An inventory representation is "changed" when ANY field of `InventoryEntry`
-differs: id, memberships, size, blob id, fingerprint, thread id, message id,
+differs: id, membership set, blob id, fingerprint, thread id, message id,
 references, or in-reply-to. `InventoryEntry::differs_from` is the canonical
-comparison. Comparing `Fingerprint` alone is insufficient: JMAP mailbox
+comparison. Its exhaustive destructuring forces a decision for every new field.
+Membership order and duplicate memberships do not change the set. Size lives
+only in `Fingerprint::size`; Graph leaves it absent. Comparing `Fingerprint` alone is insufficient: JMAP mailbox
 membership can change without keyword state changing.
 
 ## Mutation outcomes
@@ -471,7 +473,7 @@ crates/types/src/
   container.rs        containers, labels, roles, provenance,
                       ContainerList skip-lane envelope
   compose.rs          send and draft request vocabulary
-  account_compose.rs  compose validation and helpers
+  account_compose.rs  account routing, discovery fan-in and capability projection
   search.rs           message search requests and results
   filter.rs           server-filter model
   settings.rs         identities, vacation, quota
@@ -663,3 +665,60 @@ shared parsed rule into their supported provider vocabulary; CalDAV validates
 it before writing RECUR text. Malformed caller rules are request faults;
 valid rules a provider cannot express remain Unsupported. This does not change
 `EventRange::admits`, which retains recurring masters without expanding them.
+
+## Account composition ownership
+
+`account_compose::merge_capabilities` owns contact/directory and calendar PIM
+projection and caller-version door merging. Its exhaustive 60-field PIM literal
+requires an explicit owner for new fields; there is no default update that can
+silently drop a delegate capability. Mail fields stay primary-owned, 12 contact
+and directory fields come from contacts, and nine calendar fields from calendars.
+Absent delegates contribute false fields and no versioned doors. Versioned doors
+are selected by lane, including calendar RSVP, never unioned across accounts.
+This protocol-neutral owner lives beside typed routing and discovery fan-in
+because these are account-contract decisions, rather than IMAP wire policy.
+Factory attach failures retain the typed `OpenedAccount::skipped_scopes` lane;
+discovery fan-in retains its existing warning semantics.
+
+## Validated windows and account policy values
+
+`TimeWindow`, `UidWindow` and `PageWindow` have private endpoints and fallible
+`new` constructors enforcing `from <= to`. Every window is half-open; missing
+time bounds are unbounded and equal endpoints form an empty window. UID
+endpoints use u64 to represent u32::MAX + 1, reject larger ends, and carry the
+UIDVALIDITY epoch. `InventoryPartition` and `CoverageCoordinate` carry these
+same windows. `CoverageDomain::for_partition` copies the window and never takes
+an unrelated epoch or a non-UID sentinel. `InventoryPartitioning` describes
+planning hints, not requested windows: an inclusive maximum UID remains u32,
+with its epoch, while page totals and page sizes remain counts.
+
+`SnapshotIdentity` retains value `Eq` for durable-record round trips and
+record deduplication. It is not a coverage proof. Only `same_snapshot_as`
+compares provider snapshots, and it refuses two unstable observations. Making
+value equality non-reflexive would violate the derived record `Eq` contract.
+
+`ByteRange` describes `[start, start + length)`, or an unbounded tail when
+length is absent. HTTP adapters translate to an inclusive last byte and check
+arithmetic overflow. The representation was already length based; its former
+inclusive documentation described the wire endpoint rather than the API.
+
+`BandwidthCap` is a positive byte rate backed by `NonZeroU64`. Account and control
+setters take `Option<BandwidthCap>`; `None` is unlimited. Zero is rejected by
+construction, rather than selecting a 1 B/s trickle. Net-budget adapters extract
+its numeric rate when applying account policy.
+
+`CloudUploadMeta` carries name, declared MIME type and share scope. Upload
+length comes from the payload bytes; consumers cannot supply a conflicting size.
+Attachment media-type strings preserve the declared wire value. The existing
+`mime::parse_content_type` is deliberately tolerant and substitutes text/plain
+on malformed input, so it cannot validate outbound declarations or replace raw
+inbound evidence without losing information. The attachment fields therefore
+retain their strings rather than silently adopting that parser's fallback.
+
+`CapabilityDelta::between` compares all 15 top-level negotiated snapshot fields
+in declaration order, with exhaustive destructuring guarding additions. Keys
+name those fields; values are diagnostic Debug renderings, not a wire codec.
+The fixed snapshot schema expresses transitions in `changed`, leaving `added`
+and `removed` empty. A committed reattach publishes a nonempty delta through
+`AccountControl::CapabilitiesChanged`; a provider detecting a change before a
+replacement open may still have no second snapshot for its error's delta.

@@ -451,7 +451,7 @@ impl Account for CalDavAccount {
         self.client.net().set_priority(priority);
     }
 
-    fn set_bandwidth_cap(&self, bps: Option<u64>) {
+    fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
         self.client.net().set_bandwidth_cap(bps);
     }
 
@@ -2474,7 +2474,7 @@ mod tests {
         let client = CalDavClient::with_account_net("https://dav.example.test", net.clone());
         let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
 
-        account.set_bandwidth_cap(Some(4_096));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(4_096));
         assert_eq!(net.bandwidth_cap(), Some(4_096));
         account.set_priority(Priority::Background);
         assert_eq!(net.priority(), Priority::Background);

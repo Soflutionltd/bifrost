@@ -520,8 +520,7 @@ mod tests {
         let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
         let mut consumer = QuotaRootConsumer::new(canonical.clone());
         let context = ConsumerContext {
-            capabilities: &[],
-            enabled: &[],
+            session: crate::types::profile::SessionCapabilities::empty(),
             command_target: Some(&canonical),
             command_tag: "A001",
         };

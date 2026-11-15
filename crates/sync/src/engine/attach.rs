@@ -925,44 +925,6 @@ pub(super) async fn run_deferred_inventory_establishment(
             }
             continue;
         }
-        // The account-wide hold is slept out FIRST and the scope-local decision
-        // taken after it, so a short account hold overlapping a long mailbox
-        // hold cannot leave this scope in the inline wait below with every
-        // later scope queued behind it.
-        while let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id) {
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(wait) => {}
-            }
-        }
-        let mut keys = crate::recovery::declared_keys(
-            account.load_full().as_ref().as_ref(),
-            &account_id,
-            bifrost_types::ThrottleWork::Scope(&scope),
-        );
-        if let Some(wait) = crate::recovery::throttle_wait(&throttles, &account_id, &keys) {
-            tracing::debug!(
-                target: "bifrost.sync.backfill",
-                account = ?account_id,
-                scope = ?scope,
-                wait_secs = wait.as_secs(),
-                "deferred inventory requeued behind a throttle on this scope"
-            );
-            queue.push_back(inventory);
-            held_in_a_row += 1;
-            earliest_hold = Some(earliest_hold.map_or(wait, |e| e.min(wait)));
-            if held_in_a_row >= queue.len() {
-                let sleep_for = earliest_hold.take().unwrap_or_default();
-                held_in_a_row = 0;
-                tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    () = tokio::time::sleep(sleep_for) => {}
-                }
-            }
-            continue;
-        }
-        held_in_a_row = 0;
-        earliest_hold = None;
         // The generation of the incarnation the walk last ran against. A
         // terminated walk's recovery is stamped with it: dispatched in-task, it
         // can still reach the listener's arms after a reattach, and must not act
@@ -973,83 +935,45 @@ pub(super) async fn run_deferred_inventory_establishment(
             if !control.wait_until_running(&shutdown).await {
                 return;
             }
-            // Honor every throttle deadline this walk consumes before the
-            // inventory walk, mirroring the backfill partition runner:
-            // deferred establishment drives the same heavy inventory
-            // lane. Loop back to the boundary check after waking.
-            if crate::recovery::throttle_wait(&throttles, &account_id, &keys).is_some() {
-                // A hold that appeared during the pause park or admission.
-                // Only the ACCOUNT-WIDE part is slept here, never the
-                // combined wait: a scope-local hold sends this scope back on
-                // the queue (the outer check counts and sleeps it), so it
-                // never holds the scopes behind it.
-                let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id)
-                else {
-                    queue.push_back(inventory);
-                    continue 'queue;
-                };
-                tracing::debug!(
-                    target: "bifrost.sync.backfill",
-                    account = ?account_id,
-                    scope = ?scope,
-                    wait_secs = wait.as_secs(),
-                    "deferred inventory deferred by shared throttle deadline"
-                );
-                tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    () = tokio::time::sleep(wait) => {}
-                }
-                continue;
-            }
-            // Deferred fusion is one of the heaviest cold-start walks in
-            // the engine, so it takes a permit like every other protocol
-            // path. Held only for the walk itself; the throttle wait and
-            // the recovery handling below run outside it.
-            let admission = tokio::select! {
-                () = shutdown.cancelled() => return,
-                permit = scheduler.admit(
-                    account_id.clone(),
-                    control.priority_snapshot(),
+            let gate = super::drive_start::DriveStart {
+                current: &account,
+                control: &control,
+                scheduler: &scheduler,
+                throttles: &throttles,
+                account_id: &account_id,
+                shutdown: &shutdown,
+            };
+            let admitted = match gate
+                .admit_drive(
+                    bifrost_types::ThrottleWork::Scope(&scope),
                     crate::scheduler::WorkKind::Backfill,
-                ) => match permit {
-                    Ok(permit) => permit,
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "bifrost.sync.scheduler",
-                            account = ?account_id,
-                            scope = ?scope,
-                            %error,
-                            "deferred inventory admission refused; retrying"
-                        );
+                )
+                .await
+            {
+                Ok(admitted) => admitted,
+                Err(super::drive_start::StartRefused::ShuttingDown) => return,
+                Err(super::drive_start::StartRefused::Paused) => continue,
+                Err(super::drive_start::StartRefused::Held { until, .. }) => {
+                    let wait = until.saturating_duration_since(tokio::time::Instant::now());
+                    queue.push_back(inventory);
+                    held_in_a_row += 1;
+                    earliest_hold = Some(earliest_hold.map_or(wait, |e| e.min(wait)));
+                    if held_in_a_row >= queue.len() {
+                        let sleep_for = earliest_hold.take().unwrap_or_default();
+                        held_in_a_row = 0;
                         tokio::select! {
                             () = shutdown.cancelled() => return,
-                            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            () = tokio::time::sleep(sleep_for) => {}
                         }
-                        continue;
                     }
-                },
+                    continue 'queue;
+                }
             };
-            // Admission can park, and a hold recorded meanwhile predates this
-            // walk. Release the permit and go back round to the wait above.
-            //
-            // The keys are asked of the account the walk is about to run
-            // against: a reopen during the waits above can install one whose
-            // declaration differs from the keys computed before them.
-            let acc_arc = account.load_full();
+            held_in_a_row = 0;
+            earliest_hold = None;
+            let acc_arc = &admitted.incarnation;
             walked_generation = acc_arc.generation();
             let acc: &dyn Account = acc_arc.as_ref().as_ref();
-            let final_keys = crate::recovery::declared_keys(
-                acc,
-                &account_id,
-                bifrost_types::ThrottleWork::Scope(&scope),
-            );
-            if crate::recovery::throttle_wait(&throttles, &account_id, &final_keys).is_some() {
-                // Carry the fresh keys to the wait at the top of the loop, or
-                // it would check the stale ones and re-admit straight away.
-                keys = final_keys;
-                drop(admission);
-                continue;
-            }
             // The pre-walk fence check again, now that every wait above - a
             // pause, a throttle, admission - is behind us. A reset can commit
             // inside any of them (a schema reset parked under a pause runs the
@@ -1061,7 +985,7 @@ pub(super) async fn run_deferred_inventory_establishment(
             // Admission is released first: the follow-up `EstablishIfAbsent`
             // must not be sent while holding it.
             if coverage.scope_fence(&scope) != inventory.fence {
-                drop(admission);
+                drop(admitted);
                 break Ok(crate::multiplexer::FusionOutcome::Invalidated);
             }
             let fusion = crate::multiplexer::InventoryFusion {
@@ -1082,7 +1006,7 @@ pub(super) async fn run_deferred_inventory_establishment(
                     fusion.run_resume_with_broadcast(acc, cursor.clone()).await
                 }
             };
-            drop(admission);
+            drop(admitted);
             if matches!(result, Err(Error::Paused)) {
                 continue;
             }

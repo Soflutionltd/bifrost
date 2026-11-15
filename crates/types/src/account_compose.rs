@@ -1,22 +1,14 @@
-//! Reusable account-composition helpers.
+//! Account composition: typed routing, discovery fan-in and capability ownership.
 //!
-//! A composing account (today IMAP; tomorrow JMAP / Graph) can attach
-//! CardDAV / CalDAV sub-accounts and present their typed scopes as
-//! first-class sync scopes. The two pieces every composing account needs
-//! are the same:
+//! This layer stays protocol-neutral because all three decisions depend on
+//! Account contracts, not IMAP sessions. Keeping capability projection beside
+//! routing gives composition one owner instead of a second IMAP-only table.
+//! Discovery failures retain the existing warning contract; factory attach
+//! failures use OpenedAccount's typed skipped-scopes lane at the caller.
 //!
-//! - [`route_typed_scope`] - decide whether a `CursorScope` is serviced
-//!   by the composing account itself or delegated to a contacts /
-//!   calendars sub-account, keyed only on the scope and `ObjectType`.
-//! - [`merge_scope_streams`] - fan the composing account's own discovery
-//!   items in with each sub-account's discovery stream into one bounded
-//!   stream (warnings, then one final batch, then one `Done`).
-//!
-//! These are protocol-agnostic: they name only `CursorScope`,
-//! `ObjectType`, `Account`, and the stream/event types. The composing
-//! crate maps [`ScopeTarget::This`] onto its own per-protocol handler
-//! (e.g. IMAP resolves it to a `MailboxName`) and builds the
-//! `Unsupported` error in its own error vocabulary.
+//! The exhaustive PIM projection below requires every new field to choose an
+//! owner. Enterprise users expect attached contacts and calendars to retain
+//! their backend's operations and version protection without changing mail.
 
 use std::sync::Arc;
 
@@ -174,3 +166,123 @@ async fn drain_sub_discovery<T>(
 // a hand-rolled busy-loop executor into the foundational crate purely to
 // re-prove what the consumer already pins, so the test lives with the
 // consumer.
+
+/// Project PIM methods and caller-version doors from their servicing accounts.
+/// Mail capabilities remain owned by `primary`; absent delegates contribute none.
+/// The exhaustive struct literal deliberately has no default update: adding a
+/// PIM field must choose its owner here before the contract crate compiles.
+pub fn merge_capabilities(
+    primary: &mut crate::AccountCapabilities,
+    contacts: Option<&crate::AccountCapabilities>,
+    calendars: Option<&crate::AccountCapabilities>,
+) {
+    use crate::{MutationConcurrency, PimMethodSupport, VersionedDoors};
+
+    let contact_methods = contacts.map(|caps| caps.pim_methods).unwrap_or_default();
+    let calendar_methods = calendars.map(|caps| caps.pim_methods).unwrap_or_default();
+    primary.pim_methods = PimMethodSupport {
+        category_definitions: primary.pim_methods.category_definitions,
+        message_reactions: primary.pim_methods.message_reactions,
+        add_to_container: primary.pim_methods.add_to_container,
+        remove_from_container: primary.pim_methods.remove_from_container,
+        set_keyword: primary.pim_methods.set_keyword,
+        set_label_membership: primary.pim_methods.set_label_membership,
+        set_category: primary.pim_methods.set_category,
+        set_extended_property: primary.pim_methods.set_extended_property,
+        set_importance: primary.pim_methods.set_importance,
+        set_is_read: primary.pim_methods.set_is_read,
+        send_message: primary.pim_methods.send_message,
+        attachment_upload: primary.pim_methods.attachment_upload,
+        host_attachment: primary.pim_methods.host_attachment,
+        draft_create: primary.pim_methods.draft_create,
+        draft_update: primary.pim_methods.draft_update,
+        draft_discard: primary.pim_methods.draft_discard,
+        draft_send: primary.pim_methods.draft_send,
+        scheduled_send: primary.pim_methods.scheduled_send,
+        send_as: primary.pim_methods.send_as,
+        search: primary.pim_methods.search,
+        search_messages: primary.pim_methods.search_messages,
+        containers_list: primary.pim_methods.containers_list,
+        container_create: primary.pim_methods.container_create,
+        container_rename: primary.pim_methods.container_rename,
+        container_move: primary.pim_methods.container_move,
+        container_delete: primary.pim_methods.container_delete,
+        identities_list: primary.pim_methods.identities_list,
+        identity_update: primary.pim_methods.identity_update,
+        vacation_get: primary.pim_methods.vacation_get,
+        vacation_set: primary.pim_methods.vacation_set,
+        quota_get: primary.pim_methods.quota_get,
+        thread_hydrate: primary.pim_methods.thread_hydrate,
+        message_hydrate: primary.pim_methods.message_hydrate,
+        open_raw_rfc822: primary.pim_methods.open_raw_rfc822,
+        filters_list: primary.pim_methods.filters_list,
+        filter_create: primary.pim_methods.filter_create,
+        filter_update: primary.pim_methods.filter_update,
+        filter_delete: primary.pim_methods.filter_delete,
+        filter_validate: primary.pim_methods.filter_validate,
+        address_books_list: contact_methods.address_books_list,
+        contacts_list: contact_methods.contacts_list,
+        contact_get: contact_methods.contact_get,
+        contact_create: contact_methods.contact_create,
+        contact_update: contact_methods.contact_update,
+        contact_delete: contact_methods.contact_delete,
+        contact_search: contact_methods.contact_search,
+        contact_autocomplete: contact_methods.contact_autocomplete,
+        directory_search: contact_methods.directory_search,
+        directory_enumerate: contact_methods.directory_enumerate,
+        directory_groups_list: contact_methods.directory_groups_list,
+        directory_group_expand: contact_methods.directory_group_expand,
+        calendars_list: calendar_methods.calendars_list,
+        events_in_range: calendar_methods.events_in_range,
+        event_get: calendar_methods.event_get,
+        event_create: calendar_methods.event_create,
+        event_update: calendar_methods.event_update,
+        event_delete: calendar_methods.event_delete,
+        event_rsvp: calendar_methods.event_rsvp,
+        event_search: calendar_methods.event_search,
+        event_autocomplete: calendar_methods.event_autocomplete,
+    };
+    let mail = primary.mutation.concurrency.versioned_doors();
+    let contacts = contacts
+        .map(|caps| caps.mutation.concurrency.versioned_doors())
+        .unwrap_or(VersionedDoors::NONE);
+    let calendars = calendars
+        .map(|caps| caps.mutation.concurrency.versioned_doors())
+        .unwrap_or(VersionedDoors::NONE);
+    // Never union a delegate's whole set: its mail or other PIM lane belongs
+    // to that delegate, not to this composite's corresponding handler.
+    let mut doors = VersionedDoors::NONE;
+    doors = doors.with(
+        VersionedDoors::MAIL_SET_FLAGS,
+        mail.contains(VersionedDoors::MAIL_SET_FLAGS),
+    );
+    doors = doors.with(
+        VersionedDoors::MAIL_MOVE,
+        mail.contains(VersionedDoors::MAIL_MOVE),
+    );
+    doors = doors.with(
+        VersionedDoors::MAIL_DESTROY,
+        mail.contains(VersionedDoors::MAIL_DESTROY),
+    );
+    doors = doors.with(
+        VersionedDoors::CONTACT_UPDATE,
+        contacts.contains(VersionedDoors::CONTACT_UPDATE),
+    );
+    doors = doors.with(
+        VersionedDoors::CONTACT_DELETE,
+        contacts.contains(VersionedDoors::CONTACT_DELETE),
+    );
+    doors = doors.with(
+        VersionedDoors::EVENT_UPDATE,
+        calendars.contains(VersionedDoors::EVENT_UPDATE),
+    );
+    doors = doors.with(
+        VersionedDoors::EVENT_DELETE,
+        calendars.contains(VersionedDoors::EVENT_DELETE),
+    );
+    doors = doors.with(
+        VersionedDoors::EVENT_RSVP,
+        calendars.contains(VersionedDoors::EVENT_RSVP),
+    );
+    primary.mutation.concurrency = MutationConcurrency::ExpectedVersion(doors);
+}

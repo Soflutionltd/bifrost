@@ -202,10 +202,10 @@ pub(super) async fn ack_writer(
     // takes ownership of it.
     let mut provisional: HashMap<CursorScope, crate::engine::ReattachAttempt> = HashMap::new();
     let mut pending_repairs: HashMap<
-        crate::cursor::PublicationId,
+        crate::cursor::AckToken,
         Vec<crate::repair::RepairResolution>,
     > = HashMap::new();
-    let mut acknowledged_publications: HashSet<crate::cursor::PublicationId> = HashSet::new();
+    let mut acknowledged_publications: HashSet<crate::cursor::AckToken> = HashSet::new();
     // The authoritative debt ledger for this account. Held here rather than
     // re-read per write because this task is the only thing that may mutate it,
     // which is what makes generation-aware conditional transitions possible
@@ -369,10 +369,10 @@ pub(super) async fn ack_writer(
                 // The REPAIR lane specifically: a checkpoint publication's id
                 // resolves to `Unknown` here rather than being consumed, so a
                 // consumer cannot discharge a checkpoint through this path and
-                // leave the later `ack_checkpoint` short-circuiting as already
+                // leave the later `ack` short-circuiting as already
                 // persisted over a store write that never happened.
                 let result = match coverage.claim_repair(publication.clone()) {
-                    ClaimLookup::Apply(_) => {
+                    ClaimLookup::Apply(_) | ClaimLookup::Replay(_) => {
                         if let Some(resolutions) = pending_repairs.remove(&publication) {
                             let outcome = apply_repair_resolutions(
                                 &account_id,
@@ -783,7 +783,7 @@ pub(super) async fn ack_writer(
                 // never became durable. Leaving it outstanding would
                 // wedge every later pause / checkpoint_now on this
                 // account. The consumer learns about the store failure
-                // from `ack_checkpoint`'s own `Result`, below. The
+                // from `ack`'s own `Result`, below. The
                 // watermark deliberately does NOT move: a retry of
                 // this acknowledgement must report `Unknown` and fail
                 // again, never "already persisted" for a write that
@@ -1002,7 +1002,7 @@ async fn discard_backfill(
     coverage: &PendingCoverage,
     ledger: &mut crate::cursor::DebtLedger,
     scope: &CursorScope,
-    through: Option<&crate::cursor::PublicationId>,
+    through: Option<&crate::cursor::AckToken>,
 ) -> Result<(), Error> {
     // The BACKFILL half only. Fencing the whole scope refused a replacement
     // consumer's acknowledgement of live batches it had really received, with an
@@ -1158,8 +1158,8 @@ const PARKED_REPAIR_CAP: usize = 64;
 
 fn park_pending_repair(
     account_id: &AccountId,
-    parked: &mut HashMap<crate::cursor::PublicationId, Vec<crate::repair::RepairResolution>>,
-    publication: crate::cursor::PublicationId,
+    parked: &mut HashMap<crate::cursor::AckToken, Vec<crate::repair::RepairResolution>>,
+    publication: crate::cursor::AckToken,
     resolutions: Vec<crate::repair::RepairResolution>,
 ) {
     if parked.len() >= PARKED_REPAIR_CAP
@@ -1410,7 +1410,7 @@ fn completion_refusal(
     coverage: &PendingCoverage,
     ledger: &crate::cursor::DebtLedger,
     checkpoint: &bifrost_types::BackfillCheckpoint,
-    publication: Option<&crate::cursor::PublicationId>,
+    publication: Option<&crate::cursor::AckToken>,
 ) -> Option<CompletionRefusal> {
     // Evaluated FIRST and independently of the debt, because the two answers
     // call for different repairs and the stronger one must not be masked. When
@@ -1536,8 +1536,8 @@ async fn persist_ack_request(
     // for both - a foreign row is exactly what must not become this account's
     // resume position - so the imprecision costs nothing beyond a slightly
     // generous status. Distinguishing them means putting an account identity
-    // into the publication id, a published-type change out of proportion to
-    // the nit.
+    // into the token. The public token currently binds checkpoint and lane,
+    // while the caller still selects the account.
     //
     // Only when the receipt really names THIS batch's lane. A publication from
     // another lane presented with a backfill checkpoint is evidence about the
@@ -1583,6 +1583,13 @@ async fn persist_ack_request(
             }
             for report in &claim.reports {
                 candidate.ingest(report, claim.generation, now);
+            }
+        }
+        Some(ClaimLookup::Replay(reports)) => {
+            let now = jiff::Timestamp::now().as_second();
+            for report in &reports {
+                ledger.accrue().replay_ack_debt(report, now);
+                candidate.replay_ack_report(report, now, true);
             }
         }
         // Already persisted by an earlier acknowledgement of this exact

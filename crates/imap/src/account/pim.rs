@@ -8,6 +8,11 @@
 //! absence of reading, not evidence of correctness. Noted so a later auditor
 //! knows where coverage stops.
 
+use super::error::{
+    expunged_message, or_folder_restriction_error, pim_malformed, restamp, search_cursor_voided,
+    stamp_imap_protocol,
+};
+
 use bifrost_types::{
     Application, ErrorScope, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets,
     TargetRef, TargetRole,
@@ -33,9 +38,10 @@ use bifrost_types::page::Page;
 use bifrost_types::search::{SearchFilter, SearchRequest};
 use bifrost_types::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFuture, AccountOperation, Cause,
-    DiagnosticText, LabelId, Protocol, ProtocolKind, RequestCause, RequestErrorKind,
+    AccountError, AccountFuture, AccountOperation, DiagnosticText, LabelId, Protocol, ProtocolKind,
 };
+#[cfg(test)]
+use bifrost_types::{AccountErrorKind, Cause, RequestCause, RequestErrorKind};
 use jiff::Timestamp;
 use jiff::tz::Offset;
 
@@ -1052,20 +1058,6 @@ fn restamp_draft_date(
     ))
 }
 
-/// Collapse RFC 5322 folded header lines into `(lowercase-name, value)`
-/// pairs, preserving order.
-/// Re-stamp an `AccountError` from the submission boundary with the IMAP
-/// operation that drove it, so recovery/telemetry attribute it correctly.
-///
-/// `into_builder` preserves idempotency and throttle overrides. Restamping
-/// changes the operation without discarding the submission boundary's evidence.
-fn restamp(err: AccountError, op: AccountOperation) -> AccountError {
-    err.into_builder()
-        .operation(op)
-        .try_build()
-        .expect("valid account error classification")
-}
-
 /// Stamp each not-accepted recipient's error with the send call's operation.
 fn restamp_recipients(
     recipients: Vec<RecipientNotAccepted>,
@@ -1081,17 +1073,6 @@ fn restamp_recipients(
             )
         })
         .collect()
-}
-
-/// Attribute a provider-neutral assembler error to IMAP. The shared
-/// `bifrost-types` MIME assembler leaves the protocol unset (it is shared
-/// across providers); the IMAP send path stamps `Protocol::Imap` so
-/// telemetry and recovery attribute the failure to this account.
-fn stamp_imap_protocol(err: AccountError) -> AccountError {
-    err.into_builder()
-        .protocol(Protocol::Imap)
-        .try_build()
-        .expect("valid account error classification")
 }
 
 pub(crate) fn draft_discard(
@@ -1743,6 +1724,7 @@ async fn result_mutation(
     op: AccountOperation,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
     use bifrost_types::{ItemOutcome, TransmissionState};
+
     let mut done = Vec::new();
     for (folder, ids) in group_by_folder(ids) {
         for window in ids.chunks(account.config.mutation_batch_size.max(1)) {
@@ -2345,52 +2327,11 @@ fn merge_folder(
     op: AccountOperation,
 ) -> Result<Option<MailboxName>, bifrost_types::AccountError> {
     match (current, next) {
-        (Some(a), Some(b)) if a != b => {
-            use bifrost_types::{
-                AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, Protocol,
-                RequestCause, RequestErrorKind,
-            };
-            Err(AccountErrorBuilder::new(
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::InvalidArgument {
-                    field: Some("folder"),
-                    message: Some(DiagnosticText::support_only(format!(
-                        "search filter spans two folders ({} and {}); \
-                         IMAP SEARCH cannot span multiple mailboxes in one command",
-                        a.as_str(),
-                        b.as_str()
-                    ))),
-                }),
-            )
-            .protocol(Protocol::Imap)
-            .operation(op)
-            .try_build()
-            .expect("valid account error classification"))
-        }
+        (Some(a), Some(b)) if a != b => Err(super::error::search_folders_conflict(&a, &b, op)),
         (Some(a), _) => Ok(Some(a)),
         (_, Some(b)) => Ok(Some(b)),
         (None, None) => Ok(None),
     }
-}
-
-/// A folder restriction (`SearchFilter::In`) nested inside an `Or` has no
-/// faithful single-mailbox IMAP SEARCH encoding (see `combine_or`).
-fn or_folder_restriction_error(op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("folder"),
-            message: Some(DiagnosticText::support_only(
-                "a folder restriction (In) inside an Or cannot be expressed as a \
-                 single-mailbox IMAP SEARCH; restructure the query so folder scoping \
-                 is not OR-ed with other criteria",
-            )),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(op)
-    .try_build()
-    .expect("valid account error classification")
 }
 
 fn empty_to_all(criteria: SearchCriteria) -> SearchCriteria {
@@ -2639,34 +2580,6 @@ impl<T> SearchPager<T> {
 /// uses too, so consumers restart paging the same way across providers.
 fn search_page_cursor_error(op: AccountOperation, detail: impl Into<String>) -> AccountError {
     AccountError::invalid_page_cursor(op, Protocol::Imap, detail)
-}
-
-/// The cursor's folder answered with a different UIDVALIDITY, so the UID
-/// the walk resumes after no longer names anything there.
-///
-/// This stays `ConcurrencyConflict`, not the page_cursor `Malformed` fault the
-/// decode and restriction cases use: the cursor was valid when issued and the
-/// server replaced the mailbox under it. `Malformed` derives ClientBug, which
-/// would report a server-side epoch change as an application defect; an
-/// Outlook user whose mailbox was rebuilt expects the search to simply run
-/// again, which a conflict's re-read recovery gives. A consumer restarts
-/// paging on either error. How UIDVALIDITY changes are classified across the
-/// rest of the IMAP account is a separate, still open, question.
-fn search_cursor_voided(op: AccountOperation, folder: &MailboxName) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::ConcurrencyConflict,
-        Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-    )
-    .protocol(Protocol::Imap)
-    .operation(op)
-    .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
-    ))
-    .text(DiagnosticText::support_only(
-        "UIDVALIDITY of the folder this search page cursor resumes in changed; repeat the search",
-    ))
-    .try_build()
-    .expect("valid account error classification")
 }
 
 fn flatten_thread(node: &ThreadNode, out: &mut Vec<u32>) {
@@ -3074,55 +2987,6 @@ fn draft_patch_to_rfc5322(patch: &DraftPatch) -> Result<Vec<u8>, AccountError> {
     bifrost_types::render_rfc5322(&composed).map_err(stamp_imap_protocol)
 }
 
-/// The message a completed `UID FETCH` did not answer for.
-///
-/// `hydrate_decoded` only reaches the FETCH once `valid_uids` has confirmed the
-/// id's UIDVALIDITY matches the selected mailbox, so the UID is a live name in
-/// the current epoch and the id was well-formed. A tagged OK with no FETCH for
-/// that UID is how RFC 3501 6.4.8 / RFC 9051 6.4.9 report a UID that no longer
-/// exists: the message was expunged between the caller learning the id and
-/// this FETCH. That is `NotFound(Message)`, not the caller's malformed request.
-/// The server answered, so the attempt is `Acknowledged`.
-fn expunged_message(id: ObjectId) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message),
-        Cause::Request(RequestCause::NotFound {
-            what: bifrost_types::ResourceKind::Message,
-            id: Some(id.0.clone()),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(AccountOperation::HydrateMessage)
-    .scope(bifrost_types::ErrorScope::Message { id })
-    .push_cause(Cause::Attempt(bifrost_types::AttemptCause::new(
-        bifrost_types::TransmissionState::Acknowledged,
-    )))
-    .try_build()
-    .expect("valid account error classification")
-}
-
-/// Build a `Request(Malformed)` `AccountError` for local PIM failures
-/// where the caller provided invalid or internally inconsistent state.
-///
-/// The operation is threaded in from the caller. Helpers reachable from
-/// more than one PIM surface (id decode, mailbox-name validation,
-/// search-criteria assembly, page-cursor parsing) take the op as a
-/// parameter rather than guessing, so a locally-malformed request is
-/// attributable to the PIM call that produced it. The recovery class is
-/// `ClientBug` for all of them; the operation is the telemetry.
-fn pim_malformed(op: AccountOperation, detail: impl Into<String>) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(detail.into()),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(op)
-    .try_build()
-    .expect("valid account error classification")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3472,16 +3336,7 @@ mod tests {
         // unsupporting relay (brick 4.6a). The IMAP send path re-stamps
         // only the operation/protocol via `restamp`; it must not change
         // the kind. Pin that the kind survives unchanged.
-        let smtp_derived = bifrost_types::AccountErrorBuilder::new(
-            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Send),
-            bifrost_types::Cause::Request(bifrost_types::RequestCause::Unsupported {
-                operation: AccountOperation::Send,
-            }),
-        )
-        .protocol(Protocol::Smtp)
-        .operation(AccountOperation::Send)
-        .try_build()
-        .expect("valid account error classification");
+        let smtp_derived = crate::account::error::test_support::smtp_unsupported();
 
         let restamped = restamp(smtp_derived, AccountOperation::Send);
         assert_eq!(
@@ -5109,12 +4964,7 @@ mod partial_commit_tests {
     }
     #[test]
     fn partial_commit_container_create_refresh_failure_is_protected() {
-        let leaf = AccountErrorBuilder::new(
-            AccountErrorKind::Server(bifrost_types::ServerErrorKind::Unavailable),
-            Cause::Server(bifrost_types::ServerCause::Unavailable { retry_hint: None }),
-        )
-        .try_build()
-        .unwrap();
+        let leaf = crate::account::error::test_support::unavailable_without_context();
         let error = container_refresh_error(
             leaf,
             StepEffect::Created,

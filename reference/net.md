@@ -1738,3 +1738,37 @@ resume status without Location from a redirect; request dispatch must still
 disable redirects. Providers own I/O, shutdown, deadlines and durable effect
 records. A window's final flag remains readable in the provider's effect record
 when an in-flight future is dropped.
+
+## Credential destination admission
+
+`TrustedOrigins` owns exact HTTP(S) origin membership and mints `AdmittedUrl`
+proofs. It rejects userinfo, including empty userinfo discarded by URL parsing.
+Cloning copies the set, so DAV discovery cannot widen a sibling protocol leg.
+`AccountNet::admitted_request` sends the proof's canonical URL; a proof does
+not grant authority over another account's configured origins.
+
+`AccountSpec::trusted_origins` optionally restricts automatic account bearer
+injection. A configured empty set refuses all destinations. The shared request
+loop checks it on every authenticated hop before token lookup, including after
+retagging. `None` retains protocol-owned admission for existing consumers.
+`HopPolicy` remains the admission authority for credentials it selects, including
+DAV credentials and Graph's separate Outlook audience. Its admission occurs
+before lookup; account-wide restrictions do not replace that leg's policy.
+
+Making every request constructor require a proof is not implemented: JMAP's
+initial discovery and authenticated session endpoints have independent origins,
+and existing composed handles do not carry a complete per-leg origin policy.
+Redirect trust cannot supply that missing authority. Enterprise users must retain
+working discovered endpoint authentication. Protocols opt into account-wide
+restrictions only when their full credential destination set is known.
+
+`TokenSnapshot::contention_account_error(protocol, operation)` classifies only
+`Contended` as transient authentication unavailability, without a transport cause
+or target-attempt evidence. Other states return `None`. Blocking SMTP uses this
+projection: a locally busy cache requires retry rather than reauthorization.
+
+Account policy setters use `Option<bifrost_types::BandwidthCap>`: finite caps
+are positive and `None` is unlimited. `AccountNet::set_bandwidth_cap` extracts
+the numeric value into the shared budget. The lower-level `BandwidthBudget`
+retains its numeric constructor/setter and zero-clamping behavior for transport
+admission callers; it cannot introduce zero through the typed account setter.

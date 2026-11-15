@@ -113,8 +113,15 @@ async fn current_or_probe_state<T: HttpTransport>(
 pub(crate) async fn probe_email_state<T: HttpTransport>(
     mail: &MailAccount<T>,
 ) -> crate::Result<crate::core::id::ObjectState<Email>> {
-    Ok(mail
+    let state = mail
         .call(EmailGet::new().ids(Vec::<EmailId>::new()))
         .await?
-        .into_state())
+        .into_state();
+    // An Outlook user expects a usable concurrency guard, never an empty token.
+    if state.as_str().is_empty() {
+        return Err(crate::Error::MissingResponseField(
+            "nonempty Email/get state",
+        ));
+    }
+    Ok(state)
 }

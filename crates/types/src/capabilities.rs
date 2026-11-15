@@ -580,3 +580,108 @@ pub struct CapabilityDelta {
     pub removed: Vec<CapabilityKey>,
     pub changed: Vec<CapabilityChange>,
 }
+
+impl CapabilityDelta {
+    /// Compare the complete negotiated snapshots. Fixed snapshot fields are
+    /// always present, so transitions populate `changed`, not added/removed.
+    #[must_use]
+    pub fn between(before: &AccountCapabilities, after: &AccountCapabilities) -> Self {
+        fn values(snapshot: &AccountCapabilities) -> Vec<(CapabilityKey, CapabilityValue)> {
+            let AccountCapabilities {
+                cursor_freshness,
+                blob_range,
+                blob_digest_pre_download,
+                push,
+                mutation,
+                batching_policy,
+                rate_limit_class,
+                quota_signal,
+                requires_uidvalidity_recheck,
+                historyid_expires_after,
+                delta_token_expires_after,
+                pim_methods,
+                filter_rule_shape,
+                conveniences,
+                discovers_foreign_namespaces_on_rediscovery,
+            } = snapshot;
+            vec![
+                (
+                    CapabilityKey("cursor_freshness".into()),
+                    CapabilityValue(format!("{cursor_freshness:?}")),
+                ),
+                (
+                    CapabilityKey("blob_range".into()),
+                    CapabilityValue(format!("{blob_range:?}")),
+                ),
+                (
+                    CapabilityKey("blob_digest_pre_download".into()),
+                    CapabilityValue(format!("{blob_digest_pre_download:?}")),
+                ),
+                (
+                    CapabilityKey("push".into()),
+                    CapabilityValue(format!("{push:?}")),
+                ),
+                (
+                    CapabilityKey("mutation".into()),
+                    CapabilityValue(format!("{mutation:?}")),
+                ),
+                (
+                    CapabilityKey("batching_policy".into()),
+                    CapabilityValue(format!("{batching_policy:?}")),
+                ),
+                (
+                    CapabilityKey("rate_limit_class".into()),
+                    CapabilityValue(format!("{rate_limit_class:?}")),
+                ),
+                (
+                    CapabilityKey("quota_signal".into()),
+                    CapabilityValue(format!("{quota_signal:?}")),
+                ),
+                (
+                    CapabilityKey("requires_uidvalidity_recheck".into()),
+                    CapabilityValue(format!("{requires_uidvalidity_recheck:?}")),
+                ),
+                (
+                    CapabilityKey("historyid_expires_after".into()),
+                    CapabilityValue(format!("{historyid_expires_after:?}")),
+                ),
+                (
+                    CapabilityKey("delta_token_expires_after".into()),
+                    CapabilityValue(format!("{delta_token_expires_after:?}")),
+                ),
+                (
+                    CapabilityKey("pim_methods".into()),
+                    CapabilityValue(format!("{pim_methods:?}")),
+                ),
+                (
+                    CapabilityKey("filter_rule_shape".into()),
+                    CapabilityValue(format!("{filter_rule_shape:?}")),
+                ),
+                (
+                    CapabilityKey("conveniences".into()),
+                    CapabilityValue(format!("{conveniences:?}")),
+                ),
+                (
+                    CapabilityKey("discovers_foreign_namespaces_on_rediscovery".into()),
+                    CapabilityValue(format!("{discovers_foreign_namespaces_on_rediscovery:?}")),
+                ),
+            ]
+        }
+        let changed = values(before)
+            .into_iter()
+            .zip(values(after))
+            .filter_map(|((key, from), (_, to))| {
+                (from != to).then_some(CapabilityChange { key, from, to })
+            })
+            .collect();
+        Self {
+            changed,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}

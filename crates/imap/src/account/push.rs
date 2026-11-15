@@ -1,3 +1,4 @@
+use super::error::rejected_scope_error;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -199,25 +200,6 @@ pub(crate) fn push_subscribe(
                 )
             })
     })
-}
-
-/// One rejected scope in the `push_subscribe` failed lane.
-///
-/// Both refusals are `Unsupported(PushSubscribe)`: neither is a whole-request
-/// fault (`Err` stays reserved for that), neither is retryable as issued, and
-/// a rejected scope must not fail its siblings. They are distinguished by the
-/// diagnostic text, not the kind, because a capacity refusal and a
-/// scope-shape refusal need different operator action even though they carry
-/// the same recovery class - bifrost-sync keeps polling either way.
-fn rejected_scope_error(detail: &'static str) -> AccountError {
-    AccountError::unsupported(
-        AccountOperation::PushSubscribe,
-        bifrost_types::Protocol::Imap,
-    )
-    .into_builder()
-    .text(bifrost_types::DiagnosticText::user_safe(detail))
-    .try_build()
-    .expect("valid push scope error")
 }
 
 /// IMAP push is folder-granular: IDLE and `NOTIFY SET` both name mailboxes,

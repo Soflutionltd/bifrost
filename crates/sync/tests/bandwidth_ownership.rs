@@ -84,7 +84,7 @@ async fn slot_budget_precedes_open_survives_reopen_and_drops_on_detach() {
         .attach(id.clone(), Arc::<Factory>::clone(&factory))
         .await
         .expect("attach");
-    control.bandwidth_cap(Some(7));
+    control.bandwidth_cap(bifrost_types::BandwidthCap::new(7));
     // Keep the executor runnable, so paused time cannot advance the schedule.
     for _ in 0..100 {
         if registry.budget(id.clone()).cap() == Some(7) {
@@ -103,7 +103,7 @@ async fn slot_budget_precedes_open_survives_reopen_and_drops_on_detach() {
         tokio::spawn(async move { engine.reattach(&id).await })
     };
     factory.started.notified().await;
-    control.bandwidth_cap(Some(11));
+    control.bandwidth_cap(bifrost_types::BandwidthCap::new(11));
     for _ in 0..100 {
         if registry.budget(id.clone()).cap() == Some(11) {
             break;

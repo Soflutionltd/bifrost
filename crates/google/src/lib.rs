@@ -11,12 +11,16 @@
 #![recursion_limit = "256"]
 
 pub mod account;
-mod api;
+mod calendar;
 mod client;
+mod drive;
 mod encoding;
 mod error;
+mod gmail;
 mod headers;
+mod people;
 mod quota;
+mod transport;
 mod types;
 
 use error::{Error, Result};

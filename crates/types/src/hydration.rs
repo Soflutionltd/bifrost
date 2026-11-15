@@ -61,6 +61,9 @@ pub enum AttachmentSource {
 #[derive(Debug, Clone)]
 pub struct MessageAttachment {
     pub filename: Option<String>,
+    // Preserve the declared wire media type. parse_content_type is a tolerant
+    // inbound parser: malformed input becomes text/plain, which would silently
+    // change an outbound declaration or hide inbound evidence.
     pub content_type: Option<String>,
     pub content_id: Option<String>,
     pub inline: bool,

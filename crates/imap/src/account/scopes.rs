@@ -336,18 +336,7 @@ mod tests {
         // discovery stream for the sub.
         let discover = |_sub: &Arc<dyn Account>| -> AccountStream<SyncEvent<CursorScope>> {
             let op = bifrost_types::AccountOperation::DiscoverCursorScopes;
-            let error = bifrost_types::AccountErrorBuilder::new(
-                bifrost_types::AccountErrorKind::Transport(
-                    bifrost_types::TransportErrorKind::Network,
-                ),
-                bifrost_types::Cause::Transport(bifrost_types::TransportCause::new(
-                    bifrost_types::TransportKind::Network,
-                    None,
-                )),
-            )
-            .operation(op)
-            .try_build()
-            .expect("valid account error classification");
+            let error = crate::account::error::test_support::discovery_transport(op);
             Box::pin(futures::stream::iter([SyncEvent::Terminated(error)]))
         };
 

@@ -681,8 +681,7 @@ mod tests {
 
     fn ctx() -> ConsumerContext<'static> {
         ConsumerContext {
-            capabilities: &[],
-            enabled: &[],
+            session: crate::types::profile::SessionCapabilities::empty(),
             command_target: None,
             command_tag: "A001",
         }
@@ -964,8 +963,7 @@ mod tests {
     fn move_keeps_untagged_copyuid_beside_a_tagged_highestmodseq() {
         let qresync = ["QRESYNC".to_owned()];
         let ctx = ConsumerContext {
-            capabilities: &[],
-            enabled: &qresync,
+            session: &crate::types::profile::SessionCapabilities::new(Vec::new(), qresync.to_vec()),
             command_target: None,
             command_tag: "A001",
         };
@@ -1013,8 +1011,7 @@ mod tests {
     fn expunge_keeps_every_removal_in_the_form_it_arrived_on_a_qresync_connection() {
         let qresync = ["QRESYNC".to_owned()];
         let ctx = ConsumerContext {
-            capabilities: &[],
-            enabled: &qresync,
+            session: &crate::types::profile::SessionCapabilities::new(Vec::new(), qresync.to_vec()),
             command_target: None,
             command_tag: "A001",
         };

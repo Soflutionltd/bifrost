@@ -8,6 +8,7 @@ use super::*;
 /// `handle_account_error`, the engine-directive arm, and the reopen
 /// loop don't carry seven-positional argument lists.
 pub(crate) struct RecoveryContext<'a> {
+    pub scheduler: &'a Scheduler,
     pub deferred_schema_reset: &'a Arc<DeferredSchemaReset>,
     pub bandwidth_budget: Option<&'a bifrost_net::BandwidthBudget>,
     pub factory: &'a Arc<dyn AccountFactory>,
@@ -880,6 +881,56 @@ impl RepairPacing {
         local.max(shared)
     }
 
+    async fn admit(
+        &mut self,
+        ctx: &RecoveryContext<'_>,
+        control: &SyncControl,
+        account: Option<&dyn Account>,
+        scope: Option<&CursorScope>,
+    ) -> Result<super::drive_start::RecoveryAdmission, Error> {
+        let gate = super::drive_start::DriveStart {
+            current: ctx.current,
+            control,
+            scheduler: ctx.scheduler,
+            throttles: ctx.throttles,
+            account_id: ctx.account_id,
+            shutdown: ctx.shutdown,
+        };
+        loop {
+            self.wait(ctx, account, scope).await?;
+            let result = gate
+                .admit_recovery(crate::scheduler::WorkKind::Sync, account, |account| {
+                    if let Some(scope) = scope {
+                        crate::recovery::declared_keys(
+                            account,
+                            ctx.account_id,
+                            bifrost_types::ThrottleWork::Scope(scope),
+                        )
+                    } else {
+                        self.failed_keys.clone()
+                    }
+                })
+                .await;
+            match result {
+                Ok(admitted) => return Ok(admitted),
+                Err(super::drive_start::StartRefused::Paused) => return Err(Error::Paused),
+                Err(super::drive_start::StartRefused::ShuttingDown) => {
+                    return Err(Error::ShuttingDown);
+                }
+                // No scheduler permit or newly registered activity survives
+                // this return. The next wait charges the recovery allowance.
+                Err(super::drive_start::StartRefused::Held { .. }) => {}
+            }
+        }
+    }
+
+    // Scope repair already deleted its cursor, or replacement attach owns
+    // provisional writer rows, under an outer admitted activity and reopen
+    // lock. Those transaction owners deliberately span pacing: releasing them
+    // would let pause report quiescence halfway through recovery, or let a
+    // second replacement consume provisional state. Only the per-attempt
+    // scheduler permit and inner activity come from DriveStart, and neither
+    // spans a hold. Never reload current in place of the pinned account here.
     async fn wait(
         &mut self,
         ctx: &RecoveryContext<'_>,
@@ -1653,20 +1704,62 @@ pub(super) enum ReplacementOpen {
 /// guard is returned so the caller can hand it to `reattach_account` and keep
 /// the whole reopen inside one activity registration.
 ///
-/// This consumer-driven path acquires the reopen lock after admission.
-/// `restart_account` acquires it in its pacing loop instead, so a hold that
-/// lands during acquisition releases both guards before waiting. Both paths
-/// hand the guards to `open_replacement_admitted` for the open and swap;
-/// neither holds the lock while waiting for a paused account to resume.
+/// Both consumer-driven reattach and restart register activity, take the
+/// reopen lock, then take scheduler budget, matching scoped recovery's lock
+/// order. A hold found before or after queued admission releases all those
+/// owners before waiting. Neither retains the lock while waiting for resume.
 pub(super) async fn open_replacement(
     ctx: &RecoveryContext<'_>,
 ) -> Result<(OwnedMutexGuard<()>, SyncActivityGuard, Replacement), ReplacementOpen> {
-    let activity = ctx
-        .control
-        .begin_activity()
-        .ok_or(ReplacementOpen::Paused)?;
-    let reopen_guard = Arc::clone(ctx.reopen_lock).lock_owned().await;
-    open_replacement_admitted(ctx, reopen_guard, activity).await
+    let gate = super::drive_start::DriveStart {
+        current: ctx.current,
+        control: ctx.control,
+        scheduler: ctx.scheduler,
+        throttles: ctx.throttles,
+        account_id: ctx.account_id,
+        shutdown: ctx.shutdown,
+    };
+    loop {
+        let activity = ctx
+            .control
+            .begin_activity()
+            .ok_or(ReplacementOpen::Paused)?;
+        let mut boundary = ctx.control.drive_boundary();
+        if boundary.peek() != BoundaryRequest::Run {
+            return Err(ReplacementOpen::Paused);
+        }
+        let reopen_guard = tokio::select! {
+            biased;
+            () = ctx.shutdown.cancelled() => return Err(ReplacementOpen::Detached),
+            _ = boundary.changed() => return Err(ReplacementOpen::Paused),
+            guard = Arc::clone(ctx.reopen_lock).lock_owned() => guard,
+        };
+        // Lock before budget, matching scope recovery. A factory open has no
+        // scope declaration yet; establishment asks the replacement itself.
+        let admitted = match gate
+            .admit_recovery(crate::scheduler::WorkKind::Sync, None, |_| Vec::new())
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(super::drive_start::StartRefused::Paused) => return Err(ReplacementOpen::Paused),
+            Err(super::drive_start::StartRefused::ShuttingDown) => {
+                return Err(ReplacementOpen::Detached);
+            }
+            Err(super::drive_start::StartRefused::Held { until, .. }) => {
+                drop(reopen_guard);
+                drop(activity);
+                tokio::select! {
+                    () = ctx.shutdown.cancelled() => return Err(ReplacementOpen::Detached),
+                    () = tokio::time::sleep_until(until) => {}
+                }
+                continue;
+            }
+        };
+        drop(activity);
+        let result = open_replacement_admitted(ctx, reopen_guard, admitted.activity).await;
+        drop(admitted.permit);
+        return result;
+    }
 }
 
 async fn open_replacement_admitted(
@@ -2062,7 +2155,15 @@ async fn reattach_account_paced(
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            // A mail user expects account affordances to follow renegotiation.
+            // Only committed cutover has both authoritative snapshots.
+            let delta = bifrost_types::CapabilityDelta::between(&capabilities, next.capabilities());
             *capabilities = next.capabilities().clone();
+            if !delta.is_empty() {
+                let _ = ctx
+                    .account_control_tx
+                    .send(AccountControl::CapabilitiesChanged(delta));
+            }
         }
         // Sealed against detach like every registry write (see
         // `SubscriptionRegistry::replace`). A refusal means detach cancelled the
@@ -2262,34 +2363,63 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
             }
             return false;
         }
-        let (reopen_guard, activity) = loop {
-            let Some(activity) = ctx.control.begin_activity() else {
-                continue 'restart;
-            };
-            let reopen_guard = Arc::clone(ctx.reopen_lock).lock_owned().await;
-            if stale_generation(ctx) {
-                return false;
-            }
-            if pacing.pending_wait(ctx, None, None).is_zero() {
-                break (reopen_guard, activity);
-            }
-            // A hold landed while lock acquisition was pending. Neither the
-            // serialization lock nor an activity may be carried across it.
+        let Some(activity) = ctx.control.begin_activity() else {
+            continue;
+        };
+        let mut boundary = ctx.control.drive_boundary();
+        if boundary.peek() != BoundaryRequest::Run {
+            continue 'restart;
+        }
+        let reopen_guard = tokio::select! {
+            biased;
+            () = ctx.shutdown.cancelled() => return false,
+            _ = boundary.changed() => continue 'restart,
+            guard = Arc::clone(ctx.reopen_lock).lock_owned() => guard,
+        };
+        if stale_generation(ctx) {
+            return false;
+        }
+        let gate = super::drive_start::DriveStart {
+            current: ctx.current,
+            control: ctx.control,
+            scheduler: ctx.scheduler,
+            throttles: ctx.throttles,
+            account_id: ctx.account_id,
+            shutdown: ctx.shutdown,
+        };
+        // The reopen lock is another internal wait. Release every owner before
+        // paying a hold; the next pass charges it to RepairPacing's allowance.
+        if !pacing.pending_wait(ctx, None, None).is_zero() {
             drop(reopen_guard);
             drop(activity);
-            if let Err(error) = pacing.wait(ctx, None, None).await {
-                if matches!(error, Error::WaitBudgetExhausted) {
-                    warn_wait_budget(ctx, CursorScope::Account);
-                    engine_pause(ctx, PauseReason::RetryBudgetExhausted);
-                }
-                return false;
+            continue;
+        }
+        // Every recovery path orders reopen lock before scheduler budget.
+        // Taking a permit first can deadlock against a scoped repair that
+        // owns this lock and is queued for that same one-permit budget.
+        let admitted = match gate
+            .admit_recovery(crate::scheduler::WorkKind::Sync, None, |_| {
+                pacing.failed_keys.clone()
+            })
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(super::drive_start::StartRefused::ShuttingDown) => return false,
+            Err(_) => {
+                drop(reopen_guard);
+                drop(activity);
+                continue;
             }
         };
+        drop(activity);
+        let super::drive_start::RecoveryAdmission { activity, permit } = admitted;
         // The previous attempt's holds have been paid. Failures from this
         // open start a new local deadline set, including a hintless failure.
         pacing.local_deadline = None;
         pacing.observed = false;
-        match open_replacement_admitted(ctx, reopen_guard, activity).await {
+        let opened = open_replacement_admitted(ctx, reopen_guard, activity).await;
+        drop(permit);
+        match opened {
             // A pause won the race between the wait above and the activity
             // registration, and nothing was opened. Loop back through the
             // boundary wait instead of spending an attempt on it.
@@ -2593,8 +2723,14 @@ async fn run_establish(
             EstablishOrigin::CreatedFresh
         };
         // The writer may have parked while another lane recorded a hold.
-        pacing.wait(ctx, Some(account), Some(&scope)).await?;
+        let admitted = pacing
+            .admit(ctx, control, Some(account), Some(&scope))
+            .await?;
+        if coverage.scope_fence(&scope) != walk_fence {
+            return Err(Error::Superseded);
+        }
         let decision = establishment(account, &scope, stored).await?;
+        drop(admitted);
         let (classified_as_inventory, resume_stream) = match decision {
             Establishment::Ready(cursor) => {
                 if persist_ready && origin == EstablishOrigin::CreatedFresh {
@@ -2613,7 +2749,12 @@ async fn run_establish(
             } => (Some(classified_as_inventory), stream),
             Establishment::Inventory => (None, None),
         };
-        pacing.wait(ctx, Some(account), Some(&scope)).await?;
+        let _admitted = pacing
+            .admit(ctx, control, Some(account), Some(&scope))
+            .await?;
+        if coverage.scope_fence(&scope) != walk_fence {
+            return Err(Error::Superseded);
+        }
         let fusion = crate::multiplexer::InventoryFusion {
             expected_fence: walk_fence,
             account_id: account_id.clone(),

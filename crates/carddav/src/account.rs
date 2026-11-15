@@ -546,7 +546,7 @@ impl Account for CardDavAccount {
         self.client.net().set_priority(priority);
     }
 
-    fn set_bandwidth_cap(&self, bps: Option<u64>) {
+    fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
         self.client.net().set_bandwidth_cap(bps);
     }
 
@@ -3093,7 +3093,7 @@ mod tests {
         let account =
             CardDavAccount::for_tests(Arc::new(client), "https://dav.example.test/books/");
 
-        account.set_bandwidth_cap(Some(4_096));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(4_096));
         assert_eq!(net.bandwidth_cap(), Some(4_096));
         account.set_priority(Priority::Background);
         assert_eq!(net.priority(), Priority::Background);

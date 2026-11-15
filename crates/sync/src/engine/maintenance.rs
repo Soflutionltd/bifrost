@@ -54,65 +54,52 @@ impl MaintenanceGate<'_> {
                 }
                 _ => return Err(Error::Paused),
             }
-            let admission = tokio::select! {
+            let gate = super::drive_start::DriveStart {
+                current: self.current,
+                control: self.control,
+                scheduler: self.scheduler,
+                throttles: self.throttles,
+                account_id: self.account_id,
+                shutdown: self.shutdown,
+            };
+            let admitted = tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => return Err(Error::ShuttingDown),
                 _ = boundary.changed() => continue,
-                result = self.scheduler.admit(
-                    self.account_id.clone(), self.control.priority_snapshot(),
-                    crate::scheduler::WorkKind::Sync,
-                ) => result?,
+                admitted = gate.admit_keys(crate::scheduler::WorkKind::Sync, |account| {
+                    scopes.iter().flat_map(|scope| crate::recovery::declared_keys(
+                        account, self.account_id, bifrost_types::ThrottleWork::Scope(scope),
+                    )).collect()
+                }) => admitted,
             };
-            // Re-read the incarnation and holds after admission: either may have
-            // changed while queued. Never hold a scheduler permit while sleeping.
-            let account = self.current.load_full();
-            let keys = scopes
-                .iter()
-                .flat_map(|scope| {
-                    crate::recovery::declared_keys(
-                        account.as_ref().as_ref(),
-                        self.account_id,
-                        bifrost_types::ThrottleWork::Scope(scope),
-                    )
-                })
-                .collect::<Vec<_>>();
-            if let Some(wait) =
-                crate::recovery::throttle_wait(self.throttles, self.account_id, &keys)
-            {
-                drop(admission);
-                tokio::select! {
-                    biased;
-                    () = self.shutdown.cancelled() => return Err(Error::ShuttingDown),
-                    _ = boundary.changed() => {},
-                    () = tokio::time::sleep(wait) => {},
+            match admitted {
+                Ok(admitted) => {
+                    return Ok((admitted.incarnation, admitted.activity, admitted.permit));
                 }
-                continue;
-            }
-            // An enterprise user's pause includes maintenance. Register only
-            // after waits, then retain activity through the provider future so
-            // pause/checkpoint quiescence cannot race an untracked wire call.
-            match self.control.begin_activity() {
-                Some(activity) => return Ok((account, activity, admission)),
-                // A pause landed between the boundary check and registration.
-                // A waiting caller releases its admission and waits it out.
-                None if self.wait_for_run => {
-                    drop(admission);
-                    // Registration checks the control's own boundary, which
-                    // can differ from this gate's boundary (including in tests).
-                    // Wait on that authority without retaining scarce capacity.
+                Err(super::drive_start::StartRefused::ShuttingDown) => {
+                    return Err(Error::ShuttingDown);
+                }
+                Err(super::drive_start::StartRefused::Held { until, .. }) => {
                     tokio::select! {
                         biased;
                         () = self.shutdown.cancelled() => return Err(Error::ShuttingDown),
-                        changed = boundary.changed() => {
-                            if changed.is_err() { return Err(Error::ShuttingDown); }
-                        }
+                        _ = boundary.changed() => {},
+                        () = tokio::time::sleep_until(until) => {},
+                    }
+                }
+                Err(super::drive_start::StartRefused::Paused) if self.wait_for_run => {
+                    // The control can have a separate boundary in tests. Wait
+                    // on either authority, with neither permit nor activity.
+                    tokio::select! {
+                        biased;
+                        () = self.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                        _ = boundary.changed() => {},
                         running = self.control.wait_until_running(self.shutdown) => {
                             if !running { return Err(Error::Paused); }
                         }
                     }
-                    continue;
                 }
-                None => return Err(Error::Paused),
+                Err(super::drive_start::StartRefused::Paused) => return Err(Error::Paused),
             }
         }
     }

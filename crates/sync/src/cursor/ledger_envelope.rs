@@ -65,6 +65,11 @@
 //!
 //! Version 10 adds `AccountClosed` (kind tag 12); older versions reject it.
 //!
+//! Version 12 removes the mirrored attempt count from policy tag 0 and splits
+//! entry and barrier policy types. Versions 3 through 11 still decode: open
+//! entry counters must match the lineage row, and inert barrier counters are
+//! discarded. Waiver identities and signed Unix seconds keep their wire form.
+//!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
 //! checkpoint codec owns that layout and its migration chain, and a second
@@ -98,16 +103,16 @@ use super::envelope::{
     write_bytes, write_string,
 };
 use super::ledger::{
-    BarrierIncident, DebtLedger, DischargeAudit, DischargeEvidence, ErrorDigest, LedgerEntry,
-    LineageBudget, PolicyStatus, ProofStatus,
+    BarrierIncident, BarrierPolicy, DebtLedger, DischargeAudit, DischargeEvidence, EntryPolicy,
+    ErrorDigest, LedgerEntry, LineageBudget, OperatorId, ProofStatus, UnixSeconds,
 };
 use crate::error::Error;
 
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
-// Version 11 adds the IMAP namespace error scope (tag 14).
-pub const LEDGER_ENVELOPE_VERSION: u32 = 11;
+// Version 12 removes the mirrored policy attempt counter.
+pub const LEDGER_ENVELOPE_VERSION: u32 = 12;
 
 /// Lowest ledger envelope version still readable by this engine.
 ///
@@ -224,8 +229,12 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
     let proof_count = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
 
     let mut entries = BTreeMap::new();
+    let mut legacy_attempts = BTreeMap::new();
     for _ in 0..entry_count {
-        let entry = decode_entry(&mut reader)?;
+        let (entry, attempts) = decode_entry(&mut reader)?;
+        if let Some(attempts) = attempts {
+            legacy_attempts.insert(entry.key.clone(), attempts);
+        }
         if entries.insert(entry.key.clone(), entry).is_some() {
             return Err(duplicate("entry"));
         }
@@ -280,6 +289,23 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
         return Err(Error::Other("ledger envelope: trailing bytes".into()));
     }
 
+    // Historical writers persisted the count twice. Check their agreement
+    // before dropping the old view; migration must not hide corrupt budgets.
+    for (key, attempts) in legacy_attempts {
+        let entry = &entries[&key];
+        if entry.is_open() {
+            let lineage = entry.parent.as_ref().unwrap_or(&entry.key);
+            if lineages
+                .get(lineage)
+                .is_none_or(|budget| budget.attempts != attempts)
+            {
+                return Err(Error::Other(
+                    "ledger envelope: legacy policy disagrees with lineage budget".into(),
+                ));
+            }
+        }
+    }
+
     let ledger = migrate_ledger(
         version,
         DebtLedger::from_parts(entries, barriers, proved, compacted, lineages),
@@ -293,10 +319,9 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
 /// Bring a ledger decoded from an accepted historical layout up to the current
 /// one.
 ///
-/// A no-op while every version in the readable window shares one layout
-/// (versions 4 through 9 only widened the error vocabulary). It exists as the
-/// named boundary anyway, for the same reason `migrate_change_cursor` does:
-/// the codec is the only place in the workspace that may hold ledger state in
+/// Historical policy counters are checked and removed while decoding, before
+/// current lineage validation. This final boundary is otherwise a no-op.
+/// Like `migrate_change_cursor`, the codec alone may hold ledger state in
 /// an older shape, so a fixup written anywhere else spreads knowledge of a dead
 /// layout into consumers that have no code to interpret it.
 fn migrate_ledger(from_version: u32, ledger: DebtLedger) -> DebtLedger {
@@ -341,12 +366,12 @@ fn encode_entry(out: &mut Vec<u8>, entry: &LedgerEntry) {
     encode_error(out, &entry.last_error);
 }
 
-fn decode_entry(reader: &mut Reader<'_>) -> Result<LedgerEntry, Error> {
+fn decode_entry(reader: &mut Reader<'_>) -> Result<(LedgerEntry, Option<u32>), Error> {
     let key = ObligationKey(reader.bytes()?);
     let domain = decode_domain(reader)?;
     let generation = crate::cursor::WalkGeneration::restore(reader.u64()?);
     let proof = decode_proof(reader)?;
-    let policy = decode_policy(reader)?;
+    let (policy, legacy_attempts) = decode_policy(reader)?;
     let target = match reader.u8()? {
         0 => None,
         1 => Some(bifrost_types::InventoryRepairTarget::Object {
@@ -373,17 +398,20 @@ fn decode_entry(reader: &mut Reader<'_>) -> Result<LedgerEntry, Error> {
     };
     let first_seen_unix_seconds = reader.i64()?;
     let last_error = decode_error(reader)?;
-    Ok(LedgerEntry {
-        key,
-        domain,
-        generation,
-        proof,
-        policy,
-        target,
-        parent,
-        first_seen_unix_seconds,
-        last_error,
-    })
+    Ok((
+        LedgerEntry {
+            key,
+            domain,
+            generation,
+            proof,
+            policy,
+            target,
+            parent,
+            first_seen_unix_seconds,
+            last_error,
+        },
+        legacy_attempts,
+    ))
 }
 
 fn encode_barrier(out: &mut Vec<u8>, barrier: &BarrierIncident) {
@@ -392,7 +420,7 @@ fn encode_barrier(out: &mut Vec<u8>, barrier: &BarrierIncident) {
     out.extend_from_slice(&barrier.generation.to_le_bytes());
     write_string(out, &barrier.failure_label);
     encode_error(out, &barrier.evidence);
-    encode_policy(out, &barrier.policy);
+    encode_barrier_policy(out, &barrier.policy);
     match &barrier.resume_from {
         None => out.push(0),
         Some(checkpoint) => {
@@ -411,7 +439,19 @@ fn decode_barrier(reader: &mut Reader<'_>) -> Result<BarrierIncident, Error> {
     let generation = crate::cursor::WalkGeneration::restore(reader.u64()?);
     let failure_label = reader.string()?;
     let evidence = decode_error(reader)?;
-    let policy = decode_policy(reader)?;
+    let (entry_policy, _) = decode_policy(reader)?;
+    // The legacy automatic barrier counter was inert, regardless of its value.
+    let policy = match entry_policy {
+        EntryPolicy::Automatic => BarrierPolicy::Undecided,
+        EntryPolicy::OperatorBlocked => BarrierPolicy::OperatorBlocked,
+        EntryPolicy::Waived {
+            by,
+            at_unix_seconds,
+        } => BarrierPolicy::Waived {
+            by,
+            at_unix_seconds,
+        },
+    };
     let resume_from = match reader.u8()? {
         0 => None,
         1 => Some(decode_envelope(&reader.bytes()?)?),
@@ -500,34 +540,59 @@ fn decode_proof(reader: &mut Reader<'_>) -> Result<ProofStatus, Error> {
     }
 }
 
-fn encode_policy(out: &mut Vec<u8>, policy: &PolicyStatus) {
+fn encode_policy(out: &mut Vec<u8>, policy: &EntryPolicy) {
     match policy {
-        PolicyStatus::Retrying { attempts } => {
-            out.push(0);
-            out.extend_from_slice(&attempts.to_le_bytes());
-        }
-        PolicyStatus::OperatorBlocked => out.push(1),
-        PolicyStatus::Waived {
+        EntryPolicy::Automatic => out.push(0),
+        EntryPolicy::OperatorBlocked => out.push(1),
+        EntryPolicy::Waived {
             by,
             at_unix_seconds,
         } => {
             out.push(2);
-            write_string(out, by);
-            out.extend_from_slice(&at_unix_seconds.to_le_bytes());
+            encode_waiver(out, by, *at_unix_seconds);
         }
     }
 }
 
-fn decode_policy(reader: &mut Reader<'_>) -> Result<PolicyStatus, Error> {
+fn encode_barrier_policy(out: &mut Vec<u8>, policy: &BarrierPolicy) {
+    match policy {
+        BarrierPolicy::Undecided => out.push(0),
+        BarrierPolicy::OperatorBlocked => out.push(1),
+        BarrierPolicy::Waived {
+            by,
+            at_unix_seconds,
+        } => {
+            out.push(2);
+            encode_waiver(out, by, *at_unix_seconds);
+        }
+    }
+}
+
+fn encode_waiver(out: &mut Vec<u8>, by: &OperatorId, at: UnixSeconds) {
+    write_string(out, &by.0);
+    out.extend_from_slice(&at.0.to_le_bytes());
+}
+
+// Returns the historical mirror only at the migration boundary. It never
+// enters current ledger state. Barrier callers intentionally discard it.
+fn decode_policy(reader: &mut Reader<'_>) -> Result<(EntryPolicy, Option<u32>), Error> {
     match reader.u8()? {
-        0 => Ok(PolicyStatus::Retrying {
-            attempts: reader.u32()?,
-        }),
-        1 => Ok(PolicyStatus::OperatorBlocked),
-        2 => Ok(PolicyStatus::Waived {
-            by: reader.string()?,
-            at_unix_seconds: reader.i64()?,
-        }),
+        0 => {
+            let attempts = if reader.version < 12 {
+                Some(reader.u32()?)
+            } else {
+                None
+            };
+            Ok((EntryPolicy::Automatic, attempts))
+        }
+        1 => Ok((EntryPolicy::OperatorBlocked, None)),
+        2 => Ok((
+            EntryPolicy::Waived {
+                by: OperatorId(reader.string()?),
+                at_unix_seconds: UnixSeconds(reader.i64()?),
+            },
+            None,
+        )),
         other => Err(Error::Other(format!(
             "ledger envelope: unknown policy status tag {other}"
         ))),
@@ -542,28 +607,21 @@ fn encode_domain(out: &mut Vec<u8>, domain: &CoverageDomain) {
     write_bytes(out, &encode_scope(&domain.scope));
     match &domain.coordinate {
         CoverageCoordinate::Full => out.push(0),
-        CoverageCoordinate::TimeRange {
-            from_unix_seconds,
-            to_unix_seconds,
-        } => {
+        CoverageCoordinate::TimeRange(window) => {
             out.push(1);
-            write_opt_i64(out, *from_unix_seconds);
-            write_opt_i64(out, *to_unix_seconds);
+            write_opt_i64(out, window.from());
+            write_opt_i64(out, window.to());
         }
-        CoverageCoordinate::UidRange {
-            uid_validity,
-            from,
-            to,
-        } => {
+        CoverageCoordinate::UidRange(window) => {
             out.push(2);
-            out.extend_from_slice(&uid_validity.to_le_bytes());
-            out.extend_from_slice(&from.to_le_bytes());
-            out.extend_from_slice(&to.to_le_bytes());
+            out.extend_from_slice(&window.uid_validity().to_le_bytes());
+            out.extend_from_slice(&window.from().to_le_bytes());
+            out.extend_from_slice(&window.to().to_le_bytes());
         }
-        CoverageCoordinate::PageRange { from, to } => {
+        CoverageCoordinate::PageRange(window) => {
             out.push(3);
-            out.extend_from_slice(&from.to_le_bytes());
-            out.extend_from_slice(&to.to_le_bytes());
+            out.extend_from_slice(&window.from().to_le_bytes());
+            out.extend_from_slice(&window.to().to_le_bytes());
         }
         CoverageCoordinate::ProviderRegion { namespace, region } => {
             out.push(4);
@@ -586,19 +644,22 @@ fn decode_domain(reader: &mut Reader<'_>) -> Result<CoverageDomain, Error> {
     let scope = decode_scope(&reader.bytes()?)?;
     let coordinate = match reader.u8()? {
         0 => CoverageCoordinate::Full,
-        1 => CoverageCoordinate::TimeRange {
-            from_unix_seconds: read_opt_i64(reader)?,
-            to_unix_seconds: read_opt_i64(reader)?,
-        },
-        2 => CoverageCoordinate::UidRange {
-            uid_validity: reader.u32()?,
-            from: reader.u64()?,
-            to: reader.u64()?,
-        },
-        3 => CoverageCoordinate::PageRange {
-            from: reader.u32()?,
-            to: reader.u32()?,
-        },
+        1 => CoverageCoordinate::TimeRange(
+            bifrost_types::TimeWindow::new(read_opt_i64(reader)?, read_opt_i64(reader)?)
+                .ok_or_else(|| {
+                    Error::Other("ledger envelope: reversed or out-of-range window".into())
+                })?,
+        ),
+        2 => CoverageCoordinate::UidRange(
+            bifrost_types::UidWindow::new(reader.u32()?, reader.u64()?, reader.u64()?).ok_or_else(
+                || Error::Other("ledger envelope: reversed or out-of-range window".into()),
+            )?,
+        ),
+        3 => CoverageCoordinate::PageRange(
+            bifrost_types::PageWindow::new(reader.u32()?, reader.u32()?).ok_or_else(|| {
+                Error::Other("ledger envelope: reversed or out-of-range window".into())
+            })?,
+        ),
         4 => CoverageCoordinate::ProviderRegion {
             namespace: reader.string()?,
             region: reader.bytes()?,
@@ -1573,6 +1634,78 @@ mod tests {
             "the charge made before the round trip still counts"
         );
         assert_eq!(restored.repairable().count(), 0);
+    }
+
+    // Rebuild the historical policy prefix explicitly, rather than changing
+    // only the header of a current-shaped record.
+    fn historical_entry_row(ledger: &DebtLedger, version: u32, attempts: u32) -> Vec<u8> {
+        let entry = ledger.entries().next().expect("one entry");
+        let mut prefix = Vec::new();
+        super::write_bytes(&mut prefix, &entry.key.0);
+        super::encode_domain(&mut prefix, &entry.domain);
+        prefix.extend_from_slice(&entry.generation.to_le_bytes());
+        super::encode_proof(&mut prefix, &entry.proof);
+        let mut bytes = encode_ledger(ledger);
+        let counter_at = super::HEADER_LEN + prefix.len() + 1;
+        bytes.splice(counter_at..counter_at, attempts.to_le_bytes());
+        bytes[4..8].copy_from_slice(&version.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn historical_policy_counters_migrate_only_when_the_lineage_agrees() {
+        let mut ledger = DebtLedger::new();
+        ledger.ingest(
+            &bifrost_types::InventoryCoverageReport::degraded(
+                bifrost_types::CoverageDomain::full(CursorScope::Account),
+                vec![replayable("root")],
+            ),
+            crate::cursor::WalkGeneration::for_test(1),
+            100,
+        );
+        let key = bifrost_types::ObligationKey(b"root".to_vec());
+        ledger.record_attempt(&key, 3);
+        ledger.record_attempt(&key, 3);
+        for version in super::MIN_MIGRATABLE_LEDGER..12 {
+            let restored = decode_ledger(&historical_entry_row(&ledger, version, 2))
+                .expect("historical budget retained");
+            assert_eq!(restored.lineage_budget(&key).expect("budget").attempts, 2);
+            assert_eq!(encode_ledger(&restored), encode_ledger(&ledger));
+            assert!(matches!(
+                decode_ledger(&historical_entry_row(&ledger, version, 1)),
+                Err(Error::Other(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn historical_barrier_counters_are_inert_for_every_readable_version() {
+        let mut ledger = DebtLedger::new();
+        let obligation = replayable("barrier");
+        let incident = super::BarrierIncident {
+            key: obligation.key().clone(),
+            domain: bifrost_types::CoverageDomain::full(CursorScope::Account),
+            generation: crate::cursor::WalkGeneration::for_test(1),
+            failure_label: "unknown extent".into(),
+            evidence: obligation.error().into(),
+            policy: super::BarrierPolicy::Undecided,
+            resume_from: None,
+        };
+        let mut prefix = Vec::new();
+        super::write_bytes(&mut prefix, &incident.key.0);
+        super::encode_domain(&mut prefix, &incident.domain);
+        prefix.extend_from_slice(&incident.generation.to_le_bytes());
+        super::write_string(&mut prefix, &incident.failure_label);
+        super::encode_error(&mut prefix, &incident.evidence);
+        ledger.record_barrier(incident);
+        for version in super::MIN_MIGRATABLE_LEDGER..12 {
+            let mut bytes = encode_ledger(&ledger);
+            let counter_at = super::HEADER_LEN + prefix.len() + 1;
+            bytes.splice(counter_at..counter_at, u32::MAX.to_le_bytes());
+            bytes[4..8].copy_from_slice(&version.to_le_bytes());
+            let restored = decode_ledger(&bytes).expect("inert barrier count migrates");
+            assert_eq!(encode_ledger(&restored), encode_ledger(&ledger));
+        }
     }
 
     /// Decode validates rather than heals: an open member whose budget row

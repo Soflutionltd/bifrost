@@ -375,7 +375,7 @@ async fn clear_account_checkpoints_drops_every_row_of_the_account_and_only_that_
             bifrost_types::Protocol::Unknown,
         )
         .into(),
-        policy: bifrost_sync::cursor::PolicyStatus::Retrying { attempts: 0 },
+        policy: bifrost_sync::cursor::BarrierPolicy::Undecided,
         resume_from: None,
     });
     let bytes = bifrost_sync::cursor::encode_ledger(&ledger);

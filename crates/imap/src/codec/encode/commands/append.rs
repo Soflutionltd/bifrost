@@ -102,7 +102,7 @@ pub(crate) fn encode_append(
         if let Some(date) = msg.date.as_deref() {
             validate_append_datetime(date)?;
             w.raw(b" ");
-            w.string(date.as_bytes(), false);
+            w.string(date.as_bytes(), crate::codec::utf7::WireMode::ModifiedUtf7);
         }
 
         match body_form(msg, wrapper) {

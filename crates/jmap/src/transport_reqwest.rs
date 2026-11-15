@@ -163,7 +163,10 @@ impl ReqwestTransport {
         self.net.meter().sink_handle()
     }
 
-    pub(crate) fn set_bandwidth_cap(&self, bps: Option<u64>) {
+    // `bifrost-types` is an optional dependency pulled in by `sync`, the only
+    // caller of this method.
+    #[cfg(feature = "sync")]
+    pub(crate) fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
         self.net.set_bandwidth_cap(bps);
     }
 
@@ -572,6 +575,10 @@ fn transport_error_from_net(error: bifrost_net::Error) -> TransportError {
 }
 
 fn redirect_policy_from_trusted_hosts(trusted_hosts: &HashSet<String>) -> RedirectPolicy {
+    // Redirect trust is not initial credential admission. Session discovery can
+    // name API, upload and download origins independently of this host list.
+    // Do not turn same_origin into an account-wide credential restriction:
+    // enterprise servers rely on those authenticated session endpoints.
     let mut policy = RedirectPolicy::with_hops(5);
     if trusted_hosts.is_empty() {
         policy = policy.same_origin();

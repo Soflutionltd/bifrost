@@ -629,7 +629,7 @@ mod tests {
     type ControlViews = (
         crate::cancel::BoundaryView,
         tokio::sync::watch::Receiver<bifrost_types::Priority>,
-        tokio::sync::watch::Receiver<Option<u64>>,
+        tokio::sync::watch::Receiver<Option<bifrost_types::BandwidthCap>>,
     );
 
     fn guarded_fusion() -> (
@@ -686,7 +686,6 @@ mod tests {
             items: vec![bifrost_types::InventoryEntry {
                 id: bifrost_types::ObjectId("observed".into()),
                 memberships: Vec::new(),
-                size: None,
                 blob_id: None,
                 fingerprint: bifrost_types::Fingerprint {
                     server_version: bifrost_types::ServerVersion::Unavailable,

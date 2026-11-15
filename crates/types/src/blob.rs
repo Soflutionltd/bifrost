@@ -8,7 +8,8 @@
 
 use crate::ids::BlobId;
 
-/// Inclusive byte range for partial blob fetches.
+/// Half-open byte window `[start, start + length)` for partial blob fetches.
+/// HTTP adapters translate the length to an inclusive wire endpoint.
 ///
 /// `length = None` is open-ended to the end of the blob; servers
 /// answer with whatever they have.

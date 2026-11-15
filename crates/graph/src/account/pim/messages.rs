@@ -199,16 +199,14 @@ pub(super) async fn delete_extended_property(
     // Absence is successful for an already cleared property. A successful
     // clear can change the parent message's validator, so retain its target
     // for cache eviction as well as error correlation.
-    let resource = account
-        .batch_resource(ids)
-        .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?;
-    let progress = submit_write_batch_resource(
+    let progress = submit_message_write_chunks_with_absence(
         account,
-        resource,
         requests,
         ids,
-        crate::account::batch::AbsentMeans::Success,
         operation,
+        StepEffect::Updated,
+        StepReplay::Repeatable,
+        crate::account::batch::AbsentMeans::Success,
     )
     .await?;
     batch_progress_error(progress, ids, StepEffect::Updated, StepReplay::Repeatable)
@@ -629,20 +627,35 @@ async fn submit_message_write_chunks(
     effect: StepEffect,
     replay: StepReplay,
 ) -> Result<BatchProgress, AccountError> {
+    submit_message_write_chunks_with_absence(
+        account,
+        requests,
+        targets,
+        operation,
+        effect,
+        replay,
+        crate::account::batch::AbsentMeans::Failure,
+    )
+    .await
+}
+
+async fn submit_message_write_chunks_with_absence(
+    account: &GraphAccount,
+    requests: Vec<BatchRequestItem>,
+    targets: &[ObjectId],
+    operation: AccountOperation,
+    effect: StepEffect,
+    replay: StepReplay,
+    absent: crate::account::batch::AbsentMeans,
+) -> Result<BatchProgress, AccountError> {
     let mut progress = BatchProgress::default();
     for (chunk_index, chunk) in requests.chunks(crate::account::batch::LIMIT).enumerate() {
         let offset = chunk_index * crate::account::batch::LIMIT;
         let chunk_targets = &targets[offset..offset + chunk.len()];
         let mut chunk = chunk.to_vec();
         crate::account::mutate::assign_batch_ids(&mut chunk);
-        match submit_write_batch_with_targets(
-            account,
-            chunk,
-            chunk_targets,
-            crate::account::batch::AbsentMeans::Failure,
-            operation,
-        )
-        .await
+        match submit_write_batch_with_targets(account, chunk, chunk_targets, absent, operation)
+            .await
         {
             Ok(next) => {
                 let failed = !next.failed.is_empty();

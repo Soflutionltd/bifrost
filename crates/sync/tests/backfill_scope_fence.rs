@@ -52,7 +52,6 @@ fn entry(id: &str) -> InventoryEntry {
     InventoryEntry {
         id: ObjectId(id.into()),
         memberships: Vec::new(),
-        size: None,
         blob_id: None,
         fingerprint: Fingerprint {
             server_version: ServerVersion::Unavailable,
@@ -85,7 +84,7 @@ fn endless_stub(
     };
     stub.partition_hook = Some(Arc::new(move |scope, partition| {
         let from = match partition {
-            InventoryPartition::Page { from, .. } => *from,
+            InventoryPartition::Page(window) => window.from(),
             other => panic!("the PageCount plan yields page partitions only: {other:?}"),
         };
         let width = if from == 0 { 8 } else { PAGE };
@@ -180,19 +179,12 @@ async fn a_reset_between_partitions_stops_the_walk_it_invalidated() {
                 continue;
             }
             let publication = event
-                .publication
-                .clone()
+                .ack_token()
+                .cloned()
                 .expect("a checkpointed page carries its publication");
-            let checkpoint = event.checkpoint.clone().expect("a checkpointed page");
+            assert!(event.checkpoint.is_some(), "a checkpointed page");
             let _ = page_tx.send(event.scope.cursor().expect("cursor event").clone());
-            let _ = reader_engine
-                .ack_checkpoint(
-                    &reader_account,
-                    event.scope.cursor().expect("cursor event").clone(),
-                    checkpoint,
-                    Some(publication),
-                )
-                .await;
+            let _ = reader_engine.ack(&reader_account, publication).await;
         }
     });
 

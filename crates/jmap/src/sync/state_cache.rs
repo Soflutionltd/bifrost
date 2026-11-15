@@ -33,11 +33,13 @@ impl<O> Default for StateCell<O> {
 
 impl<O> StateCell<O> {
     fn guard(&self) -> Option<ObjectState<O>> {
-        self.state.clone()
+        self.state
+            .clone()
+            .filter(|state| !state.as_str().is_empty())
     }
 
     fn replace_if(&mut self, expected: Option<&ObjectState<O>>, new: ObjectState<O>) {
-        if self.state.as_ref() == expected {
+        if self.state.as_ref() == expected && !new.as_str().is_empty() {
             self.state = Some(new);
         }
     }
@@ -70,7 +72,10 @@ pub(crate) fn seeded<O>(states: HashMap<String, Option<ObjectState<O>>>) -> Stat
     Arc::new(Mutex::new(
         states
             .into_iter()
-            .map(|(account, state)| (account, StateCell { state }))
+            .map(|(account, state)| {
+                let state = state.filter(|state| !state.as_str().is_empty());
+                (account, StateCell { state })
+            })
             .collect(),
     ))
 }

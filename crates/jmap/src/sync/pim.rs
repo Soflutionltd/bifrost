@@ -703,6 +703,9 @@ pub(crate) fn send_message<T: HttpTransport>(
             let window = std::time::Duration::from_secs(max_delayed_send as u64);
             bifrost_types::validate_scheduled(at, Some(window))?;
         }
+        let hold_until = scheduled
+            .map(|at| checked_timestamp(at, AccountOperation::Send).map(|at| at.to_string()))
+            .transpose()?;
         let envelope_recipients = request
             .to
             .iter()
@@ -773,8 +776,8 @@ pub(crate) fn send_message<T: HttpTransport>(
                 // envelope mailFrom address. `holduntil` is the
                 // absolute-time form matching our `SystemTime`.
                 let mut mail_from = submission_address_from_compose(from);
-                if let Some(at) = scheduled {
-                    mail_from = mail_from.with_parameter("holduntil", Some(rfc3339(at)));
+                if let Some(at) = hold_until {
+                    mail_from = mail_from.with_parameter("holduntil", Some(at));
                 }
                 submit.envelope(
                     mail_from,
@@ -4093,14 +4096,6 @@ fn submission_address_from_compose(address: &bifrost_types::Address) -> Submissi
     SubmissionAddress::new(address.address.clone())
 }
 
-/// Format an absolute instant as RFC 3339 / ISO 8601 UTC for the SMTP
-/// FUTURERELEASE `holduntil` envelope parameter.
-fn rfc3339(at: SystemTime) -> String {
-    jiff::Timestamp::try_from(at)
-        .map(|ts| ts.to_string())
-        .unwrap_or_default()
-}
-
 /// A scheduled JMAP send needs a concrete mailFrom and recipients to carry
 /// the hold parameter. A caller-selected Identity can supply mailFrom when
 /// `from` is absent; without either, JMAP defines no default identity to use.
@@ -4164,6 +4159,9 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
     Box::pin(async move {
         let window = std::time::Duration::from_secs(max_delayed_send as u64);
         bifrost_types::validate_scheduled(scheduled, Some(window))?;
+        // Refuse before cancelling the existing scheduled send.
+        let hold_until =
+            checked_timestamp(scheduled, AccountOperation::RescheduleSend)?.to_string();
 
         let submission_id = crate::email_submission::EmailSubmissionId::new(handle.0.as_str());
 
@@ -4237,7 +4235,7 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
             let submit = set.create_with_id(SUBMISSION_CREATE_ID);
             submit.email_id(email_id);
             let mail_from = SubmissionAddress::new(mail_from_email)
-                .with_parameter("holduntil", Some(rfc3339(scheduled)));
+                .with_parameter("holduntil", Some(hold_until));
             submit.envelope(mail_from, rcpt_to.into_iter().map(SubmissionAddress::new));
         }
         // The replacement create's application: `from_leaf` (a `notCreated`

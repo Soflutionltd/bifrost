@@ -47,7 +47,10 @@ impl Harness {
         }));
         stub.partition_hook = Some(Arc::new(move |s, p| {
             if *s == scope()
-                && *p == (InventoryPartition::Page { from: 0, to: 1 })
+                && *p
+                    == (InventoryPartition::Page(
+                        bifrost_types::PageWindow::new(0, 1).expect("ordered window"),
+                    ))
                 && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
             {
                 bucket.record(
@@ -217,9 +220,9 @@ async fn parking_fixed_plan_retries_the_pending_partition() {
     assert_eq!(
         h.partitions(),
         vec![
-            InventoryPartition::Page { from: 0, to: 1 },
-            InventoryPartition::Page { from: 1, to: 2 },
-            InventoryPartition::Page { from: 2, to: 3 }
+            InventoryPartition::Page(bifrost_types::PageWindow::new(0, 1).expect("ordered window")),
+            InventoryPartition::Page(bifrost_types::PageWindow::new(1, 2).expect("ordered window")),
+            InventoryPartition::Page(bifrost_types::PageWindow::new(2, 3).expect("ordered window"))
         ]
     );
     assert_eq!(h.state(), Some(BackfillState::Completed));
@@ -248,7 +251,7 @@ async fn parking_page_loss_restarts_without_completion() {
     h.advance(5).await;
     assert_eq!(
         h.partitions()[1],
-        InventoryPartition::Page { from: 0, to: 1 }
+        InventoryPartition::Page(bifrost_types::PageWindow::new(0, 1).expect("ordered window"))
     );
     h.stop().await;
 }
@@ -263,7 +266,7 @@ async fn parking_incarnation_change_discards_the_old_walk() {
     h.advance(60).await;
     assert_eq!(
         h.partitions()[1],
-        InventoryPartition::Page { from: 0, to: 1 }
+        InventoryPartition::Page(bifrost_types::PageWindow::new(0, 1).expect("ordered window"))
     );
     h.stop().await;
 }

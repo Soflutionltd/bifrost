@@ -28,6 +28,8 @@ use bifrost_types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::calendar::api::{event_move_url, event_url};
+use crate::calendar::types::*;
 use crate::client::GmailClient;
 
 use super::error::{self, GmailErrorContext};
@@ -65,6 +67,7 @@ pub(crate) fn calendars_list(
                 url.push_str(&bifrost_net::url::encode_query_value(token));
             }
             let response: CalendarListResponse = client
+                .calendar()
                 .get(&url)
                 .await
                 .map_err(|error| collection_error(error, AccountOperation::CalendarsList))?;
@@ -141,6 +144,7 @@ pub(crate) fn events_in_range(
             url.push_str(&bifrost_net::url::encode_query_value(&token));
         }
         let response: EventsResponse = client
+            .calendar()
             .get(&url)
             .await
             .map_err(|error| collection_error(error, AccountOperation::EventsInRange))?;
@@ -156,6 +160,7 @@ pub(crate) fn get(
         let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventGet)?;
         let url = event_url(client.calendar_base(), &calendar_id, &event_id);
         let event: GoogleEvent = client
+            .calendar()
             .get(&url)
             .await
             .map_err(|error| event_error(error, AccountOperation::EventGet, event.0.clone()))?;
@@ -180,6 +185,7 @@ pub(crate) fn create(
         let encoded = bifrost_net::url::encode_path_component(&calendar_id);
         let url = format!("{}/calendars/{encoded}/events", client.calendar_base());
         let created: GoogleEvent = client
+            .calendar()
             .post(&url, &body, bifrost_net::ReplayPolicy::Never)
             .await
             .map_err(|error| collection_error(error, AccountOperation::EventCreate))?;
@@ -267,6 +273,7 @@ pub(crate) fn update(
             && target_calendar.0 != calendar_id
         {
             let _: GoogleEvent = client
+                .calendar()
                 .post(
                     &event_move_url(
                         client.calendar_base(),
@@ -296,6 +303,7 @@ pub(crate) fn update(
         let target_event_id = join_event_id(&calendar_id, &native_event_id);
         let google_patch = google_patch.expect("a field patch was prepared before the move");
         let response = client
+            .calendar()
             .execute_if_match(
                 &url,
                 reqwest::Method::PATCH,
@@ -356,6 +364,7 @@ pub(crate) fn delete_if_version(
         let (calendar_id, native_id) = split_event_id(&event.0, AccountOperation::EventDelete)?;
         let url = event_url(client.calendar_base(), &calendar_id, &native_id);
         let response = client
+            .calendar()
             .execute_if_match(
                 &url,
                 reqwest::Method::DELETE,
@@ -403,6 +412,7 @@ pub(crate) fn rsvp_if_version(
         let response_status = rsvp_request_value(status)?;
         let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventRsvp)?;
         let mut current: GoogleEvent = client
+            .calendar()
             .get(&event_url(client.calendar_base(), &calendar_id, &event_id))
             .await
             .map_err(|error| event_error(error, AccountOperation::EventRsvp, event.0.clone()))?;
@@ -412,6 +422,7 @@ pub(crate) fn rsvp_if_version(
             ..GoogleEventPatch::default()
         };
         let response = client
+            .calendar()
             .execute_if_match(
                 &event_url(client.calendar_base(), &calendar_id, &event_id),
                 reqwest::Method::PATCH,
@@ -576,6 +587,7 @@ async fn search_one_calendar(
         url.push_str(&bifrost_net::url::encode_query_value(&token));
     }
     let response: EventsResponse = client
+        .calendar()
         .get(&url)
         .await
         .map_err(|error| collection_error(error, AccountOperation::EventSearch))?;
@@ -868,7 +880,7 @@ fn google_event_from_create(event: &EventCreate) -> Result<GoogleEventPatch, Acc
         end: Some(google_time(&event.end, event.is_all_day)),
         status: Some(google_event_status(event.status).to_string()),
         attendees: google_attendees(&event.attendees, AccountOperation::EventCreate)?,
-        recurrence: recurrence_lines(&event.recurrence),
+        recurrence: recurrence_lines(&event.recurrence, AccountOperation::EventCreate)?,
         visibility: Some(match event.visibility {
             EventVisibility::Private => "private".to_string(),
             EventVisibility::Public => "public".to_string(),
@@ -913,7 +925,11 @@ fn google_event_from_patch(patch: &EventPatch) -> Result<GoogleEventPatch, Accou
         recurrence: patch
             .recurrence
             .as_ref()
-            .map(|recurrence| recurrence_lines(recurrence).unwrap_or_default()),
+            .map(|recurrence| {
+                recurrence_lines(recurrence, AccountOperation::EventUpdate)
+                    .map(Option::unwrap_or_default)
+            })
+            .transpose()?,
         visibility: patch.visibility.map(|visibility| match visibility {
             EventVisibility::Private => "private".to_string(),
             EventVisibility::Public => "public".to_string(),
@@ -1205,30 +1221,6 @@ fn unknown_event_time() -> EventTime {
     }
 }
 
-fn event_url(base: &str, calendar_id: &str, event_id: &str) -> String {
-    format!(
-        "{base}/calendars/{}/events/{}",
-        bifrost_net::url::encode_path_component(calendar_id),
-        bifrost_net::url::encode_path_component(event_id)
-    )
-}
-
-fn event_move_url(
-    base: &str,
-    calendar_id: &str,
-    event_id: &str,
-    target_calendar_id: &str,
-) -> String {
-    format!(
-        "{}/move?destination={}",
-        event_url(base, calendar_id, event_id),
-        // Query encoder, not the path encoder: the two differ on the complete
-        // `.` and `..` components, which the path encoder double-escapes
-        // against WHATWG path navigation. A calendar id is a query value here.
-        bifrost_net::url::encode_query_value(target_calendar_id)
-    )
-}
-
 /// A PATCH failed after the move committed. The PATCH leaf keeps its own
 /// classification (`leg_recovery`), re-addressed at the destination event;
 /// the committed move is `Blocking` because replaying the public update
@@ -1358,7 +1350,14 @@ fn split_event_id(
         })
 }
 
-fn recurrence_lines(recurrence: &EventRecurrence) -> Option<Vec<String>> {
+fn recurrence_lines(
+    recurrence: &EventRecurrence,
+    operation: AccountOperation,
+) -> Result<Option<Vec<String>>, AccountError> {
+    // Validate before rendering so malformed caller rules never reach Calendar.
+    recurrence
+        .parsed_rule()
+        .map_err(|error| caller_input_error(operation, error.to_string()))?;
     let mut lines = Vec::new();
     if let Some(rrule) = &recurrence.rrule {
         lines.push(format!("RRULE:{rrule}"));
@@ -1375,7 +1374,7 @@ fn recurrence_lines(recurrence: &EventRecurrence) -> Option<Vec<String>> {
             .iter()
             .map(|value| format!("EXDATE:{value}")),
     );
-    (!lines.is_empty()).then_some(lines)
+    Ok((!lines.is_empty()).then_some(lines))
 }
 
 fn prefixed_values(values: Option<&[String]>, prefix: &str) -> Vec<String> {
@@ -1556,113 +1555,6 @@ fn local_error_with_field(
     )
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CalendarListResponse {
-    items: Option<Vec<GoogleCalendarListEntry>>,
-    next_page_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GoogleCalendarListEntry {
-    id: Option<String>,
-    summary: Option<String>,
-    background_color: Option<String>,
-    primary: Option<bool>,
-    access_role: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct EventsResponse {
-    items: Option<Vec<GoogleEvent>>,
-    next_page_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct GoogleEvent {
-    id: Option<String>,
-    etag: Option<String>,
-    i_cal_uid: Option<String>,
-    summary: Option<String>,
-    description: Option<String>,
-    location: Option<String>,
-    start: Option<GoogleEventTime>,
-    end: Option<GoogleEventTime>,
-    /// True when `end` is a placeholder, not a real end time.
-    end_time_unspecified: Option<bool>,
-    status: Option<String>,
-    visibility: Option<String>,
-    organizer: Option<GoogleOrganizer>,
-    attendees: Option<Vec<GoogleAttendee>>,
-    recurrence: Option<Vec<String>>,
-    original_start_time: Option<GoogleEventTime>,
-    transparency: Option<String>,
-    html_link: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct GoogleEventPatch {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    summary: Option<Option<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<Option<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    location: Option<Option<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    start: Option<GoogleEventTime>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    end: Option<GoogleEventTime>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    attendees: Option<Vec<GoogleAttendee>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    recurrence: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    visibility: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    transparency: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GoogleEventTime {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    date: Option<String>,
-    #[serde(rename = "dateTime", skip_serializing_if = "Option::is_none")]
-    date_time: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    time_zone: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GoogleOrganizer {
-    email: Option<String>,
-    display_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GoogleAttendee {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    email: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    optional: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resource: Option<bool>,
-    #[serde(flatten)]
-    extra: Map<String, Value>,
-}
-
 #[cfg(test)]
 mod tests {
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
@@ -1760,6 +1652,20 @@ mod tests {
             headers: reqwest::header::HeaderMap::new(),
             body: Bytes::from(serde_json::to_vec(&value).expect("fixture serializes")),
         }
+    }
+
+    #[test]
+    fn recurrence_writes_use_shared_rule_validation() {
+        let recurrence = EventRecurrence {
+            rrule: Some("FREQ=DAILY;COUNT=0".into()),
+            ..Default::default()
+        };
+        assert!(recurrence_lines(&recurrence, AccountOperation::EventCreate).is_err());
+        let patch = EventPatch {
+            recurrence: Some(recurrence),
+            ..Default::default()
+        };
+        assert!(google_event_from_patch(&patch).is_err());
     }
 
     fn scripted_client(steps: Vec<Canned>) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
@@ -2526,28 +2432,6 @@ mod tests {
             &AccountErrorKind::Internal(bifrost_types::InternalErrorKind::LimitExceeded)
         );
         assert_eq!(script.requests().len(), MAX_CALENDAR_LIST_PAGES);
-    }
-
-    #[test]
-    fn event_move_url_encodes_destination_calendar() {
-        // The path and query encoders differ on exactly two inputs: the
-        // complete `.` and `..` components, which the path encoder
-        // double-escapes so the WHATWG parser cannot resolve them as
-        // navigation. `destination` is a query value, where dots carry
-        // no structural meaning, so both must survive verbatim.
-        let base = "https://www.googleapis.com/calendar/v3";
-        let url = event_move_url(base, "primary", "event/1", ".");
-        assert!(url.contains("/calendars/primary/events/event%2F1/move"));
-        assert!(url.ends_with("destination=."));
-
-        let parent = event_move_url(base, "primary", "event/1", "..");
-        assert!(parent.ends_with("destination=.."));
-
-        // Everything else encodes identically under both, so a value
-        // carrying query delimiters still pins that the destination is
-        // escaped at all.
-        let delimited = event_move_url(base, "primary", "event/1", "a&b=c+d");
-        assert!(delimited.ends_with("destination=a%26b%3Dc%2Bd"));
     }
 
     #[tokio::test]

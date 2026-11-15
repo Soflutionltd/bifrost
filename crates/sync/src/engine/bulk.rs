@@ -440,46 +440,46 @@ impl SyncEngine {
                 continue;
             };
             cursor = (index + 1) % cohorts.len();
-            let admission = tokio::select! {
+            let gate = slot.drive_start(account_id);
+            let admitted = tokio::select! {
                 () = slot.shutdown.cancelled() => { first_error.get_or_insert(Error::ShuttingDown); break; },
                 _ = boundary.changed(), if aborting => { continue; },
-                result = slot.scheduler.admit(account_id.clone(), slot.control.priority_snapshot(), crate::scheduler::WorkKind::Mutation) => match result {
-                    Ok(permit) => permit,
-                    Err(_error) => {
-                        // Admission refusal is transient. Delay this action,
-                        // release all permits, and let ready siblings run.
-                        // It consumes neither a submission nor a retry slot.
-                        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+                admitted = gate.admit_keys(crate::scheduler::WorkKind::Mutation, |account| {
+                    if cohorts[index].phase == CohortPhase::Readback {
+                        crate::recovery::declared_keys(account, account_id, bifrost_types::ThrottleWork::Objects(&remaining))
+                    } else {
+                        campaign_keys(account, account_id, &remaining, &op)
+                    }
+                }) => match admitted {
+                    Ok(admitted) => admitted,
+                    Err(super::drive_start::StartRefused::ShuttingDown) => {
+                        first_error.get_or_insert(Error::ShuttingDown);
+                        break;
+                    }
+                    Err(super::drive_start::StartRefused::Paused) => {
+                        if aborting { break; }
+                        continue;
+                    }
+                    Err(super::drive_start::StartRefused::Held { until, .. }) => {
                         if cohorts[index].phase == CohortPhase::Readback {
-                            cohorts[index].reconcile_at = deadline;
+                            cohorts[index].reconcile_at = cohorts[index].reconcile_at.max(until);
                         } else {
-                            cohorts[index].retry_at = deadline;
+                            cohorts[index].retry_at = cohorts[index].retry_at.max(until);
                         }
                         continue;
                     }
-                }
+                },
             };
-            let account = slot.current.load_full();
+            let super::drive_start::Admitted {
+                incarnation: account,
+                activity,
+                permit: admission,
+            } = admitted;
             // Every directive this action raises is stamped with the incarnation
             // it ran against, so one queued past a reattach is declined rather
             // than restarting, resetting or disabling the replacement.
             let incarnation = Some(account.generation());
             let cohort = &mut cohorts[index];
-            let keys = if cohort.phase == CohortPhase::Readback {
-                crate::recovery::declared_keys(
-                    account.as_ref().as_ref(),
-                    account_id,
-                    bifrost_types::ThrottleWork::Objects(&remaining),
-                )
-            } else {
-                campaign_keys(account.as_ref().as_ref(), account_id, &remaining, &op)
-            };
-            // Admission can wait through a reopen or a newly recorded hold.
-            // Return to the scheduler rather than parking this cohort inline.
-            if crate::recovery::throttle_wait(&slot.throttles, account_id, &keys).is_some() {
-                drop(admission);
-                continue;
-            }
             if !cohort.submitted()
                 && remaining.iter().any(|id| {
                     cohort_identity(
@@ -496,13 +496,6 @@ impl SyncEngine {
                 drop(admission);
                 continue;
             }
-            let Some(activity) = slot.control.begin_activity() else {
-                drop(admission);
-                if aborting {
-                    break;
-                }
-                continue;
-            };
             if cohort.phase == CohortPhase::Readback {
                 // Observed state cannot prove an uncertain caller-guarded
                 // write passed its precondition. Leave those targets pending.

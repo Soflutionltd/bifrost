@@ -446,7 +446,7 @@ impl Account for HealAccount {
 
     fn set_priority(&self, _priority: Priority) {}
 
-    fn set_bandwidth_cap(&self, _bps: Option<u64>) {}
+    fn set_bandwidth_cap(&self, _bps: Option<bifrost_types::BandwidthCap>) {}
 
     fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
         unreachable!("describe_cursor not exercised by attach recovery tests")
@@ -2969,7 +2969,7 @@ async fn a_published_change_checkpoint_always_carries_its_publication_id() {
         "the stub emits a checkpoint-bearing batch"
     );
     assert!(
-        published.publication.is_some(),
+        published.ack_token().cloned().is_some(),
         "a checkpoint published without an id cannot be acknowledged against its own claim"
     );
 }
@@ -3122,13 +3122,14 @@ async fn a_deferred_inventory_that_raises_schema_incompatible_is_established_aft
     tokio::time::timeout(Duration::from_secs(300), async {
         while done.len() < 2 {
             let event = receiver.recv().await.expect("event");
-            if let Some(checkpoint) = event.checkpoint.clone() {
+            if event.checkpoint.is_some() {
                 engine
-                    .ack_checkpoint(
+                    .ack(
                         &id,
-                        event.scope.cursor().expect("cursor event").clone(),
-                        checkpoint,
-                        event.publication.clone(),
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
                     )
                     .await
                     .expect("ack");

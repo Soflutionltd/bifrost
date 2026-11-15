@@ -181,7 +181,7 @@ impl Account for FlagsAccount {
 
     fn set_priority(&self, _priority: Priority) {}
 
-    fn set_bandwidth_cap(&self, _bps: Option<u64>) {}
+    fn set_bandwidth_cap(&self, _bps: Option<bifrost_types::BandwidthCap>) {}
 
     fn throttle_keys(
         &self,
@@ -2257,7 +2257,7 @@ impl Account for JudgingAccount {
     fn set_priority(&self, _priority: Priority) {
         self.inner.set_priority(_priority);
     }
-    fn set_bandwidth_cap(&self, _bps: Option<u64>) {
+    fn set_bandwidth_cap(&self, _bps: Option<bifrost_types::BandwidthCap>) {
         self.inner.set_bandwidth_cap(_bps);
     }
     fn throttle_keys(
@@ -2795,7 +2795,6 @@ impl ReassertAccount {
                                 HydratedObjectKind::Metadata(bifrost_types::InventoryEntry {
                                     id: id.clone(),
                                     memberships: memberships.clone(),
-                                    size: None,
                                     blob_id: None,
                                     fingerprint: bifrost_types::Fingerprint {
                                         server_version: bifrost_types::ServerVersion::Unavailable,
@@ -3068,7 +3067,7 @@ impl Account for ReassertAccount {
     fn set_priority(&self, _priority: Priority) {
         self.inner.set_priority(_priority);
     }
-    fn set_bandwidth_cap(&self, _bps: Option<u64>) {
+    fn set_bandwidth_cap(&self, _bps: Option<bifrost_types::BandwidthCap>) {
         self.inner.set_bandwidth_cap(_bps);
     }
     fn throttle_keys(

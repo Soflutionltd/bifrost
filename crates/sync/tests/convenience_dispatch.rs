@@ -105,7 +105,7 @@ impl Account for RecorderAccount {
 
     fn set_priority(&self, _priority: Priority) {}
 
-    fn set_bandwidth_cap(&self, _bps: Option<u64>) {}
+    fn set_bandwidth_cap(&self, _bps: Option<bifrost_types::BandwidthCap>) {}
 
     fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
         unreachable!("describe_cursor not exercised by dispatch tests")
@@ -997,7 +997,9 @@ async fn default_partition_stream_serves_full_and_rejects_the_rest() {
     let events: Vec<_> = account
         .inventory_partition_stream(
             CursorScope::Account,
-            InventoryPartition::Page { from: 0, to: 100 },
+            InventoryPartition::Page(
+                bifrost_types::PageWindow::new(0, 100).expect("ordered window"),
+            ),
         )
         .collect()
         .await;

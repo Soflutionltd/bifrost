@@ -359,9 +359,7 @@ pub(super) struct ConnectionStateSnapshot {
     /// Current session state (RFC 3501 Section3).
     pub session_state: super::SessionState,
     /// Cached server capabilities (RFC 3501 Section7.2.1).
-    pub capabilities: Vec<Capability>,
-    /// Successfully `ENABLE`d extensions (RFC 5161 Section3.2).
-    pub enabled: Vec<String>,
+    pub(crate) session: std::sync::Arc<crate::types::profile::SessionCapabilities>,
     /// Whether any mailbox has been selected in this session, even if it
     /// has since been closed (RFC 5161 Section 3.1).
     pub mailbox_selected: bool,
@@ -369,12 +367,18 @@ pub(super) struct ConnectionStateSnapshot {
     pub selected: Option<crate::types::MailboxName>,
 }
 
+impl std::ops::Deref for ConnectionStateSnapshot {
+    type Target = crate::types::profile::SessionCapabilities;
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
 impl Default for ConnectionStateSnapshot {
     fn default() -> Self {
         Self {
             session_state: super::SessionState::NotAuthenticated,
-            capabilities: Vec::new(),
-            enabled: Vec::new(),
+            session: crate::types::profile::SessionCapabilities::new(Vec::new(), Vec::new()),
             mailbox_selected: false,
             selected: None,
         }
@@ -1209,11 +1213,11 @@ pub(super) fn process_untagged_prefix(
 
 /// Derive the UTF-8 wire mode from protocol state.
 ///
-/// True when `UTF8=ACCEPT` (RFC 6855 Section 3) has been enabled or
+/// UTF-8 mode when `UTF8=ACCEPT` (RFC 6855 Section 3) has been enabled or
 /// `IMAP4rev2` is active (RFC 9051 Section 7). Asks the same authority the
 /// encoder uses so reads and writes cannot disagree.
-fn utf8_mode(state: &super::state::ProtocolState) -> bool {
-    build_encode_options(state).utf8_mode
+fn utf8_mode(state: &super::state::ProtocolState) -> crate::codec::utf7::WireMode {
+    state.session.utf8_mode()
 }
 
 /// Derive the literal negotiation mode from capabilities.
@@ -1221,7 +1225,7 @@ fn utf8_mode(state: &super::state::ProtocolState) -> bool {
 /// RFC 7888 Section4 (LITERAL+), Section5 (LITERAL-), RFC 3501 Section4.3 (synchronizing).
 #[cfg(test)]
 fn literal_mode(state: &super::state::ProtocolState) -> LiteralMode {
-    build_encode_options(state).literal_mode
+    state.session.literal_mode()
 }
 
 /// Build an [`EncodeOptions`] snapshot from protocol state.
@@ -1229,7 +1233,7 @@ fn literal_mode(state: &super::state::ProtocolState) -> LiteralMode {
 /// The driver builds encode options from the state it owns; there is no
 /// second builder on the connection handle.
 fn build_encode_options(state: &super::state::ProtocolState) -> EncodeOptions {
-    super::admission::encode_options(&state.snapshot())
+    EncodeOptions::from_session(std::sync::Arc::clone(&state.session))
 }
 
 /// Build a [`ConsumerContext`] from protocol state.
@@ -1242,8 +1246,7 @@ fn build_consumer_context<'a>(
     command_tag: &'a str,
 ) -> ConsumerContext<'a> {
     ConsumerContext {
-        capabilities: state.capabilities(),
-        enabled: state.enabled(),
+        session: &state.session,
         command_target,
         command_tag,
     }

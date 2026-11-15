@@ -88,29 +88,35 @@ pub(super) use search_response::*;
 /// Handles tagged, untagged, and continuation responses per
 /// RFC 3501 Section 7 / RFC 9051 Section 7.
 ///
-/// Equivalent to `parse_response_utf8(input, false)`  -  RFC 2047 decoding is applied.
+/// Equivalent to `parse_response_utf8(input, WireMode::ModifiedUtf7)`  -  RFC 2047 decoding is applied.
 #[cfg(test)]
 pub(crate) fn parse_response(input: &[u8]) -> IResult<&[u8], Response> {
-    parse_response_utf8(input, false)
+    parse_response_utf8(input, crate::codec::utf7::WireMode::ModifiedUtf7)
 }
 
 /// Parse a single IMAP response line, with UTF-8 mode for RFC 6532/6855.
 ///
-/// When `utf8_mode` is `true` (UTF8=ACCEPT enabled per RFC 6855 Section 3), ENVELOPE
+/// When `utf8_mode` is `WireMode::Utf8` (UTF8=ACCEPT enabled per RFC 6855 Section 3), ENVELOPE
 /// fields contain raw UTF-8 (RFC 6532 Section 3) and RFC 2047 decoding is skipped.
-pub(crate) fn parse_response_utf8(input: &[u8], utf8_mode: bool) -> IResult<&[u8], Response> {
+pub(crate) fn parse_response_utf8(
+    input: &[u8],
+    utf8_mode: crate::codec::utf7::WireMode,
+) -> IResult<&[u8], Response> {
     parse_response_with_backing(input, utf8_mode, None)
 }
 
 /// Parse one response backed by immutable `Bytes`, allowing FETCH literals to
 /// retain slices of the reader's response buffer.
-pub(crate) fn parse_response_bytes(input: &Bytes, utf8_mode: bool) -> IResult<&[u8], Response> {
+pub(crate) fn parse_response_bytes(
+    input: &Bytes,
+    utf8_mode: crate::codec::utf7::WireMode,
+) -> IResult<&[u8], Response> {
     parse_response_with_backing(input.as_ref(), utf8_mode, Some(input))
 }
 
 fn parse_response_with_backing<'a>(
     input: &'a [u8],
-    utf8_mode: bool,
+    utf8_mode: crate::codec::utf7::WireMode,
     backing: Option<&Bytes>,
 ) -> IResult<&'a [u8], Response> {
     alt((

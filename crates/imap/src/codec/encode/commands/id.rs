@@ -20,7 +20,7 @@ pub(in crate::codec::encode) fn encode_id(
     w: &mut CommandWriter,
     tag: &str,
     params: &[(String, Option<String>)],
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     // RFC 2971 Section 3.3: "Implementations MUST NOT send more than 30
     // field-value pairs."

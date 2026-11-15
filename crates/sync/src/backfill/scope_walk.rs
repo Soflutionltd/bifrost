@@ -113,8 +113,11 @@ impl ScopeWalkDriver {
             PartitionSource::Fixed(partitions) => partitions.next(),
             PartitionSource::OpenPages { from, chunk } => {
                 let to = from.saturating_add(*chunk);
+                // `to` saturates upward from `from`, so the window is always
+                // ordered; a refusal would only end the walk.
+                let window = bifrost_types::PageWindow::new(*from, to)?;
                 self.pending_to = Some(to);
-                Some(InventoryPartition::Page { from: *from, to })
+                Some(InventoryPartition::Page(window))
             }
         }
     }
@@ -250,9 +253,15 @@ mod tests {
 
     fn fixed_three() -> ScopeWalkDriver {
         ScopeWalkDriver::fixed(vec![
-            InventoryPartition::Page { from: 0, to: 10 },
-            InventoryPartition::Page { from: 10, to: 20 },
-            InventoryPartition::Page { from: 20, to: 30 },
+            InventoryPartition::Page(
+                bifrost_types::PageWindow::new(0, 10).expect("ordered window"),
+            ),
+            InventoryPartition::Page(
+                bifrost_types::PageWindow::new(10, 20).expect("ordered window"),
+            ),
+            InventoryPartition::Page(
+                bifrost_types::PageWindow::new(20, 30).expect("ordered window"),
+            ),
         ])
     }
 
@@ -263,11 +272,21 @@ mod tests {
     fn a_barrier_in_an_early_partition_stops_every_later_partition() {
         let mut driver = fixed_three();
         let first = driver.next_partition().expect("first partition");
-        assert_eq!(first, InventoryPartition::Page { from: 0, to: 10 });
+        assert_eq!(
+            first,
+            InventoryPartition::Page(
+                bifrost_types::PageWindow::new(0, 10).expect("ordered window")
+            )
+        );
         let _ = driver.fold(&clean(5));
 
         let second = driver.next_partition().expect("second partition");
-        assert_eq!(second, InventoryPartition::Page { from: 10, to: 20 });
+        assert_eq!(
+            second,
+            InventoryPartition::Page(
+                bifrost_types::PageWindow::new(10, 20).expect("ordered window")
+            )
+        );
         let _ = driver.fold(&barrier(3));
 
         assert!(
@@ -289,7 +308,9 @@ mod tests {
         let _ = driver.fold(&degraded(4));
         assert_eq!(
             driver.next_partition(),
-            Some(InventoryPartition::Page { from: 10, to: 20 })
+            Some(InventoryPartition::Page(
+                bifrost_types::PageWindow::new(10, 20).expect("ordered window")
+            ))
         );
         assert!(!driver.completed(), "but the sentinel is still withheld");
     }
@@ -301,12 +322,16 @@ mod tests {
         let mut driver = ScopeWalkDriver::open_pages(0, 50);
         assert_eq!(
             driver.next_partition(),
-            Some(InventoryPartition::Page { from: 0, to: 50 })
+            Some(InventoryPartition::Page(
+                bifrost_types::PageWindow::new(0, 50).expect("ordered window")
+            ))
         );
         let _ = driver.fold(&clean(50));
         assert_eq!(
             driver.next_partition(),
-            Some(InventoryPartition::Page { from: 50, to: 100 }),
+            Some(InventoryPartition::Page(
+                bifrost_types::PageWindow::new(50, 100).expect("ordered window")
+            )),
             "a clean window advances"
         );
         let _ = driver.fold(&barrier(20));
@@ -328,13 +353,17 @@ mod tests {
         let _ = driver.fold(&clean(7));
         assert_eq!(
             driver.next_partition(),
-            Some(InventoryPartition::Page { from: 50, to: 100 }),
+            Some(InventoryPartition::Page(
+                bifrost_types::PageWindow::new(50, 100).expect("ordered window")
+            )),
             "a short page must not be read as end-of-inventory"
         );
         let _ = driver.fold(&clean(0));
         assert_eq!(
             driver.next_partition(),
-            Some(InventoryPartition::Page { from: 100, to: 150 }),
+            Some(InventoryPartition::Page(
+                bifrost_types::PageWindow::new(100, 150).expect("ordered window")
+            )),
             "an empty window that declares more beyond must not end the walk"
         );
         let _ = driver.fold(&exhausted(3));

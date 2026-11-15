@@ -67,7 +67,7 @@ fn parse_quota_resource_list(input: &[u8]) -> IResult<&[u8], Vec<QuotaResource>>
 /// The response contains a mailbox name followed by zero or more quota root names.
 pub(super) fn parse_untagged_quotaroot(
     input: &[u8],
-    utf8_mode: bool,
+    utf8_mode: crate::codec::utf7::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"QUOTAROOT "[..]).parse(input)?;
     // Decode wire-form mailbox name (MUTF-7 or UTF-8) at parse time
@@ -103,7 +103,7 @@ pub(super) fn parse_untagged_quotaroot(
 /// The ACL response lists all access control entries for the specified mailbox.
 pub(super) fn parse_untagged_acl(
     input: &[u8],
-    utf8_mode: bool,
+    utf8_mode: crate::codec::utf7::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"ACL "[..]).parse(input)?;
     // Decode wire-form mailbox name (MUTF-7 or UTF-8) at parse time
@@ -137,7 +137,7 @@ pub(super) fn parse_untagged_acl(
 /// Parse `* MYRIGHTS <mailbox> <rights>` (RFC 4314 Section 3.8).
 pub(super) fn parse_untagged_myrights(
     input: &[u8],
-    utf8_mode: bool,
+    utf8_mode: crate::codec::utf7::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"MYRIGHTS "[..]).parse(input)?;
     // Decode wire-form mailbox name (MUTF-7 or UTF-8) at parse time
@@ -159,7 +159,7 @@ pub(super) fn parse_untagged_myrights(
 /// strings, each representing a set of rights that can be granted independently.
 pub(super) fn parse_untagged_listrights(
     input: &[u8],
-    utf8_mode: bool,
+    utf8_mode: crate::codec::utf7::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"LISTRIGHTS "[..]).parse(input)?;
     // Decode wire-form mailbox name (MUTF-7 or UTF-8) at parse time
@@ -209,7 +209,7 @@ pub(super) fn parse_untagged_listrights(
 ///    without values, terminated by CRLF. Each produces `MetadataEntry { name, value: None }`.
 pub(super) fn parse_untagged_metadata(
     input: &[u8],
-    utf8_mode: bool,
+    utf8_mode: crate::codec::utf7::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"METADATA "[..]).parse(input)?;
     // Decode wire-form mailbox name (MUTF-7 or UTF-8) at parse time

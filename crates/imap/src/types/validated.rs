@@ -433,8 +433,12 @@ impl MailboxName {
     }
 
     /// Retain the address separately from the lenient display decoding.
-    pub(crate) fn from_wire(s: String, bytes: &[u8], utf8: bool) -> Self {
-        let mode = crate::codec::utf7::WireMode::from(utf8);
+    pub(crate) fn from_wire(
+        s: String,
+        bytes: &[u8],
+        utf8: impl Into<crate::codec::utf7::WireMode>,
+    ) -> Self {
+        let mode = utf8.into();
         let (decoded, canonical) = mode.decode(bytes);
         // A mismatched display must never authorize a mode conversion.
         let canonical = canonical && decoded == s;
@@ -465,13 +469,13 @@ impl MailboxName {
     }
 
     /// Original octets apply only in the mode in which they were received.
-    pub(crate) fn wire_bytes(&self, utf8: bool) -> Option<&[u8]> {
+    pub(crate) fn wire_bytes(
+        &self,
+        utf8: impl Into<crate::codec::utf7::WireMode>,
+    ) -> Option<&[u8]> {
+        let wire_mode = utf8.into();
         match &self.1 {
-            MailboxWire::Raw { bytes, mode, .. }
-                if *mode == crate::codec::utf7::WireMode::from(utf8) =>
-            {
-                Some(bytes)
-            }
+            MailboxWire::Raw { bytes, mode, .. } if *mode == wire_mode => Some(bytes),
             _ => None,
         }
     }
@@ -562,11 +566,7 @@ impl MailboxName {
                 raw.extend_from_slice(delimiter.to_string().as_bytes());
                 let leaf = mode.encode_component(leaf);
                 raw.extend_from_slice(leaf.as_bytes());
-                return Ok(Self::from_wire(
-                    display.0,
-                    &raw,
-                    *mode == crate::codec::utf7::WireMode::Utf8,
-                ));
+                return Ok(Self::from_wire(display.0, &raw, *mode));
             }
         }
         Ok(display)
@@ -590,11 +590,7 @@ impl MailboxName {
                 };
                 let raw = &bytes[..index];
                 let (display, _) = mode.decode(raw);
-                return Ok(Some(Self::from_wire(
-                    display,
-                    raw,
-                    *mode == crate::codec::utf7::WireMode::Utf8,
-                )));
+                return Ok(Some(Self::from_wire(display, raw, *mode)));
             }
         }
         self.0

@@ -37,24 +37,39 @@ pub(crate) enum LiteralMode {
 pub(crate) struct EncodeOptions {
     /// RFC 6855 / RFC 9051 `UTF8=ACCEPT` mode.
     ///
-    /// When `true`, non-ASCII UTF-8 bytes are allowed in quoted strings
+    /// In `WireMode::Utf8`, non-ASCII UTF-8 bytes are allowed in quoted strings
     /// (RFC 6855 Section 3 / RFC 9051 Section 9) and mailbox names are
     /// sent as raw UTF-8 instead of modified UTF-7.
-    pub(crate) utf8_mode: bool,
+    pub(crate) utf8_mode: crate::codec::utf7::WireMode,
     /// RFC 7888 LITERAL+ vs synchronizing literal (RFC 3501 Section 4.3).
     pub(crate) literal_mode: LiteralMode,
     /// Server-advertised capabilities (RFC 3501 Section 7.2.1).
-    pub(crate) capabilities: Vec<Capability>,
-    /// Extensions successfully enabled with ENABLE.
-    pub(crate) enabled: Vec<String>,
+    pub(crate) session: std::sync::Arc<crate::types::profile::SessionCapabilities>,
+}
+
+impl std::ops::Deref for EncodeOptions {
+    type Target = crate::types::profile::SessionCapabilities;
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
 }
 
 impl EncodeOptions {
+    pub(crate) fn from_session(
+        session: std::sync::Arc<crate::types::profile::SessionCapabilities>,
+    ) -> Self {
+        Self {
+            utf8_mode: session.utf8_mode(),
+            literal_mode: session.literal_mode(),
+            session,
+        }
+    }
+
     /// Check whether the capability is usable on this connection, through the
-    /// single authority `crate::types::profile::supports` (advertised, implied
+    /// single authority `SessionCapabilities::supports` (advertised, implied
     /// by QRESYNC for CONDSTORE, or folded into active IMAP4rev2).
     pub(crate) fn has_capability(&self, cap: &Capability) -> bool {
-        crate::types::profile::supports(&self.capabilities, &self.enabled, cap)
+        self.session.supports(cap)
     }
 
     /// Check whether CONDSTORE is available (explicitly or via QRESYNC).
@@ -73,9 +88,7 @@ impl EncodeOptions {
     /// active `IMAP4rev2`: only `UTF8=ACCEPT` obliges APPEND to wrap message
     /// data in the RFC 6855 Section 4 `UTF8 (...)` data extension.
     pub(super) fn utf8_accept_enabled(&self) -> bool {
-        self.enabled
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT"))
+        self.enabled.contains(&crate::types::Capability::Utf8Accept)
     }
 
     /// Whether `literal8` may carry the non-synchronizing `+` modifier.
@@ -96,7 +109,7 @@ impl EncodeOptions {
     /// `crate::types::profile`. The rule is NOT restated here: this view owns a
     /// coherent `(capabilities, enabled)` pair and hands it over.
     fn imap4rev2_active(&self) -> bool {
-        crate::types::profile::imap4rev2_active(&self.capabilities, &self.enabled)
+        self.session.imap4rev2_active()
     }
 }
 
@@ -235,12 +248,12 @@ impl CommandWriter {
     /// you send" sends them as a literal. With `utf8` (UTF8=ACCEPT per RFC 6855
     /// Section 3, or active rev2 per RFC 9051 Section 9) valid UTF-8 is also
     /// quotable, under the same control-character and DEL exclusions.
-    pub(crate) fn string(&mut self, data: &[u8], utf8: bool) {
+    pub(crate) fn string(&mut self, data: &[u8], utf8: crate::codec::utf7::WireMode) {
         if data.contains(&0) {
             self.invalid_nul = true;
             return;
         }
-        let quotable = if utf8 {
+        let quotable = if utf8 == crate::codec::utf7::WireMode::Utf8 {
             std::str::from_utf8(data).is_ok()
                 && data.iter().all(|&b| (b >= 0x20 && b != 0x7F) || b >= 0x80)
         } else {

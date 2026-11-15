@@ -8,75 +8,28 @@
 //! consumer reaches `send` through the uniform `Account` surface with no
 //! IMAP-plus-SMTP composition leaking up.
 //!
-//! Address conversion is confined here: the send path stays in
+//! Address conversion is owned by the SMTP facade: the send path stays in
 //! `bifrost_types::Address` space, and the checked
 //! `Address -> bifrost_smtp::Address` reverse-path / recipient
 //! conversion (bare addr-specs, no display name) happens only at
-//! `send_rfc5322`.
+//! `bifrost_smtp::submission::Submission::submit`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use bifrost_net::TokenSource;
+use bifrost_smtp::transport::smtp::PoolConfig;
 use bifrost_smtp::transport::smtp::authentication::Credentials as SmtpCredentials;
-use bifrost_smtp::transport::smtp::{PoolConfig, SendOptions, SubmissionStatus, submission_status};
-use bifrost_smtp::{Address as SmtpAddress, AsyncSmtpTransport, TokioExecutor};
-use bifrost_types::error::{AccountError, BatchItem, BatchItemId};
+use bifrost_types::RecipientNotAccepted;
+#[cfg(test)]
+use bifrost_types::RecipientOutcome;
+use bifrost_types::error::AccountError;
 use bifrost_types::mime::SubmissionEnvelope;
-use bifrost_types::{RecipientNotAccepted, RecipientOutcome};
 
 use crate::types::{Credentials, CredentialsKind};
 
-/// TLS mode for the submission transport. Mirrors `ImapConfig`'s TLS
-/// modes; maps to SMTP's `relay` / `starttls_relay` / `builder_dangerous`
-/// at build time.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubmissionTls {
-    /// Implicit TLS (SMTPS). Default port 465.
-    Implicit,
-    /// STARTTLS upgrade. Default port 587.
-    StartTls,
-    /// Plaintext. Default port 587. Requires opting into insecure auth.
-    Plaintext,
-}
-
-impl SubmissionTls {
-    /// Message-submission defaults, not relay defaults: plaintext stays on
-    /// 587 (see `default_submission_port`).
-    const fn default_port(self) -> u16 {
-        use bifrost_smtp::transport::smtp::{PortTls, default_submission_port};
-        let tls = match self {
-            Self::Implicit => PortTls::Implicit,
-            Self::StartTls => PortTls::StartTls,
-            Self::Plaintext => PortTls::Plaintext,
-        };
-        default_submission_port(tls)
-    }
-}
-
-/// Submission auth when it differs from the IMAP login. The common
-/// single-sign-on case (`SmtpSubmissionConfig::credentials == None`)
-/// reuses the IMAP `Credentials` and never constructs one of these.
-#[non_exhaustive]
-#[derive(Clone)]
-pub enum SubmissionCredentials {
-    /// Username + password submission auth.
-    Password {
-        /// Authentication identity.
-        username: String,
-        /// Password or app password.
-        password: String,
-    },
-    /// OAuth 2.0 bearer submission auth, sharing a rotation source.
-    OAuth2 {
-        /// Authorization identity, usually the email address.
-        identity: String,
-        /// Live token source, read fresh at each connect.
-        token_source: Arc<dyn TokenSource>,
-    },
-}
-
+pub use bifrost_smtp::submission::{SubmissionCredentials, SubmissionTls};
 /// Submission transport configuration, independent of the IMAP dial
 /// config because submission host/port differ from IMAP host/port.
 #[non_exhaustive]
@@ -164,7 +117,7 @@ impl SmtpSubmissionConfig {
 /// resolved default From / save-to-sent policy, so the send path can
 /// default `from` and the MAIL FROM reverse path.
 pub(crate) struct SubmissionTransport {
-    transport: AsyncSmtpTransport<TokioExecutor>,
+    transport: bifrost_smtp::submission::Submission,
     pub(crate) budget: bifrost_net::BandwidthBudget,
     default_from: bifrost_types::Address,
     save_to_sent_default: bool,
@@ -172,7 +125,7 @@ pub(crate) struct SubmissionTransport {
 
 impl SubmissionTransport {
     pub(crate) async fn shutdown(&self) {
-        bifrost_smtp::AsyncTransport::shutdown(&self.transport).await;
+        self.transport.shutdown().await;
     }
 
     pub(crate) fn default_from(&self) -> &bifrost_types::Address {
@@ -220,19 +173,9 @@ impl SubmissionTransport {
         let smtp_config_err = |e: bifrost_smtp::transport::smtp::Error| {
             crate::Error::InvalidInput(e.to_string().into())
         };
-        let mut builder = match cfg.tls {
-            SubmissionTls::Implicit => {
-                AsyncSmtpTransport::<TokioExecutor>::relay(&cfg.host).map_err(smtp_config_err)?
-            }
-            SubmissionTls::StartTls => {
-                AsyncSmtpTransport::<TokioExecutor>::starttls_relay(&cfg.host)
-                    .map_err(smtp_config_err)?
-            }
-            SubmissionTls::Plaintext => {
-                AsyncSmtpTransport::<TokioExecutor>::builder_dangerous(cfg.host.clone())
-                    .dangerous_allow_insecure_auth(true)
-            }
-        };
+        let mut builder = bifrost_smtp::submission::SubmissionConfig::new(&cfg.host, cfg.tls)
+            .map_err(smtp_config_err)?
+            .transport;
 
         // Submission and IMAP share one account budget in each direction.
         builder = builder
@@ -251,170 +194,27 @@ impl SubmissionTransport {
             builder = builder.scripted_connector(connector);
         }
         Ok(Self {
-            transport: builder.build(),
+            transport: bifrost_smtp::submission::Submission::from(
+                bifrost_smtp::submission::SubmissionConfig { transport: builder },
+            ),
             budget: bandwidth_budget,
             default_from: cfg.default_from.clone(),
             save_to_sent_default: cfg.save_to_sent_default,
         })
     }
 
-    /// Submit the RFC 5322 bytes over SMTP using `envelope` as the
-    /// reverse path / recipient set. This is the only place the
-    /// `bifrost_types::Address -> bifrost_smtp::Address` conversion
-    /// happens. Returns the already-translated `AccountError` from
-    /// `bifrost-smtp` on failure, and on success the recipients that were
-    /// not accepted while another one was (empty on a clean send). Their
-    /// errors are not yet stamped with the caller's operation.
+    /// Submit using SMTP's shared envelope and receipt policy.
     pub(crate) async fn send_rfc5322(
         &self,
         envelope: &SubmissionEnvelope,
         raw: &[u8],
         hold: Option<std::time::SystemTime>,
     ) -> Result<Vec<RecipientNotAccepted>, AccountError> {
-        let from = SmtpAddress::try_from(&envelope.from)
-            .map_err(|_| submission_invalid("invalid SMTP reverse-path address"))?;
-        let options = build_send_options(hold)?;
-        let mut locally_failed = Vec::new();
-        let recipients: Vec<BatchItem<SmtpAddress>> = envelope
-            .recipients
-            .iter()
-            .enumerate()
-            .filter_map(|(index, address)| match SmtpAddress::try_from(address) {
-                Ok(address) => Some(BatchItem::new(BatchItemId(index.to_string()), address)),
-                Err(_) => {
-                    locally_failed.push(RecipientNotAccepted::new(
-                        address.clone(),
-                        RecipientOutcome::Failed,
-                        submission_invalid("invalid SMTP recipient address"),
-                    ));
-                    None
-                }
-            })
-            .collect();
-        if recipients.is_empty() {
-            return Err(locally_failed.first().map_or_else(
-                || submission_invalid("SMTP submission requires a recipient"),
-                |failure| failure.error.clone(),
-            ));
-        }
-
-        let outcome = self
-            .transport
-            .send_raw_batch_with_options(Some(from), recipients, raw, &options)
-            .await?;
-
-        // One shared DATA, three-lane per-recipient outcome. An `Err` from
-        // a non-idempotent send reads as "send failed" and invites the
-        // caller to resend the whole message, so `Err` is returned ONLY
-        // when no recipient acknowledged acceptance. If any recipient
-        // landed in the succeeded lane, the body crossed the side-effect
-        // boundary and a resend would double-deliver to it. A partial
-        // send (A delivered, B rejected on RCPT) is therefore a success,
-        // and the recipients that were not accepted ride the receipt,
-        // each with its own error, never resent by us.
-        //
-        // bifrost-smtp's `submission_status` owns that "counts as a send"
-        // decision; this match only maps its answer onto the receipt.
-        match submission_status(&outcome) {
-            SubmissionStatus::Committed => {}
-            // Nothing acknowledged acceptance, but a recipient may still
-            // have the message. Its error (InFlight evidence, so
-            // `Application::from_leaf` reads Uncertain) is returned rather
-            // than a failed recipient's, whose recovery could advise
-            // resending the whole call and duplicate the uncertain one.
-            // Whether an uncertain IMAP send should instead surface as an
-            // uncertain receipt is an open owner ruling; this keeps the
-            // existing error return until it is made.
-            SubmissionStatus::AcceptanceUncertain(error) | SubmissionStatus::Rejected(error) => {
-                return Err(error.clone());
-            }
-            SubmissionStatus::Empty => return Ok(Vec::new()),
-            // A status bifrost-smtp adds later is not known to commit the
-            // message, so it is reported through whichever lane error exists
-            // rather than claimed as sent.
-            _ => {
-                if let Some(lane) = outcome.uncertain().first() {
-                    return Err(lane.error.clone());
-                }
-                return match outcome.failed().first() {
-                    Some(lane) => Err(lane.error.clone()),
-                    None => Ok(Vec::new()),
-                };
-            }
-        }
-        let mut not_accepted = locally_failed;
-        not_accepted.extend(not_accepted_recipients(&envelope.recipients, &outcome));
-        if !not_accepted.is_empty() {
-            tracing::warn!(
-                target: "bifrost_imap::send",
-                delivered = outcome.succeeded().len(),
-                failed = not_accepted.iter().filter(|r| {
-                    r.outcome == RecipientOutcome::Failed
-                }).count(),
-                uncertain = outcome.uncertain().len(),
-                "partial submission: message committed to some recipients while \
-                 others were not accepted; reported on the receipt"
-            );
-        }
-        Ok(not_accepted)
+        self.transport
+            .submit(envelope, raw, hold)
+            .await
+            .map(|receipt| receipt.recipients_not_accepted)
     }
-}
-
-/// Map the failed and uncertain lanes back to their envelope recipients.
-/// Each lane entry carries the `BatchItemId` `send_rfc5322` assigned (the
-/// envelope index); the mapping goes by that id, never by position within a
-/// lane, since LMTP's final-status drain skips rejected recipients. An id
-/// that names no envelope entry cannot come from bifrost-smtp, which checks
-/// one answer per submitted id; it is skipped rather than invented.
-fn not_accepted_recipients<T>(
-    recipients: &[bifrost_types::Address],
-    outcome: &bifrost_types::BatchOutcome<T>,
-) -> Vec<RecipientNotAccepted> {
-    let address = |id: &BatchItemId| {
-        id.0.parse::<usize>()
-            .ok()
-            .and_then(|index| recipients.get(index))
-            .cloned()
-    };
-    let failed = outcome.failed().iter().filter_map(|lane| {
-        address(&lane.item).map(|address| {
-            RecipientNotAccepted::new(address, RecipientOutcome::Failed, lane.error.clone())
-        })
-    });
-    let uncertain = outcome.uncertain().iter().filter_map(|lane| {
-        address(&lane.item).map(|address| {
-            RecipientNotAccepted::new(address, RecipientOutcome::Uncertain, lane.error.clone())
-        })
-    });
-    failed.chain(uncertain).collect()
-}
-
-/// Build the SMTP `SendOptions` for a submission. When `hold` is
-/// `Some`, FUTURERELEASE rides as the absolute-time HOLDUNTIL parameter
-/// so the boundary does not race `now()`; the relay computes the delay
-/// and decides support (an unsupporting relay yields an
-/// `Unsupported(Send)` AccountError from the smtp layer).
-fn build_send_options(hold: Option<std::time::SystemTime>) -> Result<SendOptions, AccountError> {
-    match hold {
-        Some(at) => Ok(SendOptions::default().hold_until(hold_until_rfc3339(at)?)),
-        None => Ok(SendOptions::default()),
-    }
-}
-
-/// Refuse instants outside the timestamp range before opening an SMTP transaction.
-fn hold_until_rfc3339(at: std::time::SystemTime) -> Result<String, AccountError> {
-    jiff::Timestamp::try_from(at)
-        .map(|ts| ts.to_string())
-        .map_err(|_| {
-            submission_invalid("scheduled send instant is outside the supported timestamp range")
-        })
-}
-
-fn submission_invalid(detail: &str) -> AccountError {
-    super::error::into_account_error(
-        crate::Error::InvalidInput(detail.into()),
-        super::error::ImapErrorContext::operation(bifrost_types::AccountOperation::Send),
-    )
 }
 
 /// Derive SMTP credentials: an explicit override if present, else a
@@ -426,13 +226,7 @@ fn resolve_credentials(
     imap_credentials: &Credentials,
 ) -> SmtpCredentials {
     match &cfg.credentials {
-        Some(SubmissionCredentials::Password { username, password }) => {
-            SmtpCredentials::password(username.clone(), password.clone())
-        }
-        Some(SubmissionCredentials::OAuth2 {
-            identity,
-            token_source,
-        }) => SmtpCredentials::oauth2_source(identity.clone(), Arc::clone(token_source)),
+        Some(credentials) => credentials.transport_credentials(),
         None => match imap_credentials.kind() {
             CredentialsKind::Password { username, password } => {
                 SmtpCredentials::password(username.clone(), password.as_str().to_owned())
@@ -449,7 +243,6 @@ fn resolve_credentials(
 mod tests {
     use super::*;
     use bifrost_net::StaticTokenSource;
-    use bifrost_smtp::transport::smtp::extension::{FutureReleaseParameter, MailParameter};
 
     #[tokio::test(start_paused = true)]
     async fn account_close_shuts_down_the_owned_submission_pool() {
@@ -534,8 +327,8 @@ mod tests {
         parts.bandwidth_budget = budget.clone();
         parts.submission = Some(Arc::new(submission));
         let account = super::super::ImapAccount::new(parts);
-        for (requested, expected) in [(Some(17), Some(17)), (Some(0), Some(1)), (None, None)] {
-            account.set_bandwidth_cap(requested);
+        for (requested, expected) in [(Some(17), Some(17)), (None, None)] {
+            account.set_bandwidth_cap(requested.and_then(bifrost_types::BandwidthCap::new));
             assert_eq!(budget.cap(), expected);
         }
     }
@@ -572,7 +365,7 @@ mod tests {
         parts.bandwidth_budget = budget;
         parts.submission = Some(Arc::clone(&submission));
         let account = super::super::ImapAccount::new(parts);
-        account.set_bandwidth_cap(Some(64));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(64));
         // Spend the exact handle handed to SMTP's bandwidth_metering builder.
         for direction in [BandwidthDirection::Inbound, BandwidthDirection::Outbound] {
             submission.budget.admit(direction, 64).await.finish(64);
@@ -706,7 +499,7 @@ mod tests {
         parts.submission = Some(Arc::clone(&submission));
         let account = super::super::ImapAccount::new(parts);
         // A small live account cap splits even commands across several writes.
-        account.set_bandwidth_cap(Some(8));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(8));
         budget.admit(direction, 8).await.finish(8);
         let envelope = SubmissionEnvelope {
             from: bifrost_types::Address::bare("user@example.com"),
@@ -918,28 +711,6 @@ mod tests {
         assert_eq!(
             error.kind(),
             &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-        );
-    }
-
-    #[test]
-    fn scheduled_send_builds_holduntil_mail_parameter() {
-        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
-        let options = build_send_options(Some(at)).unwrap();
-        assert!(
-            options.mail_parameters().iter().any(|p| matches!(
-                p,
-                MailParameter::FutureRelease(FutureReleaseParameter::HoldUntil(_))
-            )),
-            "scheduled send must emit a FutureRelease(HoldUntil) mail parameter"
-        );
-
-        // An immediate send carries no FUTURERELEASE parameter.
-        let immediate = build_send_options(None).unwrap();
-        assert!(
-            !immediate
-                .mail_parameters()
-                .iter()
-                .any(|p| matches!(p, MailParameter::FutureRelease(_)))
         );
     }
 

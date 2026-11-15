@@ -33,7 +33,7 @@ const OP: AccountOperation = AccountOperation::OpenBlob;
 /// the parser only read a prefix of, pass while pinning the traversal of a
 /// structure nobody meant to write.
 fn parse(input: &[u8]) -> BodyStructure {
-    let (rest, structure) = body_structure(input, false, 0).expect("BODYSTRUCTURE parses");
+    let (rest, structure) = body_structure(input, false.into(), 0).expect("BODYSTRUCTURE parses");
     assert!(
         rest.is_empty(),
         "fixture left {} unparsed bytes: {:?}",
@@ -326,7 +326,7 @@ fn deepest_accepted_nesting_walks_complete() {
 #[test]
 fn one_level_deeper_is_refused_by_the_parser() {
     assert!(
-        body_structure(&nested_message_chain(65), false, 0).is_err(),
+        body_structure(&nested_message_chain(65), false.into(), 0).is_err(),
         "parser accepted nesting deeper than the traversal bound"
     );
 }

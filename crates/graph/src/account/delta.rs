@@ -98,8 +98,7 @@ pub(super) fn walk(
             let mut changes = Vec::new();
             let mut obligations = Vec::new();
             let mut last_seen_id = None;
-            let mut etags = Vec::new();
-            let mut removed_etag_ids = Vec::new();
+            let mut etag_observations = Vec::new();
             for value in page.value {
                 let item = GraphItem::decode(&value);
                 // Decide identity once for both lanes, live values and tombstones.
@@ -133,7 +132,7 @@ pub(super) fn walk(
                 last_seen_id = Some(object_id.0.clone());
                 if matches!(item.state, DeltaState::Removed) {
                     if parsed.etag_cached() {
-                        removed_etag_ids.push(object_id.0.clone());
+                        etag_observations.push((object_id.0.clone(), super::EtagObservation::Invalidated));
                     }
                     match &lane {
                         DeltaLane::Inventory { .. } => removed.push(object_id),
@@ -146,7 +145,7 @@ pub(super) fn walk(
                     continue;
                 }
                 if parsed.etag_cached() && let Some(etag) = graph_etag(&value) {
-                    etags.push((object_id.0.clone(), etag));
+                    etag_observations.push((object_id.0.clone(), super::EtagObservation::Read(etag)));
                 }
                 match &lane {
                     DeltaLane::Inventory { .. } => {
@@ -170,10 +169,10 @@ pub(super) fn walk(
                     }
                 }
             }
-            if !etags.is_empty() || !removed_etag_ids.is_empty() {
+            if !etag_observations.is_empty() {
                 let mut cache = account.etag_index.write().await;
-                for (id, etag) in etags { cache.insert(id, etag); }
-                for id in removed_etag_ids { cache.remove(&id); }
+                // Preserve wire order: a re-added message must retain its new validator.
+                for (id, observation) in etag_observations { cache.observe(&id, observation); }
             }
             let coverage = coverage_of(&scope, &obligations);
             let failure = if !obligations.is_empty() {

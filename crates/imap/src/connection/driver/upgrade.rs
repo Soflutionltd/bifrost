@@ -508,7 +508,10 @@ mod bandwidth_review_tests {
             u64::try_from(ok_len).unwrap(),
             "the coalesced deflate suffix is counted after decompression"
         );
-        reader.read_one(false).await.unwrap();
+        reader
+            .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+            .await
+            .unwrap();
         assert_eq!(
             counter.0.load(Ordering::Relaxed),
             u64::try_from(ok_len + plaintext.len()).unwrap()

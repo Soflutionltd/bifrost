@@ -18,36 +18,30 @@ pub enum ShareScope {
     Organization,
 }
 
-/// Metadata the consumer supplies for a host request. `size` is the total byte
-/// length (used to declare `X-Upload-Content-Length` to Drive and to chunk).
+/// Metadata the consumer supplies for a host request. Upload length is derived
+/// from the bytes supplied to `Account::host_attachment`.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct CloudUploadMeta {
     /// The file name the hosted item is given on the drive.
     pub file_name: String,
+    // Preserve the declared wire media type. parse_content_type is a tolerant
+    // inbound parser: malformed input becomes text/plain, which would silently
+    // change an outbound declaration or hide inbound evidence.
     /// The MIME type declared for the uploaded bytes.
     pub mime: String,
-    /// Total byte length of the payload. MUST equal `bytes.len()` at the call
-    /// site; used to declare the resumable-upload content length and to chunk.
-    pub size: u64,
     /// Who the minted share link grants access to.
     pub scope: ShareScope,
 }
 
 impl CloudUploadMeta {
-    /// Construct upload metadata from a file name, MIME type, total size, and
+    /// Construct upload metadata from a file name, MIME type, and
     /// share scope.
     #[must_use]
-    pub fn new(
-        file_name: impl Into<String>,
-        mime: impl Into<String>,
-        size: u64,
-        scope: ShareScope,
-    ) -> Self {
+    pub fn new(file_name: impl Into<String>, mime: impl Into<String>, scope: ShareScope) -> Self {
         Self {
             file_name: file_name.into(),
             mime: mime.into(),
-            size,
             scope,
         }
     }

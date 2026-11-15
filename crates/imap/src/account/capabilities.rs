@@ -46,12 +46,6 @@ pub(crate) fn build_capabilities_for_registry(
     foreign_namespaces_advertised: bool,
     push_capacity: usize,
 ) -> AccountCapabilities {
-    // Copy only the contact / calendar field subsets from the
-    // sub-accounts' real capability snapshots; an absent sub-account
-    // leaves those flags `false` (`PimMethodSupport::default()`). Every
-    // other `pim_methods` field stays IMAP-owned below.
-    let contact_pim = contacts.map(|c| &c.pim_methods);
-    let calendar_pim = calendars.map(|c| &c.pim_methods);
     let has_drafts = folders
         .role_folder(bifrost_types::container::FolderRole::Drafts)
         .is_some();
@@ -70,31 +64,7 @@ pub(crate) fn build_capabilities_for_registry(
     let has_thread_references = profile.capabilities.iter().any(
         |cap| matches!(cap, Capability::Thread(alg) if alg.eq_ignore_ascii_case("REFERENCES")),
     );
-    let contact_update = contacts.is_some_and(|caps| {
-        caps.mutation
-            .concurrency
-            .versioned_doors()
-            .contains(VersionedDoors::CONTACT_UPDATE)
-    });
-    let event_update = calendars.is_some_and(|caps| {
-        caps.mutation
-            .concurrency
-            .versioned_doors()
-            .contains(VersionedDoors::EVENT_UPDATE)
-    });
-    let contact_delete = contacts.is_some_and(|caps| {
-        caps.mutation
-            .concurrency
-            .versioned_doors()
-            .contains(VersionedDoors::CONTACT_DELETE)
-    });
-    let event_delete = calendars.is_some_and(|caps| {
-        caps.mutation
-            .concurrency
-            .versioned_doors()
-            .contains(VersionedDoors::EVENT_DELETE)
-    });
-    AccountCapabilities {
+    let mut capabilities = AccountCapabilities {
         cursor_freshness: CursorFreshness::Hybrid,
         // IMAP can fetch a BODY[] section by range, but this account does
         // not yet emit attachment BlobHandles backed by those sections.
@@ -113,12 +83,7 @@ pub(crate) fn build_capabilities_for_registry(
         },
         mutation: MutationCapabilities {
             concurrency: MutationConcurrency::ExpectedVersion(
-                VersionedDoors::NONE
-                    .with(VersionedDoors::MAIL_SET_FLAGS, mail_set_flags)
-                    .with(VersionedDoors::CONTACT_UPDATE, contact_update)
-                    .with(VersionedDoors::EVENT_UPDATE, event_update)
-                    .with(VersionedDoors::CONTACT_DELETE, contact_delete)
-                    .with(VersionedDoors::EVENT_DELETE, event_delete),
+                VersionedDoors::NONE.with(VersionedDoors::MAIL_SET_FLAGS, mail_set_flags),
             ),
             replay_safety: MutationReplaySafety::None,
             reassertion: bifrost_types::MutationReassertion {
@@ -192,27 +157,27 @@ pub(crate) fn build_capabilities_for_registry(
             filter_update: has_sieve,
             filter_delete: has_sieve,
             filter_validate: has_sieve,
-            address_books_list: contact_pim.is_some_and(|p| p.address_books_list),
-            contacts_list: contact_pim.is_some_and(|p| p.contacts_list),
-            contact_get: contact_pim.is_some_and(|p| p.contact_get),
-            contact_create: contact_pim.is_some_and(|p| p.contact_create),
-            contact_update: contact_pim.is_some_and(|p| p.contact_update),
-            contact_delete: contact_pim.is_some_and(|p| p.contact_delete),
-            contact_search: contact_pim.is_some_and(|p| p.contact_search),
-            contact_autocomplete: contact_pim.is_some_and(|p| p.contact_autocomplete),
-            directory_search: contact_pim.is_some_and(|p| p.directory_search),
-            directory_enumerate: contact_pim.is_some_and(|p| p.directory_enumerate),
+            address_books_list: false,
+            contacts_list: false,
+            contact_get: false,
+            contact_create: false,
+            contact_update: false,
+            contact_delete: false,
+            contact_search: false,
+            contact_autocomplete: false,
+            directory_search: false,
+            directory_enumerate: false,
             directory_groups_list: false,
             directory_group_expand: false,
-            calendars_list: calendar_pim.is_some_and(|p| p.calendars_list),
-            events_in_range: calendar_pim.is_some_and(|p| p.events_in_range),
-            event_get: calendar_pim.is_some_and(|p| p.event_get),
-            event_create: calendar_pim.is_some_and(|p| p.event_create),
-            event_update: calendar_pim.is_some_and(|p| p.event_update),
-            event_delete: calendar_pim.is_some_and(|p| p.event_delete),
-            event_rsvp: calendar_pim.is_some_and(|p| p.event_rsvp),
-            event_search: calendar_pim.is_some_and(|p| p.event_search),
-            event_autocomplete: calendar_pim.is_some_and(|p| p.event_autocomplete),
+            calendars_list: false,
+            events_in_range: false,
+            event_get: false,
+            event_create: false,
+            event_update: false,
+            event_delete: false,
+            event_rsvp: false,
+            event_search: false,
+            event_autocomplete: false,
         },
         filter_rule_shape: if has_sieve {
             FilterRuleShape::Scripts
@@ -231,12 +196,53 @@ pub(crate) fn build_capabilities_for_registry(
         // through - and NAMESPACE is a truthful "never" signal, so a
         // personal-only server honestly reports false.
         discovers_foreign_namespaces_on_rediscovery: foreign_namespaces_advertised,
-    }
+    };
+    bifrost_types::account_compose::merge_capabilities(&mut capabilities, contacts, calendars);
+    capabilities
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composition_projects_rsvp_and_directory_groups_without_cross_lane_leaks() {
+        let profile = ServerProfile::new(Vec::new(), Vec::new());
+        for enabled in [false, true] {
+            let mut contacts = crate::account::test_support::stub_capabilities();
+            let mut calendars = contacts.clone();
+            contacts.pim_methods.directory_groups_list = enabled;
+            contacts.pim_methods.directory_group_expand = enabled;
+            contacts.pim_methods.event_rsvp = !enabled;
+            contacts.mutation.concurrency =
+                MutationConcurrency::ExpectedVersion(VersionedDoors::EVENT_RSVP);
+            calendars.pim_methods.event_rsvp = enabled;
+            calendars.pim_methods.directory_groups_list = !enabled;
+            calendars.mutation.concurrency = MutationConcurrency::ExpectedVersion(
+                VersionedDoors::NONE.with(VersionedDoors::EVENT_RSVP, enabled),
+            );
+            let caps = build_capabilities(
+                &profile,
+                &[],
+                false,
+                Some(&contacts),
+                Some(&calendars),
+                false,
+                false,
+                1,
+            );
+            assert_eq!(caps.pim_methods.directory_groups_list, enabled);
+            assert_eq!(caps.pim_methods.directory_group_expand, enabled);
+            assert_eq!(caps.pim_methods.event_rsvp, enabled);
+            assert_eq!(
+                caps.mutation
+                    .concurrency
+                    .versioned_doors()
+                    .contains(VersionedDoors::EVENT_RSVP),
+                enabled,
+            );
+        }
+    }
 
     #[test]
     fn caller_delete_capabilities_follow_only_the_correct_composed_backend() {

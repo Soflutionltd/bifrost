@@ -19,7 +19,7 @@ const MAX_BODY_NESTING_DEPTH: u32 = 64;
 /// Parse BODYSTRUCTURE per RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2.
 ///
 /// Entry point  -  multipart starts with nested `(`, single-part starts with a string.
-/// When `utf8_mode` is true, embedded ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
+/// When `utf8_mode` is `WireMode::Utf8`, embedded ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
 ///
 /// `depth` tracks the current nesting level; callers at the top level pass 0.
 /// Returns a nom error if `depth` exceeds [`MAX_BODY_NESTING_DEPTH`].
@@ -28,7 +28,7 @@ const MAX_BODY_NESTING_DEPTH: u32 = 64;
 // rather than hand-built enum values, so it needs the real parser.
 pub(crate) fn body_structure(
     input: &[u8],
-    utf8_mode: bool,
+    utf8_mode: crate::codec::utf7::WireMode,
     depth: u32,
 ) -> IResult<&[u8], BodyStructure> {
     // Defense-in-depth: reject excessively nested BODYSTRUCTURE to prevent
@@ -53,10 +53,14 @@ pub(crate) fn body_structure(
 
 /// Parse a single-part body: text, message/rfc822, or basic (RFC 3501 Section 7.4.2).
 ///
-/// When `utf8_mode` is true, embedded ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
+/// When `utf8_mode` is `WireMode::Utf8`, embedded ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
 ///
 /// `depth` tracks the current nesting level for recursion-depth enforcement.
-fn body_type_single(input: &[u8], utf8_mode: bool, depth: u32) -> IResult<&[u8], BodyStructure> {
+fn body_type_single(
+    input: &[u8],
+    utf8_mode: crate::codec::utf7::WireMode,
+    depth: u32,
+) -> IResult<&[u8], BodyStructure> {
     // media-type SP media-subtype
     // RFC 2045 Section 5.1: media types are case-insensitive  -  lowercase
     // is the canonical form used in RFC examples (e.g. `text/plain`).
@@ -179,12 +183,12 @@ fn body_type_single(input: &[u8], utf8_mode: bool, depth: u32) -> IResult<&[u8],
 /// Parse multipart body (RFC 3501 Section 7.4.2).
 ///
 /// Starts after the opening `(` of the BODYSTRUCTURE and the first nested `(`.
-/// When `utf8_mode` is true, embedded ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
+/// When `utf8_mode` is `WireMode::Utf8`, embedded ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
 ///
 /// `depth` tracks the current nesting level for recursion-depth enforcement.
 pub(super) fn body_type_mpart(
     input: &[u8],
-    utf8_mode: bool,
+    utf8_mode: crate::codec::utf7::WireMode,
     depth: u32,
 ) -> IResult<&[u8], BodyStructure> {
     // One or more nested body structures  -  each child increments the depth.

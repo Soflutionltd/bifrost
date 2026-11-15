@@ -74,6 +74,36 @@ pub enum TokenSnapshot {
     Contended,
 }
 
+impl TokenSnapshot {
+    /// Classify temporary local cache contention without inventing a wire failure.
+    /// A busy credential cache should retry, never ask the user to sign in again.
+    pub fn contention_account_error(
+        &self,
+        protocol: bifrost_types::Protocol,
+        operation: bifrost_types::AccountOperation,
+    ) -> Option<bifrost_types::AccountError> {
+        use bifrost_types::{
+            AccountErrorBuilder, AccountErrorKind, AuthCause, AuthErrorKind, Cause, DiagnosticText,
+        };
+        if !matches!(self, Self::Contended) {
+            return None;
+        }
+        Some(
+            AccountErrorBuilder::new(
+                AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient),
+                Cause::Auth(AuthCause::RefreshTransient),
+            )
+            .protocol(protocol)
+            .operation(operation)
+            .text(DiagnosticText::support_only(
+                "OAuth token cache is busy; retry when ready",
+            ))
+            .try_build()
+            .expect("valid local credential contention"),
+        )
+    }
+}
+
 /// Source of OAuth bearer tokens. Implementations are responsible for
 /// holding the refresh token (or whatever provider-specific material
 /// is needed) and exchanging it for a fresh access token.

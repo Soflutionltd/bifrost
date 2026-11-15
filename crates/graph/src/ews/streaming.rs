@@ -254,12 +254,20 @@ const FRAME_LOCAL_NAME: &[u8] = b"GetStreamingEventsResponseMessage";
 /// or two characters.
 const MAX_PREFIX_LEN: usize = 64;
 
+// Local safety bound: a stalled or hostile response must not exhaust the mail client.
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
 impl StreamingFrameDecoder {
-    /// Rescans the buffer from index 0 on every chunk. Assessed and accepted as
-    /// a known bound, not a defect: every path below either drains the consumed
-    /// prefix or truncates the buffer to a bounded tail, so the quadratic case
-    /// needs a single frame larger than the whole transfer.
     pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
+        let mut frames = Vec::new();
+        // Bound temporary accumulation even when one transport chunk is huge.
+        for part in chunk.chunks(MAX_FRAME_BYTES) {
+            frames.extend(self.push_part(part)?);
+        }
+        Ok(frames)
+    }
+
+    fn push_part(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
         self.buffered.extend_from_slice(chunk);
         let mut frames = Vec::new();
         loop {
@@ -277,8 +285,16 @@ impl StreamingFrameDecoder {
                 self.buffered.drain(..start);
             }
             let Some(end) = find_frame_end(&self.buffered) else {
+                if self.buffered.len() > MAX_FRAME_BYTES {
+                    self.buffered.clear();
+                    return Err("streaming EWS frame exceeded local byte limit".to_string());
+                }
                 break;
             };
+            if end > MAX_FRAME_BYTES {
+                self.buffered.clear();
+                return Err("streaming EWS frame exceeded local byte limit".to_string());
+            }
             let frame = self.buffered.drain(..end).collect::<Vec<_>>();
             let frame = String::from_utf8(frame)
                 .map_err(|error| format!("streaming EWS frame was not UTF-8: {error}"))?;

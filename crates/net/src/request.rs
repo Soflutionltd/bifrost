@@ -1229,6 +1229,18 @@ pub(crate) async fn send_streaming_inner(
             } else {
                 None
             };
+            // Per-leg HopPolicy admission above is authoritative for its own
+            // source, including Outlook and DAV on composed account handles.
+            // Ordinary account bearers must pass account admission before lookup.
+            // With no account token source no bearer would be injected, so
+            // there is no credential to protect and nothing to refuse.
+            if hop_policy.is_none()
+                && auth_for_next_hop
+                && account.token_source().is_some()
+                && let Some(origins) = &account.inner.trusted_origins
+            {
+                let _admitted = origins.admit(&url)?;
+            }
             let hop_source = match &hop_credential {
                 Some(crate::HopCredential::Bearer(source)) => Some(Arc::clone(source.as_source())),
                 Some(_) => None,
@@ -2829,7 +2841,7 @@ mod tests {
             Vec::new(),
             RetryPolicy::disabled(),
         );
-        account.set_bandwidth_cap(Some(256));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(256));
         let started = tokio::time::Instant::now();
 
         let result = account
@@ -2872,7 +2884,7 @@ mod tests {
             Vec::new(),
             RetryPolicy::disabled(),
         );
-        account.set_bandwidth_cap(Some(256));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(256));
         let started = tokio::time::Instant::now();
 
         let error = account
@@ -2910,7 +2922,7 @@ mod tests {
             Vec::new(),
             RetryPolicy::disabled(),
         );
-        account.set_bandwidth_cap(Some(256));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(256));
         let started = tokio::time::Instant::now();
 
         let error = account
@@ -3892,7 +3904,7 @@ mod tests {
             Vec::new(),
             RetryPolicy::disabled(),
         );
-        account.set_bandwidth_cap(Some(10));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(10));
         let started = tokio::time::Instant::now();
         use futures::StreamExt as _;
         let results = futures::future::join_all((0..4).map(|_| {
@@ -4002,7 +4014,7 @@ mod tests {
         policy.initial_backoff = Duration::ZERO;
         policy.max_backoff = Duration::ZERO;
         let account = scripted_account(&script, NetConfig::default(), Vec::new(), policy);
-        account.set_bandwidth_cap(Some(10));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(10));
         let payload = Bytes::from_static(b"01234567890123456789");
         let started = tokio::time::Instant::now();
         account
@@ -4034,7 +4046,7 @@ mod tests {
             Vec::new(),
             RetryPolicy::disabled(),
         );
-        account.set_bandwidth_cap(Some(10));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(10));
         let mut first = Box::pin(
             account
                 .post("https://upload.test/first")
@@ -4076,7 +4088,7 @@ mod tests {
             crate::ResponseHeadersTimeout::Bounded(Duration::from_millis(100));
         let account = crate::test_support::scripted_net(&script, NetConfig::default())
             .attach_account(crate::AccountId("upload".into()), spec);
-        account.set_bandwidth_cap(Some(10));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(10));
         let started = tokio::time::Instant::now();
         let payload = Bytes::from_static(b"0123456789012345678901234567890123456789");
         account
@@ -4107,7 +4119,7 @@ mod tests {
             crate::ResponseHeadersTimeout::Bounded(Duration::from_millis(100));
         let account = crate::test_support::scripted_net(&script, NetConfig::default())
             .attach_account(crate::AccountId("upload-stall".into()), spec);
-        account.set_bandwidth_cap(Some(10));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(10));
         let started = tokio::time::Instant::now();
         let error = account
             .post("https://upload.test/stall")
@@ -4136,7 +4148,7 @@ mod tests {
         policy.initial_backoff = Duration::ZERO;
         policy.max_backoff = Duration::ZERO;
         let account = scripted_account(&script, NetConfig::default(), Vec::new(), policy);
-        account.set_bandwidth_cap(Some(10));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(10));
         let started = tokio::time::Instant::now();
         account
             .put("https://retry-upload.test/body")
@@ -4163,7 +4175,7 @@ mod tests {
             Vec::new(),
             RetryPolicy::disabled(),
         );
-        account.set_bandwidth_cap(Some(10));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(10));
         let started = tokio::time::Instant::now();
         account
             .put("https://redirect-upload.test/body")
@@ -4188,7 +4200,7 @@ mod tests {
             Vec::new(),
             RetryPolicy::disabled(),
         );
-        account.set_bandwidth_cap(Some(1024));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(1024));
         let started = tokio::time::Instant::now();
         let error = account
             .get("https://diagnostic.test/body")
@@ -4212,7 +4224,7 @@ mod tests {
             Vec::new(),
             RetryPolicy::disabled(),
         );
-        account.set_bandwidth_cap(Some(10));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(10));
         let mut response = account
             .get("https://resume.test/body")
             .timeout(Duration::from_secs(2))
@@ -4252,7 +4264,7 @@ mod tests {
         spec.read_timeout = Some(Duration::from_millis(100));
         let account = crate::test_support::scripted_net(&script, NetConfig::default())
             .attach_account(crate::AccountId("body-admission".into()), spec);
-        account.set_bandwidth_cap(Some(10));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(10));
         let started = tokio::time::Instant::now();
         let response = account
             .get("https://body-admission.test/body")

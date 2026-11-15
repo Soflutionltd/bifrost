@@ -452,6 +452,16 @@ async fn a_straggler_worker_does_not_cost_the_ack_writer_its_drain() {
         }
     };
     stub.inventory_hook = Some(common::establishing_inventory());
+    stub.changes_hook = Some(Arc::new(|cursor| {
+        if cursor.scope == CursorScope::Account {
+            vec![bifrost_types::SyncEvent::Done(Some(
+                bifrost_types::Checkpoint::Change(common::cursor_for(&cursor.scope, ACKED_STATE)),
+            ))]
+        } else {
+            Vec::new()
+        }
+    }));
+    stub.changes_stall = Some(Arc::new(tokio::sync::Notify::new()));
     let stub = Arc::new(stub);
 
     let store_gate = Arc::new(tokio::sync::Notify::new());
@@ -481,7 +491,7 @@ async fn a_straggler_worker_does_not_cost_the_ack_writer_its_drain() {
 
     // The deferred worker waits for a real subscriber before it walks anything,
     // so the straggler does not exist until somebody subscribes.
-    let _subscriber = engine
+    let mut subscriber = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
     // Not "the stream was constructed" but "its tail is actually parked": the
@@ -492,23 +502,24 @@ async fn a_straggler_worker_does_not_cost_the_ack_writer_its_drain() {
         .expect("the deferred inventory worker reaches its parked membership refresh")
         .expect("the parked signal is not dropped");
 
+    // A real delivered publication supplies the acknowledgement token.
+    let token = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let event = subscriber.recv().await.expect("published event");
+            if matches!(event.checkpoint.as_ref(), Some(bifrost_types::Checkpoint::Change(cursor))
+                if cursor.server_state.bytes == ACKED_STATE)
+            {
+                break event.ack_token().expect("checkpoint token").clone();
+            }
+        }
+    })
+    .await
+    .expect("acknowledgeable change arrives");
     // Acknowledged work, outstanding: the writer takes it and parks in the store.
     let acking = tokio::spawn({
         let engine = Arc::clone(&engine);
         let account_id = account_id.clone();
-        async move {
-            engine
-                .ack_checkpoint(
-                    &account_id,
-                    CursorScope::Account,
-                    bifrost_types::Checkpoint::Change(common::cursor_for(
-                        &CursorScope::Account,
-                        ACKED_STATE,
-                    )),
-                    None,
-                )
-                .await
-        }
+        async move { engine.ack(&account_id, token).await }
     });
     tokio::time::timeout(Duration::from_secs(120), async {
         while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {

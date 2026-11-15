@@ -451,7 +451,7 @@ fn publish_recovered(
     coverage: &Arc<crate::cursor::PendingCoverage>,
     scope: &CursorScope,
     recovered: &[bifrost_types::ObjectId],
-) -> Option<crate::cursor::PublicationId> {
+) -> Option<crate::cursor::AckToken> {
     let delivery = delivery?;
     if recovered.is_empty() {
         return None;
@@ -523,7 +523,6 @@ mod tests {
         InventoryEntry {
             id: ObjectId(id.into()),
             memberships: Vec::new(),
-            size: None,
             blob_id: None,
             fingerprint: Fingerprint {
                 server_version: ServerVersion::Unavailable,

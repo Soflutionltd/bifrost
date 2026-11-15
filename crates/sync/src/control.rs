@@ -91,8 +91,7 @@ struct SyncControlInner {
     /// Watch channel carrying the latest persisted checkpoint and the
     /// generation in which quiescence was observed.
     checkpoint_tx: watch::Sender<CheckpointSnapshot>,
-    durable:
-        std::sync::Mutex<HashMap<DurableLane, (Option<crate::cursor::PublicationId>, Checkpoint)>>,
+    durable: std::sync::Mutex<HashMap<DurableLane, (Option<crate::cursor::AckToken>, Checkpoint)>>,
     /// Monotonic generation counter; bumped by `pause` /
     /// `checkpoint_now` BEFORE flipping the boundary so the waiter
     /// reads the new generation before parking.
@@ -109,7 +108,7 @@ struct SyncControlInner {
     /// unacked batch can never wedge boundary waiters indefinitely.
     publications: Arc<crate::cursor::Publications>,
     priority: watch::Sender<Priority>,
-    bandwidth_cap: watch::Sender<Option<u64>>,
+    bandwidth_cap: watch::Sender<Option<bifrost_types::BandwidthCap>>,
     bandwidth_observed: AtomicU64,
 }
 
@@ -119,7 +118,7 @@ impl SyncControl {
         account: AccountId,
         boundary: Boundary,
         priority: watch::Sender<Priority>,
-        bandwidth_cap: watch::Sender<Option<u64>>,
+        bandwidth_cap: watch::Sender<Option<bifrost_types::BandwidthCap>>,
     ) -> Self {
         Self::new_with_publications(
             account,
@@ -138,7 +137,7 @@ impl SyncControl {
         account: AccountId,
         boundary: Boundary,
         priority: watch::Sender<Priority>,
-        bandwidth_cap: watch::Sender<Option<u64>>,
+        bandwidth_cap: watch::Sender<Option<bifrost_types::BandwidthCap>>,
         publications: Arc<crate::cursor::Publications>,
     ) -> Self {
         let (checkpoint_tx, _rx) = watch::channel(CheckpointSnapshot {
@@ -224,7 +223,7 @@ impl SyncControl {
         drop(priority);
         self.apply_bandwidth_cap(|cap| {
             if let Some(budget) = budget {
-                budget.set_cap(cap);
+                budget.set_cap(cap.map(bifrost_types::BandwidthCap::get));
             }
             account.set_bandwidth_cap(cap);
         });
@@ -282,7 +281,7 @@ impl SyncControl {
     /// Supersession in `register` is what keeps the set bounded.
     pub(crate) async fn record_publication(
         &self,
-        publication: Option<crate::cursor::PublicationId>,
+        publication: Option<crate::cursor::AckToken>,
         checkpoint: Checkpoint,
     ) {
         match publication.clone() {
@@ -294,7 +293,7 @@ impl SyncControl {
 
     fn announce_durable(
         &self,
-        publication: Option<crate::cursor::PublicationId>,
+        publication: Option<crate::cursor::AckToken>,
         checkpoint: Checkpoint,
     ) {
         let checkpoints = {
@@ -311,7 +310,7 @@ impl SyncControl {
                         (Some(next), Some(previous)) => next >= previous,
                         // A publication-less announcement replaces
                         // unconditionally - including a lane snapshot recorded
-                        // under a newer PublicationId. No engine path reaches
+                        // under a newer AckToken. No engine path reaches
                         // that today (only the published `record_checkpoint`
                         // foot-gun announces without a publication), but a new
                         // publication-less caller would silently regress the
@@ -358,7 +357,7 @@ impl SyncControl {
     /// claim. Production paths use `publish_checkpoint_if_fence`, so a
     /// publication cannot exist with only one of its halves.
     #[cfg(test)]
-    pub(crate) fn expect_checkpoint(&self, checkpoint: Checkpoint) -> crate::cursor::PublicationId {
+    pub(crate) fn expect_checkpoint(&self, checkpoint: Checkpoint) -> crate::cursor::AckToken {
         self.publish_checkpoint_without_report(checkpoint)
     }
 
@@ -383,7 +382,7 @@ impl SyncControl {
         checkpoint: Checkpoint,
         claim: crate::cursor::CoverageClaim,
         expected_fence: crate::cursor::ScopeFence,
-    ) -> Result<crate::cursor::PublicationId, crate::cursor::CoverageClaim> {
+    ) -> Result<crate::cursor::AckToken, crate::cursor::CoverageClaim> {
         self.inner
             .publications
             .register_if_fence(checkpoint, claim, expected_fence, None)
@@ -399,7 +398,7 @@ impl SyncControl {
         checkpoint: Checkpoint,
         walk_watermark: crate::cursor::UndeliveredMark,
         expected_fence: crate::cursor::ScopeFence,
-    ) -> Result<crate::cursor::PublicationId, crate::cursor::CoverageClaim> {
+    ) -> Result<crate::cursor::AckToken, crate::cursor::CoverageClaim> {
         self.inner.publications.register_if_fence(
             checkpoint,
             crate::cursor::CoverageClaim {
@@ -420,7 +419,7 @@ impl SyncControl {
     pub(crate) fn publish_checkpoint_without_report(
         &self,
         checkpoint: Checkpoint,
-    ) -> crate::cursor::PublicationId {
+    ) -> crate::cursor::AckToken {
         // A report-less publication still takes its generation from the
         // coverage owner, never from a bare integer.
         let generation = self.inner.publications.next_generation();
@@ -442,13 +441,13 @@ impl SyncControl {
     /// later `pause` / `checkpoint_now` on this account for the rest
     /// of the process. The durable snapshot is deliberately NOT
     /// advanced, because nothing new became durable; a consumer whose
-    /// ack failed learns that from `ack_checkpoint`'s own `Result`.
+    /// ack failed learns that from `ack`'s own `Result`.
     ///
     /// Identified by PUBLICATION for the same reason acknowledgement
     /// is: two publications can carry equal checkpoint values, and a
     /// value search would retire the wrong one - releasing a boundary
     /// still in flight, and taking its coverage claim with it.
-    pub(crate) fn retire_publication(&self, publication: crate::cursor::PublicationId) {
+    pub(crate) fn retire_publication(&self, publication: crate::cursor::AckToken) {
         self.inner.publications.retire_publication(publication);
         let generation = CheckpointGeneration(self.inner.generation.load(Ordering::SeqCst));
         self.publish_quiescence(generation);
@@ -517,18 +516,26 @@ impl SyncControl {
 
     /// Apply the latest policy while holding the control snapshot stable.
     pub(crate) fn apply_bandwidth_budget(&self, budget: &bifrost_net::BandwidthBudget) {
-        budget.set_cap(*self.inner.bandwidth_cap.borrow());
+        budget.set_cap(
+            self.inner
+                .bandwidth_cap
+                .borrow()
+                .map(bifrost_types::BandwidthCap::get),
+        );
     }
 
     /// Keep control updates ordered with a replacement account's setter.
-    pub(crate) fn apply_bandwidth_cap(&self, setter: impl FnOnce(Option<u64>)) {
+    pub(crate) fn apply_bandwidth_cap(
+        &self,
+        setter: impl FnOnce(Option<bifrost_types::BandwidthCap>),
+    ) {
         let cap = self.inner.bandwidth_cap.borrow();
         setter(*cap);
     }
 
     /// Read the configured cap. `None` when no cap is set.
     #[must_use]
-    pub fn bandwidth_cap_snapshot(&self) -> Option<u64> {
+    pub fn bandwidth_cap_snapshot(&self) -> Option<bifrost_types::BandwidthCap> {
         *self.inner.bandwidth_cap.borrow()
     }
 
@@ -549,6 +556,12 @@ impl SyncControl {
     #[cfg(test)]
     pub(crate) fn durable_snapshot(&self) -> DurableCheckpointSet {
         self.inner.checkpoint_tx.borrow().checkpoints.clone()
+    }
+
+    /// Drive admission watches the same boundary that activity registration
+    /// checks, so a pause can cancel a queued scheduler request.
+    pub(crate) fn drive_boundary(&self) -> crate::cancel::BoundaryView {
+        self.inner.boundary.subscribe()
     }
 
     pub(crate) async fn wait_until_running(&self, shutdown: &CancellationToken) -> bool {
@@ -773,7 +786,7 @@ impl Control for SyncControl {
         self.inner.priority.send_replace(p);
     }
 
-    fn bandwidth_cap(&self, bps: Option<u64>) {
+    fn bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
         self.inner.bandwidth_cap.send_replace(bps);
     }
 
@@ -841,7 +854,7 @@ mod tests {
     #[test]
     fn replacement_bandwidth_application_serializes_control_changes() {
         let control = control();
-        control.bandwidth_cap(Some(7));
+        control.bandwidth_cap(bifrost_types::BandwidthCap::new(7));
         let budget = bifrost_net::BandwidthBudget::new(Some(7));
         let (start_tx, start_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -849,7 +862,7 @@ mod tests {
         let changed_budget = budget.clone();
         let worker = std::thread::spawn(move || {
             start_rx.recv().expect("start change");
-            changing.bandwidth_cap(Some(11));
+            changing.bandwidth_cap(bifrost_types::BandwidthCap::new(11));
             changing.apply_bandwidth_budget(&changed_budget);
             done_tx.send(()).expect("change done");
         });
@@ -857,7 +870,7 @@ mod tests {
             start_tx.send(()).expect("start worker");
             // A concurrent update must wait until the setter has finished.
             let changed = done_rx.recv_timeout(std::time::Duration::from_millis(100));
-            budget.set_cap(cap);
+            budget.set_cap(cap.map(bifrost_types::BandwidthCap::get));
             assert!(
                 changed.is_err(),
                 "control changed during replacement setter"

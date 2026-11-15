@@ -983,7 +983,9 @@ mod tests {
                         .unwrap();
                     assert_eq!(script.requests().len(), incarnation + 1);
                     assert_eq!(opened.skipped_scopes.len(), 1);
-                    opened.account.set_bandwidth_cap(Some(4096));
+                    opened
+                        .account
+                        .set_bandwidth_cap(bifrost_types::BandwidthCap::new(4096));
                     assert_eq!(budget.cap(), Some(4096));
                     let start = Instant::now();
                     let folder = crate::types::MailboxName::new("INBOX").unwrap();
@@ -1166,28 +1168,11 @@ mod tests {
     }
 
     fn transport_error() -> AccountError {
-        bifrost_types::AccountErrorBuilder::new(
-            bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
-            bifrost_types::Cause::Transport(bifrost_types::TransportCause::new(
-                bifrost_types::TransportKind::Network,
-                None,
-            )),
-        )
-        .operation(AccountOperation::Discover)
-        .try_build()
-        .expect("valid account error classification")
+        crate::account::error::test_support::factory_transport()
     }
 
     fn auth_lost_error() -> AccountError {
-        bifrost_types::AccountErrorBuilder::new(
-            bifrost_types::AccountErrorKind::Authentication(
-                bifrost_types::AuthErrorKind::ReauthorizationRequired,
-            ),
-            bifrost_types::Cause::Auth(bifrost_types::AuthCause::ReauthorizationRequired),
-        )
-        .operation(AccountOperation::Discover)
-        .try_build()
-        .expect("valid account error classification")
+        crate::account::error::test_support::factory_auth_lost()
     }
 
     #[test]

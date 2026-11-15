@@ -64,8 +64,10 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
                 // Timer-driven: refuse and retry on the next tick.
                 wait_for_run: false,
             };
-            // The registry retains the scopes behind this opaque handle, so
-            // cleanup honors their declared budgets as well as account holds.
+            // MaintenanceGate delegates wire admission to the slot's
+            // DriveStart. The registry retains the scopes behind this opaque
+            // handle, so cleanup honors their declared budgets and account holds.
+            // No further await separates that gate from the provider call.
             let Ok((account, _activity, _admission)) = gate.acquire(&record.scopes).await else {
                 break;
             };

@@ -23,9 +23,12 @@ fn recognized_fetch_failure(
 
 /// Parse a single address: `(name adl mailbox host)` (RFC 3501 Section 7.4.2).
 ///
-/// When `utf8_mode` is true, the display name is raw UTF-8 per RFC 6532 Section 3 /
+/// When `utf8_mode` is `WireMode::Utf8`, the display name is raw UTF-8 per RFC 6532 Section 3 /
 /// RFC 6855 Section 3. When false, RFC 2047 encoded words in the display name are decoded.
-pub(super) fn address(input: &[u8], utf8_mode: bool) -> IResult<&[u8], EnvelopeAddress> {
+pub(super) fn address(
+    input: &[u8],
+    utf8_mode: crate::codec::utf7::WireMode,
+) -> IResult<&[u8], EnvelopeAddress> {
     let (input, _) = char('(').parse(input)?;
     let (input, name_raw) = nstring(input)?;
     let (input, _) = sp(input)?;
@@ -38,7 +41,7 @@ pub(super) fn address(input: &[u8], utf8_mode: bool) -> IResult<&[u8], EnvelopeA
 
     // RFC 6532 Section 3 / RFC 6855 Section 3: skip RFC 2047 decoding when UTF8=ACCEPT is active
     let name = name_raw.map(|v| {
-        if utf8_mode {
+        if utf8_mode == crate::codec::utf7::WireMode::Utf8 {
             String::from_utf8_lossy(&v).into_owned()
         } else {
             decode_rfc2047(&v)
@@ -58,8 +61,11 @@ pub(super) fn address(input: &[u8], utf8_mode: bool) -> IResult<&[u8], EnvelopeA
 
 /// Parse an address list: NIL or `(addr1 addr2 ...)` (RFC 3501 Section 7.4.2).
 ///
-/// When `utf8_mode` is true, address display names use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
-pub(super) fn address_list(input: &[u8], utf8_mode: bool) -> IResult<&[u8], Vec<EnvelopeAddress>> {
+/// When `utf8_mode` is `WireMode::Utf8`, address display names use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
+pub(super) fn address_list(
+    input: &[u8],
+    utf8_mode: crate::codec::utf7::WireMode,
+) -> IResult<&[u8], Vec<EnvelopeAddress>> {
     alt((
         value(vec![], nil_token),
         // RFC 3501 Section 7.4.2: address-list = "(" 1*address ")" / NIL
@@ -76,17 +82,20 @@ pub(super) fn address_list(input: &[u8], utf8_mode: bool) -> IResult<&[u8], Vec<
 ///
 /// Ten fields: date, subject, from, sender, reply-to, to, cc, bcc, in-reply-to, message-id.
 ///
-/// When `utf8_mode` is true (UTF8=ACCEPT per RFC 6855 Section 3), the subject and
+/// When `utf8_mode` is `WireMode::Utf8` (UTF8=ACCEPT per RFC 6855 Section 3), the subject and
 /// address display names contain raw UTF-8 per RFC 6532 Section 3, and RFC 2047
 /// decoding is skipped.
-pub(super) fn envelope(input: &[u8], utf8_mode: bool) -> IResult<&[u8], Envelope> {
+pub(super) fn envelope(
+    input: &[u8],
+    utf8_mode: crate::codec::utf7::WireMode,
+) -> IResult<&[u8], Envelope> {
     let (input, _) = char('(').parse(input)?;
     let (input, date) = nstring_utf8(input)?;
     let (input, _) = sp(input)?;
     // RFC 6532 Section 3 / RFC 6855 Section 3: skip RFC 2047 decoding when UTF8=ACCEPT is active
     let (input, subject_raw) = nstring(input)?;
     let subject = subject_raw.map(|v| {
-        if utf8_mode {
+        if utf8_mode == crate::codec::utf7::WireMode::Utf8 {
             String::from_utf8_lossy(&v).into_owned()
         } else {
             decode_rfc2047(&v)
@@ -152,14 +161,17 @@ pub(super) fn envelope(input: &[u8], utf8_mode: bool) -> IResult<&[u8], Envelope
 /// Parse the parenthesized content of a FETCH response (RFC 3501 Section 7.4.2).
 ///
 /// Called after `* <n> FETCH ` is consumed.
-/// When `utf8_mode` is true, ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
-pub(super) fn fetch_response_inner(input: &[u8], utf8_mode: bool) -> IResult<&[u8], FetchResponse> {
+/// When `utf8_mode` is `WireMode::Utf8`, ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
+pub(super) fn fetch_response_inner(
+    input: &[u8],
+    utf8_mode: crate::codec::utf7::WireMode,
+) -> IResult<&[u8], FetchResponse> {
     fetch_response_inner_with_backing(input, utf8_mode, None)
 }
 
 pub(super) fn fetch_response_inner_with_backing<'a>(
     input: &'a [u8],
-    utf8_mode: bool,
+    utf8_mode: crate::codec::utf7::WireMode,
     backing: Option<&Bytes>,
 ) -> IResult<&'a [u8], FetchResponse> {
     let (input, _) = char('(').parse(input)?;
@@ -316,7 +328,7 @@ fn multipart_fixed_prefix_is_malformed(mut input: &[u8], depth: u32) -> bool {
 /// labels as plain `astring` would make an ordinary Gmail FETCH response
 /// connection-fatal. User labels arrive as normal astrings, quoted when they
 /// contain spaces, in the negotiated mailbox encoding.
-fn gmail_label(input: &[u8], utf8_mode: bool) -> IResult<&[u8], String> {
+fn gmail_label(input: &[u8], utf8_mode: crate::codec::utf7::WireMode) -> IResult<&[u8], String> {
     alt((
         map((char('\\'), atom), |(_, name)| {
             format!("\\{}", String::from_utf8_lossy(name))
@@ -370,7 +382,7 @@ fn fetch_value_policy<'a>(
 fn fetch_attr_value<'a>(
     upper: &str,
     input: &'a [u8],
-    utf8_mode: bool,
+    utf8_mode: crate::codec::utf7::WireMode,
     backing: Option<&Bytes>,
     fr: &mut FetchResponse,
 ) -> IResult<&'a [u8], ()> {
@@ -1022,11 +1034,26 @@ mod label_encoding_tests {
 
     #[test]
     fn gmail_labels_follow_negotiated_mailbox_encoding() {
-        assert_eq!(gmail_label(b"\"&AGE-\"", false).unwrap().1, "a");
-        assert_eq!(gmail_label(b"\"&AGE-\"", true).unwrap().1, "&AGE-");
-        assert_eq!(gmail_label("\"café\"".as_bytes(), true).unwrap().1, "café");
+        assert_eq!(
+            gmail_label(b"\"&AGE-\"", crate::codec::utf7::WireMode::ModifiedUtf7)
+                .unwrap()
+                .1,
+            "a"
+        );
+        assert_eq!(
+            gmail_label(b"\"&AGE-\"", crate::codec::utf7::WireMode::Utf8)
+                .unwrap()
+                .1,
+            "&AGE-"
+        );
+        assert_eq!(
+            gmail_label("\"café\"".as_bytes(), crate::codec::utf7::WireMode::Utf8)
+                .unwrap()
+                .1,
+            "café"
+        );
         for utf8 in [false, true] {
-            assert_eq!(gmail_label(b"\\Inbox", utf8).unwrap().1, "\\Inbox");
+            assert_eq!(gmail_label(b"\\Inbox", utf8.into()).unwrap().1, "\\Inbox");
         }
     }
 }

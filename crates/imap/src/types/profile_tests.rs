@@ -65,7 +65,12 @@ fn the_dual_mode_rule_truth_table() {
         ),
     ] {
         assert_eq!(
-            imap4rev2_active(&caps, &en),
+            imap4rev2_active(
+                &caps,
+                &en.iter()
+                    .map(|s| Capability::from_imap_str(s))
+                    .collect::<Vec<_>>()
+            ),
             expected,
             "{why} (capabilities={caps:?}, enabled={en:?})"
         );
@@ -84,7 +89,14 @@ fn supports_matrix_over_every_capability_and_state() {
         for capability in every_capability() {
             let expected = expected_usable(&state_caps, &enabled, &capability);
             assert_eq!(
-                supports(&state_caps, &enabled, &capability),
+                supports(
+                    &state_caps,
+                    &enabled
+                        .iter()
+                        .map(|s| Capability::from_imap_str(s))
+                        .collect::<Vec<_>>(),
+                    &capability
+                ),
                 expected,
                 "unadvertised {capability:?} with capabilities={state_caps:?}, \
                  enabled={enabled:?}"
@@ -100,7 +112,14 @@ fn supports_matrix_over_every_capability_and_state() {
             let mut advertised = state_caps.clone();
             advertised.push(capability.clone());
             assert!(
-                supports(&advertised, &enabled, &capability),
+                supports(
+                    &advertised,
+                    &enabled
+                        .iter()
+                        .map(|s| Capability::from_imap_str(s))
+                        .collect::<Vec<_>>(),
+                    &capability
+                ),
                 "an advertised {capability:?} is always usable (capabilities={advertised:?})"
             );
         }
@@ -257,15 +276,33 @@ fn binary_fetch_items_are_usable_under_rev2_or_an_advertised_binary() {
 
     for (caps, enabled) in connection_states() {
         assert_eq!(
-            binary_fetch_usable(&caps, &enabled),
-            imap4rev2_active(&caps, &enabled),
+            binary_fetch_usable(
+                &caps,
+                &enabled
+                    .iter()
+                    .map(|s| Capability::from_imap_str(s))
+                    .collect::<Vec<_>>()
+            ),
+            imap4rev2_active(
+                &caps,
+                &enabled
+                    .iter()
+                    .map(|s| Capability::from_imap_str(s))
+                    .collect::<Vec<_>>()
+            ),
             "unadvertised BINARY: FETCH side follows active rev2 \
              (capabilities={caps:?}, enabled={enabled:?})"
         );
         let mut advertised = caps.clone();
         advertised.push(Capability::Binary);
         assert!(
-            binary_fetch_usable(&advertised, &enabled),
+            binary_fetch_usable(
+                &advertised,
+                &enabled
+                    .iter()
+                    .map(|s| Capability::from_imap_str(s))
+                    .collect::<Vec<_>>()
+            ),
             "an advertised BINARY always admits the FETCH items \
              (capabilities={advertised:?})"
         );
@@ -341,7 +378,10 @@ fn append_limit_policy_is_explicit() {
 #[test]
 fn thread_algorithms_are_normalized() {
     let profile = ServerProfile::new(vec![Capability::from_imap_str("THREAD=references")], vec![]);
-    assert_eq!(profile.thread_algorithms, vec!["REFERENCES"]);
+    assert_eq!(
+        profile.thread_algorithms().collect::<Vec<_>>(),
+        vec!["REFERENCES"]
+    );
 }
 
 #[test]

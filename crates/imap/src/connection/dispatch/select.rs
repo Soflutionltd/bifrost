@@ -230,7 +230,7 @@ fn validate_select_responses(
     // `crate::types::profile`. This decides whether a SELECT must carry a
     // RECENT (rev1) or a matching LIST (rev2), so an inlined copy that drifted
     // would reject every SELECT against a conforming server.
-    let is_rev2 = crate::types::profile::imap4rev2_active(ctx.capabilities(), ctx.enabled());
+    let is_rev2 = ctx.session.imap4rev2_active();
 
     let command_name = if is_examine { "EXAMINE" } else { "SELECT" };
     let section = match (is_rev2, is_examine) {
@@ -540,8 +540,7 @@ mod tests {
 
     fn default_ctx() -> ConsumerContext<'static> {
         ConsumerContext {
-            capabilities: &[],
-            enabled: &[],
+            session: crate::types::profile::SessionCapabilities::empty(),
             command_target: None,
             command_tag: "A001",
         }
@@ -579,8 +578,7 @@ mod tests {
         let target = MailboxName::new("a").expect("valid mailbox");
         let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
         let context = ConsumerContext {
-            capabilities: &[],
-            enabled: &[],
+            session: crate::types::profile::SessionCapabilities::empty(),
             command_target: Some(&target),
             command_tag: "A001",
         };

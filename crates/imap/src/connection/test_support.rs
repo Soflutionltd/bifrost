@@ -34,8 +34,10 @@ pub(crate) fn detached(
 ) -> ImapConnection {
     let snapshot = driver::ConnectionStateSnapshot {
         session_state,
-        capabilities,
-        enabled: enabled.iter().map(|e| (*e).to_owned()).collect(),
+        session: crate::types::profile::SessionCapabilities::new(
+            capabilities,
+            enabled.iter().map(|e| (*e).to_owned()).collect(),
+        ),
         mailbox_selected: session_state == SessionState::Selected,
         selected: None,
     };

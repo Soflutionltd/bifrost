@@ -76,6 +76,9 @@ impl Address {
 pub struct AttachmentInline {
     /// Filename presented in the MIME `Content-Disposition`.
     pub filename: String,
+    // Preserve the declared wire media type. parse_content_type is a tolerant
+    // inbound parser: malformed input becomes text/plain, which would silently
+    // change an outbound declaration or hide inbound evidence.
     /// Content-Type.
     pub mime: String,
     /// Raw payload bytes.

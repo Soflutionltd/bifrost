@@ -807,10 +807,11 @@ features to use Exchange credentials without disclosing a Graph token there.
 
 ### Which URLs may carry the bearer (`origin.rs`)
 
-bifrost-net attaches the token source's bearer to the FIRST request of every
-call, whatever its host; its trusted-host allowlist and `Authorization`
-stripping apply only to redirect hops. So the origin decision is made here,
-once. Each configured base (the api-base, the Outlook origin) is parsed into
+Graph supplies each credential leg's base to net's `TrustedOrigins`, which
+mints the `AdmittedUrl` proof wrapped by `origin.rs`. Account-wide origin
+restrictions are optional because a composed handle is not the credential
+authority for every leg; Graph still gates every target independently.
+Each configured base (the api-base, the Outlook origin) is parsed into
 a `Base` at construction: http or https, a host, and no userinfo, or it is
 stored as unusable and every request on that surface fails closed before any
 byte (`Request(Malformed)`, consumer configuration; the published
@@ -3127,3 +3128,25 @@ validity and typed BYDAY/UNTIL; it decides only Graph expressibility and
 DTSTART anchoring. A trailing empty RRULE part is malformed, consistently with
 the shared grammar. Leap-second UNTIL is valid shared syntax but Unsupported
 by the Graph date-time projection.
+
+## Bounded Graph auxiliary decoding and writes
+
+EWS streaming frames have a local 1 MiB byte limit. The decoder copies transport
+chunks in bounded pieces and refuses oversized complete or partial frames through
+its existing malformed-stream failure path. An Outlook user expects a broken
+push response to lose its session rather than exhaust the mail client's memory.
+
+Extended-property clears use the same batch::LIMIT chunk owner as typed message
+PATCH/move writes, with absence accepted per leg. Local numbering, parent etag
+eviction and earlier committed effects survive later-envelope failure. Delta
+etag observations apply in wire order, so removal followed by re-addition retains
+the new validator. Public-folder inventory termination returns immediately;
+only the successful path emits Done.
+
+Shared-mailbox merge compares addresses ASCII-case-insensitively and retains the
+first spelling, with configured addresses first. Calendar recurrence weekday
+projections share Sunday-first Graph and RRULE name tables. WKST is already
+validated by the shared grammar; its text-only accessor still needs a fallible
+Graph-name projection. Public-calendar EWS GetItem hydration has its own named
+20-item local bound, independent of the Graph JSON batch limit; fixtures consume
+that same bound.

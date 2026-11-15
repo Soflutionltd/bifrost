@@ -523,8 +523,7 @@ mod tests {
         let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
         let mut consumer = ListStatusConsumer::new();
         let context = ConsumerContext {
-            capabilities: &[],
-            enabled: &[],
+            session: crate::types::profile::SessionCapabilities::empty(),
             command_target: None,
             command_tag: "A001",
         };
@@ -565,8 +564,7 @@ mod tests {
         let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
         let mut consumer = ListStatusConsumer::new();
         let context = ConsumerContext {
-            capabilities: &[],
-            enabled: &[],
+            session: crate::types::profile::SessionCapabilities::empty(),
             command_target: None,
             command_tag: "A001",
         };

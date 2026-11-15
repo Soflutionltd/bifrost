@@ -475,16 +475,8 @@ pub(crate) fn graph_recurrence_rule(rrule: &str) -> Result<GraphRecurrenceRule, 
             .by_day()
             .iter()
             .map(|day| {
-                use jiff::civil::Weekday::*;
-                let name = match day.weekday {
-                    Monday => "monday",
-                    Tuesday => "tuesday",
-                    Wednesday => "wednesday",
-                    Thursday => "thursday",
-                    Friday => "friday",
-                    Saturday => "saturday",
-                    Sunday => "sunday",
-                };
+                let name =
+                    GRAPH_WEEKDAYS[usize::from(day.weekday.to_sunday_zero_offset().unsigned_abs())];
                 RRuleByDay {
                     ordinal: day.ordinal.map(i32::from),
                     day: name,
@@ -495,10 +487,13 @@ pub(crate) fn graph_recurrence_rule(rrule: &str) -> Result<GraphRecurrenceRule, 
     // WKST is carried as Graph's `firstDayOfWeek` on weekly patterns, the
     // only Graph pattern it changes; elsewhere RFC 5545 gives it meaning only
     // alongside BYWEEKNO, which is refused above.
+    // The shared grammar already validates WKST. Its API retains only text,
+    // so this lookup projects it to Graph spelling; keep a fallible boundary
+    // rather than panic or silently substitute Monday if that contract changes.
     let first_day_of_week = parsed
         .value("WKST")
         .map(|week_start| {
-            rrule_day_to_graph(&week_start.to_ascii_uppercase()).ok_or_else(|| {
+            rrule_day_to_graph(week_start).ok_or_else(|| {
                 malformed_rrule(format!("RRULE WKST {week_start:?} is not a weekday"))
             })
         })
@@ -682,30 +677,21 @@ fn rrule_single_number(
         .map_err(|_| unexpressible(format!("Graph cannot express {key}={value}")))
 }
 
+// Same Sunday-first indices as GRAPH_WEEKDAYS and jiff's weekday offsets.
+const RRULE_WEEKDAYS: [&str; 7] = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
+
 pub(crate) fn graph_day_to_rrule(day: &str) -> Option<&'static str> {
-    match day {
-        "sunday" => Some("SU"),
-        "monday" => Some("MO"),
-        "tuesday" => Some("TU"),
-        "wednesday" => Some("WE"),
-        "thursday" => Some("TH"),
-        "friday" => Some("FR"),
-        "saturday" => Some("SA"),
-        _ => None,
-    }
+    GRAPH_WEEKDAYS
+        .iter()
+        .position(|name| *name == day)
+        .map(|index| RRULE_WEEKDAYS[index])
 }
 
 pub(crate) fn rrule_day_to_graph(day: &str) -> Option<&'static str> {
-    match day {
-        "SU" => Some("sunday"),
-        "MO" => Some("monday"),
-        "TU" => Some("tuesday"),
-        "WE" => Some("wednesday"),
-        "TH" => Some("thursday"),
-        "FR" => Some("friday"),
-        "SA" => Some("saturday"),
-        _ => None,
-    }
+    RRULE_WEEKDAYS
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(day))
+        .map(|index| GRAPH_WEEKDAYS[index])
 }
 
 pub(crate) fn graph_index_to_setpos(index: &str) -> Option<i32> {

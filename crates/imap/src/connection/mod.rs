@@ -805,8 +805,10 @@ pub(crate) fn admit_for_encoding(
     }
     let snapshot = driver::ConnectionStateSnapshot {
         session_state: command.kind().legal_states()[0],
-        capabilities,
-        enabled: opts.enabled.clone(),
+        session: std::sync::Arc::new(crate::types::profile::SessionCapabilities {
+            capabilities,
+            enabled: opts.enabled.clone(),
+        }),
         mailbox_selected: false,
         selected: None,
     };

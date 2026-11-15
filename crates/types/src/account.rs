@@ -276,9 +276,9 @@ pub trait Account: Send + Sync {
     /// Implementations owning an `AccountNet` forward to its cap setter.
     ///
     /// This governs payload bytes above TLS, not wire rate. `None` is unlimited;
-    /// `Some(0)` is a 1 B/s trickle. See `reference/net.md` for the smoothing
+    /// a finite cap must be positive. See `reference/net.md` for the smoothing
     /// bound and the allowance for outstanding admissions and lower buffering.
-    fn set_bandwidth_cap(&self, bps: Option<u64>);
+    fn set_bandwidth_cap(&self, bps: Option<crate::BandwidthCap>);
 
     /// The throttle keys `work` consumes, so the engine can hold it while a
     /// provider deadline recorded under any of them is pending.
@@ -940,6 +940,8 @@ pub trait Account: Send + Sync {
     /// `DraftPatch` payloads. The `mime` argument is the
     /// Content-Type the server should record on the resulting
     /// attachment.
+    // MIME remains the declared wire value; the tolerant inbound MIME parser
+    // substitutes text/plain on invalid input and is not an outbound validator.
     fn attachment_upload(
         &self,
         bytes: AccountStream<Result<Bytes, AccountError>>,
@@ -951,7 +953,7 @@ pub trait Account: Send + Sync {
     /// view: this returns `Ok(HostedAttachment)` only when the file is on the
     /// drive AND a link exists; any failure (including a failed link step after
     /// a successful upload) returns `Err`. `bytes` is the whole payload;
-    /// `meta.size` MUST equal `bytes.len()`.
+    /// The upload length is derived from `bytes.len()`.
     ///
     /// Gated by `capabilities().pim_methods.host_attachment`. A `false` flag
     /// (JMAP, IMAP, CalDAV, CardDAV) means this returns

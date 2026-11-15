@@ -168,6 +168,16 @@ async fn modify_target(
     remove_labels: Vec<String>,
     operation: bifrost_types::AccountOperation,
 ) -> Result<(), AccountError> {
+    // MutationTarget currently exposes only Message and Thread, so no caller
+    // can reproduce an unsupported-kind no-op today. Keep admission ahead of
+    // the empty patch for future variants: users expect unsupported targets
+    // to fail even when removing the synthetic Archive membership does no work.
+    if !matches!(
+        &target,
+        MutationTarget::Message(_) | MutationTarget::Thread(_)
+    ) {
+        return Err(unsupported(operation));
+    }
     if add_labels.is_empty() && remove_labels.is_empty() {
         return Ok(());
     }

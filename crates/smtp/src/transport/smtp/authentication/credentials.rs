@@ -175,21 +175,19 @@ impl Credentials {
                     TokenSnapshot::Usable(token) => {
                         Ok((identity.clone(), Zeroizing::new(token.as_str().to_owned())))
                     }
-                    #[cfg(feature = "account-error")]
-                    TokenSnapshot::Contended => Err(oauth_token_error(
-                        bifrost_net::Error::RefreshFailed {
-                            retry_after: None,
-                            source: Arc::new(bifrost_net::Error::Network {
-                                message: "OAuth token cache is busy; retry when ready".to_owned(),
-                                transmission_state: bifrost_types::TransmissionState::Unsent,
-                                source: None,
-                            }),
-                        },
-                    )),
-                    #[cfg(not(feature = "account-error"))]
-                    TokenSnapshot::Contended => Err(error::connection(
-                        "OAuth token cache is busy; retry when ready",
-                    )),
+                    snapshot @ TokenSnapshot::Contended => {
+                        let error = error::connection("OAuth token cache is busy; retry when ready");
+                        #[cfg(feature = "account-error")]
+                        let error = error.with_preclassified_account_error(
+                            snapshot.contention_account_error(
+                                bifrost_types::Protocol::Smtp,
+                                bifrost_types::AccountOperation::Send,
+                            ).expect("contended snapshot"),
+                        );
+                        #[cfg(not(feature = "account-error"))]
+                        let _ = snapshot;
+                        Err(error.with_phase(SmtpCommandPhase::Auth { mechanism: None }))
+                    }
                     _ => Err(error::invalid_input(
                         "OAuth token source requires refresh or async resolution; use the async SMTP transport",
                     )
@@ -239,6 +237,26 @@ impl Debug for Credentials {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn contended_snapshot_has_transient_authentication_without_wire_evidence() {
+        let error = bifrost_net::auth::TokenSnapshot::Contended
+            .contention_account_error(
+                bifrost_types::Protocol::Smtp,
+                bifrost_types::AccountOperation::Send,
+            )
+            .unwrap();
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Authentication(
+                bifrost_types::AuthErrorKind::RefreshTransient,
+            )
+        );
+        assert!(error.chain().iter().all(|cause| !matches!(
+            cause,
+            bifrost_types::Cause::Transport(_) | bifrost_types::Cause::Attempt(_)
+        )));
+    }
+
     #[test]
     fn token_source_failure_has_a_connection_class_in_every_feature_build() {
         let error = super::oauth_token_error(bifrost_net::Error::RefreshFailed {

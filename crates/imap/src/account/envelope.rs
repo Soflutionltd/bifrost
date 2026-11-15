@@ -1,8 +1,12 @@
+#[cfg(test)]
+use bifrost_types::AccountErrorKind;
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, ChangeCursor,
-    CursorScope, DiagnosticText, ObjectId, OpaqueChangeState, Protocol, ProtocolKind, RequestCause,
-    RequestErrorKind, ThreadId,
+    AccountError, AccountOperation, ChangeCursor, CursorScope, ObjectId, OpaqueChangeState,
+    ProtocolKind, ThreadId,
 };
+
+pub(super) use super::error::malformed;
+use super::error::schema_incompatible;
 
 use crate::types::MailboxName;
 
@@ -87,20 +91,9 @@ pub(crate) fn decode_cursor(cursor: &ChangeCursor) -> Result<FolderCursor, Accou
             ProtocolKind::Imap,
             bifrost_types::PayloadVersion::new(ENVELOPE_VERSION),
         )
-        .map_err(|fault| {
-            fault
-                .builder(Protocol::Imap, AccountOperation::SyncChanges)
-                .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
-                .try_build()
-                .expect("valid account error classification")
-        })?;
-    decode_folder_cursor(bytes).map_err(|error| {
-        error
-            .into_builder()
-            .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
-            .try_build()
-            .expect("valid account error classification")
-    })
+        .map_err(|fault| super::error::cursor_decode_fault(fault, &cursor.scope))?;
+    decode_folder_cursor(bytes)
+        .map_err(|error| super::error::cursor_scope_error(error, &cursor.scope))
 }
 
 fn encode_folder_cursor(cursor: &FolderCursor) -> Vec<u8> {
@@ -149,7 +142,7 @@ fn decode_folder_cursor(bytes: &[u8]) -> Result<FolderCursor, AccountError> {
     match tag {
         1 => {
             let uidvalidity = input.take_u32()?;
-            let modseq = input.take_u64()?;
+            let modseq = input.take_modseq()?;
             // Three on-disk shapes are accepted:
             //   * pre-baseline v1: no bytes after modseq -> empty set,
             //     incomplete (legacy cursors written before known_uids
@@ -181,7 +174,7 @@ fn decode_folder_cursor(bytes: &[u8]) -> Result<FolderCursor, AccountError> {
         }
         2 => Ok(FolderCursor::Condstore {
             uidvalidity: input.take_u32()?,
-            modseq: input.take_u64()?,
+            modseq: input.take_modseq()?,
             known_uids: input.take_uid_set()?,
         }),
         3 => Ok(FolderCursor::Basic {
@@ -255,6 +248,14 @@ impl<'a> CursorBytes<'a> {
             .try_into()
             .map_err(|_| schema_incompatible("IMAP cursor u32 field malformed"))?;
         Ok(u32::from_le_bytes(bytes))
+    }
+
+    // Saved state must obey the same bound as live command operands. An
+    // enterprise user expects invalid durable state rebuilt before sync runs.
+    fn take_modseq(&mut self) -> Result<u64, AccountError> {
+        crate::types::ModSeq::new(self.take_u64()?)
+            .map(crate::types::ModSeq::get)
+            .ok_or_else(|| schema_incompatible("invalid persisted IMAP MODSEQ"))
     }
 
     fn take_u64(&mut self) -> Result<u64, AccountError> {
@@ -566,43 +567,53 @@ pub(super) fn parse_nonzero_u32(
     Ok(parsed)
 }
 
-/// Build a `Request(Malformed)` `AccountError` for IMAP object-id or
-/// cursor decode failures. These are caller-side invalid inputs (the
-/// object id was not produced by this crate or was corrupted in transit).
-///
-/// The operation is threaded in from the caller: `decode_object_id` and
-/// `decode_thread_id` are always reached while servicing one specific
-/// account-trait call (hydration, a mutation lane, a blob open, a PIM
-/// primitive), so the op is known at every call site and the resulting
-/// error carries it. The recovery class is `ClientBug` either way; the
-/// operation is what makes the telemetry attributable to a lane.
-pub(super) fn malformed(detail: &str, op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(detail.to_owned()),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(op)
-    .try_build()
-    .expect("valid account error classification")
-}
-
-/// Build a `SyncState(SchemaIncompatible)` `AccountError` for IMAP
-/// cursor envelope decoding failures. The cursor bytes are structurally
-/// unrecognizable, which triggers the `SchemaIncompatible` engine
-/// directive to clear cursor state and re-establish from inventory.
-fn schema_incompatible(detail: &str) -> AccountError {
-    bifrost_types::CursorDecodeFault::Malformed
-        .builder(Protocol::Imap, AccountOperation::SyncChanges)
-        .text(DiagnosticText::support_only(detail.to_owned()))
-        .try_build()
-        .expect("valid account error classification")
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persisted_modseq_obeys_live_operand_bounds() {
+        use super::*;
+
+        let scope = CursorScope::Folder(bifrost_types::FolderId("INBOX".into()));
+        for modseq in [
+            0,
+            1,
+            crate::types::ModSeq::MAX,
+            crate::types::ModSeq::MAX + 1,
+            u64::MAX,
+        ] {
+            for cursor in [
+                FolderCursor::QResync {
+                    uidvalidity: 7,
+                    modseq,
+                    baseline: UidBaseline::Complete(CompactUidSet::default()),
+                },
+                FolderCursor::Condstore {
+                    uidvalidity: 7,
+                    modseq,
+                    known_uids: CompactUidSet::default(),
+                },
+            ] {
+                let encoded = encode_cursor(scope.clone(), &cursor);
+                let result = decode_cursor(&encoded);
+                if crate::types::ModSeq::new(modseq).is_some() {
+                    assert_eq!(result.unwrap(), cursor);
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(
+                        error.kind(),
+                        &AccountErrorKind::SyncState(
+                            bifrost_types::SyncStateErrorKind::SchemaIncompatible,
+                        ),
+                    );
+                    assert_eq!(
+                        error.scope(),
+                        Some(&bifrost_types::ErrorScope::Cursor(scope.clone())),
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn decoded_ids_keep_the_submitted_spelling() {
         for submitted in [

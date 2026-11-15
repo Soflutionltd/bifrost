@@ -17,7 +17,7 @@ pub(in crate::codec::encode) fn encode_set_quota(
     tag: &str,
     root: &str,
     resources: &[(String, u64)],
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     // RFC 2087 Section 4.1: setquota_resource = atom SP number
     // RFC 3501 Section 9: number = 1*DIGIT (u32 range)
@@ -60,7 +60,7 @@ pub(in crate::codec::encode) fn encode_set_acl(
     mailbox: impl AsRef<[u8]>,
     identifier: &str,
     rights: &str,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) {
     w.raw(tag.as_bytes());
     w.raw(b" SETACL ");

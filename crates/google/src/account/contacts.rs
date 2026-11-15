@@ -11,16 +11,20 @@ use bifrost_types::{
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use base64::Engine;
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AddressBook, AddressBookId, ContactCard,
     ContactCorpus, ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch,
     ContactPhone, ContactProvenance, ContactSearchRequest, DirectoryCard, Page, ProtocolKind,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::client::GmailClient;
+use crate::people::api::{
+    PERSON_FIELDS, caller_input_error, contact_groups_url, delete_contact_photo_url,
+    directory_search_url, directory_search_warmup_url, encode_resource_name_path, search_url,
+    search_warmup_url, update_contact_photo_request, update_contact_photo_url,
+};
+use crate::people::types::*;
 
 use super::error::{self, GmailErrorContext};
 use super::non_empty;
@@ -31,7 +35,6 @@ const CONTACTS_BOOK_ID: &str = "google:contacts";
 /// `OtherAutoCollected`-corpus book so the consumer routes it to its own
 /// local store without matching on the provider.
 const OTHER_CONTACTS_BOOK_ID: &str = "google:other-contacts";
-const PERSON_FIELDS: &str = "names,emailAddresses,phoneNumbers,addresses,organizations,photos,biographies,memberships,metadata";
 /// `otherContacts.list` supports only this read-mask subset (no
 /// addresses / organizations / photos / biographies / memberships).
 const OTHER_CONTACTS_READ_MASK: &str = "names,emailAddresses,phoneNumbers,metadata";
@@ -64,6 +67,7 @@ pub(crate) fn address_books_list(
         let mut seen_page_tokens = HashSet::new();
         loop {
             let response: ContactGroupsResponse = client
+                .people()
                 .get(&contact_groups_url(
                     client.people_base(),
                     page_token.as_deref(),
@@ -154,6 +158,7 @@ pub(crate) fn list(
             url.push_str(&bifrost_net::url::encode_query_value(&token));
         }
         let response: PeopleConnectionsResponse = client
+            .people()
             .get(&url)
             .await
             .map_err(|error| collection_error(error, AccountOperation::ContactsList))?;
@@ -189,6 +194,7 @@ async fn list_other_contacts(
         url.push_str(&bifrost_net::url::encode_query_value(&token));
     }
     let response: OtherContactsResponse = client
+        .people()
         .get(&url)
         .await
         .map_err(|error| collection_error(error, AccountOperation::ContactsList))?;
@@ -229,6 +235,7 @@ pub(crate) fn create(
             bifrost_net::url::encode_query_value(PERSON_FIELDS)
         );
         let person: Person = client
+            .people()
             .post(&url, &person, bifrost_net::ReplayPolicy::Never)
             .await
             .map_err(|error| collection_error(error, AccountOperation::ContactCreate))?;
@@ -347,6 +354,7 @@ pub(crate) fn update(
                 bifrost_net::url::encode_query_value(PERSON_FIELDS)
             );
             let _: Person = client
+                .people()
                 .patch(&url, &person, bifrost_net::ReplayPolicy::Never)
                 .await
                 .map_err(|error| {
@@ -381,6 +389,7 @@ async fn update_contact_photo(
         // People documents PATCH for this action, despite the colon verb path:
         // https://developers.google.com/people/api/rest/v1/people/updateContactPhoto
         let _: serde_json::Value = client
+            .people()
             .patch(
                 &url,
                 &update_contact_photo_request(photo),
@@ -393,6 +402,7 @@ async fn update_contact_photo(
     } else {
         let url = delete_contact_photo_url(client.people_base(), &encoded);
         let _: Person = client
+            .people()
             .delete(&url, bifrost_net::ReplayPolicy::Never)
             .await
             .map(|_| Person::default())
@@ -429,43 +439,6 @@ fn fields_then_photo_error(error: AccountError, contact: &ContactId) -> AccountE
         .expect("valid contact photo record")
 }
 
-fn update_contact_photo_url(people_base: &str, encoded_resource_name: &str) -> String {
-    // `updateContactPhoto` takes its field mask in the request body, not the
-    // query string; the response is discarded here, so no `personFields`
-    // query param is needed.
-    format!("{people_base}/{encoded_resource_name}:updateContactPhoto")
-}
-
-fn delete_contact_photo_url(people_base: &str, encoded_resource_name: &str) -> String {
-    format!(
-        "{people_base}/{encoded_resource_name}:deleteContactPhoto?personFields={}",
-        bifrost_net::url::encode_query_value(PERSON_FIELDS)
-    )
-}
-
-fn update_contact_photo_request(photo: bifrost_types::ContactPhoto) -> UpdateContactPhotoRequest {
-    UpdateContactPhotoRequest {
-        photo_bytes: base64::engine::general_purpose::STANDARD.encode(photo.data),
-    }
-}
-
-/// Percent-encode a People resource name (e.g. `people/c1`) for placement
-/// in a URL path segment. A People resource name's `/` separators are real
-/// REST path separators - the People API serves
-/// `/v1/people/c1:updateContact`, not `/v1/people%2Fc1:updateContact`
-/// (which 404s) - so each `/`-delimited part is component-encoded and the
-/// parts are rejoined on a literal `/`. Any genuinely unsafe character
-/// inside a part is still escaped. This is deliberately not folded into
-/// `bifrost_net::url::encode_path_component`, whose other callers rely on it
-/// escaping `/` as a normal component character.
-fn encode_resource_name_path(resource_name: &str) -> String {
-    resource_name
-        .split('/')
-        .map(bifrost_net::url::encode_path_component)
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 async fn get_person(
     client: &GmailClient,
     contact: &ContactId,
@@ -478,6 +451,7 @@ async fn get_person(
         bifrost_net::url::encode_query_value(PERSON_FIELDS)
     );
     client
+        .people()
         .get(&url)
         .await
         .map_err(|error| contact_error(error, operation, contact.0.clone()))
@@ -495,6 +469,7 @@ pub(crate) fn delete(
         let encoded = encode_resource_name_path(&contact.0);
         let url = format!("{}/{encoded}:deleteContact", client.people_base());
         client
+            .people()
             .delete(&url, bifrost_net::ReplayPolicy::Never)
             .await
             .map_err(|error| contact_error(error, AccountOperation::ContactDelete, contact.0))
@@ -511,6 +486,7 @@ pub(crate) fn search(
             AccountOperation::ContactSearch,
         )?;
         if let Err(error) = client
+            .people()
             .get::<PeopleSearchResponse>(&search_warmup_url(client.people_base()))
             .await
         {
@@ -523,6 +499,7 @@ pub(crate) fn search(
         }
         let url = search_url(client.people_base(), &request)?;
         let response: PeopleSearchResponse = client
+            .people()
             .get(&url)
             .await
             .map_err(|error| collection_error(error, AccountOperation::ContactSearch))?;
@@ -565,6 +542,7 @@ pub(crate) fn directory_search(
             // A transient cache-priming failure can defer to the real query.
             // A terminal refusal must remain visible even on the first page.
             if let Err(error) = client
+                .people()
                 .get::<DirectoryPeopleResponse>(&directory_search_warmup_url(client.people_base()))
                 .await
             {
@@ -579,6 +557,7 @@ pub(crate) fn directory_search(
         let url =
             directory_search_url(client.people_base(), &query, limit, page_cursor.as_deref())?;
         let response: DirectoryPeopleResponse = client
+            .people()
             .get(&url)
             .await
             .map_err(|error| collection_error(error, AccountOperation::DirectorySearch))?;
@@ -597,45 +576,6 @@ pub(crate) fn directory_search(
             skipped_scopes: Vec::new(),
         })
     })
-}
-
-const DIRECTORY_READ_MASK: &str = "names,emailAddresses,phoneNumbers,organizations";
-const DIRECTORY_SOURCES: &str = "DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE";
-
-fn directory_search_warmup_url(people_base: &str) -> String {
-    format!(
-        "{people_base}/people:searchDirectoryPeople?query=&readMask={}&sources={DIRECTORY_SOURCES}",
-        bifrost_net::url::encode_query_value(DIRECTORY_READ_MASK)
-    )
-}
-
-fn directory_search_url(
-    people_base: &str,
-    query: &str,
-    limit: Option<u32>,
-    page_cursor: Option<&[u8]>,
-) -> Result<String, AccountError> {
-    let page_size = limit.unwrap_or(1000).min(1000);
-    let mut url = if query.is_empty() {
-        format!(
-            "{people_base}/people:listDirectoryPeople?readMask={}&sources={DIRECTORY_SOURCES}&pageSize={page_size}",
-            bifrost_net::url::encode_query_value(DIRECTORY_READ_MASK)
-        )
-    } else {
-        format!(
-            "{people_base}/people:searchDirectoryPeople?query={}&readMask={}&sources={DIRECTORY_SOURCES}&pageSize={page_size}",
-            bifrost_net::url::encode_query_value(query),
-            bifrost_net::url::encode_query_value(DIRECTORY_READ_MASK)
-        )
-    };
-    if let Some(cursor) = page_cursor {
-        let token = std::str::from_utf8(cursor).map_err(|error| {
-            caller_input_error(AccountOperation::DirectorySearch, error.to_string())
-        })?;
-        url.push_str("&pageToken=");
-        url.push_str(&bifrost_net::url::encode_query_value(token));
-    }
-    Ok(url)
 }
 
 /// Project one directory `Person` into a `DirectoryCard`. Returns `None`
@@ -705,45 +645,6 @@ fn validate_address_book(
         ));
     }
     Ok(())
-}
-
-fn contact_groups_url(people_base: &str, page_token: Option<&str>) -> String {
-    let mut url = format!(
-        "{people_base}/contactGroups?groupFields={}&pageSize=1000",
-        bifrost_net::url::encode_query_value("metadata,name")
-    );
-    if let Some(token) = page_token {
-        url.push_str("&pageToken=");
-        url.push_str(&bifrost_net::url::encode_query_value(token));
-    }
-    url
-}
-
-fn search_warmup_url(people_base: &str) -> String {
-    format!(
-        "{people_base}/people:searchContacts?query=&readMask={}",
-        bifrost_net::url::encode_query_value(PERSON_FIELDS)
-    )
-}
-
-fn search_url(people_base: &str, request: &ContactSearchRequest) -> Result<String, AccountError> {
-    let mut url = format!(
-        "{people_base}/people:searchContacts?query={}&readMask={}",
-        bifrost_net::url::encode_query_value(&request.query),
-        bifrost_net::url::encode_query_value(PERSON_FIELDS)
-    );
-    if let Some(limit) = request.limit {
-        url.push_str("&pageSize=");
-        url.push_str(&limit.min(30).to_string());
-    }
-    if let Some(cursor) = request.page_cursor.as_ref() {
-        let token = std::str::from_utf8(cursor).map_err(|error| {
-            caller_input_error(AccountOperation::ContactSearch, error.to_string())
-        })?;
-        url.push_str("&pageToken=");
-        url.push_str(&bifrost_net::url::encode_query_value(token));
-    }
-    Ok(url)
 }
 
 fn page_from_people(
@@ -1216,13 +1117,6 @@ fn contact_error(error: crate::Error, operation: AccountOperation, id: String) -
 /// address book this backend does not have. Refused before the request it
 /// would shape is sent, so never a provider fault: `Request(Malformed)`, per
 /// the local-refusal rule in `reference/error-model.md`.
-fn caller_input_error(operation: AccountOperation, message: String) -> AccountError {
-    error::into_account_error(
-        crate::error::Error::invalid_request(operation, message),
-        GmailErrorContext::contact_collection(operation),
-    )
-}
-
 fn local_error_with_field(
     operation: AccountOperation,
     field: &'static str,
@@ -1232,192 +1126,6 @@ fn local_error_with_field(
         crate::error::Error::missing_field(field, message),
         GmailErrorContext::contact_collection(operation),
     )
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct Person {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resource_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    etag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    names: Option<Vec<Name>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    email_addresses: Option<Vec<EmailAddress>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    phone_numbers: Option<Vec<PhoneNumber>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    addresses: Option<Vec<PeopleAddress>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    organizations: Option<Vec<Organization>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    photos: Option<Vec<Photo>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    biographies: Option<Vec<Biography>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    memberships: Option<Vec<Membership>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PeopleConnectionsResponse {
-    connections: Option<Vec<Person>>,
-    next_page_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct OtherContactsResponse {
-    other_contacts: Option<Vec<Person>>,
-    next_page_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateContactPhotoRequest {
-    photo_bytes: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ContactGroupsResponse {
-    contact_groups: Option<Vec<ContactGroup>>,
-    next_page_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ContactGroup {
-    resource_name: Option<String>,
-    name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PeopleSearchResponse {
-    results: Option<Vec<SearchResult>>,
-    next_page_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SearchResult {
-    person: Person,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct DirectoryPeopleResponse {
-    people: Option<Vec<Person>>,
-    next_page_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Name {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    given_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    family_name: Option<String>,
-    #[serde(flatten)]
-    extra: Map<String, Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct EmailAddress {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    value: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    formatted_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<FieldMetadata>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PhoneNumber {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    value: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    formatted_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<FieldMetadata>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PeopleAddress {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    formatted_value: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    street_address: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    city: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    region: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    postal_code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    country: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    formatted_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<FieldMetadata>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FieldMetadata {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    primary: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Organization {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    department: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Photo {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Biography {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    value: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Membership {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    contact_group_membership: Option<ContactGroupMembership>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ContactGroupMembership {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    contact_group_resource_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -2073,23 +1781,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn resource_name_path_keeps_slash_literal() {
-        // A People resource name's `/` is a real REST path separator: the
-        // People API serves `/v1/people/c1:updateContact`, and the buggy
-        // `%2F`-escaped form (`/v1/people%2Fc1...`) 404s. The helper must
-        // keep the slash literal while still escaping unsafe characters.
-        assert_eq!(encode_resource_name_path("people/c1"), "people/c1");
-        assert_eq!(
-            encode_resource_name_path("otherContacts/x1"),
-            "otherContacts/x1"
-        );
-        assert_eq!(
-            encode_resource_name_path("people/a b#c"),
-            "people/a%20b%23c"
-        );
-    }
-
     #[tokio::test]
     async fn contact_photo_update_sends_patch() {
         let (client, script) = scripted_client(b"{}");
@@ -2111,33 +1802,6 @@ mod tests {
                 .url
                 .as_str()
                 .ends_with("/people/c1:updateContactPhoto")
-        );
-    }
-
-    #[test]
-    fn contact_photo_patch_uses_people_photo_endpoint_payload() {
-        let people_base = "https://people.googleapis.com/v1";
-        let encoded = encode_resource_name_path("people/c1");
-        // The resource name renders with a literal `/`, matching the real
-        // People verb path (`/v1/people/c1:updateContactPhoto`).
-        assert!(
-            update_contact_photo_url(people_base, &encoded)
-                .contains("people/c1:updateContactPhoto")
-        );
-        assert!(
-            delete_contact_photo_url(people_base, &encoded)
-                .contains("people/c1:deleteContactPhoto")
-        );
-        assert!(!update_contact_photo_url(people_base, &encoded).contains("people%2Fc1"));
-
-        let payload = update_contact_photo_request(bifrost_types::ContactPhoto {
-            data: vec![1, 2, 3, 4],
-            media_type: Some("image/jpeg".to_string()),
-        });
-        let value = serde_json::to_value(payload).expect("photo payload");
-        assert_eq!(
-            value.get("photoBytes").and_then(Value::as_str),
-            Some("AQIDBA==")
         );
     }
 
@@ -2183,16 +1847,6 @@ mod tests {
         .expect_err("unsupported book should fail");
 
         assert_eq!(error.operation(), Some(AccountOperation::ContactsList));
-    }
-
-    #[test]
-    fn contact_groups_url_includes_fields_and_page_token() {
-        let url = contact_groups_url("https://people.mock.test/v1", Some("next token"));
-
-        assert!(url.starts_with("https://people.mock.test/v1/contactGroups"));
-        assert!(url.contains("contactGroups?groupFields=metadata%2Cname"));
-        assert!(url.contains("pageSize=1000"));
-        assert!(url.contains("pageToken=next%20token"));
     }
 
     #[test]
@@ -2305,35 +1959,6 @@ mod tests {
         assert!(person_in_group(&person, None));
     }
 
-    #[test]
-    fn search_url_includes_page_token_and_capped_page_size() {
-        let url = search_url(
-            "https://people.mock.test/v1",
-            &ContactSearchRequest {
-                query: "Ada Lovelace".to_string(),
-                address_book_id: None,
-                page_cursor: Some(b"next token".to_vec()),
-                limit: Some(100),
-            },
-        )
-        .expect("search url");
-
-        assert!(url.starts_with("https://people.mock.test/v1/people:searchContacts"));
-        assert!(url.contains("query=Ada%20Lovelace"));
-        assert!(url.contains("pageSize=30"));
-        assert!(url.contains("pageToken=next%20token"));
-    }
-
-    #[test]
-    fn search_warmup_url_uses_empty_query_and_read_mask() {
-        let url = search_warmup_url("https://people.mock.test/v1");
-
-        assert!(url.starts_with("https://people.mock.test/v1/people:searchContacts"));
-        assert!(url.contains("people:searchContacts?query=&readMask="));
-        assert!(url.contains("names%2CemailAddresses"));
-        assert!(!url.contains("pageSize="));
-    }
-
     #[tokio::test]
     async fn transient_contact_search_warmup_failure_falls_through_to_query() {
         let (client, script) = scripted_client_steps(vec![
@@ -2408,46 +2033,6 @@ mod tests {
                 assert_eq!(script.requests().len(), 1);
             }
         }
-    }
-
-    #[test]
-    fn directory_search_empty_query_lists_directory_people() {
-        let url =
-            directory_search_url("https://people.mock.test/v1", "", Some(2000), None).expect("url");
-
-        assert!(url.starts_with("https://people.mock.test/v1/people:listDirectoryPeople"));
-        assert!(url.contains("people:listDirectoryPeople"));
-        assert!(url.contains("sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"));
-        // limit caps at 1000.
-        assert!(url.contains("pageSize=1000"));
-        assert!(!url.contains("searchDirectoryPeople"));
-    }
-
-    #[test]
-    fn directory_search_nonempty_query_searches_directory_people() {
-        let url = directory_search_url(
-            "https://people.mock.test/v1",
-            "Ada Lovelace",
-            None,
-            Some(b"tok".as_slice()),
-        )
-        .expect("url");
-
-        assert!(url.starts_with("https://people.mock.test/v1/people:searchDirectoryPeople"));
-        assert!(url.contains("people:searchDirectoryPeople"));
-        assert!(url.contains("query=Ada%20Lovelace"));
-        assert!(url.contains("sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"));
-        assert!(url.contains("pageToken=tok"));
-    }
-
-    #[test]
-    fn directory_search_warmup_url_uses_empty_query() {
-        let url = directory_search_warmup_url("https://people.mock.test/v1");
-
-        assert!(url.starts_with("https://people.mock.test/v1/people:searchDirectoryPeople"));
-        assert!(url.contains("people:searchDirectoryPeople?query=&"));
-        assert!(url.contains("sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"));
-        assert!(!url.contains("pageSize="));
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub(in crate::codec::encode) fn encode_notify_set(
     w: &mut CommandWriter,
     tag: &str,
     params: &NotifySetParams,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     // RFC 5465 Section 8: event-groups = event-group *(SP event-group)
     // requires at least one event-group.
@@ -87,7 +87,7 @@ pub(in crate::codec::encode) fn encode_notify_set(
 fn encode_mailbox_filter(
     w: &mut CommandWriter,
     filter: &MailboxFilter,
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     match filter {
         MailboxFilter::Selected => w.raw(b"selected"),
@@ -131,7 +131,7 @@ fn encode_mailbox_filter(
 fn encode_one_or_more_mailbox(
     w: &mut CommandWriter,
     mailboxes: &[crate::types::MailboxArgument],
-    utf8: bool,
+    utf8: crate::codec::utf7::WireMode,
 ) -> Result<(), crate::Error> {
     if mailboxes.len() == 1 {
         // RFC 5465 Section 8: one-or-more-mailbox = mailbox

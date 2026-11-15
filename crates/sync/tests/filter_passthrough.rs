@@ -134,7 +134,7 @@ impl Account for FilterAccount {
 
     fn set_priority(&self, _priority: Priority) {}
 
-    fn set_bandwidth_cap(&self, _bps: Option<u64>) {}
+    fn set_bandwidth_cap(&self, _bps: Option<bifrost_types::BandwidthCap>) {}
 
     fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
         unreachable!("describe_cursor not exercised by filter passthrough tests")

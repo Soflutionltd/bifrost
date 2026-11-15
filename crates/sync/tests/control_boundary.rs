@@ -42,7 +42,7 @@ struct ControlHarness {
     // at the bottom of this file.
     _boundary_view: BoundaryView,
     _priority_rx: watch::Receiver<Priority>,
-    _cap_rx: watch::Receiver<Option<u64>>,
+    _cap_rx: watch::Receiver<Option<bifrost_types::BandwidthCap>>,
 }
 
 fn make_control() -> ControlHarness {
@@ -196,8 +196,12 @@ async fn priority_and_bandwidth_snapshots_reflect_control_calls() {
     assert_eq!(h.control.priority_snapshot(), Priority::Bulk);
 
     assert_eq!(h.control.bandwidth_cap_snapshot(), None);
-    h.control.bandwidth_cap(Some(125_000));
-    assert_eq!(h.control.bandwidth_cap_snapshot(), Some(125_000));
+    h.control
+        .bandwidth_cap(bifrost_types::BandwidthCap::new(125_000));
+    assert_eq!(
+        h.control.bandwidth_cap_snapshot(),
+        bifrost_types::BandwidthCap::new(125_000)
+    );
 
     assert_eq!(h.control.bandwidth_observed(), 0);
     h.control.observe_bandwidth(42);
@@ -233,7 +237,7 @@ async fn boundary_snapshot_updates_after_every_view_is_dropped() {
 async fn priority_and_cap_snapshots_update_without_receivers() {
     let (boundary, _view) = Boundary::new();
     let (priority_tx, priority_rx) = watch::channel(Priority::Normal);
-    let (cap_tx, cap_rx) = watch::channel(Some(1_000_u64));
+    let (cap_tx, cap_rx) = watch::channel(bifrost_types::BandwidthCap::new(1_000));
     drop(priority_rx);
     drop(cap_rx);
     let control = SyncControl::new(AccountId("ctl-lost".into()), boundary, priority_tx, cap_tx);

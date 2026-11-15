@@ -5,6 +5,7 @@
 //!
 //! Client commands are defined in RFC 3501 Section 6 / RFC 9051 Section 6.
 
+use super::Capability;
 use super::fetch::AppendMessage;
 use super::flag::Flag;
 use super::mailbox::MailboxAttribute;
@@ -34,7 +35,7 @@ pub(crate) enum Command {
     /// Each element is a capability atom (e.g., `"CONDSTORE"`, `"QRESYNC"`).
     /// The server responds with an untagged `ENABLED` listing the
     /// extensions it actually activated.
-    Enable { capabilities: Vec<String> },
+    Enable { capabilities: Vec<Capability> },
 
     // --- Mailbox management (RFC 3501 Section 6.3 / RFC 9051 Section 6.3) ---
     /// LIST command (RFC 3501 Section 6.3.8, RFC 5258 for LIST-EXTENDED).

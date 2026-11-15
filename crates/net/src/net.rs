@@ -342,6 +342,7 @@ impl Net {
                 account: id,
                 registration_id: Some(registration_id),
                 meter: account_meter,
+                trusted_origins: spec.trusted_origins,
                 token_source: spec
                     .token_source
                     .map(|source| CoordinatedTokenSource::with_max_age(source, spec.token_max_age)),
@@ -465,6 +466,7 @@ pub(crate) struct AccountNetInner {
     pub(crate) meter: AccountMeter,
     /// Provider of OAuth bearer tokens for this account.
     pub(crate) token_source: Option<CoordinatedTokenSource>,
+    pub(crate) trusted_origins: Option<crate::TrustedOrigins>,
     /// Quota discriminator selected for each registered request host.
     pub(crate) rate_scopes: HashMap<String, crate::QuotaScope>,
     /// Hosts this account declared more than one quota scope for. A request
@@ -595,6 +597,18 @@ impl AccountNet {
     #[must_use]
     pub fn request(&self, method: http::Method, url: &str) -> RequestBuilder {
         RequestBuilder::new(self.clone(), method, url)
+    }
+
+    /// Start a request using net-minted destination proof. Account-level
+    /// restrictions are still checked before automatic bearer lookup, so proof
+    /// from another policy cannot bypass this account's configured restriction.
+    #[must_use]
+    pub fn admitted_request(
+        &self,
+        method: http::Method,
+        url: &crate::AdmittedUrl,
+    ) -> RequestBuilder {
+        self.request(method, url.as_str())
     }
 
     /// Send to a provider-admitted, pre-authenticated session URL.
@@ -751,10 +765,12 @@ impl AccountNet {
         self.inner.meter.clone()
     }
 
-    /// Set the shared account payload smoothing cap. Zero becomes one B/s.
+    /// Set the shared account payload smoothing cap. Finite rates are positive.
     /// See `BandwidthBudget` for the allowance bound and plaintext scope.
-    pub fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        self.inner.bandwidth_budget.set_cap(bps);
+    pub fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
+        self.inner
+            .bandwidth_budget
+            .set_cap(bps.map(bifrost_types::BandwidthCap::get));
     }
 
     /// Current shared cap; None means unlimited.
@@ -969,6 +985,7 @@ impl AccountNet {
                 registration_id: new_registration,
                 meter: account_meter,
                 token_source: self.inner.token_source.clone(),
+                trusted_origins: self.inner.trusted_origins.clone(),
                 rate_scopes: self.inner.rate_scopes.clone(),
                 ambiguous_scope_hosts: self.inner.ambiguous_scope_hosts.clone(),
                 default_retry: self.inner.default_retry.clone(),
@@ -999,6 +1016,12 @@ pub struct AccountSpec {
     /// A retained source owns its proactive refresh and backoff policy.
     /// `None` expresses an account that does not use bearer auth.
     pub token_source: Option<Arc<dyn TokenSource>>,
+    /// Exact destinations for automatic account bearer injection.
+    /// `None` leaves admission to the protocol leg. Composed handles and
+    /// JMAP session endpoints cannot infer credential authority from redirects.
+    /// A configured empty set refuses every automatic bearer destination.
+    /// HopPolicy credentials have their own per-leg admission authority.
+    pub trusted_origins: Option<crate::TrustedOrigins>,
     /// Default retry policy.
     pub default_retry: RetryPolicy,
     /// Default total timeout applied to requests from this account.
@@ -1052,6 +1075,7 @@ impl AccountSpec {
     pub fn new(token_source: Option<Arc<dyn TokenSource>>) -> Self {
         Self {
             hosts: Vec::new(),
+            trusted_origins: None,
             token_source,
             default_retry: RetryPolicy::default(),
             request_timeout: None,
@@ -1965,15 +1989,15 @@ mod tests {
             AccountId("destination-budget".into()),
             AccountSpec::new(None),
         );
-        source.set_bandwidth_cap(Some(10));
-        destination.set_bandwidth_cap(Some(1));
+        source.set_bandwidth_cap(bifrost_types::BandwidthCap::new(10));
+        destination.set_bandwidth_cap(bifrost_types::BandwidthCap::new(1));
         let mut outstanding = source
             .bandwidth_budget()
             .reserve(crate::BandwidthDirection::Inbound, 10);
         assert!(outstanding.offer());
         let retagged = source.retag(destination.account().clone());
         assert_eq!(retagged.bandwidth_cap(), Some(1));
-        retagged.set_bandwidth_cap(Some(2));
+        retagged.set_bandwidth_cap(bifrost_types::BandwidthCap::new(2));
         assert_eq!(destination.bandwidth_cap(), Some(2));
         assert_eq!(source.bandwidth_cap(), Some(10));
         outstanding.finish(10);
@@ -2005,7 +2029,7 @@ mod tests {
         let id = AccountId("shared-budget".into());
         let a = first.attach_account(id.clone(), AccountSpec::new(None));
         let b = second.attach_account(id.clone(), AccountSpec::new(None));
-        a.set_bandwidth_cap(Some(7));
+        a.set_bandwidth_cap(bifrost_types::BandwidthCap::new(7));
         assert_eq!(b.bandwidth_cap(), Some(7));
         let private = build_net().attach_account(id, AccountSpec::new(None));
         assert_eq!(private.bandwidth_cap(), None);
@@ -2082,7 +2106,7 @@ mod coordinating_resource_tests {
         let id = AccountId("shared-tls-resource-test".into());
         let first = trusted.attach_account(id.clone(), AccountSpec::new(None));
         let second = permissive.attach_account(id, AccountSpec::new(None));
-        first.set_bandwidth_cap(Some(17));
+        first.set_bandwidth_cap(bifrost_types::BandwidthCap::new(17));
         assert_eq!(second.bandwidth_cap(), Some(17));
     }
 }

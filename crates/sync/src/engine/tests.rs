@@ -124,7 +124,7 @@ fn publish_a_marker(
     coverage: &crate::cursor::PendingCoverage,
     checkpoint: &bifrost_types::Checkpoint,
     walk_watermark: crate::cursor::UndeliveredMark,
-) -> crate::cursor::PublicationId {
+) -> crate::cursor::AckToken {
     let id = coverage.register_walk_marker(
         checkpoint.clone(),
         crate::cursor::CoverageClaim {
@@ -142,7 +142,7 @@ fn publish_a_page(
     control: &crate::control::SyncControl,
     coverage: &crate::cursor::PendingCoverage,
     checkpoint: &bifrost_types::Checkpoint,
-) -> crate::cursor::PublicationId {
+) -> crate::cursor::AckToken {
     let id = control.publish_checkpoint_without_report(checkpoint.clone());
     coverage.mark_delivered(&id, crate::multiplexer::ReceiverSequence::for_test(1));
     id
@@ -1675,7 +1675,7 @@ fn backfill_checkpoint_at(
 async fn ack(
     tx: &mpsc::Sender<WriterRequest>,
     checkpoint: bifrost_types::Checkpoint,
-    publication: Option<crate::cursor::PublicationId>,
+    publication: Option<crate::cursor::AckToken>,
 ) -> Result<(), Error> {
     use crate::multiplexer::AckRequest;
     let (done, wait) = oneshot::channel();
@@ -1697,7 +1697,7 @@ fn register(
     coverage: &crate::cursor::PendingCoverage,
     checkpoint: &bifrost_types::Checkpoint,
     claim: crate::cursor::CoverageClaim,
-) -> crate::cursor::PublicationId {
+) -> crate::cursor::AckToken {
     coverage.register(checkpoint.clone(), claim)
 }
 
@@ -2242,7 +2242,7 @@ async fn seed_debt(
 async fn apply_repair(
     tx: &mpsc::Sender<WriterRequest>,
     resolutions: Vec<crate::repair::RepairResolution>,
-    publication: Option<crate::cursor::PublicationId>,
+    publication: Option<crate::cursor::AckToken>,
 ) {
     let (done, wait) = oneshot::channel();
     tx.send(WriterRequest::ApplyRepair {
@@ -2340,11 +2340,11 @@ async fn a_recovery_discharges_only_after_the_consumer_acknowledges() {
     writer.await.expect("writer exits");
 }
 
-/// `ack_publication` is the REPAIR lane. Handed a checkpoint publication's
+/// The writer's `AcknowledgePublication` request is the REPAIR lane. Handed a checkpoint publication's
 /// id it must refuse, and - this is the part that bites - must leave that
 /// publication's claim intact.
 ///
-/// Consuming it would make the later, real `ack_checkpoint` resolve as
+/// Consuming it would make the later, real `ack` resolve as
 /// already persisted and return before writing anything, while the engine
 /// went on to announce the checkpoint as a durable boundary. A cursor
 /// position reported durable that no store ever accepted is the lying
@@ -2456,7 +2456,7 @@ async fn repeated_deferrals_block_rather_than_abandon() {
 
     let ledger = store.get_ledger(&account).await.expect("ledger");
     let entry = ledger.entry(&key).expect("entry");
-    assert_eq!(entry.policy, crate::cursor::PolicyStatus::OperatorBlocked);
+    assert_eq!(entry.policy, crate::cursor::EntryPolicy::OperatorBlocked);
     assert!(entry.is_open(), "a spent budget proves nothing");
     assert!(
         !ledger.completion_permitted(&email_scope()),
@@ -2511,7 +2511,7 @@ async fn repeated_stalled_splits_exhaust_the_lineage() {
     let ledger = store.get_ledger(&account).await.expect("ledger");
     let entry = ledger.entry(&current).expect("latest slice");
     assert!(entry.is_open(), "a spent budget proves nothing");
-    assert_eq!(entry.policy, crate::cursor::PolicyStatus::OperatorBlocked);
+    assert_eq!(entry.policy, crate::cursor::EntryPolicy::OperatorBlocked);
     assert_eq!(
         ledger.repairable().count(),
         0,
@@ -3618,10 +3618,9 @@ fn open_pages_resume_short_final_page_resumes_rather_than_skipping() {
     // proves exhaustion. Skipping here would silently drop every
     // message past the window on re-attach.
     let key =
-        crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page {
-            from: 0,
-            to: 500,
-        });
+        crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page(
+            bifrost_types::PageWindow::new(0, 500).expect("ordered window"),
+        ));
     let ck = checkpoint_on(key, 256);
     assert_eq!(
         open_pages_resume(Some(&ck)),
@@ -3633,10 +3632,9 @@ fn open_pages_resume_short_final_page_resumes_rather_than_skipping() {
 fn open_pages_resume_full_page_resumes_after_it() {
     use super::backfill::{OpenPagesResume, open_pages_resume};
     let key =
-        crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page {
-            from: 500,
-            to: 1000,
-        });
+        crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page(
+            bifrost_types::PageWindow::new(500, 1000).expect("ordered window"),
+        ));
     let ck = checkpoint_on(key, 500);
     assert_eq!(
         open_pages_resume(Some(&ck)),
@@ -3702,10 +3700,9 @@ fn an_open_pages_plan_resumes_at_the_acked_window() {
     assert!(matches!(plan.resume(Some(&marker)), ScopeResume::Skip));
 
     let key =
-        crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page {
-            from: 0,
-            to: 500,
-        });
+        crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page(
+            bifrost_types::PageWindow::new(0, 500).expect("ordered window"),
+        ));
     let acked = checkpoint_on(key, 500);
     let plan = BackfillPlan::OpenPages { chunk: 500 };
     let ScopeResume::Walk(mut driver) = plan.resume(Some(&acked)) else {
@@ -3713,10 +3710,9 @@ fn an_open_pages_plan_resumes_at_the_acked_window() {
     };
     assert_eq!(
         driver.next_partition(),
-        Some(bifrost_types::InventoryPartition::Page {
-            from: 500,
-            to: 1000
-        }),
+        Some(bifrost_types::InventoryPartition::Page(
+            bifrost_types::PageWindow::new(500, 1000).expect("ordered window")
+        )),
         "the walk resumes after the furthest durably-acked window"
     );
 }
@@ -3743,7 +3739,9 @@ fn a_failed_resume_read_walks_from_scratch_on_both_plan_shapes() {
     };
     assert_eq!(
         driver.next_partition(),
-        Some(bifrost_types::InventoryPartition::Page { from: 0, to: 250 }),
+        Some(bifrost_types::InventoryPartition::Page(
+            bifrost_types::PageWindow::new(0, 250).expect("ordered window")
+        )),
         "a failed read restarts at page 0, never at a guessed offset"
     );
 }
@@ -4206,17 +4204,10 @@ async fn mismatched_ack_scopes_preserve_provisional_ownership_and_checkpoint_row
     }
 }
 
-#[tokio::test]
-async fn ack_checkpoint_rejects_a_scope_mismatch_before_routing() {
-    let engine = super::SyncEngine::builder().build().expect("engine");
-    let result = engine
-        .ack_checkpoint(
-            &bifrost_types::AccountId("unattached".into()),
-            CursorScope::Account,
-            bifrost_types::Checkpoint::Change(change_cursor(b"checkpoint")),
-            None,
-        )
-        .await;
+#[test]
+fn acknowledgement_scope_validation_rejects_a_mismatch() {
+    let checkpoint = bifrost_types::Checkpoint::Change(change_cursor(b"checkpoint"));
+    let result = super::ack::validate_ack_scope(&CursorScope::Account, &checkpoint);
     assert!(matches!(result, Err(Error::Other(_))));
 }
 

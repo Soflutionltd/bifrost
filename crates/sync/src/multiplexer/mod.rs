@@ -84,21 +84,26 @@ pub struct MultiplexerEvent {
     pub event: Arc<SyncEvent<bifrost_types::Change>>,
     pub checkpoint: Option<Checkpoint>,
     /// Engine-issued identity for THIS publication of `checkpoint`, to be
-    /// passed back to `Engine::ack_checkpoint`.
+    /// passed back to `Engine::ack`.
     ///
-    /// `Some` for every acknowledgeable publication. Checkpoint-bearing
-    /// events return it through `ack_checkpoint`; repair events carry no
-    /// checkpoint and return it through `ack_publication`. It exists because
+    /// `Some` for every acknowledgeable publication. Both checkpoint-bearing
+    /// and repair events return it through `ack`. It exists because
     /// `Checkpoint` equality is value equality and cannot identify a
     /// publication: a backfill page whose content was entirely unrepresentable
     /// increments no item count and produces a checkpoint byte-identical to its
     /// predecessor, and inventory fusion publishes its final checkpoint twice.
     /// Acknowledging by value would then apply one publication's coverage claim
     /// to a different publication's checkpoint.
-    pub publication: Option<crate::cursor::PublicationId>,
+    pub(crate) publication: Option<crate::cursor::AckToken>,
 }
 
 impl MultiplexerEvent {
+    /// Token to acknowledge after the corresponding consumer transaction commits.
+    #[must_use]
+    pub fn ack_token(&self) -> Option<&crate::cursor::AckToken> {
+        self.publication.as_ref()
+    }
+
     /// An event carrying no checkpoint, and so nothing to acknowledge.
     #[must_use]
     pub fn unacked(scope: EventScope, event: Arc<SyncEvent<bifrost_types::Change>>) -> Self {
@@ -461,7 +466,7 @@ impl ChangeDelivery {
         &self,
         event: MultiplexerEvent,
         coverage: &crate::cursor::PendingCoverage,
-        publication: Option<&crate::cursor::PublicationId>,
+        publication: Option<&crate::cursor::AckToken>,
     ) -> bool {
         let state = self.guard();
         // Every receiver that can possibly hold this batch is numbered below
@@ -1672,75 +1677,11 @@ async fn spawn_scope_poll_inner(
                 }
             }
         }
-        // Honor any throttle deadline this scope's drive consumes - the
-        // account-wide holds plus the keys the account declares for the
-        // scope (a mailbox budget a sibling scope or a sibling account
-        // recorded) - before driving the wire. Re-checked after waking: a
-        // longer deadline can land while this scope sleeps off the first one.
-        //
-        // The declaration is re-asked after every wake: a reattach can swap in
-        // an account that declares a different budget, and waiting on the
-        // retired one's keys could hold this scope for as long as a sibling
-        // keeps extending a budget it no longer consumes.
-        let declared_now = || {
-            crate::recovery::declared_keys(
-                account.load_full().as_ref().as_ref(),
-                &account_id,
-                bifrost_types::ThrottleWork::Scope(&scope),
-            )
-        };
-        while let Some(wait) =
-            crate::recovery::throttle_wait(&throttles, &account_id, &declared_now())
-        {
-            tracing::debug!(
-                target: "bifrost.sync.changes",
-                account = ?account_id,
-                scope = ?scope,
-                wait_secs = wait.as_secs(),
-                "poll deferred by shared throttle deadline"
-            );
-            tokio::select! {
-                () = shutdown.cancelled() => return PollExit::Retire,
-                () = scope_cancel.cancelled() => return PollExit::Retire,
-                () = tokio::time::sleep(wait) => {}
-            }
-        }
-        let _admission = tokio::select! {
-            () = shutdown.cancelled() => return PollExit::Retire,
+        tokio::select! {
             () = scope_cancel.cancelled() => return PollExit::Retire,
-            permit = scheduler.admit(
-                account_id.clone(),
-                control.priority_snapshot(),
-                crate::scheduler::WorkKind::Sync,
-            ) => match permit {
-                Ok(permit) => permit,
-                Err(error) => {
-                    // A refused admission is transient (a full lane, or a
-                    // scheduler shutting down). Exiting here would retire
-                    // the scope's poll loop permanently for a condition
-                    // that clears on its own, so back off one cadence
-                    // step and re-enter instead.
-                    tracing::warn!(
-                        target: "bifrost.sync.scheduler",
-                        scope = ?scope,
-                        %error,
-                        "poll admission refused; retrying at the next cadence"
-                    );
-                    tokio::select! {
-                        () = shutdown.cancelled() => return PollExit::Retire,
-                        () = scope_cancel.cancelled() => return PollExit::Retire,
-                        () = tokio::time::sleep(cadence.interval) => {}
-                    }
-                    continue;
-                }
-            },
-        };
-        // Admission can park behind other work, and a deadline recorded while
-        // it parked existed before this drive started. Re-check with the
-        // permit in hand; on a hold, release it (no permit is held across a
-        // throttle wait) and go back round to the wait above.
-        if crate::recovery::throttle_wait(&throttles, &account_id, &declared_now()).is_some() {
-            continue;
+            running = control.wait_until_running(&shutdown) => {
+                if !running { return PollExit::Retire; }
+            }
         }
         // The drive's OWN boundary arm answers `Stop` and `Pause`, which is
         // what a detach publishes. This outer select answers the two signals
@@ -1756,19 +1697,20 @@ async fn spawn_scope_poll_inner(
         // `ScopeTokens`); this arm remains because it also retires the poll
         // task itself, which the registry knows nothing about.
         //
-        // Safe to cut here precisely because it cannot cut anywhere
-        // interesting: `with_drive` suspends only at `claim_drive` and at the
-        // drive itself, the drive suspends only at its stream poll, and a
-        // select cannot destroy a branch mid-poll - so the page's registration
-        // and its broadcast, which are synchronous, cannot be split. Dropping
-        // the future releases the lease, the activity guard and the stream.
+        // Before the stream opens, cancellation drops lease/admission waits.
+        // During the drive it cuts only at the stream poll: a select cannot
+        // destroy a branch mid-poll, so synchronous page registration and
+        // broadcast cannot be split. Dropping the future releases the lease,
+        // scheduler permit, activity guard and stream.
         let driven = tokio::select! {
             () = shutdown.cancelled() => return PollExit::Retire,
             () = scope_cancel.cancelled() => return PollExit::Retire,
             driven = cursors
             .with_drive(&scope, |cursor, registry_generation| {
                 let pre_advance_state = cursor.server_state.bytes.clone();
-                let acc_arc = account.load_full();
+                let account = Arc::clone(&account);
+                let scheduler = scheduler.clone();
+                let shutdown = shutdown.clone();
                 let drive_cursors = Arc::clone(&cursors);
                 let advance_cursors = Arc::clone(&cursors);
                 let advance_scope = scope.clone();
@@ -1779,27 +1721,24 @@ async fn spawn_scope_poll_inner(
                 let throttles = Arc::clone(&throttles);
                 let account_id = account_id.clone();
                 async move {
-                    // The LAST check before the wire. `with_drive` can park on
-                    // the drive lease after admission, and a hold recorded
-                    // while it parked predates this drive. A held drive
-                    // returns without driving; the loop goes back round,
-                    // releasing the lease and the permit before it waits.
-                    //
-                    // The keys are asked of `acc_arc`, the very account this
-                    // drive runs against: a reopen during the waits above can
-                    // install an account whose declaration differs, and keys
-                    // cached from the old one would check the wrong budget.
-                    let acc: &dyn Account = acc_arc.as_ref().as_ref();
-                    let final_keys = crate::recovery::declared_keys(
-                        acc,
-                        &account_id,
+                    let gate = crate::engine::drive_start::DriveStart {
+                        current: &account, control: &control, scheduler: &scheduler,
+                        throttles: &throttles, account_id: &account_id, shutdown: &shutdown,
+                    };
+                    let admitted = match gate.admit_drive(
                         bifrost_types::ThrottleWork::Scope(&scope),
-                    );
-                    if crate::recovery::throttle_wait(&throttles, &account_id, &final_keys)
-                        .is_some()
-                    {
-                        return None;
+                        crate::scheduler::WorkKind::Sync,
+                    ).await {
+                        Ok(admitted) => admitted,
+                        Err(refusal) => return Err(refusal),
+                    };
+                    // The registry checked its generation before invoking us.
+                    // Admission can wait, so check it again before the wire.
+                    if drive_cursors.drive_generation(&scope) != registry_generation {
+                        return Err(crate::engine::drive_start::StartRefused::Paused);
                     }
+                    let acc_arc = &admitted.incarnation;
+                    let acc: &dyn Account = acc_arc.as_ref().as_ref();
                     let outcome = drive_changes_stream(
                         acc,
                         scope,
@@ -1820,20 +1759,28 @@ async fn spawn_scope_poll_inner(
                     let advanced = advance_cursors
                         .snapshot(&advance_scope)
                         .is_some_and(|c| c.server_state.bytes != pre_advance_state);
-                    Some((advanced, outcome, acc_arc.generation()))
+                    Ok((advanced, outcome, acc_arc.generation()))
                 }
             }) => driven,
         };
-        drop(_admission);
         let Some(driven) = driven else {
             // The scope left the registry - either before the drive started or
             // while it ran, `with_drive` reporting both the same way. Exit
             // cleanly; if the scope is re-established the 1s scan respawns us.
             return PollExit::Retire;
         };
-        let Some((advanced, outcome, generation)) = driven else {
-            // Held at the last check: wait it out at the top of the loop.
-            continue;
+        let (advanced, outcome, generation) = match driven {
+            Ok(driven) => driven,
+            Err(crate::engine::drive_start::StartRefused::ShuttingDown) => return PollExit::Retire,
+            Err(crate::engine::drive_start::StartRefused::Paused) => continue,
+            Err(crate::engine::drive_start::StartRefused::Held { until, .. }) => {
+                tokio::select! {
+                    () = shutdown.cancelled() => return PollExit::Retire,
+                    () = scope_cancel.cancelled() => return PollExit::Retire,
+                    () = tokio::time::sleep_until(until) => {}
+                }
+                continue;
+            }
         };
         let recovered = handle_drive_outcome(
             &scope,
@@ -2035,9 +1982,8 @@ async fn handle_drive_outcome(
                         error: original,
                         generation: Some(generation),
                     };
-                    // Nothing is held here: admission was dropped by the
-                    // caller and the lease and activity guard ended with the
-                    // drive. Per-scope poll tasks are not detach workers -
+                    // Nothing is held here: admission, lease and activity
+                    // ended inside the caller's lease-protected drive. Per-scope poll tasks are not detach workers -
                     // nobody holds their handles - so a bare send against a
                     // full channel behind a busy listener (which keeps its
                     // receiver while inside a repair) would outlive detach
@@ -3200,13 +3146,13 @@ mod tests {
         }
 
         /// Register and broadcast one backfill page, as `run_partition` does.
-        fn publish(&self, partition: &str) -> crate::cursor::PublicationId {
+        fn publish(&self, partition: &str) -> crate::cursor::AckToken {
             self.publish_reaching(partition).0
         }
 
         /// `publish`, also reporting what the gate reported: whether a
         /// NUMBERED receiver took delivery.
-        fn publish_reaching(&self, partition: &str) -> (crate::cursor::PublicationId, bool) {
+        fn publish_reaching(&self, partition: &str) -> (crate::cursor::AckToken, bool) {
             let checkpoint = Self::backfill_page(partition);
             let id = self.control.expect_checkpoint(checkpoint.clone());
             let event = MultiplexerEvent {

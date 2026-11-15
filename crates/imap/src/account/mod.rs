@@ -429,8 +429,9 @@ impl Account for ImapAccount {
     }
 
     // Account: every protocol leg admits against this shared budget.
-    fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        self.bandwidth_budget.set_cap(bps);
+    fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
+        self.bandwidth_budget
+            .set_cap(bps.map(bifrost_types::BandwidthCap::get));
     }
 
     // Account: names the per-mailbox throttle keys engine work consumes; direct users pace themselves.
@@ -950,6 +951,17 @@ impl Account for ImapAccount {
         unsupported_future(AccountOperation::ContactSearch)
     }
 
+    fn contact_autocomplete(
+        &self,
+        query: String,
+        limit: u32,
+    ) -> AccountFuture<Result<Vec<ContactCard>, AccountError>> {
+        if let Some(contacts) = &self.contacts {
+            return contacts.contact_autocomplete(query, limit);
+        }
+        unsupported_future(AccountOperation::ContactSearch)
+    }
+
     fn directory_search(
         &self,
         query: String,
@@ -964,16 +976,22 @@ impl Account for ImapAccount {
 
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
+        if let Some(contacts) = &self.contacts {
+            return contacts.directory_groups_list(page_cursor);
+        }
         unsupported_future(AccountOperation::DirectoryGroupsList)
     }
 
     fn directory_group_expand(
         &self,
-        _group: DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        group: DirectoryGroupId,
+        page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
+        if let Some(contacts) = &self.contacts {
+            return contacts.directory_group_expand(group, page_cursor);
+        }
         unsupported_future(AccountOperation::DirectoryGroupExpand)
     }
 
@@ -1048,12 +1066,37 @@ impl Account for ImapAccount {
         unsupported_future(AccountOperation::EventRsvp)
     }
 
+    // Preserve the backend's caller-version contract, including its refusal
+    // when it cannot guard RSVP. Never downgrade a protected response.
+    fn event_rsvp_if_version(
+        &self,
+        event: EventId,
+        status: RsvpStatus,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(calendars) = &self.calendars {
+            return calendars.event_rsvp_if_version(event, status, expected_version);
+        }
+        unsupported_future(AccountOperation::EventRsvp)
+    }
+
     fn event_search(
         &self,
         request: EventSearchRequest,
     ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
         if let Some(calendars) = &self.calendars {
             return calendars.event_search(request);
+        }
+        unsupported_future(AccountOperation::EventSearch)
+    }
+
+    fn event_autocomplete(
+        &self,
+        query: String,
+        limit: u32,
+    ) -> AccountFuture<Result<Vec<CalendarEvent>, AccountError>> {
+        if let Some(calendars) = &self.calendars {
+            return calendars.event_autocomplete(query, limit);
         }
         unsupported_future(AccountOperation::EventSearch)
     }

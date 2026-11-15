@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream,
-    BatchFailure, BatchItemId, BatchUncertain, Cause, DiagnosticText, HydratedObject,
-    HydratedObjectKind, ItemOutcome, PageBoundary, Projection, Protocol, RequestCause,
-    RequestErrorKind, ResourceKind, SyncEvent,
+    AccountError, AccountOperation, AccountStream, BatchFailure, BatchItemId, BatchUncertain,
+    HydratedObject, HydratedObjectKind, ItemOutcome, PageBoundary, Projection, SyncEvent,
+};
+
+use super::error::{
+    hydration_uidvalidity_changed_error as uidvalidity_changed_error, message_not_found_error,
 };
 use futures::StreamExt;
 
@@ -183,40 +185,6 @@ impl From<crate::Error> for GetError {
     fn from(value: crate::Error) -> Self {
         Self::Imap(value, 0)
     }
-}
-
-fn uidvalidity_changed_error(folder: &MailboxName) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only("UIDVALIDITY changed before hydration"),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(AccountOperation::Hydrate)
-    // Cursor(Folder(..)), not ErrorScope::Mailbox: the folder producers'
-    // documented scope shape, so scope readers matching one shape do not
-    // silently degrade (mutate.rs builds the identical condition this way).
-    .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
-    ))
-    .try_build()
-    .expect("valid account error classification")
-}
-
-fn message_not_found_error(id: &DecodedObjectId) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::NotFound(ResourceKind::Message),
-        Cause::Request(RequestCause::NotFound {
-            what: ResourceKind::Message,
-            id: Some(id.id.0.clone()),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(AccountOperation::Hydrate)
-    .scope(bifrost_types::ErrorScope::Message { id: id.id.clone() })
-    .try_build()
-    .expect("valid account error classification")
 }
 
 fn failed_hydration(
@@ -933,7 +901,7 @@ mod tests {
             .expect("uid present");
         match object.kind {
             HydratedObjectKind::Metadata(entry) => {
-                assert_eq!(entry.size, Some(77));
+                assert_eq!(entry.fingerprint.size, Some(77));
                 assert!(
                     entry
                         .memberships

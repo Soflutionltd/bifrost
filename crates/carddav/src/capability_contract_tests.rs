@@ -270,7 +270,7 @@ async fn every_false_pim_flag_refuses_without_touching_the_wire() {
         AccountOperation::HostAttachment,
         account.host_attachment(
             bytes::Bytes::from_static(b"x"),
-            CloudUploadMeta::new("f.bin", "application/octet-stream", 1, ShareScope::Anyone),
+            CloudUploadMeta::new("f.bin", "application/octet-stream", ShareScope::Anyone),
         )
     );
     refuses!(

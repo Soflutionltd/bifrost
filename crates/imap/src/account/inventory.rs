@@ -476,7 +476,6 @@ pub(crate) fn fetch_to_inventory(
     Ok(InventoryEntry {
         id: encode_object_id(folder, uidvalidity, uid),
         memberships,
-        size: fetch.rfc822_size,
         blob_id: None,
         fingerprint: Fingerprint {
             server_version: fetch
@@ -894,7 +893,7 @@ mod tests {
             )]
         );
         assert_eq!(personal.id, encode_object_id(&folder(), 9, 42));
-        assert_eq!(personal.size, Some(1024));
+        assert_eq!(personal.fingerprint.size, Some(1024));
         assert_eq!(
             personal.fingerprint.server_version,
             ServerVersion::ModSeq(7)
@@ -923,7 +922,6 @@ mod tests {
         };
         let entry = fetch_to_inventory(&folder(), 9, fetch, None).unwrap();
         assert_eq!(entry.fingerprint.server_version, ServerVersion::Unavailable);
-        assert_eq!(entry.size, None);
         assert_eq!(entry.fingerprint.size, None);
     }
 

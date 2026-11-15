@@ -8,6 +8,7 @@ use jiff::civil;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+// Local EWS GetItem request bound, independent of Graph JSON batching.
 const HYDRATE_CHUNK: usize = 20;
 const HYDRATE_CONCURRENCY: usize = 4;
 
@@ -1336,7 +1337,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut responses = vec![soap(&rows.concat(), true)];
         responses.extend(
-            rows.chunks(20).map(|chunk| {
+            rows.chunks(HYDRATE_CHUNK).map(|chunk| {
                 batch_soap(&chunk.iter().map(|item| get_soap(item)).collect::<Vec<_>>())
             }),
         );

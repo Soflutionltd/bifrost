@@ -275,14 +275,16 @@ fn sort_and_thread_inherit_the_search_criteria_gates() {
     use crate::types::Command;
 
     let opts = EncodeOptions {
-        utf8_mode: false,
+        utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
         literal_mode: LiteralMode::Synchronizing,
-        capabilities: vec![
-            Capability::Imap4Rev1,
-            Capability::Sort,
-            Capability::from_imap_str("THREAD=ORDEREDSUBJECT"),
-        ],
-        enabled: Vec::new(),
+        session: crate::types::profile::SessionCapabilities::new(
+            vec![
+                Capability::Imap4Rev1,
+                Capability::Sort,
+                Capability::from_imap_str("THREAD=ORDEREDSUBJECT"),
+            ],
+            Vec::new(),
+        ),
     };
     // The criteria gate runs at admission, where queued commands see the
     // capability snapshot that is current when they reach the wire.

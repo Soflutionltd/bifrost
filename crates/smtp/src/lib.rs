@@ -106,6 +106,9 @@ pub mod error;
 mod executor;
 // pub: crate users build RFC 5322/MIME messages through this module.
 pub mod message;
+#[cfg(all(feature = "tokio", feature = "account-error"))]
+// pub: protocol-independent account submission facade.
+pub mod submission;
 mod time;
 // pub: crate users send messages through concrete and erased transports.
 pub mod transport;

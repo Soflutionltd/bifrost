@@ -1,11 +1,9 @@
 //! Which URLs may carry the account bearer.
 //!
-//! `bifrost-net` attaches the token source's bearer to the FIRST request of
-//! every call, whatever its host; its trusted-host allowlist and
-//! `Authorization` stripping apply only to redirect hops. So every URL this
-//! crate sends a bearer-carrying request to must already be known to sit on
-//! the origin the token was configured for. This module is where that is
-//! decided, and the only place.
+//! Net owns exact-origin admission and mints the URL proof used here. Graph
+//! supplies the configured base; upload sessions retain their separate policy.
+//! AccountNet's unrestricted default still requires this per-leg gate: a
+//! composed handle's account bearer authority cannot replace Outlook admission.
 //!
 //! The rule is exact origin equality with the configured base (scheme, host
 //! and port, default ports normalized by the URL parser), with no userinfo in
@@ -70,14 +68,16 @@ impl fmt::Display for Refusal {
 /// A URL admitted onto a configured origin. Only [`Base::admit`] builds one,
 /// and the bearer-carrying send paths accept nothing else.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct AdmittedUrl(Url);
+pub(crate) struct AdmittedUrl(bifrost_net::AdmittedUrl);
 
 impl AdmittedUrl {
-    /// A fixture that skips admission, for tests that build cursor payloads
+    /// A fixture that trusts its own origin, for tests that build cursor payloads
     /// without a client.
     #[cfg(test)]
     pub(crate) fn for_tests(link: &str) -> Self {
-        Self(Url::parse(link).expect("test fixture is a URL"))
+        let mut origins = bifrost_net::TrustedOrigins::default();
+        origins.trust(link).expect("test fixture is a URL");
+        Self(origins.admit(link).expect("fixture origin was trusted"))
     }
 
     /// The serialized URL. This exact string is what goes on the wire:
@@ -90,15 +90,7 @@ impl AdmittedUrl {
 
 impl fmt::Debug for AdmittedUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Skip and delta tokens ride in the query and are credential-like,
-        // so a Debug names the origin and path only, as `ProviderLink` does.
-        let query = if self.0.query().is_some() { "?.." } else { "" };
-        write!(
-            f,
-            "AdmittedUrl({}{}{query})",
-            self.0.origin().ascii_serialization(),
-            self.0.path()
-        )
+        self.0.fmt(f)
     }
 }
 
@@ -209,14 +201,13 @@ impl Base {
             format!("{}/{target}", self.text)
         };
         let url = validate(&resolved).map_err(Refusal::Target)?;
-        if url.origin() != base.origin() {
-            return Err(Refusal::Target(format!(
-                "origin {} is not the configured origin {}",
-                url.origin().ascii_serialization(),
-                base.origin().ascii_serialization()
-            )));
-        }
-        Ok(AdmittedUrl(url))
+        let mut origins = bifrost_net::TrustedOrigins::default();
+        origins
+            .trust(base.as_str())
+            .map_err(|_| Refusal::InvalidBase("credential origin is unusable".into()))?;
+        origins.admit(url.as_str()).map(AdmittedUrl).map_err(|_| {
+            Refusal::Target("target is not on the configured credential origin".into())
+        })
     }
 
     /// Admit a server-supplied link. Graph documents these as complete URLs,

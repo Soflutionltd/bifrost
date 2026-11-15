@@ -30,7 +30,6 @@ fn entry(id: &str) -> InventoryEntry {
     InventoryEntry {
         id: ObjectId(id.into()),
         memberships: Vec::new(),
-        size: None,
         blob_id: None,
         fingerprint: Fingerprint {
             server_version: ServerVersion::Unavailable,
@@ -101,7 +100,7 @@ async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
     stub.partition_hook = Some(Arc::new(move |scope, partition| {
         assert_eq!(scope, &hook_scope, "one scope in this plan");
         match partition {
-            InventoryPartition::Page { from: 0, .. } => vec![
+            InventoryPartition::Page(window) if window.from() == 0 => vec![
                 batch(
                     entries("clean", 10),
                     InventoryCoverageReport::complete(CoverageDomain::full(scope.clone())),
@@ -117,7 +116,7 @@ async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
             // a `Done` carrying the same coverage, as every walk must: a
             // stream that just stops is now read as incomplete, so the waived
             // retry below would never reach the completion sentinel.
-            InventoryPartition::Page { from: 10, .. } => vec![
+            InventoryPartition::Page(window) if window.from() == 10 => vec![
                 batch(entries("torn", 3), barrier_report(scope)),
                 InventoryEvent::Done(InventoryCompletion::new(
                     None,
@@ -173,7 +172,7 @@ async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
                 if event.checkpoint.is_some() {
                     checkpointed_batches += 1;
                     assert!(
-                        event.publication.is_some(),
+                        event.ack_token().cloned().is_some(),
                         "every checkpoint-bearing broadcast carries its publication id"
                     );
                 } else if !b.items.is_empty() {
@@ -212,8 +211,12 @@ async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
     assert_eq!(
         walked,
         vec![
-            InventoryPartition::Page { from: 0, to: 10 },
-            InventoryPartition::Page { from: 10, to: 20 },
+            InventoryPartition::Page(
+                bifrost_types::PageWindow::new(0, 10).expect("ordered window")
+            ),
+            InventoryPartition::Page(
+                bifrost_types::PageWindow::new(10, 20).expect("ordered window")
+            ),
         ],
         "a stopped scope walk hands out no further partition"
     );
@@ -264,9 +267,12 @@ async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
     );
 
     assert!(
-        stub.walked_partitions()
-            .iter()
-            .any(|(_, partition)| { *partition == InventoryPartition::Page { from: 20, to: 30 } }),
+        stub.walked_partitions().iter().any(|(_, partition)| {
+            *partition
+                == InventoryPartition::Page(
+                    bifrost_types::PageWindow::new(20, 30).expect("ordered window"),
+                )
+        }),
         "crossing a waived barrier reaches the partition beyond it"
     );
 

@@ -1929,8 +1929,11 @@ forms are distinct, and durations enforce unit order and week-only syntax.
 Fractional seconds up to nanosecond precision survive time/duration conversion.
 The Account adapter parses shared times before constructing these wire values.
 A missing inbound duration keeps its PT0S default; malformed or numerically
-unrepresentable duration fails hydration with Protocol(ParseFailed) instead
-of fabricating a zero-length event.
+unrepresentable duration or overflowing end calculation fails single-event
+hydration with Protocol(ParseFailed) instead of fabricating a zero-length event.
+List and range reads retain valid siblings and report rejected events in
+`Page::failed_ids`: an enterprise Outlook user expects the calendar to remain
+visible with bad events reported.
 
 RRULE validity comes from `bifrost_types::RecurrenceRule`, including duplicate
 parts, positive COUNT/INTERVAL, typed BYDAY/UNTIL and frequency constraints.
@@ -1940,3 +1943,16 @@ rules are checked against the same shared grammar after conversion. Fractional
 JSCalendar UNTIL is refused because RFC 5545 has no fractional UNTIL carrier.
 Raw recurrence text remains an observation carrier; it is parsed when interpreted
 or written rather than making unrelated scalar edits depend on its validity.
+
+Scheduled-send instants use the checked timestamp boundary and refuse
+unrepresentable values as Request(Malformed). Rescheduling validates the new
+instant before cancelling the existing submission, preserving the user's
+scheduled message when its replacement cannot be represented.
+
+Email-state probes reject empty states as Protocol(MissingField) before cache
+publication or guard construction. Empty seeds supply no guard, and empty
+changes observations cannot replace a usable state. A missing method response
+is Protocol(PartialResponse) with Acknowledged transmission evidence, retaining
+retry/reconciliation rather than declaring a terminal missing field. Unknown
+FlagOp variants are local Unsupported refusals, including the defensive patch
+builder path; they do not describe malformed provider data.

@@ -55,6 +55,7 @@ impl Fixture {
     fn ctx<'a>(&'a self, writer: &'a WriterHandle) -> RecoveryContext<'a> {
         let slot = &self.slot;
         RecoveryContext {
+            scheduler: &slot.scheduler,
             deferred_schema_reset: &slot.deferred_schema_reset,
             bandwidth_budget: slot.bandwidth_budget.as_ref(),
             factory: &slot.factory,

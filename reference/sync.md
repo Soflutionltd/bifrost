@@ -1002,11 +1002,10 @@ under the same write lock.
    `MultiplexerEvent { scope, event, checkpoint }`.
 2. Consumer atomically persists `(items, checkpoint)` in their
    own store.
-3. For a checkpoint event, extract the cursor with `event.scope.cursor()` and
-   call `SyncEngine::ack_checkpoint(account, scope, checkpoint, publication)`.
-   The supplied cursor scope must equal the checkpoint's
-   scope. Both the entry point and writer reject a mismatch before changing
-   provisional ownership or persisting any checkpoint.
+3. Persist `encode_ack_token(event.ack_token().expect("token"), key)` with
+   the batch, then call `SyncEngine::ack(account, token)`. Scope, checkpoint
+   and acknowledgement lane come from that opaque token. Diagnostic-only
+   events have no token.
 4. The per-account writer task (one per slot, fed by an
    mpsc kept in `engine.ack_senders`) receives an `AckRequest`,
    writes to `CheckpointStore`, then fires
@@ -1252,7 +1251,10 @@ and sends it through the existing scratch-restart path.
 
 The rescan wait is shortened to the earliest parked, held or retry deadline,
 within the normal one-second discovery cadence, and selects shutdown.
-Account-wide holds continue to sleep inline.
+Account-wide holds continue to sleep inline. Planning, barrier queries and
+checkpoint reads are local work and take no scheduler admission; the partition
+start uses `DriveStart` after these waits and checks the original walk fence
+and registry incarnation before opening its stream.
 
 `BackfillRunner::run_partition` walks
 `inventory_partition_stream(scope, partition)` and broadcasts each
@@ -1260,7 +1262,7 @@ page as a synthetic `Batch` carrying a `BackfillCheckpoint`. It does
 NOT write to `CheckpointStore`: durable persistence is
 consumer-ack-deferred, exactly like `drive_changes_stream`. The
 consumer persists the page items, then calls
-`SyncEngine::ack_checkpoint` with the `Checkpoint::Backfill`; the
+`SyncEngine::ack` with the page's acknowledgement token; the
 ack writer routes that to `CheckpointStore::put_backfill`. This keeps
 at-least-once intact for cold-start hydration - a crash between
 broadcast and the consumer's write re-walks the partition on restart
@@ -1316,11 +1318,14 @@ partitioner and `CoverageDomain::for_partition`; `CoverageDomain::covers`
 tests containment (`self_from <= other_from && self_to >= other_to`) and reads
 identically under either convention.
 
-One upgrade consequence: `partition_key` renders a UID partition as
-`uid:{from}:{to}`, so durable backfill checkpoints written under the old
-inclusive convention no longer match the newly planned keys. Those partitions
-re-walk once. That is re-work, not loss - a missing partition checkpoint means
-"start this chunk over", and the chunk boundaries themselves are unchanged.
+UID partition keys include the epoch as `uid:{uid_validity}:{from}:{to}`.
+Legacy keys without an epoch cannot resume a current UID window and re-walk
+once. This is re-work rather than loss: a missing matching checkpoint starts
+the chunk over. The planner carries the advertised UIDVALIDITY into each UID
+partition, and coverage conversion copies it without a sentinel argument.
+Shared `TimeWindow`, `UidWindow` and `PageWindow` constructors enforce ordered,
+half-open endpoints. The ledger codec preserves its existing endpoint bytes
+and rejects reversed or out-of-range decoded windows instead of panicking.
 
 The deferred-inventory set captured at attach is a structural exclusion:
 the first registry incarnation of each such scope belongs to
@@ -1588,7 +1593,7 @@ ordinary trade on any channel, and with it the bound on how many superseded
 pages one partition's surviving entry retains (see `BoundaryEntry::subsumed`).
 That retained history is unbounded PER PARTITION, and for the `Full` plan -
 which is what JMAP Email uses - there is one partition per scope, so it is
-unbounded over the whole scope's backfill: one `PublicationId`, its
+unbounded over the whole scope's backfill: one `AckToken`, its
 `PublicationReceipt` and its coverage claim per page the consumer read and did
 not acknowledge.
 Marking is keyed on the numbering: a reader the delivery gate never handed out
@@ -1674,6 +1679,11 @@ the runner turns into a failed partition on the rescan ramp; it is never read
 as `WaitFailed::ShuttingDown`, which would retire the whole orchestrator. The
 completion marker takes no admission at all (`wait_for_capacity`): it does no
 wire work and is emitted after the partition pass has handed its permit back.
+A `LanePermit` drop guard also releases the gate's stored permit when the
+partition future is cancelled. Capacity wakeup resumes the same already-open
+stream with its original activity, account and publication fence; it does not
+start a new drive or load a replacement account. Its low-level refused
+re-admission remains a partition failure, distinct from drive-start refusal.
 
 **Which receivers can still acknowledge a page is tracked per receiver.** A
 `tokio::broadcast` receiver joins at the ring's tail, so it can never take
@@ -2016,7 +2026,7 @@ wrong, for two independent reasons:
   which is what the guarantee needs.
 
 The only sound record trigger the engine has is the consumer ack:
-`ack_checkpoint` is what this crate already treats as proof of
+`ack` is what this crate already treats as proof of
 receipt, precisely because broadcast delivery is not. A correct
 design buffers ids as pending keyed by their batch's checkpoint and
 promotes them only on ack, with a policy for batches carrying no
@@ -2338,8 +2348,9 @@ method and final read-back guard. Campaign flow:
    sleep until the earliest readiness, selecting on shutdown. A replacement
    account wakes the scheduler to re-evaluate declarations.
 
-   Admission remains mandatory. Refused admission delays the cohort by 100 ms
-   without spending a submission or retry slot; ready siblings can proceed.
+   Admission remains mandatory. Scheduler refusal uses the shared drive-start
+   retry of one second, without spending a submission or retry slot and with
+   neither activity nor budget retained during that delay.
    Re-check declarations and holds against
    the account snapshot used after admission; release admission and return
    to the scheduler if readiness changed. Hold waits consume no attempts.
@@ -2755,7 +2766,7 @@ one of them:
   nothing durable (store write failed) or when no real subscriber
   received the batch. The entry stops gating waiters - it is no
   longer in flight - but the durable snapshot is NOT advanced, and
-  the consumer learns of a failed write from `ack_checkpoint`'s own
+  the consumer learns of a failed write from `ack`'s own
   `Result`. Leaving it pending instead would wedge every later
   `pause` / `checkpoint_now` on the account for the process lifetime.
 - Supersession: a newer broadcast on the same LANE replaces the older
@@ -2874,7 +2885,12 @@ durable hot-path history without forgetting a partial union still in progress.
 ### Proof and policy are separate axes
 
 `ProofStatus` is what the system knows (`Unresolved` / `Discharged`).
-`PolicyStatus` is what it will do (`Retrying` / `OperatorBlocked` / `Waived`).
+`EntryPolicy` is what it will do (`Automatic` / `OperatorBlocked` / `Waived`).
+Barriers have `BarrierPolicy` (`Undecided` / `OperatorBlocked` / `Waived`):
+they have no automatic repair attempt counter or lineage budget. Both waiver
+variants retain an `OperatorId` and signed `UnixSeconds`; all historical
+identity strings and i64 timestamps remain representable. `DebtLedger::waive`
+converts the operator input once at the ledger boundary.
 
 Collapsing them is the mistake the split exists to prevent. A waiver is accepted
 loss, NOT proof that anything was materialized or proved irrelevant, so a waived
@@ -2987,8 +3003,8 @@ operator waiver is load-bearing rather than a nicety.
 
 Coverage reaches the durable record through the per-account `Publications`
 ledger, keyed by an
-engine-issued `PublicationId`. It cannot ride `Checkpoint`, which is a published
-type crossing the broadcast channel and back through `ack_checkpoint`.
+engine-issued `AckToken`. It cannot ride `Checkpoint`, which is a published
+type crossing the broadcast channel and back through `ack`.
 
 Keying by scope is unsound: two backfill partitions of one scope are in flight
 together, and the second's report overwrites the first's. Keying by `Checkpoint`
@@ -3004,15 +3020,42 @@ promised to identify a publication:
 - a later walk can produce the same cursor bytes as an earlier one while proving
   different coverage.
 
-`MultiplexerEvent::publication` therefore carries a restart-safe token to the consumer.
+`MultiplexerEvent::ack_token()` therefore exposes a restart-safe token to the consumer.
 The token contains the immutable checkpoint lane and coverage receipt as well as
 its compact numeric identity. A consumer persists the whole token beside the
 batch. If the writer restarts before the acknowledgement, the new writer can
 apply the exact original claim; accepting the number with an empty claim would
 advance the cursor while silently discarding degraded coverage.
-`ack_checkpoint` takes it back for checkpoint-bearing events;
-`ack_publication` acknowledges repair events, which intentionally carry no
-checkpoint because they advance no cursor. A repeated acknowledgement of the same
+`SyncEngine::ack(account, token)` accepts both checkpoint and repair tokens;
+repair tokens intentionally carry no checkpoint because they advance no cursor.
+The token's receipt and claim fields,
+and all receipt-minting methods, are crate-private. `number()` exposes only
+compact identity; `checkpoint()` exposes the immutable checkpoint for inspection.
+The event's public scope and checkpoint remain diagnostic views; acknowledging
+never takes them as input. Account identity is still selected by the caller;
+tokens are not account-bound. A foreign change token cannot be distinguished
+from a prior attachment's replay, so applications must retain the account beside
+the token. Backfill takes the conservative withholding path for both.
+
+`encode_ack_token(token, key)` and `decode_ack_token(bytes, key)` live beside
+`encode_envelope` and `encode_ledger`. The application supplies a persistent
+32-byte secret and retains it separately from batch storage for the whole token
+retention period. HMAC-SHA-256 authenticates the versioned framing before decoding;
+this protects stored bytes, not against the application holding the key. The
+payload is not encrypted. Lost or rotated keys make retained tokens unreadable.
+The publication freezes its receipt after absorbing carried and superseded claims.
+The standalone `PendingCoverage::supersede` operation updates only live claims,
+not receipts already handed out, so it does not preserve that later fold across
+a writer restart. Production publication uses the inline registration fold.
+The token codec preserves report order and serializes each report's ingested debt
+and proof through the ledger codec, including its error digest and repair target.
+It does not reconstruct an operational `AccountError`: acknowledgement stores
+diagnostics, not recovery advice. Barriers remain the walk's responsibility and
+are not ingested by acknowledgement. Restored debt preserves existing operator
+policy and retry history; restored proof stays on the staged ledger until the
+checkpoint store succeeds. Backfill replay from a prior attachment is still
+withheld, including completion markers whose walk watermark cannot be vouched
+for. Encoding does not grant permission to resume beyond an unreceived page. A repeated acknowledgement of the same
 publication is idempotent. A token whose receipt names the wrong lane is refused
 without consuming any live claim. It is never defaulted to complete coverage.
 
@@ -3039,11 +3082,9 @@ together by design and any gap lets both leave a live entry for one key.
 A publication's LANE is its supersession key and its acknowledgement key. Lanes
 are one changes stream per scope, one backfill PARTITION per scope, and one
 repair lane. The partition belongs in the backfill key: sibling partitions of a
-scope neither subsume nor release each other. The lane is checked on
-acknowledgement, so `ack_publication` handed a checkpoint publication's id
-refuses instead of consuming it - consuming it would make the later, real
-`ack_checkpoint` short-circuit as already persisted and return before writing,
-while the engine announced a durable boundary the store never accepted.
+scope neither subsume nor release each other. The public acknowledgement derives that lane from the token, so a checkpoint
+publication cannot be consumed through the repair path. Internal claim lookup
+also checks the exact checkpoint before consuming its live claim.
 
 `retire`, `retire_publication` and batch `abandon` share one retirement
 transition: remove the publication's boundary (including a subsumed registration),
@@ -3155,6 +3196,9 @@ planning: an enterprise user who asked for a repair expects it to run once the
 barrier lifts, not a transient `Error::Paused`. `Stop` refuses with
 `Error::Paused`; shutdown cancels the wait and the pass. The orphan-teardown
 timer uses the same gate in refusing mode and retries on its next tick.
+The refreshed ledger is another wait boundary: repair rechecks the scopes it
+actually plans, the current incarnation and holds after that read, releasing
+admission and activity before waiting or replanning on refusal.
 A dropped queued admission frees its scheduler lane slot at once: `admit`
 prunes cancelled waiters before its capacity check, and the dispatcher never
 hands a permit to a cancelled waiter.
@@ -3217,7 +3261,7 @@ acknowledgement of the batch that actually carried its id, never on a sibling
 scope's batch. Within a scope the pass is still all-or-nothing. Pinned by
 `recovered_ids_are_published_under_their_own_scope`.
 
-Discharge happens on the consumer's explicit `ack_publication` acknowledgement
+Discharge happens on the consumer's explicit `ack` acknowledgement
 of the repair publication,
 and both halves are recorded as `DischargeEvidence::RepairedAndPublished`.
 Neither alone suffices: an account recovery nobody was told about leaves the
@@ -3255,10 +3299,10 @@ lineage, or whose key is another live lineage's id, is refused outright
 (`ChildCollidesWithForeignLineage`) rather than silently given two lineages; a
 child reusing its parent's or its lineage's own key is refused
 (`ChildReusesLineageKey`); and a split arriving for a parent that is no longer
-`Retrying` - an operator blocked or waived it, or its budget ran out, while the
+`Automatic` - an operator blocked or waived it, or its budget ran out, while the
 result was in flight - is refused (`PolicyNoLongerRetrying`) and charges
 nothing, because accepting it would discharge the only entry carrying that
-decision and hand the debt to fresh `Retrying` children.
+decision and hand the debt to fresh `Automatic` children.
 
 **Where the budget lives.** A lineage's identity is its root key: an entry with
 `parent: None` is its own lineage, and a child's `parent` names the root
@@ -3278,12 +3322,12 @@ discharged, whatever that member's policy. A discharged member counts because
 `upsert` reopens a rediscovered entry with its history intact, so dropping the
 row at discharge would let a provider alternating a covering walk with a
 rediscovery reset the budget every cycle; the row goes when compaction folds
-the last member, which keeps the table bounded by the entry map. It rewrites
-every open `Retrying` member from its row: blocked when
-the row is exhausted, otherwise mirroring the row's count. `Retrying { attempts }`
-on an entry is therefore a view, never read back to decide anything; waived and
-`OperatorBlocked` members are never written, and discharged entries are never
-touched. Exhaustion is sticky - a later charge with a larger budget does not
+the last member, which keeps the table bounded by the entry map. It blocks
+every open `Automatic` member when the row is exhausted. Entries carry no
+attempt count: `DebtLedger::lineage_budget(key)` returns the retained member's
+`LineageBudget { attempts, exhausted }` by reference, or none for a folded or
+unknown key. Waived and `OperatorBlocked` members are never written, and
+discharged entries are never touched. Exhaustion is sticky - a later charge with a larger budget does not
 reopen a lineage - so a member that joins a spent lineage later (a closed
 sibling rediscovered, say) comes back blocked.
 
@@ -3538,13 +3582,22 @@ Versions 3 through 9 remain readable without that tag. Version 11 adds the
 prefix), rejected in older-version rows; versions 3 through 10 remain readable
 without it. The cursor envelope needed no bump for qualified DAV collections:
 its existing `FolderType` encoding already represents them.
-Existing tags and layouts are unchanged; the readable minimum remains 3.
+Version 12 removes the mirrored u32 attempt counter after policy tag 0.
+Entries now encode `Automatic` there; barriers encode `Undecided`. Policy tags
+1 and 2 and the waiver string and signed Unix seconds bytes are unchanged.
+The readable window is 3 through 12. Versions 3 through 11 consume their old
+policy counters: an open automatic entry's count must equal its lineage row
+or decoding returns `Error::Other`; discharged entries' historical counters
+remain unchecked, and inert barrier counters are discarded. The lineage table
+is retained verbatim, so migration cannot reset the budget. Versions outside
+3 through 12 return `Error::SchemaIncompatible`.
 
 Decode VALIDATES, never heals: a duplicated entry, barrier or lineage key,
 trailing bytes, a lineage that is not flat (a parent naming itself or an entry
 that has a parent, which covers every chain and cycle), an entry whose lineage
-has no budget row, a row with no retained member, or an open `Retrying` entry
-disagreeing with its row is `Error::Other`. Repairing any of these would mean choosing which half
+has no budget row, a row with no retained member, an open `Automatic` entry
+in an exhausted lineage, or a legacy open retry counter disagreeing with its
+row is `Error::Other`. Repairing any of these would mean choosing which half
 of a contradiction to believe, and a guessed budget is the silent reset budgets
 exist to stop. A parent naming an ABSENT key is legal - its root was compacted.
 
@@ -3903,6 +3956,40 @@ membership; Graph declares the Outlook mailbox `ThrottleKey::Budget` each
 scope, object and destination folder is routed to; every other crate
 declares nothing and waits on account-wide holds only.
 
+`engine/drive_start.rs::DriveStart` owns new wire admission. The slot exposes
+it through `AccountSlot::drive_start`; worker contexts borrow the same services.
+It registers activity only under `Run`, sleeps account holds before consulting
+scope keys, and checks the current account's declaration before and after
+scheduler admission. Every internal wake repeats registration and reloads the
+account. Boundary changes cancel queued admission so a pause cannot wait on an
+activity stranded in that queue. Refusal releases both permit and activity.
+Scheduler overflow uses one second across new-drive callers: it is transient
+engine pressure, so it consumes no provider retry budget and must not spin or
+inherit a scope's adaptive poll cadence.
+
+Poll and push claim the registry drive lease before asking this gate for
+budget, then recheck the registry generation after admission and before the
+wire. They therefore retain no scheduler permit while waiting for that lease.
+Backfill partitions, deferred inventory, mutation submissions and read-back,
+orphan teardown and operator repair use the same gate. Their reactions to a
+scope-local hold remain local: park the walk, requeue the scope, defer the hint
+or schedule the cohort's next readiness.
+
+Recovery uses the same admission implementation with two explicit differences.
+`RepairPacing` owns its cumulative hold allowance, so the gate returns holds
+instead of sleeping them. Recovery pins the account owned by its reopen
+transaction, which may be a replacement not yet installed in `current`; it
+must never substitute the live account for that replacement. The outer admitted
+activity and reopen lock span delete-then-establish and provisional-row work,
+including pacing, so a pause cannot report a half-finished recovery as idle.
+Only per-attempt budget and inner activity are released for holds. Both scope
+recovery and replacement open order the reopen lock before scheduler budget;
+the opposite order can deadlock a restart against a scope repair waiting for
+the same one-permit budget. Restart releases the lock and activity when a hold
+lands in either wait, and charges the next hold wait to `RepairPacing`.
+Establishment rechecks the original scope fence after writer and admission
+waits, before provider establishment and inventory fusion.
+
 The guarantee is drive-start granularity. Each site checks immediately
 before driving, and checks again after every wait that precedes the drive
 (a retry-advice sleep, a pause park, scheduler or lane admission, and - for
@@ -4039,7 +4126,7 @@ crates/sync/src/
   engine/
     mod.rs                // SyncEngine, SyncEngineBuilder, Drop;
                           // detach / reattach / shutdown;
-                          // ack_checkpoint, ack_publication, debt,
+                          // ack, ack, debt,
                           // repair_debt, waive/block_obligation;
                           // account_changes_stream,
                           // account_control_stream, invalidation_sink,
@@ -4048,6 +4135,7 @@ crates/sync/src/
                           // account_capabilities. Every path that
                           // resolved through `crate::engine` before the
                           // split still resolves here.
+    drive_start.rs        // new wire admission, holds and scheduler refusal pacing
     context.rs            // SlotContext: the slot-wide handle bundle
                           // every spawned worker shares, plus
                           // `recovery()` which borrows it as a
@@ -4208,9 +4296,10 @@ live numbered set the slowest-reader rule is evaluated against),
 `retained_history` with the bound, then `register_walk_marker`,
 `walk_watermark`, `minted_here`, `note_undelivered`, `take_backfill_discard`,
 `take_backfill_discards` and `undelivered_watermark` with the completion
-guarantee. `PublicationReceipt` gained a public field,
-`walk_watermark: Option<UndeliveredMark>`, which is a struct-literal break for any
-downstream constructing one. `BackfillConfig` gained `lane_capacity`, and
+guarantee. `PublicationReceipt` carries a crate-private
+`walk_watermark: Option<UndeliveredMark>`; consumers retain the opaque token through
+its codec rather than constructing receipts. Receipt-minting methods, including
+`register_walk_marker`, are crate-private. `BackfillConfig` gained `lane_capacity`, and
 `WriterRequest` a `DiscardBackfillProgress` variant. The enum is public and
 re-exported as `bifrost_sync::multiplexer::WriterRequest`; its variants are
 part of the published surface. Everything else the lane work touched is
@@ -4377,7 +4466,7 @@ retirement. `Cursor(scope)` names an actual cursor for changes, inventory,
 backfill, repair and scoped recovery. In particular,
 `Cursor(CursorScope::Account)` is a real account cursor and is distinct from
 `Account`. A mail user must be able to distinguish a stopped account from a
-single cursor's failure. Checkpoint acknowledgement still accepts `CursorScope`;
+single cursor's failure. Checkpoint acknowledgement derives its scope from the token;
 `EventScope::cursor` extracts it and returns `None` for attachment-wide events.
 
 Every mutation submission round validates answers against its submitted target
@@ -4420,7 +4509,7 @@ a lifecycle epoch and an account generation cannot be substituted at a call.
 | Value | Owner and operations |
 |---|---|
 | `cursor::ScopeFence` | `PendingCoverage` burns exclusive bounds under its ledger lock, compares producer snapshots and tests whether a publication is excluded. Scope, account and backfill fences use the same bound semantics. `initial_fence` supplies the attach-time baseline. |
-| `cursor::PublicationNumber` | `PendingCoverage` mints the compact identity carried by `PublicationId`; display and ordering remain available, with segment extraction confined to coverage. |
+| `cursor::PublicationNumber` | `PendingCoverage` mints the compact identity carried by `AckToken`; display and ordering remain available, with segment extraction confined to coverage. |
 | `cursor::UndeliveredMark` | `PendingCoverage` records scope-local losses and supplies walk snapshots; a walk compares those snapshots for completion. `PublicationReceipt::walk_watermark` carries this type. |
 | `cursor::WalkGeneration` | `PendingCoverage::next_generation` issues coverage proof order. Claims, barriers, retained proofs, repair resolutions and discharge audits carry it throughout the writer path. Empty claims use the owner's initial baseline. |
 | `cursor::LifecycleEpoch` | `CursorRegistry` advances it only on provider deletion; owed establishment maps retain the epoch they observed. |
@@ -4526,3 +4615,11 @@ Completion eligibility reads the candidate. A refusal that discards an
 incomplete walk uses the live debt ledger, withholding the rejected walk's
 proof throughout the discard's intermediate writes. Reset and discard fences
 and their second debt collection passes remain in effect.
+
+Committed reattach computes `CapabilityDelta::between` from the retained and
+replacement capabilities before replacing the retained snapshot. Nonempty
+changes are published as `AccountControl::CapabilitiesChanged`, so consumers
+can update account affordances after negotiation. Pre-open capability errors
+may carry no delta because the replacement snapshot is not available yet.
+Bandwidth control watches and snapshots carry `Option<BandwidthCap>` throughout;
+only application to the shared net budget extracts the positive numeric rate.

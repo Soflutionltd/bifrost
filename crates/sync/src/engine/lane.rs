@@ -148,7 +148,7 @@ const PARK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3
 /// park and re-acquired on the wake.
 #[derive(Debug)]
 pub struct BackfillAdmission {
-    scheduler: Scheduler,
+    pub(super) scheduler: Scheduler,
     account_id: AccountId,
     control: SyncControl,
     permit: Mutex<Option<BudgetPermit>>,
@@ -236,6 +236,16 @@ pub struct LaneGate {
     park_warned_at: Arc<Mutex<Option<tokio::time::Instant>>>,
 }
 
+/// A cancelled partition future must release the gate's stored budget too.
+/// Keeping the permit only in the cloneable gate would outlive that future.
+pub(super) struct LanePermit<'a>(&'a LaneGate);
+
+impl Drop for LanePermit<'_> {
+    fn drop(&mut self) {
+        self.0.release_admission();
+    }
+}
+
 impl LaneGate {
     #[must_use]
     pub fn new(
@@ -275,6 +285,18 @@ impl LaneGate {
     /// Take the account's sync admission for a partition pass.
     pub async fn admit(&self) -> Result<(), WaitFailed> {
         self.admission.acquire(&self.shutdown).await
+    }
+
+    /// Install a permit acquired by the slot's drive-start gate. The gate
+    /// retains activity and the incarnation in the partition caller; this
+    /// owner releases only the scarce scheduler budget at a capacity park.
+    pub(super) fn hold_admission(&self, permit: BudgetPermit) -> LanePermit<'_> {
+        *self
+            .admission
+            .permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(permit);
+        LanePermit(self)
     }
 
     /// Give the account's sync admission back.
@@ -318,6 +340,10 @@ impl LaneGate {
         }
         self.release_admission();
         self.wait_for_capacity().await?;
+        // This resumes an already-open partition stream; it is not a new
+        // drive. Replacing its account here would pair an old stream with new
+        // state. The runner retains the original activity and publication
+        // fence; protocol pacing owns holds discovered during that drive.
         self.admit().await
     }
 
@@ -645,7 +671,7 @@ mod tests {
 
     impl Harness {
         /// Register and mark delivered, the order a producer uses.
-        fn publish(&self, checkpoint: &Checkpoint, seq: u64) -> crate::cursor::PublicationId {
+        fn publish(&self, checkpoint: &Checkpoint, seq: u64) -> crate::cursor::AckToken {
             let id = self.coverage.register(
                 checkpoint.clone(),
                 CoverageClaim {

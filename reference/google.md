@@ -52,13 +52,14 @@ local-hold error stamps, and `quota::project_hold_key` derives the net
 namespace. Other provider holds cannot invent a Gmail project budget.
 
 The shared request funnel accepts `reqwest::Method`, with no string-method
-panic. After API surface selection, `client::GmailEndpoint` resolves the Gmail
+panic. After API surface selection, `gmail::endpoint::GmailEndpoint` resolves the Gmail
 path once and owns its quota units and data-concurrency admission. Watch and
 stop identities bypass the data queue, including when query parameters are
 present. History error contexts carry the same endpoint identity instead of a
-separate boolean. Endpoint resolution stays at the common builder boundary
-because the generic builders also accept absolute Calendar and People URLs;
-a relative-path annotation cannot establish their API surface.
+separate boolean. Gmail endpoint resolution runs only after the typed API view selects Gmail.
+Calendar, People and Drive views select their service explicitly; URL spelling
+never selects initial quota, concurrency or error attribution. The shared
+transport still matches configured URL roots to refuse cross-service redirects.
 
 
 Error contexts explicitly distinguish Gmail, Calendar, People and Drive.
@@ -71,10 +72,9 @@ a concurrent-request 429 (even with a `rateLimitExceeded` reason), and
 undocumented `quotaExceeded` remain account-scoped and never stamp the
 project budget. Without a configured
 project, throttling retains `ThrottleScope::Account` and has no project gate.
-Calendar and People daily or rate errors never stamp or record it. Requests
-select their API surface using the most specific configured URL path root,
-including when redirected bases share an origin or nest under the Gmail base;
-Gmail quota costs and concurrency use that same selection. Google rejects
+Calendar and People daily or rate errors never stamp or record it. Typed API handles select the request surface. Redirect admission uses the most
+specific configured URL path root, including when bases share an origin or nest
+under the Gmail base. Google rejects
 cross-surface redirects with a terminal net `Error::RedirectRejected` before dispatching the
 target; same-surface redirects continue through net's normal policy. A
 request-level net redirect guard keeps the initial gate, observer, quota cost
@@ -82,8 +82,9 @@ and concurrency attribution valid for the whole redirect walk. This applies
 to typed and raw builders, including the raw Drive session-creation POST;
 pre-authenticated Drive chunk uploads and cancellation use the same guarded
 builder funnel and disable redirects. Session creation accepts a `Location`
-only on the HTTPS `www.googleapis.com/upload/drive/v3/files` surface (the exact
-path or descendants, port 443, without userinfo). Chunk PUT and cancellation
+only on the configured Drive origin's `/upload/drive/v3/files` subtree
+(the exact path or descendants, matching scheme, host and port, without userinfo).
+The default is HTTPS `www.googleapis.com` on port 443. Chunk PUT and cancellation
 validate that surface again before dispatch. A successful session-creation
 response cannot authorize sending to Gmail, Calendar, People or another host. Thus Calendar/People cannot redirect into a held Gmail API, and
 Gmail cannot record Calendar/People errors into its project hold.
@@ -199,7 +200,7 @@ Internal modules:
   is `Protocol(MissingField)`; a `Location` that is present but not
   visible-ASCII text, or not an absolute http or https URL with a host, is
   `Protocol(ParseFailed)`, since accepting it would send every chunk PUT and
-  the cancel to a bogus URL. An absolute URL outside the HTTPS Drive upload
+  the cancel to a bogus URL. An absolute URL outside the configured Drive upload
   surface is `Protocol(ContractViolation)` and is refused before any chunk or
   cancellation is sent; a present 308 `Range` that does not parse
   is `Protocol(ParseFailed)`; a 308 claiming bytes never sent, fewer bytes
@@ -239,8 +240,19 @@ Internal modules:
 - `error.rs` - translation boundary from `crate::Error` to
   `AccountError` via the central `AccountErrorBuilder`.
 
-`crates/google/src/api.rs` is the Gmail wire wrapper used by these
-modules. Every dynamic label, thread, message, attachment, draft,
+`crates/google/src/gmail/api.rs` is the Gmail wire wrapper used by these
+modules. `gmail/types.rs` owns the shared Gmail responses, including inventory
+list pages; inventory calls the same list method as search. `gmail/endpoint.rs`
+owns method costs and data-concurrency classification. `gmail/quota.rs` owns
+project holds and deadline policy; `quota.rs` retains the API surface enum and
+its crate-local import door. `calendar/{api,types}.rs`,
+`people/{api,types}.rs` and `drive/{api,types}.rs` own their service-bound views,
+wire representations and extracted URL encoders. Account modules retain domain
+mapping and multi-step sequencing. `transport.rs` owns attachment, byte tallying,
+recorded sends and shared configuration; `client.rs` and `types.rs` retain
+crate-local import doors without duplicate implementations. The original mail
+handle is named `GmailApi`, with `GmailClient` retained as a crate-local import
+alias; CalendarApi, PeopleApi and DriveApi borrow that shared attachment. Every dynamic label, thread, message, attachment, draft,
 filter, send-as, and page-token component is passed through
 the matching `bifrost_net::url` path or query encoder before URL
 assembly. The Drive hosting path applies the path rule to returned
@@ -258,9 +270,9 @@ for `open(account_id)`.
 The factory is the only public entry point; the raw `GmailClient`,
 Gmail wire DTOs, and crate-local `Error` are `pub(crate)`.
 
-### Three independent API bases
+### Four independent API bases
 
-The crate talks to three Google surfaces, and each base is configured
+The crate talks to four Google surfaces, and each base is configured
 separately because none can be derived from another:
 
 | Surface | Production base | Override |
@@ -268,9 +280,10 @@ separately because none can be derived from another:
 | Gmail mail | `www.googleapis.com/gmail/v1/users/me` | `from_access_token_with_api_base` / `from_token_source_with_api_base` |
 | People (contacts, directory) | `people.googleapis.com/v1` | `with_people_api_base` |
 | Calendar | `www.googleapis.com/calendar/v3` | `with_calendar_api_base` |
+| Drive origin | `www.googleapis.com` | `with_drive_api_base` |
 
 Calendar shares a HOST with Gmail but not a path root, so it cannot ride the
-Gmail base; People differs in both. All three compose, so a harness can redirect
+Gmail base; People differs in both. All four compose, so a harness can redirect
 any subset.
 
 `RATATOSKR_TEST_GCAL_ENDPOINT` still sets the Calendar base when
@@ -292,11 +305,11 @@ send funnel, including raw Drive builders. Thus production APIs sharing
 `www.googleapis.com` do not debit Gmail quota units or wait behind mail
 hydration: users expect calendar reads to remain independent of mail traffic.
 Gmail uses method quota costs; the other surfaces use request costs. Drive
-registers its production host explicitly. Malformed base overrides fall back
+registers the host of its configured origin. Malformed base overrides fall back
 to the corresponding production host for registration. Declaring several scopes
 on one host does not warn at attach; `bifrost-net` warns only if a request
 reaches that host without an explicit scope, which this funnel never does.
-A URL under no configured base is classified Drive rather than refused: the
+For redirect admission, a URL under no configured base is classified Drive: the
 production case is a server-issued Drive resumable-upload session URL, which the
 Drive bucket meters. Such a request goes unmetered client-side only when its
 host has no registration (redirected test bases, or a session URL on another
@@ -1959,7 +1972,9 @@ same encoder.
 
 Response and decode errors retain a typed Gmail, Calendar, People or Drive
 service. Raw builder dispatch also takes that enum rather than a string with a
-Drive fallback. Error translation preserves Gmail provider/protocol/wire signals
+Drive fallback. Transport errors retain the view's surface even without an
+error response, and response/decode translation takes its service from the
+error itself. Operation contexts supply service only for local refusals. Error translation preserves Gmail provider/protocol/wire signals
 for Gmail, and stamps Provider::Google with API-specific protocol and wire
 variants for Calendar, People and Drive. Native reason/status, HTTP evidence
 and API response diagnostics survive translation. The account's primary
@@ -2100,3 +2115,17 @@ to rebuild without blaming the provider or silently missing mail.
 Payload versions use `PayloadVersion`; change and backfill outer versions use
 `TraitEnvelopeVersion`. These are separate types with explicit numeric access
 for storage; existing wire values are unchanged.
+
+## Calendar recurrence writes and no-op mail mutations
+
+Calendar create and recurrence patch rendering call `EventRecurrence::parsed_rule`
+before writing RRULE text. A malformed rule is a local malformed-request refusal;
+an omitted patch still leaves recurrence alone, and an empty recurrence patch
+still clears it. Users expect invalid meeting rules to fail before a write.
+Single-label writes admit Message or Thread before accepting an empty patch.
+Those are currently the only constructible target variants; the order preserves
+that refusal contract if the shared target vocabulary grows.
+
+Response headers retain `bifrost_types::RetryHint` directly. Delta-seconds are
+resolved once using the observer clock with checked addition, and HTTP dates
+retain their absolute instant; translation does not maintain another retry enum.

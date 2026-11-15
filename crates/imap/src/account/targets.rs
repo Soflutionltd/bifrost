@@ -32,6 +32,8 @@
 //! still a debug assertion in [`Drop`], so a path that returns early with ids
 //! unaccounted for cannot go unnoticed.
 
+use super::error::excluded_from_operand_error;
+
 use bifrost_types::{
     AccountError, AccountOperation, BatchFailure, BatchItemId, BatchSuccess, ItemOutcome,
 };
@@ -325,29 +327,6 @@ impl Drop for TargetBatch {
 
 fn item_id(id: &DecodedObjectId) -> BatchItemId {
     BatchItemId(id.id.0.clone())
-}
-
-fn excluded_from_operand_error(operation: AccountOperation, folder: &MailboxName) -> AccountError {
-    use bifrost_types::{
-        AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, Protocol, RequestCause,
-        RequestErrorKind,
-    };
-
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(
-                "message id could not be placed in an IMAP UID operand",
-            ),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(operation)
-    .scope(bifrost_types::ErrorScope::Cursor(super::folder_scope(
-        folder,
-    )))
-    .try_build()
-    .expect("valid account error classification")
 }
 
 #[cfg(test)]

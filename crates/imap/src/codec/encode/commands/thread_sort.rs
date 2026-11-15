@@ -50,7 +50,7 @@ pub(in crate::codec::encode) fn encode_thread_or_sort_cmd(
     }
     w.raw(charset.as_bytes());
     w.raw(b" ");
-    super::super::write_search(w, criteria, false);
+    super::super::write_search(w, criteria, crate::codec::utf7::WireMode::ModifiedUtf7);
     w.raw(b"\r\n");
     Ok(())
 }

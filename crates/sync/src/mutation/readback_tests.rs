@@ -27,7 +27,7 @@ impl Account for ScriptAccount {
     fn set_priority(&self, _priority: Priority) {
         unreachable!("unexpected account door")
     }
-    fn set_bandwidth_cap(&self, _bps: Option<u64>) {
+    fn set_bandwidth_cap(&self, _bps: Option<bifrost_types::BandwidthCap>) {
         unreachable!("unexpected account door")
     }
     fn throttle_keys(

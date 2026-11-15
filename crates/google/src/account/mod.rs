@@ -187,6 +187,15 @@ impl GoogleAccountFactory {
         }
     }
 
+    /// Override the Drive origin, independently of mail, contacts and calendars.
+    #[must_use]
+    pub fn with_drive_api_base(self, drive_base: impl Into<String>) -> Self {
+        Self {
+            client: Arc::new(self.client.with_drive_base(drive_base)),
+            pubsub: self.pubsub,
+        }
+    }
+
     /// Configure Gmail Cloud Pub/Sub watch ownership for opened accounts.
     #[must_use]
     pub fn with_pubsub_config(mut self, config: PubSubConfig) -> Self {
@@ -441,7 +450,7 @@ impl Account for GoogleAccount {
         self.client.account_net().set_priority(priority);
     }
 
-    fn set_bandwidth_cap(&self, bps: Option<u64>) {
+    fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
         self.client.account_net().set_bandwidth_cap(bps);
     }
 
@@ -1517,7 +1526,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             error,
-            crate::Error::Net(bifrost_net::Error::LocalHold { .. })
+            crate::Error::ObservedNet(ref observed) if matches!(observed.error, bifrost_net::Error::LocalHold { .. })
         ));
         assert_eq!(script.requests().len(), 4);
     }

@@ -10,6 +10,8 @@
 //!    `CursorRegistry` at every batch boundary; advance-checkpoints
 //!    rewrite both the registry and the store atomically.
 
+pub mod ack_token;
+pub use ack_token::{decode_ack_token, encode_ack_token};
 pub mod coverage;
 pub mod envelope;
 pub mod ledger;
@@ -27,15 +29,16 @@ use tokio_util::sync::CancellationToken;
 use bifrost_types::{ChangeCursor, CursorScope, MembershipScope};
 
 pub use coverage::{
-    ClaimLookup, CoverageClaim, PendingCoverage, PublicationId, PublicationNumber,
-    PublicationReceipt, Publications, ScopeFence, UndeliveredMark, WalkGeneration,
+    AckToken, ClaimLookup, CoverageClaim, PendingCoverage, PublicationNumber, PublicationReceipt,
+    Publications, ScopeFence, UndeliveredMark, WalkGeneration,
 };
 pub use envelope::{
     CursorEnvelope, ENGINE_VERSION, EnvelopeKind, MIN_MIGRATABLE, decode_envelope, encode_envelope,
 };
 pub use ledger::{
-    BarrierIncident, DebtLedger, DischargeAudit, DischargeEvidence, ErrorDigest, LedgerEntry,
-    PolicyStatus, ProofStatus, ReplacementProgress, ReplacementRefusal, discharge_fingerprint,
+    BarrierIncident, BarrierPolicy, DebtLedger, DischargeAudit, DischargeEvidence, EntryPolicy,
+    ErrorDigest, LedgerEntry, LineageBudget, OperatorId, ProofStatus, ReplacementProgress,
+    ReplacementRefusal, UnixSeconds, discharge_fingerprint,
 };
 pub use ledger_envelope::{
     LEDGER_ENVELOPE_VERSION, MIN_MIGRATABLE_LEDGER, decode_ledger, encode_ledger,

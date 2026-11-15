@@ -333,6 +333,7 @@ pub(crate) fn into_account_error(error: Error, mut ctx: GmailErrorContext) -> Ac
     match error {
         Error::Net(net_error) => translate_net_error(net_error, &ctx),
         Error::ObservedNet(observed) => {
+            ctx.surface = observed.surface;
             ctx.observed_headers = Some(observed.headers);
             translate_net_error(observed.error, &ctx)
         }
@@ -341,8 +342,12 @@ pub(crate) fn into_account_error(error: Error, mut ctx: GmailErrorContext) -> Ac
         // post-200 (decoding a successful response body), so they carry
         // unreadable-success evidence: acknowledged, and the write the body
         // reports on may have landed.
-        Error::Response(resp) => translate_response(*resp, &ctx),
+        Error::Response(resp) => {
+            ctx.surface = resp.service;
+            translate_response(*resp, &ctx)
+        }
         Error::JsonDecode { service, source } => {
+            ctx.surface = service;
             parse_failed(&ctx, format!("{service} JSON decode: {source}"))
         }
         Error::Base64 { encoding, source } => {
@@ -686,7 +691,7 @@ fn refine_status_with_gmail_body(
         .clone()
         .unwrap_or_else(|| crate::error::GmailResponseHeaders::from_headers(headers));
     let resp = GmailResponseError {
-        service: ctx.surface.into(),
+        service: ctx.surface,
         status,
         headers: resp_headers,
         body: bytes::Bytes::copy_from_slice(body),
@@ -731,15 +736,7 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
             resp.headers
                 .retry_after
                 .filter(|_| is_retry_after_applicable(status, &signal))
-                .map(|hint| {
-                    resp.headers
-                        .retry_at
-                        .map(RetryHint::At)
-                        .unwrap_or_else(|| match hint {
-                            crate::error::RetryAfter::Delta(delta) => RetryHint::After(delta),
-                            crate::error::RetryAfter::At(at) => RetryHint::At(at),
-                        })
-                })
+                .map(|hint| resp.headers.retry_at.map(RetryHint::At).unwrap_or(hint))
         });
 
     let (kind, cause) = classify_response(status, &signal, ctx, retry_hint);
@@ -1460,7 +1457,7 @@ mod tests {
 
     fn gmail_response(status: u16, body: &str) -> Error {
         Error::response_from_parts(
-            crate::error::GmailService::GmailApi,
+            crate::quota::ApiSurface::Gmail,
             status,
             crate::error::GmailResponseHeaders::default(),
             Bytes::copy_from_slice(body.as_bytes()),
@@ -1516,7 +1513,7 @@ mod tests {
             ctx.surface = surface;
             assert_eq!(scope_for(&ctx), scope);
             let error = Error::response_from_parts(
-                surface.into(),
+                surface,
                 403,
                 crate::error::GmailResponseHeaders::default(),
                 Bytes::from_static(
@@ -2152,7 +2149,7 @@ mod tests {
         );
         let resp_headers = crate::error::GmailResponseHeaders::from_headers(&headers);
         let resp = GmailResponseError {
-            service: crate::error::GmailService::GmailApi,
+            service: crate::quota::ApiSurface::Gmail,
             status: 500,
             headers: resp_headers,
             body: bytes::Bytes::from_static(b"x"),
@@ -2201,7 +2198,7 @@ mod tests {
     fn json_decode_pushes_acknowledged_attempt_cause() {
         let source = serde_json::from_slice::<serde_json::Value>(b"not json").expect_err("decode");
         let err = Error::JsonDecode {
-            service: crate::error::GmailService::GmailApi,
+            service: crate::quota::ApiSurface::Gmail,
             source,
         };
         let acc = into_account_error(err, GmailErrorContext::inventory());
@@ -2463,7 +2460,7 @@ mod tests {
         let resp_headers = crate::error::GmailResponseHeaders::from_headers_at(&headers, now);
         let body = body_with_reason("rateLimitExceeded");
         let resp = GmailResponseError {
-            service: crate::error::GmailService::GmailApi,
+            service: crate::quota::ApiSurface::Gmail,
             status: 429,
             headers: resp_headers,
             body: bytes::Bytes::copy_from_slice(body.as_bytes()),
@@ -2479,7 +2476,7 @@ mod tests {
         assert_eq!(hint.min_delay(now), std::time::Duration::from_secs(42));
 
         let resp = GmailResponseError {
-            service: crate::error::GmailService::GmailApi,
+            service: crate::quota::ApiSurface::Gmail,
             status: 429,
             headers: crate::error::GmailResponseHeaders::from_headers(&headers),
             body: bytes::Bytes::copy_from_slice(body.as_bytes()),

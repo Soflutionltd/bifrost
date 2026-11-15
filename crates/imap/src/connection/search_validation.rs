@@ -11,10 +11,9 @@ impl ImapConnection {
                 criteria: criteria.into(),
             },
             &crate::codec::encode::EncodeOptions {
-                utf8_mode: false,
+                utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
                 literal_mode: crate::codec::encode::LiteralMode::LiteralPlus,
-                capabilities: snap.capabilities.clone(),
-                enabled: snap.enabled.clone(),
+                session: std::sync::Arc::clone(&snap.session),
             },
         )
     }

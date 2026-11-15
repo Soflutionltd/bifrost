@@ -409,8 +409,10 @@ impl Scheduler {
             admission.lanes[lane].push_back(AdmissionRequest { account, kind, tx });
         }
         self.inner.admitted.notify_one();
-        rx.await
-            .map_err(|_| crate::Error::Other("scheduler admission was abandoned".into()))
+        // The dispatcher dropped our request unanswered: it is gone, so no
+        // retry can succeed. A typed error lets callers tell this apart from
+        // a full lane (which is transient).
+        rx.await.map_err(|_| crate::Error::ShuttingDown)
     }
 
     fn ensure_dispatcher(&self) {

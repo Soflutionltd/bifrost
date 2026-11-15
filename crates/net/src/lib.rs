@@ -47,6 +47,7 @@ pub mod test_support;
 pub mod trace;
 mod upload;
 pub mod url;
+pub use url::{AdmittedUrl, TrustedOrigins};
 
 pub use account_error::{
     NetErrorContext, into_account_error_with_throttle_scope, token_source_account_error,

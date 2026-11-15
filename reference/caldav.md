@@ -1598,3 +1598,13 @@ RRULE text so malformed provider data need not erase a user's meeting.
 There is no separate UNTIL range parser: `EventRange::admits` retains recurring
 masters, including rules bounded by UNTIL, because occurrence starts do not
 bound their ends and RDATE can extend a series.
+
+## Shared credential-origin admission
+
+`DavDispatch` stores net's `TrustedOrigins` rather than its own string allowlist.
+`is_trusted_url` asks net to mint an admitted URL before credentials are selected.
+Only authenticated discovery widens this per-leg set; cross-origin HTTPS homes
+remain supported and an HTTPS base still refuses discovered plaintext homes.
+Cloned dispatchers copy admission state so another protocol leg is not widened.
+Absolute native hrefs are recognized by URL parsing, including uppercase schemes;
+relative native hrefs retain configured-base directory resolution.

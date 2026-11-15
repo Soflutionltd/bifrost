@@ -1,14 +1,20 @@
+pub(super) use super::error::finish_partial;
+use super::error::{
+    concurrency_conflict_error, invalid_move_destination_error, store_failed_error,
+    uidvalidity_changed_error,
+};
 use bifrost_types::{
     Application, ErrorScope, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets,
     TargetRef, TargetRole,
 };
+#[cfg(test)]
+use bifrost_types::{RequestErrorKind, ServerErrorKind};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream,
-    AttemptCause, BatchFailure, BatchItemId, Cause, DiagnosticText, FlagOp, IdempotencyKey,
-    ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol, RequestCause,
-    RequestErrorKind, ServerCause, ServerErrorKind, StateCause, SyncEvent, TransmissionState,
+    AccountError, AccountErrorKind, AccountOperation, AccountStream, BatchFailure, BatchItemId,
+    FlagOp, IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol,
+    SyncEvent, TransmissionState,
 };
 use futures::StreamExt;
 
@@ -1250,78 +1256,6 @@ fn mutation_error_verdict(error: &AccountError) -> Verdict<MutationSuccess> {
     Verdict::SubmissionError(error.clone())
 }
 
-fn invalid_move_destination_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only("bulk-move destination is not a sendable mailbox"),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(AccountOperation::BulkMove)
-    .try_build()
-    .expect("valid account error classification")
-}
-
-/// Build a `ConcurrencyConflict` `AccountError` for STORE UNCHANGEDSINCE
-/// conflicts. Takes the caller's `AccountOperation` so flag, move, and
-/// destroy paths each surface their own operation - the central recovery
-/// mapping needs the correct op to pick `Retry::AfterStateRefresh` for
-/// the right kind of work.
-fn concurrency_conflict_error(operation: AccountOperation, folder: &MailboxName) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::ConcurrencyConflict,
-        Cause::State(StateCause::ConcurrencyConflict),
-    )
-    .protocol(Protocol::Imap)
-    .operation(operation)
-    .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
-    ))
-    .try_build()
-    .expect("valid account error classification")
-}
-
-/// Build a generic `Request(Malformed)` for UIDVALIDITY mismatch before mutation.
-fn uidvalidity_changed_error(operation: AccountOperation, folder: &MailboxName) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only("UIDVALIDITY changed before mutation"),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(operation)
-    .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
-    ))
-    .try_build()
-    .expect("valid account error classification")
-}
-
-/// Build a generic server refusal for a STORE command failure without a
-/// specific per-item response code. Takes the caller's `AccountOperation`
-/// so move / destroy / flag mutations each carry their own op.
-fn store_failed_error(operation: AccountOperation, folder: &MailboxName) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
-        Cause::Server(ServerCause::Error { status: None }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(operation)
-    .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
-    ))
-    .push_cause(Cause::Attempt(AttemptCause::new(
-        TransmissionState::Acknowledged,
-    )))
-    .text(DiagnosticText::support_only(
-        "STORE command failed with no per-item response code",
-    ))
-    .try_build()
-    .expect("valid account error classification")
-}
-
 /// Remove the just-marked messages, with a bounded fallback for servers
 /// that have neither UIDPLUS nor IMAP4rev2.
 ///
@@ -1363,13 +1297,7 @@ pub(super) fn folder_targets(folder: &MailboxName, role: TargetRole) -> StepTarg
         ErrorScope::Cursor(super::folder_scope(folder)),
     )])
 }
-pub(super) fn finish_partial(error: AccountError, record: PartialCommitBuilder) -> AccountError {
-    error
-        .into_builder()
-        .partial_commit(record)
-        .try_build()
-        .expect("valid IMAP partial commitment")
-}
+
 /// Run one bounded Result-lane window through the bulk folder engine. No task
 /// is spawned, so dropping the public future retains its existing cancellation
 /// behavior. Records are deferred only for composition, never re-decided here.
@@ -1484,7 +1412,11 @@ fn move_fallback_record(
         dest_uids,
         ..
     }) = &copy.copy_uid
+        && *uid_validity != 0
     {
+        // A zero epoch cannot identify a message. Keep the known folder
+        // effect but omit unusable message detail: users need truthful
+        // reconciliation targets after a partially completed move.
         // Support detail must be bounded by local policy, never a server's
         // numeric span. The folder target still identifies every copied item
         // when message detail is truncated (StepTargets::at_least).
@@ -1495,6 +1427,9 @@ fn move_fallback_record(
                 .take(remaining)
             {
                 remaining -= 1;
+                if uid == 0 {
+                    continue;
+                }
                 refs.push(TargetRef::new(
                     TargetRole::Destination,
                     ErrorScope::Message {
@@ -1828,38 +1763,15 @@ mod tests {
 
     #[test]
     fn stream_terminating_keeps_account_authz_and_schema_terminal() {
-        use bifrost_types::{
-            AccessCause, AccessErrorKind, AccountErrorBuilder, AuthCause, AuthErrorKind, MailboxId,
-            StateCause, SyncStateErrorKind,
-        };
-        let auth = AccountErrorBuilder::new(
-            AccountErrorKind::Authentication(AuthErrorKind::Expired),
-            Cause::Auth(AuthCause::Expired),
-        )
-        .protocol(Protocol::Imap)
-        .operation(AccountOperation::UpdateFlags)
-        .try_build()
-        .expect("auth error");
+        use bifrost_types::{MailboxId, SyncStateErrorKind};
+        let auth = crate::account::error::test_support::expired_auth();
         assert!(stream_terminating(&auth));
 
-        let schema = AccountErrorBuilder::new(
-            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-            Cause::State(StateCause::SchemaIncompatible),
-        )
-        .protocol(Protocol::Imap)
-        .operation(AccountOperation::UpdateFlags)
-        .try_build()
-        .expect("schema error");
+        let schema = crate::account::error::test_support::incompatible_schema();
         assert!(stream_terminating(&schema));
 
-        let personal_permission_denied = AccountErrorBuilder::new(
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied { resource: None }),
-        )
-        .protocol(Protocol::Imap)
-        .operation(AccountOperation::UpdateFlags)
-        .try_build()
-        .expect("personal-folder permission error");
+        let personal_permission_denied =
+            crate::account::error::test_support::personal_permission_denied();
         assert!(stream_terminating(&personal_permission_denied));
 
         // The same NO [NOPERM] on a shared folder, through the production
@@ -1885,14 +1797,7 @@ mod tests {
         ));
         assert!(!stream_terminating(&shared_revoked));
 
-        let transient = AccountErrorBuilder::new(
-            AccountErrorKind::Server(bifrost_types::ServerErrorKind::Unavailable),
-            Cause::Server(bifrost_types::ServerCause::Unavailable { retry_hint: None }),
-        )
-        .protocol(Protocol::Imap)
-        .operation(AccountOperation::UpdateFlags)
-        .try_build()
-        .expect("server error");
+        let transient = crate::account::error::test_support::unavailable_update();
         assert!(!stream_terminating(&transient));
     }
 
@@ -2202,17 +2107,7 @@ mod tests {
 
     #[test]
     fn in_flight_mutation_error_is_uncertain_but_acknowledged_is_failed() {
-        let build = |state| {
-            AccountErrorBuilder::new(
-                AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-            )
-            .protocol(Protocol::Imap)
-            .operation(AccountOperation::UpdateFlags)
-            .push_cause(Cause::Attempt(AttemptCause::new(state)))
-            .try_build()
-            .expect("valid mutation error")
-        };
+        let build = |state| crate::account::error::test_support::unavailable_update_at(state);
 
         let in_flight = build(TransmissionState::InFlight);
         let uncertain = settled(&[4], AccountOperation::UpdateFlags, |_| {
@@ -2299,14 +2194,40 @@ mod tests {
         assert_eq!(stale[0].uid, 1);
     }
     fn partial_retry() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        )
-        .operation(AccountOperation::BulkMove)
-        .try_build()
-        .unwrap()
+        crate::account::error::test_support::retryable_move()
     }
+    #[test]
+    fn copyuid_diagnostics_omit_invalid_message_identities() {
+        // A zero destination UID cannot be built: `UidRange::single` rejects
+        // it (RFC 3501 nz-number), so only the invalid UIDVALIDITY is testable.
+        for (uid_validity, uid, expected_refs) in [(0, 1, 2), (9, 1, 3)] {
+            let copy = crate::types::CopyResult {
+                code: None,
+                copy_uid: Some(ResponseCode::CopyUid {
+                    uid_validity,
+                    source_uids: vec![crate::types::UidRange::single(1)],
+                    dest_uids: vec![crate::types::UidRange::single(uid)],
+                }),
+            };
+            let error = move_fallback_record(
+                partial_retry(),
+                &copy,
+                false,
+                &folder(),
+                &MailboxName::new("Archive").unwrap(),
+            );
+            let steps = error.partial_commit().unwrap().steps();
+            assert_eq!(steps[0].effect(), Some(StepEffect::Copied));
+            assert_eq!(steps[0].targets().refs.len(), expected_refs);
+            assert!(!steps[0].targets().complete);
+            for target in &steps[0].targets().refs {
+                if let ErrorScope::Message { id } = &target.scope {
+                    assert!(decode_object_id(id, AccountOperation::BulkMove).is_ok());
+                }
+            }
+        }
+    }
+
     #[test]
     fn copyuid_diagnostic_detail_is_bounded_across_ranges() {
         let copy = crate::types::CopyResult {

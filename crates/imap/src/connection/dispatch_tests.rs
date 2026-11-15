@@ -37,8 +37,7 @@ fn tagged_bad() -> TaggedResponse {
 
 fn default_ctx() -> ConsumerContext<'static> {
     ConsumerContext {
-        capabilities: &[],
-        enabled: &[],
+        session: crate::types::profile::SessionCapabilities::empty(),
         command_target: None,
         command_tag: "A001",
     }

@@ -960,8 +960,7 @@ fn offered_authentication(
     include_login: bool,
 ) -> Vec<String> {
     let mut offered = profile
-        .auth_mechanisms
-        .iter()
+        .auth_mechanisms()
         .map(|mechanism| format!("AUTH={mechanism}"))
         .collect::<Vec<_>>();
     if include_login && profile.supports_login_command() {
@@ -987,13 +986,13 @@ fn offered_authentication(
 /// included) are encoded by the driver from live state at send time, and a
 /// handle-side encoding decision would go stale while the command is queued.
 pub(super) fn is_rev2_from_snapshot(snap: &driver::ConnectionStateSnapshot) -> bool {
-    crate::types::profile::imap4rev2_active(&snap.capabilities, &snap.enabled)
+    snap.session.imap4rev2_active()
 }
 
 /// Whether `capability` is usable on the connection a
 /// [`ConnectionStateSnapshot`](driver::ConnectionStateSnapshot) describes: the
 /// snapshot-side view of the single capability authority
-/// `crate::types::profile::supports` (advertised, QRESYNC implying CONDSTORE,
+/// `SessionCapabilities::supports` (advertised, QRESYNC implying CONDSTORE,
 /// or folded into active IMAP4rev2).
 ///
 /// EVERY handle gate of the shape "capability X, or rev2 folds it in" goes
@@ -1004,7 +1003,7 @@ pub(super) fn snapshot_supports(
     snap: &driver::ConnectionStateSnapshot,
     capability: &Capability,
 ) -> bool {
-    crate::types::profile::supports(&snap.capabilities, &snap.enabled, capability)
+    snap.session.supports(capability)
 }
 
 /// Protocol error adapter; certificate policy and parsing are SASL-owned.

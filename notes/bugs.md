@@ -261,47 +261,10 @@ status-line precedent applies: net exports the status classification, and JMAP
 overrides only the JMAP-typed problem types (`limit`, `unknownCapability`,
 `notJSON`, `notRequest`).
 
-## BUG-075 - Graph presents its Graph-audience token to EWS and Autodiscover
-
-**Reported by:** graph (probable live; not observable hermetically).
-
-`bifrost_net::TokenSource::current()` takes no resource or host.
-`public_folder::ews_client` builds the EWS client over the Graph client's own
-`AccountNet`, and Autodiscover posts through `execute_aux` with
-`AuxTarget::Bearer` on that same net. Both present the Graph access token, whose
-audience is `https://graph.microsoft.com`, to `outlook.office365.com`, which needs
-an Outlook/EWS-audience token; Azure AD issues one audience per access token, and
-the trait gives a consumer no way to answer differently per host. Unless
-something outside the crate compensates, EWS streaming push, public-folder sync,
-public contacts and calendars, and delegate Autodiscover cannot authenticate in
-production; the scripted wire accepts any bearer. The axis belongs in net: either
-`AccountSpec` carries a token source per trusted origin, or
-`TokenSource::current(&Audience)`, with Graph constructing its Outlook-origin
-requests with the Outlook audience. Related: STR-113 (cloud-aware origins).
-
-## BUG-099 - SMTP fabricates a network failure to classify a contended token cache
-
-**Reported by:** smtp-sasl; residue after wave 11 fixed the IMAP and ManageSieve token paths.
-
-SMTP's `oauth2_token_blocking`
-(`crates/smtp/src/transport/smtp/authentication/credentials.rs`) turns
-`TokenSnapshot::Contended` into a fabricated `bifrost_net::Error::RefreshFailed {
-source: Network { "OAuth token cache is busy" } }` purely to obtain a transient
-classification. The classification of a snapshot state belongs on `TokenSnapshot`
-(or in net's projection). Token-lookup failures themselves are now classified
-once, by `bifrost_net::token_source_account_error`, for IMAP, ManageSieve and
-SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
-
 ## BUG-170 - Small wave 10 lateral findings across Google, Graph, JMAP and IMAP
 
 **Reported by:** wave 10 fixers (lateral).
 
-- Graph etag updates apply every insert before every removal, whatever the wire
-  order of a repeated id, so a delete then re-add of one id within a page can
-  leave the wrong final state.
-- JMAP: a method response omitted entirely from a JMAP reply maps through
-  `CallNotFound` to a terminal `MissingField` outside the send path, where the
-  per-id lanes now report an omission as unanswered (retryable).
 - IMAP: NOTIFY `MessageNew.fetch_attrs` still bypasses FETCH extension admission
   (`validate_fetch_wire`); its raw items get syntax validation only.
 
@@ -309,9 +272,6 @@ SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
 
 **Reported by:** wave 11 fixers (lateral).
 
-- IMAP `account/mutate.rs`: the COPYUID diagnostic target construction can
-  still encode a zero UIDVALIDITY epoch, although SELECT assembly now
-  normalizes zero to absent.
 - Resumable uploads (`crates/net/src/resumable.rs`, used by Google Drive and
   OneDrive): both paths accept a 200 or 201 after a non-final chunk without
   verifying that every payload byte was sent.
@@ -365,8 +325,8 @@ SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
 - Closed-account guards are not universal across provider methods: the shared
   `AccountClosed` kind replaced existing refusals, but many methods have no
   lifecycle gate at all.
-- Graph `account/public_folder.rs` emits `Done` after some `Terminated`
-  inventory events.
+- Graph `account/public_folder.rs` change streams emit `Done(None)` after
+  `Terminated` at eight sites (inventory already returns before `Done`).
 - bifrost-sasl SCRAM server-final parsing still accepts an empty `e=` and a
   message carrying both `e=` and `v=`.
 - Sync `engine/attach.rs` `AttachingWriter` aborts the checkpoint writer task
@@ -407,12 +367,6 @@ SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
 - IMAP `codec/decode/envelope_fetch.rs::gmail_id` documents unsigned 64-bit
   ids but parses with `number64`, which rejects values above the signed
   63-bit ceiling.
-- IMAP `account/envelope.rs` cursor decoding still accepts a zero or oversized
-  persisted MODSEQ, although request construction now refuses those values
-  through the bounded `ModSeq`.
-- JMAP `sync/mutation.rs` labels an unsupported `FlagOp` as `NotParsable`.
-- JMAP state cache: an empty probe state can become an `ifInState` guard while
-  set continuity rejects empty endpoints; the existing policy was preserved.
 - Net and engine hold stores: the engine records a second hold for a net
   `LocalHold` error because nothing in `AccountError` marks local-hold
   provenance; removing it needs a provenance marker set by net and every
@@ -448,34 +402,16 @@ SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
 - Sync `engine/attach.rs::scope_covers_membership` compares folder strings
   without object type, so a type-qualified DAV `FolderType` scope can match a
   same-string mail membership.
-- Graph EWS streaming frame accumulation (`ews/streaming.rs`) has no size cap.
-- Graph `merge_shared_mailboxes` documents exact-string deduplication but
-  compares case-insensitively.
-- Graph `pim/messages.rs::delete_extended_property` builds a `$batch`
-  envelope with no 20-leg bound.
-- Google single-label mutations accept an empty patch before validating the
-  target kind.
-- Google `account/calendar.rs::recurrence_lines` writes RRULE text without the
-  shared `bifrost_types` recurrence validation.
-- JMAP `sync/pim.rs` turns an unrepresentable scheduled-send timestamp into an
-  empty string; JMAP's event end calculation substitutes the start when date
-  addition overflows.
 - IMAP NOTIFY FETCH operands lack FETCH-equivalent capability admission, and
   `SearchCriteria::mod_seq(u64)` accepts values above the protocol ceiling.
 - SMTP: in both drivers an OAuth mechanism incompatibility falls through to
   password mechanism selection.
-- JMAP `sync/calendar_ops.rs::event_from_jmap` now fails on a malformed server
-  duration; if list and range reads propagate it, one bad event fails the whole
-  read instead of being skipped. An enterprise user expects the rest of the
-  calendar to show. Check the callers.
 - Sync `cursor/ledger.rs` `ErrorDigest` exposes the complete `DiagnosticInfo`,
   support-only text included, as public fields reachable through
   `SyncEngine::debt`; nothing enforces the consent tier before export.
 - IMAP `types/capability.rs` `Capability::Auth` now carries
   `bifrost_sasl::MechanismName`, a type from the private sasl crate in a public
   IMAP enum, not re-exported from bifrost-imap.
-- Google `error.rs` `RetryAfter { Delta, At }` is a private copy of
-  `bifrost_types::RetryHint`, converted right after parsing.
 - Sync `PagePublisher::publish_page`, `publish_marker`, `publish_unacked` and
   the `Arc::ptr_eq` asserts in `BackfillRunner::run_partition` and
   `emit_backfill_complete` guard wiring mistakes with `assert!`, `expect` and
@@ -488,10 +424,58 @@ SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
   without `Retry-After` reports an earlier attempt's hint.
 - IMAP auth ladder rejection list names `LOGIN` twice (SASL LOGIN and the
   LOGIN command).
-- Graph `calendar/recurrence.rs` keeps three weekday-name maps and
-  re-validates WKST the shared parser already checked;
-  `account/calendar_public.rs` hard-codes an unnamed `chunks(20)` for EWS SOAP
-  batches.
+
+## BUG-175 - Small wave 15 lateral findings across sync, net, Graph, JMAP and IMAP
+
+**Reported by:** wave 15 fixers (lateral).
+
+- Sync `cursor/ledger.rs` `record_barrier` permits an incident sharing a
+  waived entry's key; `cross_waived_barriers` can then authorize crossing
+  through that entry but replace the operator's waiver with the incident's
+  policy, so a waiver may be silently lost.
+- Sync `engine/passthrough.rs` explicitly bypasses engine pause, admission and
+  throttle holds.
+- Sync `backfill/scope_walk.rs`: open-page walking can repeat an empty window
+  at `u32::MAX` with `MoreBeyond`.
+- Sync acknowledgement tokens are not bound to an account, and a standalone
+  `supersede` cannot update receipts already delivered.
+- bifrost-net: a caller-supplied `Authorization` header is outside the new
+  automatic-bearer origin restriction; `net.rs` encoder docs say zero-length
+  requests are rejected upstream while the adapter returns an empty stream.
+- Sync `cursor/ack_token.rs`: a wrong or rotated key and a corrupted token both
+  decode to the same `Error::Other("invalid acknowledgement token")`; a
+  key-identifier byte in the header would let a consumer tell lost key from
+  corrupt storage (needs a ruling).
+- Sync `engine/lane.rs`: the `BackfillAdmission` permit slot is shared by every
+  clone of a gate, so two concurrent passes on one gate would release each
+  other's permits; passes are sequential today, nothing enforces it.
+- bifrost-net `AccountSpec::trusted_origins` is set by nothing in the
+  workspace and no test drives its admission gate in `send_streaming_inner`;
+  `AccountNet::admitted_request` forwards the URL string, so the proof an
+  `AdmittedUrl` carries is never checked there.
+- SMTP `submission.rs` dropped the partial-submission `tracing::warn!` that
+  IMAP `send_rfc5322` emitted (delivered, failed and uncertain counts), and its
+  malformed-envelope and hold errors now carry `Protocol::Smtp` where they
+  carried the IMAP vocabulary.
+- Sync `InventoryEntry::differs_from` doc still says "flags, size, or its
+  version token" although `size` moved to `Fingerprint::size`.
+- Sync `AckToken` receipts hold the full cumulative claim, growing the
+  per-page retention already noted on `BoundaryEntry`.
+- SMTP `Cargo.toml` makes `jiff` unconditional though only `submission.rs`
+  (gated on tokio plus account-error) uses it.
+- dav-core `resolve_url` now treats any parseable href as absolute, so a bare
+  `scheme:opaque` href such as `mailto:` is returned as-is instead of joined to
+  the base.
+- IMAP composed `contact_autocomplete` and `event_autocomplete` refuse as
+  `ContactSearch` / `EventSearch` although `ContactAutocomplete` and
+  `EventAutocomplete` operations exist.
+- JMAP `calendar_ops.rs::end_from_start_duration` passes an unparseable start
+  through verbatim.
+- IMAP `connection/dispatch.rs::EnableConsumer` returns only the first ENABLED
+  frame while `ProtocolState` adopts every frame.
+- `reference/imap.md` still has an older paragraph saying namespace error
+  scopes do not exist, and contradicts itself on STORE response-text retention
+  (`types/fetch.rs::StoreResult` keeps `text`).
 
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 

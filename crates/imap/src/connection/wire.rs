@@ -137,16 +137,19 @@ impl WireReader {
     /// * On I/O error -> `Err(Error::Io)`
     /// * On EOF (zero-byte read) -> `Err(Error::Closed)`
     ///
-    /// `utf8_mode` should be `true` when `UTF8=ACCEPT` (RFC 6855
+    /// `utf8_mode` should be `WireMode::Utf8` when `UTF8=ACCEPT` (RFC 6855
     /// Section 3) has been enabled or `IMAP4rev2` is active (RFC 9051
     /// Section 7).
-    pub(crate) async fn read_one(&mut self, utf8_mode: bool) -> Result<Response, Error> {
+    pub(crate) async fn read_one(
+        &mut self,
+        utf8_mode: crate::codec::utf7::WireMode,
+    ) -> Result<Response, Error> {
         self.read_one_limited(utf8_mode, None).await
     }
 
     pub(crate) async fn read_one_limited(
         &mut self,
-        utf8_mode: bool,
+        utf8_mode: crate::codec::utf7::WireMode,
         limit: Option<usize>,
     ) -> Result<Response, Error> {
         loop {
@@ -442,7 +445,7 @@ impl WireReader {
     /// (RFC 9051 Section 7: quoted-strings carry raw UTF-8).
     fn try_parse_response_limited(
         &mut self,
-        utf8_mode: bool,
+        utf8_mode: crate::codec::utf7::WireMode,
         limit: Option<usize>,
     ) -> Result<Option<Response>, Error> {
         if self.buffer_is_empty() {

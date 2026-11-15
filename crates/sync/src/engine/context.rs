@@ -161,6 +161,7 @@ impl SlotContext {
     /// it, so it has to outlive the dispatch on the caller's stack.
     pub(super) fn recovery<'a>(&'a self, writer: &'a WriterHandle) -> RecoveryContext<'a> {
         RecoveryContext {
+            scheduler: &self.scheduler,
             deferred_schema_reset: &self.deferred_schema_reset,
             bandwidth_budget: self.bandwidth_budget.as_ref(),
             factory: &self.factory,

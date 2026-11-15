@@ -212,7 +212,6 @@ pub(super) fn inventory_entry_from_parsed(
     Some(InventoryEntry {
         id: scope.mint_object_id(&id),
         memberships: vec![membership],
-        size: None,
         blob_id: None,
         fingerprint,
         thread_id,
@@ -1697,7 +1696,7 @@ mod tests {
         });
 
         let entry = inventory_entry_from_value(&scope, &value).expect("entry expected");
-        assert!(entry.size.is_none());
+        assert!(entry.fingerprint.size.is_none());
         assert_eq!(entry.message_id.as_deref(), Some("<m1@example.test>"));
         assert_eq!(entry.references.len(), 2);
         assert!(matches!(

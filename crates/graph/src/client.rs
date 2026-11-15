@@ -2756,7 +2756,7 @@ mod tests {
         let client = GraphClient::new("token");
         client.attach_account(AccountId("graph-cap-forward".to_string()));
         let account = opened_shape_account(&client);
-        account.set_bandwidth_cap(Some(1234));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(1234));
         assert_eq!(client.account_net().unwrap().bandwidth_cap(), Some(1234));
         account.set_bandwidth_cap(None);
         assert_eq!(client.account_net().unwrap().bandwidth_cap(), None);
@@ -2770,13 +2770,13 @@ mod tests {
         let id = AccountId("graph-cap-reattach".to_string());
         client.attach_account(id.clone());
         let account = opened_shape_account(&client);
-        account.set_bandwidth_cap(Some(2345));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(2345));
         assert_eq!(client.account_net().unwrap().bandwidth_cap(), Some(2345));
         // Keep no AccountNet clone alive across replacement: only the slot
         // may hold the registry's weakly retained budget alive.
         client.attach_account(id);
         assert_eq!(client.account_net().unwrap().bandwidth_cap(), Some(2345));
-        account.set_bandwidth_cap(Some(3456));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(3456));
         assert_eq!(client.account_net().unwrap().bandwidth_cap(), Some(3456));
     }
 
@@ -2790,10 +2790,10 @@ mod tests {
             AccountId("graph-cap-source".to_string()),
             AccountSpec::new(None),
         );
-        source.set_bandwidth_cap(Some(1111));
+        source.set_bandwidth_cap(bifrost_types::BandwidthCap::new(1111));
         let destination_id = AccountId("graph-cap-destination".to_string());
         let destination = net.attach_account(destination_id.clone(), AccountSpec::new(None));
-        destination.set_bandwidth_cap(Some(2222));
+        destination.set_bandwidth_cap(bifrost_types::BandwidthCap::new(2222));
         let client = GraphClient::with_account_net(
             source.clone(),
             "https://graph.microsoft.com/v1.0",
@@ -2809,7 +2809,7 @@ mod tests {
         assert_eq!(attached.account(), &destination_id);
         assert_eq!(attached.bandwidth_cap(), Some(2222));
         let account = opened_shape_account(&client);
-        account.set_bandwidth_cap(Some(3333));
+        account.set_bandwidth_cap(bifrost_types::BandwidthCap::new(3333));
         assert_eq!(attached.bandwidth_cap(), Some(3333));
         assert_eq!(destination.bandwidth_cap(), Some(3333));
         assert_eq!(source.bandwidth_cap(), Some(1111));

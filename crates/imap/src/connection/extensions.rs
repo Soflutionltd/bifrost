@@ -148,9 +148,11 @@ impl ImapConnection {
     /// (RFC 5161 Section 2).
     pub async fn enable_utf8(&self, timeout: Duration) -> Result<bool, Error> {
         let enabled = self.enable(&["UTF8=ACCEPT"], timeout).await?;
-        Ok(enabled
+        let enabled: crate::types::profile::EnabledSet = enabled
             .iter()
-            .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT")))
+            .map(|extension| Capability::from_imap_str(extension))
+            .collect();
+        Ok(enabled.contains(&Capability::Utf8Accept))
     }
 
     /// ENABLE  -  request the server to activate one or more IMAP extensions
@@ -192,7 +194,10 @@ impl ImapConnection {
         // RFC 5161 Section 2: ENABLE is only valid in Authenticated state.
 
         let cmd = Command::Enable {
-            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            capabilities: capabilities
+                .iter()
+                .map(|c| Capability::from_imap_str(c))
+                .collect(),
         };
         let consumer = super::dispatch::EnableConsumer::default();
         self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))

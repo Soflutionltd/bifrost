@@ -23,7 +23,7 @@ pub(super) struct SessionView<'a> {
 
 impl SessionView<'_> {
     fn supports(&self, cap: &Capability) -> bool {
-        crate::types::profile::supports(&self.snapshot.capabilities, &self.snapshot.enabled, cap)
+        self.snapshot.session.supports(cap)
     }
 
     fn require(&self, cap: Capability) -> Result<(), Error> {
@@ -44,12 +44,7 @@ impl SessionView<'_> {
 
     pub(super) fn require_enabled(&self, cap: Capability) -> Result<(), Error> {
         self.require(cap.clone())?;
-        if self
-            .snapshot
-            .enabled
-            .iter()
-            .any(|enabled| enabled.eq_ignore_ascii_case(&cap.to_string()))
-        {
+        if self.snapshot.enabled.contains(&cap) {
             Ok(())
         } else {
             // An Outlook user expects negotiation before using a supported mode.
@@ -63,7 +58,7 @@ impl SessionView<'_> {
     }
 
     fn is_rev2(&self) -> bool {
-        crate::types::profile::imap4rev2_active(&self.snapshot.capabilities, &self.snapshot.enabled)
+        self.snapshot.session.imap4rev2_active()
     }
 }
 
@@ -295,27 +290,7 @@ pub(super) fn admit(command: &Command, session: &SessionView<'_>) -> Result<(), 
 }
 
 pub(super) fn encode_options(snap: &ConnectionStateSnapshot) -> EncodeOptions {
-    let rev2 = crate::types::profile::imap4rev2_active(&snap.capabilities, &snap.enabled);
-    EncodeOptions {
-        utf8_mode: rev2
-            || snap
-                .enabled
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT")),
-        literal_mode: if snap.capabilities.contains(&Capability::LiteralPlus) {
-            crate::codec::encode::LiteralMode::LiteralPlus
-        } else if crate::types::profile::supports(
-            &snap.capabilities,
-            &snap.enabled,
-            &Capability::LiteralMinus,
-        ) {
-            crate::codec::encode::LiteralMode::LiteralMinus
-        } else {
-            crate::codec::encode::LiteralMode::Synchronizing
-        },
-        capabilities: snap.capabilities.clone(),
-        enabled: snap.enabled.clone(),
-    }
+    EncodeOptions::from_session(std::sync::Arc::clone(&snap.session))
 }
 
 /// Proof that the handle snapshot admitted every command of one submission.
@@ -358,10 +333,7 @@ impl ImapConnection {
 impl SessionView<'_> {
     pub(super) fn check_utf8_only_enforced(&self) -> Result<(), Error> {
         let snap = self.snapshot;
-        let utf8_enabled = snap
-            .enabled
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT"));
+        let utf8_enabled = snap.enabled.contains(&Capability::Utf8Accept);
         let needs_utf8 =
             snap.capabilities.contains(&Capability::Utf8Only) && !utf8_enabled && !self.is_rev2();
 
@@ -397,11 +369,7 @@ impl SessionView<'_> {
     }
     pub(super) fn require_condstore(&self) -> Result<(), Error> {
         let snap = self.snapshot;
-        let has_condstore = crate::types::profile::supports(
-            &snap.capabilities,
-            &snap.enabled,
-            &Capability::Condstore,
-        );
+        let has_condstore = snap.session.supports(&Capability::Condstore);
 
         if !has_condstore {
             return Err(Error::MissingCapability("CONDSTORE".into()));
@@ -411,11 +379,7 @@ impl SessionView<'_> {
     pub(super) fn require_searchres(&self) -> Result<(), Error> {
         let snap = self.snapshot;
         // RFC 9051 Appendix E: IMAP4rev2 folds SEARCHRES into the base protocol.
-        let has_searchres = crate::types::profile::supports(
-            &snap.capabilities,
-            &snap.enabled,
-            &Capability::SearchRes,
-        );
+        let has_searchres = snap.session.supports(&Capability::SearchRes);
 
         if !has_searchres {
             return Err(Error::MissingCapability("SEARCHRES".into()));
@@ -446,13 +410,7 @@ impl SessionView<'_> {
         {
             let snap = self.snapshot;
 
-            if patterns.len() > 1
-                && !crate::types::profile::supports(
-                    &snap.capabilities,
-                    &snap.enabled,
-                    &Capability::ListExtended,
-                )
-            {
+            if patterns.len() > 1 && !snap.session.supports(&Capability::ListExtended) {
                 return Err(Error::MissingCapability("LIST-EXTENDED".into()));
             }
 
@@ -462,13 +420,7 @@ impl SessionView<'_> {
             // RFC 5819 LIST-STATUS.
             let needs_list_extended = !selection_options.is_empty() || !return_options.is_empty();
 
-            if needs_list_extended
-                && !crate::types::profile::supports(
-                    &snap.capabilities,
-                    &snap.enabled,
-                    &Capability::ListExtended,
-                )
-            {
+            if needs_list_extended && !snap.session.supports(&Capability::ListExtended) {
                 return Err(Error::MissingCapability("LIST-EXTENDED".into()));
             }
 
@@ -484,11 +436,8 @@ impl SessionView<'_> {
                 if matches!(
                     option,
                     crate::types::command_options::ListSelect::SpecialUse
-                ) && !crate::types::profile::supports(
-                    &snap.capabilities,
-                    &snap.enabled,
-                    &Capability::SpecialUse,
-                ) {
+                ) && !snap.session.supports(&Capability::SpecialUse)
+                {
                     return Err(Error::MissingCapability("SPECIAL-USE".into()));
                 }
             }
@@ -515,11 +464,8 @@ impl SessionView<'_> {
                 if matches!(
                     option,
                     crate::types::command_options::ListReturn::SpecialUse
-                ) && !crate::types::profile::supports(
-                    &snap.capabilities,
-                    &snap.enabled,
-                    &Capability::SpecialUse,
-                ) {
+                ) && !snap.session.supports(&Capability::SpecialUse)
+                {
                     return Err(Error::MissingCapability("SPECIAL-USE".into()));
                 }
             }
@@ -606,11 +552,7 @@ impl SessionView<'_> {
                 }
                 crate::types::command_options::StatusAttribute::Size => {
                     let snap = self.snapshot;
-                    if !crate::types::profile::supports(
-                        &snap.capabilities,
-                        &snap.enabled,
-                        &Capability::StatusSize,
-                    ) {
+                    if !snap.session.supports(&Capability::StatusSize) {
                         return Err(Error::MissingCapability("STATUS=SIZE".into()));
                     }
                 }
@@ -619,10 +561,9 @@ impl SessionView<'_> {
                 }
                 crate::types::command_options::StatusAttribute::AppendLimit => {
                     let has_appendlimit = !matches!(
-                        crate::types::ServerProfile::new(
-                            self.snapshot.capabilities.clone(),
-                            self.snapshot.enabled.clone()
-                        )
+                        crate::types::ServerProfile::from_session(std::sync::Arc::clone(
+                            &self.snapshot.session
+                        ))
                         .append_limit,
                         crate::types::profile::AppendLimitPolicy::NotAdvertised
                     );
@@ -632,11 +573,7 @@ impl SessionView<'_> {
                 }
                 crate::types::command_options::StatusAttribute::MailboxId => {
                     let snap = self.snapshot;
-                    if !crate::types::profile::supports(
-                        &snap.capabilities,
-                        &snap.enabled,
-                        &Capability::ObjectId,
-                    ) {
+                    if !snap.session.supports(&Capability::ObjectId) {
                         return Err(Error::MissingCapability("OBJECTID".into()));
                     }
                 }
@@ -804,11 +741,7 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
             if *multi {
                 session.require(Capability::MultiAppend)?;
             }
-            let wrapper = session
-                .snapshot
-                .enabled
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT"));
+            let wrapper = session.snapshot.enabled.contains(&Capability::Utf8Accept);
             if !wrapper
                 && messages.iter().any(|msg| msg.data.contains(&0))
                 && !session.supports(&Capability::Binary)
@@ -872,10 +805,7 @@ impl SessionView<'_> {
                     Some(Capability::XGmExt1)
                 }
                 FetchAttr::Binary { .. } | FetchAttr::BinarySize { .. } => {
-                    if !crate::types::profile::binary_fetch_usable(
-                        &self.snapshot.capabilities,
-                        &self.snapshot.enabled,
-                    ) {
+                    if !self.snapshot.session.binary_fetch_usable() {
                         return Err(missing("FETCH", "BINARY"));
                     }
                     None
@@ -916,10 +846,7 @@ impl SessionView<'_> {
                     "EMAILID" | "THREADID" => Some(Capability::ObjectId),
                     "X-GM-MSGID" | "X-GM-THRID" | "X-GM-LABELS" => Some(Capability::XGmExt1),
                     "BINARY" | "BINARY.PEEK" | "BINARY.SIZE" => {
-                        if !crate::types::profile::binary_fetch_usable(
-                            &self.snapshot.capabilities,
-                            &self.snapshot.enabled,
-                        ) {
+                        if !self.snapshot.session.binary_fetch_usable() {
                             return Err(missing("FETCH", "BINARY"));
                         }
                         None
@@ -967,8 +894,10 @@ mod tests {
     fn snapshot(capabilities: Vec<Capability>, enabled: &[&str]) -> ConnectionStateSnapshot {
         ConnectionStateSnapshot {
             session_state: SessionState::Selected,
-            capabilities,
-            enabled: enabled.iter().map(|value| (*value).to_owned()).collect(),
+            session: crate::types::profile::SessionCapabilities::new(
+                capabilities,
+                enabled.iter().map(|value| (*value).to_owned()).collect(),
+            ),
             mailbox_selected: true,
             selected: None,
         }
@@ -1010,7 +939,9 @@ mod tests {
                 "{cmd:?}"
             );
             let mut available = base.clone();
-            available.capabilities.push(cap);
+            std::sync::Arc::make_mut(&mut available.session)
+                .capabilities
+                .push(cap);
             assert!(check(&cmd, &available).is_ok(), "{cmd:?}");
         }
         // Header names are data, never requirements of the FETCH command.
@@ -1047,7 +978,9 @@ mod tests {
         for cmd in [&select, &vanished] {
             assert!(matches!(check(cmd, &snap), Err(Error::InvalidState(_))));
         }
-        snap.enabled.push("Qresync".into());
+        std::sync::Arc::make_mut(&mut snap.session)
+            .enabled
+            .insert(Capability::QResync);
         for cmd in [&select, &vanished] {
             assert!(check(cmd, &snap).is_ok());
         }
@@ -1061,7 +994,9 @@ mod tests {
             mailbox: crate::types::MailboxName::new("Archive").unwrap(),
         };
         assert!(matches!(check(&cmd, &snap), Err(Error::InvalidState(_))));
-        snap.enabled.push("UTF8=ACCEPT".into());
+        std::sync::Arc::make_mut(&mut snap.session)
+            .enabled
+            .insert(Capability::Utf8Accept);
         assert!(check(&cmd, &snap).is_ok());
     }
 
@@ -1074,7 +1009,9 @@ mod tests {
             check(&Command::StartTls, &snap),
             Err(Error::StartTlsUnavailable)
         );
-        snap.capabilities.push(Capability::StartTls);
+        std::sync::Arc::make_mut(&mut snap.session)
+            .capabilities
+            .push(Capability::StartTls);
         assert!(check(&Command::StartTls, &snap).is_ok());
         assert!(matches!(
             admit(

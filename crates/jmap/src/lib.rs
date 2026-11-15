@@ -410,6 +410,8 @@ pub(crate) enum Error {
     ///
     /// Missing provider properties use MissingResponseField instead.
     NotParsable(String),
+    /// A local operation this adapter cannot represent.
+    UnsupportedOperation(&'static str),
     /// A URL or URL-component value this crate's own caller supplied is
     /// unusable (an empty custom-transport session URL or EventSource type
     /// list, for example). The caller's fault. A URL the SERVER supplied is
@@ -601,6 +603,7 @@ impl Display for Error {
             Error::IdUnanswered { id, context } => {
                 write!(f, "Id {id} unanswered in {} response", context.method)
             }
+            Error::UnsupportedOperation(reason) => f.write_str(reason),
             Error::NotParsable(id) => write!(f, "{id} is not parsable"),
             Error::InvalidUrl(msg) => write!(f, "Invalid URL: {msg}"),
             Error::MalformedSessionUrl { property, detail } => {

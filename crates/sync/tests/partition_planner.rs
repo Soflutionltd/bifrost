@@ -40,7 +40,10 @@ fn default_time_partitions_chain_back_to_back() {
 #[test]
 fn uid_range_plan_is_newest_first_and_complete() {
     let policy = BackfillPolicy {
-        strategy: BackfillStrategy::UidRange { chunk_size: 1000 },
+        strategy: BackfillStrategy::UidRange {
+            uid_validity: 1,
+            chunk_size: 1000,
+        },
         clock_skew: Duration::ZERO,
     };
     let plan = partitioner::plan(&policy, fixed_now(), 4500);
@@ -49,11 +52,19 @@ fn uid_range_plan_is_newest_first_and_complete() {
     let first = &plan.partitions[0];
     let last = &plan.partitions[plan.partitions.len() - 1];
     match first {
-        PartitionBounds::Uid { from: _, to } => assert_eq!(*to, 4501),
+        PartitionBounds::Uid {
+            uid_validity: _,
+            from: _,
+            to,
+        } => assert_eq!(*to, 4501),
         _ => panic!("expected UID partition"),
     }
     match last {
-        PartitionBounds::Uid { from, to: _ } => assert_eq!(*from, 1),
+        PartitionBounds::Uid {
+            uid_validity: _,
+            from,
+            to: _,
+        } => assert_eq!(*from, 1),
         _ => panic!("expected UID partition"),
     }
 }
@@ -110,20 +121,30 @@ fn clock_skew_shifts_time_partitions_forward() {
 #[test]
 fn small_total_uid_yields_one_partition() {
     let policy = BackfillPolicy {
-        strategy: BackfillStrategy::UidRange { chunk_size: 5000 },
+        strategy: BackfillStrategy::UidRange {
+            uid_validity: 1,
+            chunk_size: 5000,
+        },
         clock_skew: Duration::ZERO,
     };
     let plan = partitioner::plan(&policy, fixed_now(), 12);
     assert_eq!(
         plan.partitions,
-        vec![PartitionBounds::Uid { from: 1, to: 13 }]
+        vec![PartitionBounds::Uid {
+            uid_validity: 1,
+            from: 1,
+            to: 13
+        }]
     );
 }
 
 #[test]
 fn empty_total_yields_no_partitions() {
     let policy = BackfillPolicy {
-        strategy: BackfillStrategy::UidRange { chunk_size: 100 },
+        strategy: BackfillStrategy::UidRange {
+            uid_validity: 1,
+            chunk_size: 100,
+        },
         clock_skew: Duration::ZERO,
     };
     let plan = partitioner::plan(&policy, fixed_now(), 0);

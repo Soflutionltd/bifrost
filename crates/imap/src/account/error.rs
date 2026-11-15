@@ -1,9 +1,10 @@
 //! IMAP -> `AccountError` translation boundary.
 //!
-//! This module is the only place in `bifrost-imap` that constructs
-//! `bifrost_types::AccountError`. Every account-trait call site funnels
-//! its crate-private `crate::Error` through `into_account_error` with an
-//! `ImapErrorContext` carrying operation, scope, and provider.
+//! This module owns IMAP account error classification and decoration.
+//! Account-trait call sites translate crate-private `crate::Error` through
+//! `into_account_error` with an `ImapErrorContext`, or use the domain
+//! constructors below. Submission translation belongs to its sibling boundary;
+//! shared classifications remain owned by `bifrost-types`.
 //!
 //! Why this matters: the central recovery mapping in
 //! `bifrost_types::error::recovery` derives `RecoveryClass` from
@@ -1283,6 +1284,421 @@ fn response_code_payload(code: &ResponseCode) -> Option<DiagnosticText> {
     Some(DiagnosticText::support_only(value))
 }
 
+pub(super) fn invalid_move_destination_error() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("bulk-move destination is not a sendable mailbox"),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::BulkMove)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Build a `ConcurrencyConflict` `AccountError` for STORE UNCHANGEDSINCE
+/// conflicts. Takes the caller's `AccountOperation` so flag, move, and
+/// destroy paths each surface their own operation - the central recovery
+/// mapping needs the correct op to pick `Retry::AfterStateRefresh` for
+/// the right kind of work.
+pub(super) fn concurrency_conflict_error(
+    operation: AccountOperation,
+    folder: &MailboxName,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::ConcurrencyConflict,
+        Cause::State(StateCause::ConcurrencyConflict),
+    )
+    .protocol(Protocol::Imap)
+    .operation(operation)
+    .scope(bifrost_types::ErrorScope::Cursor(
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
+    ))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Build a generic `Request(Malformed)` for UIDVALIDITY mismatch before mutation.
+pub(super) fn uidvalidity_changed_error(
+    operation: AccountOperation,
+    folder: &MailboxName,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("UIDVALIDITY changed before mutation"),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(operation)
+    .scope(bifrost_types::ErrorScope::Cursor(
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
+    ))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Build a generic server refusal for a STORE command failure without a
+/// specific per-item response code. Takes the caller's `AccountOperation`
+/// so move / destroy / flag mutations each carry their own op.
+pub(super) fn store_failed_error(
+    operation: AccountOperation,
+    folder: &MailboxName,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+        Cause::Server(ServerCause::Error { status: None }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(operation)
+    .scope(bifrost_types::ErrorScope::Cursor(
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
+    ))
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
+    .text(DiagnosticText::support_only(
+        "STORE command failed with no per-item response code",
+    ))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+pub(super) fn finish_partial(
+    error: AccountError,
+    record: bifrost_types::PartialCommitBuilder,
+) -> AccountError {
+    error
+        .into_builder()
+        .partial_commit(record)
+        .try_build()
+        .expect("valid IMAP partial commitment")
+}
+
+pub(super) fn hydration_uidvalidity_changed_error(folder: &MailboxName) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("UIDVALIDITY changed before hydration"),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::Hydrate)
+    // Cursor(Folder(..)), not ErrorScope::Mailbox: the folder producers'
+    // documented scope shape, so scope readers matching one shape do not
+    // silently degrade (mutate.rs builds the identical condition this way).
+    .scope(bifrost_types::ErrorScope::Cursor(
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
+    ))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+pub(super) fn message_not_found_error(id: &super::envelope::DecodedObjectId) -> AccountError {
+    fetched_message_not_found(&id.id, AccountOperation::Hydrate)
+}
+
+/// A folder restriction (`SearchFilter::In`) nested inside an `Or` has no
+/// faithful single-mailbox IMAP SEARCH encoding.
+pub(super) fn or_folder_restriction_error(op: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("folder"),
+            message: Some(DiagnosticText::support_only(
+                "a folder restriction (In) inside an Or cannot be expressed as a \
+                 single-mailbox IMAP SEARCH; restructure the query so folder scoping \
+                 is not OR-ed with other criteria",
+            )),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(op)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// The cursor's folder answered with a different UIDVALIDITY, so the UID
+/// the walk resumes after no longer names anything there.
+///
+/// This stays `ConcurrencyConflict`, not the page_cursor `Malformed` fault the
+/// decode and restriction cases use: the cursor was valid when issued and the
+/// server replaced the mailbox under it. `Malformed` derives ClientBug, which
+/// would report a server-side epoch change as an application defect; an
+/// Outlook user whose mailbox was rebuilt expects the search to simply run
+/// again, which a conflict's re-read recovery gives. A consumer restarts
+/// paging on either error. How UIDVALIDITY changes are classified across the
+/// rest of the IMAP account is a separate, still open, question.
+pub(super) fn search_cursor_voided(op: AccountOperation, folder: &MailboxName) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::ConcurrencyConflict,
+        Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
+    )
+    .protocol(Protocol::Imap)
+    .operation(op)
+    .scope(bifrost_types::ErrorScope::Cursor(
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
+    ))
+    .text(DiagnosticText::support_only(
+        "UIDVALIDITY of the folder this search page cursor resumes in changed; repeat the search",
+    ))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// The message a completed `UID FETCH` did not answer for.
+///
+/// `hydrate_decoded` only reaches the FETCH once `valid_uids` has confirmed the
+/// id's UIDVALIDITY matches the selected mailbox, so the UID is a live name in
+/// the current epoch and the id was well-formed. A tagged OK with no FETCH for
+/// that UID is how RFC 3501 6.4.8 / RFC 9051 6.4.9 report a UID that no longer
+/// exists: the message was expunged between the caller learning the id and
+/// this FETCH. That is `NotFound(Message)`, not the caller's malformed request.
+/// The server answered, so the attempt is `Acknowledged`.
+pub(super) fn expunged_message(id: bifrost_types::ObjectId) -> AccountError {
+    fetched_message_not_found(&id, AccountOperation::HydrateMessage)
+}
+
+/// Build a `Request(Malformed)` `AccountError` for local PIM failures
+/// where the caller provided invalid or internally inconsistent state.
+///
+/// The operation is threaded in from the caller. Helpers reachable from
+/// more than one PIM surface (id decode, mailbox-name validation,
+/// search-criteria assembly, page-cursor parsing) take the op as a
+/// parameter rather than guessing, so a locally-malformed request is
+/// attributable to the PIM call that produced it. The recovery class is
+/// `ClientBug` for all of them; the operation is the telemetry.
+pub(super) fn pim_malformed(op: AccountOperation, detail: impl Into<String>) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(detail.into()),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(op)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Re-stamp an `AccountError` from the submission boundary with the IMAP
+/// operation that drove it, so recovery/telemetry attribute it correctly.
+///
+/// `into_builder` preserves idempotency and throttle overrides. Restamping
+/// changes the operation without discarding the submission boundary's evidence.
+pub(super) fn restamp(err: AccountError, op: AccountOperation) -> AccountError {
+    err.into_builder()
+        .operation(op)
+        .try_build()
+        .expect("valid account error classification")
+}
+
+/// Attribute a provider-neutral assembler error to IMAP. The shared
+/// `bifrost-types` MIME assembler leaves the protocol unset (it is shared
+/// across providers); the IMAP send path stamps `Protocol::Imap` so
+/// telemetry and recovery attribute the failure to this account.
+pub(super) fn stamp_imap_protocol(err: AccountError) -> AccountError {
+    err.into_builder()
+        .protocol(Protocol::Imap)
+        .try_build()
+        .expect("valid account error classification")
+}
+
+/// `NotFound(Message)` for a raw read whose UID the server no longer holds,
+/// keyed by the id exactly as submitted.
+pub(super) fn raw_message_not_found(id: &bifrost_types::ObjectId) -> AccountError {
+    fetched_message_not_found(id, AccountOperation::OpenRawRfc822)
+}
+
+pub(super) fn folder_of(
+    container: &bifrost_types::ContainerId,
+    op: AccountOperation,
+) -> Result<MailboxName, AccountError> {
+    MailboxName::from_account_id(&container.0).map_err(|err| {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(format!("not an IMAP folder identity: {err}")),
+            }),
+        )
+        .protocol(Protocol::Imap)
+        .operation(op)
+        .try_build()
+        .expect("valid account error classification")
+    })
+}
+
+/// `Unsupported`, scoped to the folder: a `UIDNOTSTICKY` folder's UIDs do
+/// not persist across selections, so it cannot be tracked by UID.
+pub(super) fn not_sticky(folder: &MailboxName, op: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(op),
+        Cause::Request(RequestCause::Unsupported { operation: op }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(op)
+    .scope(ErrorScope::Cursor(super::folder_scope(folder)))
+    .text(DiagnosticText::support_only(
+        "folder is UIDNOTSTICKY: its UIDs do not persist across selections",
+    ))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+pub(super) fn excluded_from_operand_error(
+    operation: AccountOperation,
+    folder: &MailboxName,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(
+                "message id could not be placed in an IMAP UID operand",
+            ),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(operation)
+    .scope(bifrost_types::ErrorScope::Cursor(super::folder_scope(
+        folder,
+    )))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Build a `Request(Malformed)` `AccountError` for IMAP object-id or
+/// cursor decode failures. These are caller-side invalid inputs (the
+/// object id was not produced by this crate or was corrupted in transit).
+///
+/// The operation is threaded in from the caller: `decode_object_id` and
+/// `decode_thread_id` are always reached while servicing one specific
+/// account-trait call (hydration, a mutation lane, a blob open, a PIM
+/// primitive), so the op is known at every call site and the resulting
+/// error carries it. The recovery class is `ClientBug` either way; the
+/// operation is what makes the telemetry attributable to a lane.
+pub(super) fn malformed(detail: &str, op: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(detail.to_owned()),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(op)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Build a `SyncState(SchemaIncompatible)` `AccountError` for IMAP
+/// cursor envelope decoding failures. The cursor bytes are structurally
+/// unrecognizable, which triggers the `SchemaIncompatible` engine
+/// directive to clear cursor state and re-establish from inventory.
+pub(super) fn schema_incompatible(detail: &str) -> AccountError {
+    bifrost_types::CursorDecodeFault::Malformed
+        .builder(Protocol::Imap, AccountOperation::SyncChanges)
+        .text(DiagnosticText::support_only(detail.to_owned()))
+        .try_build()
+        .expect("valid account error classification")
+}
+
+/// A raw read refused because the selected mailbox changed epoch.
+pub(super) fn raw_uidvalidity_changed(folder: &MailboxName) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("UIDVALIDITY changed before fetch"),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::OpenRawRfc822)
+    .scope(ErrorScope::Cursor(super::folder_scope(folder)))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+pub(super) fn search_folders_conflict(
+    a: &MailboxName,
+    b: &MailboxName,
+    op: AccountOperation,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("folder"),
+            message: Some(DiagnosticText::support_only(format!(
+                "search filter spans two folders ({} and {}); \
+                 IMAP SEARCH cannot span multiple mailboxes in one command",
+                a.as_str(),
+                b.as_str()
+            ))),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(op)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+pub(super) fn cursor_decode_fault(
+    fault: bifrost_types::CursorDecodeFault,
+    scope: &CursorScope,
+) -> AccountError {
+    fault
+        .builder(Protocol::Imap, AccountOperation::SyncChanges)
+        .scope(ErrorScope::Cursor(scope.clone()))
+        .try_build()
+        .expect("valid account error classification")
+}
+
+pub(super) fn cursor_scope_error(error: AccountError, scope: &CursorScope) -> AccountError {
+    error
+        .into_builder()
+        .scope(ErrorScope::Cursor(scope.clone()))
+        .try_build()
+        .expect("valid account error classification")
+}
+
+/// A tagged successful FETCH with no matching UID proves absence and answers
+/// the command. Enterprise users expect a vanished message reported as absent;
+/// retain Acknowledged evidence consistently across hydration and raw reads.
+fn fetched_message_not_found(id: &bifrost_types::ObjectId, op: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::NotFound(ResourceKind::Message),
+        Cause::Request(RequestCause::NotFound {
+            what: ResourceKind::Message,
+            id: Some(id.0.clone()),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(op)
+    .scope(ErrorScope::Message { id: id.clone() })
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// One rejected scope in the `push_subscribe` failed lane.
+///
+/// Both refusals are `Unsupported(PushSubscribe)`: neither is a whole-request
+/// fault (`Err` stays reserved for that), neither is retryable as issued, and
+/// a rejected scope must not fail its siblings. They are distinguished by the
+/// diagnostic text, not the kind, because a capacity refusal and a
+/// scope-shape refusal need different operator action even though they carry
+/// the same recovery class - bifrost-sync keeps polling either way.
+pub(super) fn rejected_scope_error(detail: &'static str) -> AccountError {
+    AccountError::unsupported(
+        AccountOperation::PushSubscribe,
+        bifrost_types::Protocol::Imap,
+    )
+    .into_builder()
+    .text(bifrost_types::DiagnosticText::user_safe(detail))
+    .try_build()
+    .expect("valid push scope error")
+}
+
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod tests;
@@ -1302,5 +1718,167 @@ mod unsupported_constructor_tests {
             error.kind(),
             &bifrost_types::AccountErrorKind::Unsupported(operation)
         );
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+    use bifrost_types::AccessErrorKind;
+
+    pub(in crate::account) fn discovery_transport(op: AccountOperation) -> AccountError {
+        bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
+            bifrost_types::Cause::Transport(bifrost_types::TransportCause::new(
+                bifrost_types::TransportKind::Network,
+                None,
+            )),
+        )
+        .operation(op)
+        .try_build()
+        .expect("valid account error classification")
+    }
+
+    pub(in crate::account) fn factory_transport() -> AccountError {
+        bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
+            bifrost_types::Cause::Transport(bifrost_types::TransportCause::new(
+                bifrost_types::TransportKind::Network,
+                None,
+            )),
+        )
+        .operation(AccountOperation::Discover)
+        .try_build()
+        .expect("valid account error classification")
+    }
+
+    pub(in crate::account) fn factory_auth_lost() -> AccountError {
+        bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Authentication(
+                bifrost_types::AuthErrorKind::ReauthorizationRequired,
+            ),
+            bifrost_types::Cause::Auth(bifrost_types::AuthCause::ReauthorizationRequired),
+        )
+        .operation(AccountOperation::Discover)
+        .try_build()
+        .expect("valid account error classification")
+    }
+
+    pub(in crate::account) fn smtp_unsupported() -> AccountError {
+        bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Send),
+            bifrost_types::Cause::Request(bifrost_types::RequestCause::Unsupported {
+                operation: AccountOperation::Send,
+            }),
+        )
+        .protocol(Protocol::Smtp)
+        .operation(AccountOperation::Send)
+        .try_build()
+        .expect("valid account error classification")
+    }
+
+    pub(in crate::account) fn unavailable_without_context() -> AccountError {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Server(bifrost_types::ServerErrorKind::Unavailable),
+            Cause::Server(bifrost_types::ServerCause::Unavailable { retry_hint: None }),
+        )
+        .try_build()
+        .unwrap()
+    }
+
+    pub(in crate::account) fn expired_auth() -> AccountError {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Authentication(AuthErrorKind::Expired),
+            Cause::Auth(AuthCause::Expired),
+        )
+        .protocol(Protocol::Imap)
+        .operation(AccountOperation::UpdateFlags)
+        .try_build()
+        .expect("auth error")
+    }
+
+    pub(in crate::account) fn incompatible_schema() -> AccountError {
+        AccountErrorBuilder::new(
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
+            Cause::State(StateCause::SchemaIncompatible),
+        )
+        .protocol(Protocol::Imap)
+        .operation(AccountOperation::UpdateFlags)
+        .try_build()
+        .expect("schema error")
+    }
+
+    pub(in crate::account) fn personal_permission_denied() -> AccountError {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+            Cause::Access(AccessCause::PermissionDenied { resource: None }),
+        )
+        .protocol(Protocol::Imap)
+        .operation(AccountOperation::UpdateFlags)
+        .try_build()
+        .expect("personal-folder permission error")
+    }
+
+    pub(in crate::account) fn unavailable_update() -> AccountError {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Server(bifrost_types::ServerErrorKind::Unavailable),
+            Cause::Server(bifrost_types::ServerCause::Unavailable { retry_hint: None }),
+        )
+        .protocol(Protocol::Imap)
+        .operation(AccountOperation::UpdateFlags)
+        .try_build()
+        .expect("server error")
+    }
+
+    pub(in crate::account) fn unavailable_update_at(state: TransmissionState) -> AccountError {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+        )
+        .protocol(Protocol::Imap)
+        .operation(AccountOperation::UpdateFlags)
+        .push_cause(Cause::Attempt(AttemptCause::new(state)))
+        .try_build()
+        .expect("valid mutation error")
+    }
+
+    pub(in crate::account) fn retryable_move() -> AccountError {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+        )
+        .operation(AccountOperation::BulkMove)
+        .try_build()
+        .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod fetched_message_tests {
+    use super::*;
+
+    #[test]
+    fn completed_fetch_misses_share_acknowledged_evidence() {
+        let id = bifrost_types::ObjectId("imap1:5:INBOX:7:9".into());
+        let decoded = super::super::decode_object_id(&id, AccountOperation::Hydrate).unwrap();
+        for (error, operation) in [
+            (message_not_found_error(&decoded), AccountOperation::Hydrate),
+            (
+                expunged_message(id.clone()),
+                AccountOperation::HydrateMessage,
+            ),
+            (raw_message_not_found(&id), AccountOperation::OpenRawRfc822),
+        ] {
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::NotFound(ResourceKind::Message)
+            );
+            assert_eq!(error.operation(), Some(operation));
+            assert_eq!(error.scope(), Some(&ErrorScope::Message { id: id.clone() }));
+            assert!(error.chain().iter().any(|cause| matches!(
+                cause,
+                Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged
+            )));
+        }
     }
 }

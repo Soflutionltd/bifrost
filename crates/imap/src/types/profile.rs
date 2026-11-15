@@ -19,6 +19,107 @@ pub enum AppendLimitPolicy {
     Limit(u64),
 }
 
+/// Confirmed ENABLE observations, parsed through the capability vocabulary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EnabledSet(Vec<Capability>);
+
+impl EnabledSet {
+    pub(crate) fn contains(&self, capability: &Capability) -> bool {
+        self.0.contains(capability)
+    }
+
+    pub(crate) fn insert(&mut self, capability: Capability) {
+        if !self.contains(&capability) {
+            self.0.push(capability);
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+    pub(crate) fn as_slice(&self) -> &[Capability] {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for EnabledSet {
+    type Target = [Capability];
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl FromIterator<Capability> for EnabledSet {
+    fn from_iter<T: IntoIterator<Item = Capability>>(iter: T) -> Self {
+        let mut enabled = Self::default();
+        for capability in iter {
+            enabled.insert(capability);
+        }
+        enabled
+    }
+}
+
+/// One coherent advertised/confirmed session observation. Snapshots and command
+/// views share this value; driver mutations use copy-on-write so queued views
+/// retain the exact negotiation state they observed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionCapabilities {
+    pub(crate) capabilities: Vec<Capability>,
+    pub(crate) enabled: EnabledSet,
+}
+
+impl SessionCapabilities {
+    #[cfg(test)]
+    pub(crate) fn empty() -> &'static Self {
+        static EMPTY: std::sync::LazyLock<SessionCapabilities> =
+            std::sync::LazyLock::new(SessionCapabilities::default);
+        &EMPTY
+    }
+
+    pub(crate) fn new(capabilities: Vec<Capability>, enabled: Vec<String>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            capabilities,
+            enabled: enabled
+                .iter()
+                .map(|s| Capability::from_imap_str(s))
+                .collect(),
+        })
+    }
+
+    pub(crate) fn supports(&self, capability: &Capability) -> bool {
+        supports(&self.capabilities, self.enabled.as_slice(), capability)
+    }
+
+    pub(crate) fn imap4rev2_active(&self) -> bool {
+        imap4rev2_active(&self.capabilities, self.enabled.as_slice())
+    }
+
+    pub(crate) fn utf8_mode(&self) -> crate::codec::utf7::WireMode {
+        if self.imap4rev2_active() || self.enabled.contains(&Capability::Utf8Accept) {
+            crate::codec::utf7::WireMode::Utf8
+        } else {
+            crate::codec::utf7::WireMode::ModifiedUtf7
+        }
+    }
+
+    pub(crate) fn qresync_enabled(&self) -> bool {
+        self.enabled.contains(&Capability::QResync)
+    }
+    pub(crate) fn binary_fetch_usable(&self) -> bool {
+        self.supports(&Capability::Binary) || self.imap4rev2_active()
+    }
+
+    pub(crate) fn literal_mode(&self) -> crate::codec::encode::LiteralMode {
+        if self.capabilities.contains(&Capability::LiteralPlus) {
+            crate::codec::encode::LiteralMode::LiteralPlus
+        } else if self.supports(&Capability::LiteralMinus) {
+            crate::codec::encode::LiteralMode::LiteralMinus
+        } else {
+            crate::codec::encode::LiteralMode::Synchronizing
+        }
+    }
+}
+
 /// Caller-friendly snapshot of server capabilities and enabled extensions.
 ///
 /// This is not a live view. Capabilities and enabled extensions can change
@@ -29,31 +130,29 @@ pub enum AppendLimitPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerProfile {
     /// Raw advertised capabilities.
-    pub capabilities: Vec<Capability>,
-    /// Extensions successfully enabled with ENABLE.
-    pub enabled: Vec<String>,
+    pub(crate) session: std::sync::Arc<crate::types::profile::SessionCapabilities>,
     /// True when IMAP4rev2 behavior is active.
     pub imap4rev2: bool,
-    /// AUTH mechanisms advertised by the server.
-    pub auth_mechanisms: Vec<bifrost_sasl::MechanismName>,
     /// Server APPENDLIMIT policy advertised in CAPABILITY.
     pub append_limit: AppendLimitPolicy,
-    /// Advertised THREAD algorithms.
-    pub thread_algorithms: Vec<String>,
+}
+
+impl std::ops::Deref for ServerProfile {
+    type Target = crate::types::profile::SessionCapabilities;
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
 }
 
 impl ServerProfile {
     /// Build a profile from capability and enabled-extension snapshots.
     pub fn new(capabilities: Vec<Capability>, enabled: Vec<String>) -> Self {
-        let imap4rev2 = imap4rev2_active(&capabilities, &enabled);
-        // Capability parsing owns canonical suffix spelling; profiles project it.
-        let auth_mechanisms = capabilities
-            .iter()
-            .filter_map(|cap| match cap {
-                Capability::Auth(mechanism) => Some(mechanism.clone()),
-                _ => None,
-            })
-            .collect();
+        Self::from_session(SessionCapabilities::new(capabilities, enabled))
+    }
+
+    pub(crate) fn from_session(session: std::sync::Arc<SessionCapabilities>) -> Self {
+        let capabilities = &session.capabilities;
+        let imap4rev2 = session.imap4rev2_active();
         // Preserve both constraints on contradictory advertisements. A user
         // expects the size check and the displayed policy to agree, and the
         // most restrictive advertised limit avoids a preventable rejection.
@@ -76,28 +175,33 @@ impl ServerProfile {
                 .map(AppendLimitPolicy::Limit)
                 .unwrap_or_default()
         };
-        let thread_algorithms = capabilities
-            .iter()
-            .filter_map(|cap| match cap {
-                Capability::Thread(algorithm) => Some(algorithm.to_string()),
-                _ => None,
-            })
-            .collect();
-
         Self {
-            capabilities,
-            enabled,
+            session,
             imap4rev2,
-            auth_mechanisms,
             append_limit,
-            thread_algorithms,
         }
+    }
+
+    /// AUTH mechanism observations are projected from their capability owner.
+    pub fn auth_mechanisms(&self) -> impl Iterator<Item = &bifrost_sasl::MechanismName> {
+        self.capabilities.iter().filter_map(|cap| match cap {
+            Capability::Auth(mechanism) => Some(mechanism),
+            _ => None,
+        })
+    }
+
+    /// THREAD algorithms retain the capability parser's canonical vocabulary.
+    pub fn thread_algorithms(&self) -> impl Iterator<Item = &str> {
+        self.capabilities.iter().filter_map(|cap| match cap {
+            Capability::Thread(algorithm) => Some(&**algorithm),
+            _ => None,
+        })
     }
 
     /// Return `true` if the capability is advertised, implied by an advertised
     /// QRESYNC (CONDSTORE only), or folded into active IMAP4rev2.
     pub fn supports(&self, capability: Capability) -> bool {
-        supports(&self.capabilities, &self.enabled, &capability)
+        self.session.supports(&capability)
     }
 
     /// Return `true` if the server advertises the SASL mechanism.
@@ -119,9 +223,7 @@ impl ServerProfile {
         if mechanism == AuthMechanism::ImapLogin {
             return false;
         }
-        self.auth_mechanisms
-            .iter()
-            .any(|m| m.known() == Some(mechanism))
+        self.auth_mechanisms().any(|m| m.known() == Some(mechanism))
     }
 
     /// Return `true` if the legacy IMAP LOGIN command is available.
@@ -131,9 +233,10 @@ impl ServerProfile {
 
     /// Return `true` if the extension has been enabled.
     pub fn enabled(&self, extension: &str) -> bool {
-        self.enabled
-            .iter()
-            .any(|enabled| enabled.eq_ignore_ascii_case(extension))
+        match Capability::from_imap_str(extension) {
+            Capability::QResync => self.session.qresync_enabled(),
+            capability => self.session.enabled.contains(&capability),
+        }
     }
 
     /// Return `true` when UIDPLUS commands are available.
@@ -275,14 +378,8 @@ fn rev2_baseline_includes(capability: &Capability) -> bool {
 ///   in (RFC 9051 Appendix E). Extensions outside that baseline get no rev2
 ///   clause.
 ///
-/// The same warning as [`imap4rev2_active`] applies: pass a coherent
-/// `(capabilities, enabled)` pair from one owner, preferably through a typed
-/// wrapper.
-pub(crate) fn supports(
-    capabilities: &[Capability],
-    enabled: &[String],
-    capability: &Capability,
-) -> bool {
+/// Session views call this through `SessionCapabilities::supports`.
+fn supports(capabilities: &[Capability], enabled: &[Capability], capability: &Capability) -> bool {
     if capabilities.contains(capability) {
         return true;
     }
@@ -300,7 +397,8 @@ pub(crate) fn supports(
 /// Deliberately a separate question from `supports(Binary)`, which stays
 /// advertised-only on rev2 because rev2 did not fold in RFC 3516's APPEND
 /// side (see [`rev2_baseline_includes`]).
-pub(crate) fn binary_fetch_usable(capabilities: &[Capability], enabled: &[String]) -> bool {
+#[cfg(test)]
+fn binary_fetch_usable(capabilities: &[Capability], enabled: &[Capability]) -> bool {
     supports(capabilities, enabled, &Capability::Binary) || imap4rev2_active(capabilities, enabled)
 }
 
@@ -311,26 +409,11 @@ pub(crate) fn binary_fetch_usable(capabilities: &[Capability], enabled: &[String
 /// client says which it wants, so rev2 behaviour there requires an explicit
 /// `ENABLE IMAP4rev2`. A server advertising only rev2 is in rev2 from the start.
 ///
-/// This lives here, over a slice pair, rather than on any one of the state
-/// types that hold those slices, because the rule's real input is exactly
-/// `(capabilities, enabled)` and four different views own that pair -
-/// `ProtocolState`, `ConnectionStateSnapshot`, `EncodeOptions` and
-/// `ServerProfile`. It used to be written out five times over those four views,
-/// and the two copies that had tests were not the three that decide wire bytes
-/// (modified UTF-7 versus raw UTF-8, synchronizing versus non-synchronizing
-/// literals) and SELECT validation.
-///
-/// CALL IT THROUGH A TYPED WRAPPER unless you are adapting one coherent owner.
-/// The slice pair is deliberately low-level and nothing stops a caller pairing
-/// one view's capabilities with another view's enabled list; the wrappers exist
-/// so that ordinary call sites cannot.
-pub(crate) fn imap4rev2_active(capabilities: &[Capability], enabled: &[String]) -> bool {
+fn imap4rev2_active(capabilities: &[Capability], enabled: &[Capability]) -> bool {
     let has_rev2 = capabilities.contains(&Capability::Imap4Rev2);
     let has_rev1 = capabilities.contains(&Capability::Imap4Rev1);
     if has_rev2 && has_rev1 {
-        enabled
-            .iter()
-            .any(|extension| extension.eq_ignore_ascii_case("IMAP4rev2"))
+        enabled.contains(&Capability::Imap4Rev2)
     } else {
         has_rev2
     }
@@ -416,7 +499,14 @@ pub(crate) mod capability_matrix {
         capabilities.contains(capability)
             || (matches!(capability, Capability::Condstore)
                 && capabilities.contains(&Capability::QResync))
-            || (rev2_baseline_includes(capability) && imap4rev2_active(capabilities, enabled))
+            || (rev2_baseline_includes(capability)
+                && imap4rev2_active(
+                    capabilities,
+                    &enabled
+                        .iter()
+                        .map(|s| Capability::from_imap_str(s))
+                        .collect::<Vec<_>>(),
+                ))
     }
 
     /// Connection states that exercise every branch of the rev2-ACTIVE rule.

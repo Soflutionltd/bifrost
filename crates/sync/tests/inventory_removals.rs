@@ -138,15 +138,15 @@ async fn assert_inventory_removal(fusion: bool) {
     }
     // Commit the consumer transaction, then acknowledge exactly its page.
     rows = transaction;
-    let committed = checkpoint.clone();
     assert!(!rows.contains(&removed));
     assert!(rows.contains(&ObjectId("sibling".into())));
     engine
-        .ack_checkpoint(
+        .ack(
             &account,
-            scope.clone(),
-            committed,
-            event.publication.clone(),
+            event
+                .ack_token()
+                .cloned()
+                .expect("acknowledgeable publication"),
         )
         .await
         .expect("ack");

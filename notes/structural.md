@@ -284,32 +284,6 @@ Also prose-only: `warn_if_uid_count_mismatch` (`WarningKind::Other`, counts in
 prose), `DavScopeIndex::build` collisions (`OperatorAttentionNeeded`, href only
 in text), and `push_stream`'s "NOTIFY SET refused: ..." (`Other`).
 
-## STR-011 - Smaller axes in `bifrost-types`
-
-**Reported by:** types.
-
-- `CloudUploadMeta::size` "MUST equal `bytes.len()`": an input that can only be
-  wrong; derive it.
-- `ByteRange` is documented "Inclusive" with `start` + `length`, while every
-  other range in the crate is half-open.
-- `CoverageDomain::for_partition(scope, partition, uid_validity: u32)` takes the
-  epoch even for non-UID partitions; JMAP passes `0` as a sentinel. Put the
-  epoch in `InventoryPartition::Uid`.
-- `SnapshotIdentity` derives `PartialEq` while `same_snapshot_as` documents that
-  `==` is the wrong question; `CoverageDomain` derives `Eq` through it.
-- `InventoryEntry::differs_from` hand-lists every field, so a new field is
-  silently excluded (destructure exhaustively instead); it compares
-  `memberships: Vec<_>` order-sensitively, so a provider reordering labels
-  reports a change. `InventoryEntry::size` duplicates `Fingerprint::size`.
-- `set_bandwidth_cap(Option<u64>)` documents `Some(0)` as a 1 B/s trickle; a
-  `BandwidthCap` type would not admit 0.
-- `CapabilityKey(String)` / `CapabilityValue(String)` / `CapabilityDelta` are
-  never constructed; every `CapabilityChanged` carries `delta: None`. Compute it
-  (reattach holds both snapshots) or ask the owner whether it stays.
-- `AttachmentInline::mime`, `attachment_upload(mime: String)`,
-  `CloudUploadMeta::mime`, `MessageAttachment::content_type`: unparsed media
-  types beside a crate that has `mime::parse_content_type`.
-
 ## STR-012 - The engine's consumer API lives in the contract crate
 
 **Reported by:** types (needs owner: moves published items).
@@ -400,18 +374,6 @@ own module (an extension trait with a blanket impl, or free functions over `&dyn
 Account`), dispatched uniformly through `ConvenienceShape` (add a `LabelShape`),
 providers owning their sentinel strings.
 
-## STR-016 - `account_compose.rs` is neither the composition layer nor IMAP's
-
-**Reported by:** types.
-
-Its name collides with `compose.rs` (mail composition) though it is account
-composition; it is used only by IMAP; its tests live in IMAP by design; it holds
-routing and discovery fan-in but not the capability merge (CON-010) or the
-`ObjectType::Event` alias decision (CON-011); its module doc still says
-"tomorrow JMAP / Graph". Either grow it into the real composition layer
-(`composition.rs`: routing, discovery merge with a typed skip lane, capability
-merge) or move it into `bifrost-imap` until a second composer exists.
-
 ## STR-017 - Write-only capability fields
 
 **Reported by:** types (removal needs owner; wire-or-retire).
@@ -436,18 +398,6 @@ No account reads `run_id`, `sequence` or `protocol_salt`; the salt's string
 payloads are always empty. Its only function is engine bookkeeping, which need
 not cross the account boundary.
 
-## STR-019 - Three parallel range vocabularies
-
-**Reported by:** types.
-
-`InventoryPartition { Time, Uid, Page }`, `CoverageCoordinate { TimeRange,
-UidRange, PageRange }` and `InventoryPartitioning { TimeWindowed, UidRange,
-PageCount }` restate the same three windows with different names and integer
-widths (`Uid` u64 endpoints vs `max_uid: Option<u32>`), joined by
-`CoverageDomain::for_partition`. Shared half-open `TimeWindow`, `UidWindow`,
-`PageWindow` types (with `from <= to` enforced, which nothing checks today)
-would carry the convention the reference doc had to fix by hand once.
-
 ## STR-020 - Hydration has two projection enums, and two placement vocabularies
 
 **Reported by:** types.
@@ -461,48 +411,6 @@ places the message by `containers: Vec<ContainerId>` while inventory uses
 `memberships: Vec<MembershipScope>`; nothing maps one to the other without
 provider knowledge (Gmail fills the former with label ids, the latter with
 `MembershipScope::Label`).
-
-## STR-023 - The acknowledgement is assembled from loose parts the consumer must keep in step
-
-**Reported by:** sync-engine.
-
-The facts live in `ack_checkpoint(account_id, scope, checkpoint, publication:
-Option<PublicationId>)`, the event `MultiplexerEvent { scope, event, checkpoint,
-publication }`, and the receipt `PublicationId(u64, Arc<PublicationReceipt {
-checkpoint, claim, walk_watermark }>)`: scope three times, checkpoint twice. The
-engine re-derives agreement in several places (`claim_checkpoint` rejects a lane
-mismatch; `persist_ack_request` matches `id.1.checkpoint` against
-`acked.scope`; `completion_refusal` treats `publication: None` as `Unvouchable`;
-the `Ack` arm trusts `req.scope`, BUG-005). Because `PublicationId`'s fields are
-`pub`, a consumer can mint one with any receipt; `minted_here` is the run-time
-patch.
-
-Proposal: the event carries a non-forgeable `AckToken` (private fields, minted
-only by `PendingCoverage`), and the public entry becomes `ack(account, token)`;
-scope, checkpoint and lane come from the token. `ack_publication` folds in (a
-repair token is the same thing with no checkpoint). The `Target` permit move
-applied to acknowledgements: no wrong lane, no consumer minting, and
-`publication: None` unrepresentable for anything acknowledgeable. Reshapes a
-published signature and type without removing the capability.
-
-The sync-lanes hunter reports the restart side of the same gap (latent): the
-docs say a consumer "persists the whole token beside the batch" so an
-acknowledgement can replay after a writer restart, but every field of
-`PublicationReceipt` and `CoverageClaim` is public and the engine ships no
-encoding for it, though it does for cursors (`encode_envelope`) and ledgers
-(`encode_ledger`). A consumer must hand-serialize an `InventoryCoverageReport`,
-and on replay `claim_in`'s receipt fallback ingests whatever claim the consumer
-rebuilt; `Complete` reports discharge debt. For change-cursor lanes nothing
-checks the receipt against anything the engine minted (`minted_here` gates only
-the backfill withhold). That reopens "no protocol crate (or consumer) may
-construct ledger state", which `DebtLedger::from_parts` being crate-private
-exists to enforce. Its proposal: make the receipt opaque, give it a codec next
-to `encode_envelope` / `encode_ledger` (with an integrity tag if consumer
-storage is not trusted), and make construction crate-private (owner ruling:
-shape change of public fields). Lateral: `BoundaryEntry::subsumed` is unbounded
-per partition under the receipt bound (the whole scope for `Full` plans) and
-each retained id holds a full receipt and claim, the ledger's main memory
-hazard.
 
 ## STR-027 - Engine failures reach callers only as prose
 
@@ -760,22 +668,6 @@ StoppedAtBarrier }` beside the counts; `fold` becomes a match and
 - `WorkSet::hold: Option<(u64, Instant)>` is a bare tuple of account generation
   and deadline.
 
-## STR-041 - `PolicyStatus::Retrying { attempts }` is a mirrored view; barriers reuse a policy that means nothing for them
-
-**Reported by:** sync-lanes.
-
-`attempts` on an entry is documented as "a VIEW", rewritten from the lineage
-table by `settle_lineages` after every mutation and cross-checked on decode by
-`validate_lineages` ("an open `Retrying` entry disagreeing with its row is
-`Error::Other`") - two copies held in step by a pairwise-agreement check, the
-shape the hunt brief names. `BarrierIncident::policy` is minted as `Retrying {
-attempts: 0 }` (`inventory_walk::barrier_incidents`) and "is inert". Proposal:
-`EntryPolicy { Automatic, OperatorBlocked, Waived { .. } }` with the attempt
-count read through `DebtLedger::lineage_budget(entry)`, and a separate
-`BarrierPolicy { Undecided, OperatorBlocked, Waived { .. } }`. `Waived { by:
-String, at_unix_seconds: i64 }` should carry an `OperatorId` and a timestamp
-type.
-
 ## STR-042 - `PendingCoverage` is five subsystems behind one lock and one public surface
 
 **Reported by:** sync-lanes (owner ruling for demotions).
@@ -1024,54 +916,6 @@ string goes - `imap1`/`imap2` object ids, `imapthread1`/`2`, `imapsearch1`
 cursors, `imappart2`/`3` part handles, the `imapmsgid1` correlation token,
 `DraftHandle` ("an object id in a costume"), `imap-idle-N` subscription handles;
 `ImapMessageRef` a thin public wrapper over it; `FolderCursor` fields typed.
-
-## STR-055 - IMAP ENABLEd extensions are `Vec<String>` and the UTF-8 mode is a bool
-
-**Reported by:** imap-protocol.
-
-`enabled: Vec<String>` lives in `ProtocolState`, the connection snapshot,
-`EncodeOptions` and `ServerProfile`, fed by `UntaggedResponse::Enabled(Vec<String>)`.
-"Is UTF8=ACCEPT enabled" is a string scan at `driver::utf8_mode`,
-`EncodeOptions::utf8_accept_enabled`, `helpers::check_utf8_only_enforced`,
-`helpers::utf8_enabled` and the ENABLE path in `extensions.rs`; "is QRESYNC
-enabled" at `mailbox::validate_qresync_params` (whose comment says it matches
-"exactly as `ServerProfile::enabled` does" - agreement held by a comment) and
-`uid_ops`; `imap4rev2_active` scans for `"IMAP4rev2"`. `profile.rs`'s own doc says
-the `(capabilities, enabled)` pair is owned by four views and asks callers to go
-"through a typed wrapper" that does not exist. Proposal: `ConnectionCaps {
-advertised: CapabilitySet, enabled: EnabledSet }` (enabled entries typed as
-`Capability`), one value held by all four views, owning `supports`,
-`imap4rev2_active`, `binary_fetch_usable`, `utf8_mode`, `literal_mode`,
-`qresync_enabled`; replace the about 60 `utf8_mode: bool` / `utf8: bool`
-parameters across decode and encode with `WireMode { Ascii, Utf8 }`.
-`ServerProfile::auth_mechanisms: Vec<String>` and `thread_algorithms:
-Vec<String>` duplicate `Capability::Auth` / `Thread` and should be views. Also
-`build_encode_options` clones `capabilities` and `enabled` for every encoded
-command; behind an `Arc` that becomes a refcount bump. The live gate
-disagreement is BUG-029.
-
-The imap-connection hunter counted five views (`ProtocolState::enabled`,
-`ConnectionStateSnapshot::enabled`, `EncodeOptions::enabled`,
-`ConsumerContext::enabled`, `ServerProfile::enabled`, all `Vec<String>`) and the
-"is X ENABLEd" scans at `driver::utf8_mode`, `helpers::check_utf8_only_enforced`
-and `helpers::utf8_enabled`, `extensions::enable_utf8`, `codec/encode/core.rs`,
-`uid_ops::uid_fetch_vanished` and `uid_fetch_vanished_stream` (verbatim copies
-whose comment says "exactly as `ServerProfile::enabled` does" - a self-declared
-copy of a rule with an owner), `mailbox::validate_qresync_params`,
-`account/changes.rs`, `types::profile::imap4rev2_active`, and
-`ProtocolState::apply_untagged` (dedup on insert). The pair is threaded as two
-slices into `types::profile::supports(capabilities, enabled, cap)`, whose doc
-warns that nothing stops a caller pairing one view's capabilities with another's
-enabled list and that "the wrappers exist so that ordinary call sites cannot" -
-but the only wrappers are `auth::snapshot_supports` and
-`auth::is_rev2_from_snapshot`, and the driver and encoder call the slice
-functions directly. Its target is the same `SessionCapabilities { advertised,
-enabled: EnabledSet }`, owned by `ProtocolState`, published in the snapshot as an
-`Arc` (both vectors are cloned into the watch after every command today, and
-every handle gate re-borrows the watch, `validate_list_extended_request` four
-times, so an `Arc<SessionView>` also gives a method one coherent view for all its
-gates), embedded in `EncodeOptions` and `ConsumerContext`, with
-`ServerProfile` a projection and `Command::Enable` taking typed capabilities.
 
 ## STR-056 - Smaller IMAP protocol axes
 
@@ -1366,6 +1210,9 @@ the registry (BUG-028), and the primitives folded into the mutation engine
 
 **Reported by:** imap-account, jmap-account.
 
+The IMAP half landed in wave 15: every IMAP account-layer `AccountError` is now
+built in `account/error.rs` under its armed lint. Residue: the JMAP half below.
+
 The jmap-account hunter reports the same in JMAP: `error.rs` carries
 `#![warn(dead_code)]` so an unreachable classification arm is a warning, but
 `AccountError`s are also built inline in `capabilities.rs` (four builders),
@@ -1596,28 +1443,6 @@ contact arms; and the inventory tests for all of these. Either calendar and cont
 folder discovery is missing, or the lanes are built ahead of a producer; either
 way a large surface compiles and is tested with no path to it.
 
-## STR-121 - Split the Google client into one typed handle per API
-
-**Reported by:** google (its headline structural fix).
-
-Use one typed handle per API (`GmailApi`, `PeopleApi`, `CalendarApi`, `DriveApi`),
-each a thin view over the shared transport, owning its base URL, `ApiSurface`,
-quota scope and cost table, concurrency rule, error service and wire types; URL
-sniffing, the service string and the hand-set context field all go (BUG-086,
-BUG-087). Proposed layout: `transport.rs` (shared `AccountNet` attachment,
-`ByteTally`, `send_recorded`), `gmail/{api,types,quota,endpoint}.rs`,
-`people/{api,types}.rs`, `calendar/{api,types}.rs`, `drive/{api,types}.rs`
-(resumable session, permissions, base URL configurable), `error.rs` (`Error`
-carries the `ApiSurface`; `GmailService` grows to all four or is replaced by
-`ApiSurface`), `account/...`. Today the Calendar and People wire types
-(`GoogleEvent`, `Person`, ...) and URL builders live inside `account/calendar.rs`
-and `account/contacts.rs`, mixed with the `Account` mapping; only Gmail has an
-`api.rs` and `types.rs`; Drive hard-codes `SESSION_URL` and
-`https://www.googleapis.com/drive/v3/...` with no base override, unlike the other
-three. Two pairs of duplicate Gmail wire types exist: `inventory.rs` defines its own
-`ListMessagesResponse` and `GmailMessageStub` beside the ones in `types.rs`, and its
-own `list_messages_page` beside `api::list_messages`.
-
 ## STR-129 - Google's mailbox watch registry is process-global
 
 **Reported by:** google.
@@ -1762,21 +1587,6 @@ dialing policy is not a property of the runtime. Moving `connect` out is interna
 dropping the `E` parameter needs the owner. `ConnectionOptions` exists "keeping the
 dial signature stable across features" - a symptom of the parameter list living in
 the wrong place.
-
-## STR-143 - Submission composition lives in IMAP but is not IMAP's
-
-**Reported by:** smtp-sasl.
-
-`imap/src/account/submission.rs` holds a TLS-mode enum (`SubmissionTls`) mirroring
-both IMAP's TLS modes and bifrost-smtp's `Tls`; default ports (BUG-107); a credential
-type (STR-078); the envelope-address conversion (BUG-103); the HOLDUNTIL formatting
-(BUG-054); and the BatchOutcome-to-send-result projection (CON-057). None is about
-IMAP. Proposal: bifrost-smtp exposes a `Submission` facade (`from(SubmissionConfig)
--> Submission`, `submit(&SubmissionEnvelope, raw, hold: Option<SystemTime>) ->
-Result<SubmissionReceipt, AccountError>`) in `bifrost_types` vocabulary, reused by
-any future account crate composing SMTP (a CalDAV-only or JMAP-without-submission
-deployment) rather than copying IMAP's file; IMAP keeps only the decision to own
-one.
 
 ## STR-146 - URLs travel as `String` through every net and DAV layer
 

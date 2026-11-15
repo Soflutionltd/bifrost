@@ -219,8 +219,7 @@ pub(crate) struct ConsumerContext<'a> {
     // All fields are pub(in crate::connection)  -  constructed by the
     // dispatcher inside the connection module, read by consumers
     // via the accessor methods below. No field is pub.
-    pub(in crate::connection) capabilities: &'a [Capability],
-    pub(in crate::connection) enabled: &'a [String],
+    pub(in crate::connection) session: &'a crate::types::profile::SessionCapabilities,
     pub(in crate::connection) command_target: Option<&'a MailboxName>,
     /// The tag of the in-flight command. Used by consumers that need
     /// to correlate solicited responses (e.g., ESEARCH tag correlation
@@ -229,16 +228,6 @@ pub(crate) struct ConsumerContext<'a> {
 }
 
 impl ConsumerContext<'_> {
-    /// Cached server capabilities (RFC 3501 Section7.2.1).
-    pub(crate) fn capabilities(&self) -> &[Capability] {
-        self.capabilities
-    }
-
-    /// Successfully `ENABLE`d extensions (RFC 5161 Section3.2).
-    pub(crate) fn enabled(&self) -> &[String] {
-        self.enabled
-    }
-
     /// The mailbox argument of the current command, if applicable.
     pub(crate) fn command_target(&self) -> Option<&MailboxName> {
         self.command_target
@@ -823,7 +812,8 @@ impl Consumer for NamespaceConsumer {
 /// of extensions the server actually enabled for this request.
 #[derive(Default)]
 pub(crate) struct EnableConsumer {
-    /// The enabled extensions from `* ENABLED`.
+    /// Wire observations retain server spelling. ProtocolState parses these
+    /// into its typed negotiation owner before any mode or capability gate.
     caps: Option<Vec<String>>,
     /// Non-matching untagged responses to reclassify as events.
     buffered: Vec<UntaggedResponse>,

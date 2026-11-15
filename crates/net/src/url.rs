@@ -61,9 +61,117 @@ pub fn encode_path_component(value: &str) -> String {
     encode_query_value(value)
 }
 
+/// Exact credential origins, independently owned by each protocol leg.
+/// Cloning copies the set: discovery must not widen a sibling leg's authority.
+#[derive(Clone, Debug, Default)]
+pub struct TrustedOrigins(Vec<reqwest::Url>);
+
+impl TrustedOrigins {
+    /// Trust the complete origin of an absolute HTTP(S) URL.
+    pub fn trust(&mut self, raw: &str) -> Result<(), crate::Error> {
+        let mut url = credential_url(raw)?;
+        if !self.0.iter().any(|base| base.origin() == url.origin()) {
+            url.set_path("/");
+            url.set_query(None);
+            url.set_fragment(None);
+            self.0.push(url);
+        }
+        Ok(())
+    }
+
+    /// Mint proof that this URL belongs to this leg's credential destinations.
+    pub fn admit(&self, raw: &str) -> Result<AdmittedUrl, crate::Error> {
+        let url = credential_url(raw)?;
+        if !self.0.iter().any(|base| base.origin() == url.origin()) {
+            return Err(crate::Error::InvalidRequest {
+                field: "url",
+                detail: "credential destination is not a trusted origin".into(),
+            });
+        }
+        Ok(AdmittedUrl(url))
+    }
+}
+
+/// A URL minted by net's exact-origin credential admission.
+/// This proves membership in the minting policy, not in another account's set.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AdmittedUrl(reqwest::Url);
+
+impl AdmittedUrl {
+    /// The canonical serialization that must be sent without reinterpretation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Debug for AdmittedUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Provider query tokens are credentials too.
+        f.write_str("AdmittedUrl(..)")
+    }
+}
+
+fn credential_url(raw: &str) -> Result<reqwest::Url, crate::Error> {
+    let refuse = || crate::Error::InvalidRequest {
+        field: "url",
+        detail: "credential destination must be an absolute HTTP(S) URL without userinfo".into(),
+    };
+    let url = reqwest::Url::parse(raw).map_err(|_| refuse())?;
+    let authority = raw.split_once(':').map(|(_, rest)| {
+        let rest = rest.trim_start_matches(['/', '\\']);
+        let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
+        &rest[..end]
+    });
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || authority.is_some_and(|authority| authority.contains('@'))
+    {
+        return Err(refuse());
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{encode_path_component, encode_query_value};
+
+    #[test]
+    fn credential_origins_compare_scheme_host_and_effective_port() {
+        let mut origins = super::TrustedOrigins::default();
+        origins.trust("https://EXAMPLE.test:443/base").unwrap();
+        assert!(origins.admit("HTTPS://example.test/other?q=token").is_ok());
+        for raw in [
+            "http://example.test/",
+            "https://example.test:444/",
+            "https://other.test/",
+            "https://@example.test/",
+            "https://user@example.test/",
+        ] {
+            assert!(origins.admit(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn cloned_credential_origins_do_not_widen_sibling_legs() {
+        let mut original = super::TrustedOrigins::default();
+        original.trust("https://principal.test/").unwrap();
+        let mut discovered = original.clone();
+        discovered.trust("https://home.test/").unwrap();
+        assert!(discovered.admit("https://home.test/cal/").is_ok());
+        assert!(original.admit("https://home.test/cal/").is_err());
+    }
+
+    #[test]
+    fn admitted_url_debug_hides_provider_tokens() {
+        let mut origins = super::TrustedOrigins::default();
+        origins.trust("https://example.test/").unwrap();
+        let admitted = origins.admit("https://example.test/?secret=token").unwrap();
+        assert_eq!(format!("{admitted:?}"), "AdmittedUrl(..)");
+        assert_eq!(admitted.as_str(), "https://example.test/?secret=token");
+    }
 
     #[test]
     fn unreserved_characters_survive_untouched() {

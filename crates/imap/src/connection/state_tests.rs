@@ -168,7 +168,10 @@ fn enabled_appends_to_state() {
     ])));
     let digest = state.apply_side_effects(&resp);
 
-    assert_eq!(state.enabled(), &["CONDSTORE", "QRESYNC"]);
+    assert_eq!(
+        state.enabled(),
+        &[Capability::Condstore, Capability::QResync]
+    );
     assert!(!digest.had_bye());
 }
 
@@ -192,7 +195,7 @@ fn enabled_dedup_case_insensitive() {
     let _ = state.apply_side_effects(&resp2);
 
     assert_eq!(state.enabled().len(), 1);
-    assert_eq!(state.enabled()[0], "IMAP4rev2");
+    assert_eq!(state.enabled()[0], Capability::Imap4Rev2);
 }
 
 // ---------------------------------------------------------------------------
@@ -212,8 +215,8 @@ fn enabled_accumulates_across_calls() {
     let _ = state.apply_side_effects(&resp2);
 
     assert_eq!(state.enabled().len(), 2);
-    assert!(state.enabled().contains(&"CONDSTORE".to_owned()));
-    assert!(state.enabled().contains(&"QRESYNC".to_owned()));
+    assert!(state.enabled().contains(&Capability::Condstore));
+    assert!(state.enabled().contains(&Capability::QResync));
 }
 
 // ---------------------------------------------------------------------------
@@ -505,7 +508,7 @@ fn advertisements_survive_a_failed_command() {
             state.capabilities(),
             &[Capability::Imap4Rev1, Capability::Idle]
         );
-        assert_eq!(state.enabled(), &["QRESYNC"]);
+        assert_eq!(state.enabled(), &[Capability::QResync]);
         let _ = state.apply_side_effects(&Response::Tagged(TaggedResponse {
             tag: "A1".into(),
             status: refusal,
@@ -516,7 +519,7 @@ fn advertisements_survive_a_failed_command() {
             state.capabilities(),
             &[Capability::Imap4Rev1, Capability::Idle]
         );
-        assert_eq!(state.enabled(), &["QRESYNC"]);
+        assert_eq!(state.enabled(), &[Capability::QResync]);
     }
 }
 

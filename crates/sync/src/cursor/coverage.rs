@@ -3,7 +3,7 @@
 //! Coverage cannot travel with the checkpoint itself: `Checkpoint::Change`
 //! carries a `ChangeCursor`, which is protocol-owned opaque bytes plus an
 //! envelope tag, and it crosses the broadcast channel to a consumer and back
-//! through `ack_checkpoint`. Widening it would push engine-internal concepts
+//! through `ack`. Widening it would push engine-internal concepts
 //! through a published type every consumer matches on.
 //!
 //! So the producer records the claim here when it emits a checkpoint-bearing
@@ -35,7 +35,7 @@
 //! - A later walk can legitimately produce the same cursor bytes as an earlier
 //!   one while proving different coverage.
 //!
-//! So the engine issues its own monotonic `PublicationId` per checkpoint-
+//! So the engine issues its own monotonic `AckToken` per checkpoint-
 //! bearing publication, and the acknowledgement names it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -48,14 +48,15 @@ use bifrost_types::{Checkpoint, CursorScope, InventoryCoverageReport};
 ///
 /// Monotonic identity plus the immutable receipt needed to acknowledge after
 /// the issuing writer has restarted. Consumers persist the whole value beside
-/// the batch, not only its numeric field.
+/// the batch using `encode_ack_token`, not only its numeric identity.
 #[derive(Debug, Clone)]
 pub struct PublicationReceipt {
+    pub(crate) replay: Option<Vec<super::DebtLedger>>,
     /// The exact checkpoint lane this receipt may acknowledge. `None` is the
     /// repair lane, which intentionally has no checkpoint.
-    pub checkpoint: Option<Checkpoint>,
+    pub(crate) checkpoint: Option<Checkpoint>,
     /// The coverage evidence that must land atomically with the checkpoint.
-    pub claim: CoverageClaim,
+    pub(crate) claim: CoverageClaim,
     /// For a backfill COMPLETION marker: the walk's undelivered watermark as of
     /// the moment it was published. `None` for every other publication.
     ///
@@ -70,7 +71,7 @@ pub struct PublicationReceipt {
     ///
     /// It is only meaningful to the `PendingCoverage` that minted it: see
     /// [`PendingCoverage::walk_watermark`].
-    pub walk_watermark: Option<crate::cursor::UndeliveredMark>,
+    pub(crate) walk_watermark: Option<crate::cursor::UndeliveredMark>,
 }
 
 /// Coverage proof order, issued by the coverage owner, never by repair ids.
@@ -98,11 +99,11 @@ impl WalkGeneration {
 pub struct ScopeFence(u64);
 
 impl ScopeFence {
-    fn excludes(self, publication: &PublicationId) -> bool {
+    fn excludes(self, publication: &AckToken) -> bool {
         self.0 > publication.0.0
     }
 
-    fn after(publication: &PublicationId) -> Self {
+    fn after(publication: &AckToken) -> Self {
         Self(publication.0.0.saturating_add(1))
     }
 
@@ -119,7 +120,7 @@ impl ScopeFence {
 /// Snapshot of a scope's undelivered-page count, issued by its coverage ledger.
 /// Equality is the walk-completion operation; it is not a publication bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct UndeliveredMark(u64);
+pub struct UndeliveredMark(pub(super) u64);
 
 impl UndeliveredMark {
     #[cfg(test)]
@@ -140,7 +141,7 @@ impl UndeliveredMark {
 
 /// Compact publication sequence, minted only by the coverage ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PublicationNumber(u64);
+pub struct PublicationNumber(pub(super) u64);
 
 impl std::fmt::Display for PublicationNumber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -150,9 +151,9 @@ impl std::fmt::Display for PublicationNumber {
 
 /// Engine-issued acknowledgement token.
 ///
-/// The first field is retained as the compact identity consumers may log and
-/// key on. The receipt is the durable meaning of that identity and must be
-/// retained with it across writer restarts.
+/// `number()` exposes the compact identity consumers may log and key on.
+/// The receipt is the durable meaning of that identity and must be retained
+/// with it across writer restarts.
 ///
 /// This type is `Clone` and NOT `Copy`, which it once was. The ergonomic cost
 /// is real and was judged unavoidable: carrying the receipt behind an `Arc` is
@@ -175,28 +176,42 @@ impl std::fmt::Display for PublicationNumber {
 /// writer therefore withholds a backfill row whose publication this ledger did
 /// not mint, exactly as it withholds an `Unvouchable` marker.
 #[derive(Debug, Clone)]
-pub struct PublicationId(
-    pub PublicationNumber,
-    pub std::sync::Arc<PublicationReceipt>,
+pub struct AckToken(
+    pub(crate) PublicationNumber,
+    pub(crate) std::sync::Arc<PublicationReceipt>,
 );
 
-impl PartialEq for PublicationId {
+impl AckToken {
+    /// Exact checkpoint carried by this token; absent for repair publications.
+    #[must_use]
+    pub fn checkpoint(&self) -> Option<&Checkpoint> {
+        self.1.checkpoint.as_ref()
+    }
+
+    /// Compact identity for diagnostics, without exposing receipt construction.
+    #[must_use]
+    pub fn number(&self) -> PublicationNumber {
+        self.0
+    }
+}
+
+impl PartialEq for AckToken {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
-impl Eq for PublicationId {}
-impl std::hash::Hash for PublicationId {
+impl Eq for AckToken {}
+impl std::hash::Hash for AckToken {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }
 }
-impl PartialOrd for PublicationId {
+impl PartialOrd for AckToken {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for PublicationId {
+impl Ord for AckToken {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0.cmp(&other.0)
     }
@@ -214,14 +229,17 @@ pub struct CoverageClaim {
     /// discarded. Within one inventory walk reports are cumulative and this is
     /// harmless duplication; across backfill partitions it is the only thing
     /// that keeps partition A's debt alive when B supersedes it.
-    pub reports: Vec<InventoryCoverageReport>,
+    pub(crate) reports: Vec<InventoryCoverageReport>,
     /// Walk generation, ordering proof events even when cursor bytes repeat.
-    pub generation: crate::cursor::WalkGeneration,
+    pub(crate) generation: crate::cursor::WalkGeneration,
 }
 
 impl CoverageClaim {
     #[must_use]
-    pub fn new(report: InventoryCoverageReport, generation: crate::cursor::WalkGeneration) -> Self {
+    pub(crate) fn new(
+        report: InventoryCoverageReport,
+        generation: crate::cursor::WalkGeneration,
+    ) -> Self {
         Self {
             reports: vec![report],
             generation,
@@ -265,9 +283,8 @@ impl CoverageClaim {
 /// It is the supersession key: broadcasts within one lane come from a single
 /// sequential task, so the newest subsumes its predecessors.
 ///
-/// It is also the ACKNOWLEDGEMENT lane. `ack_checkpoint` resolves an id in the
-/// lane of the checkpoint it was handed, and `ack_publication` resolves one in
-/// `Repair`. A repair acknowledgement naming a checkpoint publication therefore
+/// It is also the ACKNOWLEDGEMENT lane. `ack` derives it from the token
+/// checkpoint, selecting `Repair` when the token carries no checkpoint. A repair acknowledgement naming a checkpoint publication therefore
 /// finds nothing instead of consuming it - without that check it would consume
 /// the claim, the later real acknowledgement would short-circuit as already
 /// persisted, and the engine would announce a durable boundary the store never
@@ -288,7 +305,7 @@ enum Lane {
     /// another.
     UnkeyedCheckpoint,
     /// A repair notification. Carries no checkpoint and is acknowledged through
-    /// `SyncEngine::ack_publication`.
+    /// `SyncEngine::ack`.
     Repair,
 }
 
@@ -356,7 +373,7 @@ struct Publication {
 /// page has to be right about which of them it is reading.
 #[derive(Debug, Clone)]
 struct SubsumedPage {
-    id: PublicationId,
+    id: AckToken,
     /// This page's OWN delivery stamp, never the survivor's. See
     /// [`BoundaryEntry::subsumed`].
     delivered_at: Option<crate::multiplexer::ReceiverSequence>,
@@ -380,7 +397,7 @@ struct SubsumedPage {
 /// to remember at the call site.
 #[derive(Debug, Clone)]
 struct BoundaryEntry {
-    id: PublicationId,
+    id: AckToken,
     lane: Lane,
     checkpoint: Checkpoint,
     /// Which numbered receivers have READ this batch.
@@ -466,7 +483,7 @@ struct BoundaryEntry {
     /// or `OpenPages` plan the partition is a slice of the scope; for the `Full`
     /// plan - which is what JMAP Email uses - there is ONE partition per scope, so
     /// the growth is over the whole scope's backfill. A consumer that never
-    /// acknowledges therefore retains one `PublicationId`, and with it one
+    /// acknowledges therefore retains one `AckToken`, and with it one
     /// `PublicationReceipt` and its whole coverage claim, per page of the walk.
     /// Filed rather than fixed: dropping a read subsumed page's receipt claim once
     /// every eligible reader has read it would bound this, at the cost of the
@@ -575,7 +592,7 @@ impl BoundaryEntry {
 #[derive(Debug)]
 struct Ledger {
     /// Publications that have not yet been resolved.
-    claims: HashMap<PublicationId, Publication>,
+    claims: HashMap<AckToken, Publication>,
     /// Debt rescued from publications nobody can acknowledge, waiting for the
     /// next publication that someone can.
     carried: Option<CoverageClaim>,
@@ -585,7 +602,7 @@ struct Ledger {
     /// persisted id at or above `id` means everything `id` proved is durable.
     /// One entry per lane bounds this by the account's scope count, where a
     /// tombstone per acknowledgement grew for the life of the attachment.
-    persisted: HashMap<Lane, PublicationId>,
+    persisted: HashMap<Lane, AckToken>,
     /// Highest publication per lane whose claim was FOLDED into a successor.
     ///
     /// A superseded publication's claim moves to the survivor so coarse acking
@@ -595,7 +612,7 @@ struct Ledger {
     /// must persist its checkpoint while ingesting nothing, because its
     /// coverage now rides the survivor. One entry per lane, so this stays
     /// bounded where a per-publication record would not.
-    folded: HashMap<Lane, PublicationId>,
+    folded: HashMap<Lane, AckToken>,
     /// Publications whose checkpoint the control path is still waiting on, in
     /// publication order. Also the backfill lane's capacity ledger - see
     /// [`BoundaryEntry`].
@@ -737,9 +754,12 @@ impl Default for PendingCoverage {
 
 /// What the writer should do with an acknowledgement.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ClaimLookup {
     /// First acknowledgement: ingest these reports, then persist.
     Apply(CoverageClaim),
+    /// Codec-restored reports, normalized to the durable evidence the writer ingests.
+    Replay(Vec<super::DebtLedger>),
     /// Already persisted. Report success, change nothing.
     AlreadyPersisted,
     /// No such publication. NEVER treat this as complete coverage - an unknown
@@ -820,8 +840,8 @@ impl PendingCoverage {
     /// Mint and register under ONE ledger guard. Minting under one guard and
     /// registering under another lets an id minted before invalidation escape
     /// both retirement passes, stranding the debt in a fenced registration.
-    fn mint(&self, _held: &mut Ledger, receipt: PublicationReceipt) -> PublicationId {
-        PublicationId(
+    fn mint(&self, _held: &mut Ledger, receipt: PublicationReceipt) -> AckToken {
+        AckToken(
             PublicationNumber(self.next.fetch_add(1, Ordering::Relaxed)),
             std::sync::Arc::new(receipt),
         )
@@ -834,10 +854,10 @@ impl PendingCoverage {
     /// an enumeration, so it must not touch the coverage lattice - hence the
     /// explicit empty claim rather than an absent entry, which is a different
     /// fact ("the report went missing").
-    pub fn publish_without_report(
+    pub(crate) fn publish_without_report(
         &self,
         generation: crate::cursor::WalkGeneration,
-    ) -> PublicationId {
+    ) -> AckToken {
         self.publish(CoverageClaim {
             reports: Vec::new(),
             generation,
@@ -847,12 +867,13 @@ impl PendingCoverage {
     /// Register a REPAIR-lane claim and issue its publication identity.
     ///
     /// Repair publications carry no checkpoint, gate no boundary waiter, and
-    /// are acknowledged through `SyncEngine::ack_publication`. Checkpoint
+    /// are acknowledged through `SyncEngine::ack`. Checkpoint
     /// publications go through [`PendingCoverage::register`] instead, which is
     /// what keeps the two halves of a checkpoint publication - the claim and
     /// the boundary registration - from ever existing separately.
-    pub fn publish(&self, claim: CoverageClaim) -> PublicationId {
+    pub(crate) fn publish(&self, claim: CoverageClaim) -> AckToken {
         let receipt = PublicationReceipt {
+            replay: None,
             checkpoint: None,
             claim: claim.clone(),
             walk_watermark: None,
@@ -877,7 +898,7 @@ impl PendingCoverage {
     /// lock. Two backfill partitions of one scope are in flight together by
     /// design, and any gap here lets both leave a live entry for the same lane,
     /// after which one acknowledgement discharges only one of them.
-    pub fn register(&self, checkpoint: Checkpoint, claim: CoverageClaim) -> PublicationId {
+    pub(crate) fn register(&self, checkpoint: Checkpoint, claim: CoverageClaim) -> AckToken {
         self.register_in(checkpoint, claim, None, None)
             .expect("unconditional registration")
     }
@@ -885,12 +906,13 @@ impl PendingCoverage {
     /// Register a backfill COMPLETION marker, stamping the walk's undelivered
     /// watermark into its receipt so the ack writer can ask again, at
     /// acknowledgement time, whether that walk is still whole.
-    pub fn register_walk_marker(
+    #[cfg(test)]
+    pub(crate) fn register_walk_marker(
         &self,
         checkpoint: Checkpoint,
         claim: CoverageClaim,
         walk_watermark: crate::cursor::UndeliveredMark,
-    ) -> PublicationId {
+    ) -> AckToken {
         self.register_in(checkpoint, claim, Some(walk_watermark), None)
             .expect("unconditional registration")
     }
@@ -901,7 +923,7 @@ impl PendingCoverage {
         claim: CoverageClaim,
         walk_watermark: Option<crate::cursor::UndeliveredMark>,
         expected_fence: Option<crate::cursor::ScopeFence>,
-    ) -> Result<PublicationId, CoverageClaim> {
+    ) -> Result<AckToken, CoverageClaim> {
         let lane = Lane::of(&checkpoint);
         self.register_lane_in(checkpoint, claim, walk_watermark, expected_fence, lane)
     }
@@ -913,8 +935,9 @@ impl PendingCoverage {
         walk_watermark: Option<crate::cursor::UndeliveredMark>,
         expected_fence: Option<crate::cursor::ScopeFence>,
         lane: Lane,
-    ) -> Result<PublicationId, CoverageClaim> {
+    ) -> Result<AckToken, CoverageClaim> {
         let receipt = PublicationReceipt {
+            replay: None,
             checkpoint: Some(checkpoint.clone()),
             claim: claim.clone(),
             walk_watermark,
@@ -933,7 +956,7 @@ impl PendingCoverage {
                 return Err(claim);
             }
         }
-        let id = self.mint(&mut ledger, receipt);
+        let mut id = self.mint(&mut ledger, receipt);
         let mut claim = claim;
         if let Lane::Backfill(scope, _) = &lane {
             let mint = ledger
@@ -1049,6 +1072,10 @@ impl PendingCoverage {
             }
         }
 
+        // The restart receipt must include carried and superseded evidence,
+        // exactly like the live claim. Freeze it only after folding, before
+        // any consumer can receive this publication.
+        std::sync::Arc::make_mut(&mut id.1).claim = claim.clone();
         ledger.claims.insert(
             id.clone(),
             Publication {
@@ -1083,7 +1110,7 @@ impl PendingCoverage {
         claim: CoverageClaim,
         expected_fence: crate::cursor::ScopeFence,
         walk_watermark: Option<crate::cursor::UndeliveredMark>,
-    ) -> Result<PublicationId, CoverageClaim> {
+    ) -> Result<AckToken, CoverageClaim> {
         self.register_in(checkpoint, claim, walk_watermark, Some(expected_fence))
     }
 
@@ -1186,12 +1213,12 @@ impl PendingCoverage {
     /// that no longer exists, in a `PendingCoverage` that starts every scope at
     /// zero. Comparing it there would refuse a marker that is legitimately
     /// durable and delete the scope's rows with it. The id's high bits are a
-    /// per-instance segment (see [`PublicationId`]), so "another attachment
+    /// per-instance segment (see [`AckToken`]), so "another attachment
     /// minted this" is answerable without keeping any state about the old one,
     /// and the answer is `None`: not a marker this attachment can judge, which
     /// refuses NOTHING rather than assuming the worst.
     #[must_use]
-    pub fn walk_watermark(&self, id: &PublicationId) -> Option<UndeliveredMark> {
+    pub fn walk_watermark(&self, id: &AckToken) -> Option<UndeliveredMark> {
         if !self.minted_here(id) {
             return None;
         }
@@ -1204,7 +1231,7 @@ impl PendingCoverage {
     /// acknowledgement replayed across a detach is recognisable without keeping
     /// any state about the attachment that minted it.
     #[must_use]
-    pub fn minted_here(&self, id: &PublicationId) -> bool {
+    pub fn minted_here(&self, id: &AckToken) -> bool {
         id.0.0 >> Self::SEGMENT_SHIFT == self.segment
     }
 
@@ -1220,7 +1247,7 @@ impl PendingCoverage {
     /// capacity of a page that is about to be delivered.
     pub fn mark_delivered(
         &self,
-        id: &PublicationId,
+        id: &AckToken,
         subscriber_seq: crate::multiplexer::ReceiverSequence,
     ) {
         let mut ledger = self.guard();
@@ -1247,11 +1274,7 @@ impl PendingCoverage {
     /// consumer is only now reading may already have been folded into a later
     /// publication of its partition, and the page just read is almost always
     /// either the survivor or the most recently folded element.
-    pub fn mark_received(
-        &self,
-        id: &PublicationId,
-        receiver_seq: crate::multiplexer::ReceiverSequence,
-    ) {
+    pub fn mark_received(&self, id: &AckToken, receiver_seq: crate::multiplexer::ReceiverSequence) {
         let freed = {
             let mut ledger = self.guard();
             let mut freed = false;
@@ -1638,7 +1661,7 @@ impl PendingCoverage {
     ///
     /// See [`CoverageClaim::debt_only`] for why only the debt travels: what a
     /// batch nobody received proved CLEAN must not discharge anything.
-    fn carry_and_forget(ledger: &mut Ledger, ids: impl IntoIterator<Item = PublicationId>) {
+    fn carry_and_forget(ledger: &mut Ledger, ids: impl IntoIterator<Item = AckToken>) {
         for id in ids {
             if let Some(publication) = ledger.claims.remove(&id) {
                 let debt = publication.claim.debt_only();
@@ -1660,7 +1683,7 @@ impl PendingCoverage {
     /// the final checkpoint on both the last batch and `Done`), so a
     /// value search can release a boundary belonging to a different, still
     /// in-flight publication.
-    pub fn acknowledge_publication(&self, id: PublicationId) {
+    pub fn acknowledge_publication(&self, id: AckToken) {
         {
             let mut ledger = self.guard();
             if let Some(index) = ledger.boundaries.iter().position(|entry| entry.id == id) {
@@ -1693,7 +1716,7 @@ impl PendingCoverage {
     /// have nothing to do with this one. A later reset then finds neither a
     /// boundary nor carried debt, and the obligation is simply gone. Re-raising
     /// an obligation is idempotent; losing one is not.
-    pub fn retire_publication(&self, id: PublicationId) {
+    pub fn retire_publication(&self, id: AckToken) {
         self.abandon(std::iter::once(id));
     }
 
@@ -1828,7 +1851,7 @@ impl PendingCoverage {
     pub(crate) fn invalidate_scope_backfill(
         &self,
         scope: &CursorScope,
-        through: Option<&PublicationId>,
+        through: Option<&AckToken>,
     ) -> CoverageClaim {
         self.invalidate_in(scope, Some(LaneKind::Backfill), through)
     }
@@ -1844,11 +1867,7 @@ impl PendingCoverage {
     /// from `last_backfill_mint` rather than from the live entries, because the
     /// later attempt's own publications are gone the moment they are
     /// acknowledged, which is exactly the case that has rows worth protecting.
-    pub(crate) fn backfill_minted_after(
-        &self,
-        scope: &CursorScope,
-        ceiling: &PublicationId,
-    ) -> bool {
+    pub(crate) fn backfill_minted_after(&self, scope: &CursorScope, ceiling: &AckToken) -> bool {
         self.guard()
             .last_backfill_mint
             .get(scope)
@@ -1859,10 +1878,10 @@ impl PendingCoverage {
         &self,
         scope: &CursorScope,
         lane_kind: Option<LaneKind>,
-        through: Option<&PublicationId>,
+        through: Option<&AckToken>,
     ) -> CoverageClaim {
         let mut ledger = self.guard();
-        let mut ids: Vec<PublicationId> = Vec::new();
+        let mut ids: Vec<AckToken> = Vec::new();
         // Removing the ENTRY is what frees the capacity - including the pages it
         // subsumed, which is the whole reason the charge lives on the entry
         // rather than in a list of ids somebody has to remember to extend. The
@@ -1986,7 +2005,11 @@ impl PendingCoverage {
     /// obligations get discarded while the engine believes B accounted for
     /// them. `register` performs this inline for the checkpoint lane; this is
     /// the standalone form.
-    pub fn supersede(&self, superseded: PublicationId, survivor: PublicationId) {
+    // This standalone operation changes only live evidence: it cannot revise a
+    // survivor receipt already handed to a consumer. Restart replay therefore
+    // cannot recover this later fold. Production checkpoint publication folds
+    // before freezing the receipt in register_lane_in instead.
+    pub fn supersede(&self, superseded: AckToken, survivor: AckToken) {
         let mut ledger = self.guard();
         let Some(old) = ledger.claims.remove(&superseded) else {
             return;
@@ -2005,21 +2028,24 @@ impl PendingCoverage {
     /// The checkpoint names the lane, so an id belonging to a repair
     /// publication - or to a different lane entirely - resolves to `Unknown`
     /// rather than consuming a claim it does not name.
-    pub fn claim_checkpoint(&self, id: PublicationId, checkpoint: &Checkpoint) -> ClaimLookup {
+    pub fn claim_checkpoint(&self, id: AckToken, checkpoint: &Checkpoint) -> ClaimLookup {
+        if id.1.checkpoint.as_ref() != Some(checkpoint) {
+            return ClaimLookup::Unknown;
+        }
         self.claim_in(id, &Lane::of(checkpoint))
     }
 
     /// Resolve an acknowledgement of a REPAIR publication.
     ///
     /// A checkpoint publication's id resolves to `Unknown` here. That is the
-    /// whole point: consuming it would let the later, real `ack_checkpoint`
+    /// whole point: consuming it would let the later, real `ack`
     /// short-circuit as already persisted and make the engine announce a
     /// durable boundary the store never wrote.
-    pub fn claim_repair(&self, id: PublicationId) -> ClaimLookup {
+    pub fn claim_repair(&self, id: AckToken) -> ClaimLookup {
         self.claim_in(id, &Lane::Repair)
     }
 
-    fn claim_in(&self, id: PublicationId, lane: &Lane) -> ClaimLookup {
+    fn claim_in(&self, id: AckToken, lane: &Lane) -> ClaimLookup {
         let mut ledger = self.guard();
         // The fence is checked before the live claims, not only after them: a
         // publication registered DURING a scope reset's store deletes is still
@@ -2102,7 +2128,10 @@ impl PendingCoverage {
                     .is_some_and(|saved| Lane::of(saved) == *lane)
                     || (*lane == Lane::Repair && id.1.checkpoint.is_none())
                 {
-                    ClaimLookup::Apply(id.1.claim.clone())
+                    match &id.1.replay {
+                        Some(reports) => ClaimLookup::Replay(reports.clone()),
+                        None => ClaimLookup::Apply(id.1.claim.clone()),
+                    }
                 } else {
                     ClaimLookup::Unknown
                 }
@@ -2116,16 +2145,16 @@ impl PendingCoverage {
     /// write that failed reports `Unknown` - honestly refusing - rather than
     /// `AlreadyPersisted`, which would make the engine announce a durable
     /// boundary that does not exist.
-    pub fn settle_checkpoint(&self, id: PublicationId, checkpoint: &Checkpoint) {
+    pub fn settle_checkpoint(&self, id: AckToken, checkpoint: &Checkpoint) {
         self.settle_in(id, Lane::of(checkpoint));
     }
 
     /// Record that a repair publication was durably applied.
-    pub fn settle_repair(&self, id: PublicationId) {
+    pub fn settle_repair(&self, id: AckToken) {
         self.settle_in(id, Lane::Repair);
     }
 
-    fn settle_in(&self, id: PublicationId, lane: Lane) {
+    fn settle_in(&self, id: AckToken, lane: Lane) {
         let mut ledger = self.guard();
         let watermark = ledger.persisted.entry(lane).or_insert(id.clone());
         if *watermark < id {
@@ -2147,7 +2176,7 @@ impl PendingCoverage {
     /// publication by checkpoint VALUE where equal values are routinely
     /// different publications. Both stay; every engine path uses the
     /// lane-checked, publication-identified forms.
-    pub fn claim(&self, id: PublicationId) -> ClaimLookup {
+    pub fn claim(&self, id: AckToken) -> ClaimLookup {
         let lane = self.guard().claims.get(&id).map(|p| p.lane.clone());
         match lane {
             Some(lane) => self.claim_in(id, &lane),
@@ -2161,7 +2190,7 @@ impl PendingCoverage {
     /// See [`CoverageClaim::debt_only`] for why only the debt travels.
     pub fn abandon<I>(&self, ids: I)
     where
-        I: IntoIterator<Item = PublicationId>,
+        I: IntoIterator<Item = AckToken>,
     {
         {
             let mut ledger = self.guard();
@@ -2193,7 +2222,7 @@ impl PendingCoverage {
     /// does not prove a checkpoint durable, and folding debt does not settle
     /// delivery. SyncControl owns generation-specific quiescence notifications;
     /// ledger-only callers must arrange that notification through their control.
-    pub fn retire(&self, id: PublicationId) {
+    pub fn retire(&self, id: AckToken) {
         self.abandon(std::iter::once(id));
     }
 
@@ -2894,7 +2923,7 @@ mod tests {
     }
 
     /// A repair acknowledgement must not be able to consume a CHECKPOINT
-    /// publication. If it could, the later real `ack_checkpoint` would find the
+    /// publication. If it could, the later real `ack` would find the
     /// claim already resolved, short-circuit as persisted, and the engine would
     /// report a durable boundary the store never wrote.
     #[test]

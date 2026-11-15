@@ -1,7 +1,8 @@
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, Checkpoint,
-    DiagnosticText, ObjectId, PageBoundary, Protocol, RequestCause, RequestErrorKind, SyncEvent,
+    AccountError, AccountOperation, Checkpoint, ObjectId, PageBoundary, Protocol, SyncEvent,
 };
+
+use super::error::raw_message_not_found;
 use bytes::Bytes;
 
 use crate::types::{FetchAttr, MailboxName};
@@ -112,40 +113,9 @@ async fn run_raw(
         // the stream with zero batches presented that as an empty message.
         RawFetchOutcome::Absent => Err(BlobError::Account(raw_message_not_found(&decoded.id))),
         RawFetchOutcome::GenerationChanged { .. } => Err(BlobError::Account(
-            AccountErrorBuilder::new(
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed {
-                    detail: DiagnosticText::support_only("UIDVALIDITY changed before fetch"),
-                }),
-            )
-            .protocol(Protocol::Imap)
-            .operation(AccountOperation::OpenRawRfc822)
-            // Cursor(Folder(..)), not ErrorScope::Mailbox: the folder
-            // producers' documented scope shape (see get.rs / mutate.rs).
-            .scope(bifrost_types::ErrorScope::Cursor(super::folder_scope(
-                &decoded.folder,
-            )))
-            .try_build()
-            .expect("valid account error classification"),
+            super::error::raw_uidvalidity_changed(&decoded.folder),
         )),
     }
-}
-
-/// `NotFound(Message)` for a raw read whose UID the server no longer holds,
-/// keyed by the id exactly as submitted.
-fn raw_message_not_found(id: &ObjectId) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message),
-        Cause::Request(RequestCause::NotFound {
-            what: bifrost_types::ResourceKind::Message,
-            id: Some(id.0.clone()),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(AccountOperation::OpenRawRfc822)
-    .scope(bifrost_types::ErrorScope::Message { id: id.clone() })
-    .try_build()
-    .expect("valid account error classification")
 }
 
 /// What a completed raw read established about the requested message.
@@ -255,21 +225,7 @@ pub(super) async fn run_fetch(
     let operand = super::targets::UidOperand::build([uid]);
     let Some(uid_set) = operand.uid_set() else {
         return Err(BlobError::Account(
-            AccountErrorBuilder::new(
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed {
-                    detail: DiagnosticText::support_only(
-                        "message id could not be placed in an IMAP UID operand",
-                    ),
-                }),
-            )
-            .protocol(Protocol::Imap)
-            .operation(op)
-            .scope(bifrost_types::ErrorScope::Cursor(super::folder_scope(
-                folder,
-            )))
-            .try_build()
-            .expect("valid account error classification"),
+            super::error::excluded_from_operand_error(op, folder),
         ));
     };
     let attrs = [attr];

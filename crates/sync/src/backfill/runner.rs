@@ -14,7 +14,7 @@
 //! `drive_changes_stream`. The runner broadcasts each page and its
 //! `BackfillCheckpoint` but does NOT write to `CheckpointStore`. The
 //! consumer atomically persists the page items in their own store, then
-//! calls `SyncEngine::ack_checkpoint` with the `Checkpoint::Backfill`;
+//! calls `SyncEngine::ack` with the page's acknowledgement token;
 //! the per-account ack writer routes that to
 //! `CheckpointStore::put_backfill` and fires `record_checkpoint` to wake
 //! pause / checkpoint waiters on a durable boundary.
@@ -99,7 +99,7 @@ pub const LIVE_SUPERSEDES_DEFAULT_CAP: usize = 100_000;
 ///    a given id on both sides.
 ///
 /// The only sound record trigger this engine has is the consumer ack:
-/// `SyncEngine::ack_checkpoint` is what the crate already treats as
+/// `SyncEngine::ack` is what the crate already treats as
 /// proof of receipt, precisely because broadcast delivery is not. A
 /// correct implementation buffers ids as pending, keyed by the
 /// checkpoint of the batch carrying them, and promotes them to
@@ -804,7 +804,6 @@ mod tests {
         InventoryEntry {
             id: ObjectId(id.into()),
             memberships: Vec::new(),
-            size: None,
             blob_id: None,
             fingerprint: Fingerprint {
                 server_version: ServerVersion::Unavailable,

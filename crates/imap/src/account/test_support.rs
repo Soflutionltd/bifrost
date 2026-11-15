@@ -133,7 +133,6 @@ fn sentinel_inventory_batch() -> SyncEvent<InventoryEntry> {
         items: vec![InventoryEntry {
             id: ObjectId(STUB_SENTINEL.to_string()),
             memberships: Vec::new(),
-            size: None,
             blob_id: None,
             fingerprint: bifrost_types::Fingerprint {
                 server_version: bifrost_types::ServerVersion::Unavailable,
@@ -176,7 +175,7 @@ impl Account for StubAccount {
 
     fn set_priority(&self, _priority: Priority) {}
 
-    fn set_bandwidth_cap(&self, _bps: Option<u64>) {}
+    fn set_bandwidth_cap(&self, _bps: Option<bifrost_types::BandwidthCap>) {}
 
     fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
         self.describe_called.store(true, Ordering::SeqCst);
@@ -869,7 +868,9 @@ mod unsupported_default_tests {
         );
         let mut stream = account.inventory_partition_stream(
             CursorScope::Account,
-            bifrost_types::InventoryPartition::Uid { from: 1, to: 2 },
+            bifrost_types::InventoryPartition::Uid(
+                bifrost_types::UidWindow::new(1, 1, 2).expect("ordered window"),
+            ),
         );
         let Some(InventoryEvent::Terminated(error)) = stream.next().await else {
             panic!("expected inventory refusal");
