@@ -56,8 +56,8 @@ pub(crate) struct EmailParseResponse {
 
 impl crate::core::method::JmapMethod for EmailParseRequest {
     const REPLAY_SAFE: bool = true;
-    const NAME: &'static str = "Email/parse";
-    type Cap = crate::core::capability::Mail;
+    const NAME: &'static str = <super::Email as crate::core::Object>::METHODS.parse;
+    type Cap = <super::Email as crate::core::Object>::Cap;
     type Response = EmailParseResponse;
 
     fn set_account_id(&mut self, account_id: &AccountId) {

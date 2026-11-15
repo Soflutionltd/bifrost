@@ -109,24 +109,114 @@ pub fn inventory_partition_for(bounds: &PartitionBounds) -> InventoryPartition {
     }
 }
 
+/// Engine-owned durable backfill key. The codec preserves existing store bytes,
+/// including unknown keys, so upgrading never moves a consumer's resume row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackfillKey {
+    Full,
+    Time { from: Option<i64>, to: Option<i64> },
+    Uid { from: u64, to: u64 },
+    Page { from: u32, to: u32 },
+    Complete,
+    LegacyComplete,
+    Opaque(Partition),
+}
+
+impl BackfillKey {
+    #[must_use]
+    pub fn decode(partition: &Partition) -> Self {
+        let Ok(text) = std::str::from_utf8(&partition.0) else {
+            return Self::Opaque(partition.clone());
+        };
+        match text {
+            "full" => return Self::Full,
+            "complete" => return Self::LegacyComplete,
+            "complete:v2" => return Self::Complete,
+            _ => {}
+        }
+        if let Some((kind, rest)) = text.split_once(':')
+            && let Some((from, to)) = rest.split_once(':')
+        {
+            match kind {
+                "page" => {
+                    if let (Ok(from), Ok(to)) = (from.parse(), to.parse()) {
+                        return Self::Page { from, to };
+                    }
+                }
+                "uid" => {
+                    if let (Ok(from), Ok(to)) = (from.parse(), to.parse()) {
+                        return Self::Uid { from, to };
+                    }
+                }
+                "time" => {
+                    let parse = |s: &str| {
+                        if s.is_empty() {
+                            Some(None)
+                        } else {
+                            s.parse::<i64>().ok().map(Some)
+                        }
+                    };
+                    if let (Some(from), Some(to)) = (parse(from), parse(to)) {
+                        return Self::Time { from, to };
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self::Opaque(partition.clone())
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Partition {
+        let text = match self {
+            Self::Full => "full".to_owned(),
+            Self::Time { from, to } => {
+                format!("time:{}:{}", optional_i64(*from), optional_i64(*to))
+            }
+            Self::Uid { from, to } => format!("uid:{from}:{to}"),
+            Self::Page { from, to } => format!("page:{from}:{to}"),
+            Self::Complete => "complete:v2".to_owned(),
+            Self::LegacyComplete => "complete".to_owned(),
+            Self::Opaque(partition) => return partition.clone(),
+        };
+        Partition(text.into_bytes())
+    }
+
+    /// Legacy empty-plan markers require one inventory recheck. Counts on new
+    /// markers are ordinary counts, never an ordering discriminator.
+    #[must_use]
+    pub fn proves_completion(&self, items_done: u64) -> bool {
+        matches!(self, Self::Complete) || matches!(self, Self::LegacyComplete) && items_done > 1
+    }
+}
+
 /// Stable durable checkpoint key for an inventory partition.
 #[must_use]
 pub fn partition_key(partition: &InventoryPartition) -> Partition {
     let key = match partition {
-        InventoryPartition::Full => "full".to_string(),
+        InventoryPartition::Full => BackfillKey::Full,
         InventoryPartition::Time {
             from_unix_seconds,
             to_unix_seconds,
-        } => format!(
-            "time:{}:{}",
-            optional_i64(*from_unix_seconds),
-            optional_i64(*to_unix_seconds)
-        ),
-        InventoryPartition::Uid { from, to } => format!("uid:{from}:{to}"),
-        InventoryPartition::Page { from, to } => format!("page:{from}:{to}"),
-        _ => "unknown".to_string(),
+        } => BackfillKey::Time {
+            from: *from_unix_seconds,
+            to: *to_unix_seconds,
+        },
+        InventoryPartition::Uid { from, to } => BackfillKey::Uid {
+            from: *from,
+            to: *to,
+        },
+        InventoryPartition::Page { from, to } => BackfillKey::Page {
+            from: *from,
+            to: *to,
+        },
+        // The external non-exhaustive partition type has no opaque encoding
+        // door. Preserve the historical fallback until it supplies one; a
+        // Debug rendering would not be a durable identity contract either.
+        _ => BackfillKey::Opaque(Partition(b"unknown".to_vec())),
     };
-    Partition(key.into_bytes())
+    key.encode()
 }
 
 fn optional_i64(value: Option<i64>) -> String {
@@ -141,10 +231,10 @@ fn optional_i64(value: Option<i64>) -> String {
 /// rather than re-walking from page 0 on every re-attach.
 #[must_use]
 pub fn parse_page_partition(partition: &Partition) -> Option<(u32, u32)> {
-    let text = std::str::from_utf8(&partition.0).ok()?;
-    let rest = text.strip_prefix("page:")?;
-    let (from, to) = rest.split_once(':')?;
-    Some((from.parse().ok()?, to.parse().ok()?))
+    match BackfillKey::decode(partition) {
+        BackfillKey::Page { from, to } => Some((from, to)),
+        _ => None,
+    }
 }
 
 /// Sentinel partition key marking a scope's backfill as fully exhausted.
@@ -152,24 +242,25 @@ pub fn parse_page_partition(partition: &Partition) -> Option<(u32, u32)> {
 /// done" flag the orchestrator writes via the normal consumer-ack path on
 /// completion, for both fixed plans and open-ended page walks. Distinct
 /// from every real `page:F:T` / `uid:F:T` / `time:F:T` key so it never
-/// collides with a partition checkpoint. The orchestrator stamps it with
-/// `items_done = total_walked + 1` so it strictly wins `get_backfill`'s
-/// "latest by items_done" query and a completed scope is recognised and
-/// skipped without re-walking.
+/// collides with a partition checkpoint. Stores select it by row kind,
+/// independently of the number of entries observed during this walk.
 #[must_use]
 pub fn completion_partition() -> Partition {
     // The unversioned marker could be earned by an empty plan without any
     // inventory. Its bytes cannot distinguish that from a legitimate walk.
     // A new version distinguishes a genuinely empty inventory from that old
     // marker; resume rechecks legacy zero/one markers once for missing history.
-    Partition(b"complete:v2".to_vec())
+    BackfillKey::Complete.encode()
 }
 
 /// True if `partition` names a completion sentinel, including the legacy key.
 /// Resume separately checks whether a legacy marker proves any inventory.
 #[must_use]
 pub fn is_completion_partition(partition: &Partition) -> bool {
-    partition.0 == b"complete:v2" || partition.0 == b"complete"
+    matches!(
+        BackfillKey::decode(partition),
+        BackfillKey::Complete | BackfillKey::LegacyComplete
+    )
 }
 
 /// Plan a partition list for the given policy.
@@ -262,6 +353,27 @@ mod tests {
             .in_tz("UTC")
             .unwrap()
             .timestamp()
+    }
+
+    #[test]
+    fn durable_key_codec_reads_existing_rows() {
+        for bytes in [
+            "full",
+            "time::123",
+            "time:-456:",
+            "uid:7:9",
+            "page:500:1000",
+            "complete",
+            "complete:v2",
+            "future:opaque",
+            "page:broken",
+        ] {
+            let partition = Partition(bytes.as_bytes().to_vec());
+            assert_eq!(BackfillKey::decode(&partition).encode(), partition);
+        }
+        assert!(!BackfillKey::LegacyComplete.proves_completion(1));
+        assert!(BackfillKey::LegacyComplete.proves_completion(2));
+        assert!(BackfillKey::Complete.proves_completion(0));
     }
 
     #[test]

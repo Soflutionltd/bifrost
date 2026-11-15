@@ -484,7 +484,13 @@ impl PartialEq for Error {
 impl Eq for Error {}
 
 impl Error {
-    /// Whether a driver-side failure makes the wire stream unsafe to reuse.
+    /// Whether a failure means the client can no longer trust the session.
+    /// The driver retires on ReadLoop's typed framing, on explicit
+    /// unusable-session signals, and on this classification for any exchange
+    /// that may have put bytes on the wire: a tagged completion synchronizes
+    /// the framing but does not prove the client understood the answer.
+    /// Continuation consumers also use it to decide whether cancellation is
+    /// safe.
     ///
     /// Server rejections and local validation failures leave command
     /// framing intact. Transport loss, BYE, parse failure, and protocol

@@ -104,6 +104,7 @@ pub(crate) fn move_placement_patch(destination: &str, source: Option<&str>) -> L
         add_label_ids,
         remove_label_ids,
         unsupported_flags: Vec::new(),
+        unsupported_operation: false,
     }
 }
 
@@ -118,6 +119,7 @@ pub(crate) struct LabelPatch {
     pub(crate) add_label_ids: Vec<String>,
     pub(crate) remove_label_ids: Vec<String>,
     pub(crate) unsupported_flags: Vec<String>,
+    pub(crate) unsupported_operation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +214,8 @@ pub(crate) fn translate_flag_op(op: &FlagOp, labels: &[GmailLabel]) -> LabelPatc
         FlagOp::Patch { add, remove } => patch_from_sets(add, remove, labels),
         FlagOp::Set(flags) => patch_for_set(flags, labels),
         _ => LabelPatch {
-            unsupported_flags: vec!["unknown future FlagOp variant".to_string()],
+            // Future operations are refusals, never consumer-visible flag tokens.
+            unsupported_operation: true,
             ..LabelPatch::default()
         },
     }

@@ -938,19 +938,30 @@ impl StreamingResponse {
 #[derive(Default)]
 pub(crate) struct AttemptEvidence {
     attempts: Vec<Error>,
-    may_have_committed: bool,
-    unreplayable_terminal: bool,
+    ledger: crate::AttemptLedger,
 }
 
 impl AttemptEvidence {
-    pub(crate) fn finish(self, source: Error) -> Error {
-        if self.attempts.is_empty() && !self.unreplayable_terminal {
+    pub(crate) fn finish(mut self, source: Error) -> Error {
+        self.ledger.record_error(&source, true);
+        let may_have_committed = self.ledger.verdict() == crate::CommitEvidence::MayHaveCommitted;
+        // A direct terminal status is a complete answer, not an incomplete
+        // exchange. Only retry-candidate stops and body/transport failures
+        // need reconciliation in the absence of an earlier attempt.
+        let complete_answer = matches!(
+            source,
+            Error::Status { .. }
+                | Error::AuthLost { .. }
+                | Error::RateLimited { .. }
+                | Error::LocalHold { .. }
+        );
+        if self.attempts.is_empty() && (!may_have_committed || complete_answer) {
             return source;
         }
         Error::AttemptHistory {
             source: Box::new(source),
             attempts: self.attempts,
-            may_have_committed: self.may_have_committed || self.unreplayable_terminal,
+            may_have_committed,
         }
     }
 
@@ -1183,8 +1194,7 @@ pub(crate) async fn send_streaming_inner(
     // particular a POST's 303 can follow a successful commit. Keep this
     // across method rewrites so a held replacement GET cannot authorize
     // replaying the original operation.
-    let mut may_have_committed = false;
-    let mut unreplayable_terminal = false;
+    let mut ledger = crate::AttemptLedger::default();
     let mut pending_response = None;
     let outcome = async {
         'outer: loop {
@@ -1260,7 +1270,7 @@ pub(crate) async fn send_streaming_inner(
                     key: key.clone(),
                     held,
                     attempts: std::mem::take(&mut prior_attempts),
-                    may_have_committed,
+                    may_have_committed: ledger.verdict() == crate::CommitEvidence::MayHaveCommitted,
                 });
             }
 
@@ -1306,7 +1316,7 @@ pub(crate) async fn send_streaming_inner(
                     // authentication, so it cannot be evidence that this
                     // non-idempotent attempt committed. Keep any earlier
                     // commit evidence sticky across redirects and retries.
-                    may_have_committed |= !replayable && r.status() != StatusCode::UNAUTHORIZED;
+                    ledger.record(crate::AttemptOutcome::Response(r.status()), replayable);
                     pending_response = Some(FinalResponse {
                         status: r.status(),
                         headers: r.headers().clone(),
@@ -1318,6 +1328,7 @@ pub(crate) async fn send_streaming_inner(
                     r
                 }
                 Err(e) => {
+                    ledger.record_error(&e, replayable);
                     if policy.network_errors
                         && attempts.can_retry()
                         && transport_error_is_replayable(&e, replayable)
@@ -1326,9 +1337,6 @@ pub(crate) async fn send_streaming_inner(
                         prior_attempts.push(e);
                         deadline.sleep(delay).await?;
                         continue;
-                    }
-                    if !replayable && left_the_process(&e) {
-                        unreplayable_terminal = true;
                     }
                     return Err(e);
                 }
@@ -1400,9 +1408,6 @@ pub(crate) async fn send_streaming_inner(
                                 retry_after: retry_after_history.last().copied(),
                                 final_response: evidence,
                             });
-                        }
-                        if !replayable && status != StatusCode::UNAUTHORIZED {
-                            unreplayable_terminal = true;
                         }
                         return Err(Error::RetryBudgetExhausted {
                             final_response: Some(evidence),
@@ -1638,8 +1643,7 @@ pub(crate) async fn send_streaming_inner(
     }
     let evidence = AttemptEvidence {
         attempts: prior_attempts,
-        may_have_committed,
-        unreplayable_terminal,
+        ledger,
     };
     match outcome {
         Ok(mut response) => {
@@ -1702,27 +1706,7 @@ fn build_reqwest(
 /// refusals establish that the attempted work was refused; a generic 5xx does not,
 /// because a gateway 502/503/504 can follow a commit.
 fn status_error_is_replayable(status: StatusCode, replayable: bool) -> bool {
-    replayable
-        || matches!(
-            status,
-            StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS
-        )
-}
-
-/// Whether a transport failure happened after bytes of the attempt may have
-/// left the process: the complement of the `Unsent` half of
-/// [`transport_error_is_replayable`].
-fn left_the_process(error: &Error) -> bool {
-    match error {
-        Error::Network {
-            transmission_state, ..
-        }
-        | Error::Tls {
-            transmission_state, ..
-        }
-        | Error::Timeout { transmission_state } => *transmission_state != TransmissionState::Unsent,
-        _ => false,
-    }
+    replayable || crate::is_proven_refusal(status)
 }
 
 /// Whether a transport failure may be replayed on the wire.
@@ -4230,12 +4214,12 @@ mod tests {
 
     #[test]
     fn status_replay_obeys_policy_except_proven_refusals() {
-        for code in [401, 429, 409, 500, 502, 503, 504, 599] {
+        for code in [401, 405, 429, 501, 409, 500, 502, 503, 504, 599] {
             let status = StatusCode::from_u16(code).unwrap();
             assert!(status_error_is_replayable(status, true));
             assert_eq!(
                 status_error_is_replayable(status, false),
-                matches!(code, 401 | 429)
+                matches!(code, 401 | 429 | 405 | 501)
             );
         }
     }

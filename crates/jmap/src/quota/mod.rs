@@ -81,6 +81,7 @@ crate::core::method::define_property_enum! {
 }
 
 impl crate::core::Object for Quota {
+    crate::core::method::object_metadata!(Quota);
     type Property = Property;
     type Id = QuotaId;
     fn requires_account_id() -> bool {
@@ -96,22 +97,7 @@ impl crate::core::get::GetObject for Quota {
     type GetArguments = ();
 }
 
-crate::define_get_method!(QuotaGet, Quota, "Quota/get", crate::core::capability::Quota);
-crate::define_changes_method!(
-    QuotaChanges,
-    Quota,
-    "Quota/changes",
-    crate::core::capability::Quota
-);
-crate::define_query_method!(
-    QuotaQuery,
-    Quota,
-    "Quota/query",
-    crate::core::capability::Quota
-);
-crate::define_query_changes_method!(
-    QuotaQueryChanges,
-    Quota,
-    "Quota/queryChanges",
-    crate::core::capability::Quota
-);
+crate::define_get_method!(QuotaGet, Quota);
+crate::define_changes_method!(QuotaChanges, Quota);
+crate::define_query_method!(QuotaQuery, Quota);
+crate::define_query_changes_method!(QuotaQueryChanges, Quota);

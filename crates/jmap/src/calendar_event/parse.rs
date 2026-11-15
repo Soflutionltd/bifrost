@@ -3,8 +3,7 @@ pub(crate) type CalendarEventParseResponse =
 
 crate::define_parse_method!(
     CalendarEventParseRequest,
-    super::Property,
-    "CalendarEvent/parse",
+    super::CalendarEvent,
     crate::core::capability::CalendarsParse,
     CalendarEventParseResponse
 );

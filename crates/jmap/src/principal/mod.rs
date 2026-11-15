@@ -302,6 +302,7 @@ impl DKIM {
 }
 
 impl crate::core::Object for Principal {
+    crate::core::method::object_metadata!(Principal);
     type Property = Property;
     type Id = PrincipalId;
     fn requires_account_id() -> bool {
@@ -352,36 +353,11 @@ impl crate::core::SetCreate for PrincipalCreate {
     }
 }
 
-crate::define_get_method!(
-    PrincipalGet,
-    Principal,
-    "Principal/get",
-    crate::core::capability::Principals
-);
-crate::define_set_method!(
-    PrincipalSet,
-    Principal,
-    "Principal/set",
-    crate::core::capability::Principals
-);
-crate::define_changes_method!(
-    PrincipalChanges,
-    Principal,
-    "Principal/changes",
-    crate::core::capability::Principals
-);
-crate::define_query_method!(
-    PrincipalQuery,
-    Principal,
-    "Principal/query",
-    crate::core::capability::Principals
-);
-crate::define_query_changes_method!(
-    PrincipalQueryChanges,
-    Principal,
-    "Principal/queryChanges",
-    crate::core::capability::Principals
-);
+crate::define_get_method!(PrincipalGet, Principal);
+crate::define_set_method!(PrincipalSet, Principal);
+crate::define_changes_method!(PrincipalChanges, Principal);
+crate::define_query_method!(PrincipalQuery, Principal);
+crate::define_query_changes_method!(PrincipalQueryChanges, Principal);
 
 #[cfg(test)]
 mod time_zone_tests {

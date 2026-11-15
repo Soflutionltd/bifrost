@@ -28,7 +28,6 @@ const DEFAULT_CALENDAR_ID: &str = "calendar";
 /// are minted with this segment to keep `event_get`/`update`/`delete`
 /// routing honest.
 const MAILBOX_SCOPE: &str = "$mailbox";
-const EVENT_ID_SEPARATOR: &str = "::";
 const EVENT_SELECT: &str = "id,subject,body,location,start,end,isAllDay,showAs,sensitivity,organizer,attendees,originalStart,webLink,categories,responseStatus,isCancelled,changeKey,recurrence";
 const EVENT_TIMEZONE_PREFER: &str = "outlook.timezone=\"UTC\"";
 const EVENT_SEARCH_FIELDS: &[&str] = &[
@@ -1026,16 +1025,24 @@ fn event_search_path(prefix: &str, calendar_id: Option<&CalendarId>) -> String {
 }
 
 pub(super) fn join_event_id(calendar_id: &str, event_id: &str) -> String {
-    format!("{calendar_id}{EVENT_ID_SEPARATOR}{event_id}")
+    super::foreign::GraphId::Event {
+        calendar: calendar_id,
+        event: event_id,
+    }
+    .encode()
 }
 
 fn split_event_id(
     value: &str,
     operation: AccountOperation,
 ) -> Result<(String, String), AccountError> {
-    value
-        .split_once(EVENT_ID_SEPARATOR)
-        .map(|(calendar, event)| (calendar.to_string(), event.to_string()))
+    super::foreign::GraphId::parse_event(value)
+        .and_then(|id| match id {
+            super::foreign::GraphId::Event { calendar, event } => {
+                Some((calendar.to_string(), event.to_string()))
+            }
+            _ => None,
+        })
         // Every id this crate hands out carries the separator, so one without
         // it is caller input this crate never minted: `Request(Malformed)`,
         // not a capability Graph lacks.

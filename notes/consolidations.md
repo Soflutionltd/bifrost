@@ -677,60 +677,6 @@ Each summarizes other code with nothing forcing agreement:
 Owner: table-driven decode dispatch (keyword -> parser + strictness + numeric
 width) and a classification table from which routing keys are computed.
 
-## CON-033 - Should this IMAP outcome retire the connection?
-
-**Reported by:** imap-connection.
-
-The driver arms are consolidated: all four call `finish_exchange` before
-publishing state or answering, with explicit untouched, exchanged and
-interrupted phases. Residue: the read loops still do not return a typed
-`Framing` outcome, so exchanged errors fall back to `is_connection_fatal`. A
-framing-only rule was declined because a synchronized completion can still leave
-stale capabilities or a poisoned transport, so whatever replaces the fallback
-must keep those two retirement reasons. The typed outcome's natural producer is
-CON-034's single read loop.
-
-## CON-034 - What does a foreign tag mean? Six IMAP read loops answer differently
-
-**Reported by:** imap-connection.
-
-The `OK/NO/BAD -> Ok/no_with_code/bad_with_code` match is written out in
-`wire_send::wait_for_continuation`, `idle::run_committed_idle`,
-`idle::wait_for_idle_grant`, `idle::drain_idle_responses`, `SelectConsumer`,
-`NotifySetConsumer`, the fetch consumers and `dispatch/auth.rs`, beside the owner
-`TaggedResponse::require_ok` that 24 consumers use - harmless as code. The
-decision actually duplicated is foreign-tag policy: `dispatch_response_loop`,
-`wait_for_continuation` and `wait_for_idle_grant` treat a foreign tag as fatal
-`Protocol`; the IDLE loop and `drain_idle_responses` "ignore to preserve the
-connection"; `logout_best_effort` ends the drain. Only one command is ever
-outstanding in all six, so a foreign tag is the same fact (desynchronization) in
-each. The loops (`dispatch_response_loop`, `route_pipeline_response` with two
-callers, `wait_for_continuation` in two modes, `wait_for_idle_grant`, the IDLE
-loop, `drain_idle_responses`, `logout_best_effort`) each re-implement read with
-the right utf8 mode and budget, apply side effects, run the untagged prologue,
-then a tagged/continuation/greeting policy; the untagged prologue was already
-extracted after drift (`process_untagged_prefix`, `process_untagged_as_event`),
-the tagged half was not. `logout_best_effort` also bypasses the "one sender"
-(`send_wire_command`'s doc: "Every command ... reaches the socket through here")
-by writing `format!("{tag} LOGOUT\r\n")` raw, and is the one tagged arm that
-emits no response-code events. Owner: one `ReadLoop` driven by a `LoopPolicy {
-on_own_tag, on_foreign_tag, on_continuation, route_untagged }`, which also makes
-literal budgets apply in every loop (BUG-037) and gives CON-033's `Framing` one
-producer.
-
-## CON-042 - JMAP data type, capability and method name are restated at every invocation
-
-**Reported by:** jmap-protocol.
-
-`DataType` (crate root) is a string table parsed by hand; `Object` types do not
-know their `DataType`; each `define_*_method!(EmailGet, Email, "Email/get",
-capability::Mail)` restates the type name and capability, five or six times per
-object; `sync/push.rs::scope_for_data_type` maps `DataType` back to cursor scopes.
-`tests.rs::method_name_and_capability_table` is the pairwise-agreement test
-holding the copies in step. Owner: `Object` gains `const DATA_TYPE: DataType` (or
-`TYPE_NAME`) and `type Cap`; the macros derive `NAME` (`concat!(stringify!..)`)
-and `Cap` from the object, and the table test becomes unnecessary.
-
 ## CON-043 - JMAP wire property names are declared twice per enum
 
 **Reported by:** jmap-protocol.

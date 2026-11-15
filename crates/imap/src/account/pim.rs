@@ -478,7 +478,7 @@ where
 {
     Box::pin(async move {
         let _send_gate = account.send_gate.read().await;
-        if account.closed.load(std::sync::atomic::Ordering::Acquire) {
+        if account.shutdown.is_cancelled() {
             return Err(op_err(AccountOperation::Send)(Error::closed()));
         }
         // Graph-style shared-mailbox send routing is not modeled over
@@ -534,7 +534,7 @@ pub(crate) fn send_raw_message(
 ) -> AccountFuture<Result<SendReceipt, AccountError>> {
     Box::pin(async move {
         let _send_gate = account.send_gate.read().await;
-        if account.closed.load(std::sync::atomic::Ordering::Acquire) {
+        if account.shutdown.is_cancelled() {
             return Err(op_err(AccountOperation::Send)(Error::closed()));
         }
         let Some(submission) = account.submission.clone() else {
@@ -583,7 +583,7 @@ pub(super) fn draft_send_with_clock(
 ) -> AccountFuture<Result<SendReceipt, AccountError>> {
     Box::pin(async move {
         let _send_gate = account.send_gate.read().await;
-        if account.closed.load(std::sync::atomic::Ordering::Acquire) {
+        if account.shutdown.is_cancelled() {
             return Err(op_err(AccountOperation::DraftSend)(Error::closed()));
         }
         let Some(submission) = account.submission.clone() else {
@@ -1213,10 +1213,12 @@ pub(crate) fn search_messages(
 pub(crate) fn containers_list(
     account: ImapAccount,
 ) -> AccountFuture<Result<ContainerList, AccountError>> {
-    // The snapshot already folds in shared/other-user folders discovered
-    // at open; per-prefix degradations were handled (and skipped) during
-    // that discovery, so the enumeration itself has nothing to skip.
-    Box::pin(async move { Ok(ContainerList::complete(containers_snapshot(&account))) })
+    Box::pin(async move {
+        Ok(ContainerList {
+            containers: containers_snapshot(&account),
+            skipped_scopes: account.discovery_skips.clone(),
+        })
+    })
 }
 
 fn container_refresh_error(

@@ -85,6 +85,7 @@ crate::core::method::define_property_enum! {
 }
 
 impl crate::core::Object for SieveScript {
+    crate::core::method::object_metadata!(SieveScript);
     type Property = Property;
     type Id = SieveScriptId;
     fn requires_account_id() -> bool {
@@ -123,21 +124,6 @@ impl crate::core::SetCreate for SieveScriptCreate {
     }
 }
 
-crate::define_get_method!(
-    SieveScriptGet,
-    SieveScript,
-    "SieveScript/get",
-    crate::core::capability::Sieve
-);
-crate::define_set_method!(
-    SieveScriptSet,
-    SieveScript,
-    "SieveScript/set",
-    crate::core::capability::Sieve
-);
-crate::define_query_method!(
-    SieveScriptQuery,
-    SieveScript,
-    "SieveScript/query",
-    crate::core::capability::Sieve
-);
+crate::define_get_method!(SieveScriptGet, SieveScript);
+crate::define_set_method!(SieveScriptSet, SieveScript);
+crate::define_query_method!(SieveScriptQuery, SieveScript);

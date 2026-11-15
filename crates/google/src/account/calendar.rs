@@ -629,11 +629,19 @@ fn decode_page_token(
         })
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CalendarSearchKey {
+    calendar_id: String,
+    page_token: String,
+}
+
 fn encode_cross_calendar_cursor(calendar_id: &str, page_token: &[u8]) -> Vec<u8> {
-    let mut cursor = calendar_id.as_bytes().to_vec();
-    cursor.push(b'\n');
-    cursor.extend_from_slice(page_token);
-    cursor
+    let key = CalendarSearchKey {
+        calendar_id: calendar_id.to_string(),
+        page_token: String::from_utf8(page_token.to_vec())
+            .expect("Calendar page tokens originate as JSON strings"),
+    };
+    serde_json::to_vec(&key).expect("string-only cursor serialization")
 }
 
 fn decode_cross_calendar_cursor(
@@ -643,12 +651,27 @@ fn decode_cross_calendar_cursor(
     let Some(cursor) = decode_page_token(page_cursor, AccountOperation::EventSearch)? else {
         return Ok((0, None));
     };
-    let (calendar_id, page_token) = cursor.split_once('\n').ok_or_else(|| {
-        caller_input_error(
-            AccountOperation::EventSearch,
-            "cross-calendar search cursor is missing calendar id".to_string(),
-        )
-    })?;
+    let key = serde_json::from_str::<CalendarSearchKey>(&cursor)
+        .or_else(|_| {
+            // Keep persisted pre-JSON cursors readable during an upgrade.
+            cursor
+                .split_once('\n')
+                .map(|(calendar_id, page_token)| CalendarSearchKey {
+                    calendar_id: calendar_id.to_string(),
+                    page_token: page_token.to_string(),
+                })
+                .ok_or(())
+        })
+        .map_err(|()| {
+            caller_input_error(
+                AccountOperation::EventSearch,
+                "invalid cross-calendar search cursor; restart the search".to_string(),
+            )
+        })?;
+    let CalendarSearchKey {
+        calendar_id,
+        page_token,
+    } = key;
     // A cursor this crate minted can name a calendar the account no longer
     // lists: it was removed between pages. That is state moving under the
     // caller's pagination, not a caller bug and not a provider fault, so it is
@@ -656,7 +679,7 @@ fn decode_cross_calendar_cursor(
     // restarting the search.
     let index = calendar_ids
         .iter()
-        .position(|candidate| candidate == calendar_id)
+        .position(|candidate| candidate == &calendar_id)
         .ok_or_else(|| {
             bifrost_types::AccountErrorBuilder::new(
                 bifrost_types::AccountErrorKind::ConcurrencyConflict,
@@ -675,7 +698,7 @@ fn decode_cross_calendar_cursor(
             .try_build()
             .expect("valid account error classification")
         })?;
-    let page_token = (!page_token.is_empty()).then(|| page_token.to_string());
+    let page_token = (!page_token.is_empty()).then_some(page_token);
     Ok((index, page_token))
 }
 
@@ -1269,7 +1292,45 @@ fn reject_unexpressible_all_day_patch(patch: &EventPatch) -> Result<(), AccountE
     Ok(())
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CalendarEventKey {
+    calendar_id: String,
+    event_id: String,
+}
+
+impl CalendarEventKey {
+    fn encode(&self) -> String {
+        serde_json::to_string(self).expect("string-only event key serialization")
+    }
+
+    fn decode(value: &str) -> Option<Self> {
+        serde_json::from_str(value).ok().or_else(|| {
+            // Enterprise users must retain access to event ids persisted before
+            // the codec change. The old delimiter split remains read-only.
+            value
+                .split_once(EVENT_ID_SEPARATOR)
+                .map(|(calendar, event)| Self {
+                    calendar_id: calendar.to_string(),
+                    event_id: event.to_string(),
+                })
+        })
+    }
+}
+
 fn join_event_id(calendar_id: &str, event_id: &str) -> String {
+    // Event ids are durable identities a consumer has already stored. Minting
+    // a new spelling would make every synced event look new to an Outlook-style
+    // client, which expects its calendar to stay put across an upgrade. Google
+    // calendar ids (addresses) and event ids (base32hex) never contain the
+    // separator, so the historical form stays the minted one; the JSON form is
+    // only used when a component would make the split ambiguous.
+    if calendar_id.contains(EVENT_ID_SEPARATOR) || event_id.contains(EVENT_ID_SEPARATOR) {
+        return CalendarEventKey {
+            calendar_id: calendar_id.to_string(),
+            event_id: event_id.to_string(),
+        }
+        .encode();
+    }
     format!("{calendar_id}{EVENT_ID_SEPARATOR}{event_id}")
 }
 
@@ -1277,9 +1338,8 @@ fn split_event_id(
     value: &str,
     operation: AccountOperation,
 ) -> Result<(String, String), AccountError> {
-    value
-        .split_once(EVENT_ID_SEPARATOR)
-        .map(|(calendar, event)| (calendar.to_string(), event.to_string()))
+    CalendarEventKey::decode(value)
+        .map(|key| (key.calendar_id, key.event_id))
         .ok_or_else(|| {
             caller_input_error(
                 operation,
@@ -1607,6 +1667,33 @@ mod tests {
     /// request, as the caller's fault - never `Protocol(MissingField)`, which
     /// used to blame Google for an id or cursor it never saw.
     #[test]
+    fn persisted_calendar_keys_and_delimiter_components_round_trip() {
+        let event = CalendarEventKey {
+            calendar_id: "calendar::with\nseparator".to_string(),
+            event_id: "event::part".to_string(),
+        };
+        assert_eq!(CalendarEventKey::decode(&event.encode()), Some(event));
+        assert_eq!(
+            split_event_id("primary::old", AccountOperation::EventGet).unwrap(),
+            ("primary".to_string(), "old".to_string())
+        );
+        let calendars = vec!["calendar\npart".to_string()];
+        let cursor = encode_cross_calendar_cursor(&calendars[0], b"opaque\ntoken");
+        assert_eq!(
+            decode_cross_calendar_cursor(Some(cursor), &calendars).unwrap(),
+            (0, Some("opaque\ntoken".to_string()))
+        );
+        assert_eq!(
+            decode_cross_calendar_cursor(
+                Some(b"primary\nold-token".to_vec()),
+                &["primary".to_string()]
+            )
+            .unwrap(),
+            (0, Some("old-token".to_string()))
+        );
+    }
+
+    #[test]
     fn unusable_caller_input_is_a_client_bug_not_a_provider_fault() {
         let assert_client_bug = |error: AccountError| {
             assert!(
@@ -1736,11 +1823,11 @@ mod tests {
             )]);
             let expected = Some(bifrost_types::ServerVersion::ETag("\"caller-old\"".into()));
             let error = if delete {
-                delete_if_version(client, EventId("primary::e1".into()), expected).await
+                delete_if_version(client, EventId(join_event_id("primary", "e1")), expected).await
             } else {
                 update(
                     client,
-                    EventId("primary::e1".into()),
+                    EventId(join_event_id("primary", "e1")),
                     EventPatch {
                         expected_version: expected,
                         title: Some(Some("new title".into())),
@@ -1768,13 +1855,13 @@ mod tests {
         for delete in [false, true] {
             let (client, script) = scripted_client(vec![canned_json(StatusCode::OK, json!({}))]);
             if delete {
-                delete_if_version(client, EventId("primary::e1".into()), None)
+                delete_if_version(client, EventId(join_event_id("primary", "e1")), None)
                     .await
                     .unwrap();
             } else {
                 update(
                     client,
-                    EventId("primary::e1".into()),
+                    EventId(join_event_id("primary", "e1")),
                     EventPatch {
                         title: Some(Some("new title".into())),
                         ..Default::default()
@@ -1794,7 +1881,7 @@ mod tests {
         let (client, script) = scripted_client(Vec::new());
         let error = update(
             client,
-            EventId("primary::e1".into()),
+            EventId(join_event_id("primary", "e1")),
             EventPatch {
                 expected_version: Some(bifrost_types::ServerVersion::ETag("\"old\"".into())),
                 calendar_id: Some(CalendarId("other".into())),
@@ -1828,7 +1915,7 @@ mod tests {
         let error = rsvp_if_version(
             client,
             "self@example.test".into(),
-            EventId("primary::e1".into()),
+            EventId(join_event_id("primary", "e1")),
             RsvpStatus::Accepted,
             Some(bifrost_types::ServerVersion::ETag("\"old\"".into())),
         )
@@ -1984,7 +2071,7 @@ mod tests {
         )
         .expect("a cancelled stub is a deletion notice, not a projection failure");
 
-        assert_eq!(event.id.0, "primary::deleted-standalone");
+        assert_eq!(event.id.0, join_event_id("primary", "deleted-standalone"));
         assert_eq!(event.status, EventStatus::Cancelled);
         assert_eq!(event.start.value, "");
         assert_eq!(event.end, None);
@@ -2118,7 +2205,10 @@ mod tests {
                 .iter()
                 .map(|event| event.native_id.as_str())
                 .collect::<Vec<_>>(),
-            ["primary::deleted-standalone", "primary::live"]
+            [
+                join_event_id("primary", "deleted-standalone"),
+                join_event_id("primary", "live")
+            ]
         );
         assert_eq!(page.items[0].status, EventStatus::Cancelled);
         assert!(
@@ -2165,9 +2255,9 @@ mod tests {
                 .map(|event| event.native_id.as_str())
                 .collect::<Vec<_>>(),
             [
-                "primary::cancelled-instance",
-                "primary::bare-tombstone",
-                "primary::live"
+                join_event_id("primary", "cancelled-instance"),
+                join_event_id("primary", "bare-tombstone"),
+                join_event_id("primary", "live")
             ]
         );
         // The cancelled instance keeps projecting off `originalStartTime`
@@ -2178,7 +2268,7 @@ mod tests {
             page.items[0].end.as_ref().map(|end| end.value.as_str()),
             Some("2026-06-02T12:00:00Z")
         );
-        assert_eq!(page.failed_ids, vec!["primary::broken".to_string()]);
+        assert_eq!(page.failed_ids, vec![join_event_id("primary", "broken")]);
         assert_eq!(page.next_cursor.as_deref(), Some(b"page-2".as_slice()));
     }
 
@@ -2230,13 +2320,13 @@ mod tests {
                 .iter()
                 .map(|event| event.native_id.as_str())
                 .collect::<Vec<_>>(),
-            ["work::good"]
+            [join_event_id("work", "good")]
         );
         assert_eq!(
             page.failed_ids,
             vec![
-                "primary::broken-a".to_string(),
-                "work::broken-b".to_string()
+                join_event_id("primary", "broken-a"),
+                join_event_id("work", "broken-b")
             ]
         );
     }
@@ -2492,7 +2582,7 @@ mod tests {
             .expect_err("destination patch fails");
         let direct_error = update(
             direct_client,
-            EventId("destination::event-1".to_string()),
+            EventId(join_event_id("destination", "event-1")),
             direct_patch,
         )
         .await
@@ -2514,7 +2604,7 @@ mod tests {
         assert_eq!(
             error.scope(),
             Some(&bifrost_types::ErrorScope::Calendar {
-                id: ("destination::event-1".to_string()).into()
+                id: (join_event_id("destination", "event-1")).into()
             })
         );
         assert_eq!(error.scope(), direct_error.scope());
@@ -2618,7 +2708,7 @@ mod tests {
         let Some(bifrost_types::ErrorScope::Calendar { id }) = error.scope() else {
             panic!("continuation must name the destination event");
         };
-        assert_eq!(id.0, "destination::event-1");
+        assert_eq!(id.0, join_event_id("destination", "event-1"));
         // Follow the public continuation with the ORIGINAL patch, including
         // calendar_id. This must send only PATCH, never another events.move.
         update(client, EventId(id.0.clone()), patch)
@@ -3224,7 +3314,7 @@ mod tests {
             ..EventPatch::default()
         };
 
-        update(client, EventId("primary::event-1".to_string()), patch)
+        update(client, EventId(join_event_id("primary", "event-1")), patch)
             .await
             .expect("an echoed start with an empty end is written");
 
@@ -3410,7 +3500,7 @@ mod tests {
         let (client, script) = scripted_client(vec![canned_json(StatusCode::OK, json!({}))]);
         update(
             client,
-            EventId("primary::e1".to_string()),
+            EventId(join_event_id("primary", "e1")),
             EventPatch {
                 title: Some(Some("Renamed".to_string())),
                 end: read.end,

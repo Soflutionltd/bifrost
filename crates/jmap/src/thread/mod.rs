@@ -1,3 +1,6 @@
+// Thread/get and Thread/changes are RFC 8621 surface retained beyond what the mail sync calls.
+#![allow(dead_code)]
+
 pub(crate) mod get;
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +28,7 @@ crate::core::method::define_property_enum! {
 }
 
 impl crate::core::Object for Thread {
+    crate::core::method::object_metadata!(Thread);
     type Property = Property;
     type Id = ThreadId;
     fn requires_account_id() -> bool {
@@ -36,15 +40,5 @@ impl crate::core::changes::ChangesObject for Thread {
     type ChangesResponse = ();
 }
 
-crate::define_get_method!(
-    ThreadGet,
-    Thread,
-    "Thread/get",
-    crate::core::capability::Mail
-);
-crate::define_changes_method!(
-    ThreadChanges,
-    Thread,
-    "Thread/changes",
-    crate::core::capability::Mail
-);
+crate::define_get_method!(ThreadGet, Thread);
+crate::define_changes_method!(ThreadChanges, Thread);

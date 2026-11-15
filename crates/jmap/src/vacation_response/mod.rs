@@ -119,6 +119,7 @@ crate::core::method::define_property_enum! {
 }
 
 impl crate::core::Object for VacationResponse {
+    crate::core::method::object_metadata!(VacationResponse);
     type Property = Property;
     type Id = VacationResponseId;
     fn requires_account_id() -> bool {
@@ -161,15 +162,5 @@ impl crate::core::SetCreate for VacationResponseCreate {
     }
 }
 
-crate::define_get_method!(
-    VacationResponseGet,
-    VacationResponse,
-    "VacationResponse/get",
-    crate::core::capability::VacationResponseCap
-);
-crate::define_set_method!(
-    VacationResponseSet,
-    VacationResponse,
-    "VacationResponse/set",
-    crate::core::capability::VacationResponseCap
-);
+crate::define_get_method!(VacationResponseGet, VacationResponse);
+crate::define_set_method!(VacationResponseSet, VacationResponse);

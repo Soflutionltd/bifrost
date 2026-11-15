@@ -1,3 +1,7 @@
+// WebSocket request/response correlation surface is protocol surface the sync
+// engine does not read.
+#![allow(dead_code)]
+
 use std::pin::Pin;
 use std::sync::Arc;
 

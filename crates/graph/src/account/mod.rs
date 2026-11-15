@@ -28,6 +28,7 @@ mod push_tasks;
 mod reactions;
 mod scope;
 mod scopes;
+mod wire_item;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -54,8 +55,8 @@ use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 
 // pub: consumers build a GraphClient before registering GraphAccountFactory with the engine.
-pub use crate::client::GraphClient;
 use crate::client::Resource;
+pub use crate::client::{GraphClient, MicrosoftCloud};
 use crate::etag::GraphETag;
 use crate::types::GraphMailFolder;
 

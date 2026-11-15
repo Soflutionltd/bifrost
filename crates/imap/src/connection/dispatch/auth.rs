@@ -407,10 +407,10 @@ impl Consumer for AuthenticateScramConsumer {
             return Finalized::failure(e, self.buffered);
         }
         if self.state != ScramState::Done {
-            // Stays `Error::Protocol`, not a command failure: the driver reads
-            // this class to decide the failure is connection-fatal before the
-            // result is published. A tagged OK here means the server claimed
-            // success without proving it knew the password.
+            // A tagged OK here means the server claimed success without
+            // proving it knew the password. The driver explicitly retires an
+            // authentication session whose OK failed consumer verification,
+            // even though its tagged completion synchronized the framing.
             return Finalized::failure(
                 Error::Protocol("SCRAM exchange ended before server-final verification".into()),
                 self.buffered,

@@ -85,6 +85,7 @@ async fn run_committed_idle(
 
     // 3. IDLE reading loop.
     let mut done_rx = done_rx;
+    let idle_tags = [(tag, Some(true))];
     loop {
         // Opportunistic drain of pending critical events (D7).
         let _ = event_sink.drain_pending_nonblocking();
@@ -94,40 +95,28 @@ async fn run_committed_idle(
         let done_signaled = tokio::select! {
             biased;
             _ = &mut done_rx => true,
-            result = wire_reader.read_one(super::utf8_mode(state)) => {
+            result = super::read_loop::ReadLoop::next(
+                wire_reader, state, event_sink, None,
+                super::read_loop::LoopPolicy {
+                    tags: &idle_tags, early_ok_tag: None,
+                    command_kind: None, route_untagged: false,
+                },
+            ) => {
                 // The IDLE command is on the wire and the server granted it,
                 // so a transport failure here is InFlight, as in
                 // `dispatch_response_loop`. Without the stamp an EOF mid-IDLE
                 // carried no phase and read as Unsent.
-                let resp = result.map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-                let digest = state.apply_side_effects(&resp);
+                let resp = result?.response;
                 match resp {
                     crate::types::Response::Tagged(t) if t.tag == tag => {
                         // RFC 2177 Section 3: server terminated IDLE.
-                        super::emit_tagged_response_code_events(&t, event_sink);
-                        // Check status. NO/BAD is an error, not a
-                        // successful server termination.
-                        match t.status {
-                            StatusKind::Ok => {
-                                trace!(tag, "driver: server terminated IDLE");
-                                return Ok(IdleTermination::ServerTerminated);
-                            }
-                            StatusKind::No => {
-                                return Err(Error::no_with_code(t.text, t.code));
-                            }
-                            StatusKind::Bad => {
-                                return Err(Error::bad_with_code(t.text, t.code));
-                            }
-                        }
+                        t.require_ok()?;
+                        trace!(tag, "driver: server terminated IDLE");
+                        return Ok(IdleTermination::ServerTerminated);
                     }
-                    crate::types::Response::Tagged(t) => {
-                        // Foreign tagged response during IDLE. This is a
-                        // protocol anomaly; emit tagged response code events
-                        // and otherwise ignore to preserve the connection.
-                        super::emit_tagged_response_code_events(&t, event_sink);
-                    }
-                    crate::types::Response::Untagged(u) => {
-                        super::process_untagged_as_event(digest, u, event_sink, TransmissionState::InFlight)?;
+                    crate::types::Response::Untagged(_) => {}
+                    crate::types::Response::Tagged(_) => {
+                        unreachable!("ReadLoop rejects foreign tags");
                     }
                     crate::types::Response::Continuation(_) => {
                         // A second continuation during IDLE is invalid;
@@ -181,15 +170,23 @@ async fn wait_for_idle_grant(
 ) -> Result<(), Error> {
     loop {
         // The IDLE command is on the wire: a transport failure is InFlight.
-        let resp = wire_reader
-            .read_one(super::utf8_mode(state))
-            .await
-            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-        let digest = state.apply_side_effects(&resp);
+        let frame = super::read_loop::ReadLoop::next(
+            wire_reader,
+            state,
+            event_sink,
+            None,
+            super::read_loop::LoopPolicy {
+                tags: &[(tag, Some(true))],
+                early_ok_tag: None,
+                command_kind: None,
+                route_untagged: false,
+            },
+        )
+        .await?;
+        let resp = frame.response;
         match resp {
             crate::types::Response::Continuation(_) => return Ok(()),
             crate::types::Response::Tagged(t) if t.tag == tag => {
-                super::emit_tagged_response_code_events(&t, event_sink);
                 return Err(match t.status {
                     StatusKind::No => Error::no_with_code(t.text, t.code),
                     StatusKind::Bad => Error::bad_with_code(t.text, t.code),
@@ -200,19 +197,9 @@ async fn wait_for_idle_grant(
                     ),
                 });
             }
-            crate::types::Response::Tagged(t) => {
-                return Err(Error::Protocol(format!(
-                    "unexpected tag {:?} while waiting for the IDLE continuation (expected {tag:?})",
-                    t.tag,
-                )));
-            }
-            crate::types::Response::Untagged(u) => {
-                super::process_untagged_as_event(
-                    digest,
-                    u,
-                    event_sink,
-                    TransmissionState::InFlight,
-                )?;
+            crate::types::Response::Untagged(_) => {}
+            crate::types::Response::Tagged(_) => {
+                unreachable!("ReadLoop rejects foreign tags");
             }
             crate::types::Response::Greeting(_) => {
                 return Err(Error::Protocol(
@@ -232,32 +219,27 @@ async fn drain_idle_responses(
     tag: &str,
 ) -> Result<(), Error> {
     loop {
-        let resp = wire_reader
-            .read_one(super::utf8_mode(state))
-            .await
-            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-        let digest = state.apply_side_effects(&resp);
+        let frame = super::read_loop::ReadLoop::next(
+            wire_reader,
+            state,
+            event_sink,
+            None,
+            super::read_loop::LoopPolicy {
+                tags: &[(tag, Some(true))],
+                early_ok_tag: None,
+                command_kind: None,
+                route_untagged: false,
+            },
+        )
+        .await?;
+        let resp = frame.response;
         match resp {
             crate::types::Response::Tagged(t) if t.tag == tag => {
-                super::emit_tagged_response_code_events(&t, event_sink);
-                return match t.status {
-                    StatusKind::Ok => Ok(()),
-                    StatusKind::No => Err(Error::no_with_code(t.text, t.code)),
-                    StatusKind::Bad => Err(Error::bad_with_code(t.text, t.code)),
-                };
+                return t.require_ok().map(|_| ());
             }
-            crate::types::Response::Tagged(t) => {
-                // Foreign tagged response while draining IDLE. Emit
-                // critical response code events and ignore otherwise.
-                super::emit_tagged_response_code_events(&t, event_sink);
-            }
-            crate::types::Response::Untagged(u) => {
-                super::process_untagged_as_event(
-                    digest,
-                    u,
-                    event_sink,
-                    TransmissionState::InFlight,
-                )?;
+            crate::types::Response::Untagged(_) => {}
+            crate::types::Response::Tagged(_) => {
+                unreachable!("ReadLoop rejects foreign tags");
             }
             crate::types::Response::Continuation(_) => {
                 // Ignore unexpected continuation while draining DONE.

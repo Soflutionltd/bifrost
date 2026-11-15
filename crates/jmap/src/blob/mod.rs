@@ -1,3 +1,6 @@
+// Blob copy, management (RFC 9404) and URL helpers are retained beyond what the sync calls.
+#![allow(dead_code)]
+
 use crate::core::{
     id::{AccountId, BlobId},
     session::URLParser,

@@ -59,6 +59,7 @@ impl std::fmt::Display for TestProp {
 }
 
 impl super::Object for TestObj {
+    super::method::object_metadata!("Test", crate::DataType::Core, crate::core::capability::Core);
     type Property = TestProp;
     type Id = TestObjId;
     fn requires_account_id() -> bool {
@@ -101,22 +102,30 @@ impl QueryObject for TestObj {
     type Sort = ();
 }
 
-crate::define_get_method!(TestGet, TestObj, "Test/get", crate::core::capability::Core);
-crate::define_query_method!(
-    TestQuery,
-    TestObj,
-    "Test/query",
-    crate::core::capability::Core
-);
+crate::define_get_method!(TestGet, TestObj);
+crate::define_query_method!(TestQuery, TestObj);
 // A second get method on a DIFFERENT capability, so the `using`
 // accumulation in `Request::call` has something to accumulate. Every
 // other test method rides `Core`, which `Request::new` already seeds.
-crate::define_get_method!(
-    TestMailGet,
-    TestObj,
-    "TestMail/get",
-    crate::core::capability::Mail
-);
+#[derive(serde::Serialize)]
+struct TestMailGet(TestGet);
+
+impl TestMailGet {
+    fn new() -> Self {
+        Self(TestGet::new())
+    }
+}
+
+impl JmapMethod for TestMailGet {
+    const NAME: &'static str = "TestMail/get";
+    const REPLAY_SAFE: bool = true;
+    type Cap = crate::core::capability::Mail;
+    type Response = <TestGet as JmapMethod>::Response;
+
+    fn set_account_id(&mut self, account_id: &crate::core::id::AccountId) {
+        self.0.set_account_id(account_id);
+    }
+}
 
 fn make_handle<M: JmapMethod>(call_id: &str) -> CallHandle<M> {
     CallHandle {
@@ -645,12 +654,7 @@ mod envelope {
         .expect("session fixture parses")
     }
 
-    crate::define_set_method!(
-        ReplayTestSet,
-        super::TestObj,
-        "Test/set",
-        crate::core::capability::Core
-    );
+    crate::define_set_method!(ReplayTestSet, super::TestObj);
 
     #[test]
     fn request_replay_policy_is_idempotent_only_when_every_call_is_replay_safe() {

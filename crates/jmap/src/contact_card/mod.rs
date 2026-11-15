@@ -1,5 +1,8 @@
 //! ContactCard wraps a JSContact Card (RFC 9553) object.
 
+// Query, copy and JSContact accessors are protocol surface the sync uses in part.
+#![allow(dead_code)]
+
 pub(crate) mod get;
 pub(crate) mod parse;
 pub(crate) mod query;
@@ -40,6 +43,7 @@ crate::define_open_property_enum! {
 }
 
 impl crate::core::Object for ContactCard {
+    crate::core::method::object_metadata!(ContactCard);
     type Property = Property;
     type Id = ContactCardId;
     fn requires_account_id() -> bool {
@@ -61,39 +65,9 @@ impl crate::core::set::SetObject for ContactCard {
     type SetArguments = ();
 }
 
-crate::define_get_method!(
-    ContactCardGet,
-    ContactCard,
-    "ContactCard/get",
-    crate::core::capability::Contacts
-);
-crate::define_set_method!(
-    ContactCardSet,
-    ContactCard,
-    "ContactCard/set",
-    crate::core::capability::Contacts
-);
-crate::define_changes_method!(
-    ContactCardChanges,
-    ContactCard,
-    "ContactCard/changes",
-    crate::core::capability::Contacts
-);
-crate::define_query_method!(
-    ContactCardQuery,
-    ContactCard,
-    "ContactCard/query",
-    crate::core::capability::Contacts
-);
-crate::define_query_changes_method!(
-    ContactCardQueryChanges,
-    ContactCard,
-    "ContactCard/queryChanges",
-    crate::core::capability::Contacts
-);
-crate::define_copy_method!(
-    ContactCardCopy,
-    ContactCard,
-    "ContactCard/copy",
-    crate::core::capability::Contacts
-);
+crate::define_get_method!(ContactCardGet, ContactCard);
+crate::define_set_method!(ContactCardSet, ContactCard);
+crate::define_changes_method!(ContactCardChanges, ContactCard);
+crate::define_query_method!(ContactCardQuery, ContactCard);
+crate::define_query_changes_method!(ContactCardQueryChanges, ContactCard);
+crate::define_copy_method!(ContactCardCopy, ContactCard);

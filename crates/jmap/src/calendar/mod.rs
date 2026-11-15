@@ -1,3 +1,6 @@
+// Calendar methods and builders are calendars-draft surface the calendar sync uses in part.
+#![allow(dead_code)]
+
 pub(crate) mod get;
 pub(crate) mod set;
 
@@ -269,6 +272,7 @@ crate::core::method::define_property_enum! {
 }
 
 impl crate::core::Object for Calendar {
+    crate::core::method::object_metadata!(Calendar);
     type Property = Property;
     type Id = CalendarId;
     fn requires_account_id() -> bool {
@@ -316,24 +320,9 @@ impl crate::core::SetCreate for CalendarCreate {
     }
 }
 
-crate::define_get_method!(
-    CalendarGet,
-    Calendar,
-    "Calendar/get",
-    crate::core::capability::Calendars
-);
-crate::define_set_method!(
-    CalendarSet,
-    Calendar,
-    "Calendar/set",
-    crate::core::capability::Calendars
-);
-crate::define_changes_method!(
-    CalendarChanges,
-    Calendar,
-    "Calendar/changes",
-    crate::core::capability::Calendars
-);
+crate::define_get_method!(CalendarGet, Calendar);
+crate::define_set_method!(CalendarSet, Calendar);
+crate::define_changes_method!(CalendarChanges, Calendar);
 
 impl CalendarSet {
     #[must_use]

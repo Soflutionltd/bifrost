@@ -682,10 +682,10 @@ impl DavDispatch {
                             } => matches!(r.status.as_u16(), 405 | 501),
                             _ => false,
                         };
-                        let earlier_refused = attempts
-                            .iter()
-                            .all(|attempt| status_is(attempt, &[401, 429, 503, 501]));
-                        all_auth || (method_refused && earlier_refused)
+                        // A terminal 405/501 denies the method itself, which no
+                        // earlier attempt (even an ambiguous 503) can have
+                        // caused, so earlier attempts do not gate it.
+                        all_auth || method_refused
                     }
                     _ => false,
                 };
@@ -1273,7 +1273,7 @@ impl DavDispatch {
 #[derive(Default)]
 struct RedirectHistory {
     causes: Vec<Cause>,
-    may_have_committed: bool,
+    ledger: bifrost_net::AttemptLedger,
 }
 
 impl RedirectHistory {
@@ -1281,9 +1281,10 @@ impl RedirectHistory {
         self.causes.push(Cause::Attempt(AttemptCause::new(
             TransmissionState::Acknowledged,
         )));
-        // 401 refuses this attempt before authentication. Other responses,
-        // including redirects, retain net's conservative commit evidence.
-        self.may_have_committed |= unreplayable && status != StatusCode::UNAUTHORIZED;
+        // Feed the shared refusal rule; a 503 is not proof that an upstream
+        // write did not commit. Redirect responses retain that possibility.
+        self.ledger
+            .record(bifrost_net::AttemptOutcome::Response(status), !unreplayable);
     }
 
     fn attach(
@@ -1301,7 +1302,7 @@ impl RedirectHistory {
             _ => None,
         });
         if unreplayable
-            && self.may_have_committed
+            && self.ledger.verdict() == bifrost_net::CommitEvidence::MayHaveCommitted
             && matches!(terminal_state, None | Some(TransmissionState::Unsent))
         {
             // A later hop can fail before dispatch (including while waiting
@@ -1844,7 +1845,17 @@ mod tests {
             assert_eq!(script.remaining(), 1);
         }
         for status in [StatusCode::METHOD_NOT_ALLOWED, StatusCode::NOT_IMPLEMENTED] {
-            let script = dav_script([replay_dav_response(status, "unsupported")]);
+            // 501 is a proven refusal (`is_proven_refusal`), so net may retry
+            // it even for an unreplayable MOVE; script the whole retry budget
+            // so the final 501 surfaces as data. 405 is not a retry candidate.
+            let replies = if status == StatusCode::NOT_IMPLEMENTED {
+                3
+            } else {
+                1
+            };
+            let script = dav_script(
+                (0..replies).map(|_| replay_dav_response(status, "unsupported")),
+            );
             let dispatch = scripted_dispatch(scripted_dav_net(&script));
             assert!(
                 !dispatch

@@ -97,6 +97,19 @@ impl MaintenanceGate<'_> {
                 // A waiting caller releases its admission and waits it out.
                 None if self.wait_for_run => {
                     drop(admission);
+                    // Registration checks the control's own boundary, which
+                    // can differ from this gate's boundary (including in tests).
+                    // Wait on that authority without retaining scarce capacity.
+                    tokio::select! {
+                        biased;
+                        () = self.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                        changed = boundary.changed() => {
+                            if changed.is_err() { return Err(Error::ShuttingDown); }
+                        }
+                        running = self.control.wait_until_running(self.shutdown) => {
+                            if !running { return Err(Error::Paused); }
+                        }
+                    }
                     continue;
                 }
                 None => return Err(Error::Paused),

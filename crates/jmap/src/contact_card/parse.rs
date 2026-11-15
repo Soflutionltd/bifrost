@@ -3,8 +3,7 @@ pub(crate) type ContactCardParseResponse =
 
 crate::define_parse_method!(
     ContactCardParseRequest,
-    super::Property,
-    "ContactCard/parse",
+    super::ContactCard,
     crate::core::capability::ContactsParse,
     ContactCardParseResponse
 );

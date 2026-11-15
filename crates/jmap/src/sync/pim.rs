@@ -2437,16 +2437,10 @@ pub(crate) fn delete_thread<T: HttpTransport>(
             }
             None => ContainerId(trash_mailbox.as_str().to_string()),
         };
-        // JMAP mailbox ids are server-issued opaque strings and RFC
-        // 8620 leaves case-sensitivity to the server, but two
-        // mailboxes that differ only in case is a pathological shape
-        // we are happy to misclassify in favor of defensiveness:
-        // case-insensitive compare here means a caller who normalized
-        // the id elsewhere in their stack still resolves a "thread is
-        // already in Trash" branch correctly.
-        let already_in_trash = current
-            .as_ref()
-            .is_some_and(|id| id.0.eq_ignore_ascii_case(&trash.0));
+        // Mailbox ids are opaque and case-sensitive. An Outlook user deleting
+        // from another folder expects a move to Trash, never an expunge merely
+        // because that folder's id differs from Trash only in case.
+        let already_in_trash = current.as_ref().is_some_and(|id| id == &trash);
         if already_in_trash {
             let ids = resolve_target(
                 &mail,
@@ -3608,86 +3602,20 @@ fn build_search_query(
     Ok(query_request)
 }
 
-/// The search-specific tag separates positional cursors from anchored page
-/// cursors before decoding either payload. The old shared `2` tag and bare
-/// integer cursors are refused so callers restart with an unambiguous codec.
-const SEARCH_CURSOR_TAG: &str = "search-3";
-
-/// Separator inside the search cursor payload. `:` is safe as a payload
-/// delimiter because only the first two fields are split on it: the
-/// `queryState` is the whole remaining tail and is never re-split, so an
-/// opaque state string containing `:` round-trips verbatim.
-const SEARCH_CURSOR_SEP: char = ':';
-
-/// Encode a search page cursor: `search-3:<position>:<queryState>` for the primary
-/// account, and the owner-qualified form (the same object-id codec every
-/// other foreign id uses) for a share.
-///
-/// The account has to ride in the cursor because the position means
-/// nothing outside the account whose result order produced it. Without it,
-/// a page-2 request whose filter routes elsewhere - a caller that reused
-/// the cursor with a different `In`, or dropped the `In` entirely - pages
-/// one account by another's offsets and silently duplicates and skips.
-///
-/// The `queryState` rides for the same class of reason one layer in: the
-/// position means nothing outside the result ORDER that produced it either,
-/// and that order is not stable across calls. Pinning it lets the next page
-/// refuse honestly instead of paging a reordered list.
+/// Search and anchored walks share the persisted cursor codec.
 fn encode_position(position: i32, query_state: &str, owner: Option<&str>) -> Vec<u8> {
-    qualify(
-        owner,
-        format!("{SEARCH_CURSOR_TAG}{SEARCH_CURSOR_SEP}{position}{SEARCH_CURSOR_SEP}{query_state}"),
-    )
-    .into_bytes()
+    super::page_cursor::encode_search(position, query_state, owner)
 }
 
-/// Decode a search page cursor and check it belongs to the account this
-/// request routes to. A primary cursor is bare, so the absent-separator
-/// case is "primary", not "unknown".
-///
-/// A v1 (bare-integer) cursor is REFUSED rather than upgraded in place. It
-/// carries no `queryState`, so continuing it is exactly the unpinned paging
-/// this version exists to stop, and silently treating it as pinned-to-
-/// whatever-comes-back would launder the defect into the new shape. That is
-/// the crate's standing cursor policy: an older payload version is
-/// `Request(Malformed)` and the caller restarts the walk.
 fn decode_position(
     cursor: Option<&[u8]>,
     owner: Option<&str>,
     op: AccountOperation,
 ) -> Result<SearchCursor, AccountError> {
-    let Some(bytes) = cursor else {
-        return Ok(SearchCursor {
-            position: 0,
-            query_state: None,
-        });
-    };
-    let text = std::str::from_utf8(bytes).map_err(|_| invalid_search_cursor(op))?;
-    let (cursor_owner, payload) = match super::foreign::parse_object(text) {
-        Some((account_id, payload)) => (Some(account_id), payload),
-        None => (None, text),
-    };
-    if cursor_owner != owner {
-        return Err(super::error::search_cursor_account_mismatch(
-            op,
-            cursor_owner,
-            owner,
-        ));
-    }
-    let Some(payload) = payload
-        .strip_prefix(SEARCH_CURSOR_TAG)
-        .and_then(|tail| tail.strip_prefix(SEARCH_CURSOR_SEP))
-    else {
-        return Err(invalid_search_cursor(op));
-    };
-    let Some((position, query_state)) = payload.split_once(SEARCH_CURSOR_SEP) else {
-        return Err(invalid_search_cursor(op));
-    };
+    let decoded = super::page_cursor::decode_search(cursor, owner, op)?;
     Ok(SearchCursor {
-        position: position
-            .parse::<i32>()
-            .map_err(|_| invalid_search_cursor(op))?,
-        query_state: Some(query_state.to_string()),
+        position: decoded.0,
+        query_state: decoded.1,
     })
 }
 
@@ -8624,6 +8552,38 @@ mod tests {
             _url: &str,
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_thread_from_a_case_distinct_folder_moves_instead_of_destroying() {
+        let transport = DeleteThreadTransport::new();
+        let client = crate::client::Client::with_transport(
+            transport.clone(),
+            search_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client, "primary");
+        let states: StateMap = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        delete_thread(
+            mail,
+            states,
+            "primary".to_string(),
+            ThreadId("thread-1".to_string()),
+            Some(ContainerId("TRASH-ID".to_string())),
+        )
+        .await
+        .expect("case-distinct folder moves to Trash");
+        let calls = transport.calls();
+        let sets = calls
+            .iter()
+            .filter(|call| call[0] == "Email/set")
+            .collect::<Vec<_>>();
+        assert!(!sets.is_empty());
+        for set in sets {
+            assert!(set[1].get("destroy").is_none());
+            assert!(set[1]["update"].is_object());
         }
     }
 

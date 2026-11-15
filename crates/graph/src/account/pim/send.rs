@@ -121,30 +121,16 @@ pub(crate) async fn send_raw_message(
     Ok(ObjectId(draft.0))
 }
 
-/// Reserved separator for the scheduled-send cancel/reschedule handle.
-/// A handle of the form `"<mailbox>\u{1f}<draft id>"` is a send-as
-/// scheduled draft owned by a shared mailbox; a plain id is a primary
-/// (`/me`) draft. `\u{1f}` (US) cannot appear in a Graph message id or an
-/// SMTP address / user id, so it is an unambiguous delimiter (mirrors the
-/// foreign-folder codec in `foreign.rs`).
-pub(super) const SCHEDULED_SEND_HANDLE_SEP: char = '\u{1f}';
-
 /// Encode the owning-mailbox discriminator into a scheduled-send handle.
 /// `None` mailbox yields a bare draft id (primary `/me` draft).
 pub(super) fn encode_scheduled_send_handle(mailbox: Option<&str>, draft_id: &str) -> String {
-    match mailbox {
-        Some(mailbox) => format!("{mailbox}{SCHEDULED_SEND_HANDLE_SEP}{draft_id}"),
-        None => draft_id.to_string(),
-    }
+    crate::account::foreign::qualify_with_owner(mailbox, draft_id)
 }
 
 /// Split a scheduled-send handle back into `(owning mailbox, draft id)`.
 /// A handle with no separator is a primary draft (`None` mailbox).
 pub(super) fn decode_scheduled_send_handle(handle: &str) -> (Option<&str>, &str) {
-    match handle.split_once(SCHEDULED_SEND_HANDLE_SEP) {
-        Some((mailbox, draft_id)) => (Some(mailbox), draft_id),
-        None => (None, handle),
-    }
+    crate::account::foreign::GraphId::parse_owned(handle).owner_native()
 }
 
 /// Resolve the `GraphClient` a scheduled-send handle was created on: the
@@ -154,11 +140,11 @@ pub(super) fn client_for_scheduled_send_handle<'a>(
     account: &'a GraphAccount,
     mailbox: Option<&str>,
 ) -> Result<&'a GraphClient, AccountError> {
-    match mailbox {
-        None => Ok(&account.client),
-        Some(mailbox) => crate::account::shared_client(&account.shared_clients, mailbox)
-            .ok_or_else(|| send_as_unknown_mailbox(&MailboxId(mailbox.to_string()))),
-    }
+    // Share routing with every other persisted owner-qualified identity. Keep
+    // the send door's caller-facing refusal for an unconfigured send-as owner.
+    account
+        .client_for_owner(mailbox)
+        .map_err(|_| send_as_unknown_mailbox(&MailboxId(mailbox.unwrap_or_default().to_string())))
 }
 
 /// Stamp Graph's `from` / `sender` fields from a `SendAs` directive.

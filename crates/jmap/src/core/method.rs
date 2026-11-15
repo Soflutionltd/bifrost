@@ -25,9 +25,58 @@ pub(crate) trait JmapMethod: Serialize + Send {
     }
 }
 
+/// Standard method names derived at the object's metadata declaration.
+/// Parse sub-capabilities remain method-specific: they do not redefine the
+/// capability that owns the object itself.
+pub(crate) struct ObjectMethods {
+    pub(crate) get: &'static str,
+    pub(crate) set: &'static str,
+    pub(crate) changes: &'static str,
+    pub(crate) query: &'static str,
+    pub(crate) query_changes: &'static str,
+    pub(crate) copy: &'static str,
+    pub(crate) parse: &'static str,
+    pub(crate) import: &'static str,
+    pub(crate) validate: &'static str,
+}
+
+macro_rules! object_methods {
+    ($wire:expr) => {
+        $crate::core::method::ObjectMethods {
+            get: concat!($wire, "/get"),
+            set: concat!($wire, "/set"),
+            changes: concat!($wire, "/changes"),
+            query: concat!($wire, "/query"),
+            query_changes: concat!($wire, "/queryChanges"),
+            copy: concat!($wire, "/copy"),
+            parse: concat!($wire, "/parse"),
+            import: concat!($wire, "/import"),
+            validate: concat!($wire, "/validate"),
+        }
+    };
+}
+
+pub(crate) use object_methods;
+
+macro_rules! object_metadata {
+    ($kind:ident) => {
+        const DATA_TYPE: $crate::DataType = $crate::DataType::$kind;
+        type Cap = $crate::data_type_metadata::$kind;
+        const METHODS: $crate::core::method::ObjectMethods = $crate::data_type_metadata::$kind;
+    };
+    ($wire:expr, $data_type:expr, $cap:ty) => {
+        const DATA_TYPE: $crate::DataType = $data_type;
+        type Cap = $cap;
+        const METHODS: $crate::core::method::ObjectMethods =
+            $crate::core::method::object_methods!($wire);
+    };
+}
+
+pub(crate) use object_metadata;
+
 /// Generates a JMAP /get method struct that wraps `GetRequest<O>`.
 macro_rules! define_get_method {
-    ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
+    ($name:ident, $obj:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
         pub(crate) struct $name {
             #[serde(flatten)]
@@ -35,9 +84,9 @@ macro_rules! define_get_method {
         }
 
         impl $crate::core::method::JmapMethod for $name {
-            const NAME: &'static str = $method_name;
+            const NAME: &'static str = <$obj as $crate::core::Object>::METHODS.get;
             const REPLAY_SAFE: bool = true;
-            type Cap = $cap;
+            type Cap = <$obj as $crate::core::Object>::Cap;
             type Response = $crate::core::get::GetResponse<$obj>;
 
             fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
@@ -113,7 +162,7 @@ macro_rules! define_get_method {
 
 /// Generates a JMAP /set method struct that wraps `SetRequest<O>`.
 macro_rules! define_set_method {
-    ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
+    ($name:ident, $obj:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
         pub(crate) struct $name {
             #[serde(flatten)]
@@ -121,9 +170,9 @@ macro_rules! define_set_method {
         }
 
         impl $crate::core::method::JmapMethod for $name {
-            const NAME: &'static str = $method_name;
+            const NAME: &'static str = <$obj as $crate::core::Object>::METHODS.set;
             const REPLAY_SAFE: bool = false;
-            type Cap = $cap;
+            type Cap = <$obj as $crate::core::Object>::Cap;
             type Response = $crate::core::set::SetResponse<$obj>;
 
             fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
@@ -187,7 +236,7 @@ macro_rules! define_set_method {
 
 /// Generates a JMAP /changes method struct that wraps `ChangesRequest`.
 macro_rules! define_changes_method {
-    ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
+    ($name:ident, $obj:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
         pub(crate) struct $name {
             #[serde(flatten)]
@@ -195,9 +244,9 @@ macro_rules! define_changes_method {
         }
 
         impl $crate::core::method::JmapMethod for $name {
-            const NAME: &'static str = $method_name;
+            const NAME: &'static str = <$obj as $crate::core::Object>::METHODS.changes;
             const REPLAY_SAFE: bool = true;
-            type Cap = $cap;
+            type Cap = <$obj as $crate::core::Object>::Cap;
             type Response = $crate::core::changes::ChangesResponse<$obj>;
 
             fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
@@ -242,7 +291,7 @@ macro_rules! define_changes_method {
 
 /// Generates a JMAP /query method struct that wraps `QueryRequest<O>`.
 macro_rules! define_query_method {
-    ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
+    ($name:ident, $obj:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
         pub(crate) struct $name {
             #[serde(flatten)]
@@ -250,9 +299,9 @@ macro_rules! define_query_method {
         }
 
         impl $crate::core::method::JmapMethod for $name {
-            const NAME: &'static str = $method_name;
+            const NAME: &'static str = <$obj as $crate::core::Object>::METHODS.query;
             const REPLAY_SAFE: bool = true;
-            type Cap = $cap;
+            type Cap = <$obj as $crate::core::Object>::Cap;
             type Response = $crate::core::query::QueryResponse<$obj>;
 
             fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
@@ -345,7 +394,7 @@ macro_rules! define_query_method {
 
 /// Generates a JMAP /queryChanges method struct.
 macro_rules! define_query_changes_method {
-    ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
+    ($name:ident, $obj:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
         pub(crate) struct $name {
             #[serde(flatten)]
@@ -353,9 +402,9 @@ macro_rules! define_query_changes_method {
         }
 
         impl $crate::core::method::JmapMethod for $name {
-            const NAME: &'static str = $method_name;
+            const NAME: &'static str = <$obj as $crate::core::Object>::METHODS.query_changes;
             const REPLAY_SAFE: bool = true;
-            type Cap = $cap;
+            type Cap = <$obj as $crate::core::Object>::Cap;
             type Response = $crate::core::query_changes::QueryChangesResponse<$obj>;
 
             fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
@@ -437,7 +486,7 @@ macro_rules! define_query_changes_method {
 /// reduced-feature build of the crate carries no dead macro.
 #[cfg(any(feature = "mail", feature = "contacts", feature = "calendars"))]
 macro_rules! define_copy_method {
-    ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
+    ($name:ident, $obj:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
         pub(crate) struct $name {
             #[serde(flatten)]
@@ -445,9 +494,9 @@ macro_rules! define_copy_method {
         }
 
         impl $crate::core::method::JmapMethod for $name {
-            const NAME: &'static str = $method_name;
+            const NAME: &'static str = <$obj as $crate::core::Object>::METHODS.copy;
             const REPLAY_SAFE: bool = false;
-            type Cap = $cap;
+            type Cap = <$obj as $crate::core::Object>::Cap;
             type Response = $crate::core::copy::CopyResponse<$obj>;
 
             fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
@@ -599,7 +648,7 @@ macro_rules! define_open_property_enum {
 /// Generates a JMAP /parse method struct.
 #[cfg(any(feature = "contacts", feature = "calendars"))]
 macro_rules! define_parse_method {
-    ($name:ident, $property:ty, $method_name:expr, $cap:ty, $response:ty) => {
+    ($name:ident, $obj:ty, $cap:ty, $response:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
         pub(crate) struct $name {
             #[serde(rename = "accountId")]
@@ -610,11 +659,11 @@ macro_rules! define_parse_method {
 
             #[serde(rename = "properties")]
             #[serde(skip_serializing_if = "Option::is_none")]
-            properties: Option<Vec<$property>>,
+            properties: Option<Vec<<$obj as $crate::core::Object>::Property>>,
         }
 
         impl $crate::core::method::JmapMethod for $name {
-            const NAME: &'static str = $method_name;
+            const NAME: &'static str = <$obj as $crate::core::Object>::METHODS.parse;
             const REPLAY_SAFE: bool = true;
             type Cap = $cap;
             type Response = $response;
@@ -646,7 +695,7 @@ macro_rules! define_parse_method {
             #[must_use]
             pub(crate) fn properties(
                 mut self,
-                properties: impl IntoIterator<Item = $property>,
+                properties: impl IntoIterator<Item = <$obj as $crate::core::Object>::Property>,
             ) -> Self {
                 self.properties = Some(properties.into_iter().collect());
                 self

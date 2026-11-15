@@ -115,6 +115,7 @@ pub(crate) struct Keys {
 }
 
 impl crate::core::Object for PushSubscription {
+    crate::core::method::object_metadata!(PushSubscription);
     type Property = Property;
     type Id = PushSubscriptionId;
     fn requires_account_id() -> bool {
@@ -157,15 +158,5 @@ impl crate::core::SetCreate for PushSubscriptionCreate {
     }
 }
 
-crate::define_get_method!(
-    PushSubscriptionGet,
-    PushSubscription,
-    "PushSubscription/get",
-    crate::core::capability::Core
-);
-crate::define_set_method!(
-    PushSubscriptionSet,
-    PushSubscription,
-    "PushSubscription/set",
-    crate::core::capability::Core
-);
+crate::define_get_method!(PushSubscriptionGet, PushSubscription);
+crate::define_set_method!(PushSubscriptionSet, PushSubscription);

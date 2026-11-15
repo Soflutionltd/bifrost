@@ -109,7 +109,9 @@ pub enum RepairResolution {
 
 /// Drive one repair pass for `account`.
 ///
-/// Returns the number of obligations that reached a terminal resolution.
+/// Returns the number of non-deferred outcomes submitted to the writer.
+/// Recovered publications still await consumer acknowledgement; stale proofs
+/// can be refused by the writer. Deferred and unanswered attempts do not count.
 ///
 /// Errors from the account are per-request wherever the account correlates
 /// them. A stream that ends with requests outstanding does NOT mean the account
@@ -330,7 +332,12 @@ pub(crate) async fn run_repair_pass_observed(
         ));
     }
 
-    let resolved = resolutions.len();
+    // A deferred attempt leaves the obligation owed. Reporting it as progress
+    // would tell an operator that incomplete mail had been repaired.
+    let resolved = resolutions
+        .iter()
+        .filter(|(_, resolution)| !matches!(resolution, RepairResolution::Deferred { .. }))
+        .count();
 
     // A pass plans across every repairable obligation, which can span scopes,
     // so the recovered ids are grouped by the scope they came from and each

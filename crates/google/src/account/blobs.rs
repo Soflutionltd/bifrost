@@ -213,12 +213,23 @@ pub(super) fn content_disposition_inline(headers: &[crate::types::GmailHeader]) 
         })
 }
 
+impl GmailBlobKey {
+    fn encode(&self) -> BlobId {
+        // Keep the existing JSON field names: attachment handles are persisted.
+        BlobId(serde_json::to_string(self).expect("string-only blob key serialization"))
+    }
+
+    fn decode(id: &BlobId) -> Result<Self, BlobError> {
+        serde_json::from_str(&id.0).map_err(|err| BlobError::InvalidId(err.to_string()))
+    }
+}
+
 fn encode_blob_id(message_id: &str, attachment_id: &str) -> BlobId {
-    let key = GmailBlobKey {
+    GmailBlobKey {
         message_id: message_id.to_string(),
         attachment_id: attachment_id.to_string(),
-    };
-    BlobId(serde_json::to_string(&key).unwrap_or_default())
+    }
+    .encode()
 }
 
 enum BlobError {
@@ -240,7 +251,7 @@ async fn download_blob(
 }
 
 fn decode_blob_id(id: &BlobId) -> Result<GmailBlobKey, BlobError> {
-    serde_json::from_str(&id.0).map_err(|err| BlobError::InvalidId(err.to_string()))
+    GmailBlobKey::decode(id)
 }
 
 fn blob_error_context(blob_id: &BlobId) -> error::GmailErrorContext {

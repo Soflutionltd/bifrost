@@ -49,14 +49,12 @@ pub fn into_account_error_with_throttle_scope(
             attempts,
             may_have_committed,
         } => {
-            // An unreplayable request's only attempt dropped past Unsent. No
-            // earlier attempt exists whose outcome the drop could obscure, so
-            // the terminal's own kind and transmission state are the whole
-            // truth; only the idempotency narrowing is added. Every other
-            // envelope, including the empty-attempt RetryBudgetExhausted one,
-            // must reach the reclassification below: its terminal translates
-            // to an acknowledged Server error, which retries whatever the
-            // idempotency input says.
+            let mut ledger = crate::AttemptLedger::default();
+            for attempt in &attempts {
+                ledger.record_error(attempt, true);
+            }
+            ledger.record_error(&source, true);
+            ledger.retain_possible_commit(may_have_committed);
             let lone_transport = attempts.is_empty()
                 && matches!(
                     source.as_ref(),
@@ -64,88 +62,31 @@ pub fn into_account_error_with_throttle_scope(
                 );
             let terminal =
                 into_account_error_with_throttle_scope(*source, ctx.clone(), throttle_scope);
-            if lone_transport {
-                let mut builder = terminal.into_builder();
-                if may_have_committed {
-                    builder = builder.idempotency_override(false);
-                }
-                return finish(builder, &ctx);
-            }
-            let rejected_unauthorized: Vec<_> = attempts
-                .iter()
-                .map(|attempt| {
-                    matches!(attempt, Error::Status { code, .. } if *code == StatusCode::UNAUTHORIZED)
-                })
-                .collect();
             let previous: Vec<_> = attempts
                 .into_iter()
                 .map(|error| {
                     into_account_error_with_throttle_scope(error, ctx.clone(), throttle_scope)
                 })
                 .collect();
-            let states: Vec<_> = previous
-                .iter()
-                .chain(std::iter::once(&terminal))
-                .flat_map(|error| error.chain().iter())
-                .filter_map(|cause| match cause {
-                    Cause::Attempt(a) => Some(a.transmission_state),
-                    _ => None,
-                })
-                .collect();
-            let terminal_state = terminal.chain().iter().find_map(|cause| match cause {
-                Cause::Attempt(a) => Some(a.transmission_state),
-                _ => None,
-            });
-            let inflight = may_have_committed || states.contains(&TransmissionState::InFlight);
-            let acknowledged_may_have_committed = previous.iter().zip(&rejected_unauthorized).any(
-                |(error, rejected_unauthorized)| {
-                    // A 401 rejects this attempt before authentication. Its
-                    // auth cause remains in the chain, but it cannot make a
-                    // later local or token-refresh failure ambiguous about
-                    // the mutation.
-                    !*rejected_unauthorized
-                        && error.chain().iter().any(|cause| {
-                            matches!(cause, Cause::Attempt(a)
-                                if a.transmission_state == TransmissionState::Acknowledged)
-                        })
-                },
-            ) || terminal_state
-                == Some(TransmissionState::Acknowledged);
-            // A later auth, policy, or admission failure cannot establish the
-            // outcome of an earlier mutation. PartialResponse is the existing
-            // reconcile-required lane for an incomplete logical exchange.
-            let reclassified = inflight
-                || (acknowledged_may_have_committed
-                    && terminal_state == Some(TransmissionState::Unsent));
+            let reclassified =
+                !lone_transport && ledger.verdict() == crate::CommitEvidence::MayHaveCommitted;
             let mut builder = if reclassified {
                 partial_response(
                     &ctx,
                     "logical request failed after earlier attempts".into(),
-                    if inflight {
-                        TransmissionState::InFlight
-                    } else {
-                        TransmissionState::Acknowledged
-                    },
+                    ledger.transmission_state(),
                 )
                 .into_builder()
             } else {
-                let builder = terminal.clone().into_builder();
-                if acknowledged_may_have_committed && terminal_state.is_none() {
-                    push_attempt(builder, TransmissionState::Acknowledged)
-                } else {
-                    builder
-                }
+                terminal.clone().into_builder()
             };
-            for (error, rejected_unauthorized) in previous.iter().zip(&rejected_unauthorized) {
+            for error in &previous {
                 for cause in error.chain().iter() {
                     // Keep the rejected-auth cause, but do not attach an
                     // acknowledged transmission to a later transport retry:
                     // the builder correctly refuses to classify a transport
                     // failure with acknowledged transmission evidence.
-                    if *rejected_unauthorized
-                        && matches!(cause, Cause::Attempt(a)
-                            if a.transmission_state == TransmissionState::Acknowledged)
-                    {
+                    if !reclassified && matches!(cause, Cause::Attempt(_)) {
                         continue;
                     }
                     builder = builder.push_cause(cause.clone());
@@ -201,6 +142,11 @@ pub fn into_account_error_with_throttle_scope(
                     ServerCause::QuotaExhausted { retry_hint: hint },
                 ),
             };
+            let mut ledger = crate::AttemptLedger::default();
+            for attempt in &attempts {
+                ledger.record_error(attempt, true);
+            }
+            ledger.retain_possible_commit(may_have_committed);
             let diagnostics = format!("prior attempts: {attempts:?}");
             let evidence: Vec<_> = attempts
                 .into_iter()
@@ -208,21 +154,7 @@ pub fn into_account_error_with_throttle_scope(
                     into_account_error_with_throttle_scope(attempt, ctx.clone(), throttle_scope)
                 })
                 .collect();
-            let states: Vec<_> = evidence
-                .iter()
-                .flat_map(|error| error.chain().iter())
-                .filter_map(|cause| match cause {
-                    Cause::Attempt(attempt) => Some(attempt.transmission_state),
-                    _ => None,
-                })
-                .collect();
-            let state = if may_have_committed || states.contains(&TransmissionState::InFlight) {
-                TransmissionState::InFlight
-            } else if states.contains(&TransmissionState::Acknowledged) {
-                TransmissionState::Acknowledged
-            } else {
-                TransmissionState::Unsent
-            };
+            let state = ledger.transmission_state();
             let mut builder = push_attempt(
                 base_builder(&ctx, AccountErrorKind::Server(kind), Cause::Server(cause)),
                 state,

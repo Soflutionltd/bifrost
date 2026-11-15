@@ -31,6 +31,79 @@ const FOREIGN_SEP: char = '\u{1f}';
 /// forms are mutually unambiguous.
 const PUBLIC_SEP: char = '\u{1e}';
 
+/// The outer API type supplies the namespace: a bare thread and a bare
+/// message have identical bytes, so a context-free parser cannot distinguish
+/// them. Keep the historical spellings: Outlook users must retain access to
+/// identities already persisted by the consumer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GraphId<'a> {
+    Native(&'a str),
+    Owned {
+        owner: &'a str,
+        native: &'a str,
+    },
+    Event {
+        calendar: &'a str,
+        event: &'a str,
+    },
+    PublicItem {
+        folder: &'a str,
+        item: &'a str,
+    },
+    PublicCollection {
+        namespace: &'a str,
+        folder: &'a str,
+    },
+    PublicTypedItem {
+        namespace: &'a str,
+        folder: &'a str,
+        item: &'a str,
+    },
+}
+
+impl<'a> GraphId<'a> {
+    pub(crate) fn parse_owned(value: &'a str) -> Self {
+        // Retain first-split decoding, even for malformed old owner tags.
+        // Routing must refuse an empty/stale owner, never fall back to /me.
+        match value.split_once(FOREIGN_SEP) {
+            Some((owner, native)) => Self::Owned { owner, native },
+            None => Self::Native(value),
+        }
+    }
+
+    pub(crate) fn owner_native(self) -> (Option<&'a str>, &'a str) {
+        match self {
+            Self::Native(native) => (None, native),
+            Self::Owned { owner, native } => (Some(owner), native),
+            _ => unreachable!("not an owner-qualified id"),
+        }
+    }
+
+    pub(crate) fn parse_event(value: &'a str) -> Option<Self> {
+        let (calendar, event) = value.split_once("::")?;
+        (!calendar.is_empty() && !event.is_empty()).then_some(Self::Event { calendar, event })
+    }
+
+    pub(crate) fn encode(self) -> String {
+        match self {
+            Self::Native(native) => native.to_string(),
+            Self::Owned { owner, native } => format!("{owner}{FOREIGN_SEP}{native}"),
+            Self::Event { calendar, event } => format!("{calendar}::{event}"),
+            Self::PublicItem { folder, item } => format!("{folder}{PUBLIC_SEP}{item}"),
+            Self::PublicCollection { namespace, folder } => {
+                format!("{namespace}{PUBLIC_SEP}{folder}")
+            }
+            Self::PublicTypedItem {
+                namespace,
+                folder,
+                item,
+            } => {
+                format!("{namespace}{PUBLIC_SEP}{folder}{PUBLIC_SEP}{item}")
+            }
+        }
+    }
+}
+
 /// A foreign-mailbox folder: the routing mailbox plus the native Graph
 /// folder id within it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,12 +151,13 @@ pub(crate) fn encode_foreign(mailbox: &str, folder: &str) -> FolderId {
 /// `FOREIGN_SEP`; a folder id with no separator is a primary-mailbox
 /// folder.
 pub(crate) fn parse_folder(folder: &FolderId) -> ParsedFolder {
-    match folder.0.split_once(FOREIGN_SEP) {
-        Some((mailbox, native)) => ParsedFolder::Foreign(ForeignFolder {
+    let (owner, native) = GraphId::parse_owned(&folder.0).owner_native();
+    match owner {
+        Some(mailbox) => ParsedFolder::Foreign(ForeignFolder {
             mailbox: mailbox.to_string(),
             folder: native.to_string(),
         }),
-        None => ParsedFolder::Primary(folder.0.clone()),
+        None => ParsedFolder::Primary(native.to_string()),
     }
 }
 
@@ -164,7 +238,13 @@ impl ParsedMessageId {
 /// in `routing_map` - without it a public-folder item would hydrate through
 /// Graph REST, which cannot address a raw EWS `ItemId` at all.
 pub(crate) fn encode_public_item_id(folder: &FolderId, item: &str) -> ObjectId {
-    ObjectId(format!("{}{PUBLIC_SEP}{item}", folder.0))
+    ObjectId(
+        GraphId::PublicItem {
+            folder: &folder.0,
+            item,
+        }
+        .encode(),
+    )
 }
 
 /// Encode a `(scope, native message id)` pair into the `ObjectId` carried
@@ -214,13 +294,9 @@ impl ParsedThreadId {
 /// native id, which is the primary mailbox's only wire form.
 pub(crate) fn qualify_with_owner(owner: Option<&str>, native: &str) -> String {
     match owner {
-        // The owner spelling is kept verbatim. Ids are durable identities a
-        // consumer has already stored; re-spelling the owner would make every
-        // shared-mailbox object look new. One canonical spelling per mailbox
-        // is chosen once, at configuration (`shared_clients_map`), and only
-        // routing and throttle budgets compare case-insensitively.
-        Some(mailbox) => format!("{mailbox}{FOREIGN_SEP}{native}"),
-        None => native.to_string(),
+        // Preserve the stored owner spelling; routing alone folds ASCII case.
+        Some(owner) => GraphId::Owned { owner, native }.encode(),
+        None => GraphId::Native(native).encode(),
     }
 }
 
@@ -257,12 +333,13 @@ pub(crate) fn encode_thread_id(scope: &CursorScope, native: &str) -> ThreadId {
 /// Decode a thread id into the native Graph conversation id plus its optional
 /// shared-mailbox owner.
 pub(crate) fn parse_thread_id(id: &ThreadId) -> ParsedThreadId {
-    match id.0.split_once(FOREIGN_SEP) {
-        Some((mailbox, thread)) => ParsedThreadId::Foreign {
+    let (owner, native) = GraphId::parse_owned(&id.0).owner_native();
+    match owner {
+        Some(mailbox) => ParsedThreadId::Foreign {
             mailbox: mailbox.to_string(),
-            thread: thread.to_string(),
+            thread: native.to_string(),
         },
-        None => ParsedThreadId::Primary(id.0.clone()),
+        None => ParsedThreadId::Primary(native.to_string()),
     }
 }
 
@@ -277,34 +354,50 @@ pub(crate) fn parse_message_id(id: &ObjectId) -> ParsedMessageId {
             item: item.to_string(),
         };
     }
-    match id.0.split_once(FOREIGN_SEP) {
-        Some((mailbox, message)) => ParsedMessageId::Foreign {
+    let (owner, native) = GraphId::parse_owned(&id.0).owner_native();
+    match owner {
+        Some(mailbox) => ParsedMessageId::Foreign {
             mailbox: mailbox.to_string(),
-            message: message.to_string(),
+            message: native.to_string(),
         },
-        None => ParsedMessageId::Primary(id.0.clone()),
+        None => ParsedMessageId::Primary(native.to_string()),
     }
 }
 
 /// Typed public contact collections and items carry a namespace tag even
 /// before discovery has populated routing. Native EWS ids never contain RS.
 pub(crate) fn public_address_book(folder: &str) -> bifrost_types::AddressBookId {
-    bifrost_types::AddressBookId(format!("public-contacts{PUBLIC_SEP}{folder}"))
+    bifrost_types::AddressBookId(
+        GraphId::PublicCollection {
+            namespace: "public-contacts",
+            folder,
+        }
+        .encode(),
+    )
 }
 
 pub(crate) fn public_contact(folder: &str, item: &str) -> bifrost_types::ContactId {
-    bifrost_types::ContactId(format!(
-        "{}{PUBLIC_SEP}{item}",
-        public_address_book(folder).0
-    ))
+    bifrost_types::ContactId(
+        GraphId::PublicTypedItem {
+            namespace: "public-contacts",
+            folder,
+            item,
+        }
+        .encode(),
+    )
 }
 
 pub(crate) fn parse_public_address_book(id: &str) -> Option<&str> {
-    id.strip_prefix("public-contacts\u{1e}")
+    parse_public_namespace(id, "public-contacts")
 }
 
 pub(crate) fn parse_public_contact(id: &str) -> Option<(&str, &str)> {
     parse_public_address_book(id).and_then(parse_public_item)
+}
+
+fn parse_public_namespace<'a>(id: &'a str, namespace: &str) -> Option<&'a str> {
+    let (tag, tail) = id.split_once(PUBLIC_SEP)?;
+    (tag == namespace).then_some(tail)
 }
 
 fn parse_public_item(tail: &str) -> Option<(&str, &str)> {
@@ -314,13 +407,26 @@ fn parse_public_item(tail: &str) -> Option<(&str, &str)> {
 
 /// Typed calendar ids remain public even when discovery routing is absent.
 pub(crate) fn public_calendar(folder: &str) -> bifrost_types::CalendarId {
-    bifrost_types::CalendarId(format!("public-calendar{PUBLIC_SEP}{folder}"))
+    bifrost_types::CalendarId(
+        GraphId::PublicCollection {
+            namespace: "public-calendar",
+            folder,
+        }
+        .encode(),
+    )
 }
 pub(crate) fn public_event(folder: &str, item: &str) -> bifrost_types::EventId {
-    bifrost_types::EventId(format!("{}{PUBLIC_SEP}{item}", public_calendar(folder).0))
+    bifrost_types::EventId(
+        GraphId::PublicTypedItem {
+            namespace: "public-calendar",
+            folder,
+            item,
+        }
+        .encode(),
+    )
 }
 pub(crate) fn parse_public_calendar(id: &str) -> Option<&str> {
-    id.strip_prefix("public-calendar\u{1e}")
+    parse_public_namespace(id, "public-calendar")
 }
 pub(crate) fn parse_public_event(id: &str) -> Option<(&str, &str)> {
     parse_public_calendar(id).and_then(parse_public_item)

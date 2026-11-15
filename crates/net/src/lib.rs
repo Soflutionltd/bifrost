@@ -20,6 +20,7 @@
 //! HTTP operations.
 
 pub mod account_error;
+pub mod attempt;
 pub mod auth;
 pub mod bandwidth;
 pub mod budget;
@@ -45,6 +46,7 @@ mod upload;
 pub mod url;
 
 pub use account_error::{NetErrorContext, into_account_error_with_throttle_scope};
+pub use attempt::{AttemptLedger, AttemptOutcome, CommitEvidence, is_proven_refusal};
 pub use auth::{
     AccessToken, CoordinatedTokenSource, OAuthRefresher, RefreshState, StaticTokenSource,
     TokenSource, coordinate,

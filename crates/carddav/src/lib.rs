@@ -165,9 +165,9 @@ impl AccountFactory for CardDavAccountFactory {
         let net = self.net.clone();
         Box::pin(async move {
             let account = account::CardDavAccount::open(account_id, config, net).await?;
-            // Empty by construction: discovery mints one folder cursor scope
-            // per address book, so there is no collection the sync lanes
-            // leave behind and nothing for the skip lane to report.
+            // Every discovered address book has its own cursor scope. Enterprise
+            // users expect all collections to sync, so a successful open has
+            // no collection-limit gaps to report.
             Ok(OpenedAccount {
                 account: Arc::new(account) as Arc<dyn Account>,
                 skipped_scopes: Vec::new(),

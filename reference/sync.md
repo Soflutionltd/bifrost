@@ -1372,11 +1372,12 @@ the same consumer-ack path as the page batches (`emit_backfill_complete`
 -> broadcast -> consumer persist+ack -> ack writer `put_backfill`), and
 because it is ordered behind every page it only lands durably after the
 consumer has persisted all of them - a crash before completion re-walks
-rather than recording a false "done". Its `items_done` is stamped at
-`total_walked + 1` (the honest total rides in `items_estimated`) so it
-strictly wins `get_backfill`'s "latest by items_done" query regardless of
-how a store breaks ties, and on re-attach the marker is the checkpoint
-returned.
+rather than recording a false "done". Its `items_estimated` records the
+observed total and its `items_done` sits one past it, so a consumer store that
+still orders rows by greatest `items_done` also selects the marker. Under
+`backfill_checkpoint_is_later` completion wins resume selection by key kind,
+independently of older partitions' counts, so a shrinking folder or an empty
+final probe cannot make a completed walk repeat on every attach.
 
 This skip-on-complete signal is uniform across plan kinds; the difference
 is whether positional resume is also possible:
@@ -3623,10 +3624,25 @@ is a legitimate choice for a test double, which is what
 `InMemoryCheckpointStore` is the test backend (HashMap-backed). No
 sled / sqlite default; storage is consumer-owned.
 
-`get_backfill` selects the greatest `items_done`. Equal-progress rows
-use the greatest parsed page upper bound, then lexicographically
-greatest opaque partition bytes, so equal-sized page windows resume
-deterministically from the furthest one. Page checkpoint
+`get_backfill` uses `cursor::store::backfill_checkpoint_is_later`, the public
+engine-owned comparison helper. Proven completion wins before count ordering.
+Other rows retain the greatest `items_done`, then greatest parsed page upper
+bound, then lexicographically greatest bytes. This preserves existing partial
+resume positions. `backfill::partitioner::BackfillKey` provides a typed codec for
+full, time, UID, page, versioned completion and legacy completion keys, retaining
+unknown bytes as opaque keys. Existing `complete`, `complete:v2` and `page:F:T`
+rows remain readable; legacy empty-plan markers retain their one-time recheck.
+Consumer stores should compact a scope's older partition rows atomically when a
+proven completion lands; the in-memory backend does so. Incomplete time-window
+walks can still accumulate distinct absolute-time keys across attaches.
+Because a proven completion outranks every partition row, every path that must
+re-walk a scope deletes the marker first. A provider-deleted scope does this
+through `reset_scope_for_deletion` (`delete_backfill`), and schema recovery
+through `clear_account_checkpoints`. A routine restart and a disable keep the
+marker deliberately, so an ordinary cursor invalidation never costs a full
+historical walk.
+
+Page checkpoint
 `items_done` counts entries and explicit removals observed before
 `LiveSupersedes` filtering;
 filtering therefore cannot make a full inventory window look short and
@@ -4321,3 +4337,13 @@ submitted spelling in `DecodedObjectId::id`, Graph, Google and JMAP key outcomes
 on the input id). Duplicate caller targets are dropped at campaign intake, first
 occurrence wins, so a message selected twice is changed once and answered once;
 a provider that still answers one target twice is the contract violation above.
+
+
+Repair pass counts exclude deferred attempts, including unanswered requests.
+The count describes non-deferred outcomes submitted to the writer, not a claim
+that every recovered publication has already been acknowledged or every stale
+proof accepted. An operator must not see a failed repair attempt as progress.
+
+Maintenance admission releases its scheduler permit before waiting on the
+control boundary after activity registration refuses. It also watches shutdown
+and its own boundary while waiting, so a separate Stop cannot strand that wait.

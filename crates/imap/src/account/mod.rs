@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -143,7 +143,6 @@ pub(crate) struct ImapAccountInner {
     pub(crate) pool: Arc<Pool>,
     pub(crate) folders: Arc<FolderRegistry>,
     pub(crate) shutdown: CancellationToken,
-    pub(crate) closed: AtomicBool,
     pub(crate) close_completion: std::sync::OnceLock<close::Completion>,
     pub(crate) send_gate: tokio::sync::RwLock<()>,
     pub(crate) priority: AtomicU8,
@@ -154,13 +153,9 @@ pub(crate) struct ImapAccountInner {
     /// Collision-free ownership index for composed DAV folder scopes.
     pub(crate) dav_scopes: DavScopeIndex,
     pub(crate) submission: Option<Arc<SubmissionTransport>>,
-    /// Warnings recorded at open when a configured DAV sub-account could
-    /// not be attached (brick 5 fail-soft). Read (not drained) by every
-    /// `discover_cursor_scopes` and cleared only once a discovery stream
-    /// has actually yielded its terminal `Done` to the consumer, so the
-    /// engine observes the degradation without taking mail offline and
-    /// cannot lose it to a discovery stream that is dropped un-polled.
-    pub(crate) dav_degraded: std::sync::Mutex<Vec<bifrost_types::Warning>>,
+    /// Persistent enumeration gaps; open and container snapshots expose the
+    /// same classified failures so missing shares never look like deletions.
+    pub(crate) discovery_skips: Vec<bifrost_types::SkippedScope>,
 }
 
 pub(crate) struct ImapAccountParts {
@@ -176,7 +171,7 @@ pub(crate) struct ImapAccountParts {
     /// Collision-free ownership index for composed DAV folder scopes.
     pub(crate) dav_scopes: DavScopeIndex,
     pub(crate) submission: Option<Arc<SubmissionTransport>>,
-    pub(crate) dav_degraded: Vec<bifrost_types::Warning>,
+    pub(crate) discovery_skips: Vec<bifrost_types::SkippedScope>,
 }
 
 impl ImapAccount {
@@ -203,7 +198,6 @@ impl ImapAccount {
                 pool: parts.pool,
                 folders: parts.folders,
                 shutdown: CancellationToken::new(),
-                closed: AtomicBool::new(false),
                 close_completion: std::sync::OnceLock::new(),
                 send_gate: tokio::sync::RwLock::new(()),
                 priority: AtomicU8::new(Priority::Normal as u8),
@@ -213,39 +207,9 @@ impl ImapAccount {
                 calendars: parts.calendars,
                 dav_scopes: parts.dav_scopes,
                 submission: parts.submission,
-                dav_degraded: std::sync::Mutex::new(parts.dav_degraded),
+                discovery_skips: parts.discovery_skips,
             }),
         }
-    }
-
-    /// Read the degraded-DAV warnings recorded at open WITHOUT consuming
-    /// them.
-    ///
-    /// These warnings are the only signal that a configured CardDAV or
-    /// CalDAV half failed to attach and the account is presenting as
-    /// mail-only. Draining them at stream-construction time put them
-    /// inside a future the consumer is free to drop un-polled, and unlike
-    /// the QRESYNC one-shot there is no second copy to fall back on: the
-    /// account would then look healthy forever. So the read is
-    /// non-consuming and `clear_dav_degraded_warnings` is the
-    /// acknowledgement, fired only when a discovery stream has handed its
-    /// terminal event to the consumer.
-    pub(crate) fn peek_dav_degraded_warnings(&self) -> Vec<bifrost_types::Warning> {
-        self.dav_degraded
-            .lock()
-            .expect("dav_degraded lock poisoned")
-            .clone()
-    }
-
-    /// Acknowledge delivery of the degraded-DAV warnings. Called once a
-    /// discovery stream has yielded them plus its terminal `Done`, so a
-    /// later discovery on the same account does not re-report a
-    /// degradation the consumer already saw.
-    pub(crate) fn clear_dav_degraded_warnings(&self) {
-        self.dav_degraded
-            .lock()
-            .expect("dav_degraded lock poisoned")
-            .clear();
     }
 }
 
@@ -1392,7 +1356,7 @@ pub(crate) enum DavScopeOwner {
 /// because sub-account scopes pass through `merge_scope_streams` verbatim. A
 /// mailbox collision resolves to the same scope value as the real mailbox, and
 /// a contested id fails loudly at establishment. Judged honest and sufficient,
-/// and warned at open.
+/// and recorded as a classified skip at open.
 #[derive(Debug, Default)]
 pub(crate) struct DavScopeIndex {
     owners: std::collections::HashMap<bifrost_types::FolderId, DavScopeOwner>,
@@ -1413,13 +1377,13 @@ impl DavScopeIndex {
         contact_folders: Vec<bifrost_types::FolderId>,
         calendar_folders: Vec<bifrost_types::FolderId>,
         imap_mailboxes: &std::collections::HashSet<String>,
-    ) -> (Self, Vec<bifrost_types::Warning>) {
+    ) -> (Self, Vec<bifrost_types::SkippedScope>) {
         let contested: std::collections::HashSet<&bifrost_types::FolderId> = contact_folders
             .iter()
             .filter(|folder| calendar_folders.contains(folder))
             .collect();
         let mut owners = std::collections::HashMap::new();
-        let mut warnings = Vec::new();
+        let mut skipped = Vec::new();
         let candidates = contact_folders
             .iter()
             .map(|folder| (folder, DavScopeOwner::Contacts))
@@ -1430,8 +1394,8 @@ impl DavScopeIndex {
             );
         for (folder, owner) in candidates {
             if imap_mailboxes.contains(&folder.0) {
-                warnings.push(bifrost_types::Warning::support_only(
-                    bifrost_types::WarningKind::OperatorAttentionNeeded,
+                skipped.push(collision_skip(
+                    owner,
                     format!(
                         "composed DAV collection {:?} has the same identity as an IMAP \
                          mailbox; the IMAP mailbox keeps the scope and this collection \
@@ -1442,27 +1406,50 @@ impl DavScopeIndex {
                 continue;
             }
             if contested.contains(folder) {
-                // Emitted once, on the contacts pass, so the calendars pass
-                // does not duplicate it.
-                if owner == DavScopeOwner::Contacts {
-                    warnings.push(bifrost_types::Warning::support_only(
-                        bifrost_types::WarningKind::OperatorAttentionNeeded,
-                        format!(
-                            "composed DAV collection {:?} is claimed by both the CardDAV \
-                             and the CalDAV sub-account; neither will sync it",
-                            folder.0
-                        ),
-                    ));
-                }
+                // Each losing sub-account reports its own collection: the
+                // CardDAV half under ContactCollection, the CalDAV half under
+                // CalendarCollection, so neither gap hides behind the other.
+                skipped.push(collision_skip(
+                    owner,
+                    format!(
+                        "composed DAV collection {:?} is claimed by both the CardDAV \
+                         and the CalDAV sub-account; neither will sync it",
+                        folder.0
+                    ),
+                ));
                 continue;
             }
             owners.insert(folder.clone(), owner);
         }
-        (Self { owners }, warnings)
+        (Self { owners }, skipped)
     }
 
     pub(crate) fn owner(&self, folder: &bifrost_types::FolderId) -> Option<DavScopeOwner> {
         self.owners.get(folder).copied()
+    }
+}
+
+// A collection excluded from routing must be visible as a classified gap:
+// enterprise users expect a missing address book or calendar to be reported
+// at open. It is named under the LOSING sub-account's collection scope, never
+// `Cursor(Folder(_))`: in the mailbox-collision case that folder scope is the
+// IMAP mailbox's own, which does sync, and a consumer would read the mailbox
+// as skipped. The collection URL rides in support-only detail. The cause is a
+// configuration conflict (two sources claiming one identity), which an
+// administrator fixes, so it classifies as `Request(Malformed)` - the same
+// answer Graph gives an unconfigured shared mailbox - not `Internal`, which
+// would ask the user to report a bifrost bug.
+fn collision_skip(owner: DavScopeOwner, detail: String) -> bifrost_types::SkippedScope {
+    let scope = match owner {
+        DavScopeOwner::Contacts => bifrost_types::ErrorScope::ContactCollection,
+        DavScopeOwner::Calendars => bifrost_types::ErrorScope::CalendarCollection,
+    };
+    bifrost_types::SkippedScope {
+        scope: scope.clone(),
+        error: account_error_with(
+            Error::InvalidInput(detail.into()),
+            error::ImapErrorContext::operation(AccountOperation::Discover).with_scope(scope),
+        ),
     }
 }
 
@@ -1654,6 +1641,16 @@ mod router_tests {
 
         assert_eq!(index.owner(&folder(contested)), None);
         assert_eq!(warnings.len(), 1, "the drop must be reported, not silent");
+        // Named under the losing collection, never the mailbox's own folder
+        // scope (which does sync), and classified as configuration, not a bug.
+        assert_eq!(
+            warnings[0].scope,
+            bifrost_types::ErrorScope::ContactCollection
+        );
+        assert_eq!(
+            warnings[0].error.kind(),
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
     }
 
     /// A collection both sub-accounts claim is dropped rather than resolved
@@ -1676,10 +1673,15 @@ mod router_tests {
             index.owner(&folder("https://dav.example.test/cal/")),
             Some(DavScopeOwner::Calendars)
         );
+        // Each losing sub-account reports the gap under its own collection.
+        let scopes: Vec<_> = warnings.iter().map(|skip| skip.scope.clone()).collect();
         assert_eq!(
-            warnings.len(),
-            1,
-            "the contested collection is reported exactly once"
+            scopes,
+            vec![
+                bifrost_types::ErrorScope::ContactCollection,
+                bifrost_types::ErrorScope::CalendarCollection,
+            ],
+            "the contested collection is reported once per losing sub-account"
         );
     }
 

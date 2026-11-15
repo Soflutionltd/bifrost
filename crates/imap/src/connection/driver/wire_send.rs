@@ -117,6 +117,7 @@ pub(super) async fn send_wire_command(
     mut routing: Option<&mut PipelineRouting<'_>>,
     literal_budget: Option<usize>,
 ) -> Result<SendOutcome, Error> {
+    state.framing = super::read_loop::Framing::Desynchronized;
     let segments = wire.segments();
     for (i, segment) in segments.iter().enumerate() {
         if let Err(e) = wire_reader.write_chunks(segment).await {
@@ -236,63 +237,42 @@ pub(super) async fn wait_for_continuation(
     literal_budget: Option<usize>,
 ) -> Result<ContinuationOutcome, Error> {
     loop {
-        let utf8 = super::utf8_mode(state);
-        // Accepted limit: an own-tag reply here is classified non-fatal even
-        // when an EARLIER literal of the same command was already granted, so
-        // the inter-literal text has been written. That holds because the one
-        // caller, `send_wire_command`, ends every segment on its synchronizing
-        // marker, so the marker is the last byte written before this wait, and
-        // a conforming server answers only
-        // at a marker (RFC 3502 allows a `NO` there for a later MULTIAPPEND
-        // message), so it has read everything sent and the wire is in sync,
-        // exactly as for the first literal. A server that replied straight
-        // after a literal body with no marker would leave the unread
-        // remainder to be parsed as a new command line. Making every reply
-        // after a granted literal fatal would close that but drop the
-        // connection on the legitimate mid-MULTIAPPEND `NO`. This changes only
-        // if a real server is shown replying without a marker, or if a caller
-        // ever writes past the marker before waiting.
-        //
-        // We have already sent the pre-literal bytes; a transport failure
-        // reading the server's continuation grant is InFlight.
-        let resp = wire_reader
-            .read_one_limited(
-                utf8,
-                routing
-                    .as_deref()
-                    .map_or(literal_budget, PipelineRouting::literal_budget),
-            )
-            .await
-            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-
+        let tags = routing.as_deref().map(PipelineRouting::read_tags);
+        let single_tags = [(own_tag, Some(true))];
+        let frame = super::read_loop::ReadLoop::next(
+            wire_reader,
+            state,
+            event_sink,
+            routing
+                .as_deref()
+                .map_or(literal_budget, PipelineRouting::literal_budget),
+            super::read_loop::LoopPolicy {
+                tags: tags.as_deref().unwrap_or(&single_tags),
+                early_ok_tag: Some(own_tag),
+                command_kind: None,
+                route_untagged: routing.is_some(),
+            },
+        )
+        .await?;
         if let Some(routing) = routing.as_deref_mut() {
-            // The router applies side effects itself, exactly once.
-            match route_pipeline_response(state, event_sink, routing, resp)? {
+            // ReadLoop applied side effects; the router only delivers the frame.
+            match route_pipeline_response(state, event_sink, routing, frame)? {
                 Routed::Continuation => return Ok(ContinuationOutcome::Granted),
                 Routed::OwnTagRejected => return Ok(ContinuationOutcome::Rejected),
                 Routed::Continue => continue,
             }
         }
 
-        // Our own tagged OK before the `+`: the command did not execute, so
-        // its armed effect must not complete on this OK. The pipeline router
-        // withholds it the same way; a NO/BAD keeps it.
-        if matches!(
-            resp,
-            crate::types::Response::Tagged(ref t)
-                if t.tag == own_tag && t.status == StatusKind::Ok
-        ) {
-            state.disarm_effect(own_tag);
-        }
-        let digest = state.apply_side_effects(&resp);
-        match resp {
+        match frame.response {
             crate::types::Response::Continuation(_) => return Ok(ContinuationOutcome::Granted),
             crate::types::Response::Tagged(t) if t.tag == own_tag => {
+                // Every send segment ends at a synchronizing marker. This
+                // remains a synchronized refusal after earlier MULTIAPPEND
+                // literals too: nothing past the current marker was written.
                 // The server ended the command before the literal was sent.
                 // It processed the prefix, so this is Acknowledged. Side
                 // effects already applied (RFC 3501 Section4.3), except an
                 // early OK's, disarmed above.
-                super::emit_tagged_response_code_events(&t, event_sink);
                 return match t.status {
                     // NO/BAD are tagged responses - inherently Acknowledged.
                     StatusKind::No => Err(Error::no_with_code(t.text, t.code)),
@@ -300,24 +280,11 @@ pub(super) async fn wait_for_continuation(
                     StatusKind::Ok => Err(early_ok_error()),
                 };
             }
-            crate::types::Response::Tagged(t) => {
-                return Err(Error::Protocol(format!(
-                    "unexpected tag {:?} while waiting for a literal continuation \
-                     (expected {own_tag:?})",
-                    t.tag,
-                )));
+            crate::types::Response::Tagged(_) => {
+                unreachable!("ReadLoop rejects foreign tags");
             }
             crate::types::Response::Untagged(u) => {
-                // (I13): the shared arm emits alert/notification overflow
-                // before BYE handling, so ALERT codes on BYE responses are
-                // not lost.
-                // The pre-literal bytes are on the wire: a BYE is InFlight.
-                super::process_untagged_as_event(
-                    digest,
-                    u,
-                    event_sink,
-                    TransmissionState::InFlight,
-                )?;
+                let _ = u; // ReadLoop already published this event.
             }
             crate::types::Response::Greeting(_) => {
                 return Err(Error::Protocol("unexpected greeting".into()));

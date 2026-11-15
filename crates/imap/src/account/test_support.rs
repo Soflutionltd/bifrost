@@ -51,6 +51,8 @@ pub(crate) struct StubAccount {
     pub(crate) directory_call: std::sync::Mutex<Option<DirectoryCall>>,
     scopes: Vec<CursorScope>,
     pub(crate) inventory_called: AtomicBool,
+    pub(crate) close_called: AtomicBool,
+    pub(crate) close_panic: u8,
     pub(crate) changes_called: AtomicBool,
     pub(crate) establish_called: AtomicBool,
     pub(crate) describe_called: AtomicBool,
@@ -70,6 +72,8 @@ impl StubAccount {
             caps: stub_capabilities(),
             scopes,
             inventory_called: AtomicBool::new(false),
+            close_called: AtomicBool::new(false),
+            close_panic: 0,
             changes_called: AtomicBool::new(false),
             establish_called: AtomicBool::new(false),
             describe_called: AtomicBool::new(false),
@@ -85,6 +89,8 @@ impl StubAccount {
             caps,
             scopes: Vec::new(),
             inventory_called: AtomicBool::new(false),
+            close_called: AtomicBool::new(false),
+            close_panic: 0,
             changes_called: AtomicBool::new(false),
             establish_called: AtomicBool::new(false),
             describe_called: AtomicBool::new(false),
@@ -698,7 +704,13 @@ impl Account for StubAccount {
     }
 
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Ok(()) })
+        self.close_called.store(true, Ordering::Relaxed);
+        assert_ne!(self.close_panic, 1, "synchronous provider close panic");
+        let panic = self.close_panic;
+        Box::pin(async move {
+            assert_ne!(panic, 2, "asynchronous provider close panic");
+            Ok(())
+        })
     }
 }
 
@@ -795,7 +807,7 @@ pub(crate) fn scripted_account_parts_from(
         calendars: None,
         dav_scopes: Default::default(),
         submission: None,
-        dav_degraded: Vec::new(),
+        discovery_skips: Vec::new(),
     }
 }
 

@@ -10,6 +10,7 @@ use futures::StreamExt;
 #[cfg(test)]
 use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::etag::GraphETag;
@@ -532,7 +533,10 @@ fn reconstruct_headers(h: &std::collections::HashMap<String, String>) -> HeaderM
 
 fn hydrated_from_value(id: ObjectId, value: &Value, projection: Projection) -> HydratedObject {
     let kind = match projection {
-        Projection::FlagsOnly => HydratedObjectKind::FlagsOnly(flags_from_value(value)),
+        Projection::FlagsOnly => HydratedObjectKind::FlagsOnly(
+            decode_complete_flags(value)
+                .map_or_else(|_| flags_from_value(value), super::wire_item::CompleteFlags::tokens),
+        ),
         // Graph's JSON message resource is not assembled RFC822, so the
         // body-bearing projections cannot honestly produce `RawMime`
         // here (the prior code minted a JSON blob, violating the
@@ -568,9 +572,8 @@ fn hydrated_from_value(id: ObjectId, value: &Value, projection: Projection) -> H
 /// the `Metadata` projection and the body-bearing projections that A3
 /// degrades to metadata (the real body path is `open_raw_rfc822`).
 fn metadata_or_flags(id: &ObjectId, value: &Value) -> HydratedObjectKind {
-    let folder = value
-        .get("parentFolderId")
-        .and_then(Value::as_str)
+    let folder = super::wire_item::GraphItem::decode(value)
+        .parent_folder
         .unwrap_or_default();
     let parsed_id = super::foreign::parse_message_id(id);
     let scope = CursorScope::FolderType {
@@ -596,29 +599,23 @@ fn metadata_or_flags(id: &ObjectId, value: &Value) -> HydratedObjectKind {
 }
 
 fn flags_from_value(value: &Value) -> HashSet<String> {
+    let observed = super::wire_item::GraphItem::decode(value).flags;
     let mut flags = HashSet::new();
-    if value
-        .get("isRead")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    if observed.read.unwrap_or(false) {
         flags.insert(crate::account::flags::GraphFlag::Read.token());
     }
-    if value
-        .get("flag")
-        .and_then(|flag| flag.get("flagStatus"))
-        .and_then(Value::as_str)
+    if observed
+        .status
         .is_some_and(|status| status.eq_ignore_ascii_case("flagged"))
     {
         flags.insert(crate::account::flags::GraphFlag::Flagged.token());
     }
-    if let Some(categories) = value.get("categories").and_then(Value::as_array) {
-        for category in categories {
-            if let Some(category) = category.as_str() {
-                flags.insert(crate::account::flags::GraphFlag::Category(category).token());
-            }
-        }
-    }
+    flags.extend(
+        observed
+            .categories
+            .into_iter()
+            .map(|category| crate::account::flags::GraphFlag::Category(category).token()),
+    );
     flags
 }
 
@@ -670,42 +667,33 @@ fn hydrate_url_for_id(
     Ok(format!("{prefix}/messages/{enc_id}?$select={select}"))
 }
 
-/// Completeness check for a REST `FlagsOnly` body. `flags_from_value` stays a
-/// total mapper that reads an absent field as "not set"; this is what keeps a
-/// partial body from being reported as a valid observation of an empty flag
-/// state. Every field `flags_from_value` reads must be present and well typed.
+/// Strict serde decoding is local to a correlated hydration answer. A sparse
+/// delta cannot use this schema: rejecting its page would discard siblings and
+/// bypass the id-less-value checkpoint barrier.
 fn validate_flags_value(
     value: &Value,
 ) -> Result<(), (bifrost_types::ProtocolErrorKind, &'static str)> {
+    decode_complete_flags(value).map(|_| ())
+}
+
+fn decode_complete_flags(
+    value: &Value,
+) -> Result<super::wire_item::CompleteFlags, (bifrost_types::ProtocolErrorKind, &'static str)> {
     use bifrost_types::ProtocolErrorKind::{MissingField, ParseFailed};
-    let read = value
-        .get("isRead")
-        .ok_or((MissingField, "missing isRead"))?;
-    if !read.is_boolean() {
-        return Err((ParseFailed, "invalid isRead"));
+    // Serde's derived structs also accept positional arrays. Graph resources
+    // are JSON objects; preserve the stricter wire-shape contract here.
+    if !value.is_object() || value.get("flag").is_some_and(|flag| !flag.is_object()) {
+        return Err((ParseFailed, "invalid flag observation object"));
     }
-    let flag = value.get("flag").ok_or((MissingField, "missing flag"))?;
-    let flag = flag.as_object().ok_or((ParseFailed, "invalid flag"))?;
-    let status = flag
-        .get("flagStatus")
-        .ok_or((MissingField, "missing flagStatus"))?;
-    let status = status.as_str().ok_or((ParseFailed, "invalid flagStatus"))?;
-    if !["notFlagged", "flagged", "complete"]
-        .iter()
-        .any(|s| status.eq_ignore_ascii_case(s))
-    {
-        return Err((ParseFailed, "unknown flagStatus"));
-    }
-    let categories = value
-        .get("categories")
-        .ok_or((MissingField, "missing categories"))?;
-    let categories = categories
-        .as_array()
-        .ok_or((ParseFailed, "invalid categories"))?;
-    if categories.iter().any(|v| !v.is_string()) {
-        return Err((ParseFailed, "invalid category"));
-    }
-    Ok(())
+    super::wire_item::CompleteFlags::deserialize(value).map_err(|error| {
+        // serde's missing-field diagnostic is distinct from wrong types/null.
+        // Keep the public recovery taxonomy without exporting provider values.
+        if error.to_string().starts_with("missing field ") {
+            (MissingField, "missing flag observation field")
+        } else {
+            (ParseFailed, "invalid flag observation field")
+        }
+    })
 }
 
 #[cfg(test)]

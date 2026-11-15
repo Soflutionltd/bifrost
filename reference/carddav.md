@@ -110,8 +110,10 @@ Status classification receives the HTTP response headers and uses
 throttle scope as DAV's conservative scheduling policy. Exhausted retry and
 rate-limit errors retain net's complete retry history, except 501, which MOVE
 must read as an unsupported-method answer. A non-idempotent request can also
-read its terminal status after earlier explicit 401/429/503/501 refusals;
-a history containing transport ambiguity keeps reconciliation. Conditional
+read its terminal status after earlier proven refusals, the shared
+`bifrost_net::is_proven_refusal` rule (401, 429, 405 and 501); a 503 can
+follow an upstream commit, so it stays commit-ambiguous, and a history
+containing a 503 or transport ambiguity keeps reconciliation. Conditional
 412 and locked 423 remain DAV conflicts; 400/422 are malformed requests and
 408/502/503/504 are unavailable. Cursor-invalid 410 is interpreted only by the
 sync-collection caller before the generic resource ladder.
@@ -809,8 +811,9 @@ uses IdempotentUnlessConditional and absorbs gone targets. Conditional updates
 must read back after ambiguity rather than replay into a false caller-version
 conflict. Self-fetched validators pay the same accepted read-back cost.
 Net narrows possible-commit failures and `dispatch_once` also stamps DAV-minted
-failures. Ambiguous retryable statuses stop before another write, with 401/429
-refusal handling preserved. DAV's all-401 history exception is defensive and
+failures. Ambiguous retryable statuses (including 503) stop before another
+write; the proven refusals of `bifrost_net::is_proven_refusal` (401, 429, 405,
+501) are not ambiguous. DAV's all-401 history exception is defensive and
 unreachable with today's outer credential-refresh walk. Relocation returns
 Before, MovedThenPut or CopiedThenDelete progress. contact_update attaches once:
 committed Moved/Copied steps are Blocking, with source/destination contact
@@ -979,3 +982,10 @@ removing the final resource path segment. `well_known_url` replaces the base
 path with the origin-rooted `/.well-known/<service>` and clears query and
 fragment; unusable bases return `None` so discovery can try the configured base.
 Both helpers and their existing tests live in dav-core.
+
+Factory opens deliberately return an empty skipped-scope lane after successful
+discovery: every discovered collection has an independent sync scope. This is
+also true when composed into IMAP. Enterprise users expect all discovered
+collections to sync; there is no single-collection limit to report. Discovery
+failures still fail the standalone open and are classified skips at the IMAP
+composition boundary.

@@ -876,6 +876,7 @@ impl GetArguments {
 }
 
 impl crate::core::Object for Email {
+    crate::core::method::object_metadata!(Email);
     type Property = Property;
     type Id = EmailId;
     fn requires_account_id() -> bool {
@@ -913,32 +914,12 @@ impl crate::core::SetCreate for EmailCreate {
     }
 }
 
-crate::define_get_method!(EmailGet, Email, "Email/get", crate::core::capability::Mail);
-crate::define_set_method!(EmailSet, Email, "Email/set", crate::core::capability::Mail);
-crate::define_changes_method!(
-    EmailChanges,
-    Email,
-    "Email/changes",
-    crate::core::capability::Mail
-);
-crate::define_query_method!(
-    EmailQuery,
-    Email,
-    "Email/query",
-    crate::core::capability::Mail
-);
-crate::define_query_changes_method!(
-    EmailQueryChanges,
-    Email,
-    "Email/queryChanges",
-    crate::core::capability::Mail
-);
-crate::define_copy_method!(
-    EmailCopy,
-    Email,
-    "Email/copy",
-    crate::core::capability::Mail
-);
+crate::define_get_method!(EmailGet, Email);
+crate::define_set_method!(EmailSet, Email);
+crate::define_changes_method!(EmailChanges, Email);
+crate::define_query_method!(EmailQuery, Email);
+crate::define_query_changes_method!(EmailQueryChanges, Email);
+crate::define_copy_method!(EmailCopy, Email);
 
 impl EmailGet {
     #[must_use]

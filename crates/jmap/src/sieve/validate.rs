@@ -19,8 +19,8 @@ pub(crate) struct SieveScriptValidateResponse {
 
 impl crate::core::method::JmapMethod for SieveScriptValidateRequest {
     const REPLAY_SAFE: bool = true;
-    const NAME: &'static str = "SieveScript/validate";
-    type Cap = crate::core::capability::Sieve;
+    const NAME: &'static str = <super::SieveScript as crate::core::Object>::METHODS.validate;
+    type Cap = <super::SieveScript as crate::core::Object>::Cap;
     type Response = SieveScriptValidateResponse;
 
     fn set_account_id(&mut self, account_id: &AccountId) {

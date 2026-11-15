@@ -1,3 +1,4 @@
+#![allow(dead_code)] // codec helper surface not every caller reads
 //! Foreign (shared/delegate) JMAP account codec.
 //!
 //! A non-personal JMAP account surfaces as ONE account-level cursor scope,

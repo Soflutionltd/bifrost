@@ -253,6 +253,7 @@ impl ChangesResponse {
 // -- Trait impls --
 
 impl crate::core::Object for Mailbox {
+    crate::core::method::object_metadata!(Mailbox);
     type Property = Property;
     type Id = MailboxId;
     fn requires_account_id() -> bool {
@@ -297,36 +298,11 @@ impl crate::core::SetCreate for MailboxCreate {
 
 // Method struct definitions
 
-crate::define_get_method!(
-    MailboxGet,
-    Mailbox,
-    "Mailbox/get",
-    crate::core::capability::Mail
-);
-crate::define_set_method!(
-    MailboxSet,
-    Mailbox,
-    "Mailbox/set",
-    crate::core::capability::Mail
-);
-crate::define_changes_method!(
-    MailboxChanges,
-    Mailbox,
-    "Mailbox/changes",
-    crate::core::capability::Mail
-);
-crate::define_query_method!(
-    MailboxQuery,
-    Mailbox,
-    "Mailbox/query",
-    crate::core::capability::Mail
-);
-crate::define_query_changes_method!(
-    MailboxQueryChanges,
-    Mailbox,
-    "Mailbox/queryChanges",
-    crate::core::capability::Mail
-);
+crate::define_get_method!(MailboxGet, Mailbox);
+crate::define_set_method!(MailboxSet, Mailbox);
+crate::define_changes_method!(MailboxChanges, Mailbox);
+crate::define_query_method!(MailboxQuery, Mailbox);
+crate::define_query_changes_method!(MailboxQueryChanges, Mailbox);
 
 impl<'de> Deserialize<'de> for Role {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

@@ -2,7 +2,6 @@ use bifrost_types::{
     AccountOperation, AccountStream, Change, ChangeCursor, Checkpoint, ErrorScope, ObjectChange,
     ObjectChangeKind, PageBoundary, ScopeChange, ScopeChangeKind, SyncEvent,
 };
-use serde_json::Value;
 
 use super::GraphAccount;
 use super::cursor::{CursorError, decode_cursor, encode_cursor};
@@ -181,7 +180,8 @@ pub(crate) fn changes_stream_admitted(
             let mut removed_etag_ids = Vec::new();
             let mut idless_value = false;
             for value in page.value {
-                if let Some(id) = value.get("id").and_then(Value::as_str) {
+                let item = super::wire_item::GraphItem::decode(&value);
+                if let Some(id) = item.id {
                     last_seen_id = Some(parsed.mint_object_id(id).0);
                 }
                 if is_removed(&value) {
@@ -196,7 +196,7 @@ pub(crate) fn changes_stream_admitted(
                         }
                         changes.push(Change::ScopeChange(ScopeChange {
                             id,
-                            membership: parsed.membership(value.get("parentFolderId").and_then(Value::as_str)),
+                            membership: parsed.membership(item.parent_folder),
                             kind: ScopeChangeKind::Removed,
                         }));
                     } else {
@@ -204,10 +204,10 @@ pub(crate) fn changes_stream_admitted(
                     }
                     continue;
                 }
-                if value.get("id").and_then(Value::as_str).is_none() {
+                if item.id.is_none() {
                     idless_value = true;
                 }
-                if let Some(id) = value.get("id").and_then(Value::as_str) {
+                if let Some(id) = item.id {
                     let object_id = parsed.mint_object_id(id);
                     // Only mail mutations consume this bounded cache.
                     if parsed.etag_cached()
@@ -228,7 +228,7 @@ pub(crate) fn changes_stream_admitted(
                     }));
                     changes.push(Change::ScopeChange(ScopeChange {
                         id: object_id,
-                        membership: parsed.membership(value.get("parentFolderId").and_then(Value::as_str)),
+                        membership: parsed.membership(item.parent_folder),
                         kind: ScopeChangeKind::Added,
                     }));
                 }

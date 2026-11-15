@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 #![doc = "JMAP Account implementation for bifrost."]
-// The crate hosts the full JMAP RFC type surface (mail, calendars,
-// contacts, principal, sieve, sharing, push) so the Account impl can
-// draw on whichever pieces a given stage needs. The Account impl
-// today wires a subset; the rest stays built and ready. `wrong_self_convention`
-// is allowed because JMAP RFC field names (`fromDate`, `isEnabled`,
-// `toDate`) become builder methods that mutate `self`.
-#![allow(dead_code)]
+// Dead-code diagnostics stay enabled outside the explicitly retained protocol
+// modules. Those modules keep builders and methods the Account facade does not
+// yet use; a blanket allowance here also hid drift in the live client and core.
+// Without `sync` the crate has no public items at all, so every crate-private
+// item is unreachable by construction; the lint is only meaningful with `sync`.
+#![cfg_attr(not(feature = "sync"), allow(dead_code))]
+// JMAP RFC fields (`fromDate`, `isEnabled`, `toDate`) become mutating builders.
 #![allow(clippy::wrong_self_convention)]
 // JMAP RFC vocabulary uses bare acronyms (JMAP, ACL, DKIM) and
 // enum families with shared prefixes (AddressType::As*); both
@@ -92,112 +92,109 @@ pub(crate) use crate::core::{
     method::{define_open_property_enum, define_parse_method},
 };
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
-#[non_exhaustive]
-pub(crate) enum DataType {
-    // Core (always available)
-    Core,
-    PushSubscription,
-    Principal,
-    ShareNotification,
+// Keep wire identity and capability ownership together. Feature-disabled
+// types still resolve their capability for Blob/lookup's `using` list.
+macro_rules! data_types {
+    ($( $(#[$attr:meta])* $kind:ident => $wire:literal, $cap:ident; )*) => {
+        #[derive(Debug, Eq, PartialEq, Hash, Clone)]
+        #[non_exhaustive]
+        pub(crate) enum DataType {
+            $($(#[$attr])* $kind,)*
+            /// Unknown or feature-gated data type, preserved for wire round-trips.
+            Other(String),
+        }
 
-    // Mail
-    #[cfg(feature = "mail")]
-    Email,
-    #[cfg(feature = "mail")]
-    EmailDelivery,
-    #[cfg(feature = "mail")]
-    EmailSubmission,
-    #[cfg(feature = "mail")]
-    Mailbox,
-    #[cfg(feature = "mail")]
-    Thread,
-    #[cfg(feature = "mail")]
-    Identity,
-    #[cfg(feature = "mail")]
-    SearchSnippet,
-    #[cfg(feature = "mail")]
-    VacationResponse,
-    #[cfg(feature = "mail")]
-    Mdn,
-    #[cfg(feature = "mail")]
-    SieveScript,
+        impl DataType {
+            fn parse(value: &str) -> Self {
+                match value {
+                    $($(#[$attr])* $wire => Self::$kind,)*
+                    other => Self::Other(other.to_string()),
+                }
+            }
 
-    // Calendars
-    #[cfg(feature = "calendars")]
-    Calendar,
-    #[cfg(feature = "calendars")]
-    CalendarEvent,
-    #[cfg(feature = "calendars")]
-    CalendarEventNotification,
-    #[cfg(feature = "calendars")]
-    ParticipantIdentity,
-    #[cfg(feature = "calendars")]
-    CalendarAlert,
+            /// Known types resolve even when feature-disabled. Unknown extension
+            /// types require an explicit additional request capability.
+            pub(crate) fn capability_uri(&self) -> Option<&'static str> {
+                match self.to_string().as_str() {
+                    $($wire => data_types!(@uri $cap),)*
+                    _ => None,
+                }
+            }
+        }
 
-    // Contacts
-    #[cfg(feature = "contacts")]
-    AddressBook,
-    #[cfg(feature = "contacts")]
-    ContactCard,
+        impl Display for DataType {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    $($(#[$attr])* Self::$kind => f.write_str($wire),)*
+                    Self::Other(value) => f.write_str(value),
+                }
+            }
+        }
 
-    // Quota
-    #[cfg(feature = "quota")]
-    Quota,
-
-    FileNode,
-
-    /// Unknown or feature-gated data type, preserved for wire round-trips.
-    Other(String),
+        // Object metadata selects the same capability owner as wire lookup.
+        mod data_type_metadata {
+            $(data_types!(@metadata $(#[$attr])* $kind, $wire, $cap);)*
+        }
+    };
+    (@uri None) => { None };
+    (@uri $cap:ident) => {
+        Some(<$crate::core::capability::$cap as $crate::core::capability::Capability>::URI)
+    };
+    (@metadata $(#[$attr:meta])* $kind:ident, $wire:literal, None) => {};
+    (@metadata $(#[$attr:meta])* $kind:ident, $wire:literal, $cap:ident) => {
+        $(#[$attr])*
+        // Some push/lookup types have no Object implementation or methods.
+        #[allow(dead_code)]
+        pub(crate) type $kind = crate::core::capability::$cap;
+        $(#[$attr])*
+        #[allow(dead_code, non_upper_case_globals)]
+        pub(crate) const $kind: crate::core::method::ObjectMethods =
+            crate::core::method::object_methods!($wire);
+    };
 }
 
-impl DataType {
-    fn parse(value: &str) -> Self {
-        match value {
-            "Core" => Self::Core,
-            "PushSubscription" => Self::PushSubscription,
-            "Principal" => Self::Principal,
-            "ShareNotification" => Self::ShareNotification,
-            #[cfg(feature = "mail")]
-            "Email" => Self::Email,
-            #[cfg(feature = "mail")]
-            "EmailDelivery" => Self::EmailDelivery,
-            #[cfg(feature = "mail")]
-            "EmailSubmission" => Self::EmailSubmission,
-            #[cfg(feature = "mail")]
-            "Mailbox" => Self::Mailbox,
-            #[cfg(feature = "mail")]
-            "Thread" => Self::Thread,
-            #[cfg(feature = "mail")]
-            "Identity" => Self::Identity,
-            #[cfg(feature = "mail")]
-            "SearchSnippet" => Self::SearchSnippet,
-            #[cfg(feature = "mail")]
-            "VacationResponse" => Self::VacationResponse,
-            #[cfg(feature = "mail")]
-            "MDN" => Self::Mdn,
-            #[cfg(feature = "mail")]
-            "SieveScript" => Self::SieveScript,
-            #[cfg(feature = "calendars")]
-            "Calendar" => Self::Calendar,
-            #[cfg(feature = "calendars")]
-            "CalendarEvent" => Self::CalendarEvent,
-            #[cfg(feature = "calendars")]
-            "CalendarEventNotification" => Self::CalendarEventNotification,
-            #[cfg(feature = "calendars")]
-            "ParticipantIdentity" => Self::ParticipantIdentity,
-            #[cfg(feature = "calendars")]
-            "CalendarAlert" => Self::CalendarAlert,
-            #[cfg(feature = "contacts")]
-            "AddressBook" => Self::AddressBook,
-            #[cfg(feature = "contacts")]
-            "ContactCard" => Self::ContactCard,
-            #[cfg(feature = "quota")]
-            "Quota" => Self::Quota,
-            "FileNode" => Self::FileNode,
-            other => Self::Other(other.to_string()),
-        }
-    }
+data_types! {
+    Core => "Core", Core;
+    PushSubscription => "PushSubscription", Core;
+    Principal => "Principal", Principals;
+    ShareNotification => "ShareNotification", Principals;
+    #[cfg(feature = "mail")]
+    Email => "Email", Mail;
+    #[cfg(feature = "mail")]
+    EmailDelivery => "EmailDelivery", Mail;
+    #[cfg(feature = "mail")]
+    EmailSubmission => "EmailSubmission", Submission;
+    #[cfg(feature = "mail")]
+    Mailbox => "Mailbox", Mail;
+    #[cfg(feature = "mail")]
+    Thread => "Thread", Mail;
+    #[cfg(feature = "mail")]
+    Identity => "Identity", Submission;
+    #[cfg(feature = "mail")]
+    SearchSnippet => "SearchSnippet", Mail;
+    #[cfg(feature = "mail")]
+    VacationResponse => "VacationResponse", VacationResponseCap;
+    #[cfg(feature = "mail")]
+    Mdn => "MDN", None;
+    #[cfg(feature = "mail")]
+    SieveScript => "SieveScript", Sieve;
+    #[cfg(feature = "calendars")]
+    Calendar => "Calendar", Calendars;
+    #[cfg(feature = "calendars")]
+    CalendarEvent => "CalendarEvent", Calendars;
+    #[cfg(feature = "calendars")]
+    CalendarEventNotification => "CalendarEventNotification", Calendars;
+    #[cfg(feature = "calendars")]
+    ParticipantIdentity => "ParticipantIdentity", Calendars;
+    #[cfg(feature = "calendars")]
+    CalendarAlert => "CalendarAlert", Calendars;
+    #[cfg(feature = "contacts")]
+    AddressBook => "AddressBook", Contacts;
+    #[cfg(feature = "contacts")]
+    ContactCard => "ContactCard", Contacts;
+    #[cfg(feature = "quota")]
+    Quota => "Quota", Quota;
+    FileNode => "FileNode", None;
 }
 
 impl From<&str> for DataType {
@@ -209,33 +206,6 @@ impl From<&str> for DataType {
 impl From<String> for DataType {
     fn from(value: String) -> Self {
         Self::parse(&value)
-    }
-}
-
-impl DataType {
-    /// Capability defining a known type, including types whose module is
-    /// feature-gated off. Unknown extension types remain round-trippable;
-    /// their caller must supply the extension capability explicitly.
-    pub(crate) fn capability_uri(&self) -> Option<&'static str> {
-        use crate::core::capability::{self, Capability};
-        match self.to_string().as_str() {
-            "Core" | "PushSubscription" => Some(capability::Core::URI),
-            "Principal" | "ShareNotification" => Some(capability::Principals::URI),
-            "Email" | "EmailDelivery" | "Mailbox" | "Thread" | "SearchSnippet" => {
-                Some(capability::Mail::URI)
-            }
-            "EmailSubmission" | "Identity" => Some(capability::Submission::URI),
-            "VacationResponse" => Some(capability::VacationResponseCap::URI),
-            "SieveScript" => Some(capability::Sieve::URI),
-            "Calendar"
-            | "CalendarEvent"
-            | "CalendarEventNotification"
-            | "ParticipantIdentity"
-            | "CalendarAlert" => Some(capability::Calendars::URI),
-            "AddressBook" | "ContactCard" => Some(capability::Contacts::URI),
-            "Quota" => Some(capability::Quota::URI),
-            _ => None,
-        }
     }
 }
 
@@ -665,55 +635,6 @@ impl Display for Error {
             Error::WebSocketSetup(msg) => write!(f, "WebSocket setup failed: {msg}"),
             #[cfg(feature = "websockets")]
             Error::WebSocketNotConnected => write!(f, "WebSocket connection not established"),
-        }
-    }
-}
-
-impl Display for DataType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DataType::Core => write!(f, "Core"),
-            DataType::PushSubscription => write!(f, "PushSubscription"),
-            DataType::Principal => write!(f, "Principal"),
-            DataType::ShareNotification => write!(f, "ShareNotification"),
-            DataType::FileNode => write!(f, "FileNode"),
-            #[cfg(feature = "mail")]
-            DataType::Email => write!(f, "Email"),
-            #[cfg(feature = "mail")]
-            DataType::EmailDelivery => write!(f, "EmailDelivery"),
-            #[cfg(feature = "mail")]
-            DataType::EmailSubmission => write!(f, "EmailSubmission"),
-            #[cfg(feature = "mail")]
-            DataType::Mailbox => write!(f, "Mailbox"),
-            #[cfg(feature = "mail")]
-            DataType::Thread => write!(f, "Thread"),
-            #[cfg(feature = "mail")]
-            DataType::Identity => write!(f, "Identity"),
-            #[cfg(feature = "mail")]
-            DataType::SearchSnippet => write!(f, "SearchSnippet"),
-            #[cfg(feature = "mail")]
-            DataType::VacationResponse => write!(f, "VacationResponse"),
-            #[cfg(feature = "mail")]
-            DataType::Mdn => write!(f, "MDN"),
-            #[cfg(feature = "mail")]
-            DataType::SieveScript => write!(f, "SieveScript"),
-            #[cfg(feature = "calendars")]
-            DataType::Calendar => write!(f, "Calendar"),
-            #[cfg(feature = "calendars")]
-            DataType::CalendarEvent => write!(f, "CalendarEvent"),
-            #[cfg(feature = "calendars")]
-            DataType::CalendarEventNotification => write!(f, "CalendarEventNotification"),
-            #[cfg(feature = "calendars")]
-            DataType::ParticipantIdentity => write!(f, "ParticipantIdentity"),
-            #[cfg(feature = "calendars")]
-            DataType::CalendarAlert => write!(f, "CalendarAlert"),
-            #[cfg(feature = "contacts")]
-            DataType::AddressBook => write!(f, "AddressBook"),
-            #[cfg(feature = "contacts")]
-            DataType::ContactCard => write!(f, "ContactCard"),
-            #[cfg(feature = "quota")]
-            DataType::Quota => write!(f, "Quota"),
-            DataType::Other(value) => write!(f, "{value}"),
         }
     }
 }

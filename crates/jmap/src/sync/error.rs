@@ -14,11 +14,11 @@
 //! recovery from `(kind, scope, operation, primary_cause)` at builder
 //! `build()` time.
 //!
-//! The crate root sets `#![allow(dead_code)]`, which is load-bearing for the
-//! per-RFC method modules (full `get`/`set`/`query` surfaces that consumers
-//! call and the crate itself does not). It is the wrong default HERE: an
+//! Retained per-RFC protocol modules allow dead code for their unused
+//! `get`/`set`/`query` surface. That allowance is the wrong default HERE: an
 //! unreachable arm of this boundary is a silent hole in the contract above,
-//! not unused API. This module opts back in so the compiler reports one.
+//! not unused API. This module enables the lint explicitly so the compiler
+//! reports one, whatever any enclosing scope allows.
 #![warn(dead_code)]
 
 #[cfg(feature = "websockets")]

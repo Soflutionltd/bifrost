@@ -131,8 +131,10 @@ Status classification receives the HTTP response headers and uses
 throttle scope as DAV's conservative scheduling policy. Exhausted retry and
 rate-limit errors retain net's complete retry history, except 501, which MOVE
 must read as an unsupported-method answer. A non-idempotent request can also
-read its terminal status after earlier explicit 401/429/503/501 refusals;
-a history containing transport ambiguity keeps reconciliation. Conditional
+read its terminal status after earlier proven refusals, the shared
+`bifrost_net::is_proven_refusal` rule (401, 429, 405 and 501); a 503 can
+follow an upstream commit, so it stays commit-ambiguous, and a history
+containing a 503 or transport ambiguity keeps reconciliation. Conditional
 412 and locked 423 remain DAV conflicts; 400/422 are malformed requests and
 408/502/503/504 are unavailable. Cursor-invalid 410 is interpreted only by the
 sync-collection caller before the generic resource ladder.
@@ -1223,10 +1225,14 @@ because DAV itself mints oversized-body failures. The operation table alone
 cannot prove MOVE or a partly completed sequence safe.
 
 DAV only reads method refusals (405/501) as data after histories consisting of
-401/429/503/501. Other ambiguous histories reconcile. The all-401 exception is
-defensive and unreachable today: DAV refreshes outside net, with bearer injection
-disabled. A lone 501 remains data for MOVE fallback; a lone 503 reconciles and
-cannot consume a queued 405. A genuine first-attempt 412 stays a conflict.
+proven refusals, the shared `bifrost_net::is_proven_refusal` rule in
+`crates/net/src/attempt.rs`: 401, 429, 405 and 501. A 503 can follow an
+upstream commit, so it is commit-ambiguous, and any history containing one
+reconciles, as do other ambiguous histories. Redirect walks feed the same rule
+through `AttemptLedger`. The all-401 exception is defensive and unreachable
+today: DAV refreshes outside net, with bearer injection disabled. A lone 501
+remains data for MOVE fallback; a lone 503 reconciles and cannot consume a
+queued 405. A genuine first-attempt 412 stays a conflict.
 
 **Multi-step failures preserve the leaf.** Relocation returns crate-local
 Before, MovedThenPut or CopiedThenDelete progress, and the public update attaches
@@ -1533,3 +1539,10 @@ removing the final resource path segment. `well_known_url` replaces the base
 path with the origin-rooted `/.well-known/<service>` and clears query and
 fragment; unusable bases return `None` so discovery can try the configured base.
 Both helpers and their existing tests live in dav-core.
+
+Factory opens deliberately return an empty skipped-scope lane after successful
+discovery: every discovered collection has an independent sync scope. This is
+also true when composed into IMAP. Enterprise users expect all discovered
+collections to sync; there is no single-collection limit to report. Discovery
+failures still fail the standalone open and are classified skips at the IMAP
+composition boundary.

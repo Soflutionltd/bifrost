@@ -14,7 +14,6 @@
 //! change; UIDVALIDITY alone cannot establish continuity across one.
 
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::sync::atomic::Ordering;
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, ContainerId,
@@ -504,7 +503,7 @@ async fn examine(
     folder: &MailboxName,
     op: AccountOperation,
 ) -> Result<(PooledConn, SelectedMailbox), AccountError> {
-    if account.closed.load(Ordering::Acquire) {
+    if account.shutdown.is_cancelled() {
         return Err(folder_error(Error::closed(), folder, op));
     }
     let mut conn = account

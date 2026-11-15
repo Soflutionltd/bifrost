@@ -227,7 +227,7 @@ fn mutation_stream(
                         };
                         patch = translate_flag_op(op, &labels);
                     }
-                    state.patch = Some(patch);
+                    state.patch = Some(Ok(patch));
                 }
                 MutationKind::Move {
                     destination,
@@ -283,8 +283,13 @@ fn mutation_stream(
         }
         let body_count = match &state.kind {
             MutationKind::SetFlags(_) | MutationKind::Move { .. } => {
-                let patch = state.patch.clone().unwrap_or_default();
-                batch_modify_bodies(&ids, &patch).len()
+                let patch = state
+                    .patch
+                    .clone()
+                    .unwrap_or_else(|| Ok(LabelPatch::default()));
+                patch
+                    .as_ref()
+                    .map_or(0, |patch| batch_modify_bodies(&ids, patch).len())
             }
             MutationKind::Destroy => 1,
         };
@@ -302,7 +307,10 @@ fn mutation_stream(
                     .await
                 }
                 MutationKind::SetFlags(_) | MutationKind::Move { .. } => {
-                    let patch = state.patch.clone().unwrap_or_default();
+                    let patch = state
+                        .patch
+                        .clone()
+                        .unwrap_or_else(|| Ok(LabelPatch::default()));
                     apply_label_patch_tracked(
                         &state.client,
                         &ids,
@@ -431,7 +439,7 @@ struct MutationState {
     targets: AccountStream<ObjectId>,
     kind: MutationKind,
     key: IdempotencyKey,
-    patch: Option<LabelPatch>,
+    patch: Option<Result<LabelPatch, MoveRefusal>>,
     pending_target: Option<ObjectId>,
     finished: bool,
     emitted_done: bool,
@@ -659,25 +667,30 @@ impl MutationProgress {
 async fn apply_label_patch_tracked(
     client: &GmailClient,
     ids: &[ObjectId],
-    patch: LabelPatch,
+    patch: Result<LabelPatch, MoveRefusal>,
     key: &IdempotencyKey,
     operation: AccountOperation,
     progress: Arc<Mutex<MutationProgress>>,
 ) -> MutationApply {
-    if operation == AccountOperation::BulkMove && !patch.unsupported_flags.is_empty() {
-        let detail = format!(
-            "unsupported Gmail mutation scope: {}",
-            patch.unsupported_flags.join(", ")
-        );
-        let error = account_error::into_account_error(
-            GmailError::invalid_request(operation, detail),
-            GmailErrorContext::mutation(operation),
-        );
-        return MutationApply::Batch {
-            items: failed_outcomes(ids, &error),
-            warning: None,
-        };
-    }
+    // Scope errors and future operations are request refusals, not flag tokens.
+    let patch = match patch {
+        Ok(patch) if !patch.unsupported_operation => patch,
+        result => {
+            let detail = match result {
+                Err(MoveRefusal::Destination) => "gmail move destination must be a label",
+                Err(MoveRefusal::Source) => "gmail move source must be a label",
+                Ok(_) => "unknown future FlagOp variant",
+            };
+            let error = account_error::into_account_error(
+                GmailError::invalid_request(operation, detail),
+                GmailErrorContext::mutation(operation),
+            );
+            return MutationApply::Batch {
+                items: failed_outcomes(ids, &error),
+                warning: None,
+            };
+        }
+    };
     if patch.add_label_ids.is_empty() && patch.remove_label_ids.is_empty() {
         if patch.unsupported_flags.is_empty() {
             return MutationApply::Batch {
@@ -1033,7 +1046,7 @@ async fn apply_destroy(
             match apply_label_patch_tracked(
                 client,
                 ids,
-                fallback,
+                Ok(fallback),
                 key,
                 AccountOperation::BulkDestroy,
                 Arc::clone(&progress),
@@ -1082,6 +1095,12 @@ fn terminate_event(error: AccountError) -> SyncEvent<ItemOutcome<MutationSuccess
     SyncEvent::Terminated(error)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveRefusal {
+    Destination,
+    Source,
+}
+
 /// Translate a bulk move destination (and optional source) into a
 /// Gmail label patch.
 ///
@@ -1096,26 +1115,23 @@ fn terminate_event(error: AccountError) -> SyncEvent<ItemOutcome<MutationSuccess
 /// `batchModify` is what lets a consumer drop the O(n) "bulk_move plus
 /// a per-id `remove_from_container`" composition - Gmail's
 /// `batchModify` expresses add-and-remove in one request.
-fn move_patch(destination: &MembershipScope, source: Option<&MembershipScope>) -> LabelPatch {
+fn move_patch(
+    destination: &MembershipScope,
+    source: Option<&MembershipScope>,
+) -> Result<LabelPatch, MoveRefusal> {
     let Some(LabelId(destination_id)) = as_label(destination) else {
-        return LabelPatch {
-            unsupported_flags: vec!["gmail move destination must be a label".to_string()],
-            ..LabelPatch::default()
-        };
+        return Err(MoveRefusal::Destination);
     };
     let source_id = match source {
         None => None,
         Some(scope) => {
             let Some(LabelId(id)) = as_label(scope) else {
-                return LabelPatch {
-                    unsupported_flags: vec!["gmail move source must be a label".to_string()],
-                    ..LabelPatch::default()
-                };
+                return Err(MoveRefusal::Source);
             };
             Some(id.as_str())
         }
     };
-    flags::move_placement_patch(destination_id, source_id)
+    Ok(flags::move_placement_patch(destination_id, source_id))
 }
 
 fn as_label(scope: &MembershipScope) -> Option<&LabelId> {
@@ -1606,6 +1622,7 @@ mod tests {
                 .map(|n| format!("Rem_{n}"))
                 .collect(),
             unsupported_flags: Vec::new(),
+            unsupported_operation: false,
         };
         let ids = [ObjectId("m1".to_string()), ObjectId("m2".to_string())];
         let bodies = batch_modify_bodies(&ids, &patch);
@@ -1639,6 +1656,7 @@ mod tests {
             add_label_ids: vec!["INBOX".to_string()],
             remove_label_ids: vec!["SPAM".to_string(), "TRASH".to_string()],
             unsupported_flags: Vec::new(),
+            unsupported_operation: false,
         };
         let bodies = batch_modify_bodies(&[ObjectId("m1".to_string())], &patch);
         assert_eq!(bodies.len(), 1);
@@ -2114,7 +2132,7 @@ mod tests {
 
     #[test]
     fn move_to_inbox_clears_spam_and_trash() {
-        let patch = move_patch(&label("INBOX"), None);
+        let patch = move_patch(&label("INBOX"), None).expect("label scope");
         assert_eq!(patch.add_label_ids, vec!["INBOX".to_string()]);
         assert_eq!(
             patch.remove_label_ids,
@@ -2126,7 +2144,7 @@ mod tests {
 
     #[test]
     fn move_to_inbox_is_case_insensitive() {
-        let patch = move_patch(&label("inbox"), None);
+        let patch = move_patch(&label("inbox"), None).expect("label scope");
         assert_eq!(
             patch.remove_label_ids,
             vec!["SPAM".to_string(), "TRASH".to_string()]
@@ -2135,7 +2153,7 @@ mod tests {
 
     #[test]
     fn move_to_user_label_clears_every_exclusive_container() {
-        let patch = move_patch(&label("Label_42"), None);
+        let patch = move_patch(&label("Label_42"), None).expect("label scope");
         assert_eq!(patch.add_label_ids, vec!["Label_42".to_string()]);
         assert_eq!(
             patch.remove_label_ids,
@@ -2146,7 +2164,7 @@ mod tests {
 
     #[test]
     fn bulk_move_to_archive_adds_no_label() {
-        let patch = move_patch(&label("archive"), None);
+        let patch = move_patch(&label("archive"), None).expect("label scope");
         assert!(
             patch.add_label_ids.is_empty(),
             "`archive` is synthetic; asking Gmail to apply it is a 400"
@@ -2160,7 +2178,7 @@ mod tests {
 
     #[test]
     fn source_label_rides_the_same_batch_modify() {
-        let patch = move_patch(&label("Label_42"), Some(&label("Label_7")));
+        let patch = move_patch(&label("Label_42"), Some(&label("Label_7"))).expect("label scope");
         assert_eq!(patch.add_label_ids, vec!["Label_42".to_string()]);
         assert_eq!(
             patch.remove_label_ids,
@@ -2176,7 +2194,7 @@ mod tests {
 
     #[test]
     fn source_already_implied_by_the_destination_is_not_repeated() {
-        let patch = move_patch(&label("Label_42"), Some(&label("inbox")));
+        let patch = move_patch(&label("Label_42"), Some(&label("inbox"))).expect("label scope");
         assert_eq!(
             patch.remove_label_ids,
             vec!["INBOX".to_string(), "SPAM".to_string(), "TRASH".to_string()]
@@ -2185,7 +2203,7 @@ mod tests {
 
     #[test]
     fn synthetic_archive_source_is_dropped() {
-        let patch = move_patch(&label("Label_42"), Some(&label("archive")));
+        let patch = move_patch(&label("Label_42"), Some(&label("archive"))).expect("label scope");
         assert_eq!(
             patch.remove_label_ids,
             vec!["INBOX".to_string(), "SPAM".to_string(), "TRASH".to_string()],
@@ -2195,7 +2213,7 @@ mod tests {
 
     #[test]
     fn source_equal_to_destination_is_dropped() {
-        let patch = move_patch(&label("Label_42"), Some(&label("Label_42")));
+        let patch = move_patch(&label("Label_42"), Some(&label("Label_42"))).expect("label scope");
         assert_eq!(patch.add_label_ids, vec!["Label_42".to_string()]);
         assert!(
             !patch.remove_label_ids.contains(&"Label_42".to_string()),
@@ -2204,22 +2222,13 @@ mod tests {
     }
 
     #[test]
-    fn non_label_destination_is_unsupported() {
-        let patch = move_patch(&MembershipScope::Folder(FolderId("INBOX".into())), None);
-        assert!(patch.add_label_ids.is_empty());
-        assert!(patch.remove_label_ids.is_empty());
-        assert_eq!(patch.unsupported_flags.len(), 1);
-    }
-
-    #[test]
-    fn non_label_source_is_unsupported() {
-        let patch = move_patch(
-            &label("Label_42"),
-            Some(&MembershipScope::Folder(FolderId("INBOX".into()))),
+    fn non_label_scopes_are_request_refusals() {
+        let folder = MembershipScope::Folder(FolderId("INBOX".into()));
+        assert_eq!(move_patch(&folder, None), Err(MoveRefusal::Destination));
+        assert_eq!(
+            move_patch(&label("Label_42"), Some(&folder)),
+            Err(MoveRefusal::Source)
         );
-        assert!(patch.add_label_ids.is_empty());
-        assert!(patch.remove_label_ids.is_empty());
-        assert_eq!(patch.unsupported_flags.len(), 1);
     }
 
     #[tokio::test]

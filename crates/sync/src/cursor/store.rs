@@ -108,10 +108,12 @@ pub trait CheckpointStore: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>>;
 
     /// Read the latest backfill checkpoint for `(account, scope)`.
-    /// Returns the one with the greatest `items_done` if the store has more
-    /// than one partition's worth of state. Ties must be stable: a page
-    /// partition with the greatest parsed upper bound wins, followed by
-    /// lexicographically-greatest opaque partition bytes.
+    /// Select using [`backfill_checkpoint_is_later`], the engine-owned resume
+    /// policy. A proven completion wins independently of item counts; other
+    /// rows retain the historical count, page-bound and raw-byte ordering.
+    /// Consumers can call this helper instead of copying the key codec.
+    /// Completion transitions should atomically remove older partition rows
+    /// for the same scope, so changing time windows do not accumulate forever.
     ///
     /// The default `InMemoryCheckpointStore` implementation scans every
     /// backfill entry per call (O(n) on total partitions per account).
@@ -296,6 +298,13 @@ impl CheckpointStore for InMemoryCheckpointStore {
                         .insert((account.clone(), cursor.scope.clone()), cursor);
                 }
                 Checkpoint::Backfill(checkpoint) => {
+                    if crate::backfill::partitioner::BackfillKey::decode(&checkpoint.partition)
+                        .proves_completion(checkpoint.progress.items_done)
+                    {
+                        guard.backfill.retain(|(aid, scope, _), _| {
+                            aid != &account || scope != &checkpoint.scope
+                        });
+                    }
                     let key = (
                         account.clone(),
                         checkpoint.scope.clone(),
@@ -407,10 +416,28 @@ impl CheckpointStore for InMemoryCheckpointStore {
     }
 }
 
-fn backfill_checkpoint_is_later(
+/// Compare durable resume rows without duplicating engine key policy in stores.
+#[must_use]
+pub fn backfill_checkpoint_is_later(
     candidate: &BackfillCheckpoint,
     current: &BackfillCheckpoint,
 ) -> bool {
+    use crate::backfill::partitioner::BackfillKey;
+    // A completed walk must stay complete even if an older partition saw more
+    // mail. Enterprise users expect completion to survive shrinking folders.
+    // Because completion outranks every partition row, each path that must
+    // re-walk a scope deletes its marker first: a provider-deleted scope
+    // (`reset_scope_for_deletion` -> `delete_backfill`) and schema recovery
+    // (`clear_account_checkpoints`). A routine restart or a disable keeps the
+    // marker on purpose, so ordinary recovery does not re-walk history.
+    let complete = |ck: &BackfillCheckpoint| {
+        BackfillKey::decode(&ck.partition).proves_completion(ck.progress.items_done)
+    };
+    match complete(candidate).cmp(&complete(current)) {
+        std::cmp::Ordering::Greater => return true,
+        std::cmp::Ordering::Less => return false,
+        std::cmp::Ordering::Equal => {}
+    }
     match candidate
         .progress
         .items_done
@@ -430,5 +457,38 @@ fn backfill_checkpoint_is_later(
                 _ => candidate.partition.0 > current.partition.0,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use bifrost_types::BackfillProgress;
+
+    fn row(key: &[u8], count: u64) -> BackfillCheckpoint {
+        BackfillCheckpoint {
+            scope: CursorScope::Account,
+            partition: Partition(key.to_vec()),
+            progress_marker: None,
+            progress: BackfillProgress {
+                items_done: count,
+                items_estimated: None,
+            },
+            envelope_version: crate::cursor::ENGINE_VERSION,
+        }
+    }
+
+    #[test]
+    fn completion_beats_stale_large_partitions() {
+        let old = row(b"page:0:500", 500);
+        let complete = row(b"complete:v2", 0);
+        assert!(backfill_checkpoint_is_later(&complete, &old));
+        assert!(!backfill_checkpoint_is_later(&old, &complete));
+        assert!(backfill_checkpoint_is_later(&row(b"complete", 2), &old));
+        assert!(!backfill_checkpoint_is_later(&row(b"complete", 1), &old));
+        assert!(backfill_checkpoint_is_later(
+            &row(b"page:500:1000", 500),
+            &old
+        ));
     }
 }

@@ -36,6 +36,23 @@ pub(crate) async fn set(map: &StateMap, account_id: &str, state: String) {
     guard.insert(account_id.to_string(), Some(state));
 }
 
+/// Publish a probe only if the cache still matches its pre-probe snapshot.
+/// Return the current winner under the same lock. Outlook users expect a
+/// concurrent edit to remain visible to guards, not be hidden by an older probe.
+pub(crate) async fn publish_probe(
+    map: &StateMap,
+    account_id: &str,
+    expected: Option<&str>,
+    probed: String,
+) -> String {
+    let mut guard = map.lock().await;
+    let entry = guard.entry(account_id.to_string()).or_default();
+    if entry.as_deref() == expected {
+        *entry = Some(probed.clone());
+    }
+    entry.clone().unwrap_or(probed)
+}
+
 /// Advance the cached state for an account to `state`, but only when the
 /// current value exactly matches `expected` (last-writer-wins guard against
 /// a concurrent advance racing ahead). `None` matches only an absent or
@@ -83,6 +100,31 @@ mod tests {
 
     fn map() -> StateMap {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn probe_publication_preserves_a_concurrent_winner() {
+        let m = map();
+        // An initial probe began with no state; changes published before it ended.
+        set(&m, "acct-a", "newer".into()).await;
+        assert_eq!(
+            publish_probe(&m, "acct-a", None, "older".into()).await,
+            "newer"
+        );
+        // A refusal refresh also must not overwrite a concurrent cache advance.
+        assert_eq!(
+            publish_probe(&m, "acct-a", Some("before"), "older".into()).await,
+            "newer"
+        );
+        assert_eq!(get(&m, "acct-a").await.as_deref(), Some("newer"));
+        assert_eq!(
+            publish_probe(&m, "acct-a", Some("newer"), "fresh".into()).await,
+            "fresh"
+        );
+        assert_eq!(
+            publish_probe(&m, "acct-b", None, "initial".into()).await,
+            "initial"
+        );
     }
 
     #[tokio::test]

@@ -1,3 +1,6 @@
+// AddressBook methods and builders are RFC 9610 surface the contacts sync uses in part.
+#![allow(dead_code)]
+
 pub(crate) mod get;
 pub(crate) mod set;
 
@@ -157,6 +160,7 @@ crate::core::method::define_property_enum! {
 }
 
 impl crate::core::Object for AddressBook {
+    crate::core::method::object_metadata!(AddressBook);
     type Property = Property;
     type Id = AddressBookId;
     fn requires_account_id() -> bool {
@@ -198,24 +202,9 @@ impl crate::core::SetCreate for AddressBookCreate {
     }
 }
 
-crate::define_get_method!(
-    AddressBookGet,
-    AddressBook,
-    "AddressBook/get",
-    crate::core::capability::Contacts
-);
-crate::define_set_method!(
-    AddressBookSet,
-    AddressBook,
-    "AddressBook/set",
-    crate::core::capability::Contacts
-);
-crate::define_changes_method!(
-    AddressBookChanges,
-    AddressBook,
-    "AddressBook/changes",
-    crate::core::capability::Contacts
-);
+crate::define_get_method!(AddressBookGet, AddressBook);
+crate::define_set_method!(AddressBookSet, AddressBook);
+crate::define_changes_method!(AddressBookChanges, AddressBook);
 
 impl AddressBookSet {
     #[must_use]

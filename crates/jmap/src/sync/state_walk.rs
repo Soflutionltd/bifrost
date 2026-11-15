@@ -1,3 +1,4 @@
+#![allow(dead_code)] // recovery_policy accessor is shared walk surface
 //! Shared guards, error context, and recovery policy for JMAP state walks.
 
 use std::collections::HashSet;

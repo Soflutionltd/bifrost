@@ -1,6 +1,8 @@
-// The Account impl uses the WebSocket push path; SSE / RFC 8620 §7.3
-// types and the parser are kept built for the HTTP-push consumer a
-// future stage may want.
+// The Account facade currently consumes WebSocket push. Keep the RFC 8620
+// EventSource transport and parser available; activating its fallback belongs
+// at the account boundary, where reconnect and checkpoint policy live. Both
+// transports already share PushObject::decompose, so retention does not keep a
+// second push-flattening policy alive.
 #![allow(dead_code)]
 
 pub(crate) mod parser;

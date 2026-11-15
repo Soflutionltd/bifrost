@@ -499,8 +499,14 @@ mod tests {
             },
             Some(bifrost_types::ThrottleScope::Account),
         );
+        // The request is idempotent, so the earlier in-flight attempt was
+        // explicitly replayable and is not commit evidence (reference/net.md,
+        // attempt ledger): the hold is a retry, not a reconcile. The in-flight
+        // attempt stays in the cause chain as evidence.
         assert!(
-            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(advice) if advice.reason == bifrost_types::ReconcileReason::ThrottledMidFlight)
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Retry(_)),
+            "{:?}",
+            error.recovery()
         );
         assert!(error.chain().iter().any(|cause| matches!(cause, Cause::Attempt(a) if a.transmission_state == TransmissionState::InFlight)));
         assert!(
@@ -819,7 +825,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn final_review_retry_after_past_deadline_reconciles() {
+    async fn final_review_retry_after_past_deadline_is_a_proven_refusal_and_retries() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after", "60".parse().unwrap());
         let script = ScriptedDispatch::new([Canned::Response {
@@ -836,7 +842,25 @@ mod tests {
             .await
             .err()
             .expect("retry wait timed out");
-        final_review_reconciles(error);
+        // A 429 is a proven refusal (`is_proven_refusal`): the quota gate
+        // rejected the write before doing any work, so an enterprise user
+        // expects a retry after the wait, not a reconcile of a write that
+        // never happened.
+        let error = crate::into_account_error_with_throttle_scope(
+            error,
+            crate::NetErrorContext {
+                operation: AccountOperation::Send,
+                provider: Some(Provider::Gmail),
+                protocol: Protocol::Gmail,
+                scope: None,
+            },
+            Some(bifrost_types::ThrottleScope::Account),
+        );
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Retry(_)),
+            "a refused quota write retries: {:?}",
+            error.recovery()
+        );
         assert_eq!(script.requests().len(), 1);
     }
     fn final_review_redirect(location: &str) -> Canned {

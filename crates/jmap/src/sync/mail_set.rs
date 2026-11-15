@@ -46,8 +46,11 @@ pub(super) async fn execute<T: HttpTransport>(
         Err(error)
             if matches!(guard, Guard::Replacement) && super::error::is_state_mismatch(&error) =>
         {
+            let expected = state_cache::get(email_states, account_id).await;
             let fresh = probe_email_state(mail).await?;
-            state_cache::set(email_states, account_id, fresh.clone()).await;
+            let fresh =
+                state_cache::publish_probe(email_states, account_id, expected.as_deref(), fresh)
+                    .await;
             mail.call(make_set()?.if_in_state(fresh)).await?
         }
         result => result?,
@@ -115,12 +118,7 @@ async fn current_or_probe_state<T: HttpTransport>(
         return Ok(state);
     }
     let state = probe_email_state(mail).await?;
-    // Another task may have populated the cache while the probe was in flight.
-    if let Some(existing) = state_cache::get(email_states, account_id).await {
-        return Ok(existing);
-    }
-    state_cache::set(email_states, account_id, state.clone()).await;
-    Ok(state)
+    Ok(state_cache::publish_probe(email_states, account_id, None, state).await)
 }
 
 pub(crate) async fn probe_email_state<T: HttpTransport>(

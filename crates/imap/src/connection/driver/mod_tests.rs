@@ -392,36 +392,51 @@ fn untagged_prologue_reports_whether_a_code_event_was_emitted() {
 // Shared consumer-less untagged arm
 // ---------------------------------------------------------------------------
 //
-// The read loops with nowhere to route a response (IDLE's grant wait, IDLE,
-// the post-DONE IDLE drain, the literal continuation wait, and the LOGOUT
-// drain) answer an
-// untagged response through `process_untagged_as_event`. These pin the tail
-// the helper owns: forward exactly once, never on top of a code event, and
-// never at all once the BYE guard has fired.
+// Exercise event publication through the production read boundary.
+async fn run_as_event(wire: &[u8]) -> (Result<(), crate::error::Error>, Vec<TypedEvent>) {
+    let (result, events, _) = run_read_frame(wire).await;
+    (result, events)
+}
 
-/// Run the consumer-less arm exactly as those loops do.
-fn run_as_event(response: UntaggedResponse) -> (Result<(), crate::error::Error>, Vec<TypedEvent>) {
+async fn run_read_frame(
+    wire: &[u8],
+) -> (
+    Result<(), crate::error::Error>,
+    Vec<TypedEvent>,
+    read_loop::Framing,
+) {
+    use tokio::io::AsyncWriteExt;
     let (mut sink, mut rx) = prefix_sink();
     let mut state = super::super::state::ProtocolState::new();
-    let boxed = Box::new(response);
-    let wrapped = crate::types::Response::Untagged(boxed.clone());
-    let digest = state.apply_side_effects(&wrapped);
-    let result = process_untagged_as_event(
-        digest,
-        boxed,
+    let (client, mut server) = tokio::io::duplex(1024);
+    server.write_all(wire).await.unwrap();
+    let mut reader = super::super::wire::WireReader::new(super::super::stream::ImapStream::Memory(
+        super::super::stream::Tracked::new(client),
+    ));
+    let result = read_loop::ReadLoop::next(
+        &mut reader,
+        &mut state,
         &mut sink,
-        bifrost_types::TransmissionState::InFlight,
-    );
+        None,
+        read_loop::LoopPolicy {
+            tags: &[("A1", Some(true))],
+            early_ok_tag: None,
+            command_kind: None,
+            route_untagged: false,
+        },
+    )
+    .await
+    .map(|_| ());
     let mut events = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         events.push(ev);
     }
-    (result, events)
+    (result, events, state.framing)
 }
 
-#[test]
-fn consumerless_arm_forwards_a_plain_response_as_its_own_event() {
-    let (result, events) = run_as_event(UntaggedResponse::Exists(42));
+#[tokio::test]
+async fn consumerless_arm_forwards_a_plain_response_as_its_own_event() {
+    let (result, events) = run_as_event(b"* 42 EXISTS\r\n").await;
     assert!(result.is_ok());
     assert!(
         matches!(events.as_slice(), [TypedEvent::Exists(42)]),
@@ -429,13 +444,9 @@ fn consumerless_arm_forwards_a_plain_response_as_its_own_event() {
     );
 }
 
-#[test]
-fn consumerless_arm_does_not_double_publish_a_code_event() {
-    let (result, events) = run_as_event(UntaggedResponse::Status {
-        status: UntaggedStatus::Ok,
-        text: "mailbox is over quota".to_owned(),
-        code: Some(ResponseCode::Alert),
-    });
+#[tokio::test]
+async fn consumerless_arm_does_not_double_publish_a_code_event() {
+    let (result, events) = run_as_event(b"* OK [ALERT] mailbox is over quota\r\n").await;
     assert!(result.is_ok());
     assert!(
         matches!(
@@ -446,13 +457,9 @@ fn consumerless_arm_does_not_double_publish_a_code_event() {
     );
 }
 
-#[test]
-fn consumerless_arm_fails_on_bye_after_publishing_its_alert() {
-    let (result, events) = run_as_event(UntaggedResponse::Status {
-        status: UntaggedStatus::Bye,
-        text: "server shutting down".to_owned(),
-        code: Some(ResponseCode::Alert),
-    });
+#[tokio::test]
+async fn consumerless_arm_fails_on_bye_after_publishing_its_alert() {
+    let (result, events) = run_as_event(b"* BYE [ALERT] server shutting down\r\n").await;
     assert!(
         matches!(result, Err(crate::error::Error::Bye { .. })),
         "a BYE is fatal in every read loop, got {result:?}"
@@ -508,8 +515,7 @@ fn driver_literal_mode_follows_the_capability_authority() {
 fn retirement_distinguishes_local_refusal_from_interrupted_exchange() {
     let mut state = super::super::state::ProtocolState::new();
     let (tx, mut rx) = mpsc::channel(1);
-    let error = Error::Protocol("locally refused command".into());
-    finish_exchange(&mut state, &mut rx, ExchangePhase::Untouched, Some(&error));
+    finish_exchange(&mut state, &mut rx, None);
     assert!(!tx.is_closed());
     assert_eq!(
         state.session_state(),
@@ -517,13 +523,8 @@ fn retirement_distinguishes_local_refusal_from_interrupted_exchange() {
     );
 
     // Even a normally reusable refusal cannot make unread responses safe.
-    let refusal = Error::no_with_code("refused".into(), None);
-    finish_exchange(
-        &mut state,
-        &mut rx,
-        ExchangePhase::Interrupted,
-        Some(&refusal),
-    );
+    state.framing = read_loop::Framing::Desynchronized;
+    finish_exchange(&mut state, &mut rx, None);
     assert!(tx.is_closed());
     assert_eq!(state.session_state(), super::super::SessionState::Logout);
 }
@@ -541,6 +542,75 @@ fn retirement_closes_admission_for_logout_even_without_an_error() {
             text: String::new(),
         },
     ));
-    finish_exchange(&mut state, &mut rx, ExchangePhase::Exchanged, None);
+    finish_exchange(&mut state, &mut rx, None);
     assert!(tx.is_closed());
+}
+
+#[test]
+fn synchronized_framing_keeps_admission_open() {
+    let mut state = super::super::state::ProtocolState::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    state.framing = read_loop::Framing::Synchronized;
+    finish_exchange(&mut state, &mut rx, None);
+    assert!(!tx.is_closed());
+}
+
+#[test]
+fn a_desynchronization_class_error_retires_only_once_bytes_may_have_left() {
+    let parse = Error::Parse("uninterpretable".into());
+    // Refused before the first byte: the framing is intact whatever the error.
+    let mut state = super::super::state::ProtocolState::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    finish_exchange(&mut state, &mut rx, Some(&parse));
+    assert!(!tx.is_closed());
+
+    // Synchronized by its tagged completion, but not understood: retire.
+    let mut state = super::super::state::ProtocolState::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    state.framing = read_loop::Framing::Synchronized;
+    finish_exchange(&mut state, &mut rx, Some(&parse));
+    assert!(tx.is_closed());
+
+    // A server refusal on a synchronized stream stays reusable.
+    let mut state = super::super::state::ProtocolState::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    state.framing = read_loop::Framing::Synchronized;
+    finish_exchange(
+        &mut state,
+        &mut rx,
+        Some(&Error::no_with_code("refused".into(), None)),
+    );
+    assert!(!tx.is_closed());
+}
+
+#[test]
+fn synchronized_framing_cannot_override_an_unusable_session() {
+    let mut state = super::super::state::ProtocolState::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    state.framing = read_loop::Framing::Synchronized;
+    state.apply_infrastructure_failure();
+    finish_exchange(&mut state, &mut rx, None);
+    assert!(tx.is_closed());
+}
+
+#[tokio::test]
+async fn foreign_tag_emits_its_alert_then_fails_the_shared_read_boundary() {
+    let (result, events) = run_as_event(b"other OK [ALERT] lost ownership\r\n").await;
+    assert!(matches!(result, Err(Error::Protocol(_))));
+    assert!(matches!(events.as_slice(), [TypedEvent::Alert(text)] if text == "lost ownership"));
+}
+
+#[tokio::test]
+async fn shared_read_boundary_reports_framing_from_the_wire_completion() {
+    let (result, _, framing) = run_read_frame(b"A1 NO refused\r\n").await;
+    assert!(result.is_ok()); // Status belongs to the consumer, framing to ReadLoop.
+    assert_eq!(framing, read_loop::Framing::Synchronized);
+
+    let (result, _, framing) = run_read_frame(b"+ continue\r\n").await;
+    assert!(result.is_ok());
+    assert_eq!(framing, read_loop::Framing::Desynchronized);
+
+    let (result, _, framing) = run_read_frame(b"foreign OK surplus\r\n").await;
+    assert!(matches!(result, Err(Error::Protocol(_))));
+    assert_eq!(framing, read_loop::Framing::Desynchronized);
 }

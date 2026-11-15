@@ -105,6 +105,20 @@ pub(super) struct PipelineRouting<'a> {
 }
 
 impl PipelineRouting<'_> {
+    pub(super) fn read_tags(&self) -> Vec<(&str, Option<bool>)> {
+        let bound = self.sending.map_or(self.tags.len(), |idx| idx + 1);
+        self.tags
+            .iter()
+            .enumerate()
+            .map(|(idx, tag)| {
+                let terminal = (idx < bound).then_some(
+                    self.consumers[idx].is_some() && *self.completed + 1 == self.tags.len(),
+                );
+                (tag.as_str(), terminal)
+            })
+            .collect()
+    }
+
     /// Before framing identifies an owner, use the strictest remaining budget
     /// of commands already sent. Unsent and completed commands own no data.
     /// This deliberately also bounds unsolicited literals, like single-command
@@ -199,27 +213,19 @@ fn correlated_esearch_owner(
     (idx < bound).then_some(CorrelatedEsearch::Deliver(idx))
 }
 
-/// Route one response read in pipeline context: apply its side effects
-/// exactly once, then deliver it to the command that owns it.
-///
-/// The single router for both pipeline read loops. Side effects are applied
-/// here and nowhere else on this path, so a response cannot be processed
-/// twice - which is what makes routing a response at READ time correct where
-/// buffering it for later replay was not: a replayed `* 3 EXPUNGE` would
-/// either decrement twice or need its whole read-time context reconstructed.
+/// Route a frame already processed by ReadLoop to its owning consumer.
+/// The captured notification state precedes the frame's side effects, so
+/// classification never observes a registration installed by this response.
 #[allow(clippy::too_many_lines)]
 pub(super) fn route_pipeline_response(
     state: &mut super::super::state::ProtocolState,
     event_sink: &mut event_sink::DriverEventSink,
     routing: &mut PipelineRouting<'_>,
-    resp: crate::types::Response,
+    frame: super::read_loop::ReadFrame,
 ) -> Result<Routed, Error> {
-    // Read before any mutation: classification is against the notification
-    // registration as it stood when this response was produced.
-    let notify_before = state.notify();
-
-    // The sending command's own tagged OK before its `+`: the command did not
-    // execute, so its pre-effects (a NOTIFY registration) must not install.
+    state.framing = frame.framing;
+    let notify_before = frame.notify_before;
+    let resp = frame.response;
     let early_own_ok = matches!(
         resp,
         crate::types::Response::Tagged(ref t)
@@ -228,60 +234,39 @@ pub(super) fn route_pipeline_response(
                 && routing.sending == routing.tag_to_idx.get(&t.tag).copied()
     );
 
-    if early_own_ok && let crate::types::Response::Tagged(ref t) = resp {
-        state.disarm_effect(&t.tag);
-    }
-
-    let digest = state.apply_side_effects(&resp);
-
     match resp {
         crate::types::Response::Continuation(_) => Ok(Routed::Continuation),
         crate::types::Response::Greeting(_) => {
             Err(Error::Protocol("unexpected greeting mid-pipeline".into()))
         }
         crate::types::Response::Tagged(t) => {
-            // Before every exit below, including the protocol errors: an
-            // [ALERT] on a tagged response reaches the event queue whatever
-            // happens to the response itself (RFC 3501 Section7.1).
-            super::emit_tagged_response_code_events(&t, event_sink);
-
             let Some(&idx) = routing.tag_to_idx.get(&t.tag) else {
-                return Err(Error::Protocol(format!(
-                    "unknown tag in pipeline response: {:?}",
-                    t.tag,
-                )));
+                unreachable!("ReadLoop admitted only this pipeline's tags");
             };
 
-            if let Some(sending) = routing.sending {
-                if idx == sending {
-                    // The server answered the command whose literal it has
-                    // not been given (RFC 3501 Section4.3).
-                    if early_own_ok {
-                        // The same server behaviour the single-command wait
-                        // treats as a non-fatal `ProtocolMissing`, and it is
-                        // equally safe here: the send phase is sequential
-                        // whenever a literal is synchronizing, so the only
-                        // bytes of this batch on the wire are earlier
-                        // commands (complete) and this command's first line.
-                        // No later command has been written, so the server
-                        // cannot read one as the missing literal, and the
-                        // unsent remainder is dropped exactly as after a
-                        // `NO`. The consumer is discarded, NOT finalized:
-                        // finalizing would turn the OK into a success for a
-                        // command that never ran.
-                        if routing.consumers[idx].take().is_some() {
-                            routing.results[idx] = Some(Err(super::wire_send::early_ok_error()));
-                            *routing.completed += 1;
-                        }
-                        return Ok(Routed::OwnTagRejected);
+            if let Some(sending) = routing.sending
+                && idx == sending
+            {
+                // The server answered the command whose literal it has
+                // not been given (RFC 3501 Section4.3).
+                if early_own_ok {
+                    // The same server behaviour the single-command wait
+                    // treats as a non-fatal `ProtocolMissing`, and it is
+                    // equally safe here: the send phase is sequential
+                    // whenever a literal is synchronizing, so the only
+                    // bytes of this batch on the wire are earlier
+                    // commands (complete) and this command's first line.
+                    // No later command has been written, so the server
+                    // cannot read one as the missing literal, and the
+                    // unsent remainder is dropped exactly as after a
+                    // `NO`. The consumer is discarded, NOT finalized:
+                    // finalizing would turn the OK into a success for a
+                    // command that never ran.
+                    if routing.consumers[idx].take().is_some() {
+                        routing.results[idx] = Some(Err(super::wire_send::early_ok_error()));
+                        *routing.completed += 1;
                     }
-                } else if idx > sending {
-                    // A completion for a command still unsent: the server
-                    // cannot complete what it has not received.
-                    return Err(Error::Protocol(format!(
-                        "tagged response for unsent pipelined command: {:?}",
-                        t.tag,
-                    )));
+                    return Ok(Routed::OwnTagRejected);
                 }
             }
 
@@ -320,13 +305,7 @@ pub(super) fn route_pipeline_response(
             // their results (`PipelineEnd::Ran`); the rest carry the BYE.
             // The router runs only once some of the batch is on the wire, and
             // a BYE completes none of it: InFlight.
-            let code_emitted = super::process_untagged_prefix(
-                digest,
-                &u,
-                event_sink,
-                bifrost_types::TransmissionState::InFlight,
-                None,
-            )?;
+            let code_emitted = frame.code_emitted;
             let bound = routing.untagged_bound();
 
             // An ESEARCH carrying a search-correlator names its command
@@ -763,6 +742,7 @@ async fn run_pipeline_batch(
         // so any socket progress counts every command as possibly sent.
         for (command, tag) in commands.iter().zip(&tags) {
             state.arm_effect(command, tag);
+            state.framing = super::read_loop::Framing::Desynchronized;
         }
         let start = wire_reader.written();
         let chunks: Vec<&bytes::Bytes> = wires
@@ -831,7 +811,6 @@ async fn run_pipeline_batch(
     // after it.
     let fail = |error: Error| BatchFailure { error, sent: count };
     while completed < count {
-        let utf8 = super::utf8_mode(state);
         let mut routing = PipelineRouting {
             sending: None,
             tag_to_idx: &tag_to_idx,
@@ -843,11 +822,22 @@ async fn run_pipeline_batch(
             completed: &mut completed,
         };
         // The batch is on the wire: a transport failure here is InFlight.
-        let resp = wire_reader
-            .read_one_limited(utf8, routing.literal_budget())
-            .await
-            .map_err(|e| fail(e.with_attempt(TransmissionState::InFlight)))?;
-        match route_pipeline_response(state, event_sink, &mut routing, resp).map_err(fail)? {
+        let tags = routing.read_tags();
+        let frame = super::read_loop::ReadLoop::next(
+            wire_reader,
+            state,
+            event_sink,
+            routing.literal_budget(),
+            super::read_loop::LoopPolicy {
+                tags: &tags,
+                early_ok_tag: None,
+                command_kind: None,
+                route_untagged: true,
+            },
+        )
+        .await
+        .map_err(fail)?;
+        match route_pipeline_response(state, event_sink, &mut routing, frame).map_err(fail)? {
             Routed::Continuation => {
                 // Pipelinable commands do not take continuations
                 // (`CommandKind::pipelinable`, checked in `run_pipeline`).

@@ -727,17 +727,36 @@ argument is required, not defaulted - an org can carry thousands of public
 folders holding millions of items, so "sync everything discovered" is a
 defect, not a convenience.
 
-`GraphClient` also derives an Autodiscover/EWS origin (`outlook_base`) from
-its Graph api-base: a base on `graph.microsoft.com` keeps the production
-`https://outlook.office365.com`, any other host (a harness mock, a sovereign
-cloud) becomes the origin for `/autodiscover/autodiscover.{xml,svc}` and
-`/EWS/Exchange.asmx` too. `with_outlook_base(base)` overrides it explicitly.
-Without this, redirecting the Graph api-base left Autodiscover and EWS
-pointed at the real service, so the public-folder and EWS-streaming legs
-could not be exercised against a mock at all. An UNUSABLE api-base derives
-an unusable Outlook origin rather than falling back to production, so a
-misconfigured Graph base cannot leave Autodiscover and EWS sending the bearer
-to the real `outlook.office365.com`; `with_outlook_base` can still name one.
+`account::MicrosoftCloud` owns the validated Graph REST base and Outlook
+Autodiscover/EWS base together. Its constructors are `global()`, `us_gov()`
+(GCC High/L4), `us_gov_dod()` (L5), `china()` and `custom(graph, outlook)`.
+`GraphClient::with_cloud(cloud, source)` and
+`with_cloud_account_net(net, cloud, source)` configure both surfaces at once.
+GCC uses the global cloud. The paired bases are:
+
+| Cloud | Graph REST | Outlook |
+|---|---|---|
+| Global | `https://graph.microsoft.com/v1.0` | `https://outlook.office365.com` |
+| US Government L4 | `https://graph.microsoft.us/v1.0` | `https://outlook.office365.us` |
+| US Government L5 | `https://dod-graph.microsoft.us/v1.0` | `https://outlook-dod.office365.us` |
+| China | `https://microsoftgraph.chinacloudapi.cn/v1.0` | `https://partner.outlook.cn` |
+
+Microsoft documents the [Graph service roots](https://learn.microsoft.com/en-us/graph/deployments)
+and [Exchange cloud bases](https://learn.microsoft.com/en-us/exchange/reference/admin-api-get-started).
+The [China Exchange configuration](https://learn.microsoft.com/zh-cn/power-platform/admin/connect-exchange-online)
+also specifies its EWS endpoint.
+
+The single-base constructors infer these pairs for known Microsoft hosts.
+Unknown hosts retain the historical same-origin harness behavior;
+`with_outlook_base(base)` remains an independent override. An unusable Graph
+base infers an unusable Outlook base, with no production fallback. Shared
+clients retain the same cloud. An enterprise Outlook user expects Exchange
+reads to stay in the configured cloud.
+
+The cloud type is the extension point for service-specific token audiences.
+Audience selection still needs shared transport support: all enabled surfaces
+currently use the supplied token source, which must be accepted by each.
+Selecting a cloud configures endpoints; it does not acquire or exchange tokens.
 
 ### Which URLs may carry the bearer (`origin.rs`)
 
@@ -2894,3 +2913,49 @@ REST and EWS shared-scope PermissionDenied quarantine both use
 and preserving cause and diagnostic evidence, including the EWS protocol stamp.
 Losing a delegated folder must leave an enterprise Outlook user's own mailbox
 usable. Primary scopes and other errors keep their original classification.
+
+## Projection-aware item decoding
+
+`account/wire_item.rs` owns the typed `GraphItem` view used for delta identity,
+removal state, memberships, thread ids, etags and flag fingerprints, and for
+hydration flag projection. Sparse optional fields retain the existing tolerant
+semantics. Provider flag text remains distinct from canonical writable tokens.
+A present `@removed` marker, including null, retains removal semantics.
+
+Delta envelopes and batch bodies retain JSON until individual items can be
+correlated and classified. They cannot deserialize as one mandatory message
+schema: the same delta walk carries sparse tombstones, contacts and events,
+and an id-less item must retain its checkpoint barrier and decoded siblings.
+An enterprise Outlook user expects valid siblings delivered without advancing
+past an unrepresentable item. Attachment and internet-header payloads remain
+JSON projections; the typed view does not claim those shapes are validated.
+
+FlagsOnly hydration instead decodes `CompleteFlags` / `CompleteFlag` /
+`FlagStatus` through serde. It requires object-shaped resources, boolean
+`isRead`, recognized case-insensitive flag status and string categories.
+Missing required fields remain MissingField; wrong types and unknown statuses
+remain ParseFailed. Decode happens per correlated answer before etag admission.
+Metadata and partial projections retain their tolerant flag observations.
+
+## Durable Graph id codecs
+
+`account/foreign.rs` owns `GraphId` encoding for native and owner-qualified
+identities, calendar-qualified events, public collections, public mail items
+and typed public contacts/events. Namespace-specific entry points supply the
+outer API type: a bare native message and thread have identical bytes, so one
+context-free parser cannot distinguish them. Scheduled-send handles use the
+same owner encoder/decoder as folders, messages and threads, and resolve their
+client through `GraphAccount::client_for_owner`. Their existing send-as refusal
+classification remains at the send API boundary.
+
+Existing persisted spellings remain unchanged: US separates an owner from a
+native id, RS separates public identity components, and `::` separates a
+calendar from an event. Owner spelling and first-split decoding remain stable;
+empty/stale owner tags must fail routing rather than become primary reads.
+Public contact/event parsing already rejects missing or extra components;
+calendar-event parsing now rejects an empty calendar or event. Public mail
+retains its existing first-split precedence over owner qualification. A universal
+new spelling would change durable identity without improving routing; an
+enterprise Outlook user expects previously stored objects and scheduled sends
+to remain reachable. Sync event ids already use the calendar encoder, and
+Trash recognition already parses the native folder and compares its owner.

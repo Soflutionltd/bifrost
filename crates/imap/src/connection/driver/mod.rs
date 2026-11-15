@@ -28,6 +28,7 @@ use super::reply::{ClaimedReply, Reply};
 mod events;
 mod idle;
 mod pipeline;
+pub(super) mod read_loop;
 mod upgrade;
 mod wire_send;
 
@@ -408,6 +409,7 @@ pub(super) async fn driver_task(
             biased;
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break; };
+                state.framing = read_loop::Framing::Untouched;
                 match cmd {
                     DriverCommand::Run { reply } => {
                         // Claim first: nothing is prepared, no tag drawn, no
@@ -425,7 +427,6 @@ pub(super) async fn driver_task(
                         // refusal made before the first byte leaves the
                         // framing intact, so it must not retire the
                         // connection whatever its error variant.
-                        let mut refused_before_send = false;
                         // Nothing may carry over from an earlier exchange.
                         let _ = state.take_transition();
                         let mut result = match prepare_command(&state, &mut tag_gen, &command) {
@@ -451,7 +452,6 @@ pub(super) async fn driver_task(
                                 ).await
                             }
                             Err(refusal) => {
-                                refused_before_send = true;
                                 Err(refusal)
                             }
                         };
@@ -472,16 +472,7 @@ pub(super) async fn driver_task(
                         {
                             result = Err(error);
                         }
-                        finish_exchange(
-                            &mut state,
-                            &mut cmd_rx,
-                            if refused_before_send {
-                                ExchangePhase::Untouched
-                            } else {
-                                ExchangePhase::Exchanged
-                            },
-                            result.as_ref().err(),
-                        );
+                        finish_exchange(&mut state, &mut cmd_rx, result.as_ref().err());
                         publish_then_answer(
                             || {
                                 let _ = state_tx.send_replace(state.snapshot());
@@ -510,12 +501,7 @@ pub(super) async fn driver_task(
                             Ok(Gated::Ran(())) => Ok(()),
                             Err(error) => Err(error),
                         };
-                        finish_exchange(
-                            &mut state,
-                            &mut cmd_rx,
-                            ExchangePhase::Exchanged,
-                            result.as_ref().err(),
-                        );
+                        finish_exchange(&mut state, &mut cmd_rx, result.as_ref().err());
                         let result = result.map(|()| Box::new(()) as Box<dyn std::any::Any + Send>);
                         publish_then_answer(
                             || {
@@ -530,7 +516,6 @@ pub(super) async fn driver_task(
                             trace!("driver: caller withdrew the batch before it reached the head of the queue");
                             continue;
                         };
-                        let mut phase = ExchangePhase::Untouched;
                         let result = match run_pipeline(
                             &mut wire_reader,
                             &mut state,
@@ -549,7 +534,6 @@ pub(super) async fn driver_task(
                             // command refused in `prepare_command`.
                             PipelineEnd::Refused(refusal) => Err(refusal),
                             PipelineEnd::Ran { results, failure } => {
-                                phase = ExchangePhase::Exchanged;
                                 // A batch that ended early can leave commands
                                 // on the wire whose responses nobody will
                                 // read, so the connection retires whatever
@@ -557,12 +541,20 @@ pub(super) async fn driver_task(
                                 // carry it to the caller.
                                 if let Some(failure) = failure {
                                     trace!(error = %failure, "driver: pipeline ended early");
-                                    phase = ExchangePhase::Interrupted;
+                                    state.framing = read_loop::Framing::Desynchronized;
+                                }
+                                // A completed slot whose consumer could not
+                                // interpret its well-framed answer retires
+                                // the session, as for a single command.
+                                for slot in &results {
+                                    if let Err(error) = slot {
+                                        retire_if_completion_unusable(&mut state, error);
+                                    }
                                 }
                                 Ok(results)
                             }
                         };
-                        finish_exchange(&mut state, &mut cmd_rx, phase, result.as_ref().err());
+                        finish_exchange(&mut state, &mut cmd_rx, result.as_ref().err());
                         publish_then_answer(
                             || {
                                 let _ = state_tx.send_replace(state.snapshot());
@@ -602,12 +594,7 @@ pub(super) async fn driver_task(
                             Ok(Gated::Ran(termination)) => Ok(termination),
                             Err(error) => Err(error),
                         };
-                        finish_exchange(
-                            &mut state,
-                            &mut cmd_rx,
-                            ExchangePhase::Exchanged,
-                            result.as_ref().err(),
-                        );
+                        finish_exchange(&mut state, &mut cmd_rx, result.as_ref().err());
                         publish_then_answer(
                             || {
                                 let _ = state_tx.send_replace(state.snapshot());
@@ -862,23 +849,30 @@ async fn dispatch_response_loop(
     // command bytes crossed the side-effect boundary.
     let mut continuation_error = None;
     loop {
-        let notify_before = state.notify();
-        let utf8 = utf8_mode(state);
         consumer
             .prepare_to_read()
             .await
             .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-        let resp = wire_reader
-            .read_one_limited(utf8, consumer.literal_budget())
-            .await
-            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-        let digest = state.apply_side_effects(&resp);
+        let frame = read_loop::ReadLoop::next(
+            wire_reader,
+            state,
+            event_sink,
+            consumer.literal_budget(),
+            read_loop::LoopPolicy {
+                tags: &[(tag, Some(true))],
+                early_ok_tag: None,
+                command_kind: Some(cmd_kind),
+                route_untagged: true,
+            },
+        )
+        .await?;
+        let notify_before = frame.notify_before;
+        let resp = frame.response;
 
         match resp {
             crate::types::Response::Tagged(t) if t.tag == tag => {
-                // (I13): emit alert/notification overflow from
-                // tagged response codes before finalization.
-                emit_tagged_response_code_events(&t, event_sink);
+                // ReadLoop emitted critical codes before applying effects.
+                let completion_ok = t.status == crate::types::response::StatusKind::Ok;
                 let cancellation_acknowledged = t.status == crate::types::response::StatusKind::No;
                 let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
                 // Tagged response received: the server acknowledged the
@@ -901,6 +895,22 @@ async fn dispatch_response_loop(
                     }
                 }
                 let finalized_output = finalized.output;
+                if completion_ok
+                    && finalized_output.is_err()
+                    && matches!(
+                        cmd_kind,
+                        crate::types::CommandKind::Authenticate | crate::types::CommandKind::Login
+                    )
+                {
+                    // The peer entered its authenticated session but the client
+                    // rejected verification (for example an incomplete SCRAM
+                    // exchange). Outlook users expect a fresh authenticated
+                    // connection, never reuse of an unverified session.
+                    state.apply_infrastructure_failure();
+                }
+                if let Err(error) = &finalized_output {
+                    retire_if_completion_unusable(state, error);
+                }
                 if let Some(error) = continuation_error.take() {
                     if cancellation_acknowledged {
                         // Preserve a structured auth code from the terminal
@@ -923,6 +933,9 @@ async fn dispatch_response_loop(
                         // Preserve the completed exchange evidence on Auth too.
                         return Err(error.with_attempt(TransmissionState::Acknowledged));
                     }
+                    // Framing completed, but cancellation did not restore the
+                    // agreed authentication state. Retire this session explicitly.
+                    state.apply_infrastructure_failure();
                     return Err(Error::Protocol(
                         "SASL cancellation did not end with the command's tagged NO".into(),
                     ));
@@ -930,11 +943,8 @@ async fn dispatch_response_loop(
                 return finalized_output
                     .map_err(|e| e.with_attempt(TransmissionState::Acknowledged));
             }
-            crate::types::Response::Tagged(t) => {
-                return Err(Error::Protocol(format!(
-                    "unexpected tag {:?} (expected {:?})",
-                    t.tag, tag,
-                )));
+            crate::types::Response::Tagged(_) => {
+                unreachable!("ReadLoop rejects foreign tags");
             }
             crate::types::Response::Untagged(u) => {
                 // (I13): emit alert/notification overflow before
@@ -942,14 +952,8 @@ async fn dispatch_response_loop(
                 // when the response is routed to a consumer.
                 // The command is on the wire: a BYE here is InFlight.
                 let expected_logout_bye =
-                    cmd_kind == crate::types::CommandKind::Logout && digest.had_bye();
-                let code_emitted = process_untagged_prefix(
-                    digest,
-                    &u,
-                    event_sink,
-                    TransmissionState::InFlight,
-                    Some(cmd_kind),
-                )?;
+                    cmd_kind == crate::types::CommandKind::Logout && frame.had_bye;
+                let code_emitted = frame.code_emitted;
 
                 // RFC 3501 Section 6.1.3 requires LOGOUT's BYE before its
                 // tagged OK. It belongs to the LOGOUT consumer and is not a
@@ -1024,33 +1028,61 @@ async fn dispatch_response_loop(
     }
 }
 
-/// The exchange boundary supplies facts the error variant cannot express.
-#[derive(Clone, Copy)]
-enum ExchangePhase {
-    Untouched,
-    Exchanged,
-    Interrupted,
+/// A tagged completion synchronizes the framing, but not the client's
+/// understanding of the exchange. A consumer that finalizes with a
+/// desynchronization-class error (`Protocol`, `Parse`, `FetchLiteralLimit`,
+/// `InternalMidExchange`, ...) could not make sense of a well-framed answer:
+/// the server may be in a state the client never tracked. An enterprise
+/// Outlook user whose connection may be silently corrupt expects a fresh
+/// connection, never the next command run on this one, so the session is
+/// retired. Server refusals and `ProtocolMissing` stay reusable, as
+/// `Error::is_connection_fatal` documents.
+pub(super) fn retire_if_completion_unusable(
+    state: &mut super::state::ProtocolState,
+    error: &Error,
+) {
+    if error.is_connection_fatal() {
+        state.apply_infrastructure_failure();
+    }
 }
 
 /// One retirement decision, before publishing or waking any caller.
+///
+/// Paths traced for a `Synchronized` completion that leaves the session
+/// unusable: a consumer finalize failure (handled here through `error` and
+/// at dispatch), STARTTLS / COMPRESS failing after their tagged OK and a
+/// failed mandatory capability refresh (both mark Logout where the
+/// invariant is lost), a poisoned transport (every poisoning site marks
+/// Logout), and gated commands failing locally (before the first byte, so
+/// `Untouched` and reusable).
 ///
 /// Framing alone is insufficient: a required capability refresh may finish
 /// with tagged NO on a synchronized stream, yet leave a half-transitioned
 /// session. Upgrades may also poison the transport after a tagged OK. Those
 /// paths mark Logout at the point that invariant is lost. Keep that signal
-/// alongside the error default until read loops supply richer outcomes.
+/// alongside the framing outcome produced by the shared read boundary.
 /// Enterprise users expect a fresh connection after either failure, rather
 /// than later commands using stale capabilities or a poisoned transport.
+///
+/// `error` is the exchange's own error, if any. Once a byte may have left
+/// (framing not `Untouched`), a desynchronization-class error retires the
+/// session even when the last frame read was the command's tagged
+/// completion: a synchronized wire does not prove the client and server
+/// agree on the session (see `retire_if_completion_unusable`). A refusal
+/// made before the first byte leaves the framing `Untouched` and never
+/// retires, whatever its error variant.
 fn finish_exchange(
     state: &mut super::state::ProtocolState,
     cmd_rx: &mut mpsc::Receiver<DriverCommand>,
-    phase: ExchangePhase,
     error: Option<&Error>,
 ) {
+    if state.framing != read_loop::Framing::Untouched
+        && let Some(error) = error
+    {
+        retire_if_completion_unusable(state, error);
+    }
     let retire = state.session_state() == super::SessionState::Logout
-        || matches!(phase, ExchangePhase::Interrupted)
-        || (matches!(phase, ExchangePhase::Exchanged)
-            && error.is_some_and(Error::is_connection_fatal));
+        || state.framing == read_loop::Framing::Desynchronized;
     if retire {
         state.apply_infrastructure_failure();
         cmd_rx.close();
@@ -1079,8 +1111,8 @@ fn publish_then_answer<T>(publish: impl FnOnce(), reply: ClaimedReply<T>, result
 }
 
 /// Turn a side-effect digest for an untagged response into the fatal BYE
-/// result every active driver read loop must honor, except command dispatch
-/// for LOGOUT, whose consumer owns the required BYE.
+/// result the shared read boundary honors, except LOGOUT dispatch and shutdown,
+/// which must consume the required BYE before their tagged completion.
 ///
 /// Private on purpose: the ordering constraint below (response-code events
 /// first, so an ALERT carried by BYE reaches the event queue before the
@@ -1122,15 +1154,14 @@ fn short_circuit_on_bye(
 }
 
 /// The shared prologue every driver read loop runs on an untagged response:
-/// emit response-code events, then fail on BYE unless regular command dispatch
-/// is servicing LOGOUT.
+/// emit response-code events, then fail on BYE unless servicing LOGOUT.
 /// Returns whether a code event was emitted, which the caller uses to decide
 /// whether the response still needs a plain event of its own.
 ///
 /// `phase` stamps the BYE error (see `short_circuit_on_bye`); each loop
 /// states how far its command had got rather than leaving it unstamped.
-/// `command_kind` is `Some` only for single-command dispatch; pipeline and
-/// event-only loops cannot make the LOGOUT exception.
+/// `command_kind` admits the LOGOUT exception for dispatch and shutdown.
+/// Pipelines and other event-only exchanges cannot make that exception.
 pub(super) fn process_untagged_prefix(
     digest: super::state::SideEffectDigest,
     response: &UntaggedResponse,
@@ -1141,37 +1172,6 @@ pub(super) fn process_untagged_prefix(
     let code_emitted = emit_untagged_response_code_events(response, event_sink);
     short_circuit_on_bye(digest, response, phase, command_kind)?;
     Ok(code_emitted)
-}
-
-/// The whole untagged arm of a read loop that has no consumer to route to:
-/// run the shared prologue, then forward the response as a typed event unless
-/// the prologue already published its critical code as one.
-///
-/// Four read loops always answer an untagged response this way - IDLE's
-/// wait for its `+` grant, the IDLE loop, the post-DONE IDLE drain, and the
-/// best-effort LOGOUT drain - and a fifth, the synchronizing-literal
-/// continuation wait, does so only WHEN IT HAS NO ROUTING CONTEXT, i.e. for
-/// single-command dispatch. Under a pipelined batch
-/// that same wait does have consumers to route to - earlier commands in the
-/// batch are still outstanding - and takes the router instead; answering those
-/// responses here is what silently truncated a batch's results. The five
-/// differ in how they terminate and in what they do with a tagged response,
-/// but not here, so the "prologue, then forward iff no code event" pairing
-/// lives once. Loops that DO have a consumer (command dispatch, the pipeline
-/// batch, and the pipelined continuation wait) cannot use this: for them the
-/// forward is conditional on classification, and they call
-/// `process_untagged_prefix` directly.
-pub(super) fn process_untagged_as_event(
-    digest: super::state::SideEffectDigest,
-    response: Box<UntaggedResponse>,
-    event_sink: &mut event_sink::DriverEventSink,
-    phase: bifrost_types::TransmissionState,
-) -> Result<(), Error> {
-    let code_emitted = process_untagged_prefix(digest, &response, event_sink, phase, None)?;
-    if !code_emitted {
-        let _ = event_sink.emit((*response).into());
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

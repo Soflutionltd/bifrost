@@ -350,9 +350,7 @@ pub(crate) fn inventory_stream_cancellable(
                             // unreadable message re-raises the same key rather
                             // than minting a fresh obligation every pass -
                             // which is what would let it evade a retry budget.
-                            key: bifrost_types::ObligationKey(
-                                format!("gmail:message:{id}").into_bytes(),
-                            ),
+                            key: MessageObligationKey(&id).encode(),
                             id: bifrost_types::ObjectId(id),
                             error: account_error,
                             // No provider-native repair token: a Gmail message
@@ -683,6 +681,16 @@ fn inventory_walk_refusal(
             "gmail users.messages.list exceeded {MAX_INVENTORY_PAGES} pages in one walk"
         ))
     })
+}
+
+/// A single opaque message coordinate, with stable persisted obligation bytes.
+/// There is no delimiter ambiguity here: the suffix is never split into fields.
+struct MessageObligationKey<'a>(&'a str);
+
+impl MessageObligationKey<'_> {
+    fn encode(&self) -> bifrost_types::ObligationKey {
+        bifrost_types::ObligationKey(format!("gmail:message:{}", self.0).into_bytes())
+    }
 }
 
 async fn list_messages_page(

@@ -1,3 +1,7 @@
+// Core carries the generic RFC 8620 framework (every method shape, session and
+// response accessors, set and query builders); objects use different subsets.
+#![allow(dead_code)]
+
 use std::fmt::Display;
 use std::hash::Hash;
 
@@ -28,6 +32,12 @@ mod tests;
 
 /// The base trait for a JMAP object's server-returned (Get) shape.
 pub(crate) trait Object: Sized {
+    // Protocol identity does not determine the account's cursor scope:
+    // Email and EmailDelivery, for example, both invalidate the Email scope.
+    // That routing stays with the account consumer rather than this wire table.
+    const DATA_TYPE: crate::DataType;
+    type Cap: capability::Capability;
+    const METHODS: method::ObjectMethods;
     type Property: Display + Serialize + DeserializeOwned;
     /// The strongly-typed ID for this object (`EmailId`, `MailboxId`,
     /// etc.). Used as the typed key/value type in generic core

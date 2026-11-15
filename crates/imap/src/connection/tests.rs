@@ -114,6 +114,56 @@ impl dispatch::Consumer for PanickingConsumer {
     }
 }
 
+/// A consumer that cannot interpret the server's well-framed answer: it
+/// finalizes the tagged OK with a desynchronization-class error.
+struct UninterpretableConsumer;
+
+impl dispatch::Consumer for UninterpretableConsumer {
+    type Output = ();
+
+    fn on_response(
+        &mut self,
+        _resp: UntaggedResponse,
+        _notify: NotifyFlags,
+        _ctx: &dispatch::ConsumerContext,
+    ) {
+    }
+
+    fn finalize(
+        self: Box<Self>,
+        _tagged: TaggedResponse,
+        _ctx: &dispatch::ConsumerContext,
+    ) -> dispatch::Finalized<()> {
+        dispatch::Finalized::failure(Error::Parse("uninterpretable answer".into()), Vec::new())
+    }
+}
+
+/// The tagged OK synchronizes the framing, but the consumer could not make
+/// sense of the exchange, so the client no longer knows what state the
+/// server is in. The connection must retire before the caller is answered,
+/// never be handed back for the next command.
+#[tokio::test]
+async fn a_consumer_failure_on_a_tagged_ok_retires_the_connection() {
+    use crate::connection::test_support::{
+        driver_pair, preauth_greeting, read_line, respond, tag_of,
+    };
+    let (conn, mut peer) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let server = tokio::spawn(async move {
+        let command = read_line(&mut peer).await;
+        respond(&mut peer, &format!("{} OK done\r\n", tag_of(&command))).await;
+        peer
+    });
+    let result = conn
+        .submit_regular(Command::Noop, UninterpretableConsumer, None)
+        .await;
+    assert!(matches!(result, Err(Error::Parse(_))), "got {result:?}");
+    let _peer = server.await.unwrap();
+    assert!(
+        !conn.is_alive(),
+        "a session whose answer could not be interpreted must not be reused"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Driver-panic  -  consumer panic surfaces as DriverPanicked (I7)
 // ---------------------------------------------------------------------------

@@ -105,7 +105,28 @@ pub(crate) trait JmapMethod: Serialize + Send {
 }
 ```
 
-Adding a new method: define a struct, use `define_get_method!` / `define_set_method!` etc. Zero central files touched.
+Method metadata is owned by the object, not restated at each method. One
+`data_types!` table in `lib.rs` lists every data type once with its wire name
+and owning capability; it generates `DataType`, its `parse`, `Display` and
+`DataType::capability_uri`, and a per-type metadata entry (capability alias plus
+`ObjectMethods`, the standard `<Type>/get`, `/set`, `/changes`, `/query`,
+`/queryChanges`, `/copy`, `/parse`, `/import` and `/validate` names). Known types
+resolve their capability even when their feature is off, so `Blob/lookup`'s
+`using` list still works; types with no owning capability (`MDN`, `FileNode`)
+and unknown extension types resolve to none. Each `Object` impl invokes
+`object_metadata!(Kind)`, which sets `Object::DATA_TYPE`, `Object::Cap` and
+`Object::METHODS` from that table. The `define_*_method!` macros take only the
+method struct and the object, and read `NAME` and `Cap` from the object's
+metadata. Object protocol identity does not decide cursor scope: Email and
+EmailDelivery both invalidate the Email scope, and that routing stays in the
+account layer.
+
+`/parse` is the one deliberate exception for capability: parse sub-capabilities
+(for example `ContactsParse`) are method-specific and do not redefine the
+object's own capability, so `define_parse_method!` takes its capability
+explicitly while deriving its name and property type from the object.
+
+Adding a new method: define a struct, use `define_get_method!` / `define_set_method!` etc. Adding a new object type adds one row to `data_types!`.
 
 `Request` takes one `SessionState` snapshot when it is constructed. Its
 `maxCallsInRequest` guard, default account id, and HTTP `apiUrl` all come from
@@ -595,7 +616,7 @@ that bound; the `upload_to` check still guards the transport boundary.
 Per-RFC features: `mail`, `calendars`, `contacts`, `blob`, `quota`. Each gates:
 
 - Internal module declarations in `lib.rs`.
-- DataType enum variants (with `#[serde(other)]` catch-all).
+- DataType enum variants (with the `Other(String)` catch-all); the capability lookup for a known type is not gated.
 - Capabilities enum variants + session accessors + deserializer arms.
 - PushObject/PushNotification variants.
 - Test modules.
@@ -648,6 +669,7 @@ RFC 8620: `null` removes map keys, not `false`. Email `patch` field uses `HashMa
 - `Field::is_omitted` for `skip_serializing_if` on `Field<T>` fields (with `#[serde(default)]`).
 - `SetObjectCreatable::new()` initializes optional fields to `None`/`Omitted`, not empty collections.
 - Helper impl blocks use `impl<Tr: HttpTransport> Client<Tr>` (not bare `impl Client`).
+- Dead-code allowances are module-scoped, not crate-wide. Each per-RFC protocol module (object modules, `core`, `blob`, `event_source`, the mailbox rights vocabulary) carries its own `#![allow(dead_code)]` with a one-line reason, because it holds method shapes and builders the Account layer uses only in part. The client, transport, WebSocket and `sync` code keep the lint, and `sync/error.rs` enables it explicitly so an unreachable translation path is reported. The crate root allows dead code only when `sync` is off: without it the crate has no public items, so every crate-private item is unreachable by construction.
 
 ## Account layer
 
@@ -1065,10 +1087,13 @@ schema-clear or scope-restart directive is derived.
 An enterprise user expects a broken search to leave durable mail and sync
 checkpoints intact. Moved result sets still use `ConcurrencyConflict`.
 
-The crate has TWO page-cursor encodings serving three families of walk. Both
-use distinct tags: `search-3:` for mail search and `2:` for anchored walks.
-They are not interchangeable; each decoder refuses the other tag before
-interpreting the payload.
+The crate has one persisted payload codec in `sync/page_cursor.rs`, with
+anchored and positional variants serving three families of walk. It preserves
+both issued encodings byte for byte: `search-3:` for mail search and `2:` for
+anchored walks. The entry points reject the other variant with
+`AccountError::invalid_page_cursor`; negative search positions, malformed and
+retired formats use that same restart-paging signal. Contact and calendar walks
+retain their historically shared anchored format.
 
 **Mail search (`pim.rs`)** is positional: `search-3:<position>:<queryState>`,
 owner-qualified for a share. It is described under "Known limitations" below.
@@ -1776,3 +1801,14 @@ Shared-account PermissionDenied quarantine uses
 and its cause and diagnostic evidence. Losing a delegated folder must leave an
 enterprise Outlook user's own mailbox usable. Page cursor refusals use the shared
 `AccountError::invalid_page_cursor` signal: reload only the caller-owned walk.
+
+Thread deletion compares the caller's current container with the resolved Trash
+container by exact opaque id equality, including the owner qualification. An
+enterprise Outlook user deleting from a distinct folder expects a move to Trash,
+never an expunge because its id differs from Trash only in letter case.
+
+Email-state probes publish with a compare-and-replace under one cache lock and
+return the winning state under that same lock. Both initial guard probes and
+stateMismatch refresh probes preserve a concurrent cache advance. An Outlook
+user expects concurrent edits to remain visible to mutation guards rather than
+be hidden by an older in-flight probe. The network probe holds no cache lock.

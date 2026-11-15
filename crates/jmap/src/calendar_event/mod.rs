@@ -1,5 +1,8 @@
 //! CalendarEvent wraps a JSCalendar Event (RFC 8984) object.
 
+// Query, copy and JSCalendar accessors are protocol surface the sync uses in part.
+#![allow(dead_code)]
+
 pub(crate) mod get;
 pub(crate) mod parse;
 pub(crate) mod query;
@@ -213,6 +216,7 @@ crate::define_open_property_enum! {
 }
 
 impl crate::core::Object for CalendarEvent {
+    crate::core::method::object_metadata!(CalendarEvent);
     type Property = Property;
     type Id = CalendarEventId;
     fn requires_account_id() -> bool {
@@ -234,42 +238,12 @@ impl crate::core::set::SetObject for CalendarEvent {
     type SetArguments = SetArguments;
 }
 
-crate::define_get_method!(
-    CalendarEventGet,
-    CalendarEvent,
-    "CalendarEvent/get",
-    crate::core::capability::Calendars
-);
-crate::define_set_method!(
-    CalendarEventSet,
-    CalendarEvent,
-    "CalendarEvent/set",
-    crate::core::capability::Calendars
-);
-crate::define_changes_method!(
-    CalendarEventChanges,
-    CalendarEvent,
-    "CalendarEvent/changes",
-    crate::core::capability::Calendars
-);
-crate::define_query_method!(
-    CalendarEventQuery,
-    CalendarEvent,
-    "CalendarEvent/query",
-    crate::core::capability::Calendars
-);
-crate::define_query_changes_method!(
-    CalendarEventQueryChanges,
-    CalendarEvent,
-    "CalendarEvent/queryChanges",
-    crate::core::capability::Calendars
-);
-crate::define_copy_method!(
-    CalendarEventCopy,
-    CalendarEvent,
-    "CalendarEvent/copy",
-    crate::core::capability::Calendars
-);
+crate::define_get_method!(CalendarEventGet, CalendarEvent);
+crate::define_set_method!(CalendarEventSet, CalendarEvent);
+crate::define_changes_method!(CalendarEventChanges, CalendarEvent);
+crate::define_query_method!(CalendarEventQuery, CalendarEvent);
+crate::define_query_changes_method!(CalendarEventQueryChanges, CalendarEvent);
+crate::define_copy_method!(CalendarEventCopy, CalendarEvent);
 
 impl CalendarEventGet {
     #[must_use]

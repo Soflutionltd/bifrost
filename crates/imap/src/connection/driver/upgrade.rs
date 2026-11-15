@@ -361,46 +361,41 @@ pub(super) async fn logout_best_effort(
     if state.session_state() == SessionState::Logout {
         return Ok(());
     }
-    let tag = tag_gen.next();
-    // LOGOUT is a trivial command with no literals; write raw bytes.
-    let logout_line = format!("{tag} LOGOUT\r\n");
+    let super::PreparedCommand { tag, wire } =
+        super::prepare_command(state, tag_gen, &Command::Logout)?;
     state.arm_effect(&Command::Logout, &tag);
-    wire_reader.write_all(logout_line.as_bytes()).await?;
-
-    // Read responses until the tagged OK or an error. Apply side
-    // effects so state transitions to Logout on the BYE/tagged OK.
+    let baseline = wire_reader.written();
+    super::send_wire_command(
+        wire_reader,
+        state,
+        event_sink,
+        &wire,
+        &tag,
+        baseline,
+        None,
+        None,
+    )
+    .await?;
+    // The shared loop permits LOGOUT's required BYE and continues to its
+    // own completion. The caller bounds this entire handshake with a timeout.
     loop {
-        let utf8 = super::utf8_mode(state);
-        let resp = wire_reader.read_one(utf8).await?;
-        let digest = state.apply_side_effects(&resp);
-        match resp {
-            // Accepted deviation: this is the only tagged arm in the crate that
-            // does not call `emit_tagged_response_code_events`, so an [ALERT] or
-            // [NOTIFICATIONOVERFLOW] code riding the LOGOUT completion is
-            // dropped instead of published. It is deliberate and low impact:
-            // the event sink is torn down immediately after this function
-            // returns, so an event emitted here would very likely never be
-            // observed by anyone. If the shutdown path ever grows a drain that
-            // flushes pending events to the consumer before the sink closes,
-            // this arm should emit like every other tagged arm does.
-            crate::types::Response::Tagged(t) if t.tag == tag => break,
-            // A foreign tag also ends the drain: nothing is still outstanding
-            // that we care about, and the connection is going away.
-            crate::types::Response::Tagged(_) => break,
-            crate::types::Response::Untagged(u) => {
-                // LOGOUT is on the wire. The drain's errors are discarded at
-                // teardown, but the phase is stated like every other loop's.
-                super::process_untagged_as_event(
-                    digest,
-                    u,
-                    event_sink,
-                    bifrost_types::TransmissionState::InFlight,
-                )?;
-            }
-            crate::types::Response::Continuation(_) | crate::types::Response::Greeting(_) => {}
+        let frame = super::read_loop::ReadLoop::next(
+            wire_reader,
+            state,
+            event_sink,
+            None,
+            super::read_loop::LoopPolicy {
+                tags: &[(tag.as_str(), Some(true))],
+                early_ok_tag: None,
+                command_kind: Some(crate::types::CommandKind::Logout),
+                route_untagged: false,
+            },
+        )
+        .await?;
+        if let crate::types::Response::Tagged(t) = frame.response {
+            return t.require_ok().map(|_| ());
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

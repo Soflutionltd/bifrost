@@ -89,6 +89,7 @@ crate::core::method::define_property_enum! {
 }
 
 impl crate::core::Object for ParticipantIdentity {
+    crate::core::method::object_metadata!(ParticipantIdentity);
     type Property = Property;
     type Id = ParticipantIdentityId;
     fn requires_account_id() -> bool {
@@ -127,24 +128,9 @@ impl crate::core::SetCreate for ParticipantIdentityCreate {
     }
 }
 
-crate::define_get_method!(
-    ParticipantIdentityGet,
-    ParticipantIdentity,
-    "ParticipantIdentity/get",
-    crate::core::capability::Calendars
-);
-crate::define_set_method!(
-    ParticipantIdentitySet,
-    ParticipantIdentity,
-    "ParticipantIdentity/set",
-    crate::core::capability::Calendars
-);
-crate::define_changes_method!(
-    ParticipantIdentityChanges,
-    ParticipantIdentity,
-    "ParticipantIdentity/changes",
-    crate::core::capability::Calendars
-);
+crate::define_get_method!(ParticipantIdentityGet, ParticipantIdentity);
+crate::define_set_method!(ParticipantIdentitySet, ParticipantIdentity);
+crate::define_changes_method!(ParticipantIdentityChanges, ParticipantIdentity);
 
 impl ParticipantIdentitySet {
     #[must_use]

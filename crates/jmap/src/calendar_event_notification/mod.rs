@@ -1,3 +1,6 @@
+// CalendarEventNotification methods are calendars-draft surface not yet consumed.
+#![allow(dead_code)]
+
 pub(crate) mod get;
 pub(crate) mod query;
 pub(crate) mod set;
@@ -97,6 +100,7 @@ crate::core::method::define_property_enum! {
 }
 
 impl crate::core::Object for CalendarEventNotification {
+    crate::core::method::object_metadata!(CalendarEventNotification);
     type Property = Property;
     type Id = CalendarEventNotificationId;
     fn requires_account_id() -> bool {
@@ -118,33 +122,11 @@ impl crate::core::set::SetObject for CalendarEventNotification {
     type SetArguments = ();
 }
 
-crate::define_get_method!(
-    CalendarEventNotificationGet,
-    CalendarEventNotification,
-    "CalendarEventNotification/get",
-    crate::core::capability::Calendars
-);
-crate::define_set_method!(
-    CalendarEventNotificationSet,
-    CalendarEventNotification,
-    "CalendarEventNotification/set",
-    crate::core::capability::Calendars
-);
-crate::define_changes_method!(
-    CalendarEventNotificationChanges,
-    CalendarEventNotification,
-    "CalendarEventNotification/changes",
-    crate::core::capability::Calendars
-);
-crate::define_query_method!(
-    CalendarEventNotificationQuery,
-    CalendarEventNotification,
-    "CalendarEventNotification/query",
-    crate::core::capability::Calendars
-);
+crate::define_get_method!(CalendarEventNotificationGet, CalendarEventNotification);
+crate::define_set_method!(CalendarEventNotificationSet, CalendarEventNotification);
+crate::define_changes_method!(CalendarEventNotificationChanges, CalendarEventNotification);
+crate::define_query_method!(CalendarEventNotificationQuery, CalendarEventNotification);
 crate::define_query_changes_method!(
     CalendarEventNotificationQueryChanges,
-    CalendarEventNotification,
-    "CalendarEventNotification/queryChanges",
-    crate::core::capability::Calendars
+    CalendarEventNotification
 );

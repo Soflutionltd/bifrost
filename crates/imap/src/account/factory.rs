@@ -266,33 +266,27 @@ impl ImapAccountFactory {
             // empty list; a single revoked prefix is skipped, not fatal.
             let shared = discover_shared_folders(&conn, &cfg, &profile).await;
             let foreign_namespaces_advertised = shared.foreign_namespaces_advertised;
-            let shared = shared.entries;
-            // Fail-soft: a DAV open failure degrades to IMAP-only for
-            // this cycle instead of failing the whole IMAP account. The
-            // degradation is recorded twice on purpose: as a `Warning`
-            // surfaced through the first discovery stream (the live
-            // signal), and as an open-time `SkippedScope` so the
-            // engine's `open_skipped_scopes` lane reports the missing
-            // sub-account with its classified error.
-            let mut dav_degraded = Vec::new();
-            let mut skipped_scopes = Vec::new();
+            let shared_entries = shared.entries;
+            // Keep mail online during a DAV outage. Enterprise users need one
+            // classified missing-scope report, preserved on the open result.
+            let mut skipped_scopes = shared.skipped_scopes;
             // Joined, not sequential: each DAV open is its own multi-round-trip
             // discovery against its own endpoint with its own client, so
             // awaiting them in turn made an IMAP open pay both latencies for no
             // reason. `into_attached` is applied afterwards in a fixed order so
-            // the degradation and skipped-scope lanes stay deterministic - the
+            // the skipped-scope lane stays deterministic - the
             // futures may finish in either order, the reporting may not.
             let (contacts, calendars) = futures::future::join(
                 open_carddav(&cfg, account_id.clone(), Arc::clone(&net)),
                 open_caldav(&cfg, account_id.clone(), Arc::clone(&net)),
             )
             .await;
-            let contacts = contacts.into_attached(&mut dav_degraded, &mut skipped_scopes);
-            let calendars = calendars.into_attached(&mut dav_degraded, &mut skipped_scopes);
+            let contacts = contacts.into_attached(&mut skipped_scopes);
+            let calendars = calendars.into_attached(&mut skipped_scopes);
             let contact_cursor_folders = dav_cursor_folders(contacts.as_ref()).await;
             let calendar_cursor_folders = dav_cursor_folders(calendars.as_ref()).await;
             let submission = open_submission(&cfg, meter.clone(), bandwidth_budget.clone())?;
-            let registry = Arc::new(FolderRegistry::from_lists(folders, shared));
+            let registry = Arc::new(FolderRegistry::from_lists(folders, shared_entries));
             let mut caps = capabilities::build_capabilities_for_registry(
                 &profile,
                 &registry,
@@ -312,12 +306,12 @@ impl ImapAccountFactory {
                 .into_iter()
                 .map(|entry| entry.name.account_id())
                 .collect();
-            let (dav_scopes, dav_scope_warnings) = super::DavScopeIndex::build(
+            let (dav_scopes, dav_scope_skips) = super::DavScopeIndex::build(
                 contact_cursor_folders,
                 calendar_cursor_folders,
                 &imap_mailboxes,
             );
-            dav_degraded.extend(dav_scope_warnings);
+            skipped_scopes.extend(dav_scope_skips);
             let pool = Arc::new(Pool::new(
                 Arc::clone(&cfg),
                 conn,
@@ -337,7 +331,7 @@ impl ImapAccountFactory {
                 calendars,
                 dav_scopes,
                 submission,
-                dav_degraded,
+                discovery_skips: skipped_scopes.clone(),
             });
             Ok((account, skipped_scopes))
         })
@@ -397,43 +391,18 @@ enum DavAttach {
     /// Opened and attached.
     Attached {
         account: Arc<dyn Account>,
-        /// Skips the DAV factory itself reported on a SUCCESSFUL open.
-        ///
-        /// A DAV open can succeed and still leave part of its surface
-        /// uncovered: both DAV crates sync exactly one collection, so every
-        /// further calendar or address book is enumerated and reachable
-        /// through the PIM primitives while producing no inventory or change
-        /// events. Those entries have to be forwarded onto the composed
-        /// account's own lane, or composing DAV into IMAP silently discards
-        /// the only report of the gap.
+        /// Partial discovery reported by the attached factory.
         skipped: Vec<SkippedScope>,
     },
     /// Not configured.
     None,
     /// Configured but open failed; attach IMAP-only this cycle.
-    Degraded {
-        warning: bifrost_types::Warning,
-        /// The open-time skip entry (classified error + collection
-        /// scope) recorded on `OpenedAccount::skipped_scopes`.
-        skip: SkippedScope,
-        // Retried on the engine's next reopen by design. Carried for
-        // telemetry/clarity; the engine's reopen re-runs the open either
-        // way.
-        #[allow(dead_code)]
-        transient: bool,
-    },
+    Degraded { skip: SkippedScope },
 }
 
 impl DavAttach {
-    /// Resolve to the optional sub-account handle, pushing any degraded
-    /// warning into `degraded` (surfaced by the first discovery) and the
-    /// matching skip entry into `skipped` (surfaced by
-    /// `OpenedAccount::skipped_scopes`).
-    fn into_attached(
-        self,
-        degraded: &mut Vec<bifrost_types::Warning>,
-        skipped: &mut Vec<SkippedScope>,
-    ) -> Option<Arc<dyn Account>> {
+    /// Preserve all classified skips on the composed open result.
+    fn into_attached(self, skipped: &mut Vec<SkippedScope>) -> Option<Arc<dyn Account>> {
         match self {
             DavAttach::Attached {
                 account,
@@ -443,8 +412,7 @@ impl DavAttach {
                 Some(account)
             }
             DavAttach::None => None,
-            DavAttach::Degraded { warning, skip, .. } => {
-                degraded.push(warning);
+            DavAttach::Degraded { skip } => {
                 skipped.push(skip);
                 None
             }
@@ -453,60 +421,22 @@ impl DavAttach {
 }
 
 /// Classify a DAV `open` outcome into an attach decision. A success
-/// attaches; a failure degrades, routing through the central
-/// `RecoveryClass` (read `reference/error-model.md`) to decide whether
-/// the degradation is transient (retried on the engine's next reopen) or
-/// a terminal config-fix.
+/// attaches; a failure retains its classified error and recovery without
+/// a second warning lane.
 fn classify_dav_open(
     result: Result<OpenedAccount, AccountError>,
-    label: &str,
+    _label: &str,
     scope: bifrost_types::ErrorScope,
 ) -> DavAttach {
     match result {
-        // A successful open can still report skips: both DAV crates cover one
-        // collection, so any further collection comes back on
-        // `OpenedAccount::skipped_scopes`. Forward them onto the composed
-        // account's lane rather than dropping them - this arm used to assume
-        // the DAV factories always answered an empty skip lane, which silently
-        // hid every unsynced calendar and address book behind a composed
-        // account.
+        // Every discovered DAV collection syncs; forward any partial failures.
         Ok(opened) => DavAttach::Attached {
             account: opened.account,
             skipped: opened.skipped_scopes,
         },
-        Err(error) => {
-            // A retryable recovery class means the failure is transient
-            // (transport blip, server unavailable, throttle); anything
-            // terminal (auth lost, no permission, not found) needs an
-            // operator config fix. Either way IMAP stays online.
-            let transient = error.recovery().is_retryable();
-            let kind = if transient {
-                bifrost_types::WarningKind::Other
-            } else {
-                bifrost_types::WarningKind::OperatorAttentionNeeded
-            };
-            let warning = bifrost_types::Warning::support_only(
-                kind,
-                format!(
-                    "{label} sub-account did not open ({}); continuing IMAP-only{}",
-                    error.message_key(),
-                    if transient {
-                        ", will retry on reopen"
-                    } else {
-                        "; check DAV configuration"
-                    }
-                ),
-            )
-            .with_protocol_detail(bifrost_types::DiagnosticText::support_only(
-                label.to_string(),
-            ));
-            let skip = SkippedScope { scope, error };
-            DavAttach::Degraded {
-                warning,
-                skip,
-                transient,
-            }
-        }
+        Err(error) => DavAttach::Degraded {
+            skip: SkippedScope { scope, error },
+        },
     }
 }
 
@@ -696,9 +626,11 @@ pub(crate) fn mailbox_owner_from_other_user_path(
 /// server has zero entries today but a post-open ACL grant CAN surface
 /// folders later, which is exactly what a consumer-side rediscovery
 /// reattach exists to observe. On a personal-only server the flag is
-/// `false` and such a reattach can never surface anything.
+/// `false` and such a reattach can never surface anything. A failed
+/// NAMESPACE probe retains true because the foreign surface is unknown.
 pub(crate) struct SharedDiscovery {
     pub(crate) entries: Vec<super::folder_registry::SharedFolderEntry>,
+    pub(crate) skipped_scopes: Vec<SkippedScope>,
     pub(crate) foreign_namespaces_advertised: bool,
 }
 
@@ -749,22 +681,37 @@ pub(crate) async fn discover_shared_folders(
     if !profile.supports(Capability::Namespace) {
         return SharedDiscovery {
             entries: Vec::new(),
+            skipped_scopes: Vec::new(),
             foreign_namespaces_advertised: false,
         };
     }
     let namespaces = match conn.namespace(cfg.imap.command_timeout).await {
         Ok(ns) => ns,
         Err(err) => {
-            tracing::debug!(error = %err, "NAMESPACE failed; treating as personal-only");
+            tracing::debug!(error = %err, "NAMESPACE failed; reporting incomplete discovery");
+            // `ErrorScope::Account` here names the account's SHARED surface
+            // (other-user and shared namespaces), never the account as a
+            // whole: the personal namespace was listed separately and mail
+            // stays online. bifrost-types has no namespace scope; no
+            // in-workspace reader of the skip lane treats an Account-scoped
+            // entry as "the whole account skipped" (bifrost-sync only logs
+            // and exposes it). An enterprise user expects incomplete shared
+            // folders to be reported, not mistaken for an offline account.
             return SharedDiscovery {
                 entries: Vec::new(),
-                foreign_namespaces_advertised: false,
+                skipped_scopes: vec![SkippedScope {
+                    scope: bifrost_types::ErrorScope::Account,
+                    error: discover_err(err),
+                }],
+                // An unknown namespace is not evidence that no shares exist.
+                foreign_namespaces_advertised: true,
             };
         }
     };
     let foreign_namespaces_advertised = namespaces_advertise_foreign(&namespaces);
     let acl = profile.supports(Capability::Acl);
     let mut out = Vec::new();
+    let mut skipped_scopes = Vec::new();
     // Other-user and shared namespaces are both non-personal, but their
     // owner derivation differs: an other-user root (`#user/`) carries one
     // descriptor for ALL users, so the owning principal is read per-folder
@@ -797,6 +744,17 @@ pub(crate) async fn discover_shared_folders(
                     error = %err,
                     "LIST under shared namespace prefix failed; skipping prefix"
                 );
+                // The skip names ONE shared-namespace prefix, not the account:
+                // the prefix is not a mailbox and bifrost-types has no
+                // namespace scope, so it rides `ErrorScope::Account`. Other
+                // prefixes and the personal namespace keep syncing; no
+                // in-workspace reader treats an Account-scoped skip as the
+                // whole account skipped. The classified provider failure is
+                // retained.
+                skipped_scopes.push(SkippedScope {
+                    scope: bifrost_types::ErrorScope::Account,
+                    error: discover_err(err),
+                });
                 continue;
             }
         };
@@ -850,6 +808,7 @@ pub(crate) async fn discover_shared_folders(
     }
     SharedDiscovery {
         entries: out,
+        skipped_scopes,
         foreign_namespaces_advertised,
     }
 }
@@ -1235,10 +1194,7 @@ mod tests {
         // Transport failure -> degraded, transient, skip recorded with
         // the collection scope + retryable classification.
         match classify_dav_open(Err(transport_error()), "CardDAV", contact_scope()) {
-            DavAttach::Degraded {
-                transient, skip, ..
-            } => {
-                assert!(transient, "transport is transient");
+            DavAttach::Degraded { skip } => {
                 assert!(matches!(
                     skip.scope,
                     bifrost_types::ErrorScope::ContactCollection
@@ -1250,10 +1206,7 @@ mod tests {
 
         // Auth-lost -> degraded, terminal (not transient).
         match classify_dav_open(Err(auth_lost_error()), "CardDAV", contact_scope()) {
-            DavAttach::Degraded {
-                transient, skip, ..
-            } => {
-                assert!(!transient, "auth-lost is a terminal config fix");
+            DavAttach::Degraded { skip } => {
                 assert!(skip.error.recovery().is_terminal());
             }
             other => panic!("expected Degraded, got {}", attach_label(&other)),
@@ -1274,9 +1227,7 @@ mod tests {
     }
 
     /// A DAV open that SUCCEEDS while reporting skips must forward them onto
-    /// the composed account's lane. Both DAV crates cover one collection, so
-    /// this is the path that carries an unsynced calendar or address book out
-    /// of a composed IMAP account; dropping it hides the gap entirely.
+    /// the composed account's lane, preserving future partial-open failures.
     #[test]
     fn a_successful_dav_open_forwards_its_own_skipped_scopes() {
         let stub = crate::account::test_support::stub_arc(
@@ -1295,20 +1246,78 @@ mod tests {
         };
 
         let attach = classify_dav_open(Ok(opened), "CardDAV", contact_scope);
-        let mut degraded = Vec::new();
         let mut skipped = Vec::new();
-        let account = attach.into_attached(&mut degraded, &mut skipped);
+        let account = attach.into_attached(&mut skipped);
 
         assert!(account.is_some(), "a successful open still attaches");
-        assert!(
-            degraded.is_empty(),
-            "a skip on a successful open is not a degradation"
-        );
         assert_eq!(
             skipped.len(),
             1,
             "the sub-account's own skip must reach the composed lane"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_namespace_discovery_retains_a_classified_skip() {
+        use crate::connection::test_support::{
+            driver_pair, preauth_greeting, read_line, respond, tag_of,
+        };
+        let (conn, mut peer) = driver_pair(&preauth_greeting("IMAP4rev1 NAMESPACE")).await;
+        let server = tokio::spawn(async move {
+            let command = read_line(&mut peer).await;
+            assert!(command.contains("NAMESPACE"));
+            respond(
+                &mut peer,
+                &format!("{} NO discovery unavailable\r\n", tag_of(&command)),
+            )
+            .await;
+        });
+        let cfg = bandwidth_config(false);
+        let discovery = discover_shared_folders(&conn, &cfg, &conn.server_profile()).await;
+        assert!(discovery.entries.is_empty());
+        assert!(discovery.foreign_namespaces_advertised);
+        assert_eq!(discovery.skipped_scopes.len(), 1);
+        assert_eq!(
+            discovery.skipped_scopes[0].error.operation(),
+            Some(AccountOperation::Discover)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_shared_prefix_list_retains_a_classified_skip() {
+        use crate::connection::test_support::{
+            driver_pair, preauth_greeting, read_line, respond, tag_of,
+        };
+        let (conn, mut peer) = driver_pair(&preauth_greeting("IMAP4rev1 NAMESPACE")).await;
+        let server = tokio::spawn(async move {
+            let command = read_line(&mut peer).await;
+            respond(
+                &mut peer,
+                &format!(
+                    "* NAMESPACE NIL NIL ((\"Shared/\" \"/\"))\r\n{} OK namespaces\r\n",
+                    tag_of(&command)
+                ),
+            )
+            .await;
+            let command = read_line(&mut peer).await;
+            assert!(command.contains("LIST"));
+            assert!(command.contains("Shared/*"));
+            respond(
+                &mut peer,
+                &format!("{} NO unavailable\r\n", tag_of(&command)),
+            )
+            .await;
+        });
+        let cfg = bandwidth_config(false);
+        let discovery = discover_shared_folders(&conn, &cfg, &conn.server_profile()).await;
+        assert!(discovery.entries.is_empty());
+        assert_eq!(discovery.skipped_scopes.len(), 1);
+        assert_eq!(
+            discovery.skipped_scopes[0].error.operation(),
+            Some(AccountOperation::Discover)
+        );
+        server.await.unwrap();
     }
 
     fn attach_label(attach: &DavAttach) -> &'static str {

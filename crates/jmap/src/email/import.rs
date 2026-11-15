@@ -70,8 +70,8 @@ pub(crate) struct EmailImportResponse {
 
 impl crate::core::method::JmapMethod for EmailImportRequest {
     const REPLAY_SAFE: bool = false;
-    const NAME: &'static str = "Email/import";
-    type Cap = crate::core::capability::Mail;
+    const NAME: &'static str = <super::Email as crate::core::Object>::METHODS.import;
+    type Cap = <super::Email as crate::core::Object>::Cap;
     type Response = EmailImportResponse;
 
     fn set_account_id(&mut self, account_id: &AccountId) {

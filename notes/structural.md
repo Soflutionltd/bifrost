@@ -1717,17 +1717,6 @@ designed with IMAP in mind (`types.md` says as much), and the bounded backfill
 lane depends on partitions, but no production crate mints a `Uid` partition.
 Related: STR-046.
 
-## STR-083 - IMAP account lifecycle state is four carriers
-
-**Reported by:** imap-account.
-
-`closed: AtomicBool`, `shutdown: CancellationToken`, `close_completion:
-OnceLock<Shared<..>>` and `send_gate: RwLock<()>` together encode open / closing /
-closed. The `closed` flag is checked by the send paths, `blob::run_fetch` and
-`poll::examine`, and left to the pool elsewhere. `close` also `expect`s the
-teardown task, so a panic inside a sub-account's `close()` re-panics in the
-engine's `detach`.
-
 ## STR-086 - JMAP states are all `String`; the typed `State` alias is dead
 
 **Reported by:** jmap-protocol.
@@ -1890,17 +1879,6 @@ sections exist only to hold two copies in step (CON-042, CON-043), and at least 
 pins a defect (BUG-061). Wire tests should live in the module whose wire shape
 they pin; the agreement tables go when their duplication goes.
 
-## STR-096 - The JMAP crate-wide `dead_code` allowance hides which half of each module is live
-
-**Reported by:** jmap-protocol (not a deletion proposal; everything here is `pub(crate)`, but removal still needs the owner).
-
-`lib.rs` has `#![allow(dead_code)]` and most object modules repeat it with a "kept
-for completeness" comment (email, mailbox, identity, vacation, sieve, principal,
-push_subscription, email_submission, event_source). The unwired SSE lane's push
-decomposition disagrees with the live WS one (CON-038), so "kept built" has not
-meant "kept correct". Any unwired half that is kept should share the live path's
-owners (CON-038, CON-040, BUG-064) rather than its own. Related: STR-061, STR-072.
-
 ## STR-097 - The JMAP account needs a per-account registry; its per-account facts are parallel maps keyed by bare strings
 
 **Reported by:** jmap-account (its dominant missing owner; the hunter recommends a rewrite of the account layer's internal plumbing rather than local fixes).
@@ -2007,29 +1985,6 @@ provider. Proposal: `RecurrenceRule` parsed at the `bifrost-types` boundary with
 parsed rule". Today a rule JMAP accepts and Graph refuses is refused for different
 stated reasons, and nothing compares the parsers. Related: STR-003.
 
-## STR-113 - Graph derives the Outlook origin by host comparison, not by cloud
-
-**Reported by:** graph.
-
-`client::derive_outlook_base` maps `graph.microsoft.com` to `outlook.office365.com`
-and every other host to its own origin, so sovereign Graph hosts
-(`graph.microsoft.us`, `dod-graph.microsoft.us`, `microsoftgraph.chinacloudapi.cn`)
-derive an EWS and Autodiscover origin on the Graph host - functionally wrong; an
-explicit `with_outlook_base` is the only escape. Proposal: `enum MicrosoftCloud {
-Global, UsGov, UsGovDoD, China, Custom { graph, outlook } }` owning both bases and,
-with BUG-075, both audiences.
-
-## STR-114 - Graph delta items and hydration bodies are untyped `serde_json::Value`
-
-**Reported by:** graph.
-
-`inventory_entry_from_value`, `membership_from_value`, `flags_hash`,
-`get::hydrated_from_value`, `validate_flags_value` and the changes loop walk raw
-`Value` with `.get("...")`. `validate_flags_value` exists to recover by hand the
-completeness a typed `struct DeltaMessage { id: Option<String>, is_read: bool, flag:
-Flag, categories: Vec<String>, .. }` deserialization would enforce; the same
-applies to the `@removed` tombstone shape.
-
 ## STR-115 - `GraphAccount` is a bag of about twenty-five shared fields with no owners
 
 **Reported by:** graph (the hunter says this is where concentrating invariants pays most, given the standing lesson that teardown and lifetime fixes move holes).
@@ -2118,25 +2073,6 @@ contact arms; and the inventory tests for all of these. Either calendar and cont
 folder discovery is missing, or the lanes are built ahead of a producer; either
 way a large surface compiles and is tested with no path to it.
 
-## STR-120 - Graph's mailbox-qualified id spelling: one codec, four separators
-
-**Reported by:** graph.
-
-`foreign.rs` says `qualify_with_owner` keeps every id namespace on one separator,
-but `pim::send::SCHEDULED_SEND_HANDLE_SEP` is a second `'\u{1f}'` constant with its
-own encode and decode; `pim::containers` recognizes the literal
-`"{owner}\u{1f}deletedItems"`; `foreign::parse_public_address_book` and
-`parse_public_calendar` hard-code `"public-contacts\u{1e}"` and
-`"public-calendar\u{1e}"` while the encoders build the same prefixes from
-`PUBLIC_SEP`; and `calendar.rs` adds a fourth separator, `"::"`, for event ids,
-with `sync_object_id` relying on `ObjectId` and `EventId` sharing that string form
-by convention. `send::client_for_scheduled_send_handle` re-implements
-`GraphAccount::client_for_owner` with a different error class for the same missing
-mailbox (`send_as_unknown_mailbox` vs `GraphError::Configuration`). Proposal: one
-typed id codec, `GraphId::{Message, Thread, Folder, PublicItem, PublicContact,
-PublicEvent, Event, ScheduledSend}`, with one `parse` that refuses partial forms
-(BUG-082). The workspace-level form is STR-002.
-
 ## STR-121 - Split the Google client into one typed handle per API
 
 **Reported by:** google (its headline structural fix).
@@ -2191,34 +2127,6 @@ the constant, and parsed in `flags::user_label_id_from_flag`,
 `"$gmail-label:"` plus an extra empty-id filter the others lack). A `GmailFlag` enum
 with `parse` and `Display` (`Seen`, `Flagged`, `Draft`, `Important`, `Label { id,
 advisory_name }`, `Unknown(String)`) replaces all four. Related: STR-004, STR-111.
-
-## STR-126 - Gmail `LabelPatch::unsupported_flags` carries two unrelated things
-
-**Reported by:** google.
-
-It holds flag tokens the translator could not express, and also prose diagnostics:
-`"unknown future FlagOp variant"`, `"gmail move destination must be a label"`,
-`"gmail move source must be a label"`. `apply_label_patch_tracked` reinterprets the
-field by operation (`operation == BulkMove && !unsupported.is_empty()` becomes
-`InvalidRequest`), while for `UpdateFlags` the same field feeds the
-`FlagsPartiallyApplied { unsupported }` effect a consumer reads as a list of flags.
-A move whose destination is not a label is a caller error and should never be a
-`LabelPatch`: `move_patch` returns `Result<LabelPatch, MoveRefusal>`, and
-`unsupported_flags` holds only flags.
-
-## STR-127 - Google opaque ids that are really composites, each with its own codec
-
-**Reported by:** google.
-
-`EventId` is `calendar_id + "::" + event_id` (`join_event_id` / `split_event_id`);
-the cross-calendar search cursor is `calendar_id + '\n' + page_token`; `BlobId` is a
-JSON `GmailBlobKey`; `SubscriptionHandle` is a JSON blob whose `topic`,
-`history_id` and `expiration` fields are never read back (`actor_unsubscribe`
-decodes it into `_decoded` only to validate it; only `handle_id` matters);
-obligation keys are `format!("gmail:message:{id}")`. Each composite has its own ad
-hoc codec and failure classification; typed keys with one codec each also fix
-BUG-088. `api::list_messages` returns a three-tuple `(Vec<Stub>, Option<String>,
-Option<i64>)`; return the typed response. Related: STR-002, STR-120.
 
 ## STR-128 - Google stream state machines as boolean pairs
 
@@ -2480,10 +2388,11 @@ one.
 
 **Reported by:** net-dav.
 
-`may_have_committed: bool` and `attempts: Vec<Error>` sit on two variants, and the
-recursion allows nested `AttemptHistory`, which is why `terminal()` recurses;
-`AttemptEvidence` carries two bools (`may_have_committed`, `unreplayable_terminal`)
-that `finish` ORs back into one. A typed ledger (BUG-110) replaces all of it.
+The typed `AttemptLedger` (`crates/net/src/attempt.rs`) now owns the internal
+evidence and the proven-refusal rule, and net and DAV feed it. Residue: the
+public error-envelope fields (`may_have_committed: bool`, `attempts: Vec<Error>`
+with nested `AttemptHistory`) were kept so consumers compile unchanged; move the
+public surface onto the ledger's verdict and migrate the consumers.
 `RetryBudgetExhausted` means two things - "the attempt budget is spent" and "the
 replay policy forbade another attempt" (its doc says so) - so a caller cannot branch
 on which happened, though the second is the commit-ambiguity case; split it or add a

@@ -1227,15 +1227,10 @@ mod principals_owner_capability {
 }
 
 // ---------------------------------------------------------------------------
-// Method name / capability table (RFC 8620 s3.2 "using")
-// ---------------------------------------------------------------------------
-//
-// `Request::call` derives the `using` entry from `M::Cap::URI` and the
-// wire method name from `M::NAME`. Neither is exercised by any other
-// test, and a typo in either is a runtime `unknownMethod` /
-// `unknownCapability` against a real server, never a compile error.
-
-mod method_name_and_capability_table {
+// Specialized methods retain explicit capability contracts: Blob/copy is
+// core, and calendar/contact parsing uses a separate parse capability. Standard
+// object methods derive their names and capability from Object metadata.
+mod specialized_method_contracts {
     use crate::core::capability::Capability;
     use crate::core::method::JmapMethod;
 
@@ -1243,20 +1238,9 @@ mod method_name_and_capability_table {
     #[cfg(feature = "mail")]
     const MAIL: &str = "urn:ietf:params:jmap:mail";
     #[cfg(feature = "mail")]
-    const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
-    #[cfg(feature = "mail")]
-    const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
-    #[cfg(feature = "mail")]
     const SIEVE: &str = "urn:ietf:params:jmap:sieve";
-    const PRINCIPALS: &str = "urn:ietf:params:jmap:principals";
     #[cfg(feature = "blob")]
     const BLOB: &str = "urn:ietf:params:jmap:blob";
-    #[cfg(feature = "quota")]
-    const QUOTA: &str = "urn:ietf:params:jmap:quota";
-    #[cfg(feature = "calendars")]
-    const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
-    #[cfg(feature = "contacts")]
-    const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
 
     fn check<M: JmapMethod>(name: &str, uri: &str) {
         assert_eq!(M::NAME, name, "wire method name");
@@ -1269,8 +1253,6 @@ mod method_name_and_capability_table {
 
     #[test]
     fn core_methods() {
-        check::<crate::push_subscription::PushSubscriptionGet>("PushSubscription/get", CORE);
-        check::<crate::push_subscription::PushSubscriptionSet>("PushSubscription/set", CORE);
         // RFC 8620 s6.3: Blob/copy is a core method, not a blob-extension
         // one.
         check::<crate::blob::copy::CopyBlobRequest>("Blob/copy", CORE);
@@ -1279,85 +1261,15 @@ mod method_name_and_capability_table {
     #[cfg(feature = "mail")]
     #[test]
     fn mail_methods() {
-        check::<crate::email::EmailGet>("Email/get", MAIL);
-        check::<crate::email::EmailSet>("Email/set", MAIL);
-        check::<crate::email::EmailChanges>("Email/changes", MAIL);
-        check::<crate::email::EmailQuery>("Email/query", MAIL);
-        check::<crate::email::EmailQueryChanges>("Email/queryChanges", MAIL);
-        check::<crate::email::EmailCopy>("Email/copy", MAIL);
         check::<crate::email::import::EmailImportRequest>("Email/import", MAIL);
         check::<crate::email::parse::EmailParseRequest>("Email/parse", MAIL);
         check::<crate::email::search_snippet::SearchSnippetGetRequest>("SearchSnippet/get", MAIL);
-        check::<crate::mailbox::MailboxGet>("Mailbox/get", MAIL);
-        check::<crate::mailbox::MailboxSet>("Mailbox/set", MAIL);
-        check::<crate::mailbox::MailboxChanges>("Mailbox/changes", MAIL);
-        check::<crate::mailbox::MailboxQuery>("Mailbox/query", MAIL);
-        check::<crate::mailbox::MailboxQueryChanges>("Mailbox/queryChanges", MAIL);
-        check::<crate::thread::ThreadGet>("Thread/get", MAIL);
-        check::<crate::thread::ThreadChanges>("Thread/changes", MAIL);
     }
 
     #[cfg(feature = "mail")]
     #[test]
-    fn submission_methods() {
-        // RFC 8621 s6: Identity lives in the submission capability, not
-        // in mail.
-        check::<crate::identity::IdentityGet>("Identity/get", SUBMISSION);
-        check::<crate::identity::IdentitySet>("Identity/set", SUBMISSION);
-        check::<crate::identity::IdentityChanges>("Identity/changes", SUBMISSION);
-        check::<crate::email_submission::EmailSubmissionGet>("EmailSubmission/get", SUBMISSION);
-        check::<crate::email_submission::EmailSubmissionSet>("EmailSubmission/set", SUBMISSION);
-        check::<crate::email_submission::EmailSubmissionChanges>(
-            "EmailSubmission/changes",
-            SUBMISSION,
-        );
-        check::<crate::email_submission::EmailSubmissionQuery>("EmailSubmission/query", SUBMISSION);
-        check::<crate::email_submission::EmailSubmissionQueryChanges>(
-            "EmailSubmission/queryChanges",
-            SUBMISSION,
-        );
-    }
-
-    #[cfg(feature = "mail")]
-    #[test]
-    fn vacation_and_sieve_methods() {
-        check::<crate::vacation_response::VacationResponseGet>("VacationResponse/get", VACATION);
-        check::<crate::vacation_response::VacationResponseSet>("VacationResponse/set", VACATION);
-        check::<crate::sieve::SieveScriptGet>("SieveScript/get", SIEVE);
-        check::<crate::sieve::SieveScriptSet>("SieveScript/set", SIEVE);
-        check::<crate::sieve::SieveScriptQuery>("SieveScript/query", SIEVE);
+    fn sieve_validation_method() {
         check::<crate::sieve::validate::SieveScriptValidateRequest>("SieveScript/validate", SIEVE);
-    }
-
-    #[test]
-    fn principal_and_sharing_methods() {
-        check::<crate::principal::PrincipalGet>("Principal/get", PRINCIPALS);
-        check::<crate::principal::PrincipalSet>("Principal/set", PRINCIPALS);
-        check::<crate::principal::PrincipalChanges>("Principal/changes", PRINCIPALS);
-        check::<crate::principal::PrincipalQuery>("Principal/query", PRINCIPALS);
-        check::<crate::principal::PrincipalQueryChanges>("Principal/queryChanges", PRINCIPALS);
-        // RFC 9670 s3: ShareNotification is defined by the principals
-        // capability.
-        check::<crate::share_notification::ShareNotificationGet>(
-            "ShareNotification/get",
-            PRINCIPALS,
-        );
-        check::<crate::share_notification::ShareNotificationSet>(
-            "ShareNotification/set",
-            PRINCIPALS,
-        );
-        check::<crate::share_notification::ShareNotificationChanges>(
-            "ShareNotification/changes",
-            PRINCIPALS,
-        );
-        check::<crate::share_notification::ShareNotificationQuery>(
-            "ShareNotification/query",
-            PRINCIPALS,
-        );
-        check::<crate::share_notification::ShareNotificationQueryChanges>(
-            "ShareNotification/queryChanges",
-            PRINCIPALS,
-        );
     }
 
     #[cfg(feature = "blob")]
@@ -1368,42 +1280,9 @@ mod method_name_and_capability_table {
         check::<crate::blob::manage::BlobLookupRequest>("Blob/lookup", BLOB);
     }
 
-    #[cfg(feature = "quota")]
-    #[test]
-    fn quota_methods() {
-        check::<crate::quota::QuotaGet>("Quota/get", QUOTA);
-        check::<crate::quota::QuotaChanges>("Quota/changes", QUOTA);
-        check::<crate::quota::QuotaQuery>("Quota/query", QUOTA);
-        check::<crate::quota::QuotaQueryChanges>("Quota/queryChanges", QUOTA);
-    }
-
     #[cfg(feature = "calendars")]
     #[test]
     fn calendar_methods() {
-        check::<crate::calendar::CalendarGet>("Calendar/get", CALENDARS);
-        check::<crate::calendar::CalendarSet>("Calendar/set", CALENDARS);
-        check::<crate::calendar::CalendarChanges>("Calendar/changes", CALENDARS);
-        check::<crate::calendar_event::CalendarEventGet>("CalendarEvent/get", CALENDARS);
-        check::<crate::calendar_event::CalendarEventSet>("CalendarEvent/set", CALENDARS);
-        check::<crate::calendar_event::CalendarEventChanges>("CalendarEvent/changes", CALENDARS);
-        check::<crate::calendar_event::CalendarEventQuery>("CalendarEvent/query", CALENDARS);
-        check::<crate::calendar_event::CalendarEventQueryChanges>(
-            "CalendarEvent/queryChanges",
-            CALENDARS,
-        );
-        check::<crate::calendar_event::CalendarEventCopy>("CalendarEvent/copy", CALENDARS);
-        check::<crate::calendar_event_notification::CalendarEventNotificationGet>(
-            "CalendarEventNotification/get",
-            CALENDARS,
-        );
-        check::<crate::calendar_event_notification::CalendarEventNotificationSet>(
-            "CalendarEventNotification/set",
-            CALENDARS,
-        );
-        check::<crate::participant_identity::ParticipantIdentityGet>(
-            "ParticipantIdentity/get",
-            CALENDARS,
-        );
         // The `parse` sub-capability is separate from `calendars`.
         check::<crate::calendar_event::parse::CalendarEventParseRequest>(
             "CalendarEvent/parse",
@@ -1414,15 +1293,6 @@ mod method_name_and_capability_table {
     #[cfg(feature = "contacts")]
     #[test]
     fn contact_methods() {
-        check::<crate::address_book::AddressBookGet>("AddressBook/get", CONTACTS);
-        check::<crate::address_book::AddressBookSet>("AddressBook/set", CONTACTS);
-        check::<crate::address_book::AddressBookChanges>("AddressBook/changes", CONTACTS);
-        check::<crate::contact_card::ContactCardGet>("ContactCard/get", CONTACTS);
-        check::<crate::contact_card::ContactCardSet>("ContactCard/set", CONTACTS);
-        check::<crate::contact_card::ContactCardChanges>("ContactCard/changes", CONTACTS);
-        check::<crate::contact_card::ContactCardQuery>("ContactCard/query", CONTACTS);
-        check::<crate::contact_card::ContactCardQueryChanges>("ContactCard/queryChanges", CONTACTS);
-        check::<crate::contact_card::ContactCardCopy>("ContactCard/copy", CONTACTS);
         check::<crate::contact_card::parse::ContactCardParseRequest>(
             "ContactCard/parse",
             "urn:ietf:params:jmap:contacts:parse",

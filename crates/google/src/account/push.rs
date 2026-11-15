@@ -368,6 +368,10 @@ struct GmailWatchResponse {
     expiration: Option<String>,
 }
 
+// This payload is deliberately retained: the complete serialized handle, not
+// handle_id alone, is the registration identity in the actor's HashSet. Persisted
+// handles must not be reserialized or reduced when releasing that registration.
+// Watch metadata also distinguishes handles across process-local id reuse.
 #[derive(Debug, Serialize, Deserialize)]
 struct GmailSubscriptionHandle {
     topic: String,
@@ -378,6 +382,16 @@ struct GmailSubscriptionHandle {
     /// distinct so releasing one cannot consume another's registration.
     #[serde(default)]
     handle_id: u64,
+}
+
+impl GmailSubscriptionHandle {
+    fn encode(&self) -> Result<SubscriptionHandle, serde_json::Error> {
+        serde_json::to_string(self).map(SubscriptionHandle)
+    }
+
+    fn decode(handle: &SubscriptionHandle) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(&handle.0)
+    }
 }
 
 pub(crate) fn push_subscribe(
@@ -712,7 +726,7 @@ async fn actor_subscribe(
         expiration: response.expiration.clone(),
         handle_id,
     };
-    let handle = match serde_json::to_string(&handle).map(SubscriptionHandle) {
+    let handle = match handle.encode() {
         Ok(handle) => handle,
         Err(error) => {
             // Only tear down the Gmail-side watch if no other subscriber is
@@ -745,7 +759,7 @@ async fn actor_unsubscribe(
     handles: &mut HashSet<String>,
     ownership: &mut WatchOwnership,
 ) -> Result<(), AccountError> {
-    let _decoded: GmailSubscriptionHandle = serde_json::from_str(&handle.0).map_err(|error| {
+    let _decoded = GmailSubscriptionHandle::decode(&handle).map_err(|error| {
         error::into_account_error(
             crate::error::Error::invalid_request(
                 AccountOperation::PushUnsubscribe,

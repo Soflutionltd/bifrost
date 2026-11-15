@@ -123,6 +123,16 @@ attempt ids share the sequence (also STR-025).
 
 **Reported by:** sync-lanes (latent; live once any provider adopts partitioning).
 
+Mostly fixed: a typed `BackfillKey` with codecs for every existing encoding, one
+public resume-comparison helper consumer stores can call, proven completion
+beating counts, honest completion counts, and atomic completion compaction in
+the in-memory store. Residue: incomplete `TimeWindowed` walks still mint fresh
+absolute-instant keys each attach and accumulate rows; an unknown future
+`InventoryPartition` variant still falls back to the historical shared key
+(a safe opaque identity needs bifrost-types support); and external
+`CheckpointStore` implementations must adopt the comparison helper and the
+compaction contract, which nothing enforces. The original account:
+
 The durable "backfill is done" fact is a `BackfillCheckpoint` on partition key
 `b"complete"` with `items_done = total_seen + 1`
 (`engine/backfill.rs::emit_backfill_complete`), whose doc claims every
@@ -363,26 +373,6 @@ unrecognized code. Owner: make `ImapResponseCode::code` public and derive
 middle table; the IMAP crate should own the conversion as an `impl From` beside
 `ResponseCode` in the codec, with the name table in exactly one place (see
 STR-013 on provider vocabularies in the neutral crate).
-
-## BUG-045 - IMAP drops shared-namespace discovery failures and reports a degraded open twice
-
-**Reported by:** imap-account, net-dav (adds that IMAP's `factory.rs` comment says both DAV crates sync exactly one collection and report the rest on `skipped_scopes`, while both DAV factories return an empty skip lane and `caldav::lib` says every collection is a cursor scope; `DavAttach::Degraded.transient` is computed and carried under `allow(dead_code)`).
-
-`types.md` defines `OpenedAccount::skipped_scopes`, `ContainerList` and
-`Page::skipped_scopes` for exactly this. IMAP: `discover_shared_folders` logs a
-failed `LIST` under a namespace prefix, and a failed `NAMESPACE`, with
-`tracing::debug!` only - no `SkippedScope` - and `containers_list` then returns
-`ContainerList::complete(..)` with a comment saying the skips "were handled" at
-open; they were dropped. `DavScopeIndex::build` collisions (a collection that
-will never sync) go only to the prose warning lane, not to `skipped_scopes`. A
-failed DAV open is reported twice: a prose `Warning` via a bespoke `dav_degraded:
-Mutex<Vec<Warning>>` with peek / acknowledge-on-`Done` logic in
-`discover_cursor_scopes`, and a `SkippedScope`; the bespoke lane predates the skip
-lane and duplicates it, and `DavAttach::Degraded { transient }` is a dead field.
-`classify_dav_open` encodes "transient vs needs config" as the choice between
-`WarningKind::Other` and `OperatorAttentionNeeded` while discarding the
-classified `AccountError` that decided it. The search half (one folder's failure
-fails the whole page) is already an owner-ruling item in `notes/todo.md`.
 
 ## BUG-052 - IMAP `bulk_move` to a DAV-owned folder goes to the IMAP server while `throttle_keys` says IMAP does not own it
 
@@ -705,36 +695,38 @@ no Message-ID, `parse_draft_for_submission` falls back to the constant
 which then becomes the "stable fallback id" on the receipt
 (`append_to_sent_or_fallback`) - not unique by construction.
 
-## BUG-110 - "May this logical request have committed?" is decided four ways in net and DAV, and they disagree
+## BUG-166 - JMAP contact and calendar page cursors decode as each other
 
-**Reported by:** net-dav.
+**Reported by:** wave 9 fixer (jmap-account, lateral).
 
-Given the attempts so far, what is the effective transmission state, and is replay
-forbidden? The `request.rs` send loop sets `may_have_committed |= !replayable &&
-status != 401`, sets `unreplayable_terminal` via `left_the_process`, and decides
-"proven refusal" in `status_error_is_replayable` (401 and 429 only, with a comment
-that 502/503/504 can follow a commit). `account_error.rs`'s `AttemptHistory` arm
-re-derives everything from the translated cause chains: it excludes 401s
-(`rejected_unauthorized`), computes `acknowledged_may_have_committed`, and
-reclassifies to `PartialResponse` when `inflight || (acknowledged && terminal ==
-Some(Unsent))`. Its `LocalHold` arm folds the same states differently, with no 401
-exclusion. dav-core's `RedirectHistory::record_response` applies its own
-`unreplayable && status != 401` rule, and `attach` reclassifies to
-`PartialResponse`/`InFlight` when `unreplayable && may_have_committed` and the
-terminal is `None | Some(Unsent)`. dav-core `wire_outcome`'s `refused_only` treats
-earlier attempts of 401, 429, 503 and 501 as proven refusals. Disagreements: net
-reclassifies on "acknowledged earlier attempt + `Unsent` terminal" even for a
-replayable request, DAV only for an unreplayable one; on a terminal with no attempt
-evidence (`None`, e.g. a credential error) DAV reclassifies while net pushes an
-Acknowledged attempt and keeps the terminal's kind; DAV's refusal set includes 503,
-which net's own comment says does not prove refusal (dead today for unreplayable
-requests, because net never retries past a 503 on them - a second rule waiting to
-drift). Owner: a public `AttemptLedger` in bifrost-net recording typed outcomes,
-owning one `is_proven_refusal(StatusCode)` predicate and exposing a verdict
-(`CommitEvidence::{Unsent, Acknowledged, MayHaveCommitted}`); net's loop and any
-self-walking caller (DAV) feed it, and `account_error` reads the verdict rather than
-re-mining `Cause::Attempt` entries out of translated errors. The evidence fields it
-replaces are STR-144; the second walker is CON-060.
+The two PIM page-cursor kinds still share a historical format, so a contacts
+cursor handed to a calendar walk (or the reverse) decodes instead of refusing
+with the restart-paging signal.
+
+## BUG-167 - IMAP discovery still advertises DAV scopes that were excluded, and namespace-prefix failures use account scope
+
+**Reported by:** wave 9 fixer (imap-account, lateral).
+
+Scopes excluded by a DAV collision are now on the skip lane but are still
+advertised by discovery. Separately, a failed `LIST` under a namespace prefix
+is skipped with an account-level `ErrorScope`, because no scope variant names a
+namespace.
+
+## BUG-168 - An empty-string Graph delta id bypasses the id-less checkpoint barrier
+
+**Reported by:** wave 9 fixer (graph, lateral).
+
+The id-less barrier catches a delta item with no id, but an item whose id is
+the empty string passes it and is minted as an object.
+
+## BUG-169 - The coalesced IMAP pipeline writes encoded chunks directly
+
+**Reported by:** wave 9 fixer (imap-connection, lateral).
+
+Every exchange now reads through the one read loop, but the optimized coalesced
+pipeline still writes encoded chunks without going through
+`send_wire_command`, so that function's claim that every command reaches the
+socket through it is still too broad.
 
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 
@@ -772,49 +764,4 @@ registry, meter }` (or `NetResources`) shared by Net, the engine and the IMAP
 factory, and behind it an `AccountRegistration` value owning every per-account
 entry, so detach and retag are one operation each. The string-keyed registries are
 STR-145.
-
-## BUG-164 - `MaintenanceGate::acquire` can re-loop without waiting
-
-**Reported by:** wave 7 green pass (lateral).
-
-With `wait_for_run` set, if `begin_activity()` returns `None` while the
-boundary reads `Run`, `acquire` drops the admission and `continue`s at once, a
-potential busy loop. The wave review believed the boundary and the control's
-running state are the same channel, which would make it unreachable, but that
-was not verified. Waiting on the control's running state before `continue`
-removes the possibility.
-
-## BUG-160 - Google contacts hides a first-page authorization failure as an empty directory
-
-**Reported by:** wave 7 fixer (google, lateral).
-
-`account/contacts.rs` absorbs a permission or insufficient-scope failure on the
-first directory page as an empty result, so a user whose directory access was
-withdrawn sees an empty directory instead of being told access is missing.
-
-## BUG-161 - JMAP `delete_thread` compares opaque mailbox ids case-insensitively
-
-**Reported by:** wave 7 fixer (jmap-account, lateral).
-
-JMAP ids are case-sensitive opaque strings, but `delete_thread` compares mailbox
-ids case-insensitively when deciding whether to destroy in place, so two
-distinct mailboxes whose ids differ only in case can select expunge for the
-wrong one.
-
-## BUG-162 - The JMAP state probe reads and writes the cache under separate locks
-
-**Reported by:** wave 7 fixer (jmap-account, lateral).
-
-The state-probe path reads the Email state cache and later writes it under two
-separate lock acquisitions, so a concurrent advance between them can be
-overwritten with an older state, defeating the continuity rule the cache now
-enforces for set responses.
-
-## BUG-163 - `run_repair_pass` counts deferrals as resolutions
-
-**Reported by:** wave 7 fixer (sync, lateral).
-
-`repair.rs::run_repair_pass` promises to report terminal resolutions but its
-return value also counts deferred obligations, so a caller reading it as
-progress over-reports what the pass settled.
 

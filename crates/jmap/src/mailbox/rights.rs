@@ -1,3 +1,6 @@
+// Full RFC 8621 rights vocabulary; readers are used by a subset of fields.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 // One mailbox vocabulary defines shareWith keys, myRights fields and readers.

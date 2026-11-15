@@ -229,7 +229,7 @@ fn inventory_stream_from(
             let mut removed = Vec::new();
             for value in page.value {
                 if is_removed(&value)
-                    && let Some(id) = value.get("id").and_then(Value::as_str) {
+                    && let Some(id) = super::wire_item::GraphItem::decode(&value).id {
                     let id = parsed.mint_object_id(id);
                     if parsed.etag_cached() {
                         removed_etag_ids.push(id.0.clone());
@@ -382,8 +382,9 @@ fn inventory_entry_from_parsed(
     scope: &super::scope::GraphScope,
     value: &Value,
 ) -> Option<InventoryEntry> {
-    let id = value.get("id")?.as_str()?.to_string();
-    let membership = scope.membership(value.get("parentFolderId").and_then(Value::as_str));
+    let item = super::wire_item::GraphItem::decode(value);
+    let id = item.id?.to_string();
+    let membership = scope.membership(item.parent_folder);
     let etag = graph_etag(value);
     let fingerprint = Fingerprint {
         server_version: etag
@@ -402,10 +403,7 @@ fn inventory_entry_from_parsed(
         .map(|header| header.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
     let in_reply_to = internet_header(value, "In-Reply-To");
-    let thread_id = value
-        .get("conversationId")
-        .and_then(Value::as_str)
-        .map(|thread| scope.thread_id(thread));
+    let thread_id = item.conversation.map(|thread| scope.thread_id(thread));
 
     Some(InventoryEntry {
         id: scope.mint_object_id(&id),
@@ -424,7 +422,7 @@ fn inventory_entry_from_parsed(
 pub(crate) fn membership_from_value(scope: &CursorScope, value: &Value) -> MembershipScope {
     super::scope::GraphScope::parse(scope)
         .expect("supported scope")
-        .membership(value.get("parentFolderId").and_then(Value::as_str))
+        .membership(super::wire_item::GraphItem::decode(value).parent_folder)
 }
 
 #[cfg(test)]
@@ -440,18 +438,11 @@ pub(crate) fn sync_object_id(scope: &CursorScope, id: &str) -> ObjectId {
 }
 
 pub(crate) fn graph_etag(value: &Value) -> Option<GraphETag> {
-    // The OData annotation is already an HTTP entity-tag. A change key is
-    // only its opaque payload, so never send it bare in If-Match.
-    value
-        .get("@odata.etag")
-        .and_then(Value::as_str)
+    // Both observations retain their distinct wire meaning.
+    let item = super::wire_item::GraphItem::decode(value);
+    item.etag
         .map(GraphETag::from_odata_annotation)
-        .or_else(|| {
-            value
-                .get("changeKey")
-                .and_then(Value::as_str)
-                .map(graph_change_key_etag)
-        })
+        .or_else(|| item.change_key.map(graph_change_key_etag))
 }
 
 /// Turn Graph's opaque change key into the weak HTTP entity-tag used by
@@ -461,13 +452,15 @@ pub(crate) fn graph_change_key_etag(change_key: &str) -> GraphETag {
 }
 
 pub(crate) fn is_removed(value: &Value) -> bool {
-    value.get("@removed").is_some()
+    matches!(
+        super::wire_item::GraphItem::decode(value).state,
+        super::wire_item::DeltaState::Removed
+    )
 }
 
 pub(crate) fn removed_id(value: &Value) -> Option<ObjectId> {
-    value
-        .get("id")
-        .and_then(Value::as_str)
+    super::wire_item::GraphItem::decode(value)
+        .id
         .map(|id| ObjectId(id.to_string()))
 }
 
@@ -609,18 +602,8 @@ fn internet_header(value: &Value, name: &str) -> Option<String> {
 }
 
 fn flags_hash(value: &Value) -> u64 {
-    let is_read = value.get("isRead").and_then(Value::as_bool);
-    let status = value
-        .get("flag")
-        .and_then(|flag| flag.get("flagStatus"))
-        .and_then(Value::as_str);
-    let categories = value
-        .get("categories")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str);
-    tracked_flags_hash(is_read, status, categories)
+    let flags = super::wire_item::GraphItem::decode(value).flags;
+    tracked_flags_hash(flags.read, flags.status, flags.categories)
 }
 
 pub(crate) fn tracked_flags_hash<'a>(

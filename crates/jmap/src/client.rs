@@ -1,3 +1,7 @@
+// Consumer-facing client and builder surface (follow_redirects, forwarded_for,
+// accessors, bearer) is unused by the sync engine but public to consumers.
+#![allow(dead_code)]
+
 use std::{
     collections::HashSet,
     net::IpAddr,

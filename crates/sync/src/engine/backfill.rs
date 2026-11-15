@@ -1109,8 +1109,8 @@ pub(super) fn backfill_complete_recorded(checkpoint: Option<&BackfillCheckpoint>
         // Larger legacy markers prove a nonempty walk and remain valid. An
         // enterprise mail user expects a possibly skipped empty folder to be
         // checked once; new empty inventories earn the versioned marker.
-        crate::backfill::partitioner::is_completion_partition(&ck.partition)
-            && (ck.partition.0 != b"complete" || ck.progress.items_done > 1)
+        crate::backfill::partitioner::BackfillKey::decode(&ck.partition)
+            .proves_completion(ck.progress.items_done)
     })
 }
 
@@ -1152,12 +1152,13 @@ pub(super) fn open_pages_resume(checkpoint: Option<&BackfillCheckpoint>) -> Open
 /// after the consumer has durably persisted every page. A crash before the
 /// marker is acked therefore re-walks rather than recording a false "done".
 ///
-/// `items_done` is set one past `total_seen` so the marker strictly wins
-/// `get_backfill`'s "latest by items_done" query regardless of how a store
-/// breaks ties: every per-partition checkpoint records its observed count
-/// (`<= total_seen`), so `total_seen + 1` is guaranteed larger and the
-/// marker is the row returned on re-attach. The honest total rides in
-/// `items_estimated`.
+/// `backfill_checkpoint_is_later` selects completion by durable key kind.
+/// `items_done` still sits one past `total_seen`: a consumer-written
+/// `CheckpointStore` that predates that helper and follows the earlier
+/// "greatest items_done, then page bound, then bytes" contract would
+/// otherwise tie the marker with the last page row and pick the page
+/// (`page:` sorts after `complete:`), re-walking a finished scope on every
+/// attach. The honest total rides in `items_estimated`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn emit_backfill_complete(
     changes_tx: Option<&broadcast::Sender<MultiplexerEvent>>,

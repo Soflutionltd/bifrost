@@ -198,7 +198,7 @@ pub(super) async fn run_fetch(
         section: None,
         partial: None,
     };
-    if account.closed.load(std::sync::atomic::Ordering::Acquire) {
+    if account.shutdown.is_cancelled() {
         return Err(BlobError::Imap(crate::Error::closed()));
     }
     let mut conn = account.checkout_for_folder(folder).await?;

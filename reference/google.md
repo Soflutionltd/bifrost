@@ -692,10 +692,11 @@ enumerates via `people:listDirectoryPeople` (no warmup); a non-empty query runs
 `searchContacts` family. Both use `sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE`
 and a `names,emailAddresses,phoneNumbers,organizations` readMask; email-less
 rows are dropped, the first email is the key and the rest fill
-`additional_emails`. Accounts with no directory (personal Gmail, or missing the
-`directory.readonly` scope) answer 403; the impl swallows the directory-absence
-classifications (`PermissionDenied`, `InsufficientScope`) to an empty page,
-while `PolicyBlocked` (a real admin refusal) propagates.
+`additional_emails`. Authorization failures, including missing directory scope,
+propagate on warmup and every query page. A 403 cannot distinguish an absent
+directory from withdrawn access. Enterprise users expect an actionable refusal,
+rather than an apparently empty organization. Transient warmup failures still
+fall through to the authoritative query.
 
 Google Calendar RSVP fetches the raw event, updates only the matching
 account attendee's `responseStatus`, and sends the attendee array back
@@ -1750,7 +1751,7 @@ and each is also stated at the code it describes.
   field PATCH as separate requests. If the move succeeds and the destination
   PATCH fails, the returned error keeps the PATCH's original kind, recovery
   class, retry hint, scope, telemetry, and cause chain. It is scoped to the
-  event in its DESTINATION calendar because the caller's `source::` composite
+  event in its DESTINATION calendar because the caller's source-scoped composite
   id no longer addresses it, and carries support-only text recording that the
   move succeeded. A user-safe diagnostic exposes partial commitment and the
   continuation: when recovery allows, pass the destination-scoped event id
@@ -1958,3 +1959,32 @@ Protocol::GoogleCalendar, GooglePeople or GoogleDrive. Structured response reaso
 carry matching WireCause variants, including unknown reasons. Gmail retains its
 existing Gmail identities. Transport errors use the same context API identity;
 API-specific OAuth scopes and Gmail-only project budget attribution are preserved.
+
+## Local mutation refusals and persisted Google keys
+
+`LabelPatch.unsupported_flags` contains flag tokens only. Unknown flag operations
+have a separate operation refusal marker; invalid move scopes return a typed
+`MoveRefusal` before a patch exists. Both yield per-target request failures with
+no wire write. Consumers never receive refusal prose as partially applied flags.
+
+Calendar event ids keep minting the historical `calendar::event` spelling, so
+the same event keeps the same id across an upgrade instead of looking new to a
+consumer that already stored it; the typed JSON key is minted only when a
+component itself contains `::` (Google calendar addresses and base32hex event
+ids never do), and readers accept both. Cross-calendar search cursors are
+transient and now encode a typed JSON key; readers also accept the previous
+calendar/newline/token form. A cursor naming a removed calendar still reports a
+concurrency conflict and asks the caller to restart the search. Enterprise users
+expect saved event references to keep opening the same event. Single-calendar and Gmail search
+cursors retain their provider token bytes.
+
+Blob keys retain the existing JSON fields and now own their encoding/decoding;
+string-only serialization cannot silently mint an empty handle. Subscription
+handles deliberately retain their existing JSON payload: the actor keys live
+registrations by the complete serialized value, not just `handle_id`. Old handles
+remain readable and are never reserialized during removal. The watch metadata
+also distinguishes registrations across process-local counter reuse. Message
+obligation keys retain `gmail:message:` plus the whole opaque message id; this
+single-coordinate suffix has no delimiter ambiguity and preserving its bytes
+preserves repair retry identity. Message-list search consumes the typed wire
+response rather than a positional three-tuple.

@@ -113,6 +113,7 @@ crate::core::method::define_property_enum! {
 }
 
 impl crate::core::Object for ShareNotification {
+    crate::core::method::object_metadata!(ShareNotification);
     type Property = Property;
     type Id = ShareNotificationId;
     fn requires_account_id() -> bool {
@@ -134,33 +135,8 @@ impl crate::core::set::SetObject for ShareNotification {
     type SetArguments = ();
 }
 
-crate::define_get_method!(
-    ShareNotificationGet,
-    ShareNotification,
-    "ShareNotification/get",
-    crate::core::capability::Principals
-);
-crate::define_set_method!(
-    ShareNotificationSet,
-    ShareNotification,
-    "ShareNotification/set",
-    crate::core::capability::Principals
-);
-crate::define_changes_method!(
-    ShareNotificationChanges,
-    ShareNotification,
-    "ShareNotification/changes",
-    crate::core::capability::Principals
-);
-crate::define_query_method!(
-    ShareNotificationQuery,
-    ShareNotification,
-    "ShareNotification/query",
-    crate::core::capability::Principals
-);
-crate::define_query_changes_method!(
-    ShareNotificationQueryChanges,
-    ShareNotification,
-    "ShareNotification/queryChanges",
-    crate::core::capability::Principals
-);
+crate::define_get_method!(ShareNotificationGet, ShareNotification);
+crate::define_set_method!(ShareNotificationSet, ShareNotification);
+crate::define_changes_method!(ShareNotificationChanges, ShareNotification);
+crate::define_query_method!(ShareNotificationQuery, ShareNotification);
+crate::define_query_changes_method!(ShareNotificationQueryChanges, ShareNotification);

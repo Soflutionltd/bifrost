@@ -134,6 +134,7 @@ crate::core::method::define_property_enum! {
 }
 
 impl crate::core::Object for Identity {
+    crate::core::method::object_metadata!(Identity);
     type Property = Property;
     type Id = IdentityId;
     fn requires_account_id() -> bool {
@@ -176,21 +177,6 @@ impl crate::core::SetCreate for IdentityCreate {
     }
 }
 
-crate::define_get_method!(
-    IdentityGet,
-    Identity,
-    "Identity/get",
-    crate::core::capability::Submission
-);
-crate::define_set_method!(
-    IdentitySet,
-    Identity,
-    "Identity/set",
-    crate::core::capability::Submission
-);
-crate::define_changes_method!(
-    IdentityChanges,
-    Identity,
-    "Identity/changes",
-    crate::core::capability::Submission
-);
+crate::define_get_method!(IdentityGet, Identity);
+crate::define_set_method!(IdentitySet, Identity);
+crate::define_changes_method!(IdentityChanges, Identity);

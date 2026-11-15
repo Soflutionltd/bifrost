@@ -200,6 +200,7 @@ crate::core::method::define_property_enum! {
 }
 
 impl crate::core::Object for EmailSubmission {
+    crate::core::method::object_metadata!(EmailSubmission);
     type Property = Property;
     type Id = EmailSubmissionId;
     fn requires_account_id() -> bool {
@@ -241,33 +242,8 @@ impl crate::core::SetCreate for EmailSubmissionCreate {
     }
 }
 
-crate::define_get_method!(
-    EmailSubmissionGet,
-    EmailSubmission,
-    "EmailSubmission/get",
-    crate::core::capability::Submission
-);
-crate::define_set_method!(
-    EmailSubmissionSet,
-    EmailSubmission,
-    "EmailSubmission/set",
-    crate::core::capability::Submission
-);
-crate::define_changes_method!(
-    EmailSubmissionChanges,
-    EmailSubmission,
-    "EmailSubmission/changes",
-    crate::core::capability::Submission
-);
-crate::define_query_method!(
-    EmailSubmissionQuery,
-    EmailSubmission,
-    "EmailSubmission/query",
-    crate::core::capability::Submission
-);
-crate::define_query_changes_method!(
-    EmailSubmissionQueryChanges,
-    EmailSubmission,
-    "EmailSubmission/queryChanges",
-    crate::core::capability::Submission
-);
+crate::define_get_method!(EmailSubmissionGet, EmailSubmission);
+crate::define_set_method!(EmailSubmissionSet, EmailSubmission);
+crate::define_changes_method!(EmailSubmissionChanges, EmailSubmission);
+crate::define_query_method!(EmailSubmissionQuery, EmailSubmission);
+crate::define_query_changes_method!(EmailSubmissionQueryChanges, EmailSubmission);

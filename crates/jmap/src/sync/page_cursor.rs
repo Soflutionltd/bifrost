@@ -1,4 +1,5 @@
-//! The anchored, state-pinned page cursor shared by the contact and calendar
+//! The persisted cursor codec for mail search and the anchored page mechanics
+//! shared by the contact and calendar
 //! page walks (`ContactCard/query`, `CalendarEvent/query`).
 //!
 //! Everything here is protocol mechanics that is identical for every object
@@ -20,18 +21,107 @@ use bifrost_types::{AccountError, AccountOperation, DiagnosticText};
 
 use crate::core::id::Id;
 
-/// Version tag of the page-cursor payload. v1 was a bare integer POSITION into
-/// a query result order; v2 is `2:` followed by a JSON two-element array of
-/// the anchor id and the `queryState` that order belonged to.
-///
-/// The payload after the tag is JSON, not two delimited strings: a JMAP id
-/// and a `queryState` are both opaque and either may contain any character a
-/// delimiter could be, so a delimited pair has no unambiguous split. JSON
-/// escapes its own contents, so both fields round-trip verbatim.
-///
-/// Mail search uses `search-3:` so a cross-door cursor fails the tag check
-/// before either codec interprets the other codec's payload.
-const PAGE_CURSOR_V2_PREFIX: &str = "2:";
+/// Persisted cursor payloads have one codec, with disjoint tags for anchored
+/// PIM walks and positional mail search. Keep the issued formats: consumers
+/// may hold them across an upgrade. Retired or cross-codec payloads use the
+/// caller-owned restart-paging signal, never an engine cursor reset.
+/// Contact and calendar deliberately keep their shared historical format;
+/// distinguishing those surfaces needs a versioned format and a legacy policy.
+enum CursorPayload {
+    Anchored { anchor: String, query_state: String },
+    Search { position: i32, query_state: String },
+}
+
+impl CursorPayload {
+    fn encode(&self) -> Result<String, serde_json::Error> {
+        match self {
+            Self::Anchored {
+                anchor,
+                query_state,
+            } => Ok(format!(
+                "2:{}",
+                serde_json::to_string(&(anchor, query_state))?
+            )),
+            Self::Search {
+                position,
+                query_state,
+            } => Ok(format!("search-3:{position}:{query_state}")),
+        }
+    }
+
+    fn decode(text: &str, operation: AccountOperation) -> Result<Self, AccountError> {
+        if let Some(payload) = text.strip_prefix("2:") {
+            let (anchor, query_state): (String, String) = serde_json::from_str(payload)
+                .map_err(|error| cursor_error(operation, error.to_string()))?;
+            if !anchor.is_empty() {
+                return Ok(Self::Anchored {
+                    anchor,
+                    query_state,
+                });
+            }
+        } else if let Some(payload) = text.strip_prefix("search-3:")
+            && let Some((position, query_state)) = payload.split_once(':')
+            && let Ok(position) = position.parse::<i32>()
+            && position >= 0
+        {
+            return Ok(Self::Search {
+                position,
+                query_state: query_state.to_owned(),
+            });
+        }
+
+        Err(cursor_error(
+            operation,
+            "page cursor is malformed, retired or out of range".into(),
+        ))
+    }
+}
+
+pub(super) fn encode_search(position: i32, query_state: &str, owner: Option<&str>) -> Vec<u8> {
+    let payload = CursorPayload::Search {
+        position,
+        query_state: query_state.to_owned(),
+    }
+    .encode()
+    .expect("search cursor formatting cannot fail");
+    match owner {
+        Some(owner) => super::foreign::encode_object(owner, &payload).into_bytes(),
+        None => payload.into_bytes(),
+    }
+}
+
+pub(super) fn decode_search(
+    cursor: Option<&[u8]>,
+    owner: Option<&str>,
+    operation: AccountOperation,
+) -> Result<(i32, Option<String>), AccountError> {
+    let Some(bytes) = cursor else {
+        return Ok((0, None));
+    };
+    let text =
+        std::str::from_utf8(bytes).map_err(|error| cursor_error(operation, error.to_string()))?;
+    let (cursor_owner, payload) = match super::foreign::parse_object(text) {
+        Some((owner, payload)) => (Some(owner), payload),
+        None => (None, text),
+    };
+    if cursor_owner != owner {
+        return Err(super::error::search_cursor_account_mismatch(
+            operation,
+            cursor_owner,
+            owner,
+        ));
+    }
+    match CursorPayload::decode(payload, operation)? {
+        CursorPayload::Search {
+            position,
+            query_state,
+        } => Ok((position, Some(query_state))),
+        CursorPayload::Anchored { .. } => Err(cursor_error(
+            operation,
+            "search page cursor has an anchored payload".into(),
+        )),
+    }
+}
 
 /// A decoded page cursor: the item the next page resumes strictly after, plus
 /// the `queryState` the order that anchor was chosen from belonged to. Both
@@ -122,8 +212,7 @@ pub(super) trait PageKind {
     /// be exactly the unchecked paging the pin exists to end.
     /// The refusal is [`cursor_error`]: `Request(Malformed)` with
     /// `RequestCause::InvalidArgument { field: Some("page_cursor") }`, the
-    /// crate's standing answer for an older cursor payload version (see the
-    /// mail search cursor). The `page_cursor` field, not the kind, is what
+    /// crate's standing answer for an older cursor payload version. The `page_cursor` field, not the kind, is what
     /// tells the consumer to restart paging from the first page.
     fn decode_page_cursor(
         page_cursor: Option<Vec<u8>>,
@@ -134,35 +223,19 @@ pub(super) trait PageKind {
         };
         let cursor = String::from_utf8(cursor)
             .map_err(|error| cursor_error(operation, error.to_string()))?;
-        let Some(payload) = cursor.strip_prefix(PAGE_CURSOR_V2_PREFIX) else {
-            return Err(cursor_error(
+        match CursorPayload::decode(&cursor, operation)? {
+            CursorPayload::Anchored {
+                anchor,
+                query_state,
+            } => Ok(Some(PageCursor {
+                anchor,
+                query_state,
+            })),
+            CursorPayload::Search { .. } => Err(cursor_error(
                 operation,
-                format!(
-                    "{} page cursor predates the anchored, state-pinned encoding",
-                    Self::COLLECTION
-                ),
-            ));
-        };
-        let (anchor, query_state): (String, String) =
-            serde_json::from_str(payload).map_err(|error| {
-                cursor_error(
-                    operation,
-                    format!("malformed {} page cursor: {error}", Self::COLLECTION),
-                )
-            })?;
-        if anchor.is_empty() {
-            return Err(cursor_error(
-                operation,
-                format!(
-                    "{} page cursor carries an empty anchor id",
-                    Self::COLLECTION
-                ),
-            ));
+                format!("{} page cursor has a search payload", Self::COLLECTION),
+            )),
         }
-        Ok(Some(PageCursor {
-            anchor,
-            query_state,
-        }))
     }
 
     /// Refuse a continuation whose result set moved under it.
@@ -339,15 +412,18 @@ pub(super) trait PageKind {
                 format!("{} returned an empty {} id", Self::METHOD, Self::ID_LABEL),
             ));
         }
-        let payload = serde_json::to_string(&(anchor, query_state)).map_err(|error| {
+        let payload = CursorPayload::Anchored {
+            anchor: anchor.to_owned(),
+            query_state: query_state.to_owned(),
+        }
+        .encode()
+        .map_err(|error| {
             page_envelope_violation(
                 operation,
                 format!("{} page cursor is not encodable: {error}", Self::COLLECTION),
             )
         })?;
-        Ok(Some(
-            format!("{PAGE_CURSOR_V2_PREFIX}{payload}").into_bytes(),
-        ))
+        Ok(Some(payload.into_bytes()))
     }
 
     /// The result set this page cursor addresses is not the one it was minted
@@ -480,6 +556,36 @@ pub(super) fn invalid_argument(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_codec_preserves_search_bytes_and_rejects_cross_codec_payloads() {
+        let op = AccountOperation::Search;
+        for owner in [None, Some("shared")] {
+            let encoded = encode_search(42, "q:1", owner);
+            let expected = match owner {
+                Some(owner) => super::super::foreign::encode_object(owner, "search-3:42:q:1"),
+                None => "search-3:42:q:1".to_owned(),
+            };
+            assert_eq!(encoded, expected.into_bytes());
+            assert_eq!(
+                decode_search(Some(&encoded), owner, op).unwrap(),
+                (42, Some("q:1".into()))
+            );
+        }
+        for bytes in [
+            b"search-3:-1:q".as_slice(),
+            b"2:[\"a\",\"q\"]",
+            b"7",
+            &[0xff],
+        ] {
+            let error = decode_search(Some(bytes), None, op).expect_err("restart paging");
+            let expected =
+                AccountError::invalid_page_cursor(op, bifrost_types::Protocol::Jmap, "invalid");
+            assert_eq!(error.kind(), expected.kind());
+            assert_eq!(error.recovery(), expected.recovery());
+        }
+        assert!(decode(Some(b"search-3:42:q".to_vec())).is_err());
+    }
 
     #[test]
     fn invalid_page_state_has_no_engine_recovery_directive() {
@@ -900,6 +1006,6 @@ mod tests {
             "{:?}",
             decode(Some(b"100".to_vec())).expect_err("v1 cursor")
         );
-        assert!(undecodable.contains("widget"), "{undecodable}");
+        assert!(undecodable.contains("page cursor"), "{undecodable}");
     }
 }

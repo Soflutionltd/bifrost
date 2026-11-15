@@ -40,6 +40,10 @@ use crate::types::validated::MailboxName;
 pub(crate) struct ProtocolState {
     /// Current session state (RFC 3501 Section3).
     state: SessionState,
+    /// Driver exchange evidence, independent of protocol error classification.
+    /// Reset at request admission; sends leave it unfinished until ReadLoop
+    /// observes the terminal completion. Logout remains an independent veto.
+    pub(in crate::connection) framing: super::driver::read_loop::Framing,
     /// Cached server capabilities (RFC 3501 Section7.2.1).
     capabilities: Vec<Capability>,
     /// Per-type NOTIFY registration flags (RFC 5465 Section5.1-5.8).
@@ -89,6 +93,7 @@ impl ProtocolState {
     pub(crate) fn new() -> Self {
         Self {
             state: SessionState::NotAuthenticated,
+            framing: super::driver::read_loop::Framing::Untouched,
             capabilities: Vec::new(),
             notify: NotifyFlags::default(),
             selected: None,

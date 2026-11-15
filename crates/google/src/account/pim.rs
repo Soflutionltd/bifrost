@@ -326,18 +326,19 @@ pub(crate) fn search_messages(
                 skipped_scopes: Vec::new(),
             });
         }
-        let (messages, next, estimate) = client
+        let response = client
             .list_messages(query.as_deref(), Some(max), page_token.as_deref())
             .await
             .map_err(|e| account_error_for(e, error::GmailErrorContext::search_messages()))?;
         Ok(Page {
             truncated: false,
-            items: messages
+            items: response
+                .messages
                 .into_iter()
                 .map(|message| ObjectId(message.id))
                 .collect(),
-            next_cursor: next.map(String::into_bytes),
-            estimated_total: estimate.and_then(non_negative_i64),
+            next_cursor: response.next_page_token.map(String::into_bytes),
+            estimated_total: response.result_size_estimate.and_then(non_negative_i64),
             failed_ids: Vec::new(),
             skipped_scopes: Vec::new(),
         })

@@ -113,19 +113,9 @@ impl GmailClient {
         query: Option<&str>,
         max_results: Option<u32>,
         page_token: Option<&str>,
-    ) -> Result<(
-        Vec<crate::types::GmailMessageStub>,
-        Option<String>,
-        Option<i64>,
-    )> {
+    ) -> Result<ListMessagesResponse> {
         let qs = mail_list_query(query, max_results, page_token);
-
-        let resp: ListMessagesResponse = self.get(&format!("/messages{qs}")).await?;
-        Ok((
-            resp.messages,
-            resp.next_page_token,
-            resp.result_size_estimate,
-        ))
+        self.get(&format!("/messages{qs}")).await
     }
 
     pub(crate) async fn get_thread(&self, thread_id: &str, format: &str) -> Result<GmailThread> {

@@ -28,6 +28,61 @@ pub(crate) const OUTLOOK_BASE: &str = "https://outlook.office365.com";
 /// real Graph endpoint or a harness redirect.
 const GRAPH_HOST: &str = "graph.microsoft.com";
 
+/// Paired Microsoft service endpoints, including private deployments.
+///
+/// This is the extension point for per-service token audiences once the shared
+/// transport can select an audience. For now the supplied token source must be
+/// accepted by each enabled surface; selecting a cloud does not acquire tokens.
+#[derive(Clone, Debug)]
+pub struct MicrosoftCloud {
+    graph: Base,
+    outlook: Base,
+}
+
+impl MicrosoftCloud {
+    pub fn global() -> Self {
+        Self::custom(GRAPH_API_BASE, OUTLOOK_BASE)
+    }
+
+    /// US Government L4 (GCC High). GCC uses the global cloud.
+    pub fn us_gov() -> Self {
+        Self::custom(
+            "https://graph.microsoft.us/v1.0",
+            "https://outlook.office365.us",
+        )
+    }
+
+    pub fn us_gov_dod() -> Self {
+        Self::custom(
+            "https://dod-graph.microsoft.us/v1.0",
+            "https://outlook-dod.office365.us",
+        )
+    }
+
+    pub fn china() -> Self {
+        Self::custom(
+            "https://microsoftgraph.chinacloudapi.cn/v1.0",
+            "https://partner.outlook.cn",
+        )
+    }
+
+    /// Bases are validated independently; unusable bases fail closed on use.
+    pub fn custom(graph: impl Into<String>, outlook: impl Into<String>) -> Self {
+        Self {
+            graph: Base::parse(graph),
+            outlook: Base::parse(outlook),
+        }
+    }
+
+    pub fn graph_base(&self) -> &str {
+        self.graph.as_str()
+    }
+
+    pub fn outlook_base(&self) -> &str {
+        self.outlook.as_str()
+    }
+}
+
 /// Resource ownership is declared by the caller, including continuation walks.
 pub(crate) enum Resource {
     Outlook,
@@ -57,13 +112,8 @@ struct MailboxIdentity {
 struct ClientInner {
     net: Option<Net>,
     account_net: RwLock<Option<AccountNet>>,
-    /// The Graph REST base, and the only origin a REST or blob request may
-    /// carry the bearer to (see `crate::origin`).
-    api_base: Base,
-    /// Origin for the Autodiscover + EWS surfaces. Derived from `api_base`
-    /// (see [`derive_outlook_base`]) unless a consumer overrode it with
-    /// [`GraphClient::with_outlook_base`].
-    outlook_base: Base,
+    /// One configuration owns both bearer-carrying service bases.
+    cloud: MicrosoftCloud,
     rate_limit_host: String,
     token_source: Arc<dyn TokenSource>,
     mailbox_id: Option<String>,
@@ -417,6 +467,28 @@ impl GraphClient {
         Self::with_api_base(GRAPH_API_BASE, access_token)
     }
 
+    /// Configure Graph and Exchange together before registering the account.
+    pub fn with_cloud(cloud: MicrosoftCloud, source: Arc<dyn TokenSource>) -> Self {
+        let mut client = Self::with_source(cloud.graph_base(), source);
+        Arc::get_mut(&mut client.inner)
+            .expect("new client is exclusive")
+            .cloud = cloud;
+        client
+    }
+
+    /// Inject an account transport with an explicit pair of cloud endpoints.
+    pub fn with_cloud_account_net(
+        net: AccountNet,
+        cloud: MicrosoftCloud,
+        source: Arc<dyn TokenSource>,
+    ) -> Self {
+        let mut client = Self::with_account_net(net, cloud.graph_base(), source);
+        Arc::get_mut(&mut client.inner)
+            .expect("new client is exclusive")
+            .cloud = cloud;
+        client
+    }
+
     // pub: consumers may need sovereign-cloud or test Graph API endpoints before registration.
     pub fn with_api_base(api_base: impl Into<String>, access_token: impl Into<String>) -> Self {
         // Bases are trimmed once in `with_bases_and_source`.
@@ -438,8 +510,10 @@ impl GraphClient {
             inner: Arc::new(ClientInner {
                 net: Some(Net::shared_default()),
                 account_net: RwLock::new(None),
-                api_base,
-                outlook_base,
+                cloud: MicrosoftCloud {
+                    graph: api_base,
+                    outlook: outlook_base,
+                },
                 rate_limit_host,
                 token_source: source,
                 mailbox_id: None,
@@ -469,8 +543,10 @@ impl GraphClient {
             inner: Arc::new(ClientInner {
                 net: None,
                 account_net: RwLock::new(Some(net.clone())),
-                api_base,
-                outlook_base,
+                cloud: MicrosoftCloud {
+                    graph: api_base,
+                    outlook: outlook_base,
+                },
                 rate_limit_host,
                 token_source,
                 mailbox_id: None,
@@ -551,13 +627,13 @@ impl GraphClient {
 
     #[cfg(test)]
     pub(crate) fn api_base(&self) -> &str {
-        self.inner.api_base.as_str()
+        self.inner.cloud.graph.as_str()
     }
 
     /// Origin for the Autodiscover + EWS surfaces.
     #[cfg(test)]
     pub(crate) fn outlook_base(&self) -> &str {
-        self.inner.outlook_base.as_str()
+        self.inner.cloud.outlook.as_str()
     }
 
     /// A crate-built Graph path, admitted onto the api-base. The only way
@@ -565,7 +641,8 @@ impl GraphClient {
     /// configuration, so it surfaces as `GraphError::Configuration`.
     pub(crate) fn api_url(&self, path: &str) -> Result<AdmittedUrl, GraphError> {
         self.inner
-            .api_base
+            .cloud
+            .graph
             .admit(path)
             .map_err(configuration_refusal)
     }
@@ -575,7 +652,8 @@ impl GraphClient {
     /// a refusal is attributed to the response that carried it.
     pub(crate) fn admit_link(&self, link: &ProviderLink) -> Result<AdmittedUrl, GraphError> {
         self.inner
-            .api_base
+            .cloud
+            .graph
             .admit_link(link)
             .map_err(|refusal| match refusal {
                 Refusal::InvalidBase(_) => configuration_refusal(refusal),
@@ -595,20 +673,21 @@ impl GraphClient {
     /// Admit a target whose provenance the CALLER knows (a caller page
     /// cursor, a persisted sync cursor) and will classify itself.
     pub(crate) fn admit_target(&self, target: &str) -> Result<AdmittedUrl, Refusal> {
-        self.inner.api_base.admit(target)
+        self.inner.cloud.graph.admit(target)
     }
 
     /// Admit a OneDrive upload session URL under the upload rule (see
     /// `Base::admit_upload`). The caller classifies the refusal.
     pub(crate) fn admit_upload(&self, raw: &str) -> Result<UploadUrl, Refusal> {
-        self.inner.api_base.admit_upload(raw)
+        self.inner.cloud.graph.admit_upload(raw)
     }
 
     /// A crate-built Autodiscover / EWS path, admitted onto the Outlook
     /// origin.
     pub(crate) fn outlook_url(&self, path: &str) -> Result<AdmittedUrl, GraphError> {
         self.inner
-            .outlook_base
+            .cloud
+            .outlook
             .admit(path)
             .map_err(configuration_refusal)
     }
@@ -616,7 +695,8 @@ impl GraphClient {
     /// The EWS SOAP endpoint on the Outlook origin, or why there is none.
     pub(crate) fn ews_url(&self) -> Result<AdmittedUrl, String> {
         self.inner
-            .outlook_base
+            .cloud
+            .outlook
             .admit(crate::ews::EWS_PATH)
             .map_err(|refusal| refusal.to_string())
     }
@@ -624,19 +704,12 @@ impl GraphClient {
     /// Admit an endpoint an Autodiscover response named, onto the Outlook
     /// origin. The caller classifies the refusal.
     pub(crate) fn admit_outlook_target(&self, target: &str) -> Result<AdmittedUrl, Refusal> {
-        self.inner.outlook_base.admit(target)
+        self.inner.cloud.outlook.admit(target)
     }
 
-    /// Override the Autodiscover / EWS origin independently of the Graph
-    /// api-base. Test seam mirroring `bifrost-google`'s
-    /// `with_people_api_base`: those two surfaces live on a different host
-    /// from Graph in production, so a harness that only redirects the Graph
-    /// base would still send Autodiscover and EWS traffic to
-    /// `outlook.office365.com`. Redirecting the Graph api-base to a
-    /// non-Graph host already derives this (so the common harness case needs
-    /// no extra call); this exists for a sovereign cloud, where the Graph and
-    /// Outlook hosts differ but neither is the public one.
-    // pub: harness / sovereign-cloud consumers redirect Autodiscover + EWS before registration.
+    /// Override the Autodiscover / EWS base while retaining the Graph base.
+    /// Named Microsoft clouds already pair the two surfaces; this also supports
+    /// custom deployments whose service endpoints live on different origins.
     #[must_use]
     pub fn with_outlook_base(&self, outlook_base: impl Into<String>) -> Self {
         Self {
@@ -644,8 +717,10 @@ impl GraphClient {
             inner: Arc::new(ClientInner {
                 net: self.inner.net.clone(),
                 account_net: RwLock::new(self.account_net()),
-                api_base: self.inner.api_base.clone(),
-                outlook_base: Base::parse(outlook_base),
+                cloud: MicrosoftCloud {
+                    graph: self.inner.cloud.graph.clone(),
+                    outlook: Base::parse(outlook_base),
+                },
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
                 mailbox_id: self.inner.mailbox_id.clone(),
@@ -754,8 +829,8 @@ impl GraphClient {
             _ => format!("primary|{primary}"),
         };
         // Origin only: v1.0 and beta share one provider mailbox budget.
-        let origin = self.inner.api_base.url().map_or_else(
-            || self.inner.api_base.as_str().to_owned(),
+        let origin = self.inner.cloud.graph.url().map_or_else(
+            || self.inner.cloud.graph.as_str().to_owned(),
             |url| url.origin().ascii_serialization(),
         );
         MailboxIdentity {
@@ -816,8 +891,7 @@ impl GraphClient {
             inner: Arc::new(ClientInner {
                 net: self.inner.net.clone(),
                 account_net: RwLock::new(self.account_net()),
-                api_base: self.inner.api_base.clone(),
-                outlook_base: self.inner.outlook_base.clone(),
+                cloud: self.inner.cloud.clone(),
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
                 mailbox_id: Some(mailbox_id.into().to_ascii_lowercase()),
@@ -1659,23 +1733,10 @@ fn host_from_api_base(api_base: &Base) -> String {
         .unwrap_or_else(|| GRAPH_HOST.to_string())
 }
 
-/// Derive the Autodiscover / EWS origin from the Graph api-base.
-///
-/// A base on the production Graph host means production Microsoft, so
-/// Autodiscover and EWS keep their own production origin
-/// (`outlook.office365.com`) - they are a different host from Graph and
-/// must not be rewritten to it. Any OTHER host means the api-base was
-/// redirected (a harness mock, a sovereign cloud), and the same origin is
-/// the only sane target for the sibling surfaces: a harness that redirects
-/// Graph but leaves Autodiscover/EWS pointing at the real
-/// `outlook.office365.com` cannot exercise the public-folder or EWS-streaming
-/// legs at all.
-///
-/// An UNUSABLE api-base derives an unusable Outlook origin rather than
-/// falling back to production: a consumer that misconfigured Graph must not
-/// be left with Autodiscover and EWS sending its bearer to the real
-/// `outlook.office365.com`. `with_outlook_base` can still name one
-/// explicitly.
+/// Compatibility inference for the single-base constructors. Known Microsoft
+/// hosts select the paired cloud; an unknown deployment retains the historical
+/// same-origin harness behavior. Explicit clouds avoid inference altogether.
+/// An enterprise Outlook user expects Exchange reads to remain in their cloud.
 fn derive_outlook_base(api_base: &Base) -> Base {
     let Some(url) = api_base.url() else {
         return Base::invalid(
@@ -1683,8 +1744,15 @@ fn derive_outlook_base(api_base: &Base) -> Base {
             "Outlook origin derived from an unusable Graph api-base",
         );
     };
-    if url.host_str() == Some(GRAPH_HOST) {
-        return Base::parse(OUTLOOK_BASE);
+    let cloud = match url.host_str() {
+        Some(GRAPH_HOST) => Some(MicrosoftCloud::global()),
+        Some("graph.microsoft.us") => Some(MicrosoftCloud::us_gov()),
+        Some("dod-graph.microsoft.us") => Some(MicrosoftCloud::us_gov_dod()),
+        Some("microsoftgraph.chinacloudapi.cn") => Some(MicrosoftCloud::china()),
+        _ => None,
+    };
+    if let Some(cloud) = cloud {
+        return cloud.outlook;
     }
     // `validate` guarantees a host on a usable base.
     Base::parse(url.origin().ascii_serialization())

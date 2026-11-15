@@ -149,8 +149,7 @@ Rate admission is refunded by the existing debit guard on a local refusal.
 response status, headers and capped diagnostic body. An initial refusal has no
 earlier attempts and translates with `Attempt(Unsent)`. A refusal between
 attempts preserves those causes and outcome diagnostics; the effective state
-is `InFlight` if any attempt remains uncertain OR an acknowledged
-non-idempotent attempt may have committed, otherwise `Acknowledged` if a
+is `InFlight` if a non-replayable attempt may have committed, otherwise `Acknowledged` if a
 response arrived, otherwise `Unsent`. The `may_have_committed` flag survives
 redirect method rewrites: a committed POST answered by 303 followed by a held
 GET reconciles as `ThrottledMidFlight` for a non-idempotent operation, rather
@@ -192,8 +191,9 @@ physical attempt evidence. This is the existing reconcile-required lane for
 an incomplete logical exchange, including when the later failure is auth or
 redirect policy. It prevents replaying a committed POST after its redirected
 GET times out during token lookup, or when a quota retry wait exceeds the
-total deadline. A target `401` does not count as a possibly committed attempt:
-it rejects the request before authentication. If token refresh then fails
+total deadline. The shared refusal predicate excludes 401, 429, 405 and 501 from possible
+commit evidence: authentication, quota and unsupported-method refusals prove
+that attempt did no work. If token refresh then fails
 before a replacement dispatch, the terminal refresh failure keeps its own
 retry classification and the authentication cause remains in the chain.
 Commit evidence from an earlier non-`401` response or an in-flight attempt
@@ -431,7 +431,7 @@ feeds the per-account meter and the bandwidth-cap throttle.
   retry budget: a 401 retry no longer burns one of the `max_attempts`
   network attempts.
 - 5xx or in `policy.statuses` -> retry candidate, subject to resolved replay
-  policy (401/429 refusals excepted). Allowed retries use backoff. Honor
+  policy (401/429/405/501 refusals excepted). Allowed retries use backoff. Honor
   `Retry-After` (delta-seconds + RFC 9110 HTTP-date via
   `httpdate`), capped by `policy.honor_retry_after_cap` (single
   source of truth). Without `Retry-After`: exponential backoff
@@ -496,10 +496,10 @@ processed (RFC 9113 section 8.7), so `send_error_to_error` classifies it as
 fresh upload body through admission on each attempt; reqwest cannot clone the
 wrapped body for its own protocol retries.
 All 5xx and configured `RetryPolicy::statuses` are retry candidates, gated by
-that same resolved request policy. Only 401 and 429 refusals may retry an
+that same resolved request policy. Only 401, 429, 405 and 501 refusals may retry an
 unreplayable request. Authentication refresh keeps its separate budget; 429
-must still be selected by the retry policy. A 5xx acknowledges a response, but
-does not prove refusal: it can follow a committed write. The response is drained
+must still be selected by the retry policy. A generic 5xx acknowledges a response, but
+does not prove refusal (501 is an explicit unsupported-method refusal): it can follow a committed write. The response is drained
 and observed before the gate, preserving diagnostics, holds and Retry-After.
 An allowed retry refunds its quota slot; a policy-stopped attempt neither waits
 nor refunds for a retry that never happens.
@@ -1586,3 +1586,27 @@ Request timeout overrides use explicit inherit, unbounded and bounded states.
 Ranged-download validation consumes the original `ByteRange`, rather than
 parsing the generated request header. Account priority stores `Priority`
 directly, without an integer decoding fallback.
+
+## Logical-request attempt ledger
+
+`AttemptLedger` records ordered `AttemptOutcome::Response(StatusCode)` and
+`AttemptOutcome::Transport(TransmissionState)` observations. Its sticky verdict
+is `CommitEvidence::{Unsent, Acknowledged, MayHaveCommitted}`. The send loop feeds
+it with each attempt's resolved replay policy, including across method rewrites.
+DAV's existing redirect walker and `RedirectHistory` feed the same ledger; their
+credential and redirect policies stay local to DAV.
+
+`is_proven_refusal` is the shared predicate: 401, 429, 405 and 501 prove refusal.
+503 does not: a gateway can return it after an upstream write committed.
+An enterprise mail user must never get a duplicate write from a blind retry of
+possibly committed work, and must get a retry when work provably did not happen.
+Replayable attempts do not turn a later unsent failure into a partial response;
+the terminal retry classification remains intact. Non-replayable uncertainty
+survives later local, credential and unsent failures and requires reconciliation.
+A direct terminal status remains a complete answer with its normal classification.
+
+The existing `AttemptHistory` and `LocalHold` public fields remain the transport
+and diagnostic envelope for consumers that construct or inspect them. Internally,
+`AttemptEvidence` carries the ledger instead of separate commit booleans.
+Account-error translation reads raw evidence into the ledger and consumes its
+verdict; translated diagnostic cause chains do not decide replay safety.

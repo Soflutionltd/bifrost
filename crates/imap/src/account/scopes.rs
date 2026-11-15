@@ -10,7 +10,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use bifrost_types::{Account, CursorScope, MembershipScope, SyncEvent, Warning};
-use futures::StreamExt as _;
 
 use super::{ImapAccount, folder_scope, membership_scope};
 
@@ -25,34 +24,15 @@ pub(crate) fn discover_cursor_scopes(
         .map(|entry| folder_scope(&entry.name))
         .collect();
     // The two composable sub-accounts contribute their own typed cursor
-    // scopes (CardDAV `Type(Contact)`, CalDAV `Type(CalendarEvent)`).
+    // collection-folder scopes (legacy typed scopes remain accepted).
     let subs: Vec<Arc<dyn Account>> = [account.contacts.clone(), account.calendars.clone()]
         .into_iter()
         .flatten()
         .collect();
-    // Degraded-DAV warnings recorded at open (brick 5) surface here so the
-    // engine observes the degradation. The read is non-consuming and the
-    // clear is acknowledge-driven: the warnings ride inside a future that
-    // `merge_scope_streams` only runs on first poll, and a consumer that
-    // builds this stream and drops it un-polled (the engine's attach path
-    // can) would otherwise destroy the one and only record that a CardDAV
-    // or CalDAV half is missing, leaving the account presenting as
-    // mail-only with nothing left to re-read. Clearing on the terminal
-    // `Done` bounds re-reporting to at most one duplicate per dropped
-    // stream, and discovery is not a hot path.
-    let degraded = account.peek_dav_degraded_warnings();
-    let acknowledge = !degraded.is_empty();
-    let stream = fan_in_discovery(folder_scopes, degraded, subs, |sub| {
+    // Open-time gaps belong to OpenedAccount, not a second warning lane.
+    fan_in_discovery(folder_scopes, Vec::new(), subs, |sub| {
         sub.discover_cursor_scopes()
-    });
-    if !acknowledge {
-        return stream;
-    }
-    Box::pin(stream.inspect(move |event| {
-        if matches!(event, SyncEvent::Done(_)) {
-            account.clear_dav_degraded_warnings();
-        }
-    }))
+    })
 }
 
 pub(crate) fn discover_memberships(
@@ -146,13 +126,13 @@ pub(crate) fn scope_lifecycle_stream(
 
 #[cfg(test)]
 mod tests {
-    use bifrost_types::{CursorScope, FolderId, MailboxId, ObjectType, SyncEvent};
+    use bifrost_types::{Account, CursorScope, FolderId, MailboxId, ObjectType, SyncEvent};
     use futures::StreamExt;
 
     use super::super::folder_registry::{FolderRegistry, SharedFolderEntry};
     use super::super::folder_scope;
     use super::super::test_support::{StubAccount, stub_arc};
-    use super::{fan_in_discovery, memberships_for_entry};
+    use super::{ImapAccount, discover_cursor_scopes, fan_in_discovery, memberships_for_entry};
     use crate::types::{MailboxInfo, MailboxName};
     use bifrost_types::MembershipScope;
 
@@ -371,76 +351,37 @@ mod tests {
         assert_eq!(items, vec![folder], "IMAP folder scopes still flow");
     }
 
-    mod degraded_dav {
-        use bifrost_types::{SyncEvent, Warning, WarningKind};
-        use futures::StreamExt as _;
-
-        use super::super::super::test_support::scripted_account_parts;
-        use super::super::super::{ImapAccount, ImapAccountParts};
-        use super::super::discover_cursor_scopes;
+    #[tokio::test]
+    async fn open_gaps_persist_in_container_snapshots_without_discovery_warnings() {
+        use super::super::test_support::scripted_account_parts;
         use crate::connection::test_support::{driver_pair, preauth_greeting};
-
-        async fn degraded_account() -> (ImapAccount, tokio::io::DuplexStream) {
-            let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
-            let account = ImapAccount::new(ImapAccountParts {
-                dav_degraded: vec![Warning::support_only(
-                    WarningKind::Other,
-                    "CardDAV sub-account failed to attach; mail only",
-                )],
-                ..scripted_account_parts(conn, 1)
-            });
-            (account, server)
-        }
-
-        async fn drain_warnings(
-            mut stream: bifrost_types::AccountStream<SyncEvent<bifrost_types::CursorScope>>,
-        ) -> usize {
-            let mut warnings = 0;
-            while let Some(event) = stream.next().await {
-                match event {
-                    SyncEvent::Warning(_) => warnings += 1,
-                    SyncEvent::Done(_) => break,
-                    _ => {}
-                }
-            }
-            warnings
-        }
-
-        /// The degraded-DAV warnings are the only record that a configured
-        /// CardDAV/CalDAV half is missing. A discovery stream built and
-        /// dropped before its first poll - which the engine's attach path
-        /// can do - must not consume them, or the account presents as
-        /// mail-only with nothing left to re-read.
-        #[tokio::test]
-        async fn a_discovery_stream_dropped_unpolled_keeps_the_degraded_warnings() {
-            let (account, _server) = degraded_account().await;
-
-            drop(discover_cursor_scopes(account.clone()));
-
+        let (conn, _peer) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+        let mut parts = scripted_account_parts(conn, 1);
+        parts.discovery_skips.push(bifrost_types::SkippedScope {
+            scope: bifrost_types::ErrorScope::ContactCollection,
+            error: super::super::account_error_with(
+                crate::Error::Internal("DAV open failed".into()),
+                super::super::error::ImapErrorContext::operation(
+                    bifrost_types::AccountOperation::Discover,
+                ),
+            ),
+        });
+        let account = ImapAccount::new(parts);
+        drop(discover_cursor_scopes(account.clone()));
+        for _ in 0..2 {
             assert_eq!(
-                drain_warnings(discover_cursor_scopes(account.clone())).await,
-                1,
-                "the degradation must survive a discovery stream nobody polled",
-            );
-        }
-
-        /// The flip side: once a discovery stream has actually delivered
-        /// the warnings and its terminal `Done`, the next discovery is
-        /// silent. Without this the fix would re-report the same
-        /// degradation on every discovery.
-        #[tokio::test]
-        async fn a_fully_consumed_discovery_acknowledges_the_degraded_warnings() {
-            let (account, _server) = degraded_account().await;
-
-            assert_eq!(
-                drain_warnings(discover_cursor_scopes(account.clone())).await,
+                account
+                    .containers_list()
+                    .await
+                    .unwrap()
+                    .skipped_scopes
+                    .len(),
                 1
             );
-            assert_eq!(
-                drain_warnings(discover_cursor_scopes(account.clone())).await,
-                0,
-                "a delivered degradation must not be re-reported",
-            );
+            let mut discovery = discover_cursor_scopes(account.clone());
+            while let Some(event) = discovery.next().await {
+                assert!(!matches!(event, SyncEvent::Warning(_)));
+            }
         }
     }
 }
