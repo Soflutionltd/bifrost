@@ -8,7 +8,9 @@
 //! the future", not as "the property exists".
 //!
 //! Read: the hydration `$expand` pulls `0x0F01` alone, [`is_pinned`] decodes
-//! it into the `$pinned` engine flag. Write: the `$pinned` flag projects onto
+//! it into the `$pinned` engine flag. An inventory page cannot carry the
+//! property, so the walk lists the folder's pinned ids ([`PINNED_FILTER`]) and
+//! leaves those messages to hydration. Write: the `$pinned` flag projects onto
 //! both properties in the same PATCH as the other flags.
 
 use serde_json::{Value, json};
@@ -16,9 +18,13 @@ use serde_json::{Value, json};
 /// The engine flag the pin state travels as, both directions.
 pub(crate) const PINNED_FLAG: &str = "$pinned";
 
-/// The `$expand` item that reads the pin marker, URL-encoded.
-pub(crate) const PIN_EXPAND: &str =
-    "singleValueExtendedProperties($filter=id%20eq%20'SystemTime%200x0F01')";
+/// The `$filter` that keeps a folder's pinned messages, URL-encoded. Message
+/// delta refuses an `$expand` of extended properties (HTTP 400, "Parsing
+/// OData Select and Expand failed"), so an inventory learns which messages
+/// are pinned from this listing instead of from its own pages.
+/// A date-typed extended property compares only through an explicit cast:
+/// a bare `ep/value` restriction on it answers `ErrorInvalidUrlQueryFilter`.
+pub(crate) const PINNED_FILTER: &str = "singleValueExtendedProperties/any(ep:%20ep/id%20eq%20'SystemTime%200x0F01'%20and%20cast(ep/value,%20Edm.DateTimeOffset)%20ge%204000-01-01T00:00:00Z)";
 
 const PIN_PROPERTY_ID: &str = "SystemTime 0x0F01";
 const PIN_SORT_PROPERTY_ID: &str = "SystemTime 0x0F02";
@@ -91,6 +97,11 @@ mod tests {
             "SystemTime 0xF01",
             "4500-09-01T00:00:00Z"
         )));
+    }
+
+    #[test]
+    fn the_pinned_filter_starts_at_the_year_that_reads_as_pinned() {
+        assert!(PINNED_FILTER.contains(&format!("ge%20{PINNED_FROM_YEAR}-01-01T00:00:00Z")));
     }
 
     #[test]

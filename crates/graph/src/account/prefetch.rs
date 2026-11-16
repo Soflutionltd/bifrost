@@ -79,7 +79,10 @@ impl PrefetchedMessages {
     }
 }
 
-fn self_contained(value: &Value) -> bool {
+/// Whether hydration can be answered from this page value alone, as far as
+/// the value itself can tell. Its pin state is not in it: the caller checks
+/// that against the folder's pinned ids before parking.
+pub(crate) fn self_contained(value: &Value) -> bool {
     value.get("hasAttachments").and_then(Value::as_bool) == Some(false)
         && !["body", "uniqueBody"].iter().any(|field| {
             value

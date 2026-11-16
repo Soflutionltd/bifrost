@@ -15,7 +15,7 @@ use super::cursor::{
     GraphCursorPayload, GraphPageMarker, encode_cursor, kind_for_scope, scope_for_kind,
 };
 use super::graph_error::{GraphErrorContext, cursor_error_to_account_error};
-use super::pin::PIN_EXPAND;
+use super::pin::PINNED_FILTER;
 
 const EVENT_SELECT: &str = "\
 id,subject,bodyPreview,start,end,isAllDay,location,organizer,\
@@ -128,6 +128,9 @@ fn inventory_stream_from(
             }
         };
         let mut walk = crate::paging::PageWalk::new("inventory delta");
+        // Listed on the first page value hydration could be answered from,
+        // so a walk that parks nothing asks nothing.
+        let mut pinned: Option<Option<std::collections::HashSet<String>>> = None;
 
         loop {
             if let Err(error) = walk.enter(&current_url) {
@@ -235,8 +238,15 @@ fn inventory_stream_from(
                         .memberships
                         .push(bifrost_types::MembershipScope::Mailbox(owner.clone()));
                 }
-                if matches!(scope, CursorScope::FolderType { ty: ObjectType::Email, .. }) {
-                    account.prefetched.park(entry.id.0.clone(), value);
+                if matches!(scope, CursorScope::FolderType { ty: ObjectType::Email, .. })
+                    && super::prefetch::self_contained(&value)
+                {
+                    if pinned.is_none() {
+                        pinned = Some(pinned_message_ids(&client, &scope).await);
+                    }
+                    if may_park(pinned.as_ref().and_then(Option::as_ref), &value) {
+                        account.prefetched.park(entry.id.0.clone(), value);
+                    }
                 }
                 entries.push(entry);
             }
@@ -305,6 +315,80 @@ fn inventory_stream_from(
             }
         }
     })
+}
+
+/// Pages of pinned ids read before giving up: 50 a page, far past what a
+/// folder pins by hand.
+const PINNED_LIST_MAX_PAGES: usize = 20;
+
+/// The path that lists the ids of a mail folder's pinned messages.
+fn pinned_messages_path(prefix: &str, scope: &CursorScope) -> Option<String> {
+    let CursorScope::FolderType {
+        folder,
+        ty: ObjectType::Email,
+    } = scope
+    else {
+        return None;
+    };
+    let native = super::foreign::parse_folder(folder).native_id().to_string();
+    let encoded = bifrost_net::url::encode_path_component(&native);
+    Some(format!(
+        "{prefix}/mailFolders/{encoded}/messages?$select=id&$filter={PINNED_FILTER}"
+    ))
+}
+
+/// The ids of the scope's pinned messages, as Graph spells them. `None` when
+/// the listing failed or ran past its page cap: the walk then parks nothing
+/// for the scope, and hydration reads every message with its pin marker.
+async fn pinned_message_ids(
+    client: &crate::client::GraphClient,
+    scope: &CursorScope,
+) -> Option<std::collections::HashSet<String>> {
+    let path = pinned_messages_path(&client.api_path_prefix(), scope)?;
+    let mut ids = std::collections::HashSet::new();
+    let mut url = match client.api_url(&path) {
+        Ok(url) => url,
+        Err(error) => {
+            tracing::warn!(target: "bifrost.graph.inventory", scope = ?scope, error = ?error, "pinned listing refused");
+            return None;
+        }
+    };
+    for _ in 0..PINNED_LIST_MAX_PAGES {
+        let page = match fetch_page(client, &url).await {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!(target: "bifrost.graph.inventory", scope = ?scope, error = ?error, "pinned listing failed");
+                return None;
+            }
+        };
+        ids.extend(
+            page.value
+                .iter()
+                .filter_map(|value| value.get("id").and_then(Value::as_str))
+                .map(str::to_string),
+        );
+        match client.admit_next(page.next_link.as_ref()) {
+            Ok(Some(next)) => url = next,
+            Ok(None) => return Some(ids),
+            Err(error) => {
+                tracing::warn!(target: "bifrost.graph.inventory", scope = ?scope, error = ?error, "pinned listing link refused");
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Whether a self-contained page value may answer hydration: only when the
+/// folder's pinned ids are known and this message is not one of them.
+fn may_park(pinned: Option<&std::collections::HashSet<String>>, value: &Value) -> bool {
+    let Some(pinned) = pinned else {
+        return false;
+    };
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !pinned.contains(id))
 }
 
 pub(crate) async fn fetch_delta_page(
@@ -457,11 +541,12 @@ fn initial_delta_request(
             match ty {
                 // Newest first, so a first sync shows recent mail at once. The
                 // only order message delta accepts; without one, Graph's order
-                // is unspecified. The pin property rides along so a page value
-                // can answer hydration on its own (`PrefetchedMessages`).
+                // is unspecified. No `$expand`: message delta answers an
+                // extended-property expand with HTTP 400, so the pin marker
+                // comes from `pinned_message_ids` instead.
                 ObjectType::Email => Ok((
                     format!(
-                        "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}&$expand={PIN_EXPAND}&$orderby=receivedDateTime%20desc"
+                        "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}&$orderby=receivedDateTime%20desc"
                     ),
                     None,
                 )),
@@ -668,8 +753,8 @@ mod tests {
             "a first sync must walk newest first: {url}"
         );
         assert!(
-            url.contains("&$expand=singleValueExtendedProperties("),
-            "a page value must carry the pin marker to answer hydration: {url}"
+            !url.contains("$expand"),
+            "message delta answers an extended-property expand with HTTP 400: {url}"
         );
     }
 
@@ -1591,5 +1676,113 @@ mod tests {
             entry.fingerprint.server_version,
             ServerVersion::ETag(_)
         ));
+    }
+    fn inbox_mail_scope() -> CursorScope {
+        CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        }
+    }
+
+    /// A delta page value hydration can be answered from on its own.
+    fn parkable(id: &str) -> Value {
+        json!({
+            "id": id,
+            "changeKey": format!("ck-{id}"),
+            "hasAttachments": false,
+            "body": { "contentType": "html", "content": "<p>hello</p>" }
+        })
+    }
+
+    #[test]
+    fn the_pinned_listing_filters_one_mail_folder_on_the_pin_marker() {
+        let path = pinned_messages_path("/me", &inbox_mail_scope()).expect("a mail folder");
+        assert!(
+            path.starts_with(
+                "/me/mailFolders/inbox/messages?$select=id&$filter=singleValueExtendedProperties/any("
+            ),
+            "{path}"
+        );
+        assert!(path.contains("SystemTime%200x0F01"), "{path}");
+        assert!(pinned_messages_path("/me", &CursorScope::Account).is_none());
+    }
+
+    #[test]
+    fn only_an_unpinned_message_of_a_listed_folder_may_be_parked() {
+        let pinned = std::collections::HashSet::from(["pinned-one".to_string()]);
+        assert!(may_park(Some(&pinned), &parkable("plain-two")));
+        assert!(!may_park(Some(&pinned), &parkable("pinned-one")));
+        assert!(
+            !may_park(None, &parkable("plain-two")),
+            "an unknown pin state leaves the message to hydration"
+        );
+    }
+
+    /// The page cannot say which messages are pinned, so the walk asks the
+    /// folder once and leaves the pinned ones to hydration, which reads the
+    /// pin marker.
+    #[tokio::test]
+    async fn a_pinned_message_is_left_to_hydration() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [parkable("pinned-one"), parkable("plain-two")],
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?token=final"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "value": [{ "id": "pinned-one" }] }),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let parked = std::sync::Arc::clone(&account.prefetched);
+        let mut stream = inventory_stream(account, inbox_mail_scope());
+        while stream.next().await.is_some() {}
+
+        assert!(parked.take("plain-two").is_some());
+        assert!(parked.take("pinned-one").is_none());
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].url.contains("$expand"), "{}", requests[0].url);
+        assert!(
+            requests[1]
+                .url
+                .contains("/me/mailFolders/inbox/messages?$select=id&$filter="),
+            "{}",
+            requests[1].url
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_pinned_listing_parks_nothing() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [parkable("plain-two")],
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?token=final"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::BAD_REQUEST,
+                json!({ "error": { "code": "BadRequest", "message": "refused" } }),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let parked = std::sync::Arc::clone(&account.prefetched);
+        let mut stream = inventory_stream(account, inbox_mail_scope());
+        let mut batches = 0;
+        while let Some(event) = stream.next().await {
+            if matches!(event, bifrost_types::InventoryEvent::Batch(_)) {
+                batches += 1;
+            }
+        }
+
+        assert_eq!(batches, 1, "the walk itself is not failed by the listing");
+        assert!(parked.take("plain-two").is_none());
     }
 }
