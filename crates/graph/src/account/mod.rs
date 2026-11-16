@@ -1291,7 +1291,7 @@ impl Account for GraphAccount {
         Box::pin(async move { pim::message_hydrate(account, message, projection).await })
     }
 
-    fn move_thread(
+    fn move_thread_provider(
         &self,
         thread: ThreadId,
         target: bifrost_types::ContainerId,
@@ -1301,16 +1301,10 @@ impl Account for GraphAccount {
         Box::pin(async move { pim::move_thread(account, thread, target).await })
     }
 
-    // `apply_label` and `remove_label` rely on the trait's default
-    // dispatch in `bifrost_types::Account`. The default routes
-    // `(Label, Graph)` and `(Folder, Graph)` provenance through
-    // `set_category`, `(Folder, non-Graph)` through
-    // `add_to_container` / `remove_from_container`, and the remaining
-    // shapes through `set_keyword` / `set_label_membership` - which
-    // surface `Unsupported` on Graph if the consumer hands us a
-    // cross-account label object. No override needed here.
+    // Label conveniences use this account's declared category shapes for both
+    // wire kinds. The shared extension contains no provider identity switch.
 
-    fn delete_thread(
+    fn delete_thread_provider(
         &self,
         thread: ThreadId,
         current: Option<bifrost_types::ContainerId>,
@@ -1647,7 +1641,7 @@ mod tests {
                     resource: "/me/calendars/cal/events".to_string(),
                     scopes: vec![CursorScope::FolderType {
                         folder: FolderId("cal".to_string()),
-                        ty: ObjectType::Event,
+                        ty: ObjectType::CalendarEvent,
                     }],
                     warned_unparseable_expiry: false,
                     terminated: false,

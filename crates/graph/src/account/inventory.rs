@@ -755,7 +755,7 @@ mod tests {
             (
                 CursorScope::FolderType {
                     folder: FolderId("calendar".into()),
-                    ty: ObjectType::Event,
+                    ty: ObjectType::CalendarEvent,
                 },
                 ObjectId("calendar::gone".into()),
             ),
@@ -929,7 +929,7 @@ mod tests {
         let account = test_account();
         let scope = CursorScope::FolderType {
             folder: FolderId("calendar".to_string()),
-            ty: ObjectType::Event,
+            ty: ObjectType::CalendarEvent,
         };
         let now = jiff::Timestamp::new(1_700_000_000, 0).expect("fixed test timestamp");
         let (url, end) =
@@ -974,7 +974,7 @@ mod tests {
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         let scope = CursorScope::FolderType {
             folder: FolderId("calendar".to_string()),
-            ty: ObjectType::Event,
+            ty: ObjectType::CalendarEvent,
         };
 
         let events: Vec<_> = inventory_stream(account, scope).collect().await;
@@ -1035,26 +1035,6 @@ mod tests {
     }
 
     #[test]
-    fn scope_matches_payload_treats_event_and_calendar_event_as_aliases() {
-        let event_scope = CursorScope::FolderType {
-            folder: FolderId("calendar".to_string()),
-            ty: ObjectType::Event,
-        };
-        let calendar_event_scope = CursorScope::FolderType {
-            folder: FolderId("calendar".to_string()),
-            ty: ObjectType::CalendarEvent,
-        };
-        let payload = GraphCursorPayload::new(
-            kind_for_scope(&calendar_event_scope).expect("calendar event scope maps"),
-            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
-            None,
-        );
-
-        assert!(scope_matches_payload(&calendar_event_scope, &payload));
-        assert!(scope_matches_payload(&event_scope, &payload));
-    }
-
-    #[test]
     fn scope_matches_payload_rejects_unrelated_object_types() {
         let scope = CursorScope::FolderType {
             folder: FolderId("inbox".to_string()),
@@ -1062,7 +1042,7 @@ mod tests {
         };
         let other_scope = CursorScope::FolderType {
             folder: FolderId("calendar".to_string()),
-            ty: ObjectType::Event,
+            ty: ObjectType::CalendarEvent,
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&other_scope).expect("event scope maps"),
@@ -1074,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_matches_payload_rejects_aliased_object_types_for_different_folders() {
+    fn scope_matches_payload_rejects_calendar_events_for_different_folders() {
         use super::super::cursor::GraphCursorKind;
 
         let payload = GraphCursorPayload::new(
@@ -1261,11 +1241,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_mail_sync_ids_match_typed_doors_and_leave_mail_cache_alone() {
-        for ty in [
-            ObjectType::Event,
-            ObjectType::CalendarEvent,
-            ObjectType::Contact,
-        ] {
+        for ty in [ObjectType::CalendarEvent, ObjectType::Contact] {
             let client = GraphClient::new("token");
             let page = json!({
                 "value": [{"id": "item", "changeKey": "CK1"},
@@ -1357,11 +1333,7 @@ mod tests {
 
     #[tokio::test]
     async fn foreign_non_mail_scopes_have_no_typed_read_route() {
-        for ty in [
-            ObjectType::Event,
-            ObjectType::CalendarEvent,
-            ObjectType::Contact,
-        ] {
+        for ty in [ObjectType::CalendarEvent, ObjectType::Contact] {
             let folder = super::super::foreign::encode_foreign("shared@example.com", "collection");
             let scope = CursorScope::FolderType {
                 folder: folder.clone(),

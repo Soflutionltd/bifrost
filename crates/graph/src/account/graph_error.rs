@@ -484,8 +484,8 @@ fn soap_fault_to_account_error(
 ///   code is still a refusal (it is not `NoError`), so it is not read as an
 ///   unknown protocol state.
 ///
-/// `what` names the answer level for the support text (the lookup, or one
-/// setting). The verbatim code rides as the native code.
+/// The lookup/setting label and server message remain private. Only
+/// shape-checked codes enter diagnostics.
 #[must_use]
 pub(crate) fn autodiscover_error_code_to_account_error(
     what: &str,
@@ -507,7 +507,7 @@ pub(crate) fn autodiscover_error_code_to_account_error(
 /// provider declining to answer (`ProviderRefused`), the table's fallback
 /// for an unrecognised code; guessing a transient meaning for a numeric
 /// code nobody here has pinned would retry something that may be
-/// permanent. The native code stays the verbatim number.
+/// permanent. The native code is exported only after the shared shape check.
 #[must_use]
 pub(crate) fn autodiscover_pox_error_to_account_error(
     what: &str,
@@ -515,8 +515,7 @@ pub(crate) fn autodiscover_pox_error_to_account_error(
     message: Option<&str>,
     ctx: &GraphErrorContext,
 ) -> AccountError {
-    let code = code.trim();
-    let classify_as = match code {
+    let classify_as = match code.trim() {
         "500" => "InvalidUser",
         "600" => "InvalidRequest",
         other => other,
@@ -527,13 +526,13 @@ pub(crate) fn autodiscover_pox_error_to_account_error(
 /// The shared Autodiscover table: `classify_as` picks the kind (a SOAP
 /// `ErrorCode` name), `native_code` is what the server actually sent.
 fn autodiscover_error(
-    what: &str,
+    _what: &str,
     classify_as: &str,
     native_code: &str,
-    message: Option<&str>,
+    _message: Option<&str>,
     ctx: &GraphErrorContext,
 ) -> AccountError {
-    let code = native_code;
+    let code = bifrost_net::account_error::correlation_id(native_code);
     let is = |name: &str| classify_as.eq_ignore_ascii_case(name);
     let cause = if is("ServerBusy") {
         PrimaryCause::Server(ServerCause::RateLimited {
@@ -549,23 +548,16 @@ fn autodiscover_error(
         })
     } else if is("InvalidRequest") || is("InvalidSetting") {
         PrimaryCause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(format!("{what} refused the request: {code}")),
+            detail: DiagnosticText::support_only("Autodiscover refused the request"),
         })
     } else {
         PrimaryCause::Server(ServerCause::Error { status: None })
     };
-    let shown = if code.is_empty() {
-        "without a code"
-    } else {
-        code
-    };
-    let detail = match message.map(str::trim).filter(|m| !m.is_empty()) {
-        Some(message) => format!("{what} error {shown}: {message}"),
-        None => format!("{what} error {shown}"),
-    };
-    let mut builder = base_builder(ctx, cause.clone()).text(DiagnosticText::support_only(detail));
-    if !code.is_empty() {
-        builder = builder.native_code(code.to_string());
+    // Server prose may echo credentials even under support consent.
+    let mut builder = base_builder(ctx, cause.clone())
+        .text(DiagnosticText::support_only("Autodiscover error response"));
+    if let Some(code) = code {
+        builder = builder.native_code(code);
     }
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     finish(builder, ctx)
@@ -1134,13 +1126,10 @@ pub(crate) fn id_translation_refused(
     operation: AccountOperation,
     scope: ErrorScope,
     code: Option<&str>,
-    message: Option<&str>,
+    _message: Option<&str>,
 ) -> AccountError {
-    let code = code.map(str::trim).filter(|code| !code.is_empty());
-    let detail = DiagnosticText::support_only(match code {
-        Some(code) => format!("translateExchangeIds refused an id: {code}"),
-        None => "translateExchangeIds refused an id without a code".to_string(),
-    });
+    let code = code.and_then(bifrost_net::account_error::correlation_id);
+    let detail = DiagnosticText::support_only("translateExchangeIds refused an id");
     let mut builder = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
         detail: detail.clone(),
     }))
@@ -1149,15 +1138,12 @@ pub(crate) fn id_translation_refused(
     .protocol(Protocol::Graph)
     .scope(scope)
     .text(detail);
-    if let Some(code) = code {
+    if let Some(code) = code.as_deref() {
         builder = builder
             .native_code(code.to_string())
             .push_cause(Cause::Wire(WireCause::Graph(crate::error::classify_code(
                 code,
             ))));
-    }
-    if let Some(message) = message.map(str::trim).filter(|m| !m.is_empty()) {
-        builder = builder.text(DiagnosticText::support_only(message.to_string()));
     }
     // A complete response arrived and named this id; only the conversion
     // failed.

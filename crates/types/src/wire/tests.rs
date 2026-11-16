@@ -334,3 +334,74 @@ fn cursor_payload_header_offset_cannot_overflow() {
         Err(DecodeError::Malformed(_))
     ));
 }
+
+#[test]
+fn historical_event_scopes_decode_as_calendar_events_everywhere() {
+    for (scope, historical) in [
+        (
+            CursorScope::Type(crate::ObjectType::CalendarEvent),
+            vec![1, 3],
+        ),
+        (
+            CursorScope::FolderType {
+                folder: crate::FolderId("a".into()),
+                ty: crate::ObjectType::CalendarEvent,
+            },
+            vec![4, 1, 0, 0, 0, b'a', 3],
+        ),
+    ] {
+        assert_eq!(cursor::decode_scope(&historical).unwrap(), scope);
+        let canonical = cursor::encode_scope(&scope);
+        assert_eq!(canonical.last(), Some(&6));
+        assert_eq!(cursor::decode_scope(&canonical).unwrap(), scope);
+
+        let checkpoints = [
+            crate::Checkpoint::Change(crate::ChangeCursor {
+                scope: scope.clone(),
+                server_state: crate::OpaqueChangeState {
+                    protocol: crate::ProtocolKind::Graph,
+                    envelope_version: crate::PayloadVersion::new(6),
+                    bytes: vec![7],
+                },
+                advanced_through: None,
+                envelope_version: crate::TraitEnvelopeVersion::new(cursor::ENGINE_VERSION),
+            }),
+            crate::Checkpoint::Backfill(crate::BackfillCheckpoint {
+                scope: scope.clone(),
+                partition: crate::InventoryPartition::Full.durable_key(),
+                progress_marker: None,
+                progress: crate::BackfillProgress::default(),
+                envelope_version: crate::TraitEnvelopeVersion::new(cursor::ENGINE_VERSION),
+            }),
+        ];
+        for checkpoint in checkpoints {
+            let mut encoded = cursor::encode_envelope(&checkpoint);
+            // The envelope header is 13 bytes, followed by its scope bytes.
+            let tag_offset = 13 + historical.len() - 1;
+            assert_eq!(encoded[tag_offset], 6);
+            encoded[tag_offset] = 3;
+            assert_eq!(cursor::decode_envelope(&encoded).unwrap(), checkpoint);
+        }
+
+        let mut error_scope = vec![1];
+        super::write_bytes(&mut error_scope, &historical);
+        assert_eq!(
+            ledger::decode_error_scope(&mut Reader::new(&error_scope, ledger::VOCABULARY_VERSION))
+                .unwrap(),
+            ErrorScope::Cursor(scope.clone()),
+        );
+        let domain = CoverageDomain {
+            scope,
+            coordinate: CoverageCoordinate::Full,
+            snapshot: SnapshotIdentity::unstable(),
+        };
+        let mut encoded = Vec::new();
+        ledger::encode_domain(&mut encoded, &domain);
+        assert_eq!(encoded[4 + historical.len() - 1], 6);
+        encoded[4 + historical.len() - 1] = 3;
+        assert_eq!(
+            ledger::decode_domain(&mut Reader::new(&encoded, ledger::VOCABULARY_VERSION)).unwrap(),
+            domain,
+        );
+    }
+}

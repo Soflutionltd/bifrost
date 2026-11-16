@@ -85,7 +85,7 @@ follows:
 | contacts and directory | 10 |
 | calendar | 9 |
 | typed thread and message hydration | 2 |
-| convenience operations | 11 |
+| provider hooks for thread operations and autocomplete | 4 |
 | close | 1 |
 
 Push, contacts and directory, calendar, filters, and settings are genuinely
@@ -126,20 +126,22 @@ The required protocol surface in `account.rs` covers:
 - typed message and thread hydration;
 - graceful close.
 
-Default implementations form the convenience tier. They either:
+`conveniences::AccountConveniences` owns all 11 consumer conveniences, with a
+blanket implementation for every `Account + ?Sized`. Import it alongside
+`Account` for method syntax on concrete accounts, `dyn Account` and Arc handles.
+The separate extension keeps shared product policy out of the provider contract.
 
-- dispatch through capability shapes, such as `set_starred`,
-  `mark_replied`, `mark_forwarded`, and `mark_mdn_sent`;
-- dispatch by identifier provenance, such as `apply_label` and
-  `remove_label`;
-- compose aliases, such as `set_read` over `set_is_read`;
-- adapt a broad request to a narrower result, such as autocomplete;
-- return a structured `Unsupported(AccountOperation)` when a safe
-  object-safe default cannot compose multiple async calls.
+Label, starred, replied, forwarded and MDN helpers read `ConvenienceShape`.
+Providers declare the primitive and every sentinel value; dispatch never
+switches on protocol identity. `set_read` aliases `set_is_read`.
 
-`move_thread` and `delete_thread` are in the last group and report
-`AccountOperation::MoveThread` and `AccountOperation::DeleteThread`.
-Protocol crates with an internal `Arc<Self>` handle override them.
+Four provider hooks remain on Account: `move_thread_provider`,
+`delete_thread_provider`, `contact_autocomplete_provider` and
+`event_autocomplete_provider`. The extension forwards to these so provider
+composites and IMAP's delegate routing retain their behavior. Shared hook
+fallbacks live in the convenience module: thread operations report their
+structured Unsupported operation, while autocomplete requests the first search
+page with the caller's limit. Providers override hooks when needed.
 
 ## Capabilities
 
@@ -220,6 +222,25 @@ guarantee: a reassertion may overwrite a concurrent writer's later change.
 Moves have no field and are never reasserted.
 
 ## Cursor scopes and memberships
+
+`ObjectType::CalendarEvent` is the single calendar-event domain across Graph,
+CalDAV, Google and JMAP. The former `Event` variant described the same objects,
+not a separate kind of calendar entry. An enterprise user expects the same
+calendar to have one sync identity, including through IMAP calendar composition.
+Providers and composed routing therefore use `CalendarEvent` consistently.
+
+Storage writes retain `CalendarEvent` tag 6. The shared scope decoder maps both
+historical `Event` tag 3 and tag 6 to `CalendarEvent`; tag 3 is retired for writes
+and must never be reassigned. This applies to type and folder-type scopes in
+change cursor envelopes, backfill envelopes, ledger coverage domains, error
+scopes and engine ledger scope lists. No envelope version changes are needed.
+The in-memory checkpoint store keys by decoded `CursorScope` (and partition for
+backfill), so both historical spellings become the same key. Downstream durable
+stores that index raw encoded scope bytes must also decode and canonicalize
+existing keys, or look up both historical encodings, before accessing rows by
+the new canonical tag 6. Decoding a row alone cannot migrate an external index.
+If both spellings were stored, consumers must reconcile their checkpoints and
+coverage debt rather than silently overwriting one row with the other.
 
 `CursorScope` answers where change state advances:
 
@@ -494,8 +515,8 @@ heals it) from a revoked grant.
 ## Provenance and container vocabulary
 
 Identifiers are typed newtypes. `Container`, `Label`, and related
-values preserve provider-native provenance so convenience defaults can
-choose the correct primitive:
+values preserve provider-native provenance. Convenience dispatch reads the
+account declaration for the provenance wire kind:
 
 - Gmail engine labels route through label membership;
 - Graph categories route through category mutation;
@@ -511,9 +532,9 @@ id. The public `kind` remains a presentation classification, independent of
 present a native label as a folder without changing its protocol identity.
 `Container::new` retains its existing arguments and every metadata builder.
 
-The `"$flagged"` category sentinel is reserved by the convenience
-dispatch contract for providers whose starred state is represented by
-a category.
+Graph declares its reserved `"$flagged"` category sentinel in its own
+capability builder. Gmail declares its `"STARRED"` membership id there too.
+The shared crate forwards these values without knowing their native meaning.
 
 ## Hydration and blobs
 
@@ -598,8 +619,8 @@ length.
 ```
 crates/types/src/
   lib.rs              public module and re-export surface
-  account.rs          Account, AccountFactory, OpenedAccount,
-                      convenience defaults
+  account.rs          Account, AccountFactory, OpenedAccount, provider hooks
+  conveniences.rs     AccountConveniences and shared hook defaults
   capabilities.rs     declarative feature and dispatch shapes
   cursor.rs           cursor scope, membership scope, cursor state
   cursor/topology.rs  coverage, container identity, lifecycle shapes, removals
@@ -886,11 +907,17 @@ schemas from malformed bytes; sync maps those to its existing schema recovery
 and malformed-storage errors. Historical reserved cursor tags retain schema
 recovery. This ownership move changes neither stored bytes nor readable versions.
 
-`ConvenienceShape::replied` and `forwarded` use `RepliedFlagShape` and
-`ForwardedFlagShape`, each selecting `Keyword`, `ExtendedProperty` or `None`.
-Their defaults match on that single choice, so contradictory dispatch hints
-cannot be constructed. `starred` retains `StarredFlagShape` with keyword,
-label membership, category and unsupported choices; `set_starred` reads it.
+`ConvenienceShape::replied` and `forwarded` select a keyword with its value,
+an extended property with its name and value, or unsupported. `starred`
+selects a keyword, label membership id, category name, or unsupported.
+`mdn_sent_keyword` declares a writable keyword or None. `label` and `folder`
+select independent `LabelShape` primitives: keyword/category use native
+spelling, membership uses the engine id. IMAP and JMAP declare keyword labels
+and container folders, Gmail membership labels and container folders, Graph
+category labels and category folders. DAV's default shape supports neither.
+Provider-owned declarations retain Gmail's STARRED label, Graph's flagged
+category and MAPI replied/forwarded last-verb values without embedding that
+vocabulary in the neutral convenience layer.
 
 DAV collection cursors use `FolderType` with Contact or CalendarEvent.
 Composition routes those scopes by object type without rewriting cursor state.

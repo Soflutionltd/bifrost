@@ -23,6 +23,7 @@ pub mod cloud;
 pub mod compose;
 pub mod contact;
 pub mod container;
+pub mod conveniences;
 pub mod coverage;
 pub mod cursor;
 pub mod directory;
@@ -53,6 +54,8 @@ pub use account::{
     MessageReactionState, OpenedAccount, PushSubscription, unsupported_inventory_stream,
 };
 
+pub use conveniences::AccountConveniences;
+
 // Blob types.
 pub use blob::{BlobCapabilities, BlobEncoding, BlobHandle, ByteRange, Digest, DigestAlgorithm};
 
@@ -60,9 +63,9 @@ pub use blob::{BlobCapabilities, BlobEncoding, BlobHandle, ByteRange, Digest, Di
 pub use capabilities::{
     AccountCapabilities, BatchingPolicy, BlobRangeSupport, CapabilityChange, CapabilityDelta,
     CapabilityKey, CapabilityValue, ConvenienceShape, CursorFreshness, ForwardedFlagShape,
-    MutationCapabilities, MutationConcurrency, MutationReassertion, MutationReplaySafety,
-    PimMethodSupport, PushCapability, QuotaSignal, RateLimitClass, RepliedFlagShape,
-    StarredFlagShape, VersionedDoors,
+    LabelShape, MutationCapabilities, MutationConcurrency, MutationReassertion,
+    MutationReplaySafety, PimMethodSupport, PushCapability, QuotaSignal, RateLimitClass,
+    RepliedFlagShape, StarredFlagShape, VersionedDoors,
 };
 
 // Calendar primitives.

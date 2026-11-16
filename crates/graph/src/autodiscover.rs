@@ -186,8 +186,12 @@ fn malformed_answer(message: String, ctx: GraphErrorContext) -> AccountError {
 /// (a redirect code with no target, a redirect loop): the provider's
 /// contract breach (`Protocol(ContractViolation)`, `Acknowledged`), not a
 /// parse failure - the document was read in full.
-fn contradictory_answer(message: String, ctx: &GraphErrorContext) -> AccountError {
-    provider_answer_violation(ProtocolErrorKind::ContractViolation, message, ctx)
+fn contradictory_answer(_message: String, ctx: &GraphErrorContext) -> AccountError {
+    provider_answer_violation(
+        ProtocolErrorKind::ContractViolation,
+        "contradictory Autodiscover response".to_string(),
+        ctx,
+    )
 }
 
 /// A `GetUserSettings` answer that resolved without the setting the lookup
@@ -1244,9 +1248,9 @@ mod tests {
     /// An in-body `ErrorCode` other than `NoError` is a real failure, not
     /// an empty settings vec: without this the caller reports "response
     /// missing PublicFolderInformation" for what is actually an invalid
-    /// user, and the Autodiscover error text is lost.
+    /// user. Classification retains the code while diagnostics omit server prose.
     #[tokio::test]
-    async fn an_in_body_error_code_fails_the_lookup_with_its_text() {
+    async fn an_in_body_error_code_fails_the_lookup() {
         let client = exchange_client();
         client.script_aux([ScriptedRestResponse::text(
             reqwest::StatusCode::OK,
@@ -2305,5 +2309,13 @@ mod tests {
             "server01.contoso.com".to_string(),
         )];
         assert!(public_folder_routing_from_settings(&only_server).is_none());
+    }
+    #[test]
+    fn contradictory_autodiscover_fields_remain_private() {
+        let error = contradictory_answer(
+            "unknown Action Bearer echoed-credential".to_string(),
+            &GraphErrorContext::graph(AccountOperation::Discover),
+        );
+        assert!(!format!("{:?}", error.support_internal()).contains("echoed-credential"));
     }
 }

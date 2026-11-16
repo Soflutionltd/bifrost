@@ -204,7 +204,6 @@ fn object_type_name(ty: ObjectType) -> &'static str {
         ObjectType::Email => "email",
         ObjectType::Mailbox => "mailbox",
         ObjectType::Thread => "thread",
-        ObjectType::Event => "event",
         ObjectType::Contact => "contact",
         ObjectType::EmailSubmission => "email_submission",
         ObjectType::CalendarEvent => "calendar_event",

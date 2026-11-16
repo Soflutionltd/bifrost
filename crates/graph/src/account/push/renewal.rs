@@ -104,13 +104,9 @@ pub(crate) fn renewal_session(
                         }
                         _ => ("renew", error),
                     };
-                    // Name what lost coverage. A resource covers exactly one
-                    // scope in every ordinary case (each resource string is
-                    // built from one folder or calendar id), so the common
-                    // path gets precise attribution; the ambiguous case -
-                    // `Event` and `CalendarEvent` scopes over one calendar -
-                    // stays account-scoped rather than picking a scope
-                    // arbitrarily, and the covered list is logged either way.
+                    // Name what lost coverage when the resource covers exactly
+                    // one scope; otherwise stay account-scoped rather than
+                    // pick one arbitrarily (or index an empty list).
                     let context = GraphErrorContext::graph(AccountOperation::PushSubscribe);
                     let context = match scopes.as_slice() {
                         [only] => context.with_scope(ErrorScope::Cursor(only.clone())),

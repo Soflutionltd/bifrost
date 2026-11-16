@@ -52,7 +52,7 @@ fn graph_event_subscription_names_the_scope_calendar() {
         GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
     let scope = |id: &str| CursorScope::FolderType {
         folder: FolderId(id.to_string()),
-        ty: ObjectType::Event,
+        ty: ObjectType::CalendarEvent,
     };
     assert_eq!(
         resource_for_scope(&account, &scope("calendar-id"))

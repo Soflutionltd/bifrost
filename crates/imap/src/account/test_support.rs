@@ -825,16 +825,17 @@ pub(crate) fn scripted_account_parts_from(
 #[cfg(test)]
 mod mdn_tests {
     use super::*;
+    use bifrost_types::AccountConveniences;
 
-    fn caps_with_mdn(mdn_sent_via_keyword: bool) -> AccountCapabilities {
+    fn caps_with_mdn(writable: bool) -> AccountCapabilities {
         let mut caps = stub_capabilities();
-        caps.conveniences.mdn_sent_via_keyword = mdn_sent_via_keyword;
+        caps.conveniences.mdn_sent_keyword = writable.then_some("$MDNSent");
         caps
     }
 
     #[tokio::test]
     async fn mark_mdn_sent_dispatches_to_set_keyword_when_enabled() {
-        // mdn_sent_via_keyword: true -> mark_mdn_sent flips `$MDNSent`
+        // mdn_sent_keyword: Some("$MDNSent") -> mark_mdn_sent flips `$MDNSent`
         // through set_keyword, observed succeeding and recorded.
         let stub = StubAccount::with_capabilities(caps_with_mdn(true));
         stub.mark_mdn_sent(ObjectId("m1".to_string()))
@@ -846,7 +847,7 @@ mod mdn_tests {
 
     #[tokio::test]
     async fn mark_mdn_sent_unsupported_when_read_only() {
-        // mdn_sent_via_keyword: false -> the read-receipt model is
+        // mdn_sent_keyword: None -> the read-receipt model is
         // read-only (Gmail/Graph), so the convenience surfaces
         // Unsupported(MarkMdnSent) and never touches set_keyword.
         let stub = StubAccount::with_capabilities(caps_with_mdn(false));
@@ -865,6 +866,7 @@ mod mdn_tests {
 #[cfg(test)]
 mod unsupported_default_tests {
     use super::*;
+    use bifrost_types::AccountConveniences;
 
     #[tokio::test]
     async fn unsupported_constructor_default_uses_account_protocol() {

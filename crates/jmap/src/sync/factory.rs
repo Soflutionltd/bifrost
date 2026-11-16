@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bifrost_net::credentials::Secret;
 use bifrost_net::{StaticTokenSource, TokenSource};
 use bifrost_types::{
     Account, AccountError, AccountFactory, AccountFuture, AccountId, CursorScope, ObjectType,
@@ -63,7 +64,7 @@ impl std::fmt::Debug for JmapAccountFactoryBuilder {
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum JmapCredentials {
-    Basic { username: String, password: String },
+    Basic { username: String, password: Secret },
     // The bearer source is shared: ratatoskr hands in one
     // `Arc<dyn TokenSource>` (typically an `OAuthRefresher` over its own
     // refresh-token store) and a token it refreshes and persists is read
@@ -926,7 +927,7 @@ mod tests {
         );
         let credentials = JmapCredentials::Basic {
             username: "user".to_owned(),
-            password: "secret".to_owned(),
+            password: "secret".into(),
         };
         let factories = [
             JmapAccountFactory::new("https://jmap.test", credentials.clone()).with_net(net.clone()),
@@ -3219,13 +3220,13 @@ mod tests {
     fn configured_email_uses_basic_email_username_only() {
         let basic = JmapCredentials::Basic {
             username: "Ada@Example.Test".to_string(),
-            password: "secret".to_string(),
+            password: "secret".into(),
         };
         assert_eq!(basic.configured_email(), Some("Ada@Example.Test"));
 
         let non_email = JmapCredentials::Basic {
             username: "ada".to_string(),
-            password: "secret".to_string(),
+            password: "secret".into(),
         };
         assert_eq!(non_email.configured_email(), None);
 

@@ -23,6 +23,7 @@
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use bifrost_types::AccountConveniences;
 use std::sync::Arc;
 
 use bifrost_types::{

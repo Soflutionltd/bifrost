@@ -1314,7 +1314,7 @@ impl Account for GoogleAccount {
         )
     }
 
-    fn move_thread(
+    fn move_thread_provider(
         &self,
         thread: ThreadId,
         target: ContainerId,
@@ -1326,7 +1326,7 @@ impl Account for GoogleAccount {
         )
     }
 
-    fn delete_thread(
+    fn delete_thread_provider(
         &self,
         thread: ThreadId,
         current: Option<ContainerId>,
@@ -1471,7 +1471,6 @@ mod tests {
             );
             for ty in [
                 ObjectType::CalendarEvent,
-                ObjectType::Event,
                 ObjectType::Contact,
                 ObjectType::ContactGroup,
             ] {

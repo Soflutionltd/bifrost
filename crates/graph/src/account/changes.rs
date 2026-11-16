@@ -167,7 +167,7 @@ mod tests {
     fn calendar_window_reseeds_within_the_refresh_lead() {
         let scope = CursorScope::FolderType {
             folder: FolderId("calendar".to_string()),
-            ty: ObjectType::Event,
+            ty: ObjectType::CalendarEvent,
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&scope).expect("event scope maps"),
@@ -189,14 +189,14 @@ mod tests {
     async fn a_calendar_cursor_at_its_horizon_restarts_scope_before_the_wire() {
         let scope = CursorScope::FolderType {
             folder: FolderId("calendar".to_string()),
-            ty: ObjectType::Event,
+            ty: ObjectType::CalendarEvent,
         };
         let cursor = encode_cursor(
             scope,
             GraphCursorPayload::new(
                 kind_for_scope(&CursorScope::FolderType {
                     folder: FolderId("calendar".to_string()),
-                    ty: ObjectType::Event,
+                    ty: ObjectType::CalendarEvent,
                 })
                 .expect("event scope maps"),
                 &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
@@ -234,7 +234,7 @@ mod tests {
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         let scope = CursorScope::FolderType {
             folder: FolderId("calendar".to_string()),
-            ty: ObjectType::Event,
+            ty: ObjectType::CalendarEvent,
         };
         let end = jiff::Timestamp::new(4_102_444_800, 0)
             .expect("fixed future test timestamp")
@@ -868,7 +868,7 @@ mod tests {
         let cursor = encode_cursor(
             CursorScope::FolderType {
                 folder: FolderId("calendar".to_string()),
-                ty: ObjectType::Event,
+                ty: ObjectType::CalendarEvent,
             },
             payload,
         )

@@ -104,9 +104,10 @@ pub enum ObjectType {
     Email,
     Mailbox,
     Thread,
-    Event,
     Contact,
     EmailSubmission,
+    /// Calendar events across all providers, including Graph calendarView.
+    /// An enterprise calendar has one sync identity regardless of protocol.
     CalendarEvent,
     ContactGroup,
 }
@@ -342,13 +343,13 @@ pub enum SyncStrategy {
 
 impl ObjectType {
     /// Stable tag in the sync cursor envelope. Append new tags; never renumber.
+    /// Tag 3 is retired: historical Event scopes decode as CalendarEvent (tag 6).
     #[must_use]
     pub const fn cursor_tag(self) -> u8 {
         match self {
             Self::Email => 0,
             Self::Mailbox => 1,
             Self::Thread => 2,
-            Self::Event => 3,
             Self::Contact => 4,
             Self::EmailSubmission => 5,
             Self::CalendarEvent => 6,

@@ -347,10 +347,10 @@ fn decode_obj_type(tag: u8) -> Result<ObjectType, Error> {
         OBJTYPE_EMAIL => Ok(ObjectType::Email),
         OBJTYPE_MAILBOX => Ok(ObjectType::Mailbox),
         OBJTYPE_THREAD => Ok(ObjectType::Thread),
-        OBJTYPE_EVENT => Ok(ObjectType::Event),
         OBJTYPE_CONTACT => Ok(ObjectType::Contact),
         OBJTYPE_EMAIL_SUBMISSION => Ok(ObjectType::EmailSubmission),
-        OBJTYPE_CALENDAR_EVENT => Ok(ObjectType::CalendarEvent),
+        // Historical Event scopes denote the same calendar event domain.
+        OBJTYPE_EVENT | OBJTYPE_CALENDAR_EVENT => Ok(ObjectType::CalendarEvent),
         OBJTYPE_CONTACT_GROUP => Ok(ObjectType::ContactGroup),
         other => Err(Error::Malformed(format!(
             "cursor envelope: unknown object type tag {other}"

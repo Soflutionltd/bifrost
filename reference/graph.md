@@ -69,8 +69,8 @@ inventory resume retains the parsed scope from cursor classification, and push
 parses once per submitted scope before dispatching either transport arm. Walks
 retain that interpretation for client selection, delta paths, cursor kinds,
 object and thread ids, memberships, page preferences and mail etag caching.
-`Event` and `CalendarEvent` normalize to the same collection kind while the
-original scope remains on outcomes and checkpoints. Existing cursor envelope v6
+`CalendarEvent` identifies calendar collections, and the scope remains on
+outcomes and checkpoints. Existing cursor envelope v6
 and durable id spellings are unchanged.
 
 Primary mail, calendars and contacts support REST sync and both push arms.
@@ -1241,7 +1241,8 @@ session's start or `close()`.
   `messageRules` CRUD + local `filter_validate`).
 - `conveniences`: `starred = Category` (reserved `$flagged` ->
   `flag.flagStatus`); replied/forwarded dispatch to `set_extended_property`
-  with `PidTagLastVerbExecuted` 102/104; `mdn_sent_via_keyword = false`
+  with `PidTagLastVerbExecuted` 102/104; `label` and `folder` are both
+  `Category`; `mdn_sent_keyword = None`
   (Graph `isReadReceiptRequested` read-only -> `Unsupported(MarkMdnSent)`).
 
 ## Cursor envelope
@@ -1359,7 +1360,7 @@ Supported scopes:
   (thread), change-key (etag), Message-ID / References / In-Reply-To from
   `internetMessageHeaders`, and a flags hash from `isRead` / `flag.flagStatus`
   / `categories`. `size` is `None` on this projection.
-- `FolderType { folder, Event | CalendarEvent }` -> calendarView delta over
+- `FolderType { folder, CalendarEvent }` -> calendarView delta over
   a [-90d, +365d] window; its cursor records the end and is reseeded with a
   new sliding window ninety days before that end; thread/message-id fields
   empty. The initial URL has no `$select`, because Microsoft's
@@ -1495,7 +1496,7 @@ Graph JSON is not assembled RFC822, so body-bearing projections degrade to
 `hydrate_url_for_id` builds `{prefix}/messages/{id}` for every id, and
 `select_for_projection` returns message-shaped `$select` lists for every
 projection - deliberately, even though this account also establishes
-`ObjectType::Event` and `ObjectType::Contact` cursor scopes and mints their
+`ObjectType::CalendarEvent` and `ObjectType::Contact` cursor scopes and mints their
 inventory entries and change ids through the same generic pipeline. Event
 inventory entries and changes (including removals) use `{calendar}::{event}`,
 the same identity accepted by the typed calendar doors. Contact ids remain
@@ -3321,3 +3322,11 @@ exposing credentials that an error response may echo. Classification still uses
 the original status and typed signals.
 
 EWS SOAP faults export their typed fault category, and malformed XML and provider JSON decoding export fixed labels. Raw fault details and parser prose remain available internally without entering account diagnostics.
+
+Autodiscover and per-id Exchange id translation omit server descriptions from
+all diagnostic tiers, including primary-cause detail. Native codes pass through
+`bifrost_net::account_error::correlation_id` before export; translation retains
+its typed Graph signal only for an admitted code. Autodiscover contradictory
+answers use a fixed label rather than interpolating server fields. Classification
+still reads the original wire evidence. Enterprise users expect support consent
+to protect credentials echoed by the provider.

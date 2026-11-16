@@ -1456,3 +1456,24 @@ fn ews_fault_and_xml_exports_withhold_provider_prose() {
         );
     }
 }
+
+#[test]
+fn auxiliary_provider_prose_never_enters_support_exports() {
+    let ctx = graph_ctx(AccountOperation::Discover);
+    for code in ["InvalidRequest", "Bearer-echoed-credential"] {
+        let error = autodiscover_error_code_to_account_error(
+            "Autodiscover",
+            code,
+            Some("Bearer echoed-credential"),
+            &ctx,
+        );
+        assert!(!format!("{:?}", error.support_internal()).contains("echoed-credential"));
+        let error = id_translation_refused(
+            AccountOperation::PushSubscribe,
+            ErrorScope::Account,
+            Some(code),
+            Some("Bearer echoed-credential"),
+        );
+        assert!(!format!("{:?}", error.support_internal()).contains("echoed-credential"));
+    }
+}

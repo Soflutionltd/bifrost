@@ -381,13 +381,13 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         #[cfg(feature = "websockets")]
         crate::Error::WebSocketHandshake(err) => websocket_handshake_error(err, ctx),
         #[cfg(feature = "websockets")]
-        crate::Error::WebSocketRuntime(err) => websocket_runtime_error(err.to_string(), ctx),
+        crate::Error::WebSocketRuntime(err) => {
+            websocket_runtime_error(websocket_error_label(&err), ctx)
+        }
         #[cfg(feature = "websockets")]
         crate::Error::WebSocketSend(err) => websocket_send_error(&err, ctx),
         #[cfg(feature = "websockets")]
-        crate::Error::WebSocketClosed => {
-            websocket_runtime_error("WebSocket connection closed by peer".to_string(), ctx)
-        }
+        crate::Error::WebSocketClosed => websocket_runtime_error("WebSocket stream closed", ctx),
         #[cfg(feature = "websockets")]
         crate::Error::WebSocketNotConnected => build(
             PrimaryCause::Request(RequestCause::Unsupported {
@@ -418,11 +418,13 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             )
             .try_build()
             .expect("valid account error classification"),
-            crate::WebSocketSetupError::Subprotocol(message) => build(
+            crate::WebSocketSetupError::Subprotocol(_) => build(
                 PrimaryCause::State(StateCause::CapabilityChanged { delta: None }),
                 &ctx,
             )
-            .text(DiagnosticText::support_only(message))
+            .text(DiagnosticText::support_only(
+                "WebSocket subprotocol mismatch",
+            ))
             .try_build()
             .expect("valid account error classification"),
         },
@@ -2003,7 +2005,7 @@ fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
 }
 
 #[cfg(feature = "websockets")]
-fn websocket_runtime_error(message: String, ctx: JmapErrorContext) -> AccountError {
+fn websocket_runtime_error(label: &'static str, ctx: JmapErrorContext) -> AccountError {
     // Per the plan, post-handshake WebSocket errors classify as
     // `Protocol(PartialResponse)` with `Attempt(Acknowledged)`. The
     // pre-handshake `WebSocketSetup(Tls)` arm is handled in the main
@@ -2014,7 +2016,7 @@ fn websocket_runtime_error(message: String, ctx: JmapErrorContext) -> AccountErr
             kind: ProtocolErrorKind::PartialResponse,
             wire: WireCause::MalformedResponse {
                 protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(message)),
+                detail: Some(DiagnosticText::support_only(label)),
             },
         },
         &ctx,
@@ -2024,6 +2026,21 @@ fn websocket_runtime_error(message: String, ctx: JmapErrorContext) -> AccountErr
     )))
     .try_build()
     .expect("valid account error classification")
+}
+
+// Fixed categories retain structural evidence without formatting foreign sources.
+#[cfg(feature = "websockets")]
+fn websocket_error_label(err: &tokio_websockets::Error) -> &'static str {
+    match err {
+        tokio_websockets::Error::AlreadyClosed => "WebSocket already closed",
+        tokio_websockets::Error::CannotResolveHost => "WebSocket DNS lookup failed",
+        tokio_websockets::Error::Io(_) => "WebSocket I/O failed",
+        tokio_websockets::Error::NativeTls(_) => "WebSocket TLS failed",
+        tokio_websockets::Error::Protocol(_) => "WebSocket protocol violation",
+        tokio_websockets::Error::PayloadTooLong { .. } => "WebSocket payload limit exceeded",
+        tokio_websockets::Error::Upgrade(_) => "WebSocket HTTP upgrade failed",
+        _ => "WebSocket failed",
+    }
 }
 
 /// A frame write to an established WebSocket's sink failed.
@@ -2047,9 +2064,7 @@ fn websocket_send_error(err: &tokio_websockets::Error, ctx: JmapErrorContext) ->
     build(
         PrimaryCause::Transport(TransportCause::new(
             TransportErrorKind::Network,
-            Some(DiagnosticText::support_only(format!(
-                "WebSocket frame write failed: {err}"
-            ))),
+            Some(DiagnosticText::support_only("WebSocket frame write failed")),
         )),
         &ctx,
     )
@@ -2064,7 +2079,14 @@ fn websocket_send_error(err: &tokio_websockets::Error, ctx: JmapErrorContext) ->
 /// side-effect boundary.
 #[cfg(feature = "websockets")]
 fn websocket_handshake_error(err: tokio_websockets::Error, ctx: JmapErrorContext) -> AccountError {
-    let message = err.to_string();
+    // Foreign error sources can echo credentials; export fixed labels only.
+    let message = websocket_error_label(&err).to_string();
+    let upgrade_status = match &err {
+        tokio_websockets::Error::Upgrade(
+            tokio_websockets::upgrade::Error::DidNotSwitchProtocols(status),
+        ) => Some(*status),
+        _ => None,
+    };
     let tunnel_error = StdError::source(&err)
         .and_then(|source| source.downcast_ref::<std::io::Error>())
         .and_then(std::io::Error::get_ref)
@@ -2113,7 +2135,7 @@ fn websocket_handshake_error(err: tokio_websockets::Error, ctx: JmapErrorContext
     };
 
     build(primary, &ctx)
-        .status(status)
+        .status(status.or(upgrade_status))
         .text(DiagnosticText::support_only(detail))
         .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
         .try_build()
@@ -2149,6 +2171,38 @@ mod tests {
             details: Box::new(ProblemDetails::new(error, status, None, None, None, None)),
             transport: None,
         }
+    }
+
+    #[cfg(feature = "websockets")]
+    #[test]
+    fn websocket_foreign_errors_never_enter_support_exports() {
+        for error in [
+            crate::Error::WebSocketRuntime(tokio_websockets::Error::Io(std::io::Error::other(
+                "Bearer echoed-credential",
+            ))),
+            crate::Error::WebSocketHandshake(tokio_websockets::Error::Io(std::io::Error::other(
+                "Bearer echoed-credential",
+            ))),
+            crate::Error::WebSocketSend(tokio_websockets::Error::Io(std::io::Error::other(
+                "Bearer echoed-credential",
+            ))),
+            crate::Error::WebSocketSetup(crate::WebSocketSetupError::Subprotocol(
+                "Bearer echoed-credential".to_string(),
+            )),
+        ] {
+            let error = into_account_error(
+                error,
+                JmapErrorContext::new(AccountOperation::PushSubscribe),
+            );
+            assert!(!format!("{:?}", error.support_internal()).contains("echoed-credential"));
+        }
+        let error = websocket_handshake_error(
+            tokio_websockets::Error::Upgrade(
+                tokio_websockets::upgrade::Error::DidNotSwitchProtocols(403),
+            ),
+            JmapErrorContext::new(AccountOperation::PushSubscribe),
+        );
+        assert_eq!(error.telemetry_fields().status, Some(403));
     }
 
     fn retry_after_headers(seconds: &'static str) -> reqwest::header::HeaderMap {
@@ -3321,7 +3375,7 @@ mod tests {
     #[test]
     fn websocket_runtime_classifies_as_protocol_partial_response_acknowledged() {
         let ctx = JmapErrorContext::new(AccountOperation::PushSubscribe);
-        let err = websocket_runtime_error("stream dropped".to_string(), ctx);
+        let err = websocket_runtime_error("WebSocket stream closed", ctx);
         assert_eq!(
             err.kind(),
             &AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)

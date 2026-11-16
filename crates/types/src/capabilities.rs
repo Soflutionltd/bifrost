@@ -471,78 +471,74 @@ pub struct PimMethodSupport {
 }
 }
 
-/// Mapping from each provider's flag namespace onto the canonical
-/// keyword the convenience layer expects.
-///
-/// The trait surface speaks one keyword shape - `$flagged`,
-/// `$answered`, `$forwarded`, `$seen` - but each protocol natively
-/// stores a different name (IMAP `\Flagged`, Graph
-/// `flag.flagStatus`, Gmail STARRED, JMAP `$flagged`). Account impls
-/// fill the relevant variant when they advertise support for the
-/// `set_starred` / `mark_replied` / `mark_forwarded` conveniences;
-/// the convenience layer reads this to choose the dispatch target.
+/// Primitive and provider-owned value used to persist starred state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StarredFlagShape {
-    /// `set_starred` flips an IMAP-style keyword (`\Flagged`).
-    Keyword,
-    /// `set_starred` flips a Gmail-style label membership
-    /// (STARRED). Convenience layer dispatches to
-    /// `set_label_membership`.
-    LabelMembership,
-    /// `set_starred` flips a Graph-style category / flag status.
-    /// Convenience layer dispatches to `set_category` or
-    /// `set_extended_property`.
-    Category,
-    /// Provider does not have a starred-equivalent primitive;
-    /// convenience returns `Err(Unsupported)`.
+    Keyword(&'static str),
+    LabelMembership(&'static str),
+    Category(&'static str),
     None,
 }
 
-/// Primitive used to persist replied state. Gmail derives it during sync.
+/// Primitive and provider-owned values used to persist replied state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RepliedFlagShape {
-    /// Set `$answered` via `set_keyword`.
-    Keyword,
-    /// Set Graph PR_LAST_VERB_EXECUTED via `set_extended_property`.
-    ExtendedProperty,
+    Keyword(&'static str),
+    ExtendedProperty {
+        name: &'static str,
+        value: &'static str,
+    },
     None,
 }
 
-/// Primitive used to persist forwarded state.
+/// Primitive and provider-owned values used to persist forwarded state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ForwardedFlagShape {
-    /// Set `$forwarded` via `set_keyword`.
-    Keyword,
-    /// Set Graph PR_LAST_VERB_EXECUTED via `set_extended_property`.
-    ExtendedProperty,
+    Keyword(&'static str),
+    ExtendedProperty {
+        name: &'static str,
+        value: &'static str,
+    },
     None,
 }
 
-/// Per-convenience dispatch hints. The convenience default impls
-/// read these to pick the right primitive without doing a runtime
-/// `match` on protocol kind.
+/// Primitive selected for a label's wire kind. Membership uses the engine id;
+/// keywords and categories use the native spelling carried by the label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LabelShape {
+    Keyword,
+    LabelMembership,
+    Category,
+    ContainerMembership,
+    None,
+}
+
+/// Provider declarations consumed by the shared convenience extension.
+/// Separate label and folder shapes preserve their distinct wire semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConvenienceShape {
+    pub label: LabelShape,
+    pub folder: LabelShape,
     pub starred: StarredFlagShape,
     pub replied: RepliedFlagShape,
     pub forwarded: ForwardedFlagShape,
-    /// True iff `mark_mdn_sent` should flip the `$MDNSent` keyword via
-    /// `set_keyword`. `true` on JMAP and IMAP. `false` on Gmail and Graph:
-    /// their read-receipt model (Graph `isReadReceiptRequested`) is
-    /// read-only, so the convenience returns `Unsupported(MarkMdnSent)`.
-    pub mdn_sent_via_keyword: bool,
+    /// Writable MDN keyword, or None when receipt state is read-only.
+    pub mdn_sent_keyword: Option<&'static str>,
 }
 
 impl Default for ConvenienceShape {
     fn default() -> Self {
         Self {
+            label: LabelShape::None,
+            folder: LabelShape::None,
             starred: StarredFlagShape::None,
             replied: RepliedFlagShape::None,
             forwarded: ForwardedFlagShape::None,
-            mdn_sent_via_keyword: false,
+            mdn_sent_keyword: None,
         }
     }
 }

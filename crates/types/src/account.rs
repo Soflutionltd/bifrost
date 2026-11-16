@@ -7,14 +7,9 @@
 //! `Arc<dyn Account>`. A compile-time `_dyn_safe` check in
 //! `lib.rs` verifies this at every build.
 //!
-//! Two-tier surface:
-//!
-//! - Primitives (no default impl): wire-level operations every
-//!   protocol crate implements. The Account-impl-side surface.
-//! - Conveniences (default impl in terms of primitives): ratatoskr-
-//!   shaped composites. Protocol crates override only when the
-//!   default is wrong for that provider; consumers who disagree with
-//!   ratatoskr's defaults use the primitives directly.
+//! Provider operations live here; shared mail convenience policy lives in
+//! [`crate::conveniences::AccountConveniences`]. Composite operations with
+//! provider overrides remain contract doors on Account.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,9 +23,7 @@ use crate::calendar::{
     Calendar, CalendarEvent, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
     RsvpStatus,
 };
-use crate::capabilities::{
-    AccountCapabilities, ForwardedFlagShape, RepliedFlagShape, StarredFlagShape,
-};
+use crate::capabilities::AccountCapabilities;
 use crate::cloud::{CloudUploadMeta, HostedAttachment};
 use crate::compose::{
     AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendReceipt, SendRequest,
@@ -39,9 +32,7 @@ use crate::contact::{
     AddressBook, AddressBookId, ContactCard, ContactCreate, ContactId, ContactPatch,
     ContactSearchRequest,
 };
-use crate::container::{
-    ContainerId, ContainerKind, ContainerList, ContainerStyle, Label, MutationTarget,
-};
+use crate::container::{ContainerId, ContainerKind, ContainerList, ContainerStyle, MutationTarget};
 use crate::cursor::{
     ChangeCursor, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
     ScopeLifecycleEvent,
@@ -1322,31 +1313,8 @@ pub trait Account: Send + Sync {
         projection: HydrationProjection,
     ) -> AccountFuture<Result<Message, AccountError>>;
 
-    // ------------------------------------------------------------
-    // Conveniences (S1-W1)
-    //
-    // Default impls encode ratatoskr's product opinions. Each
-    // dispatches into primitives and reads
-    // `capabilities().conveniences` to pick the right one.
-    //
-    // Default-impl strategy notes (see S1-W1 report):
-    //
-    // - Single-call conveniences (`apply_label`, `remove_label`,
-    //   `set_read`, `set_starred`, `mark_replied`, `mark_forwarded`)
-    //   have a real default impl. `set_starred`, `mark_replied`,
-    //   and `mark_forwarded` use capability-based dispatch through
-    //   `capabilities().conveniences` rather than a hard-coded
-    //   protocol switch, so consumers can override the dispatch
-    //   shape per-account without subclassing the trait.
-    // - Multi-call conveniences (`move_thread`, `delete_thread`)
-    //   default to `Err(Unsupported)`: the boxed `'static` future
-    //   returned by a trait method cannot borrow `&self` across the
-    //   await boundary between the first and second primitive, and
-    //   demanding every Account impl ship around in `Arc<Self>`
-    //   shape was the wrong tradeoff. Protocol crates implement
-    //   these in-crate where they have access to their own `Arc`-
-    //   shaped handle.
-    // ------------------------------------------------------------
+    // Provider-owned composite doors retain overrides and their static futures.
+    // Shared mail policy lives in the AccountConveniences extension.
 
     /// Move a thread between containers. `source` is the container
     /// being moved out of (`None` when the consumer is not tracking
@@ -1357,159 +1325,34 @@ pub trait Account: Send + Sync {
     /// `remove_from_container(source)`. Order: add-then-remove so a
     /// failure on the second step leaves the message in both
     /// containers (recoverable) rather than neither (lost).
-    fn move_thread(
+    fn move_thread_provider(
         &self,
         _thread: ThreadId,
         _target: ContainerId,
         _source: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        let error = AccountError::unsupported(AccountOperation::MoveThread, self.protocol());
-        Box::pin(async move { Err(error) })
-    }
-
-    /// Apply a label to `target`. Dispatches by `label.provenance`
-    /// to the right primitive.
-    fn apply_label(
-        &self,
-        target: MutationTarget,
-        label: Label,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        dispatch_label(self, target, label, true)
-    }
-
-    /// Remove a label from `target`. Same dispatch shape as
-    /// `apply_label`.
-    fn remove_label(
-        &self,
-        target: MutationTarget,
-        label: Label,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        dispatch_label(self, target, label, false)
-    }
-
-    /// Alias for `set_is_read`. Exists for naming symmetry with the
-    /// other convenience setters.
-    fn set_read(
-        &self,
-        target: MutationTarget,
-        is_read: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.set_is_read(target, is_read)
-    }
-
-    /// Toggle the starred / flagged bit. Dispatches by
-    /// `capabilities().conveniences.starred` to the right primitive.
-    ///
-    /// Capability-based dispatch (rather than a `match` on
-    /// `ProtocolKind`) is the chosen design here: protocol crates
-    /// know best which primitive corresponds to "starred" for their
-    /// account (Graph has both `flag.flagStatus` and categories;
-    /// IMAP has both `\Flagged` and Sieve flag-keyword adjuncts;
-    /// custom deployments may differ). The capability shape lets
-    /// the protocol crate declare the answer once at open-time
-    /// rather than have the convenience embed a hard-coded provider
-    /// switch.
-    fn set_starred(
-        &self,
-        target: MutationTarget,
-        starred: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        const STARRED_KEYWORD: &str = "$flagged";
-        const STARRED_LABEL: &str = "STARRED";
-        match self.capabilities().conveniences.starred {
-            StarredFlagShape::Keyword => self.set_keyword(target, STARRED_KEYWORD.into(), starred),
-            StarredFlagShape::LabelMembership => {
-                self.set_label_membership(target, ContainerId(STARRED_LABEL.to_string()), starred)
-            }
-            StarredFlagShape::Category => {
-                self.set_category(target, STARRED_KEYWORD.to_string(), starred)
-            }
-            StarredFlagShape::None => {
-                let error =
-                    AccountError::unsupported(AccountOperation::SetStarred, self.protocol());
-                Box::pin(async move { Err(error) })
-            }
-        }
-    }
-
-    /// Mark a message as replied using the advertised primitive. Gmail derives
-    /// replied state during sync and advertises no writable shape.
-    fn mark_replied(&self, message: ObjectId) -> AccountFuture<Result<(), AccountError>> {
-        let target = MutationTarget::Message(message);
-        match self.capabilities().conveniences.replied {
-            RepliedFlagShape::Keyword => self.set_keyword(target, "$answered".into(), true),
-            RepliedFlagShape::ExtendedProperty => self.set_extended_property(
-                target,
-                "PR_LAST_VERB_EXECUTED".to_string(),
-                Some("102".to_string()),
-            ),
-            RepliedFlagShape::None => {
-                let error =
-                    AccountError::unsupported(AccountOperation::MarkReplied, self.protocol());
-                Box::pin(async move { Err(error) })
-            }
-        }
-    }
-
-    /// Mark a message as forwarded using the advertised primitive.
-    fn mark_forwarded(&self, message: ObjectId) -> AccountFuture<Result<(), AccountError>> {
-        let target = MutationTarget::Message(message);
-        match self.capabilities().conveniences.forwarded {
-            ForwardedFlagShape::Keyword => self.set_keyword(target, "$forwarded".into(), true),
-            ForwardedFlagShape::ExtendedProperty => self.set_extended_property(
-                target,
-                "PR_LAST_VERB_EXECUTED".to_string(),
-                Some("104".to_string()),
-            ),
-            ForwardedFlagShape::None => {
-                let error =
-                    AccountError::unsupported(AccountOperation::MarkForwarded, self.protocol());
-                Box::pin(async move { Err(error) })
-            }
-        }
-    }
-
-    /// Persist that an MDN (read receipt) was dispatched for `message`, by
-    /// flipping the `$MDNSent` keyword. Dispatches through
-    /// `capabilities().conveniences.mdn_sent_via_keyword`; accounts whose
-    /// read-receipt model is read-only (Gmail, Graph) leave it `false` and
-    /// the convenience returns `Unsupported(MarkMdnSent)`.
-    fn mark_mdn_sent(&self, message: ObjectId) -> AccountFuture<Result<(), AccountError>> {
-        const MDN_SENT_KEYWORD: &str = "$MDNSent";
-        let target = MutationTarget::Message(message);
-        if self.capabilities().conveniences.mdn_sent_via_keyword {
-            return self.set_keyword(target, MDN_SENT_KEYWORD.into(), true);
-        }
-
-        let error = AccountError::unsupported(AccountOperation::MarkMdnSent, self.protocol());
-        Box::pin(async move { Err(error) })
+        crate::conveniences::unsupported(self, AccountOperation::MoveThread)
     }
 
     /// Contact autocomplete convenience for recipient and attendee
     /// pickers. Default implementation returns the first page of
     /// `contact_search`.
-    fn contact_autocomplete(
+    fn contact_autocomplete_provider(
         &self,
         query: String,
         limit: u32,
     ) -> AccountFuture<Result<Vec<ContactCard>, AccountError>> {
-        let mut request = ContactSearchRequest::new(query);
-        request.limit = Some(limit);
-        let future = self.contact_search(request);
-        Box::pin(async move { future.await.map(|page| page.items) })
+        crate::conveniences::default_contact_autocomplete(self, query, limit)
     }
 
     /// Event autocomplete convenience for calendar search boxes.
     /// Default implementation returns the first page of `event_search`.
-    fn event_autocomplete(
+    fn event_autocomplete_provider(
         &self,
         query: String,
         limit: u32,
     ) -> AccountFuture<Result<Vec<CalendarEvent>, AccountError>> {
-        let mut request = EventSearchRequest::new(query);
-        request.limit = Some(limit);
-        let future = self.event_search(request);
-        Box::pin(async move { future.await.map(|page| page.items) })
+        crate::conveniences::default_event_autocomplete(self, query, limit)
     }
 
     /// Move a thread to Trash, or delete-permanently if already in
@@ -1522,13 +1365,12 @@ pub trait Account: Send + Sync {
     /// borrowing `&self` across the await boundary into a `'static`
     /// future. Protocol crates ship this convenience using their
     /// own `Arc<Self>`-shaped handle.
-    fn delete_thread(
+    fn delete_thread_provider(
         &self,
         _thread: ThreadId,
         _current: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        let error = AccountError::unsupported(AccountOperation::DeleteThread, self.protocol());
-        Box::pin(async move { Err(error) })
+        crate::conveniences::unsupported(self, AccountOperation::DeleteThread)
     }
 
     /// Graceful local-handle teardown. IMAP `LOGOUT` + pool drain,
@@ -1619,47 +1461,6 @@ impl std::fmt::Debug for OpenedAccount {
             .field("account", &"Arc<dyn Account>")
             .field("skipped_scopes", &self.skipped_scopes)
             .finish()
-    }
-}
-
-/// Shared dispatch for `apply_label` / `remove_label`.
-///
-/// Reads `label.provenance` to decide which primitive to invoke.
-/// The mapping is fixed at the trait surface because
-/// `Provenance::kind` (Folder | Label) is the load-bearing signal:
-/// a label-kind id under Gmail's provider is a label-membership
-/// flip; under JMAP / IMAP it is a keyword flip; under Graph it is
-/// a category (Graph categories are the closest analog to labels,
-/// and Graph cannot express IMAP keywords). Folder-kind ids are
-/// container-membership flips for everyone except Graph, which
-/// uses categories for its folder-shaped labels too.
-fn dispatch_label<T: Account + ?Sized>(
-    receiver: &T,
-    target: MutationTarget,
-    label: Label,
-    value: bool,
-) -> AccountFuture<Result<(), AccountError>> {
-    use crate::cursor::ProtocolKind;
-    match (label.provenance.kind, label.provenance.provider) {
-        (ContainerKind::Label, ProtocolKind::Gmail) => {
-            receiver.set_label_membership(target, label.id, value)
-        }
-        (ContainerKind::Label, ProtocolKind::Graph) => {
-            receiver.set_category(target, label.provenance.native, value)
-        }
-        (ContainerKind::Label, _) => {
-            receiver.set_keyword(target, label.provenance.native.into(), value)
-        }
-        (ContainerKind::Folder, ProtocolKind::Graph) => {
-            receiver.set_category(target, label.provenance.native, value)
-        }
-        (ContainerKind::Folder, _) => {
-            if value {
-                receiver.add_to_container(target, label.id)
-            } else {
-                receiver.remove_from_container(target, label.id)
-            }
-        }
     }
 }
 

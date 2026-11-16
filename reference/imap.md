@@ -1060,7 +1060,7 @@ The SEARCH check is not atomic with the following `EXPUNGE`. Another client
 can mark a message `\Deleted` in that interval, and IMAP has no command to
 restrict plain EXPUNGE to the checked UID set. Without UIDPLUS, the remaining
 race cannot be closed by this client.
-- Keywords: `set_keyword` via UID STORE; convenience keywords `$flagged`/`$answered`/`$seen` map to `\Flagged`/`\Answered`/`\Seen`. `$forwarded` and `$MDNSent` stay IMAP keywords; `mdn_sent_via_keyword` is true, so `mark_mdn_sent` flips `$MDNSent`.
+- Keywords: `set_keyword` via UID STORE; convenience keywords `$flagged`/`$answered`/`$seen` map to `\Flagged`/`\Answered`/`\Seen`. `$forwarded` and `$MDNSent` stay IMAP keywords; `mdn_sent_keyword` is `Some("$MDNSent")`, so `mark_mdn_sent` flips `$MDNSent`.
 - Read state: `set_is_read` via `\Seen`.
 - Importance: `set_importance` maps onto the `$important` keyword (no native IMAP field). Two-valued/exclusive: `High` sets it, `Normal`/`Low` clear it (one STORE); the read side maps `$important` presence to `Message.importance`.
 - Attachment search limitation: `SearchFilter::Has` currently compiles to BODY,

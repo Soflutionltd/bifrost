@@ -260,8 +260,8 @@ pub(crate) struct GraphPageMarker {
 
 // Keep persisted collection identity cross-checked against the outer scope:
 // deriving it only from the scope would relabel an opaque delta link if a row
-// were attached to the wrong collection. Event aliases share a calendar, and
-// only that collection can carry a window bound.
+// were attached to the wrong collection. Only a calendar collection can carry
+// a window bound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GraphDeltaCollection {
     Messages {
@@ -483,7 +483,7 @@ pub(crate) fn scope_for_kind(kind: &GraphCursorKind) -> CursorScope {
         },
         GraphCursorKind::Events { calendar_id } => CursorScope::FolderType {
             folder: FolderId(calendar_id.clone()),
-            ty: ObjectType::Event,
+            ty: ObjectType::CalendarEvent,
         },
         GraphCursorKind::Contacts { folder_id } => CursorScope::FolderType {
             folder: FolderId(folder_id.clone()),
@@ -997,26 +997,6 @@ mod tests {
             }
             other => panic!("expected PublicFolder, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn scope_for_kind_collapses_calendar_event_onto_event() {
-        // Documented lossiness: the Events cursor cannot record whether the
-        // scope asked for `Event` or `CalendarEvent`, so `scope_for_kind`
-        // always answers `Event` and `GraphScope` normalizes the aliases
-        // with the alias rule.
-        let scope = CursorScope::FolderType {
-            folder: FolderId("calendar".to_string()),
-            ty: ObjectType::CalendarEvent,
-        };
-        let kind = kind_for_scope(&scope).expect("calendar event scope maps");
-        assert_eq!(
-            scope_for_kind(&kind),
-            CursorScope::FolderType {
-                folder: FolderId("calendar".to_string()),
-                ty: ObjectType::Event,
-            }
-        );
     }
 
     #[test]

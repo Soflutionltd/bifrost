@@ -129,11 +129,13 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
         },
         filter_rule_shape: FilterRuleShape::Rules,
         conveniences: bifrost_types::ConvenienceShape {
-            starred: StarredFlagShape::LabelMembership,
+            label: bifrost_types::LabelShape::LabelMembership,
+            folder: bifrost_types::LabelShape::ContainerMembership,
+            starred: StarredFlagShape::LabelMembership("STARRED"),
             replied: bifrost_types::RepliedFlagShape::None,
             forwarded: bifrost_types::ForwardedFlagShape::None,
             // Gmail's read-receipt model is read-only.
-            mdn_sent_via_keyword: false,
+            mdn_sent_keyword: None,
         },
         // Gmail delegation rides separate authorization, not open-time
         // discovery: a reopen of this account can never surface another
@@ -201,7 +203,15 @@ mod tests {
         // Gmail has no message-importance field and a read-only
         // read-receipt model.
         assert!(!caps.pim_methods.set_importance);
-        assert!(!caps.conveniences.mdn_sent_via_keyword);
+        assert_eq!(
+            caps.conveniences.label,
+            bifrost_types::LabelShape::LabelMembership
+        );
+        assert_eq!(
+            caps.conveniences.folder,
+            bifrost_types::LabelShape::ContainerMembership
+        );
+        assert_eq!(caps.conveniences.mdn_sent_keyword, None);
         assert!(caps.pim_methods.set_is_read);
         assert!(caps.pim_methods.send_message);
         assert!(!caps.pim_methods.attachment_upload);
@@ -245,7 +255,10 @@ mod tests {
     #[test]
     fn convenience_shape_uses_gmail_starred_label() {
         let caps = gmail_capabilities();
-        assert_eq!(caps.conveniences.starred, StarredFlagShape::LabelMembership);
+        assert_eq!(
+            caps.conveniences.starred,
+            StarredFlagShape::LabelMembership("STARRED")
+        );
         assert_eq!(
             caps.conveniences.replied,
             bifrost_types::RepliedFlagShape::None

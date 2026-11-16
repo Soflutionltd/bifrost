@@ -185,10 +185,12 @@ pub(crate) fn build_capabilities_for_registry(
             FilterRuleShape::None
         },
         conveniences: ConvenienceShape {
-            starred: StarredFlagShape::Keyword,
-            replied: bifrost_types::RepliedFlagShape::Keyword,
-            forwarded: bifrost_types::ForwardedFlagShape::Keyword,
-            mdn_sent_via_keyword: true,
+            label: bifrost_types::LabelShape::Keyword,
+            folder: bifrost_types::LabelShape::ContainerMembership,
+            starred: StarredFlagShape::Keyword("$flagged"),
+            replied: bifrost_types::RepliedFlagShape::Keyword("$answered"),
+            forwarded: bifrost_types::ForwardedFlagShape::Keyword("$forwarded"),
+            mdn_sent_keyword: Some("$MDNSent"),
         },
         // From the open-time NAMESPACE response: IMAP discovers shared /
         // other-user folders only at open (no scope-lifecycle events), so
@@ -350,7 +352,12 @@ mod tests {
         assert!(!caps.pim_methods.contact_autocomplete);
         assert!(caps.pim_methods.open_raw_rfc822);
         assert!(caps.pim_methods.set_importance);
-        assert!(caps.conveniences.mdn_sent_via_keyword);
+        assert_eq!(caps.conveniences.label, bifrost_types::LabelShape::Keyword);
+        assert_eq!(
+            caps.conveniences.folder,
+            bifrost_types::LabelShape::ContainerMembership
+        );
+        assert_eq!(caps.conveniences.mdn_sent_keyword, Some("$MDNSent"));
         assert!(caps.requires_uidvalidity_recheck);
     }
 

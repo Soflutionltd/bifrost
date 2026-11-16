@@ -40,24 +40,6 @@ documented as the consumer's salt namespace. Residue:
 - Collapsing the vocabularies (`ProtocolKind`, `Protocol`, `Provider`,
   `ProtocolSalt`, `PushSource`) removes published items and needs the owner.
 
-## CON-011 - Are `ObjectType::Event` and `ObjectType::CalendarEvent` the same domain?
-
-**Reported by:** types (LATENT disagreement), graph.
-
-The graph hunter adds: Graph mints `Event` (`cursor::scope_for_kind`); CalDAV and
-IMAP-composed calendars mint `CalendarEvent`; Google matches both; and Graph
-carries local alias machinery for the duplication (`inventory::event_aliases`, the
-`scope_for_kind_collapses_calendar_event_onto_event` test, and the renewal
-session's "ambiguous case - `Event` and `CalendarEvent` scopes over one calendar"
-branch). Nothing in types says how the two differ: document a real difference or
-collapse them (a published removal, so the owner rules).
-
-Graph treats them as aliases (`graph/src/account/inventory.rs::event_aliases`,
-`cursor.rs`, `push/webhook.rs`); `account_compose::route_typed_scope` routes
-only `CalendarEvent` to the calendar sub-account; the engine keys them as
-distinct `CursorScope`s. Owner: `bifrost-types`, one variant or a stated alias
-rule.
-
 ## CON-047 - May this URL carry the account credential?
 
 **Reported by:** graph.

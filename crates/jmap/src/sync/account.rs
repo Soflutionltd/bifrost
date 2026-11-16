@@ -13,7 +13,7 @@ use bifrost_types::{
     DirectoryGroupMember, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId, EventPatch,
     EventRange, EventSearchRequest, FilterValidation, HostedAttachment, HydratedObject,
     HydrationProjection, Identity, IdentityId, IdentityPatch, Importance, InventoryEvent,
-    InventoryPartition, InventoryPartitioning, ItemOutcome, Label, MembershipScope, Message,
+    InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope, Message,
     MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus,
     ScopeLifecycleEvent, SearchRequest, SendAs, SendReceipt, SendRequest, ServerFilter,
     ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
@@ -1470,7 +1470,7 @@ impl Account for JmapAccount {
         pim::message_hydrate(Arc::clone(&self.registry), message, projection)
     }
 
-    fn move_thread(
+    fn move_thread_provider(
         &self,
         thread: ThreadId,
         target: ContainerId,
@@ -1480,47 +1480,7 @@ impl Account for JmapAccount {
         pim::move_thread(mail.clone(), thread, target, source)
     }
 
-    fn apply_label(
-        &self,
-        target: MutationTarget,
-        label: Label,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        match label.provenance.kind {
-            ContainerKind::Label => self.set_keyword(target, label.provenance.native.into(), true),
-            ContainerKind::Folder => self.add_to_container(target, label.id),
-            _ => {
-                let err = super::error::unsupported_error(
-                    AccountOperation::SetLabelMembership,
-                    None,
-                    bifrost_types::UnsupportedReason::LabelKind,
-                    "JMAP does not support this label kind",
-                );
-                Box::pin(async move { Err(err) })
-            }
-        }
-    }
-
-    fn remove_label(
-        &self,
-        target: MutationTarget,
-        label: Label,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        match label.provenance.kind {
-            ContainerKind::Label => self.set_keyword(target, label.provenance.native.into(), false),
-            ContainerKind::Folder => self.remove_from_container(target, label.id),
-            _ => {
-                let err = super::error::unsupported_error(
-                    AccountOperation::SetLabelMembership,
-                    None,
-                    bifrost_types::UnsupportedReason::LabelKind,
-                    "JMAP does not support this label kind",
-                );
-                Box::pin(async move { Err(err) })
-            }
-        }
-    }
-
-    fn delete_thread(
+    fn delete_thread_provider(
         &self,
         thread: ThreadId,
         current: Option<ContainerId>,

@@ -45,11 +45,14 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
-- **Remaining provider prose in diagnostics.** Reported in passing,
-  unverified. Graph Autodiscover and id-translation mappings and JMAP
-  WebSocket runtime and handshake mappings still export provider prose. The
-  public `JmapCredentials::Basic.password` field is a plain `String` (the
-  reusable encoded credential is already a zeroizing `Secret`).
+- **Graph REST errors still carry raw provider codes.** Reported in passing,
+  unverified. The general REST mapper in
+  `crates/graph/src/account/graph_error.rs` exports `innerError.code` raw and
+  keeps arbitrary `GraphSignal::Unknown.code` values in cause chains, either of
+  which can carry foreign text.
+- **`UnsupportedReason::LabelKind` has no producer.** Its only producers were
+  JMAP's label overrides, replaced by declared `LabelShape`s. Keep or remove is
+  the owner's call (published variant).
 
 ## 2. Blocked on a live probe
 

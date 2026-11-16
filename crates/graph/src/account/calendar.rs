@@ -3246,10 +3246,8 @@ mod sync_identity_tests {
 
     #[test]
     fn sync_event_identity_is_accepted_by_the_typed_calendar_parser() {
-        for ty in [
-            bifrost_types::ObjectType::Event,
-            bifrost_types::ObjectType::CalendarEvent,
-        ] {
+        {
+            let ty = bifrost_types::ObjectType::CalendarEvent;
             let scope = bifrost_types::CursorScope::FolderType {
                 folder: bifrost_types::FolderId("calendar".into()),
                 ty,

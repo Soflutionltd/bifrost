@@ -953,13 +953,13 @@ impl Account for ImapAccount {
         unsupported_future(AccountOperation::ContactSearch)
     }
 
-    fn contact_autocomplete(
+    fn contact_autocomplete_provider(
         &self,
         query: String,
         limit: u32,
     ) -> AccountFuture<Result<Vec<ContactCard>, AccountError>> {
         if let Some(contacts) = &self.contacts {
-            return contacts.contact_autocomplete(query, limit);
+            return contacts.contact_autocomplete_provider(query, limit);
         }
         unsupported_future(AccountOperation::ContactAutocomplete)
     }
@@ -1092,13 +1092,13 @@ impl Account for ImapAccount {
         unsupported_future(AccountOperation::EventSearch)
     }
 
-    fn event_autocomplete(
+    fn event_autocomplete_provider(
         &self,
         query: String,
         limit: u32,
     ) -> AccountFuture<Result<Vec<CalendarEvent>, AccountError>> {
         if let Some(calendars) = &self.calendars {
-            return calendars.event_autocomplete(query, limit);
+            return calendars.event_autocomplete_provider(query, limit);
         }
         unsupported_future(AccountOperation::EventAutocomplete)
     }
@@ -1118,7 +1118,7 @@ impl Account for ImapAccount {
         message::message_hydrate(self.clone(), message, projection)
     }
 
-    fn move_thread(
+    fn move_thread_provider(
         &self,
         thread: ThreadId,
         target: ContainerId,
@@ -1127,7 +1127,7 @@ impl Account for ImapAccount {
         mail_actions::move_thread(self.clone(), thread, target, source)
     }
 
-    fn delete_thread(
+    fn delete_thread_provider(
         &self,
         thread: ThreadId,
         current: Option<ContainerId>,

@@ -61,6 +61,11 @@ pub struct CheckpointTransition {
 ///
 /// All methods are async because real persistence backends are IO-bound. The
 /// in-memory impl returns ready futures.
+///
+/// Scope indexes must use decoded scope identity. Historical calendar Event
+/// tag 3 decodes to CalendarEvent (canonical tag 6); raw-byte indexes must
+/// migrate those keys or admit both encodings on lookup. Preserve checkpoint
+/// progress and ledger debt if historical rows exist under both tags.
 pub trait CheckpointStore: Send + Sync {
     /// Persist a checkpoint advance and the account's ledger, atomically.
     ///

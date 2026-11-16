@@ -525,11 +525,13 @@ awaits session cleanup rather than dropping the multi-request future.
 - `filter_rule_shape: Rules`. Gmail filters are wired for
   list/create/delete plus local validation; `filter_update` is
   unsupported (no update/replace endpoint).
-- `conveniences.starred: LabelMembership`. The default
-  `set_starred` convenience dispatches to Gmail's `STARRED` label.
+- `conveniences.starred: LabelMembership("STARRED")`. The shared
+  `AccountConveniences::set_starred` dispatches to Gmail's `STARRED` label.
+  Labels dispatch via `label: LabelMembership` (engine id), folders via
+  `folder: ContainerMembership`.
   Replied and forwarded convenience shapes are `None` because Gmail
   derives that state from messages rather than exposing a writeable
-  flag. `mdn_sent_via_keyword` is false: Gmail's read-receipt model is
+  flag. `mdn_sent_keyword` is `None`: Gmail's read-receipt model is
   read-only, so `mark_mdn_sent` returns `Unsupported(MarkMdnSent)`.
   Hydrated `Message.importance` is always `Normal`.
 

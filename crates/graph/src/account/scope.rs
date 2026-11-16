@@ -36,11 +36,9 @@ impl GraphScope {
                     // address the same mailbox. Typed PIM reads currently use the
                     // primary client, so shared non-mail collections are refused at
                     // admission, including push, rather than claiming false coverage.
-                    ObjectType::Event | ObjectType::CalendarEvent if route.foreign().is_none() => {
-                        Ok(Self::Events {
-                            calendar: folder.clone(),
-                        })
-                    }
+                    ObjectType::CalendarEvent if route.foreign().is_none() => Ok(Self::Events {
+                        calendar: folder.clone(),
+                    }),
                     ObjectType::Contact if route.foreign().is_none() => Ok(Self::Contacts {
                         folder: folder.clone(),
                     }),
@@ -268,11 +266,7 @@ mod tests {
 
     #[test]
     fn shared_non_mail_and_unknown_types_never_reach_a_transport_arm() {
-        for ty in [
-            ObjectType::Event,
-            ObjectType::CalendarEvent,
-            ObjectType::Contact,
-        ] {
+        for ty in [ObjectType::CalendarEvent, ObjectType::Contact] {
             assert!(matches!(
                 GraphScope::parse(&typed(
                     foreign::encode_foreign("shared@example.com", "collection"),
@@ -302,13 +296,6 @@ mod tests {
                 "item",
                 true,
                 None,
-            ),
-            (
-                ObjectType::Event,
-                "/me/calendars/collection/events",
-                "collection::item",
-                false,
-                Some("odata.maxpagesize=50, outlook.timezone=\"UTC\""),
             ),
             (
                 ObjectType::CalendarEvent,

@@ -1108,7 +1108,10 @@ mod tests {
         let rendered = format!("{error:?}");
         assert!(!rendered.contains("OneDrive upload drive item JSON body"));
         assert!(!rendered.contains("<html>"), "{rendered}");
-        assert!(rendered.contains("captured response body bytes: 15"), "{rendered}");
+        assert!(
+            rendered.contains("captured response body bytes: 15"),
+            "{rendered}"
+        );
     }
 
     /// A 202 that parses but names an impossible offset is the provider's

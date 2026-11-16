@@ -630,7 +630,7 @@ pub(crate) fn folder_destination(destination: MembershipScope) -> Option<FolderI
 /// Extracted so the routing is unit-testable without a live `$batch`.
 ///
 /// Deliberately message-shaped for every id, even though this account also
-/// establishes `ObjectType::Event` and `ObjectType::Contact` cursor scopes.
+/// establishes `ObjectType::CalendarEvent` and `ObjectType::Contact` cursor scopes.
 /// `get_stream` is the MAIL hydration lane across this workspace: the
 /// standalone calendar and contact account crates answer it with
 /// `unsupported_stream(AccountOperation::Hydrate)`, the sync engine's only

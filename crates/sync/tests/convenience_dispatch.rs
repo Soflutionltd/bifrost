@@ -1,11 +1,8 @@
 //! `Account` convenience-layer dispatch tests.
 //!
-//! The default impls on `bifrost_types::Account` encode the
-//! capability-driven dispatch table (starred / replied / forwarded /
-//! MDN-sent / label provenance) that every protocol crate inherits.
-//! Nothing previously pinned that table; a silent change to, say, the
-//! `$flagged` sentinel the Category arm sends would break Graph's
-//! `is_starred_category` match without any test noticing.
+//! The blanket AccountConveniences extension reads provider declarations for
+//! starred, replied, forwarded, MDN and label dispatch. Tests retain each
+//! provider's primitive arguments and verify custom declaration values too.
 //!
 //! The stub records every primitive invocation as a string; each test
 //! asserts exactly which primitive fired and with which arguments.
@@ -29,6 +26,7 @@ use bifrost_types::{
     ServerFilterCreate, ServerFilterId, ServerFilterPatch, StarredFlagShape, SubscriptionHandle,
     SyncEvent, ThreadHydration, ThreadId, VacationConfig,
 };
+use bifrost_types::{AccountConveniences, LabelShape};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 
@@ -670,7 +668,7 @@ fn assert_unsupported(err: &AccountError, op: AccountOperation) {
 #[tokio::test]
 async fn set_starred_keyword_shape_flips_dollar_flagged() {
     let account = RecorderAccount::with_conveniences(ConvenienceShape {
-        starred: StarredFlagShape::Keyword,
+        starred: StarredFlagShape::Keyword("$flagged"),
         ..ConvenienceShape::default()
     });
     account.set_starred(target(), true).await.expect("ok");
@@ -683,7 +681,7 @@ async fn set_starred_keyword_shape_flips_dollar_flagged() {
 #[tokio::test]
 async fn set_starred_label_shape_flips_the_starred_label() {
     let account = RecorderAccount::with_conveniences(ConvenienceShape {
-        starred: StarredFlagShape::LabelMembership,
+        starred: StarredFlagShape::LabelMembership("STARRED"),
         ..ConvenienceShape::default()
     });
     account.set_starred(target(), false).await.expect("ok");
@@ -701,7 +699,7 @@ async fn set_starred_category_shape_sends_the_dollar_flagged_sentinel() {
     // sends exactly "$flagged" - change it and Graph starts writing a
     // literal category named "$flagged" onto messages.
     let account = RecorderAccount::with_conveniences(ConvenienceShape {
-        starred: StarredFlagShape::Category,
+        starred: StarredFlagShape::Category("$flagged"),
         ..ConvenienceShape::default()
     });
     account.set_starred(target(), true).await.expect("ok");
@@ -724,7 +722,7 @@ async fn set_starred_none_shape_is_unsupported() {
 #[tokio::test]
 async fn mark_replied_keyword_path_flips_dollar_answered() {
     let account = RecorderAccount::with_conveniences(ConvenienceShape {
-        replied: bifrost_types::RepliedFlagShape::Keyword,
+        replied: bifrost_types::RepliedFlagShape::Keyword("$answered"),
         ..ConvenienceShape::default()
     });
     account
@@ -740,7 +738,10 @@ async fn mark_replied_keyword_path_flips_dollar_answered() {
 #[tokio::test]
 async fn mark_replied_extended_property_path_writes_last_verb_102() {
     let account = RecorderAccount::with_conveniences(ConvenienceShape {
-        replied: bifrost_types::RepliedFlagShape::ExtendedProperty,
+        replied: bifrost_types::RepliedFlagShape::ExtendedProperty {
+            name: "PR_LAST_VERB_EXECUTED",
+            value: "102",
+        },
         ..ConvenienceShape::default()
     });
     account
@@ -769,7 +770,7 @@ async fn mark_replied_with_no_shape_is_unsupported() {
 #[tokio::test]
 async fn mark_forwarded_paths_mirror_replied_with_forwarded_values() {
     let keyword_account = RecorderAccount::with_conveniences(ConvenienceShape {
-        forwarded: bifrost_types::ForwardedFlagShape::Keyword,
+        forwarded: bifrost_types::ForwardedFlagShape::Keyword("$forwarded"),
         ..ConvenienceShape::default()
     });
     keyword_account
@@ -789,7 +790,10 @@ async fn mark_forwarded_paths_mirror_replied_with_forwarded_values() {
     assert_unsupported(&err, AccountOperation::MarkForwarded);
 
     let ext_account = RecorderAccount::with_conveniences(ConvenienceShape {
-        forwarded: bifrost_types::ForwardedFlagShape::ExtendedProperty,
+        forwarded: bifrost_types::ForwardedFlagShape::ExtendedProperty {
+            name: "PR_LAST_VERB_EXECUTED",
+            value: "104",
+        },
         ..ConvenienceShape::default()
     });
     ext_account
@@ -808,7 +812,7 @@ async fn mark_forwarded_paths_mirror_replied_with_forwarded_values() {
 #[tokio::test]
 async fn mark_mdn_sent_flips_the_mdnsent_keyword_or_refuses() {
     let keyword_account = RecorderAccount::with_conveniences(ConvenienceShape {
-        mdn_sent_via_keyword: true,
+        mdn_sent_keyword: Some("$MDNSent"),
         ..ConvenienceShape::default()
     });
     keyword_account
@@ -832,7 +836,10 @@ async fn mark_mdn_sent_flips_the_mdnsent_keyword_or_refuses() {
 
 #[tokio::test]
 async fn gmail_label_dispatches_to_label_membership_with_engine_id() {
-    let account = RecorderAccount::with_conveniences(ConvenienceShape::default());
+    let account = RecorderAccount::with_conveniences(ConvenienceShape {
+        label: LabelShape::LabelMembership,
+        ..ConvenienceShape::default()
+    });
     let l = label(
         ProtocolKind::Gmail,
         ContainerKind::Label,
@@ -853,7 +860,11 @@ async fn gmail_label_dispatches_to_label_membership_with_engine_id() {
 
 #[tokio::test]
 async fn graph_label_and_folder_both_dispatch_to_category_with_native_id() {
-    let account = RecorderAccount::with_conveniences(ConvenienceShape::default());
+    let account = RecorderAccount::with_conveniences(ConvenienceShape {
+        label: LabelShape::Category,
+        folder: LabelShape::Category,
+        ..ConvenienceShape::default()
+    });
     let as_label = label(
         ProtocolKind::Graph,
         ContainerKind::Label,
@@ -879,7 +890,10 @@ async fn graph_label_and_folder_both_dispatch_to_category_with_native_id() {
 
 #[tokio::test]
 async fn keyword_protocol_label_dispatches_to_set_keyword_with_native() {
-    let account = RecorderAccount::with_conveniences(ConvenienceShape::default());
+    let account = RecorderAccount::with_conveniences(ConvenienceShape {
+        label: LabelShape::Keyword,
+        ..ConvenienceShape::default()
+    });
     let l = label(
         ProtocolKind::Jmap,
         ContainerKind::Label,
@@ -895,7 +909,10 @@ async fn keyword_protocol_label_dispatches_to_set_keyword_with_native() {
 
 #[tokio::test]
 async fn folder_label_applies_via_container_membership() {
-    let account = RecorderAccount::with_conveniences(ConvenienceShape::default());
+    let account = RecorderAccount::with_conveniences(ConvenienceShape {
+        folder: LabelShape::ContainerMembership,
+        ..ConvenienceShape::default()
+    });
     let l = label(
         ProtocolKind::Imap,
         ContainerKind::Folder,
@@ -1008,4 +1025,136 @@ async fn default_partition_stream_serves_full_and_rejects_the_rest() {
         panic!("expected Terminated first, got {:?}", events[0]);
     };
     assert_unsupported(err, AccountOperation::SyncInventory);
+}
+
+#[tokio::test]
+async fn convenience_values_come_from_the_declaration_on_dyn_account() {
+    let recorder = RecorderAccount::with_conveniences(ConvenienceShape {
+        starred: StarredFlagShape::LabelMembership("custom-star"),
+        replied: bifrost_types::RepliedFlagShape::ExtendedProperty {
+            name: "custom-reply",
+            value: "reply-value",
+        },
+        forwarded: bifrost_types::ForwardedFlagShape::ExtendedProperty {
+            name: "custom-forward",
+            value: "forward-value",
+        },
+        mdn_sent_keyword: Some("custom-mdn"),
+        ..ConvenienceShape::default()
+    });
+    let account: &dyn Account = &recorder;
+    account.set_starred(target(), true).await.expect("starred");
+    account
+        .mark_replied(ObjectId("m-1".into()))
+        .await
+        .expect("replied");
+    account
+        .mark_forwarded(ObjectId("m-1".into()))
+        .await
+        .expect("forwarded");
+    account
+        .mark_mdn_sent(ObjectId("m-1".into()))
+        .await
+        .expect("mdn");
+    assert_eq!(
+        recorder.calls(),
+        vec![
+            format!("set_label_membership:{:?}:custom-star:true", target()),
+            format!(
+                "set_extended_property:{:?}:custom-reply:Some(\"reply-value\")",
+                target()
+            ),
+            format!(
+                "set_extended_property:{:?}:custom-forward:Some(\"forward-value\")",
+                target()
+            ),
+            format!("set_keyword:{:?}:custom-mdn:true", target()),
+        ]
+    );
+    let keyword = RecorderAccount::with_conveniences(ConvenienceShape {
+        starred: StarredFlagShape::Keyword("custom-star-keyword"),
+        replied: bifrost_types::RepliedFlagShape::Keyword("custom-replied"),
+        forwarded: bifrost_types::ForwardedFlagShape::Keyword("custom-forwarded"),
+        ..ConvenienceShape::default()
+    });
+    keyword
+        .set_starred(target(), false)
+        .await
+        .expect("keyword star");
+    keyword
+        .mark_replied(ObjectId("m-1".into()))
+        .await
+        .expect("keyword reply");
+    keyword
+        .mark_forwarded(ObjectId("m-1".into()))
+        .await
+        .expect("keyword forward");
+    assert_eq!(
+        keyword.calls(),
+        vec![
+            format!("set_keyword:{:?}:custom-star-keyword:false", target()),
+            format!("set_keyword:{:?}:custom-replied:true", target()),
+            format!("set_keyword:{:?}:custom-forwarded:true", target()),
+        ]
+    );
+    let category = RecorderAccount::with_conveniences(ConvenienceShape {
+        starred: StarredFlagShape::Category("custom-star-category"),
+        ..ConvenienceShape::default()
+    });
+    category
+        .set_starred(target(), true)
+        .await
+        .expect("category star");
+    assert_eq!(
+        category.calls(),
+        vec![format!(
+            "set_category:{:?}:custom-star-category:true",
+            target()
+        ),]
+    );
+}
+
+#[tokio::test]
+async fn label_dispatch_uses_shape_even_when_provenance_names_another_protocol() {
+    let account = RecorderAccount::with_conveniences(ConvenienceShape {
+        label: LabelShape::Category,
+        ..ConvenienceShape::default()
+    });
+    let l = label(
+        ProtocolKind::Gmail,
+        ContainerKind::Label,
+        "engine-id",
+        "native-category",
+    );
+    account
+        .apply_label(target(), l.clone())
+        .await
+        .expect("apply");
+    account.remove_label(target(), l).await.expect("remove");
+    assert_eq!(
+        account.calls(),
+        vec![
+            format!("set_category:{:?}:native-category:true", target()),
+            format!("set_category:{:?}:native-category:false", target()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn undeclared_label_shapes_refuse_without_a_primitive_call() {
+    let account = RecorderAccount::with_conveniences(ConvenienceShape::default());
+    for kind in [ContainerKind::Label, ContainerKind::Folder] {
+        let l = label(ProtocolKind::Jmap, kind, "engine-id", "native");
+        let error = account
+            .apply_label(target(), l.clone())
+            .await
+            .expect_err("unsupported");
+        assert_unsupported(&error, AccountOperation::SetLabelMembership);
+        let error = account
+            .remove_label(target(), l)
+            .await
+            .expect_err("unsupported");
+        assert_unsupported(&error, AccountOperation::SetLabelMembership);
+    }
+    assert!(account.calls().is_empty());
 }

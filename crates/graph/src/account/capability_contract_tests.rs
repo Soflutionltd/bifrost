@@ -24,6 +24,7 @@
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use bifrost_types::AccountConveniences;
 use bifrost_types::{
     Account, AccountError, AccountErrorKind, AccountOperation, CloudUploadMeta, ContactCreate,
     ContactId, ContactPatch, ContainerId, ContainerKind, DirectoryGroupId, DraftHandle, DraftPatch,

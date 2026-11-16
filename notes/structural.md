@@ -121,21 +121,6 @@ builder becomes a typed facade over bifrost-types' header and body writers (it
 already depends on bifrost-types), with the DKIM signer staying in bifrost-smtp, so
 header encoding, folding, Message-ID, Date and Bcc stripping are decided once.
 
-## STR-015 - `account.rs` mixes the contract with product policy
-
-**Reported by:** types.
-
-The trait file is about 1,750 lines and its default-impl tier encodes policy:
-`dispatch_label` hard-codes a `ProtocolKind` switch (Gmail -> label membership,
-Graph -> category, others -> keyword) while the next convenience,
-`set_starred`, argues at length that capability dispatch is "the chosen design"
-over a protocol switch. `set_starred` hard-codes Gmail's `"STARRED"` label id
-and reuses `"$flagged"` as a Graph category; `mark_replied`/`mark_forwarded`
-hard-code MAPI `PR_LAST_VERB_EXECUTED` codes. Proposal: conveniences in their
-own module (an extension trait with a blanket impl, or free functions over `&dyn
-Account`), dispatched uniformly through `ConvenienceShape` (add a `LabelShape`),
-providers owning their sentinel strings.
-
 ## STR-042 - `PendingCoverage` is five subsystems behind one lock and one public surface
 
 **Reported by:** sync-lanes.

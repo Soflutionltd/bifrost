@@ -14,6 +14,7 @@
 //! repository owner, not as a refactor.
 
 use super::*;
+use bifrost_types::AccountConveniences;
 
 impl SyncEngine {
     // ---------- hydration passthrough ----------
@@ -258,7 +259,7 @@ impl SyncEngine {
     // resolved per call.
 
     /// Toggle the starred / flagged bit on `target`. Forwards to
-    /// [`Account::set_starred`].
+    /// [`AccountConveniences::set_starred`].
     pub async fn set_starred(
         &self,
         account_id: &AccountId,
@@ -272,7 +273,7 @@ impl SyncEngine {
     }
 
     /// Set or clear `target`'s read state. Forwards to
-    /// [`Account::set_read`].
+    /// [`AccountConveniences::set_read`].
     pub async fn set_read(
         &self,
         account_id: &AccountId,
@@ -285,7 +286,7 @@ impl SyncEngine {
             .await?)
     }
 
-    /// Apply `label` to `target`. Forwards to [`Account::apply_label`],
+    /// Apply `label` to `target`. Forwards to [`AccountConveniences::apply_label`],
     /// which dispatches by `label.provenance` to the right primitive.
     pub async fn apply_label(
         &self,
@@ -300,7 +301,7 @@ impl SyncEngine {
     }
 
     /// Remove `label` from `target`. Forwards to
-    /// [`Account::remove_label`].
+    /// [`AccountConveniences::remove_label`].
     pub async fn remove_label(
         &self,
         account_id: &AccountId,
@@ -313,7 +314,7 @@ impl SyncEngine {
             .await?)
     }
 
-    /// Mark `message` as replied. Forwards to [`Account::mark_replied`].
+    /// Mark `message` as replied. Forwards to [`AccountConveniences::mark_replied`].
     pub async fn mark_replied(
         &self,
         account_id: &AccountId,
@@ -323,7 +324,7 @@ impl SyncEngine {
     }
 
     /// Mark `message` as forwarded. Forwards to
-    /// [`Account::mark_forwarded`].
+    /// [`AccountConveniences::mark_forwarded`].
     pub async fn mark_forwarded(
         &self,
         account_id: &AccountId,
@@ -336,7 +337,7 @@ impl SyncEngine {
     }
 
     /// Persist that an MDN (read receipt) was dispatched for `message`.
-    /// Forwards to [`Account::mark_mdn_sent`].
+    /// Forwards to [`AccountConveniences::mark_mdn_sent`].
     pub async fn mark_mdn_sent(
         &self,
         account_id: &AccountId,
@@ -349,7 +350,7 @@ impl SyncEngine {
     }
 
     /// Move a thread between containers. Forwards to
-    /// [`Account::move_thread`]; the protocol crate composes the
+    /// [`AccountConveniences::move_thread`]; the protocol crate composes the
     /// add-then-remove pair against its own `Arc`-shaped handle.
     pub async fn move_thread(
         &self,
@@ -365,7 +366,7 @@ impl SyncEngine {
     }
 
     /// Move a thread to Trash, or delete-permanently if already in Trash.
-    /// Forwards to [`Account::delete_thread`].
+    /// Forwards to [`AccountConveniences::delete_thread`].
     pub async fn delete_thread(
         &self,
         account_id: &AccountId,

@@ -400,11 +400,7 @@ async fn an_ews_request_whose_every_translation_is_refused_is_a_whole_request_er
 #[tokio::test]
 async fn shared_non_mail_scopes_are_refused_before_either_push_transport() {
     for mode in [PushMode::GraphSubscriptions, PushMode::EwsStreaming] {
-        for ty in [
-            ObjectType::Event,
-            ObjectType::CalendarEvent,
-            ObjectType::Contact,
-        ] {
+        for ty in [ObjectType::CalendarEvent, ObjectType::Contact] {
             let client = GraphClient::new("token");
             client.script_rest([]);
             let account = GraphAccount::new_for_tests_with_shared(

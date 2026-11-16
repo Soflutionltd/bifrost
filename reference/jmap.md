@@ -2147,3 +2147,11 @@ Bearer sources continue to use net's shared coordination. The encoded Basic
 value remains reusable credential material despite being base64.
 
 Reusable pre-encoded Basic authorization values use the shared zeroizing `bifrost_net::credentials::Secret`. Problem and method formatting omits raw descriptions and unknown identifiers. Decode diagnostics retain JSON positions and categories without rejected values. Custom transport messages remain private; exact known problem limit names remain available to support.
+
+WebSocket runtime, frame-write and handshake diagnostics use fixed categories
+instead of formatting foreign errors or their sources. Handshake refusal status
+and typed proxy classification remain available, with transmission evidence
+unchanged. Subprotocol mismatches omit the returned header text. Enterprise
+users expect support consent to protect credentials echoed by a peer.
+`JmapCredentials::Basic.password` is the zeroizing `bifrost_sasl::Secret`,
+imported through bifrost-net's public re-export, matching the encoded credential.

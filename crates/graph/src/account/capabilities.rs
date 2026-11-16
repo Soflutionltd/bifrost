@@ -136,12 +136,20 @@ pub(crate) fn build_capabilities(
         },
         filter_rule_shape: FilterRuleShape::Rules,
         conveniences: bifrost_types::ConvenienceShape {
-            starred: StarredFlagShape::Category,
-            replied: bifrost_types::RepliedFlagShape::ExtendedProperty,
-            forwarded: bifrost_types::ForwardedFlagShape::ExtendedProperty,
+            label: bifrost_types::LabelShape::Category,
+            folder: bifrost_types::LabelShape::Category,
+            starred: StarredFlagShape::Category("$flagged"),
+            replied: bifrost_types::RepliedFlagShape::ExtendedProperty {
+                name: "PR_LAST_VERB_EXECUTED",
+                value: "102",
+            },
+            forwarded: bifrost_types::ForwardedFlagShape::ExtendedProperty {
+                name: "PR_LAST_VERB_EXECUTED",
+                value: "104",
+            },
             // Graph's read-receipt bit (isReadReceiptRequested) is
             // read-only; mark_mdn_sent surfaces Unsupported(MarkMdnSent).
-            mdn_sent_via_keyword: false,
+            mdn_sent_keyword: None,
         },
         // Graph's foreign surfaces (delegate mailboxes, public-folder
         // pins) are configuration-driven, not open-time namespace
@@ -268,7 +276,12 @@ mod tests {
         assert!(caps.pim_methods.set_extended_property);
         assert!(caps.pim_methods.set_importance);
         // Graph's read-receipt bit is read-only.
-        assert!(!caps.conveniences.mdn_sent_via_keyword);
+        assert_eq!(caps.conveniences.label, bifrost_types::LabelShape::Category);
+        assert_eq!(
+            caps.conveniences.folder,
+            bifrost_types::LabelShape::Category
+        );
+        assert_eq!(caps.conveniences.mdn_sent_keyword, None);
         assert!(caps.pim_methods.send_message);
         assert!(!caps.pim_methods.attachment_upload);
         assert!(caps.pim_methods.open_raw_rfc822);
@@ -301,14 +314,23 @@ mod tests {
         assert!(caps.pim_methods.event_rsvp);
         assert!(caps.pim_methods.event_search);
         assert!(caps.pim_methods.event_autocomplete);
-        assert_eq!(caps.conveniences.starred, StarredFlagShape::Category);
+        assert_eq!(
+            caps.conveniences.starred,
+            StarredFlagShape::Category("$flagged")
+        );
         assert_eq!(
             caps.conveniences.replied,
-            bifrost_types::RepliedFlagShape::ExtendedProperty
+            bifrost_types::RepliedFlagShape::ExtendedProperty {
+                name: "PR_LAST_VERB_EXECUTED",
+                value: "102"
+            }
         );
         assert_eq!(
             caps.conveniences.forwarded,
-            bifrost_types::ForwardedFlagShape::ExtendedProperty
+            bifrost_types::ForwardedFlagShape::ExtendedProperty {
+                name: "PR_LAST_VERB_EXECUTED",
+                value: "104"
+            }
         );
     }
 
