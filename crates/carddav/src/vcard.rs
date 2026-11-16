@@ -48,7 +48,13 @@ pub(crate) fn contact_from_vcard(
         id: ContactId(uri.clone()),
         address_book_id: address_book_id.clone(),
         native_id: uri.clone(),
-        etag: etag.map(Into::into),
+        version: etag.map(|tag| {
+            bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::CardDav,
+                bifrost_types::ObjectType::Contact,
+                tag,
+            )
+        }),
         provenance: ContactProvenance {
             provider: ProtocolKind::CardDav,
             native: uri,

@@ -13,7 +13,7 @@ use bytes::Bytes;
 
 use crate::blob::BlobHandle;
 use crate::compose::Address;
-use crate::container::ContainerId;
+use crate::cursor::MembershipScope;
 use crate::ids::{ObjectId, ThreadId};
 
 /// Message importance, the uniform representation of the
@@ -31,7 +31,11 @@ pub enum Importance {
     High,
 }
 
-/// Per-message projection selector for `message_hydrate`.
+/// Parsed-message projection selector for `Account::message_hydrate`.
+///
+/// This always returns a `Message`. `crate::Projection` instead selects
+/// flags, inventory metadata or MIME bytes from `Account::get_stream`;
+/// sharing a selector would admit requests with no parsed-message meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HydrationProjection {
@@ -75,10 +79,10 @@ pub struct MessageAttachment {
 /// One hydrated message returned by `message_hydrate` or sitting
 /// inside a `ThreadHydration`.
 ///
-/// Distinct from `mutation::HydratedObject` (which is the engine-side
-/// read-back shape carrying a `Projection` discriminant). `Message`
-/// is the user-facing parsed shape; `HydratedObject` is the
-/// engine-internal binary one.
+/// `mutation::HydratedObject` carries flags, inventory metadata or MIME
+/// bytes for bulk reads. `Message` carries parsed content. Both use the
+/// inventory membership vocabulary so opening a message preserves its
+/// folder/label identity and shared ownership in the user's mailbox view.
 ///
 /// Not `#[non_exhaustive]` because protocol Account impls construct
 /// `Message` directly.
@@ -93,8 +97,9 @@ pub struct Message {
     pub reply_to: Vec<Address>,
     pub subject: Option<String>,
     pub date: Option<SystemTime>,
-    /// Containers (folders, labels, mailboxes) the message is in.
-    pub containers: Vec<ContainerId>,
+    /// Placement and ownership, in the same vocabulary and namespace as
+    /// `crate::InventoryEntry::memberships`.
+    pub memberships: Vec<MembershipScope>,
     /// Keywords / flags currently set on the message.
     pub flags: crate::FlagSet,
     /// Message importance. The uniform, exclusive importance bit:

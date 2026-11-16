@@ -810,7 +810,11 @@ mod gate_tests {
 
     #[test]
     fn version_gate_requires_the_operations_own_door_only_for_supplied_versions() {
-        let version = ServerVersion::ETag("caller-owned".into());
+        let version = ServerVersion::etag(
+            crate::Protocol::Graph,
+            crate::ObjectType::Email,
+            "caller-owned",
+        );
         let operations = [
             (
                 AccountOperation::UpdateFlags,

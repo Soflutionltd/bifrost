@@ -74,19 +74,6 @@ only `CalendarEvent` to the calendar sub-account; the engine keys them as
 distinct `CursorScope`s. Owner: `bifrost-types`, one variant or a stated alias
 rule.
 
-## CON-018 - Which priority maps to which scheduler lane, and when does starvation fire?
-
-**Reported by:** sync-engine.
-
-`scheduler/mod.rs::lane_index`, `AdmissionState::visit_order` and
-`record_grant` re-implement the work-item path's `Scheduler::lane` and
-`try_pull` starvation rule ("exactly as `Scheduler::try_pull` does", "matching
-`Scheduler::lane`"). Two queue types back them: `LaneQueue` with a shed policy
-and `VecDeque<AdmissionRequest>` with a refuse policy. They agree by inspection.
-Owner: one `PriorityLanes<T>` with a pluggable overflow policy owning the floor
-rule once; the published, engine-unused work-item path stays as a thin user of
-it.
-
 ## CON-047 - May this URL carry the account credential?
 
 **Reported by:** graph.

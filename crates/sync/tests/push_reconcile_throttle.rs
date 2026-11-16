@@ -1,7 +1,7 @@
 //! The push reconciler is ONE task for the whole account, and it is the second
 //! producer on every scope's lane. Both properties have consequences: a
 //! per-scope recovery delay must not be slept off inside it, and it must honor
-//! the same terminal tombstones the poll scan does.
+//! the same registry-owned terminal verdicts the poll scan does.
 
 mod common;
 
@@ -12,7 +12,6 @@ use bifrost_sync::SchedulerConfig;
 use bifrost_sync::cancel::Boundary;
 use bifrost_sync::control::SyncControl;
 use bifrost_sync::cursor::CursorRegistry;
-use bifrost_sync::multiplexer::{ScopeToken, ScopeTokens};
 use bifrost_sync::push::Reconciler;
 use bifrost_sync::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
 use bifrost_types::{
@@ -42,14 +41,10 @@ fn throttled() -> bifrost_types::AccountError {
     .expect("valid rate-limited server error")
 }
 
-fn empty_tokens() -> ScopeTokens {
-    Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
 /// Run one `HintPayload::Unknown` sweep over two folder scopes, both of whose
 /// drives terminate with the throttled error above, and report which scopes the
 /// account was actually asked to drive.
-async fn sweep(scope_tokens: ScopeTokens) -> Vec<CursorScope> {
+async fn sweep(parked: bool) -> Vec<CursorScope> {
     let scopes = vec![scope("one"), scope("two")];
     let driven: Arc<Mutex<Vec<CursorScope>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&driven);
@@ -68,6 +63,10 @@ async fn sweep(scope_tokens: ScopeTokens) -> Vec<CursorScope> {
     let cursors = Arc::new(CursorRegistry::new());
     for scope in &scopes {
         cursors.put(cursor_for(scope, b"live"));
+    }
+
+    if parked {
+        cursors.park_scope_for_drive(&scope("one"), cursors.drive_generation(&scope("one")));
     }
 
     let (boundary, boundary_view) = Boundary::new();
@@ -95,7 +94,6 @@ async fn sweep(scope_tokens: ScopeTokens) -> Vec<CursorScope> {
         reopen_tx,
         throttles: Arc::new(bifrost_sync::throttle::ThrottleBucket::new()),
         scheduler,
-        scope_tokens,
         account_generation: tokio::sync::watch::channel(
             bifrost_sync::Incarnation::initial_generation(),
         )
@@ -119,7 +117,7 @@ async fn sweep(scope_tokens: ScopeTokens) -> Vec<CursorScope> {
 #[tokio::test(start_paused = true)]
 async fn a_throttled_scope_does_not_freeze_the_account_wide_sweep() {
     let started = tokio::time::Instant::now();
-    let driven = sweep(empty_tokens()).await;
+    let driven = sweep(false).await;
     let elapsed = started.elapsed();
 
     assert_eq!(
@@ -134,20 +132,13 @@ async fn a_throttled_scope_does_not_freeze_the_account_wide_sweep() {
     );
 }
 
-/// A scope whose poll task exited on a terminal verdict leaves a parked
-/// tombstone in `scope_tokens`, and the 1s poll scan honors it. The reconciler
-/// is the other producer on that lane: without reading the same record, a later
+/// A terminal verdict is parked in the registry, and the poll scan honors it.
+/// The reconciler is the other producer on that lane: without reading the same record, a later
 /// push hint re-drove a terminally failed scope, re-broadcasting `Terminated`
 /// and spending a wire call that cannot succeed.
 #[tokio::test(start_paused = true)]
 async fn a_terminally_parked_scope_is_not_re_driven_by_a_later_hint() {
-    let tokens = empty_tokens();
-    tokens
-        .lock()
-        .expect("tokens lock")
-        .insert(scope("one"), ScopeToken::tombstone());
-
-    let driven = sweep(tokens).await;
+    let driven = sweep(true).await;
 
     assert_eq!(
         driven,
@@ -270,7 +261,6 @@ impl Harness {
             reopen_tx: reopen_tx.clone(),
             throttles: Arc::new(bifrost_sync::ThrottleBucket::new()),
             scheduler: Scheduler::new(SchedulerConfig::default(), gate),
-            scope_tokens: empty_tokens(),
             account_generation: generation_rx,
         };
         let task = tokio::spawn(reconciler.run(Arc::clone(&ingress)));

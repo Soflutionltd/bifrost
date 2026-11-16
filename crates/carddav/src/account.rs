@@ -742,7 +742,14 @@ impl Account for CardDavAccount {
                         &url,
                         data,
                         expected_etag.map_or_else(
-                            || PutCondition::from_tag(current.etag.as_ref()),
+                            || {
+                                PutCondition::from_tag(
+                                    current
+                                        .version
+                                        .as_ref()
+                                        .and_then(bifrost_types::ServerVersion::entity_tag),
+                                )
+                            },
                             |etag| PutCondition::from_etag(Some(etag)),
                         ),
                         AccountOperation::ContactUpdate,
@@ -2457,7 +2464,7 @@ mod tests {
             id: ContactId("/book/one.vcf".to_string()),
             address_book_id: Some(AddressBookId("/book/".to_string())),
             native_id: "/book/one.vcf".to_string(),
-            etag: None,
+            version: None,
             provenance: ContactProvenance {
                 provider: ProtocolKind::CardDav,
                 native: "/book/one.vcf".to_string(),
@@ -2792,7 +2799,7 @@ mod tests {
             id: ContactId("/book/ada.vcf".to_string()),
             address_book_id: Some(AddressBookId("/book/".to_string())),
             native_id: "/book/ada.vcf".to_string(),
-            etag: None,
+            version: None,
             provenance: ContactProvenance {
                 provider: ProtocolKind::CardDav,
                 native: "/book/ada.vcf".to_string(),
@@ -2844,7 +2851,7 @@ mod tests {
             id: ContactId("/book/aase.vcf".to_string()),
             address_book_id: Some(AddressBookId("/book/".to_string())),
             native_id: "/book/aase.vcf".to_string(),
-            etag: None,
+            version: None,
             provenance: ContactProvenance {
                 provider: ProtocolKind::CardDav,
                 native: "/book/aase.vcf".to_string(),

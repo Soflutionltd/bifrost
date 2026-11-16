@@ -3508,8 +3508,11 @@ mod tests {
             Some(foreign::encode_object("shared", "T9").as_str())
         );
         assert_eq!(
-            message.containers.first().map(|id| id.0.as_str()),
-            Some(foreign::encode_foreign("shared", "inbox").0.as_str())
+            message.memberships,
+            vec![
+                bifrost_types::MembershipScope::Folder(foreign::encode_foreign("shared", "inbox")),
+                bifrost_types::MembershipScope::Owner(bifrost_types::PrincipalId("shared".into())),
+            ]
         );
 
         let requests = client.transport().requests();
@@ -3556,7 +3559,12 @@ mod tests {
             message.thread_id.as_ref().map(|id| id.0.as_str()),
             Some("T9")
         );
-        assert_eq!(message.containers[0].0, "inbox");
+        assert_eq!(
+            message.memberships,
+            vec![bifrost_types::MembershipScope::Mailbox(
+                bifrost_types::MailboxId("inbox".into())
+            )]
+        );
 
         let requests = client.transport().requests();
         assert_eq!(requests[0]["methodCalls"][0][1]["accountId"], "primary");

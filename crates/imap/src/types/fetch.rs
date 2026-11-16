@@ -221,6 +221,10 @@ impl BodySection {
 /// (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(
+    dead_code,
+    reason = "The raw FETCH encoder supports attributes beyond account projections"
+)]
 pub enum FetchAttr {
     /// UID (RFC 3501 Section 2.3.1.1).
     Uid,
@@ -408,6 +412,10 @@ pub(crate) fn format_fetch_attrs(attrs: &[FetchAttr]) -> String {
 /// `store-att-flags = (["+" / "-"] "FLAGS" [".SILENT"]) SP (flag-list / NIL)`
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(
+    dead_code,
+    reason = "The raw STORE encoder also supports non-silent operations"
+)]
 pub enum StoreOperation {
     /// `+FLAGS`  -  add flags.
     Add,

@@ -125,6 +125,7 @@ impl MailboxRights {
         self.rights.contains(&right)
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.rights.is_empty()
     }

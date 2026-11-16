@@ -453,10 +453,8 @@ impl SyncEngine {
             );
         }
 
-        // The multiplexer's per-scope poll tokens. Created here rather than
-        // inside `Multiplexer` because the push reconciler - spawned first -
-        // shares them: it is the other producer on the same lane and must
-        // honor the same terminal tombstones the 1s poll scan does.
+        // Poll-task ownership only. Terminal verdicts live in `cursors`,
+        // shared by polling and reconciliation independently of task ownership.
         let scope_tokens: crate::multiplexer::ScopeTokens =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
@@ -472,7 +470,6 @@ impl SyncEngine {
             reopen_tx: reopen_tx.clone(),
             throttles: Arc::clone(&throttles),
             scheduler: self.scheduler.clone(),
-            scope_tokens: Arc::clone(&scope_tokens),
             account_generation: account_generation_rx.clone(),
             #[cfg(test)]
             attempts: None,
@@ -529,12 +526,6 @@ impl SyncEngine {
             control: control.clone(),
             shutdown: multiplexer_cancel.clone(),
             reopen_tx: reopen_tx.clone(),
-            // The SAME map the reconciler got above, not a fresh one. A private
-            // map here silently un-wires the terminal tombstone: the poll scan
-            // would write parks nobody reads and the reconciler would read a
-            // map nothing writes, so `scope_is_parked` answered `false`
-            // unconditionally and a push hint re-drove a scope whose poll loop
-            // had permanently retired.
             scope_tokens: Arc::clone(&scope_tokens),
             throttles: Arc::clone(&throttles),
             scheduler: self.scheduler.clone(),

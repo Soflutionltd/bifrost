@@ -5,8 +5,8 @@ use crate::account::pim::threads::{delete_thread, thread_hydrate};
 use crate::account::{GraphAccount, PushMode};
 use crate::client::{GraphClient, ScriptedRestResponse};
 use bifrost_types::{
-    AccountErrorKind, AccountOperation, ContainerId, ErrorScope, MutationTarget, ObjectId,
-    ProtocolErrorKind, ThreadId,
+    AccountErrorKind, AccountOperation, ContainerId, ErrorScope, FolderId, MembershipScope,
+    MutationTarget, ObjectId, ProtocolErrorKind, ThreadId,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -50,8 +50,10 @@ async fn foreign_thread_members_are_queried_and_requalified_on_the_owner_client(
     // containers `containers_list` emits nor stays distinguishable from
     // a primary folder that happens to share the id.
     assert_eq!(
-        hydrated.messages[0].containers,
-        vec![ContainerId(format!("{mailbox}\u{1f}AAMkfolder"))]
+        hydrated.messages[0].memberships,
+        vec![MembershipScope::Folder(FolderId(format!(
+            "{mailbox}\u{1f}AAMkfolder"
+        )))],
     );
 
     let ids = resolve_target_ids(

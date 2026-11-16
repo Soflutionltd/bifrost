@@ -271,18 +271,18 @@ pub(crate) fn update(
         // ServerVersion::expected_etag validates HTTP entity-tag syntax;
         // sharing it with Calendar would remove support for opaque People
         // tokens such as caller-old. Empty tokens remain Unsupported here.
-        let expected = match patch.expected_version.as_ref() {
-            Some(bifrost_types::ServerVersion::ETag(etag)) if !etag.is_empty() => {
-                Some(etag.as_str().to_owned())
-            }
-            None => None,
-            Some(_) => {
-                return Err(AccountError::unsupported(
-                    AccountOperation::ContactUpdate,
-                    bifrost_types::error::Protocol::GooglePeople,
-                ));
-            }
-        };
+        let expected = patch
+            .expected_version
+            .as_ref()
+            .map(|version| {
+                version
+                    .expected_opaque_etag(
+                        bifrost_types::Protocol::GooglePeople,
+                        AccountOperation::ContactUpdate,
+                    )
+                    .map(str::to_owned)
+            })
+            .transpose()?;
         let update_fields = update_fields_for_patch(&patch);
         if expected.is_some() && (patch.photo.is_some() || update_fields.is_empty()) {
             return Err(AccountError::unsupported(
@@ -759,7 +759,13 @@ fn person_in_group(person: &Person, group: Option<&str>) -> bool {
 }
 
 fn contact_from_person(person: Person, corpus: ContactCorpus) -> ContactCard {
-    let etag = contact_source_etag(&person).map(Into::into);
+    let version = contact_source_etag(&person).map(|tag| {
+        bifrost_types::ServerVersion::etag(
+            bifrost_types::Protocol::GooglePeople,
+            bifrost_types::ObjectType::Contact,
+            tag,
+        )
+    });
     let native = person.resource_name.unwrap_or_default();
     let book_id = book_id_for_corpus(corpus);
     let display_name = person
@@ -771,7 +777,7 @@ fn contact_from_person(person: Person, corpus: ContactCorpus) -> ContactCard {
         id: ContactId(native.clone()),
         address_book_id: Some(AddressBookId(book_id.to_string())),
         native_id: native.clone(),
-        etag,
+        version,
         provenance: ContactProvenance {
             provider: ProtocolKind::Gmail,
             native,
@@ -1184,8 +1190,13 @@ mod tests {
                 ContactId("people/c1".into()),
                 ContactPatch {
                     display_name: Some(Some("Ada".into())),
-                    expected_version: expected
-                        .map(|etag| bifrost_types::ServerVersion::ETag(etag.into())),
+                    expected_version: expected.map(|etag| {
+                        bifrost_types::ServerVersion::etag(
+                            bifrost_types::Protocol::GooglePeople,
+                            bifrost_types::ObjectType::Contact,
+                            etag,
+                        )
+                    }),
                     ..Default::default()
                 },
             )
@@ -1271,7 +1282,11 @@ mod tests {
             ContactId("people/c1".into()),
             ContactPatch {
                 display_name: Some(Some("Ada".into())),
-                expected_version: Some(bifrost_types::ServerVersion::ETag("caller-old".into())),
+                expected_version: Some(bifrost_types::ServerVersion::etag(
+                    bifrost_types::Protocol::GooglePeople,
+                    bifrost_types::ObjectType::Contact,
+                    "caller-old",
+                )),
                 ..Default::default()
             },
         )
@@ -1312,8 +1327,14 @@ mod tests {
             assert_eq!(require_person_etag(&person).is_ok(), expected.is_some());
             assert_eq!(
                 contact_from_person(person, ContactCorpus::Main)
-                    .etag
-                    .as_deref(),
+                    .version
+                    .as_ref()
+                    .map(|version| version
+                        .expected_opaque_etag(
+                            bifrost_types::Protocol::GooglePeople,
+                            AccountOperation::ContactUpdate
+                        )
+                        .unwrap()),
                 expected
             );
         }
@@ -1328,7 +1349,11 @@ mod tests {
             ContactPatch {
                 display_name: Some(Some("Ada".into())),
                 photo: Some(None),
-                expected_version: Some(bifrost_types::ServerVersion::ETag("old".into())),
+                expected_version: Some(bifrost_types::ServerVersion::etag(
+                    bifrost_types::Protocol::GooglePeople,
+                    bifrost_types::ObjectType::Contact,
+                    "old",
+                )),
                 ..Default::default()
             },
         )
@@ -1348,7 +1373,11 @@ mod tests {
             client,
             ContactId("calendar::one".into()),
             ContactPatch {
-                expected_version: Some(bifrost_types::ServerVersion::ETag("\"old\"".into())),
+                expected_version: Some(bifrost_types::ServerVersion::etag(
+                    bifrost_types::Protocol::GooglePeople,
+                    bifrost_types::ObjectType::Contact,
+                    "\"old\"",
+                )),
                 ..Default::default()
             },
         )

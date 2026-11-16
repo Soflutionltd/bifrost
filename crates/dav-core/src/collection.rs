@@ -365,7 +365,7 @@ impl<'a, D: Dialect> DavCollectionClient<'a, D> {
         etag: &str,
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
-        let version = bifrost_types::ServerVersion::ETag(etag.into());
+        let version = bifrost_types::ServerVersion::etag(D::DAV.protocol(), D::OBJECT_TYPE, etag);
         let etag = version.expected_etag(D::DAV.protocol(), operation, true)?;
         let etag = prepare_if_match(etag).expect("validated strong entity tag");
         let request = self

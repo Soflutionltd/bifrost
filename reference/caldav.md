@@ -1575,8 +1575,9 @@ parser. `PutCondition::IfMatch` carries a privately constructed `StrongTag`;
 a weak validator cannot become an If-Match header. A server offering only weak
 validators still accepts unconditional edits: an enterprise user must be able
 to save changes, with the accepted loss of HTTP lost-update protection.
-Strings remain at the shared account version and persisted snapshot boundaries;
-they are parsed when entering the conditional-write boundary.
+Shared account reads carry scoped `ServerVersion` values; persisted snapshots
+retain entity-tag bytes. Conditional writes check protocol and object type before
+admitting the validator as a precondition.
 
 Observed snapshot preservation deduplicates by `DavHrefKey`, keeping the first
 native spelling in sorted order so aliases cannot duplicate inventory entries.
@@ -1622,10 +1623,12 @@ composition boundary.
 ## Shared entity validators
 
 `bifrost_types::EntityTag` owns strong/weak classification and preserves the
-original token bytes. `ServerVersion::ETag`, `ContactCard.etag` and
-`CalendarEvent.etag` carry this type. HTTP caller-token validation lives on the
-shared type; a token without a weak marker still needs syntax validation before
-it is accepted as an HTTP precondition. `StrongTag` has a private field.
+original token bytes. `ServerVersion::ETag` wraps it with the producing
+protocol and object type. `ContactCard.version` and `CalendarEvent.version`
+carry the complete `ServerVersion`, ready to pass back unchanged.
+HTTP caller-token validation lives on the shared entity-tag type; a token
+without a weak marker still needs syntax validation before it is accepted as
+an HTTP precondition. `StrongTag` has a private field.
 
 DAV `SnapshotEntry.etag` also carries the shared type. Snapshot encoding still
 writes the original string and decoding classifies that string, preserving the

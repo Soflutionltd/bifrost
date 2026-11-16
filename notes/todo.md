@@ -45,6 +45,16 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
+- **Poll and push change drives wait for scheduler admission while holding the
+  scope drive lease.** Both `spawn_scope_poll_inner`
+  (`crates/sync/src/multiplexer/mod.rs`) and the push reconciler
+  (`crates/sync/src/push/reconciler.rs`) call `DriveStart::admit_drive` inside
+  the `CursorRegistry::with_drive` closure, so a queued admission owns the
+  lease and blocks the other producer on that scope until budget frees.
+  `reference/sync.md` contradicts itself: the scheduler section says admission
+  happens before `with_drive` so a queued task never owns a lease, while the
+  drive-start section says the lease is claimed first and admission rechecked
+  after. Decide the order, make code and both passages agree.
 
 ## 2. Blocked on a live probe
 

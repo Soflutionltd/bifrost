@@ -101,7 +101,13 @@ async fn event_patch(conditional: bool) {
         GraphAccount::new_for_tests_with_shared(client.clone(), PushMode::GraphSubscriptions, &[]);
     let patch = bifrost_types::EventPatch {
         title: Some(Some("new".into())),
-        expected_version: conditional.then(|| bifrost_types::ServerVersion::ETag("\"v1\"".into())),
+        expected_version: conditional.then(|| {
+            bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::Graph,
+                bifrost_types::ObjectType::CalendarEvent,
+                "\"v1\"",
+            )
+        }),
         ..Default::default()
     };
     let error = crate::account::calendar::update(

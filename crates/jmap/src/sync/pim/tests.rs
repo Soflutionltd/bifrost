@@ -14,8 +14,9 @@ use crate::sync::state_cache::StateMap;
 use bifrost_types::{
     AccountError, AccountOperation, Application, AttachmentSource, BlobCapabilities, BlobEncoding,
     BlobHandle, BlobId, CompensationOutcome, ContainerId, ContainerKind, ContainerNamespace,
-    ErrorScope, Importance, MessageAttachment, MutationTarget, ObjectId, SearchFilter,
-    SearchRequest, StepEffect, StepReplay, ThreadId, VacationConfig,
+    ErrorScope, Importance, MailboxId, MembershipScope, MessageAttachment, MutationTarget,
+    ObjectId, PrincipalId, SearchFilter, SearchRequest, StepEffect, StepReplay, ThreadId,
+    VacationConfig,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -1687,10 +1688,10 @@ fn a_v2_cursor_still_refuses_to_cross_accounts() {
 // the foreign inventory minted, or the consumer's follow-up blob read
 // and container join both address the primary account.
 #[test]
-fn rebase_foreign_requalifies_message_container_and_blob_ids() {
+fn rebase_foreign_requalifies_message_memberships_and_blob_ids() {
     let mut id = ObjectId("M1".to_string());
     let mut thread_id = ThreadId("T1".to_string());
-    let mut containers = vec![ContainerId("inbox".to_string())];
+    let mut memberships = vec![MembershipScope::Mailbox(MailboxId("inbox".to_string()))];
     let mut attachments = vec![
         MessageAttachment {
             filename: None,
@@ -1726,7 +1727,7 @@ fn rebase_foreign_requalifies_message_container_and_blob_ids() {
     qualify_foreign_message_ids(
         &mut id,
         Some(&mut thread_id),
-        &mut containers,
+        &mut memberships,
         &mut attachments,
         "acct-9",
     );
@@ -1752,12 +1753,14 @@ fn rebase_foreign_requalifies_message_container_and_blob_ids() {
         &attachments[1].source,
         AttachmentSource::Inline(bytes) if bytes == &Bytes::from_static(b"inline")
     ));
-    // A container id is a mailbox id, so it rides the FOLDER namespace
-    // `containers_list` and the qualified memberships key on -
-    // byte-identical, or the join fails.
+    // Foreign placement uses inventory's qualified folders and owner tag,
+    // keeping the container join and shared-mailbox attribution intact.
     assert_eq!(
-        containers[0].0,
-        super::super::foreign::encode_foreign("acct-9", "inbox").0
+        memberships,
+        vec![
+            MembershipScope::Folder(super::super::foreign::encode_foreign("acct-9", "inbox")),
+            MembershipScope::Owner(PrincipalId("acct-9".to_string())),
+        ]
     );
 }
 

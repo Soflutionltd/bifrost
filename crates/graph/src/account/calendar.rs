@@ -439,8 +439,8 @@ pub(crate) async fn delete_if_version(
     } else {
         get(account.clone(), event.clone())
             .await?
-            .etag
-            .map(bifrost_types::EntityTag::into_string)
+            .version
+            .and_then(|version| version.entity_tag().map(|tag| tag.as_str().to_owned()))
     };
     let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventDelete)?;
     let path = event_url(&account, &calendar_id, &event_id);
@@ -761,11 +761,17 @@ fn event_from_graph(calendar_id: String, event: GraphEvent) -> CalendarEvent {
         calendar_id: CalendarId(calendar_id.clone()),
         native_id: native.clone(),
         uid: Some(event.id.clone()),
-        etag: event
+        version: event
             .change_key
             .as_deref()
             .map(super::inventory::graph_change_key_etag)
-            .map(GraphETag::into_entity_tag),
+            .map(|tag| {
+                bifrost_types::ServerVersion::etag(
+                    bifrost_types::Protocol::Graph,
+                    bifrost_types::ObjectType::CalendarEvent,
+                    tag.into_entity_tag(),
+                )
+            }),
         provenance: CalendarProvenance {
             provider: ProtocolKind::Graph,
             native,
@@ -1387,7 +1393,13 @@ mod tests {
             let result = account
                 .event_delete_if_version(
                     EventId("calendar::one".into()),
-                    expected.map(|value| bifrost_types::ServerVersion::ETag(value.into())),
+                    expected.map(|value| {
+                        bifrost_types::ServerVersion::etag(
+                            bifrost_types::Protocol::Graph,
+                            bifrost_types::ObjectType::CalendarEvent,
+                            value,
+                        )
+                    }),
                 )
                 .await;
             if expected.is_some() {
@@ -1429,8 +1441,13 @@ mod tests {
                 account,
                 EventId("cal::event-1".into()),
                 EventPatch {
-                    expected_version: expected
-                        .map(|etag| bifrost_types::ServerVersion::ETag(etag.into())),
+                    expected_version: expected.map(|etag| {
+                        bifrost_types::ServerVersion::etag(
+                            bifrost_types::Protocol::Graph,
+                            bifrost_types::ObjectType::CalendarEvent,
+                            etag,
+                        )
+                    }),
                     title: Some(Some("changed".into())),
                     ..Default::default()
                 },
@@ -1470,8 +1487,10 @@ mod tests {
             account,
             EventId("cal::event-1".into()),
             EventPatch {
-                expected_version: Some(bifrost_types::ServerVersion::ETag(
-                    "W/\"caller-version\"".into(),
+                expected_version: Some(bifrost_types::ServerVersion::etag(
+                    bifrost_types::Protocol::Graph,
+                    bifrost_types::ObjectType::CalendarEvent,
+                    "W/\"caller-version\"",
                 )),
                 title: Some(Some("changed".into())),
                 ..Default::default()

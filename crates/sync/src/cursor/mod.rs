@@ -62,10 +62,10 @@ struct RegistryState {
     /// would make them discard valid results and repeat their work from
     /// the cursors they started at.
     scope_generations: HashMap<CursorScope, ScopeDeleteGeneration>,
-    /// Per-scope liveness token, minted in `put_locked` in the same branch
-    /// that mints the incarnation and cancelled by `delete` under this same
-    /// write lock. Token identity therefore IS incarnation identity, and
-    /// token presence and cursor presence are one atomic fact.
+    /// Per-scope drive token, minted alongside a new incarnation and cancelled
+    /// by deletion or a terminal park under this same write lock. Token and
+    /// cursor presence are one atomic fact. A topology replacement revives a
+    /// parked scope with a new token while preserving its incarnation.
     ///
     /// The generation fence refuses a dead drive's PUBLICATION; this is what
     /// ends the drive itself. Without it a `drive_changes_stream` parked on a
@@ -76,6 +76,10 @@ struct RegistryState {
     /// task's - and because the poll task is not the only drive path: the push
     /// reconciler holds no poll token at all.
     scope_cancels: HashMap<CursorScope, CancellationToken>,
+    /// Terminal verdicts belong to the drive incarnation, not its poll task.
+    /// Users expect one terminal notification until a restart or reattach,
+    /// even when later push hints arrive without any poll owner.
+    parked: HashMap<CursorScope, DriveGeneration>,
     /// Cursor shapes of the CURRENT account model: every scope discovered or
     /// registered since the last topology replacement, which replaces it.
     /// Lifecycle creation maps a new membership through this, not through the
@@ -316,6 +320,7 @@ impl CursorRegistry {
     /// the engine's `EngineDirective::RestartScope` recovery path.
     pub fn delete(&self, scope: &CursorScope) {
         let mut state = self.state.write().expect("poisoned");
+        state.parked.remove(scope);
         state.cursors.remove(scope);
         state.incarnations.remove(scope);
         for entry in state.membership_index.values_mut() {
@@ -441,7 +446,7 @@ impl CursorRegistry {
         // A scope the replacement does not carry is gone exactly as if
         // `delete` had run, so its in-flight drive has to end for the same
         // reason: nothing will ever consume its result, and it is sitting on
-        // the scope lease. A RETAINED scope keeps its existing token, because
+        // the scope lease. An unparked RETAINED scope keeps its token, because
         // it keeps its existing incarnation - the staging registry minted its
         // own tokens under `put`, and adopting those would hand a live scope a
         // token no delete path holds a handle to.
@@ -455,11 +460,17 @@ impl CursorRegistry {
                 ScopeIncarnation(self.next_incarnation.fetch_add(1, Ordering::Relaxed))
             });
             replacement.incarnations.insert(scope.clone(), incarnation);
-            let cancel = current
-                .scope_cancels
-                .get(scope)
-                .cloned()
-                .unwrap_or_default();
+            // A terminal park cancelled the old drive token. The new account
+            // fence revives the retained scope without changing its incarnation.
+            let cancel = if current.parked.contains_key(scope) {
+                CancellationToken::new()
+            } else {
+                current
+                    .scope_cancels
+                    .get(scope)
+                    .cloned()
+                    .unwrap_or_default()
+            };
             replacement.scope_cancels.insert(scope.clone(), cancel);
         }
         // The replacement's model is the account model from here on; deletion
@@ -473,6 +484,8 @@ impl CursorRegistry {
             .scope_generations
             .clone_from(&current.scope_generations);
         replacement.reach.merge(&current.reach);
+        // Terminal verdicts from either registry describe an older account.
+        replacement.parked.clear();
         *current = replacement;
     }
 
@@ -503,16 +516,13 @@ impl CursorRegistry {
         }
     }
 
-    /// The scope's liveness token: cancelled when the scope leaves the
-    /// registry, whether by `delete` (lifecycle deletion, `RestartScope`,
-    /// `DowngradeCapabilityForScope`, `DisableScope`) or by a topology
-    /// replacement that drops it.
+    /// The scope's drive-liveness token: cancelled on deletion, terminal
+    /// parking or a topology replacement that drops the scope. A replacement
+    /// revives retained parked scopes with fresh tokens.
     ///
-    /// `None` means the registry does not hold this scope, which is the same
-    /// condition a cancelled token reports. A caller that wants a drive
-    /// bounded by scope lifetime should use [`CursorRegistry::with_drive`],
-    /// which does this already; this accessor exists for the paths that need
-    /// the token without the lease.
+    /// `None` means no registered cursor. A cancelled token can also describe a
+    /// retained, terminally parked cursor. Use [`CursorRegistry::with_drive`]
+    /// for a drive bounded by this token and serialized against other drives.
     #[must_use]
     pub fn scope_cancel(&self, scope: &CursorScope) -> Option<CancellationToken> {
         let state = self.state.read().expect("poisoned");
@@ -531,6 +541,41 @@ impl CursorRegistry {
                 .copied()
                 .unwrap_or(ScopeDeleteGeneration(0)),
         }
+    }
+
+    /// Park this scope only if the failing drive still owns its incarnation.
+    /// A late terminal result must not disable a restarted scope. Cancellation
+    /// stops any drive or poll still using this incarnation's token; the cursor
+    /// remains available for inspection and a later topology replacement.
+    pub fn park_scope_for_drive(&self, scope: &CursorScope, generation: DriveGeneration) -> bool {
+        let mut state = self.state.write().expect("poisoned");
+        if !state.cursors.contains_key(scope)
+            || TopologyGeneration(self.registry_generation.load(Ordering::SeqCst))
+                != generation.registry
+            || state
+                .scope_generations
+                .get(scope)
+                .copied()
+                .unwrap_or(ScopeDeleteGeneration(0))
+                != generation.scope
+        {
+            return false;
+        }
+        state.parked.insert(scope.clone(), generation);
+        if let Some(cancel) = state.scope_cancels.get(scope) {
+            cancel.cancel();
+        }
+        true
+    }
+
+    /// Whether the current drive incarnation has a terminal recovery verdict.
+    #[must_use]
+    pub fn scope_is_parked(&self, scope: &CursorScope) -> bool {
+        self.state
+            .read()
+            .expect("poisoned")
+            .parked
+            .contains_key(scope)
     }
 
     /// Publish one drive result while BOTH its account generation and
@@ -599,15 +644,10 @@ impl CursorRegistry {
     /// `claim_drive` for the life of the process": the fence alone rejects the
     /// dead drive's result but leaves it holding the lease.
     ///
-    /// `None` covers both "this scope is not in the registry" and "the drive
-    /// was cut because the scope left the registry". They are deliberately not
-    /// split, because under the registry's own locking they are one event
-    /// observed at two moments: `delete` removes the cursor and cancels the
-    /// token under a single write lock, so a cancelled drive's scope is gone
-    /// and a gone scope's drive is cancelled. A separate outcome would let a
-    /// caller branch on when it happened to look, not on what happened. Both
-    /// call sites want the same answer either way - stop touching this scope -
-    /// and both already give it.
+    /// `None` means the scope is absent or terminally parked, or that deletion
+    /// or parking cut the drive short. Both callers must stop touching that
+    /// incarnation. Parking retains the cursor for inspection, cancels the
+    /// current drive token and refuses later callbacks until a fence change.
     pub async fn with_drive<T, F, Fut>(&self, scope: &CursorScope, drive: F) -> Option<T>
     where
         F: FnOnce(ChangeCursor, DriveGeneration) -> Fut,
@@ -619,6 +659,9 @@ impl CursorRegistry {
         // the uncovered drive this method exists to rule out.
         let (cursor, cancel) = {
             let state = self.state.read().expect("poisoned");
+            if state.parked.contains_key(scope) {
+                return None;
+            }
             let cursor = state.cursors.get(scope).cloned()?;
             (cursor, state.scope_cancels.get(scope).cloned())
         };
@@ -664,6 +707,108 @@ mod tests {
             advanced_through: None,
             envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
         }
+    }
+
+    #[test]
+    fn terminal_park_is_revived_only_by_its_own_fence_change() {
+        for replace_account in [false, true] {
+            let registry = CursorRegistry::new();
+            let scope = CursorScope::Account;
+            let sibling = CursorScope::Type(ObjectType::Email);
+            registry.put(cursor(scope.clone(), b"initial"));
+            registry.put(cursor(sibling.clone(), b"sibling"));
+            let generation = registry.drive_generation(&scope);
+            let incarnation = registry.all_scope_incarnations();
+            let token = registry.scope_cancel(&scope).expect("live token");
+            assert!(registry.park_scope_for_drive(&scope, generation));
+            assert!(registry.scope_is_parked(&scope));
+            assert!(token.is_cancelled());
+            assert!(!registry.scope_is_parked(&sibling));
+            assert!(
+                !registry
+                    .scope_cancel(&sibling)
+                    .expect("sibling token")
+                    .is_cancelled()
+            );
+
+            // Cursor advancement and an unrelated deletion do not revive it.
+            registry.put(cursor(scope.clone(), b"advanced"));
+            registry.delete(&sibling);
+            assert!(registry.scope_is_parked(&scope));
+            if replace_account {
+                let replacement = CursorRegistry::new();
+                replacement.put(cursor(scope.clone(), b"staged"));
+                registry.replace_topology_preserving_cursors(&replacement);
+                assert_eq!(
+                    registry
+                        .snapshot(&scope)
+                        .expect("cursor")
+                        .server_state
+                        .bytes,
+                    b"advanced"
+                );
+                let before = incarnation
+                    .iter()
+                    .find(|(key, _)| key == &scope)
+                    .expect("scope")
+                    .1;
+                assert_eq!(registry.all_scope_incarnations()[0].1, before);
+            } else {
+                registry.delete(&scope);
+                registry.put(cursor(scope.clone(), b"recreated"));
+            }
+            assert!(!registry.scope_is_parked(&scope));
+            assert!(
+                !registry
+                    .scope_cancel(&scope)
+                    .expect("revived token")
+                    .is_cancelled()
+            );
+            assert!(
+                !registry.park_scope_for_drive(&scope, generation),
+                "late terminal verdict"
+            );
+            assert!(!registry.scope_is_parked(&scope));
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_park_cuts_an_active_drive_and_refuses_the_next_callback() {
+        let registry = CursorRegistry::new();
+        let scope = CursorScope::Account;
+        registry.put(cursor(scope.clone(), b"live"));
+        let driving = registry.with_drive(&scope, |_, _| std::future::pending::<()>());
+        tokio::pin!(driving);
+        assert!(futures::poll!(driving.as_mut()).is_pending());
+        assert!(registry.park_scope_for_drive(&scope, registry.drive_generation(&scope)));
+        assert!(
+            driving.await.is_none(),
+            "park releases the active drive lease"
+        );
+        assert!(
+            registry
+                .with_drive(&scope, |_, _| async { panic!("parked callback ran") })
+                .await
+                .is_none()
+        );
+        assert!(
+            registry.snapshot(&scope).is_some(),
+            "parking retains the cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_park_refuses_a_drive_already_waiting_for_the_lease() {
+        let registry = CursorRegistry::new();
+        let scope = CursorScope::Account;
+        registry.put(cursor(scope.clone(), b"live"));
+        let lease = registry.claim_drive(&scope).await;
+        let waiting = registry.with_drive(&scope, |_, _| async { panic!("queued callback ran") });
+        tokio::pin!(waiting);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        registry.park_scope_for_drive(&scope, lease.drive_generation());
+        drop(lease);
+        assert!(waiting.await.is_none());
     }
 
     #[tokio::test]

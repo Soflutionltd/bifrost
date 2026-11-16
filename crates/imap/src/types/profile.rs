@@ -144,6 +144,10 @@ impl std::ops::Deref for ServerProfile {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Raw connection capability queries extend beyond the account strategy"
+)]
 impl ServerProfile {
     /// Build a profile from capability and enabled-extension snapshots.
     pub fn new(capabilities: Vec<Capability>, enabled: Vec<String>) -> Self {

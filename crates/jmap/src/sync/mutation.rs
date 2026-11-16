@@ -84,17 +84,14 @@ pub(crate) fn destroy<T: HttpTransport>(
 // 5.9 (CalendarEvent/set) explicitly adopt this standard /set contract:
 // https://www.rfc-editor.org/rfc/rfc9610.html#section-3.5
 // https://datatracker.ietf.org/doc/html/draft-ietf-jmap-calendars-26#section-5.9
-pub(super) fn caller_state(
-    version: Option<&bifrost_types::ServerVersion>,
+pub(super) fn caller_state<'a>(
+    version: Option<&'a bifrost_types::ServerVersion>,
     operation: AccountOperation,
-) -> Result<Option<&str>, bifrost_types::AccountError> {
-    match version {
-        None => Ok(None),
-        Some(bifrost_types::ServerVersion::StateAt(state)) if !state.is_empty() => {
-            Ok(Some(state.as_str()))
-        }
-        Some(_) => Err(super::error::unsupported(operation)),
-    }
+    account_id: &str,
+) -> Result<Option<&'a str>, bifrost_types::AccountError> {
+    version
+        .map(|version| version.expected_jmap_state(account_id, operation))
+        .transpose()
 }
 
 pub(super) fn versioned_stream<T: HttpTransport>(
@@ -117,13 +114,14 @@ pub(super) fn versioned_stream<T: HttpTransport>(
             let mut groups: Vec<(String, Option<String>, Vec<ObjectId>)> = Vec::new();
             let mut rejected = Vec::new();
             for target in chunk {
+                let owner = foreign_mail.object(&target.id.0).id_str().to_owned();
                 let validation = if let MutationKind::Flags(op) = &kind {
                     op.validate_for_account(bifrost_types::Protocol::Jmap)
                 } else {
                     Ok(())
                 };
                 let expected = validation.and_then(|()| {
-                    caller_state(target.expected_version.as_ref(), operation_for_kind(&kind))
+                    caller_state(target.expected_version.as_ref(), operation_for_kind(&kind), &owner)
                         .map(|state| state.map(str::to_owned))
                 });
                 let expected = match expected {
@@ -139,7 +137,6 @@ pub(super) fn versioned_stream<T: HttpTransport>(
                     rejected.push(outcome);
                     continue;
                 }
-                let owner = foreign_mail.object(&target.id.0).id_str().to_owned();
                 if let Some((_, _, ids)) = groups.iter_mut().find(|(account, state, _)| {
                     account == &owner && state == &expected
                 }) {
@@ -965,6 +962,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_minted_mail_versions_refuse_other_types_and_owners_before_io() {
+        use bifrost_types::{ObjectType, ServerVersion};
+        for kind in [
+            MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
+            MutationKind::Move(MailboxId::new("archive")),
+            MutationKind::Destroy,
+        ] {
+            for (id, version) in [
+                (
+                    "m1".to_owned(),
+                    ServerVersion::jmap_state("primary", ObjectType::Mailbox, "caller-old"),
+                ),
+                (
+                    "m1".to_owned(),
+                    ServerVersion::jmap_state("primary", ObjectType::Contact, "caller-old"),
+                ),
+                (
+                    "m1".to_owned(),
+                    ServerVersion::jmap_state("shared", ObjectType::Email, "caller-old"),
+                ),
+                (
+                    super::super::foreign::encode_object("shared", "m1"),
+                    ServerVersion::jmap_state("primary", ObjectType::Email, "caller-old"),
+                ),
+            ] {
+                let requests = Arc::new(StdMutex::new(Vec::new()));
+                let (primary, foreign) = mutation_accounts(CallerStateTransport {
+                    accept: true,
+                    requests: Arc::clone(&requests),
+                });
+                let registry = crate::sync::registry::Registry::from_test_states(
+                    primary,
+                    foreign,
+                    ObjectLimits {
+                        max_objects_in_get: std::num::NonZeroUsize::new(256).unwrap(),
+                        max_objects_in_set: std::num::NonZeroUsize::new(10).unwrap(),
+                    },
+                    crate::sync::state_cache::seeded(std::collections::HashMap::new()),
+                );
+                let events = versioned_stream(
+                    Arc::new(registry),
+                    Box::pin(futures::stream::iter([bifrost_types::MailMutationTarget {
+                        id: ObjectId(id),
+                        expected_version: Some(version),
+                    }])),
+                    kind.clone(),
+                )
+                .collect::<Vec<_>>()
+                .await;
+                let [SyncEvent::Batch(batch), SyncEvent::Done(None)] = events.as_slice() else {
+                    panic!("{events:?}");
+                };
+                let [ItemOutcome::Failed(failure)] = batch.items.as_slice() else {
+                    panic!("{batch:?}");
+                };
+                assert_eq!(
+                    failure.error.kind(),
+                    &bifrost_types::AccountErrorKind::Unsupported(operation_for_kind(&kind))
+                );
+                assert!(requests.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn caller_state_siblings_share_one_guarded_set() {
         for kind in [
             MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
@@ -990,8 +1052,10 @@ mod tests {
                     Box::pin(futures::stream::iter(["m1", "m2"].map(|id| {
                         bifrost_types::MailMutationTarget {
                             id: ObjectId(id.into()),
-                            expected_version: Some(bifrost_types::ServerVersion::StateAt(
-                                "caller-old".into(),
+                            expected_version: Some(bifrost_types::ServerVersion::jmap_state(
+                                "primary",
+                                bifrost_types::ObjectType::Email,
+                                "caller-old",
                             )),
                         }
                     }))),
@@ -1061,8 +1125,10 @@ mod tests {
                 )),
                 Box::pin(futures::stream::iter([bifrost_types::MailMutationTarget {
                     id: ObjectId("m1".into()),
-                    expected_version: Some(bifrost_types::ServerVersion::StateAt(
-                        "caller-old".into(),
+                    expected_version: Some(bifrost_types::ServerVersion::jmap_state(
+                        "primary",
+                        bifrost_types::ObjectType::Email,
+                        "caller-old",
                     )),
                 }])),
                 kind,

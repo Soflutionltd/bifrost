@@ -6,8 +6,8 @@ use crate::account::pim::hydrate::{
 use crate::account::{GraphAccount, PushMode};
 use crate::client::GraphClient;
 use bifrost_types::{
-    AccountOperation, AttachmentSource, ContainerId, CursorScope, FolderId, HydrationProjection,
-    Importance, ObjectId, ObjectType,
+    AccountOperation, AttachmentSource, CursorScope, FolderId, HydrationProjection, Importance,
+    MembershipScope, ObjectId, ObjectType,
 };
 use bytes::Bytes;
 use serde_json::json;
@@ -157,6 +157,26 @@ fn primary_and_foreign_ids_stay_on_the_rest_read_arm() {
     assert_eq!(ews_read_folder(&foreign), None);
 }
 
+#[test]
+fn typed_hydration_preserves_inventory_folder_memberships() {
+    let value = json!({ "id": "m1", "parentFolderId": "inbox" });
+    for owner in [None, Some("shared@contoso.com")] {
+        let folder = owner.map_or_else(
+            || FolderId("inbox".into()),
+            |owner| encode_foreign(owner, "inbox"),
+        );
+        let scope = CursorScope::FolderType {
+            folder: folder.clone(),
+            ty: ObjectType::Email,
+        };
+        let inventory = crate::account::inventory::inventory_entry_from_value(&scope, &value)
+            .expect("mail inventory entry");
+        let hydrated = message_from_value(&value, HydrationProjection::Headers, owner).unwrap();
+        assert_eq!(hydrated.memberships, inventory.memberships);
+        assert_eq!(hydrated.memberships, vec![MembershipScope::Folder(folder)]);
+    }
+}
+
 // The EWS projection keeps the folder-qualified id the consumer
 // stored, so a hydrated public item still round-trips back through
 // the EWS arm on the next read.
@@ -174,7 +194,7 @@ fn ews_item_projects_to_message_keyed_by_the_qualified_id() {
     assert_eq!(message.to[0].address, "reader@contoso.com");
     assert_eq!(message.body_html.as_deref(), Some("<p>preview text</p>"));
     assert_eq!(message.body_text.as_deref(), Some("preview text"));
-    assert_eq!(message.containers, vec![ContainerId(folder.0)]);
+    assert_eq!(message.memberships, vec![MembershipScope::Folder(folder)]);
     assert!(message.flags.contains("\\seen"));
     assert!(message.date.is_some());
 }

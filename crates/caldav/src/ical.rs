@@ -187,7 +187,13 @@ fn project_event(
         calendar_id: calendar_id.clone(),
         native_id: uri.clone(),
         uid,
-        etag: etag.map(Into::into),
+        version: etag.map(|tag| {
+            bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::CalDav,
+                bifrost_types::ObjectType::CalendarEvent,
+                tag,
+            )
+        }),
         provenance: CalendarProvenance {
             provider: ProtocolKind::CalDav,
             native: uri,

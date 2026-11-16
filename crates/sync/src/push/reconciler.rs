@@ -40,14 +40,6 @@ pub struct Reconciler {
     /// its own Retry outcomes carry.
     pub throttles: Arc<crate::throttle::ThrottleBucket>,
     pub scheduler: crate::scheduler::Scheduler,
-    /// The multiplexer's per-scope poll tokens, shared rather than copied.
-    ///
-    /// A scope whose poll or push drive reached a TERMINAL verdict leaves a
-    /// parked tombstone here, and both the 1s poll scan and this reconciler
-    /// honor it. Without the shared record, a later push hint re-drove a
-    /// terminally failed scope - re-broadcasting `Terminated` and re-running
-    /// a wire call that cannot succeed.
-    pub scope_tokens: crate::multiplexer::ScopeTokens,
     pub account_generation: tokio::sync::watch::Receiver<crate::types::AccountGeneration>,
     #[cfg(test)]
     pub(crate) attempts: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -248,8 +240,7 @@ impl Reconciler {
             deferred.remove(&scope);
             // A successful scope restart or account replacement changes the
             // registry fence, invalidating the old incarnation's terminal state.
-            crate::multiplexer::retire_stale_scope_token(&self.scope_tokens, &self.cursors, &scope);
-            if crate::multiplexer::scope_is_parked(&self.scope_tokens, &scope) {
+            if self.cursors.scope_is_parked(&scope) {
                 tracing::debug!(
                     target: "bifrost.sync.reconcile",
                     account = ?self.account_id,
@@ -470,12 +461,7 @@ impl Reconciler {
                             continue;
                         }
                         RecoveryPlan::Terminal(_) => {
-                            crate::multiplexer::park_scope_for_drive(
-                                &self.scope_tokens,
-                                &self.cursors,
-                                &scope,
-                                drive_generation,
-                            );
+                            self.cursors.park_scope_for_drive(&scope, drive_generation);
                             continue;
                         }
                     }
@@ -577,12 +563,9 @@ mod tests {
             if refused {
                 scheduler.budget().forget(&account_id);
             }
-            let tokens = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             if parked {
-                tokens
-                    .lock()
-                    .expect("tokens")
-                    .insert(scope("one"), crate::multiplexer::ScopeToken::tombstone());
+                cursors
+                    .park_scope_for_drive(&scope("one"), cursors.drive_generation(&scope("one")));
             }
             let ingress = Arc::new(PushIngress::new(4));
             let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -601,7 +584,6 @@ mod tests {
                 reopen_tx,
                 throttles: Arc::new(crate::throttle::ThrottleBucket::new()),
                 scheduler,
-                scope_tokens: tokens,
                 account_generation: tokio::sync::watch::channel(
                     crate::types::Incarnation::initial_generation(),
                 )

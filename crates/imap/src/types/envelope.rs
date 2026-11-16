@@ -61,7 +61,7 @@ impl Envelope {
 /// - **Group start**: `host` is `None`, `mailbox` holds the group name.
 /// - **Group end**: both `host` and `mailbox` are `None`.
 ///
-/// Use [`EnvelopeAddress::is_group_start`] and [`EnvelopeAddress::is_group_end`] to detect these markers.
+/// Inspect `host` and `mailbox` together to distinguish these markers.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
 pub struct EnvelopeAddress {
@@ -96,6 +96,7 @@ impl EnvelopeAddress {
     /// Returns `true` if this is an RFC 5322 group start marker.
     ///
     /// Per RFC 3501 Section 7.4.2: host is NIL, mailbox holds the group name.
+    #[cfg(test)]
     pub fn is_group_start(&self) -> bool {
         self.host.is_none() && self.mailbox.is_some()
     }
@@ -103,11 +104,13 @@ impl EnvelopeAddress {
     /// Returns `true` if this is an RFC 5322 group end marker.
     ///
     /// Per RFC 3501 Section 7.4.2: both host and mailbox are NIL.
+    #[cfg(test)]
     pub fn is_group_end(&self) -> bool {
         self.host.is_none() && self.mailbox.is_none()
     }
 
     /// Returns `true` if this is a real address (not a group marker).
+    #[cfg(test)]
     pub fn is_address(&self) -> bool {
         self.host.is_some()
     }

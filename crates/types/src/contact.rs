@@ -147,9 +147,8 @@ pub struct ContactCard {
     pub address_book_id: Option<AddressBookId>,
     /// Native contact id string, duplicated from `provenance.native`.
     pub native_id: String,
-    /// Provider etag, change key, or similar optimistic-concurrency
-    /// token when available.
-    pub etag: Option<crate::EntityTag>,
+    /// Read-minted version to pass unchanged to conditional mutations.
+    pub version: Option<crate::mutation::ServerVersion>,
     /// Wire-level metadata for round trips.
     pub provenance: ContactProvenance,
     /// Corpus this contact belongs to. Mirrors the `corpus` of its

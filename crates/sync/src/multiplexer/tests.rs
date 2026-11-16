@@ -11,21 +11,25 @@ pub(super) fn scope_tokens() -> ScopeTokens {
 }
 
 #[test]
-fn registry_replacement_and_scope_restart_retire_terminal_ownership() {
+fn registry_replacement_and_scope_restart_retire_poll_ownership() {
     for replace_account in [false, true] {
         let cursors = CursorRegistry::new();
         let scope = CursorScope::Account;
         let cursor = crate::test_common::cursor_for(&scope, b"initial");
         cursors.put(cursor.clone());
         let tokens = scope_tokens();
-        let mut entry = ScopeToken::tombstone();
-        entry.drive_generation = Some(cursors.drive_generation(&scope));
-        tokens
-            .lock()
-            .expect("poisoned")
-            .insert(scope.clone(), entry);
+        let token = CancellationToken::new();
+        tokens.lock().expect("tokens").insert(
+            scope.clone(),
+            ScopeToken {
+                generation: ScopeTokenGeneration::mint(),
+                token: token.clone(),
+                drive_generation: Some(cursors.drive_generation(&scope)),
+            },
+        );
         retire_stale_scope_token(&tokens, &cursors, &scope);
-        assert!(scope_is_parked(&tokens, &scope));
+        assert!(!token.is_cancelled());
+        assert!(tokens.lock().expect("tokens").contains_key(&scope));
         if replace_account {
             let replacement = CursorRegistry::new();
             replacement.put(cursor);
@@ -35,7 +39,8 @@ fn registry_replacement_and_scope_restart_retire_terminal_ownership() {
             cursors.put(cursor);
         }
         retire_stale_scope_token(&tokens, &cursors, &scope);
-        assert!(!tokens.lock().expect("poisoned").contains_key(&scope));
+        assert!(token.is_cancelled(), "end the old provider's poll task");
+        assert!(!tokens.lock().expect("tokens").contains_key(&scope));
     }
 }
 
@@ -196,12 +201,8 @@ async fn shutdown_unparks_an_engine_directive_send_against_a_full_reopen_channel
     drop(reopen_rx);
 }
 
-/// `ScopeLifecycle::Deleted` must retire more than the in-memory
-/// cursor: it raises `ReopenRequest::ScopeDeleted` so the engine also
-/// purges the durable rows (change cursor AND backfill rows, completion
-/// marker included). Without the request, a folder recreated under the
-/// same id finds the surviving completion marker and skips its entire
-/// cold-start walk.
+/// Exercise the poll producer, not just its recovery projection: terminal
+/// exit must install the verdict in the registry shared with reconciliation.
 #[tokio::test]
 async fn terminal_drive_outcome_parks_the_scope_instead_of_retiring_it() {
     let scope = CursorScope::Account;
@@ -210,21 +211,46 @@ async fn terminal_drive_outcome_parks_the_scope_instead_of_retiring_it() {
         .operation(AccountOperation::SyncChanges)
         .try_build()
         .expect("valid terminal authentication error");
-
-    let recovery = handle_drive_outcome(
-        &scope,
-        Ok(ChangesEvent::Terminated(error)),
-        false,
-        crate::types::AccountGeneration::for_test(7),
-        &reopen_tx,
-        &AccountId("terminal".into()),
-        &crate::throttle::ThrottleBucket::default(),
-        &CancellationToken::new(),
-        &CancellationToken::new(),
+    let mut stub = crate::test_common::StubAccount::new(vec![scope.clone()]);
+    stub.changes_hook = Some(Arc::new(move |_| {
+        vec![SyncEvent::Terminated(error.clone())]
+    }));
+    let account: Arc<dyn Account> = Arc::new(stub);
+    let account = Arc::new(ArcSwap::from_pointee(crate::types::Incarnation::new(
+        account,
+        crate::types::Incarnation::initial_generation(),
+    )));
+    let cursors = Arc::new(CursorRegistry::new());
+    cursors.put(crate::test_common::cursor_for(&scope, b"live"));
+    let (boundary, view) = crate::cancel::Boundary::new();
+    let (priority, _) = watch::channel(bifrost_types::Priority::Normal);
+    let (bandwidth, _) = watch::channel(None);
+    let account_id = AccountId("terminal".into());
+    let control = SyncControl::new(account_id.clone(), boundary, priority, bandwidth);
+    let (tx, _events) = broadcast::channel(4);
+    let scheduler = crate::scheduler::Scheduler::new(
+        crate::types::SchedulerConfig::default(),
+        crate::scheduler::BudgetGate::new(crate::scheduler::ConcurrencyBudget::default()),
+    );
+    let exit = spawn_scope_poll_inner(
+        account_id,
+        account,
+        Arc::clone(&cursors),
+        MultiplexerConfig::default(),
+        view,
+        Arc::new(ChangeDelivery::new(tx)),
+        control,
+        CancellationToken::new(),
+        CancellationToken::new(),
+        reopen_tx,
+        Arc::new(crate::throttle::ThrottleBucket::default()),
+        scheduler,
+        scope.clone(),
     )
     .await;
 
-    assert_eq!(recovery.exit, Some(PollExit::Park));
+    assert_eq!(exit, PollExit::Park);
+    assert!(cursors.scope_is_parked(&scope));
     assert!(
         reopen_rx.try_recv().is_err(),
         "terminal errors must not be handed to the reopen listener"
@@ -245,7 +271,6 @@ pub(super) fn track(tokens: &ScopeTokens, scope: &CursorScope) -> ScopeTokenGene
         ScopeToken {
             generation,
             token: CancellationToken::new(),
-            parked: false,
             drive_generation: None,
         },
     );
@@ -372,7 +397,6 @@ fn cancelling_a_scope_token_also_retires_its_entry() {
         ScopeToken {
             generation: ScopeTokenGeneration(7),
             token: token.clone(),
-            parked: false,
             drive_generation: None,
         },
     );
@@ -397,7 +421,6 @@ fn a_stale_retirement_leaves_the_current_entry_alone() {
         ScopeToken {
             generation: ScopeTokenGeneration(9),
             token: CancellationToken::new(),
-            parked: false,
             drive_generation: None,
         },
     );

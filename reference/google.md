@@ -642,8 +642,8 @@ Hydration primitives use Gmail's `full` and `metadata` formats.
 `thread_hydrate` calls `users.threads.get` and projects each message.
 `message_hydrate` picks the cheapest format for the requested
 `HydrationProjection`, parses common address and threading headers, maps
-label ids to containers and canonical flags, and surfaces attachment blob
-handles for `FullWithBlobs`. Hydration reads every repeated From, To, Cc, Bcc
+label ids to `MembershipScope::Label` memberships and canonical flags, and
+surfaces attachment blob handles for `FullWithBlobs`. Hydration reads every repeated From, To, Cc, Bcc
 and Reply-To field in wire order with the shared address parser, including
 quoted-pair handling and RFC 2047 display-name decoding. Accepted addresses
 survive malformed siblings, and any rejection marks `Message.incomplete` in
@@ -1884,7 +1884,7 @@ empty versioned event patches are refused. There is no refresh-and-retry of
 a rejected caller token. Native contract:
 https://developers.google.com/workspace/calendar/api/guides/version-resources
 
-`ContactCard.etag` exposes the CONTACT source's `metadata.sources.etag`,
+`ContactCard.version` exposes the CONTACT source's `metadata.sources.etag`,
 never the merged `Person.etag` cache token. People `updateContact` requires
 contact source metadata and rejects a stale source ETag with 400
 `failedPrecondition`. Field updates preserve the fetched source identity and
@@ -1895,7 +1895,7 @@ updates use that source ETag when it is unique and present, and then omit the
 merged `Person.etag` from the body; when CONTACT sources exist but their token
 is missing or ambiguous, they keep the merged-`Person.etag` request and leave
 source metadata unchanged, because the API does not say which of several
-sources a write targets. `ContactCard.etag` is absent for ambiguous or missing
+sources a write targets. `ContactCard.version` is absent for ambiguous or missing
 source tokens and for OTHER_CONTACT. Contact update concurrency is advertised
 for these field writes.
 Versioned empty patches and any versioned patch containing a photo action are
@@ -2118,10 +2118,12 @@ re-issue. Earlier acknowledged bodies retain their separate per-id evidence.
 ## Shared entity validators
 
 `bifrost_types::EntityTag` owns strong/weak classification and preserves the
-original token bytes. `ServerVersion::ETag`, `ContactCard.etag` and
-`CalendarEvent.etag` carry this type. HTTP caller-token validation lives on the
-shared type; a token without a weak marker still needs syntax validation before
-it is accepted as an HTTP precondition. `StrongTag` has a private field.
+original token bytes. `ServerVersion::ETag` wraps it with the producing
+protocol and object type. `ContactCard.version` and `CalendarEvent.version`
+carry the complete `ServerVersion`, ready to pass back unchanged.
+HTTP caller-token validation lives on the shared entity-tag type; a token
+without a weak marker still needs syntax validation before it is accepted as
+an HTTP precondition. `StrongTag` has a private field.
 
 Calendar caller tags use HTTP validation. People source tokens use the same
 byte-preserving carrier but remain opaque JSON values: a weak-looking prefix

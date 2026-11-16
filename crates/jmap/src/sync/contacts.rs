@@ -119,6 +119,11 @@ pub(crate) fn get<T: HttpTransport>(
             .call(ContactCardGet::new().ids([id.clone()]))
             .await
             .map_err(to_acct_err(operation))?;
+        let version = bifrost_types::ServerVersion::jmap_state(
+            contacts.id().as_str(),
+            bifrost_types::ObjectType::Contact,
+            response.state().to_string(),
+        );
         let not_found = response.not_found().contains(&id);
         let answer_context = response.answer_context;
         let card = super::single_get::require_one(
@@ -132,7 +137,10 @@ pub(crate) fn get<T: HttpTransport>(
                 id: contact.clone(),
             },
         )?;
-        contact_from_jmap(card, operation)
+        contact_from_jmap(card, operation).map(|mut card| {
+            card.version = Some(version);
+            card
+        })
     })
 }
 
@@ -166,11 +174,12 @@ pub(crate) fn update<T: HttpTransport>(
     patch: ContactPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let contacts = require_contacts(contacts, AccountOperation::ContactUpdate)?;
         let expected = super::mutation::caller_state(
             patch.expected_version.as_ref(),
             AccountOperation::ContactUpdate,
+            contacts.id().as_str(),
         )?;
-        let contacts = require_contacts(contacts, AccountOperation::ContactUpdate)?;
         if patch.photo.is_some() {
             return Err(unsupported(
                 AccountOperation::ContactUpdate,
@@ -236,11 +245,12 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
     expected_version: Option<bifrost_types::ServerVersion>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let contacts = require_contacts(contacts, AccountOperation::ContactDelete)?;
         let expected = super::mutation::caller_state(
             expected_version.as_ref(),
             AccountOperation::ContactDelete,
+            contacts.id().as_str(),
         )?;
-        let contacts = require_contacts(contacts, AccountOperation::ContactDelete)?;
         let id = ContactCardId::new(contact.0);
         let mut set = ContactCardSet::new().destroy([id.clone()]);
         if let Some(state) = expected {
@@ -346,9 +356,17 @@ async fn get_cards<T: HttpTransport>(
         .call(ContactCardGet::new().ids(ids))
         .await
         .map_err(to_acct_err(operation))?;
+    let version = bifrost_types::ServerVersion::jmap_state(
+        contacts.id().as_str(),
+        bifrost_types::ObjectType::Contact,
+        response.state().to_string(),
+    );
     let not_found = response.not_found().to_vec();
-    let (cards, unanswered) =
+    let (mut cards, unanswered) =
         reconcile_cards(requested, &not_found, response.into_list(), operation)?;
+    for card in &mut cards {
+        card.version = Some(version.clone());
+    }
     Ok(HydratedCards {
         cards,
         failed_ids: unanswered,
@@ -473,7 +491,9 @@ fn contact_from_jmap(
         id: ContactId(native.clone()),
         address_book_id: address_book_id.clone(),
         native_id: native.clone(),
-        etag: None,
+        // Type state belongs to /get, not this object. Response adapters
+        // attach the selected account and state after projection.
+        version: None,
         provenance: ContactProvenance {
             provider: ProtocolKind::Jmap,
             native,
@@ -1383,7 +1403,11 @@ mod tests {
         );
         for expected in [
             None,
-            Some(bifrost_types::ServerVersion::StateAt("s1".into())),
+            Some(bifrost_types::ServerVersion::jmap_state(
+                "primary",
+                bifrost_types::ObjectType::Contact,
+                "s1",
+            )),
         ] {
             let transport = ScriptedQueryTransport::new(Vec::new());
             let update = update(
@@ -1443,10 +1467,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_minted_contact_versions_round_trip_through_writes() {
+        let transport = ScriptedQueryTransport::new(vec![
+            ScriptedPage {
+                ids: vec!["one"],
+                position: 0,
+                total: 1,
+                query_state: "query-only",
+            };
+            2
+        ]);
+        let cards = [
+            get(Some(transport.account()), ContactId("one".into()))
+                .await
+                .unwrap(),
+            list(Some(transport.account()), None, None)
+                .await
+                .unwrap()
+                .items
+                .remove(0),
+            search(Some(transport.account()), ContactSearchRequest::new("one"))
+                .await
+                .unwrap()
+                .items
+                .remove(0),
+        ];
+        for card in cards {
+            let version = card
+                .version
+                .expect("ContactCard/get exposes its type state");
+            assert_eq!(
+                version
+                    .expected_jmap_state("primary", AccountOperation::ContactUpdate)
+                    .unwrap(),
+                "s1"
+            );
+            assert!(
+                version
+                    .expected_jmap_state("primary", AccountOperation::EventUpdate)
+                    .is_err()
+            );
+            update(
+                Some(transport.account()),
+                card.id.clone(),
+                ContactPatch {
+                    expected_version: Some(version.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            delete_if_version(Some(transport.account()), card.id, Some(version))
+                .await
+                .unwrap();
+        }
+        for (_, args) in transport
+            .calls()
+            .iter()
+            .filter(|(method, _)| method == "ContactCard/set")
+        {
+            assert_eq!(args["ifInState"], "s1", "use /get state, never queryState");
+        }
+    }
+
+    #[tokio::test]
     async fn caller_contact_state_is_enforced_without_replacing_it() {
         for state in [Some("old"), Some("s1"), None] {
             let transport = ScriptedQueryTransport::new(Vec::new());
-            let expected = state.map(|state| bifrost_types::ServerVersion::StateAt(state.into()));
+            let expected = state.map(|state| {
+                bifrost_types::ServerVersion::jmap_state(
+                    "primary",
+                    bifrost_types::ObjectType::Contact,
+                    state,
+                )
+            });
             let stale = state == Some("old");
             let result = update(
                 Some(transport.account()),
@@ -1501,8 +1595,26 @@ mod tests {
     async fn wrong_contact_version_kind_is_refused_before_io() {
         let transport = ScriptedQueryTransport::new(Vec::new());
         for expected_version in [
-            bifrost_types::ServerVersion::ETag("s1".into()),
-            bifrost_types::ServerVersion::StateAt(String::new()),
+            bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::Jmap,
+                bifrost_types::ObjectType::Contact,
+                "s1",
+            ),
+            bifrost_types::ServerVersion::jmap_state(
+                "primary",
+                bifrost_types::ObjectType::Contact,
+                String::new(),
+            ),
+            bifrost_types::ServerVersion::jmap_state(
+                "shared",
+                bifrost_types::ObjectType::Contact,
+                "s1",
+            ),
+            bifrost_types::ServerVersion::jmap_state(
+                "primary",
+                bifrost_types::ObjectType::CalendarEvent,
+                "s1",
+            ),
         ] {
             let error = update(
                 Some(transport.account()),

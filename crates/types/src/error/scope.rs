@@ -491,7 +491,7 @@ pub enum Provider {
 
 /// Protocol of the failing API or transport leg. A composed account can report
 /// several protocols even though `Account::protocol()` names one primary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
 #[non_exhaustive]
 pub enum Protocol {
     GoogleCalendar,

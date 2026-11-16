@@ -304,7 +304,14 @@ fn project(folder: &str, node: &Node) -> Result<ContactCard, ews::EwsError> {
         id: foreign::public_contact(folder, &native),
         address_book_id: Some(foreign::public_address_book(folder)),
         native_id: native.clone(),
-        etag: identity.change_key.clone().map(Into::into),
+        // This change key belongs to EWS, not the REST If-Match door.
+        version: identity.change_key.clone().map(|tag| {
+            bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::Ews,
+                bifrost_types::ObjectType::Contact,
+                tag,
+            )
+        }),
         provenance: ContactProvenance {
             provider: ProtocolKind::Graph,
             native,
@@ -570,7 +577,13 @@ Second</t:Street><t:City>London</t:City><t:State>Region</t:State><t:PostalCode>1
             Some(foreign::public_address_book("people"))
         );
         assert_eq!(card.display_name.as_deref(), Some("Ada & Grace"));
-        assert_eq!(card.etag.as_deref(), Some("version"));
+        assert_eq!(
+            card.version
+                .as_ref()
+                .and_then(bifrost_types::ServerVersion::entity_tag)
+                .map(bifrost_types::EntityTag::as_str),
+            Some("version")
+        );
         assert_eq!(card.emails.len(), 2);
         assert_eq!(card.emails[0].value, "ada@example.test");
         assert_eq!(card.phones[1].value, "456");

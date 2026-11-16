@@ -56,7 +56,7 @@ mod pool;
 mod push;
 mod scopes;
 #[cfg(test)]
-#[path = "scripted_tests.rs"]
+#[path = "scripted/mod.rs"]
 mod scripted_tests;
 mod search;
 mod settings;

@@ -35,8 +35,6 @@ pub enum ValidationReason {
     ObjectIdTooLong { length: usize, limit: usize },
     InvalidObjectIdByte(u8),
     ZeroIdentifier,
-    MissingAddressSeparator,
-    InvalidAddressParts,
 }
 
 impl ValidationError {

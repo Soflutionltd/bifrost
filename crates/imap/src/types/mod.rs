@@ -1,4 +1,4 @@
-//! Public IMAP types.
+//! Internal IMAP protocol types.
 //!
 //! Core types from RFC 3501 (`IMAP4rev1`) and RFC 9051 (`IMAP4rev2`), plus
 //! RFC 5322 (Internet Message Format), RFC 2045/2046 (MIME),
@@ -6,6 +6,8 @@
 //!
 //! All types are fully owned  -  no lifetime parameters. Parsers produce these from `&[u8]`
 //! and callers can store them freely.
+
+#![warn(dead_code)]
 
 mod acl;
 mod address;

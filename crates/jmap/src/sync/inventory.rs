@@ -196,7 +196,7 @@ fn email_inventory_loop<T: HttpTransport>(
                 }
             };
 
-            let state = get_response.state().to_string();
+            let state = ServerVersion::jmap_state(mail.id_str(), bifrost_types::ObjectType::Email, get_response.state().to_string());
             let mut items = Vec::new();
             for email in get_response.into_list().into_iter().filter(email_has_id) {
                 let mut entry = email_to_inventory(email, &state);
@@ -387,7 +387,7 @@ fn mailbox_inventory<T: HttpTransport>(
                 }
             };
 
-            let state = response.state().to_string();
+            let state = ServerVersion::jmap_state(mail.id_str(), bifrost_types::ObjectType::Mailbox, response.state().to_string());
             let items = response
                 .into_list()
                 .into_iter()
@@ -444,7 +444,7 @@ fn mailbox_has_id(mailbox: &Mailbox) -> bool {
     mailbox.id().is_some_and(|id| !id.as_str().is_empty())
 }
 
-pub(crate) fn email_to_inventory(email: Email, state: &str) -> InventoryEntry {
+pub(crate) fn email_to_inventory(email: Email, state: &ServerVersion) -> InventoryEntry {
     let id = email.id().map(ToString::to_string).unwrap_or_default();
     let memberships = email
         .mailbox_ids()
@@ -463,7 +463,7 @@ pub(crate) fn email_to_inventory(email: Email, state: &str) -> InventoryEntry {
         memberships,
         blob_id,
         fingerprint: Fingerprint {
-            server_version: ServerVersion::StateAt(state.to_string()),
+            server_version: state.clone(),
             size,
             flags_hash: flags_hash(&email),
         },
@@ -474,7 +474,7 @@ pub(crate) fn email_to_inventory(email: Email, state: &str) -> InventoryEntry {
     }
 }
 
-fn mailbox_to_inventory(mailbox: Mailbox, state: &str) -> InventoryEntry {
+fn mailbox_to_inventory(mailbox: Mailbox, state: &ServerVersion) -> InventoryEntry {
     let id = mailbox.id().map(ToString::to_string).unwrap_or_default();
     let memberships = mailbox
         .parent_id()
@@ -488,7 +488,7 @@ fn mailbox_to_inventory(mailbox: Mailbox, state: &str) -> InventoryEntry {
         memberships,
         blob_id: None,
         fingerprint: Fingerprint {
-            server_version: ServerVersion::StateAt(state.to_string()),
+            server_version: state.clone(),
             size: None,
             flags_hash,
         },
@@ -600,7 +600,11 @@ mod tests {
             memberships: Vec::new(),
             blob_id: Some(BlobId("B1".to_string())),
             fingerprint: Fingerprint {
-                server_version: ServerVersion::StateAt("s1".to_string()),
+                server_version: ServerVersion::jmap_state(
+                    "acct-9",
+                    bifrost_types::ObjectType::Email,
+                    "s1",
+                ),
                 size: Some(10),
                 flags_hash: bifrost_types::canonical_flags_hash(std::iter::empty::<&str>()),
             },
@@ -649,7 +653,10 @@ mod tests {
             "keywords": {}
         }))
         .expect("email deserializes");
-        let entry = email_to_inventory(email, "s1");
+        let entry = email_to_inventory(
+            email,
+            &ServerVersion::jmap_state("primary", bifrost_types::ObjectType::Email, "s1"),
+        );
 
         assert_eq!(entry.id.0, "M1");
         assert_eq!(

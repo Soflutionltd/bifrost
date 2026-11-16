@@ -295,7 +295,7 @@ impl<D: Dialect> DavCollectionAccount<D> {
                     let started = Instant::now();
                     let snapshot = snapshot(collection).await?;
                     let checkpoint = Self::cursor_from_snapshot(scope.clone(), &snapshot);
-                    let items = snapshot.entries.iter().map(inventory_entry).collect();
+                    let items = snapshot.entries.iter().map(inventory_entry::<D>).collect();
                     Ok::<_, AccountError>(vec![
                         SyncEvent::Batch(Batch {
                             items,

@@ -13,7 +13,7 @@ mod core;
 mod dispatch;
 
 #[cfg(test)]
-#[path = "tests.rs"]
+#[path = "tests/mod.rs"]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;
 

@@ -1345,8 +1345,10 @@ mod tests {
             Box::pin(futures::stream::iter([
                 bifrost_types::MailMutationTarget {
                     id: ObjectId("m1".into()),
-                    expected_version: Some(bifrost_types::ServerVersion::ETag(
-                        "W/\"caller\"".into(),
+                    expected_version: Some(bifrost_types::ServerVersion::etag(
+                        bifrost_types::Protocol::Graph,
+                        bifrost_types::ObjectType::Email,
+                        "W/\"caller\"",
                     )),
                 },
                 bifrost_types::MailMutationTarget {
@@ -1424,12 +1426,18 @@ mod tests {
             Box::pin(futures::stream::iter([
                 bifrost_types::MailMutationTarget {
                     id: ObjectId("m1".into()),
-                    expected_version: Some(bifrost_types::ServerVersion::ETag("W/\"old\"".into())),
+                    expected_version: Some(bifrost_types::ServerVersion::etag(
+                        bifrost_types::Protocol::Graph,
+                        bifrost_types::ObjectType::Email,
+                        "W/\"old\"",
+                    )),
                 },
                 bifrost_types::MailMutationTarget {
                     id: ObjectId("m2".into()),
-                    expected_version: Some(bifrost_types::ServerVersion::ETag(
-                        "W/\"current\"".into(),
+                    expected_version: Some(bifrost_types::ServerVersion::etag(
+                        bifrost_types::Protocol::Graph,
+                        bifrost_types::ObjectType::Email,
+                        "W/\"current\"",
                     )),
                 },
             ])),
@@ -1492,14 +1500,18 @@ mod tests {
             Box::pin(futures::stream::iter([
                 bifrost_types::MailMutationTarget {
                     id: ObjectId("m1".into()),
-                    expected_version: Some(bifrost_types::ServerVersion::ETag(
-                        "W/\"first\"".into(),
+                    expected_version: Some(bifrost_types::ServerVersion::etag(
+                        bifrost_types::Protocol::Graph,
+                        bifrost_types::ObjectType::Email,
+                        "W/\"first\"",
                     )),
                 },
                 bifrost_types::MailMutationTarget {
                     id: ObjectId("m1".into()),
-                    expected_version: Some(bifrost_types::ServerVersion::ETag(
-                        "W/\"second\"".into(),
+                    expected_version: Some(bifrost_types::ServerVersion::etag(
+                        bifrost_types::Protocol::Graph,
+                        bifrost_types::ObjectType::Email,
+                        "W/\"second\"",
                     )),
                 },
                 bifrost_types::MailMutationTarget {
@@ -1558,7 +1570,11 @@ mod tests {
         let target = || -> AccountStream<bifrost_types::MailMutationTarget> {
             Box::pin(futures::stream::iter([bifrost_types::MailMutationTarget {
                 id: ObjectId("m1".into()),
-                expected_version: Some(bifrost_types::ServerVersion::ETag("W/\"old\"".into())),
+                expected_version: Some(bifrost_types::ServerVersion::etag(
+                    bifrost_types::Protocol::Graph,
+                    bifrost_types::ObjectType::Email,
+                    "W/\"old\"",
+                )),
             }]))
         };
         let streams = [

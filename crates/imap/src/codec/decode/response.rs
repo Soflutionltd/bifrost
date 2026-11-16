@@ -97,16 +97,6 @@ pub(super) fn parse_tagged(input: &[u8]) -> IResult<&[u8], TaggedResponse> {
     }
 }
 
-/// Parse an untagged response: `* SP ...` (RFC 3501 Section 2.2.2 / RFC 9051 Section 2.2.2).
-///
-/// When `utf8_mode` is `WireMode::Utf8`, ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
-pub(super) fn parse_untagged(
-    input: &[u8],
-    utf8_mode: crate::types::wire::WireMode,
-) -> IResult<&[u8], UntaggedResponse> {
-    parse_untagged_with_backing(input, utf8_mode, None)
-}
-
 pub(super) fn parse_untagged_with_backing<'a>(
     input: &'a [u8],
     utf8_mode: crate::types::wire::WireMode,
@@ -191,19 +181,6 @@ pub(super) fn parse_untagged_status(input: &[u8]) -> IResult<&[u8], UntaggedResp
             },
         ))
     }
-}
-
-/// Parse `* <n> EXISTS/RECENT/EXPUNGE/FETCH` (RFC 3501 Section 7.3 / RFC 9051 Section 7.3).
-///
-/// EXISTS and RECENT use `number` (zero is valid for empty mailboxes).
-/// EXPUNGE and FETCH use `nz-number` per `message-data` (RFC 3501 Section 9).
-///
-/// When `utf8_mode` is `WireMode::Utf8`, FETCH ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
-pub(super) fn parse_untagged_numbered(
-    input: &[u8],
-    utf8_mode: crate::types::wire::WireMode,
-) -> IResult<&[u8], UntaggedResponse> {
-    parse_untagged_numbered_with_backing(input, utf8_mode, None)
 }
 
 fn parse_untagged_numbered_with_backing<'a>(

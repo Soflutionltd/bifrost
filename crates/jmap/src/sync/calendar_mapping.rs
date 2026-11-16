@@ -118,7 +118,9 @@ pub(super) fn event_from_jmap(
         calendar_id: calendar_id.clone(),
         native_id: native.clone(),
         uid: event.uid().map(ToString::to_string),
-        etag: None,
+        // Type state belongs to /get, not this object. Response adapters
+        // attach the selected account and state after projection.
+        version: None,
         provenance: CalendarProvenance {
             provider: ProtocolKind::Jmap,
             native,

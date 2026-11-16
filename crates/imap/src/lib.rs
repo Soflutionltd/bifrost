@@ -12,7 +12,9 @@
 // response shapes, and pipeline helpers stay built so the protocol layer
 // is complete; a future trimming pass can decide what to remove vs wire
 // up. The annotation is at the crate root because the dead surface is
-// spread across most of the connection module tree.
+// spread across most of the connection module tree. The types and codec
+// modules override it with warn(dead_code); retained protocol builders carry
+// local exceptions explaining the commands they support.
 #![allow(dead_code)]
 // The crate-private `Error` now carries typed failure evidence
 // (`LocalFailure`, `CapabilityFailure`) beside its message, so it is a large

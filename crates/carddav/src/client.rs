@@ -726,11 +726,22 @@ mod tests {
 
         for (version, moving) in [
             (
-                bifrost_types::ServerVersion::ETag("W/\"weak\"".into()),
+                bifrost_types::ServerVersion::etag(
+                    bifrost_types::Protocol::CardDav,
+                    bifrost_types::ObjectType::Contact,
+                    "W/\"weak\"",
+                ),
                 false,
             ),
             (bifrost_types::ServerVersion::ModSeq(1), false),
-            (bifrost_types::ServerVersion::ETag("strong".into()), true),
+            (
+                bifrost_types::ServerVersion::etag(
+                    bifrost_types::Protocol::CardDav,
+                    bifrost_types::ObjectType::Contact,
+                    "strong",
+                ),
+                true,
+            ),
         ] {
             let script = dav_script_empty();
             let client = Arc::new(CardDavClient::with_account_net(
@@ -800,8 +811,13 @@ mod tests {
                 .contact_update(
                     bifrost_types::ContactId("https://dav.example.test/book/one.vcf".into()),
                     bifrost_types::ContactPatch {
-                        expected_version: expected
-                            .map(|etag| bifrost_types::ServerVersion::ETag(etag.into())),
+                        expected_version: expected.map(|etag| {
+                            bifrost_types::ServerVersion::etag(
+                                bifrost_types::Protocol::CardDav,
+                                bifrost_types::ObjectType::Contact,
+                                etag,
+                            )
+                        }),
                         ..Default::default()
                     },
                 )
@@ -836,7 +852,11 @@ mod tests {
         use bifrost_types::Account;
 
         for version in [
-            bifrost_types::ServerVersion::ETag("W/\"weak\"".into()),
+            bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::CardDav,
+                bifrost_types::ObjectType::Contact,
+                "W/\"weak\"",
+            ),
             bifrost_types::ServerVersion::ModSeq(42),
             bifrost_types::ServerVersion::Unavailable,
         ] {
@@ -887,7 +907,13 @@ mod tests {
             let result = account
                 .contact_delete_if_version(
                     bifrost_types::ContactId("https://dav.example.test/book/one.vcf".into()),
-                    expected.map(|value| bifrost_types::ServerVersion::ETag(value.into())),
+                    expected.map(|value| {
+                        bifrost_types::ServerVersion::etag(
+                            bifrost_types::Protocol::CardDav,
+                            bifrost_types::ObjectType::Contact,
+                            value,
+                        )
+                    }),
                 )
                 .await;
             if expected.is_some() {
@@ -1425,7 +1451,16 @@ mod tests {
             .expect("contact_get");
         // Normalized exactly as the multiget `getetag` was, so the snapshot
         // diff keeps comparing like with like.
-        assert_eq!(card.etag.as_deref(), Some("etag-9"));
+        assert_eq!(
+            card.version.as_ref().map(|version| version
+                .expected_etag(
+                    bifrost_types::Protocol::CardDav,
+                    AccountOperation::ContactUpdate,
+                    true
+                )
+                .unwrap()),
+            Some("etag-9")
+        );
 
         let requests = transcripts(&script);
         assert_eq!(requests.len(), 1, "one request, not a REPORT plus anything");

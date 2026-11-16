@@ -705,7 +705,14 @@ fn project(folder: &str, node: &Node) -> Result<CalendarEvent, ews::EwsError> {
         calendar_id: foreign::public_calendar(folder),
         native_id: native.clone(),
         uid: node.value("UID"),
-        etag: id.change_key.clone().map(Into::into),
+        // This change key belongs to EWS, not the REST If-Match door.
+        version: id.change_key.clone().map(|tag| {
+            bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::Ews,
+                bifrost_types::ObjectType::CalendarEvent,
+                tag,
+            )
+        }),
         provenance: CalendarProvenance {
             provider: ProtocolKind::Graph,
             native,

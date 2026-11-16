@@ -139,7 +139,7 @@ async fn single_event_reads_correlate_identity_and_reject_unanswered_ids() {
     )
     .await
     .expect("second returned event");
-    assert_eq!(event.id(), Some(CalendarEventId::new("e2")));
+    assert_eq!(event.0.id(), Some(CalendarEventId::new("e2")));
     for operation in [
         AccountOperation::EventGet,
         AccountOperation::EventUpdate,
@@ -163,10 +163,98 @@ async fn single_event_reads_correlate_identity_and_reject_unanswered_ids() {
 }
 
 #[tokio::test]
+async fn read_minted_event_versions_round_trip_through_writes() {
+    let transport = ScriptedQueryTransport::new(vec![
+        ScriptedPage {
+            ids: vec!["one"],
+            position: 0,
+            total: 1,
+            query_state: "query-only",
+        };
+        2
+    ]);
+    let range = EventRange::new(
+        CalendarId("cal".into()),
+        EventTime::from_observed("2026-06-01T00:00:00Z", None),
+        EventTime::from_observed("2026-06-02T00:00:00Z", None),
+    );
+    let events = [
+        get(Some(transport.account()), EventId("one".into()))
+            .await
+            .unwrap(),
+        events_in_range(Some(transport.account()), range)
+            .await
+            .unwrap()
+            .items
+            .remove(0),
+        search(Some(transport.account()), EventSearchRequest::new("one"))
+            .await
+            .unwrap()
+            .items
+            .remove(0),
+    ];
+    for event in events {
+        let version = event
+            .version
+            .expect("CalendarEvent/get exposes its type state");
+        assert_eq!(
+            version
+                .expected_jmap_state("primary", AccountOperation::EventUpdate)
+                .unwrap(),
+            "s1"
+        );
+        assert!(
+            version
+                .expected_jmap_state("primary", AccountOperation::ContactUpdate)
+                .is_err()
+        );
+        update(
+            Some(transport.account()),
+            event.id.clone(),
+            EventPatch {
+                expected_version: Some(version.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        delete_if_version(
+            Some(transport.account()),
+            event.id.clone(),
+            Some(version.clone()),
+        )
+        .await
+        .unwrap();
+        rsvp_if_version(
+            Some(transport.account()),
+            vec!["attendee@example.test".into()],
+            event.id,
+            RsvpStatus::Accepted,
+            Some(version),
+        )
+        .await
+        .unwrap();
+    }
+    for (_, args) in transport
+        .calls()
+        .iter()
+        .filter(|(method, _)| method == "CalendarEvent/set")
+    {
+        assert_eq!(args["ifInState"], "s1", "use /get state, never queryState");
+    }
+}
+
+#[tokio::test]
 async fn caller_event_state_is_enforced_without_replacing_it() {
     for state in [Some("old"), Some("s1"), None] {
         let transport = ScriptedQueryTransport::new(Vec::new());
-        let expected = state.map(|state| bifrost_types::ServerVersion::StateAt(state.into()));
+        let expected = state.map(|state| {
+            bifrost_types::ServerVersion::jmap_state(
+                "primary",
+                bifrost_types::ObjectType::CalendarEvent,
+                state,
+            )
+        });
         let stale = state == Some("old");
         let result = update(
             Some(transport.account()),
@@ -246,7 +334,11 @@ async fn an_omitted_event_set_answer_is_a_partial_response() {
     );
     for expected in [
         None,
-        Some(bifrost_types::ServerVersion::StateAt("s1".into())),
+        Some(bifrost_types::ServerVersion::jmap_state(
+            "primary",
+            bifrost_types::ObjectType::CalendarEvent,
+            "s1",
+        )),
     ] {
         let transport = ScriptedQueryTransport::new(Vec::new());
         let update = update(
@@ -324,8 +416,26 @@ async fn a_created_event_without_a_usable_id_is_refused() {
 async fn wrong_event_version_kind_is_refused_before_io() {
     let transport = ScriptedQueryTransport::new(Vec::new());
     for expected_version in [
-        bifrost_types::ServerVersion::ETag("s1".into()),
-        bifrost_types::ServerVersion::StateAt(String::new()),
+        bifrost_types::ServerVersion::etag(
+            bifrost_types::Protocol::Jmap,
+            bifrost_types::ObjectType::CalendarEvent,
+            "s1",
+        ),
+        bifrost_types::ServerVersion::jmap_state(
+            "primary",
+            bifrost_types::ObjectType::CalendarEvent,
+            String::new(),
+        ),
+        bifrost_types::ServerVersion::jmap_state(
+            "shared",
+            bifrost_types::ObjectType::CalendarEvent,
+            "s1",
+        ),
+        bifrost_types::ServerVersion::jmap_state(
+            "primary",
+            bifrost_types::ObjectType::Contact,
+            "s1",
+        ),
     ] {
         let error = update(
             Some(transport.account()),
@@ -440,7 +550,7 @@ fn event(start: &str, end: &str, expected_all_day: bool) -> CalendarEvent {
         calendar_id: CalendarId("c1".to_string()),
         native_id: "e1".to_string(),
         uid: None,
-        etag: None,
+        version: None,
         provenance: CalendarProvenance {
             provider: ProtocolKind::Jmap,
             native: "e1".to_string(),

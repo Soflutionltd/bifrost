@@ -368,7 +368,8 @@ fn envelope_address_is_distinct_from_message_address() {
     assert_eq!(env_addr.host.as_deref(), Some("example.com"));
 
     // crate::types::Address is a simpler name+email pair (RFC 5322 Section 3.4).
-    let msg_addr = crate::types::Address::with_name("Alice", "alice@example.com").unwrap();
+    let msg_addr =
+        crate::types::Address::new_unchecked(Some("Alice".into()), "alice@example.com".into());
     assert_eq!(msg_addr.name.as_deref(), Some("Alice"));
     assert_eq!(msg_addr.email, "alice@example.com");
 

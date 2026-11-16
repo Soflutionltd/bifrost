@@ -348,17 +348,6 @@ pub enum SpecialUse {
     Important,
 }
 
-impl MailboxInfo {
-    /// Detect the special-use role of this mailbox.
-    ///
-    /// Exact INBOX is implicit; otherwise checks RFC 6154 attributes, then name matching
-    /// on well-known names ("All Mail", "Sent", "Drafts", "Trash", "Spam",
-    /// "Junk", "Archive", "Starred", "Important").
-    pub fn special_use(&self) -> Option<SpecialUse> {
-        SpecialUse::classify(&self.attributes, self.name.as_str(), self.delimiter)
-    }
-}
-
 impl SpecialUse {
     /// The single SPECIAL-USE attribute classifier, also used to rank account roles.
     pub(crate) fn from_attributes(attributes: &[MailboxAttribute]) -> Option<Self> {

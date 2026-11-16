@@ -553,7 +553,9 @@ non-`Confirmed` status, and an RSVP value Graph has no action for stay
 `Unsupported`. `responseStatus` maps to
 `self_response`; RSVP uses native `accept`/`decline`/`tentativelyAccept`.
 Contact and calendar patches accept `expected_version: Option<ServerVersion>`.
-An `ETag` is sent verbatim as `If-Match`; a 412 is `ConcurrencyConflict`.
+A read-minted Graph ETag of the matching object type is sent verbatim as
+`If-Match`; a 412 is `ConcurrencyConflict`. Wrong-protocol and wrong-type
+versions are refused locally as Unsupported before I/O.
 A versioned contact update no longer fetches a validator. Contact updates
 refuse an `address_book_id` change as `Unsupported(ContactUpdate)` before I/O:
 this Graph path does not issue a folder-aware move, so it does not acknowledge
@@ -562,8 +564,9 @@ recurrence serialization, but never substitutes that read's change key for the
 caller token. Its preflight read failure is attributed to `EventUpdate`, since
 the read is part of the update operation. An absent version retains the existing
 immediate-read guard. Graph accepts HTTP entity-tag syntax and forwards the
-accepted token verbatim; the weak-tag prefix is uppercase `W/`, so lowercase
-`w/` is refused as an invalid token.
+accepted token verbatim. Shared validation recognizes the weak-tag prefix as
+`W/` or `w/` (see `reference/types.md`), so a lowercase `w/` tag is admitted
+and forwarded with its original spelling.
 `contact_delete_if_version` and `event_delete_if_version` accept the same optional
 caller ETag and send it without fetching a replacement. The ordinary delete
 doors and conditional doors with no version retain their immediate-read guards.
@@ -1106,8 +1109,10 @@ The mail cache, hydration observations, mutation preflight maps and
 `MessagePatch::etag` carry typed validators. Direct conditional client helpers
 accept `&GraphETag` through the wire funnel; batch builders convert validators
 to strings only when constructing serialized headers. Shared account values
-such as `ServerVersion::ETag`, `ContactCard::etag` and `CalendarEvent::etag`
-carry `bifrost_types::EntityTag`. `GraphETag` wraps that shared type while
+such as `ContactCard::version`, `CalendarEvent::version` and fingerprint versions
+carry `ServerVersion::ETag` with protocol and object type around an
+`EntityTag`. EWS read versions retain Protocol::Ews and cannot enter Graph REST
+conditional writes. Callers pass read versions back unchanged. `GraphETag` wraps that shared type while
 retaining its explicit OData/change-key constructors. Weak Graph validators
 retain their exact wire spelling and remain supported on conditional writes.
 
@@ -1589,8 +1594,9 @@ reported success having touched nothing.
 
 The owner also rides back out of the typed projection. `message_from_value`
 takes the owner decoded from the requested id and qualifies all three ids it
-mints - `Message.id`, `Message.thread_id`, and `Message.containers` (Graph
-returns `parentFolderId` bare even from `/users/{owner}`) - through the
+mints - `Message.id`, `Message.thread_id`, and the folder ids in
+`Message.memberships` (Graph returns `parentFolderId` bare even from
+`/users/{owner}`) - through the
 single `foreign::qualify_with_owner`. Without the container leg a shared
 hydrated message could not join the `Shared`-namespace containers
 `containers_list` emits (that path uses `encode_foreign`) and its parent id
@@ -2432,8 +2438,8 @@ passthrough - stripped the id down to its native EWS `ItemId` and asked
 `/me/messages/{itemId}`, which 404s `ErrorItemNotFound` naming the bare item
 id. The EWS projection keeps the folder-qualified id, maps `BodyPreview` /
 HTML body onto `body_text` / `body_html`, tags the containing folder as the
-only container, and carries `Importance::Normal` and no `thread_id` (EWS's
-message shape reports neither).
+only `MembershipScope::Folder`, and carries `Importance::Normal` and no
+`thread_id` (EWS's message shape reports neither).
 
 The EWS domain kind (`EwsItemKind`) is separate from request shape
 (`EwsItemShape`). Class matching requires the exact class or a dot-separated

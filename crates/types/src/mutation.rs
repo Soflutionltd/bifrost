@@ -9,44 +9,172 @@ use bytes::Bytes;
 use crate::blob::BlobHandle;
 use crate::ids::{ObjectId, RunId};
 
-/// Server-side version stamp used in `Fingerprint`.
+/// Server observation used in fingerprints and conditional mutations.
 ///
-/// Cross-protocol diff degrades gracefully: when the protocol cannot
-/// offer a server version, `Unavailable` falls back to
-/// `(size, flags_hash)`-only comparison.
+/// ETag and JMAP observations retain their producing protocol and object type.
+/// Consumers pass the read-side value back unchanged; a token for another door
+/// is refused locally rather than retried forever as a concurrency conflict.
+/// Preconditions follow the request shape: patches own their version, while
+/// deletes and RSVP take it as an argument because they have no patch payload.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ServerVersion {
     /// IMAP CONDSTORE / QRESYNC per-message MODSEQ.
     ModSeq(u64),
-    /// HTTP entity tag, including Graph wire tags and DAV normalized tags.
-    ETag(crate::EntityTag),
-    /// Gmail historyId snapshot covering this item.
+    /// Entity validator with its producing protocol and object type.
+    ETag(EntityVersion),
+    /// Gmail historyId snapshot covering this item (not a write precondition).
     HistoryAt(u64),
-    /// JMAP State string covering this item.
-    StateAt(String),
-    /// IMAP Basic, or any protocol without a server version stamp.
+    /// JMAP type state, bound to the native account that produced it.
+    StateAt(JmapStateVersion),
+    /// No server version; fingerprints fall back to size and flags.
     Unavailable,
 }
 
+/// An observed entity validator. Mint with [`ServerVersion::etag`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EntityVersion {
+    protocol: crate::Protocol,
+    object_type: crate::ObjectType,
+    tag: crate::EntityTag,
+}
+
+impl EntityVersion {
+    #[must_use]
+    pub fn protocol(&self) -> crate::Protocol {
+        self.protocol
+    }
+
+    #[must_use]
+    pub fn object_type(&self) -> crate::ObjectType {
+        self.object_type
+    }
+}
+
+/// An observed JMAP /get state. Query states are not mutation preconditions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JmapStateVersion {
+    account_id: String,
+    object_type: crate::ObjectType,
+    state: String,
+}
+
+impl JmapStateVersion {
+    #[must_use]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    #[must_use]
+    pub fn object_type(&self) -> crate::ObjectType {
+        self.object_type
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.state
+    }
+}
+
 impl ServerVersion {
+    /// Mint at the provider read boundary, preserving opaque token bytes.
+    #[must_use]
+    pub fn etag(
+        protocol: crate::Protocol,
+        object_type: crate::ObjectType,
+        tag: impl Into<crate::EntityTag>,
+    ) -> Self {
+        Self::ETag(EntityVersion {
+            protocol,
+            object_type,
+            tag: tag.into(),
+        })
+    }
+
+    /// Mint from a JMAP /get response and its selected native account.
+    #[must_use]
+    pub fn jmap_state(
+        account_id: impl Into<String>,
+        object_type: crate::ObjectType,
+        state: impl Into<String>,
+    ) -> Self {
+        Self::StateAt(JmapStateVersion {
+            account_id: account_id.into(),
+            object_type,
+            state: state.into(),
+        })
+    }
+
+    /// Borrow the original observation for display or provider-owned saves.
+    /// This accessor does not authorize a conditional mutation.
+    #[must_use]
+    pub fn entity_tag(&self) -> Option<&crate::EntityTag> {
+        match self {
+            Self::ETag(version) => Some(&version.tag),
+            _ => None,
+        }
+    }
+
+    /// Validate provenance for opaque JSON validators, such as People source
+    /// etags. HTTP header users must additionally call `expected_etag`.
+    pub fn expected_opaque_etag(
+        &self,
+        protocol: crate::Protocol,
+        operation: crate::AccountOperation,
+    ) -> Result<&str, crate::AccountError> {
+        if let Self::ETag(version) = self
+            && version.protocol == protocol
+            && Some(version.object_type) == mutation_object_type(operation)
+            && !version.tag.is_empty()
+        {
+            return Ok(version.tag.as_str());
+        }
+        Err(crate::AccountError::unsupported(operation, protocol))
+    }
+
     /// Validate a caller version for an entity-tag conditional update.
-    ///
-    /// DAV accepts its normalized unquoted strong ETags as well as wire ETags.
-    /// Unsupported token kinds and weak DAV
-    /// validators are refused locally rather than downgraded to a blind write.
+    /// DAV-normalized strong tags and wire tags retain their existing syntax.
     pub fn expected_etag(
         &self,
-        protocol: crate::error::Protocol,
-        operation: crate::error::AccountOperation,
+        protocol: crate::Protocol,
+        operation: crate::AccountOperation,
         strong: bool,
-    ) -> Result<&str, crate::error::AccountError> {
-        if let Self::ETag(etag) = self
-            && etag.valid_http(strong)
-        {
-            return Ok(etag.as_str());
+    ) -> Result<&str, crate::AccountError> {
+        let token = self.expected_opaque_etag(protocol, operation)?;
+        if self.entity_tag().is_some_and(|tag| tag.valid_http(strong)) {
+            return Ok(token);
         }
-        Err(crate::error::AccountError::unsupported(operation, protocol))
+        Err(crate::AccountError::unsupported(operation, protocol))
+    }
+
+    /// Validate both axes of JMAP's (accountId, type) /set precondition.
+    pub fn expected_jmap_state(
+        &self,
+        account_id: &str,
+        operation: crate::AccountOperation,
+    ) -> Result<&str, crate::AccountError> {
+        if let Self::StateAt(version) = self
+            && !version.state.is_empty()
+            && !version.account_id.is_empty()
+            && version.account_id == account_id
+            && Some(version.object_type) == mutation_object_type(operation)
+        {
+            return Ok(&version.state);
+        }
+        Err(crate::AccountError::unsupported(
+            operation,
+            crate::Protocol::Jmap,
+        ))
+    }
+}
+
+fn mutation_object_type(operation: crate::AccountOperation) -> Option<crate::ObjectType> {
+    use crate::{AccountOperation as Op, ObjectType};
+    match operation {
+        Op::UpdateFlags | Op::BulkMove | Op::BulkDestroy => Some(ObjectType::Email),
+        Op::ContactUpdate | Op::ContactDelete => Some(ObjectType::Contact),
+        Op::EventUpdate | Op::EventDelete | Op::EventRsvp => Some(ObjectType::CalendarEvent),
+        _ => None,
     }
 }
 
@@ -181,6 +309,8 @@ pub fn canonical_flags_hash(flags: impl IntoIterator<Item = impl Into<crate::Fla
 /// Maps to JMAP `properties`, IMAP `FETCH` part list, Gmail `format`,
 /// and Graph `$select`. `Inventory` is intentionally absent because
 /// inventory has its own streaming primitive on the trait.
+/// Unlike `crate::HydrationProjection`, this selects flags, inventory
+/// metadata or MIME bytes, not fields of a parsed `crate::Message`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Projection {
@@ -205,10 +335,10 @@ pub enum Projection {
 
 /// Variant of a hydrated object selected by `Projection`.
 ///
-/// The engine treats the inner shapes as protocol-derived blobs of
-/// fields. Consumers down-cast based on the projection they asked
-/// for. Variants are intentionally coarse; the protocol crate fills
-/// in the fields the projection requested.
+/// Consumers pattern-match the returned shape. The object-safe Account
+/// stream accepts a runtime projection, so its result type cannot depend
+/// on that value. Flag and membership read-back consumers must check the
+/// variant before using it as evidence of the requested state.
 ///
 /// Boxing the heaviest arm (Metadata) is not worth it: hydrated
 /// streams of the FlagsOnly projection are rare on the hot path,
@@ -449,9 +579,13 @@ mod tests {
         for version in [
             ServerVersion::Unavailable,
             ServerVersion::ModSeq(1),
-            ServerVersion::ETag("W/\"weak\"".into()),
-            ServerVersion::ETag("w/\"weak\"".into()),
-            ServerVersion::ETag("bad\r\nvalue".into()),
+            ServerVersion::etag(Protocol::CardDav, crate::ObjectType::Contact, "W/\"weak\""),
+            ServerVersion::etag(Protocol::CardDav, crate::ObjectType::Contact, "w/\"weak\""),
+            ServerVersion::etag(
+                Protocol::CardDav,
+                crate::ObjectType::Contact,
+                "bad\r\nvalue",
+            ),
         ] {
             assert_eq!(
                 *version
@@ -462,22 +596,75 @@ mod tests {
             );
         }
         assert_eq!(
-            ServerVersion::ETag("normalized".into())
+            ServerVersion::etag(Protocol::CardDav, crate::ObjectType::Contact, "normalized")
                 .expected_etag(Protocol::CardDav, operation, true)
                 .unwrap(),
             "normalized"
         );
         assert!(
-            ServerVersion::ETag("*".into())
+            ServerVersion::etag(Protocol::Graph, crate::ObjectType::Contact, "*")
                 .expected_etag(Protocol::Graph, operation, false)
                 .is_err()
         );
         assert_eq!(
-            ServerVersion::ETag("W/\"opaque\"".into())
+            ServerVersion::etag(Protocol::Graph, crate::ObjectType::Contact, "W/\"opaque\"")
                 .expected_etag(Protocol::Graph, operation, false)
                 .unwrap(),
             "W/\"opaque\""
         );
+    }
+
+    #[test]
+    fn caller_versions_reject_other_protocols_types_and_jmap_owners() {
+        use super::ServerVersion;
+        use crate::{AccountOperation as Op, ObjectType as Ty, Protocol};
+
+        for (operation, ty) in [
+            (Op::UpdateFlags, Ty::Email),
+            (Op::BulkMove, Ty::Email),
+            (Op::BulkDestroy, Ty::Email),
+            (Op::ContactUpdate, Ty::Contact),
+            (Op::ContactDelete, Ty::Contact),
+            (Op::EventUpdate, Ty::CalendarEvent),
+            (Op::EventDelete, Ty::CalendarEvent),
+            (Op::EventRsvp, Ty::CalendarEvent),
+        ] {
+            let right = ServerVersion::etag(Protocol::Graph, ty, "\"same\"");
+            assert_eq!(
+                right
+                    .expected_etag(Protocol::Graph, operation, false)
+                    .unwrap(),
+                "\"same\""
+            );
+            for wrong in [
+                ServerVersion::etag(Protocol::Ews, ty, "\"same\""),
+                ServerVersion::etag(Protocol::Graph, Ty::Mailbox, "\"same\""),
+            ] {
+                assert!(
+                    wrong
+                        .expected_etag(Protocol::Graph, operation, false)
+                        .is_err()
+                );
+                assert!(
+                    wrong
+                        .expected_opaque_etag(Protocol::Graph, operation)
+                        .is_err()
+                );
+            }
+            let right = ServerVersion::jmap_state("primary", ty, "same");
+            assert_eq!(
+                right.expected_jmap_state("primary", operation).unwrap(),
+                "same"
+            );
+            for wrong in [
+                ServerVersion::jmap_state("shared", ty, "same"),
+                ServerVersion::jmap_state("primary", Ty::Mailbox, "same"),
+                ServerVersion::jmap_state("primary", ty, ""),
+            ] {
+                assert_ne!(right, wrong);
+                assert!(wrong.expected_jmap_state("primary", operation).is_err());
+            }
+        }
     }
 
     #[test]

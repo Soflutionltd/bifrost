@@ -1168,7 +1168,7 @@ mod tests {
             memberships: vec![MembershipScope::Mailbox("inbox".into())],
             blob_id: None,
             fingerprint: Fingerprint {
-                server_version: ServerVersion::StateAt("same".into()),
+                server_version: ServerVersion::jmap_state("a1", crate::ObjectType::Email, "same"),
                 size: Some(10),
                 flags_hash: 1,
             },

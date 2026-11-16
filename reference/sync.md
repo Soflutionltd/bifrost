@@ -1240,39 +1240,32 @@ C. B and C then poll one scope forever, which is both doubled wire
 traffic and two concurrent producers on a lane+scope that the
 checkpoint supersession rule in `control.rs` assumes has exactly one.
 
-An exiting poll task also reports how to leave its token (`PollExit`):
-every ordinary exit retires the entry so the 1s scan can respawn the
-scope, but a `RecoveryPlan::Terminal` verdict parks it - the uncancelled
-token stays in the map as a tombstone the scan reads as "owned", so a
-terminal error stays terminal instead of becoming a once-per-second
-respawn/re-drive loop (each drive of which would re-broadcast
-`Terminated`). Poll ownership and parked state are bound to the registry's
-`DriveGeneration`. Before poll discovery or push dispatch, an entry whose
-fence differs from the registry is cancelled and retired. Scope deletion and
-re-establishment change the scope fence; a successful account replacement
-changes the account fence. Both therefore revive terminally parked scopes
-without requiring recovery paths to reset a second state store. Task cleanup
-still uses its separate ownership generation so an old task cannot retire a
-successor. A terminal lifecycle reader broadcasts once and waits for shutdown
-or an account generation change, then opens the replacement's lifecycle stream.
+Terminal parking belongs to `CursorRegistry::RegistryState`, keyed by scope and
+bound to the failing `DriveGeneration`. Both polling and push reconciliation
+call `CursorRegistry::park_scope_for_drive`; its generation check and park are
+atomic with deletion and topology replacement. A late terminal result cannot
+park a successor. `scope_is_parked` serves both discovery and reconciliation,
+and `with_drive` refuses a parked scope even if it queued for the lease before
+the verdict. Parking cancels the scope's current drive token, ending an active
+drive and waking a poll task out of cadence or recovery waits. The cursor and
+incarnation remain registered. Users expect a terminal scope to stop repeating
+its error until a restart or successful reattach, including after push hints.
+
+Every exiting poll task retires only its own ownership generation. `ScopeTokens`
+contains task ownership, its drive fence and cancellation only; the reconciler
+does not receive it. Poll discovery still retires a task bound to an obsolete
+drive fence, so even a retained scope stops polling a stalled old provider. Scope deletion clears the park and re-establishment supplies a new token.
+Topology replacement clears terminal verdicts under its new account fence and
+supplies fresh drive tokens for retained parked scopes while preserving their
+live cursors and incarnations. Other retained scopes keep their existing tokens.
+A terminal lifecycle reader broadcasts once and waits for shutdown or an account
+generation change, then opens the replacement's lifecycle stream.
 
 Fresh unsupported change cursor envelopes from changes or inventory fusion
 are scoped `Internal(AccountContract)` failures with terminal recovery. They
 do not request an account-wide schema reset; schema recovery is reserved for
 incompatible persisted envelopes. A published `Terminated` outcome reaches
 recovery before a concurrently changed pause or stop boundary is honored.
-
-The tombstone is MARKED (`ScopeToken::parked`), not merely present, because
-the push reconciler shares the same map and needs to tell a tombstone from a
-live poll task's registration. The reconciler is the other producer on the
-lane, and it now skips a parked scope (`scope_is_parked`) instead of driving
-it: without that, a later push hint re-drove a terminally failed scope,
-re-broadcasting `Terminated` and spending a wire call that cannot succeed -
-the milder sibling of the once-per-second respawn loop the park exists to
-stop. `ScopeToken::tombstone()` is published because `ScopeTokens` is
-published while every field of an entry is private, so nothing outside the
-module could otherwise place an entry in the map. Pinned by
-`a_terminally_parked_scope_is_not_re_driven_by_a_later_hint`.
 
 Output is a `broadcast::Sender<MultiplexerEvent>`. The event
 carries `{ scope, event: Arc<SyncEvent<Change>>, checkpoint }`.
@@ -2778,7 +2771,14 @@ lanes: `Foreground` / `Normal` / `Background` / `Bulk`. Starvation
 guard forces a lower-lane pull after a configurable threshold of
 consecutive higher-lane pulls (`SchedulerConfig::starvation_floor`,
 default 64). A configured value of zero is floored to one, so lower lanes do
-not leapfrog higher-priority work on every pull.
+not leapfrog higher-priority work on every pull. `scheduler::priority::PriorityLanes<T>`
+owns priority indexing, bounded FIFO lanes, visit order and starvation accounting
+for both submitted work and admission. Each path has its own queue and grant
+history; sharing the mechanics does not let consumer work spend engine admission's
+floor. After the floor, Bulk precedes Background; if neither is eligible, the
+next higher-lane grant starts a fresh count. Inspections and empty selections
+never spend a grant. This keeps starvation relief tied to actual service, as a
+user waiting for background work expects.
 
 Lane selection combines account priority and work kind for both admission
 and submitted work items. Live polls, push reconciliation and mutations retain
@@ -2793,9 +2793,9 @@ still applies, and running work is not interrupted.
 `EngineConfig::lane_capacity`). Standalone queues can select either
 `LaneShedPolicy`: `DropOldest` evicts the head and `DropNewest` rejects the
 incoming item. Both increment the queue-local counter and emit a `warn!`.
-Production scheduler work-item queues use `DropOldest`; `EngineConfig` does not
-expose a selector. The scheduler keeps those queues private and exposes their
-depths, not their shed counters. The same capacity bounds the separate
+Production scheduler work-item queues use the same bounded lane primitive with
+`ShedOldest`; `EngineConfig` does not expose a selector. The scheduler keeps
+those queues private and exposes their depths. The same capacity bounds the separate
 admission queues used by engine work; admission overflow refuses the incoming
 request and does not increment a shed counter.
 
@@ -4517,8 +4517,9 @@ crates/sync/src/
                           // InMemoryCheckpointStore
   scheduler/
     mod.rs                // four-lane Scheduler + admission dispatcher
-    lanes.rs              // bounded LaneQueue + LaneShedPolicy
+    lanes.rs              // public LaneQueue + LaneShedPolicy
                           // (DropOldest default / DropNewest)
+    priority.rs           // shared bounded PriorityLanes + starvation rule
     backoff.rs            // Consecutive-failure pacing, carried across replacement
     budget.rs             // BudgetGate (account-pool lifecycle and cancellation)
   cancel/

@@ -51,6 +51,10 @@ impl QresyncParams {
         Ok(self)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retain the optional RFC 7162 sequence-match operand"
+    )]
     pub fn with_seq_match(
         mut self,
         seqs: SeqSetExpr,
@@ -157,6 +161,10 @@ impl SelectOptions {
 /// Delta modes for UID FETCH.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[allow(
+    dead_code,
+    reason = "Raw sync FETCH supports all CONDSTORE and QRESYNC modifiers"
+)]
 pub enum FetchChanges {
     All,
     Since(ModSeq),
@@ -176,6 +184,10 @@ pub struct SyncFetchRequest {
     pub changes: FetchChanges,
 }
 
+#[allow(
+    dead_code,
+    reason = "Raw sync FETCH builders extend beyond the account-selected projections"
+)]
 impl SyncFetchRequest {
     /// Fetch flags and UID for all messages.
     pub fn flags() -> Self {

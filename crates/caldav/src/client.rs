@@ -768,11 +768,22 @@ mod tests {
 
         for (version, moving) in [
             (
-                bifrost_types::ServerVersion::ETag("W/\"weak\"".into()),
+                bifrost_types::ServerVersion::etag(
+                    bifrost_types::Protocol::CalDav,
+                    bifrost_types::ObjectType::CalendarEvent,
+                    "W/\"weak\"",
+                ),
                 false,
             ),
             (bifrost_types::ServerVersion::ModSeq(1), false),
-            (bifrost_types::ServerVersion::ETag("strong".into()), true),
+            (
+                bifrost_types::ServerVersion::etag(
+                    bifrost_types::Protocol::CalDav,
+                    bifrost_types::ObjectType::CalendarEvent,
+                    "strong",
+                ),
+                true,
+            ),
         ] {
             let script = dav_script_empty();
             let client = Arc::new(CalDavClient::with_account_net(
@@ -838,8 +849,13 @@ mod tests {
                 .event_update(
                     bifrost_types::EventId("https://dav.example.test/book/one.ics".into()),
                     bifrost_types::EventPatch {
-                        expected_version: expected
-                            .map(|etag| bifrost_types::ServerVersion::ETag(etag.into())),
+                        expected_version: expected.map(|etag| {
+                            bifrost_types::ServerVersion::etag(
+                                bifrost_types::Protocol::CalDav,
+                                bifrost_types::ObjectType::CalendarEvent,
+                                etag,
+                            )
+                        }),
                         ..Default::default()
                     },
                 )
@@ -874,7 +890,11 @@ mod tests {
         use bifrost_types::Account;
 
         for version in [
-            bifrost_types::ServerVersion::ETag("W/\"weak\"".into()),
+            bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::CalDav,
+                bifrost_types::ObjectType::CalendarEvent,
+                "W/\"weak\"",
+            ),
             bifrost_types::ServerVersion::ModSeq(42),
             bifrost_types::ServerVersion::Unavailable,
         ] {
@@ -925,7 +945,13 @@ mod tests {
             let result = account
                 .event_delete_if_version(
                     bifrost_types::EventId("https://dav.example.test/book/one.ics".into()),
-                    expected.map(|value| bifrost_types::ServerVersion::ETag(value.into())),
+                    expected.map(|value| {
+                        bifrost_types::ServerVersion::etag(
+                            bifrost_types::Protocol::CalDav,
+                            bifrost_types::ObjectType::CalendarEvent,
+                            value,
+                        )
+                    }),
                 )
                 .await;
             if expected.is_some() {

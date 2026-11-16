@@ -52,7 +52,7 @@ mod response;
 mod search_response;
 
 #[cfg(test)]
-#[path = "tests.rs"]
+#[path = "tests/mod.rs"]
 mod tests;
 
 // Re-export pub(crate) items that were visible from the original module.

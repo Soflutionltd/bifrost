@@ -613,7 +613,7 @@ additional stored lists. `Command::Enable` retains typed capabilities; raw
 ENABLED response strings remain wire observations and are parsed on adoption.
 
 "Is capability X usable on this connection?" has ONE authority,
-`SessionCapabilities::supports`, layered on its `imap4rev2_active` decision. X is usable when it is advertised, or it is CONDSTORE and QRESYNC is advertised (RFC 7162 Section 3.2.3), or rev2 is active and the RFC 9051 baseline folds it in: ESEARCH, IDLE, MOVE, NAMESPACE, SASL-IR, SEARCHRES, UIDPLUS, UNSELECT, LIST-EXTENDED, LIST-STATUS, STATUS=SIZE, STATUS=DELETED, LITERAL-, SPECIAL-USE, ENABLE. OBJECTID and SAVEDATE are deliberately NOT in the baseline (RFC 9051 defines none of their FETCH items, SEARCH keys, STATUS items or response codes, so a rev2 server that does not advertise them owes none of it), and neither is the BINARY token: rev2 folds in only the FETCH half of RFC 3516 (RFC 9051 Appendix B), not its APPEND extension, so answering the token from rev2 would let an APPEND carry a NUL-bearing `literal8` body a rev2 server may reject. The FETCH half has its own question, `binary_fetch_usable` (BINARY advertised, or rev2 active), which `validate_requested_fetch_items` asks for `BINARY[...]` / `BINARY.PEEK[...]` / `BINARY.SIZE[...]`; `EMAILID` / `THREADID` and `SAVEDATE` FETCH items still require their own advertised capability on rev2. LITERAL+ is deliberately NOT in the baseline: RFC 9051 Appendix E folds in LITERAL- only, so a pure rev2 server takes non-synchronizing literals up to 4096 octets (RFC 9051 Section 4.3) and unbounded ones only when it also advertises LITERAL+ (RFC 7888 Section 4); listing it would tell every caller that such a server accepts a `{N+}` literal of any size. That baseline list is a private function next to `supports` and is the only copy; extensions outside it (CONDSTORE, QRESYNC, SORT, WITHIN, PREVIEW, NOTIFY, MULTIAPPEND, LITERAL+, ...) get no rev2 clause. Every consumer is a thin view over it: `ServerProfile::supports`, `EncodeOptions::has_capability` / `has_condstore` (encoder command admission, including APPEND's MULTIAPPEND and BINARY checks), the connection-handle gates through `connection/auth.rs::snapshot_supports`, and the driver's literal negotiation (`driver::literal_mode` asks the authority for LITERAL+ first, then LITERAL-, else synchronizing, so pure rev2 lands on the 4096-octet LITERAL- behaviour). New gates call one of those views, never `capabilities.contains(..) || rev2`. Checks that deliberately ask something else are the exception and say why at the call site: the non-synchronizing `literal8` form needs an advertised BINARY (which `supports` already answers advertised-only) and additionally a non-rev2 connection (RFC 9051 Section 9 makes rev2 `literal8` synchronizing), and the STATUS `DELETED` item is gated on active rev2 or `QUOTA=RES-MESSAGE` rather than on `supports(StatusDeleted)`. The two agree under rev2 and differ only on rev1, where the authority would also accept an advertised `STATUS=DELETED` token; no RFC defines that token (RFC 9051 Section 6.3.11 makes DELETED a base rev2 item, and the only rev1 route is RFC 9208 Section 4.1.4's `QUOTA=RES-MESSAGE`), so the gate names exactly those two sources. Tests: a test-only oracle in `profile.rs::capability_matrix` classifies every `Capability` variant with an exhaustive match (a new variant does not compile until classified), and matrix tests check the authority, `ServerProfile`, `EncodeOptions` and `snapshot_supports` against it across every rev2-ACTIVE state.
+`SessionCapabilities::supports`, layered on its `imap4rev2_active` decision. X is usable when it is advertised, or it is CONDSTORE and QRESYNC is advertised (RFC 7162 Section 3.2.3), or rev2 is active and the RFC 9051 baseline folds it in: ESEARCH, IDLE, MOVE, NAMESPACE, SASL-IR, SEARCHRES, UIDPLUS, UNSELECT, LIST-EXTENDED, LIST-STATUS, STATUS=SIZE, STATUS=DELETED, LITERAL-, SPECIAL-USE, ENABLE. OBJECTID and SAVEDATE are deliberately NOT in the baseline (RFC 9051 defines none of their FETCH items, SEARCH keys, STATUS items or response codes, so a rev2 server that does not advertise them owes none of it), and neither is the BINARY token: rev2 folds in only the FETCH half of RFC 3516 (RFC 9051 Appendix B), not its APPEND extension, so answering the token from rev2 would let an APPEND carry a NUL-bearing `literal8` body a rev2 server may reject. The FETCH half has its own question, `binary_fetch_usable` (BINARY advertised, or rev2 active), which `validate_requested_fetch_items` asks for `BINARY[...]` / `BINARY.PEEK[...]` / `BINARY.SIZE[...]`; `EMAILID` / `THREADID` and `SAVEDATE` FETCH items still require their own advertised capability on rev2. LITERAL+ is deliberately NOT in the baseline: RFC 9051 Appendix E folds in LITERAL- only, so a pure rev2 server takes non-synchronizing literals up to 4096 octets (RFC 9051 Section 4.3) and unbounded ones only when it also advertises LITERAL+ (RFC 7888 Section 4); listing it would tell every caller that such a server accepts a `{N+}` literal of any size. That baseline list is a private function next to `supports` and is the only copy; extensions outside it (CONDSTORE, QRESYNC, SORT, WITHIN, PREVIEW, NOTIFY, MULTIAPPEND, LITERAL+, ...) get no rev2 clause. Every consumer is a thin view over it: `ServerProfile::supports`, `EncodeOptions::has_capability` / `has_condstore` (encoder command admission, including APPEND's MULTIAPPEND and BINARY checks), the connection-handle gates through `connection/auth.rs::snapshot_supports`, and the driver's literal negotiation (`driver::literal_mode` asks the authority for LITERAL+ first, then LITERAL-, else synchronizing, so pure rev2 lands on the 4096-octet LITERAL- behaviour). New gates call one of those views, never `capabilities.contains(..) || rev2`. Checks that deliberately ask something else are the exception and say why at the call site: the non-synchronizing `literal8` form needs an advertised BINARY (which `supports` already answers advertised-only) and additionally a non-rev2 connection (RFC 9051 Section 9 makes rev2 `literal8` synchronizing), and the STATUS `DELETED` item is gated on active rev2 or `QUOTA=RES-MESSAGE` rather than on `supports(StatusDeleted)`. The two agree under rev2 and differ only on rev1, where the authority would also accept an advertised `STATUS=DELETED` token; no RFC defines that token (RFC 9051 Section 6.3.11 makes DELETED a base rev2 item, and the only rev1 route is RFC 9208 Section 4.1.4's `QUOTA=RES-MESSAGE`), so the gate names exactly those two sources. The production `rev2_baseline_includes` match classifies every `Capability` variant exhaustively. The `profile.rs::capability_matrix` fixtures use that decision to check `ServerProfile`, `EncodeOptions` and `snapshot_supports` across every rev2-ACTIVE state; they carry no second baseline table.
 
 ## Auth
 
@@ -957,7 +957,9 @@ Submodules:
 
 Tests for the split mail-action modules live in each owner's `tests.rs`;
 submission header tests live in `compose/headers/tests.rs`. Cross-method account
-transcripts remain in `scripted_tests.rs`. The layout split is not a new line
+transcripts live in `scripted/`, grouped by send, draft send, mutations, changes,
+push, polling, raw reads, search, hydration, containers and selection. Shared
+scripted fixtures live in `scripted/test_support.rs`. The layout split is not a new line
 audit: the earlier bug hunt did not line-audit the former PIM module's long tail
 beyond membership, keyword and search entry points.
 
@@ -1229,6 +1231,9 @@ poller's assertion of already-decoded values retain their distinct failure
 policies. Importance reads and writes share one keyword constant in `mail_actions.rs`.
 Both hydration lanes use `merge_requested_fetches` to filter and merge replies
 for requested UIDs; later mutable fields win and immutable data fills gaps.
+Typed `Message::memberships` carries the inventory vocabulary: the exact
+`Folder` identity and, for a discovered shared folder, its `Owner` annotation.
+Opening a shared message must preserve the mailbox view inventory assigned it.
 
 ### Hydration accounting (`get.rs`)
 
@@ -2418,3 +2423,26 @@ tests. Account hydration delegates to that method and retains its account result
 checks. `account/mailbox_identity.rs` owns the `~imap-wire:` identity envelope,
 its decoding and account ordering; the protocol name exposes only its cached
 wire identity. Existing account ids and persisted envelopes retain their bytes.
+
+
+## Protocol lints and test ownership
+
+`types/` and `codec/` enable `warn(dead_code)` below the crate-wide allowance
+for the retained raw connection surface. Protocol builders that support commands
+beyond the account strategy have local exceptions with their reasons. The
+backing-free FETCH parser adapter and address-marker inspection helpers compile
+only for tests. Unused backing-free untagged parser adapters, address constructors
+and the redundant `MailboxInfo::special_use` wrapper are removed; the live
+SPECIAL-USE classifier remains `SpecialUse::classify`, shared with the registry.
+All these types remain internal; the exported account and polling surfaces are
+unchanged.
+
+Connection transcripts live in `connection/tests/`, grouped by admission,
+APPEND, authentication, SELECT, LIST, events, FETCH, IDLE and lifecycle. Withdrawal
+and capability-refresh transcripts have separate modules. The tests beside
+admission, protocol state, wire framing, event classification and dispatch stay
+with those existing owners. Upgrade tests are named `capability_refresh_tests`.
+Decoder tests live in `codec/decode/tests/` by grammar family, and encoder tests
+in `codec/encode/tests/` by command family, strings and validation. Shared codec
+fixtures stay in each test module's root; BODYSTRUCTURE generators stay with
+their grammar tests. Existing test bodies and hermetic transcripts are preserved.

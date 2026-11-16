@@ -190,9 +190,27 @@ pub(super) fn inventory_entry_from_parsed(
     let id = item.id?.to_string();
     let membership = scope.membership(item.parent_folder);
     let etag = graph_etag(value);
+    let (protocol, object_type) = match scope {
+        super::scope::GraphScope::Mail { .. } => (
+            bifrost_types::Protocol::Graph,
+            bifrost_types::ObjectType::Email,
+        ),
+        super::scope::GraphScope::Events { .. } => (
+            bifrost_types::Protocol::Graph,
+            bifrost_types::ObjectType::CalendarEvent,
+        ),
+        super::scope::GraphScope::Contacts { .. } => (
+            bifrost_types::Protocol::Graph,
+            bifrost_types::ObjectType::Contact,
+        ),
+        super::scope::GraphScope::PublicFolder(_) => (
+            bifrost_types::Protocol::Ews,
+            bifrost_types::ObjectType::Email,
+        ),
+    };
     let fingerprint = Fingerprint {
         server_version: etag
-            .map(|etag| ServerVersion::ETag(etag.into_entity_tag()))
+            .map(|etag| ServerVersion::etag(protocol, object_type, etag.into_entity_tag()))
             .unwrap_or(ServerVersion::Unavailable),
         size: None,
         flags_hash: flags_hash(value),

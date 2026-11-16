@@ -58,34 +58,6 @@ parameter (`ItemOutcome<K, T>` / `BatchSuccess<K, T>`), `K = ObjectId` on the
 streaming lanes, a `SubmissionIndex` for positional ledgers, `BatchItemId` only
 where the caller mints it.
 
-## STR-008 - Versions are read as `etag: Option<String>` and written as `ServerVersion`
-
-**Reported by:** types, jmap-account.
-
-`ContactCard::etag` and `CalendarEvent::etag` are strings; the write side takes
-`ServerVersion` in three placements: a field on `EventPatch`/`ContactPatch`, a
-parameter on `*_delete_if_version`/`event_rsvp_if_version`, and
-`MailMutationTarget::expected_version`. `ServerVersion::expected_etag` must then
-accept both the DAV-normalized and wire forms because the consumer wrapped the
-read string itself. Proposal: `version: Option<ServerVersion>` on the read
-shapes and one placement for the write precondition.
-
-The jmap-account hunter adds provenance: JMAP accepts a caller's `StateAt` as an
-`ifInState` for Email (flags, move, destroy), ContactCard and CalendarEvent writes
-(`mutation::caller_state`); the token is per `(accountId, type)` (a comment says
-so), but the type carries neither. Inventory mints `StateAt(Email/get state)` for
-messages and `StateAt(Mailbox/get state)` for mailboxes indistinguishably, and
-nothing stops a consumer passing a Mailbox-inventory token, or a primary token for
-a shared message, into `bulk_set_flags_if_version`, giving an endless
-`ConcurrencyConflict -> Retry(AfterStateRefresh)` for a token that can never match.
-For contacts and events there is no read-side producer at all (the caller-version
-item in `notes/todo.md` already records JMAP PIM reads exposing no caller
-type-state field). Cross-crate, every provider decides at write time which
-`ServerVersion` variant it accepts (JMAP `caller_state`, Google's contact/calendar
-ETag checks, Graph's ETag paths) with no read-side mint naming the door it is valid
-for. Owner: `bifrost-types`, a version minted by the read path with its object type
-(and, for JMAP, owner) inside it.
-
 ## STR-012 - The engine's consumer API lives in the contract crate
 
 **Reported by:** types (needs owner: moves published items).
@@ -200,20 +172,6 @@ No account reads `run_id`, `sequence` or `protocol_salt`; the salt's string
 payloads are always empty. Its only function is engine bookkeeping, which need
 not cross the account boundary.
 
-## STR-020 - Hydration has two projection enums, and two placement vocabularies
-
-**Reported by:** types.
-
-`mutation::Projection` (for `get_stream`) and `hydration::HydrationProjection`
-(for `message_hydrate`) overlap (`Preview(usize)`, `Full`, `FullWithBlobs`), and
-`HydratedObjectKind` is only loosely tied to the projection requested
-("consumers down-cast"); the read-back guard's need for `FlagsOnly` to yield
-`FlagsOnly` is validated in the engine, not by the type. A hydrated `Message`
-places the message by `containers: Vec<ContainerId>` while inventory uses
-`memberships: Vec<MembershipScope>`; nothing maps one to the other without
-provider knowledge (Gmail fills the former with label ids, the latter with
-`MembershipScope::Label`).
-
 ## STR-034 - The sync test layout mirrors history, not the design
 
 **Reported by:** sync-engine.
@@ -296,21 +254,6 @@ and the durable cost of the unexercised machinery (the selection rule every
 store implements, the time-key compaction contract) is paid now by every backend
 for producers that do not exist yet.
 
-## STR-048 - Per-scope drive state is split between the cursor registry and the multiplexer
-
-**Reported by:** sync-lanes.
-
-`CursorRegistry` owns cursor, incarnation, scope delete generation, liveness
-token and drive lease. The multiplexer's `ScopeTokens` owns poll-task ownership
-and the terminal-park tombstone (`ScopeToken::parked`), which the reconciler
-reaches through free functions (`retire_stale_scope_token`, `scope_is_parked`,
-`park_scope_for_drive`). "Is this scope parked?" is a property of a scope
-incarnation under a `DriveGeneration`, and the reconciler needs it as much as
-the poll loop. Proposal: the parked verdict lives in `RegistryState`, bound to
-the scope's `DriveGeneration` (a fence change already revives it), `ScopeTokens`
-shrinks to poll-task bookkeeping, and `RegistryState` replacement merges
-per-scope state field by field (BUG-022).
-
 ## STR-050 - UID versus sequence number is not in the IMAP response types
 
 **Reported by:** imap-protocol, imap-connection.
@@ -324,22 +267,6 @@ are still separate variants doubling every match in `kind`, `mailbox_target`
 and the encoder; one variant with an addressed target would halve them. The
 wire-level `FetchResponse { seq: u32, uid: Option<u32> }` and
 `Removal::Seq(u32)` are still bare numbers.
-
-## STR-061 - The IMAP crate-root `allow(dead_code)` hides dead copies of live decisions
-
-**Reported by:** imap-protocol.
-
-Dead today: `ImapAtom`, `validated::ObjectId`, `GmailMessageId`,
-`GmailThreadId`, `types::Address`, the `EnvelopeAddress -> Address`
-conversions, `MailboxInfo::special_use`, `MailboxRights::can_insert` /
-`can_delete`, `classification::mailbox_names_eq`, `EventImpact` production use,
-`TypedEvent::MetadataChange` / `ServerMetadataChange` construction. Three are
-second copies of decisions with a live owner elsewhere (special_use, can_delete,
-mailbox_names_eq - CON-028, CON-029, BUG-027), each kept green by its own tests
-while the live owner differs. All are crate-private. The hunter recommends
-`#![warn(dead_code)]` on `types/` and `codec/` specifically (a small, closed
-vocabulary, unlike the measured crate-wide case), then wiring each item in where
-STR-051 says it belongs, deleting only what has no consumer.
 
 ## STR-062 - Protocol-value behaviour lives in IMAP `account/`, and account identity lives in `types/`
 
@@ -356,30 +283,11 @@ responsibilities (BUG-028, BUG-046) gives those decisions a home.
 
 **Reported by:** imap-protocol, imap-connection.
 
-The imap-connection hunter adds: `connection/tests.rs` is a 3,300-line catch-all
-beside per-file `*_tests.rs`; two inline modules are named after a review
-(`lifecycle.rs::bandwidth_review_tests`, `driver/upgrade.rs::bandwidth_review_tests`)
-rather than a behaviour; and the behaviours the layer must pin (admission,
-pending effects, framing/retirement, event classification) have no home of their
-own because no module owns them - once they have owners, their tests move with
-them.
-
-The imap-account hunter adds: `account/scripted_tests.rs` (about 5,800 lines, about
-140 functions) is organized by "needs a scripted peer" - send and Sent-append,
-draft send, mutation batching, push admission and sessions, all three change
-strategies, the poller, raw reads, search paging and PIM hydration share one file.
-A `scripted/` directory with one file per lane (the harness staying in
-`test_support.rs`) makes a module's coverage visible from the module; `pim.rs`
-carrying about 1,400 inline test lines is the same accident in the other
-direction.
-
-The decoder was split into nine grammar modules but `codec/decode/tests.rs` is
-one file of about 14,500 lines and `codec/encode/tests.rs` about 8,400. Tests
-should sit with the grammar they pin (or be golden transcript tables per
-response family), which also makes the CON-032 tables testable per row. The
-`capability_matrix` oracle is a test copy of production logic and should go once
-production is exhaustive.
-
+Residue. The connection, scripted-account, decoder and encoder test monoliths
+are split per behaviour or grammar, and the review-named modules are renamed.
+What remains: the `capability_matrix` oracle in `types/profile.rs` is a test
+copy of production capability logic and should go once production is
+exhaustive.
 ## STR-071 - The IMAP pipeline has no production caller yet shapes the driver's hardest invariants
 
 **Reported by:** imap-connection (crate-private, but removal is an owner decision; flagged, not recommended).
@@ -413,7 +321,7 @@ gates, typed ids and bounded waits matter for real callers), or shape the layer
 as the account's transport and let the compiler find the dead surface by removing
 the allow from `connection/` alone (the crate-wide count was measured at 105;
 a connection-only removal gives the exact list). The current middle state pays
-the complexity of a public API without its users. Related: STR-061.
+the complexity of a public API without its users.
 
 ## STR-078 - Credentials and TLS mode, three copies each
 

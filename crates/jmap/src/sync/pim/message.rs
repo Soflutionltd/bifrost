@@ -9,8 +9,8 @@ use crate::email::{
 use crate::thread::{ThreadGet, ThreadId as JmapThreadId};
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AttachmentSource, BlobCapabilities,
-    BlobEncoding, BlobHandle, BlobId, ContainerId, HydrationProjection, Importance, Message,
-    MessageAttachment, ObjectId, ThreadHydration, ThreadId,
+    BlobEncoding, BlobHandle, BlobId, HydrationProjection, Importance, MailboxId, MembershipScope,
+    Message, MessageAttachment, ObjectId, PrincipalId, ThreadHydration, ThreadId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -83,7 +83,7 @@ pub(crate) fn thread_hydrate<T: HttpTransport>(
                     qualify_foreign_message_ids(
                         &mut message.id,
                         message.thread_id.as_mut(),
-                        &mut message.containers,
+                        &mut message.memberships,
                         &mut message.attachments,
                         account,
                     );
@@ -116,12 +116,12 @@ pub(crate) fn thread_hydrate<T: HttpTransport>(
 /// ownership, so on an id collision the write lands on an unrelated
 /// primary thread's messages.
 ///
-/// Pure over the id slices so the qualification is unit-pinnable
+/// Pure over the message fields so the qualification is unit-pinnable
 /// without constructing a whole `Message`.
 pub(super) fn qualify_foreign_message_ids(
     id: &mut ObjectId,
     thread_id: Option<&mut ThreadId>,
-    containers: &mut [ContainerId],
+    memberships: &mut Vec<MembershipScope>,
     attachments: &mut [MessageAttachment],
     account: &str,
 ) {
@@ -129,12 +129,12 @@ pub(super) fn qualify_foreign_message_ids(
     if let Some(thread) = thread_id {
         thread.0 = crate::sync::foreign::encode_object(account, &thread.0);
     }
-    for container in containers {
-        // A container id is a MAILBOX id, so it carries the same namespace
-        // `containers_list` mints for a foreign mailbox - not the object
-        // namespace - and the two must not be confused.
-        *container = ContainerId(crate::sync::foreign::encode_foreign(account, &container.0).0);
-    }
+    // Use inventory's qualifier so typed reads retain the same folder
+    // namespace and owner annotation as bulk metadata reads.
+    crate::sync::inventory::qualify_foreign_memberships(
+        memberships,
+        &PrincipalId(account.to_owned()),
+    );
     for attachment in attachments {
         if let AttachmentSource::Blob(blob) = &mut attachment.source {
             blob.id = BlobId(crate::sync::foreign::encode_object(account, &blob.id.0));
@@ -193,7 +193,7 @@ pub(crate) fn message_hydrate<T: HttpTransport>(
             qualify_foreign_message_ids(
                 &mut hydrated.id,
                 hydrated.thread_id.as_mut(),
-                &mut hydrated.containers,
+                &mut hydrated.memberships,
                 &mut hydrated.attachments,
                 account,
             );
@@ -253,10 +253,10 @@ pub(super) fn body_properties() -> Vec<BodyProperty> {
 fn email_to_message(email: Email, projection: HydrationProjection) -> Message {
     let id = ObjectId(email.id().map(ToString::to_string).unwrap_or_default());
     let thread_id = email.thread_id().map(|id| ThreadId(id.to_string()));
-    let containers = email
+    let memberships = email
         .mailbox_ids()
         .into_iter()
-        .map(|id| ContainerId(id.to_string()))
+        .map(|id| MembershipScope::Mailbox(MailboxId(id.to_string())))
         .collect();
     let flags = email
         .keywords()
@@ -321,7 +321,7 @@ fn email_to_message(email: Email, projection: HydrationProjection) -> Message {
             .sent_at()
             .or_else(|| email.received_at())
             .and_then(unix_to_system_time),
-        containers,
+        memberships,
         importance: if flags.contains("$important") {
             Importance::High
         } else {

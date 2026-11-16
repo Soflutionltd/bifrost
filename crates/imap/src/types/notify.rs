@@ -19,6 +19,10 @@
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(
+    dead_code,
+    reason = "The NOTIFY encoder supports registrations beyond the account push strategy"
+)]
 pub enum MailboxFilter {
     /// `selected`  -  the currently selected mailbox; notifications delivered
     /// immediately, including expunges (RFC 5465 Section 6.1).
@@ -81,6 +85,10 @@ pub enum MailboxFilter {
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(
+    dead_code,
+    reason = "The NOTIFY encoder supports registrations beyond the account push strategy"
+)]
 pub enum NotifyEvent {
     // --- Message events (RFC 5465 Sections 5.1-5.3, RFC 5423 Section 4.1-4.2) ---
     /// `MessageNew`  -  new message delivered or appended

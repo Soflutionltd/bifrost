@@ -5,11 +5,12 @@
 //! order, with the starvation floor diverting one pull to the lower
 //! lanes every N pulls.
 
-use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{AccountId, Priority};
+
+use super::priority::{BoundedLane, OverflowPolicy, PushOutcome};
 
 /// Work item submitted to the scheduler. Kept deliberately small;
 /// the actual work lives behind the boxed thunk.
@@ -77,10 +78,8 @@ pub enum LaneShedPolicy {
 #[derive(Debug)]
 pub struct LaneQueue {
     priority: Priority,
-    capacity: usize,
-    queue: Mutex<VecDeque<WorkItem>>,
+    queue: Mutex<BoundedLane<WorkItem>>,
     shed_count: AtomicU64,
-    shed_policy: LaneShedPolicy,
 }
 
 impl LaneQueue {
@@ -106,10 +105,14 @@ impl LaneQueue {
     ) -> Self {
         Self {
             priority,
-            capacity: capacity.max(1),
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new(BoundedLane::new(
+                capacity,
+                match shed_policy {
+                    LaneShedPolicy::DropOldest => OverflowPolicy::ShedOldest,
+                    LaneShedPolicy::DropNewest => OverflowPolicy::Refuse,
+                },
+            )),
             shed_count: AtomicU64::new(0),
-            shed_policy,
         }
     }
 
@@ -119,35 +122,22 @@ impl LaneQueue {
     /// queues are private, so the engine does not expose their counters.
     pub fn push(&self, item: WorkItem) {
         let mut g = self.queue.lock().expect("poisoned");
-        if g.len() >= self.capacity {
+        let outcome = g.push(item);
+        if outcome != PushOutcome::Enqueued {
             self.shed_count.fetch_add(1, Ordering::Relaxed);
-            match self.shed_policy {
-                LaneShedPolicy::DropOldest => {
-                    let _ = g.pop_front();
-                    tracing::warn!(
-                        target: "bifrost.sync.scheduler",
-                        priority = ?self.priority,
-                        capacity = self.capacity,
-                        "lane full; shedding oldest work item"
-                    );
-                }
-                LaneShedPolicy::DropNewest => {
-                    tracing::warn!(
-                        target: "bifrost.sync.scheduler",
-                        priority = ?self.priority,
-                        capacity = self.capacity,
-                        "lane full; shedding newest work item"
-                    );
-                    return;
-                }
-            }
+            tracing::warn!(
+                target: "bifrost.sync.scheduler",
+                priority = ?self.priority,
+                capacity = g.capacity,
+                ?outcome,
+                "lane full; shedding work item"
+            );
         }
-        g.push_back(item);
     }
 
     pub fn try_pop(&self) -> Option<WorkItem> {
         let mut g = self.queue.lock().expect("poisoned");
-        g.pop_front()
+        g.queue.pop_front()
     }
 
     #[must_use]
@@ -160,7 +150,7 @@ impl LaneQueue {
         let g = self.queue.lock().expect("poisoned");
         LaneSnapshot {
             priority: self.priority,
-            depth: g.len(),
+            depth: g.queue.len(),
         }
     }
 }

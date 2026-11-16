@@ -170,6 +170,10 @@ pub(crate) struct AppendUid {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UidSetExpr(SequenceSet);
 
+#[allow(
+    dead_code,
+    reason = "Retain command operand builders beyond the account-selected UID sets"
+)]
 impl UidSetExpr {
     /// All UIDs in the selected mailbox.
     pub fn all() -> Self {
@@ -248,8 +252,16 @@ impl fmt::Display for UidSetExpr {
 
 /// A typed message sequence-number set for non-UID commands.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(
+    dead_code,
+    reason = "Sequence-addressed raw commands retain their typed operand builder"
+)]
 pub struct SeqSetExpr(SequenceSet<Seq>);
 
+#[allow(
+    dead_code,
+    reason = "Sequence-addressed raw commands retain their typed operand builder"
+)]
 impl SeqSetExpr {
     /// All sequence numbers in the selected mailbox.
     pub fn all() -> Self {

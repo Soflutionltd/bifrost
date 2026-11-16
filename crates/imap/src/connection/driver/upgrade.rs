@@ -372,7 +372,7 @@ pub(super) async fn logout_best_effort(
 }
 
 #[cfg(test)]
-mod bandwidth_review_tests {
+mod capability_refresh_tests {
     use super::*;
     use crate::connection::{
         state::ProtocolState, stream::Tracked, tag::TagGenerator, wire::WireReader,

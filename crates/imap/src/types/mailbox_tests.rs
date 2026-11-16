@@ -11,7 +11,10 @@ fn special_use_from_attribute() {
         attributes: vec![MailboxAttribute::Archive],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Archive));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Archive)
+    );
 }
 
 #[test]
@@ -22,7 +25,10 @@ fn special_use_name_fallback() {
         attributes: vec![],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Junk));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Junk)
+    );
 }
 
 #[test]
@@ -33,7 +39,10 @@ fn special_use_case_insensitive() {
         attributes: vec![],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Sent));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Sent)
+    );
 }
 
 #[test]
@@ -44,7 +53,10 @@ fn special_use_nested_name() {
         attributes: vec![],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Trash));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Trash)
+    );
 }
 
 #[test]
@@ -56,7 +68,10 @@ fn special_use_attribute_overrides_name() {
         ..Default::default()
     };
     // Attribute wins over name.
-    assert_eq!(info.special_use(), Some(SpecialUse::Sent));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Sent)
+    );
 }
 
 #[test]
@@ -67,7 +82,10 @@ fn special_use_dot_delimiter() {
         attributes: vec![],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Trash));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Trash)
+    );
 }
 
 #[test]
@@ -78,7 +96,10 @@ fn special_use_no_delimiter() {
         attributes: vec![],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Sent));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Sent)
+    );
 }
 
 #[test]
@@ -89,7 +110,10 @@ fn special_use_unknown() {
         attributes: vec![],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), None);
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        None
+    );
 }
 
 #[test]
@@ -101,7 +125,10 @@ fn special_use_from_drafts_attribute() {
         attributes: vec![MailboxAttribute::Drafts],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Drafts));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Drafts)
+    );
 }
 
 #[test]
@@ -113,7 +140,10 @@ fn special_use_from_junk_attribute() {
         attributes: vec![MailboxAttribute::Junk],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Junk));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Junk)
+    );
 }
 
 #[test]
@@ -125,7 +155,10 @@ fn special_use_from_trash_attribute() {
         attributes: vec![MailboxAttribute::Trash],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Trash));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Trash)
+    );
 }
 
 #[test]
@@ -137,7 +170,10 @@ fn special_use_from_flagged_attribute() {
         attributes: vec![MailboxAttribute::Flagged],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Flagged));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Flagged)
+    );
 }
 
 #[test]
@@ -149,7 +185,10 @@ fn special_use_from_important_attribute() {
         attributes: vec![MailboxAttribute::Important],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Important));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Important)
+    );
 }
 
 #[test]
@@ -160,7 +199,10 @@ fn special_use_name_fallback_infers_important() {
         attributes: vec![],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Important));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Important)
+    );
 }
 
 #[test]
@@ -171,7 +213,10 @@ fn special_use_name_fallback_infers_all_mail() {
         attributes: vec![],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::All));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::All)
+    );
 }
 
 #[test]
@@ -182,7 +227,10 @@ fn special_use_name_fallback_infers_flagged_from_starred() {
         attributes: vec![],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), Some(SpecialUse::Flagged));
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        Some(SpecialUse::Flagged)
+    );
 }
 
 #[test]
@@ -195,7 +243,10 @@ fn special_use_name_fallback_returns_none_for_unknown_name() {
         attributes: vec![MailboxAttribute::HasNoChildren],
         ..Default::default()
     };
-    assert_eq!(info.special_use(), None);
+    assert_eq!(
+        SpecialUse::classify(&info.attributes, info.name.as_str(), info.delimiter),
+        None
+    );
 }
 
 #[test]

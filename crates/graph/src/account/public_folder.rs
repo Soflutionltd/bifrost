@@ -568,7 +568,13 @@ pub(crate) fn item_to_inventory_entry(
             server_version: item
                 .change_key
                 .clone()
-                .map(|etag| ServerVersion::ETag(etag.into()))
+                .map(|etag| {
+                    ServerVersion::etag(
+                        bifrost_types::Protocol::Ews,
+                        bifrost_types::ObjectType::Email,
+                        etag,
+                    )
+                })
                 .unwrap_or(ServerVersion::Unavailable),
             size: None,
             flags_hash: super::inventory::tracked_flags_hash(

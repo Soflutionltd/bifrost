@@ -6,8 +6,9 @@ use crate::account::blob::blob_handle_from_graph_attachment;
 use crate::account::graph_error::GraphErrorContext;
 use bifrost_types::FlagSet;
 use bifrost_types::{
-    AccountError, AccountOperation, Address, AttachmentSource, ContainerId, ErrorScope, FolderId,
-    HydrationProjection, Importance, Message, MessageAttachment, ObjectId, ThreadId,
+    AccountError, AccountOperation, Address, AttachmentSource, ErrorScope, FolderId,
+    HydrationProjection, Importance, MembershipScope, Message, MessageAttachment, ObjectId,
+    ThreadId,
 };
 use serde_json::Value;
 use std::time::SystemTime;
@@ -171,7 +172,7 @@ pub(super) fn message_from_ews_item(
         reply_to: Vec::new(),
         subject: item.subject.clone(),
         date: item.received_at.as_deref().and_then(parse_graph_datetime),
-        containers: vec![ContainerId(folder.0.clone())],
+        memberships: vec![MembershipScope::Folder(folder.clone())],
         flags,
         // EWS surfaces only the read bit on this shape; no importance field
         // is requested, so every public item is Normal.
@@ -292,12 +293,12 @@ pub(super) fn message_from_value(
         // `encode_foreign(mailbox, folderId)`; a bare id could neither join
         // that list nor be told apart from a primary folder carrying the
         // same bytes.
-        containers: value
+        memberships: value
             .get("parentFolderId")
             .and_then(Value::as_str)
             .map(|id| {
-                vec![ContainerId(crate::account::foreign::qualify_with_owner(
-                    owner, id,
+                vec![MembershipScope::Folder(FolderId(
+                    crate::account::foreign::qualify_with_owner(owner, id),
                 ))]
             })
             .unwrap_or_default(),

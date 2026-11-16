@@ -509,6 +509,24 @@ a category.
 
 `Projection` controls bulk `get_stream` hydration. Typed
 `HydrationProjection` drives single-message hydration.
+These selectors deliberately remain distinct: the bulk result can be flags,
+inventory metadata or MIME bytes, while every typed projection returns a
+parsed `Message`. Combining them would admit flags-only and metadata requests
+with no corresponding parsed-message result, or require a second selector to
+recover the distinction. The object-safe stream chooses its projection at
+runtime; flag and move read-back still check `HydratedObjectKind` before treating
+a result as state evidence. A mismatched kind leaves that state unresolved.
+
+`Message::memberships` uses `Vec<MembershipScope>`, exactly as inventory does:
+Gmail labels remain `Label`, primary JMAP mailboxes remain `Mailbox`, and IMAP
+and Graph folders remain `Folder`. Foreign JMAP mailboxes use qualified
+`Folder` memberships plus `Owner`; shared IMAP messages retain their discovered
+`Owner` annotation too. Parsed reads and thread hydration preserve these
+identities so opening a message cannot move it into a different mailbox view
+or conflate a shared folder with a personal folder. Consumers use
+`MembershipScope::same_container` to compare placement with typed destinations
+instead of inferring a provider from an untyped container string.
+
 `HydratedObject`, `Message`, and `ThreadHydration` keep parsed content
 separate from inventory and change signals. `HydratedObject::blobs` remains
 the engine-side `BlobHandle` shape. User-facing `Message::attachments` uses
@@ -779,13 +797,47 @@ SMTP header conversion and IMAP raw/draft submission share this owner.
 `mime::generate_message_id` owns fresh sender-domain correlation ids for both
 composed messages and raw IMAP submissions missing a structural Message-ID.
 
+## Read-minted mutation versions
+
+`ContactCard.version` and `CalendarEvent.version` are optional `ServerVersion`
+values, also used by inventory fingerprints and caller mutation preconditions.
+Consumers copy the observed value into a patch's `expected_version`, a
+conditional delete/RSVP argument, or `MailMutationTarget.expected_version`.
+These placements follow the existing request shapes; a common wrapper would
+add another API layer without strengthening the precondition.
+
+`ServerVersion::etag(protocol, object_type, tag)` mints a private-field
+`EntityVersion`; `ServerVersion::jmap_state(account_id, object_type, state)` mints
+a private-field `JmapStateVersion`. Provider read adapters supply the identity,
+never the consumer's interpretation of a raw string. Entity versions validate
+both protocol and object type; JMAP validates native account ID and object type.
+A mismatched token is locally Unsupported, never a retryable state conflict.
+An enterprise user should refresh a genuinely stale edit, not retry forever
+with a mailbox state on an email or a personal token on a shared message.
+Capability metadata still decides which native conditional doors exist.
+
+JMAP PIM single reads and query hydration attach the /get response's type state,
+not queryState. Email and Mailbox inventories retain distinct type identities;
+foreign email versions retain the selected native account ID. State equality
+alone never supplies provenance. Caller state remains frozen across writes,
+including chunks: successful writes do not silently advance a caller token.
+
+`entity_tag()` exposes original validator bytes for observation and provider-owned
+unversioned guards; it is not conditional-write admission. HTTP writers use
+`expected_etag`; People uses `expected_opaque_etag` because its CONTACT-source
+token is opaque JSON. EWS observations are stamped Ews and cannot enter Graph
+REST writes. MODSEQ and Gmail history snapshots retain their existing mail-only
+forms; Gmail history is observation-only, never a conditional-write token.
+
 ## Shared entity validators
 
 `bifrost_types::EntityTag` owns strong/weak classification and preserves the
-original token bytes. `ServerVersion::ETag`, `ContactCard.etag` and
-`CalendarEvent.etag` carry this type. HTTP caller-token validation lives on the
-shared type; a token without a weak marker still needs syntax validation before
-it is accepted as an HTTP precondition. `StrongTag` has a private field.
+original token bytes. `ServerVersion::ETag` wraps it with the producing
+protocol and object type. `ContactCard.version` and `CalendarEvent.version`
+carry the complete `ServerVersion`, ready to pass back unchanged.
+HTTP caller-token validation lives on the shared entity-tag type; a token
+without a weak marker still needs syntax validation before it is accepted as
+an HTTP precondition. `StrongTag` has a private field.
 Weak marker recognition and HTTP admission both accept `W/` and `w/`.
 Classification ignores surrounding whitespace conservatively, but HTTP admission
 rejects it; `as_str` always retains the original bytes for opaque provider tokens.

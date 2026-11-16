@@ -13,6 +13,8 @@
 //! absence of findings there is an absence of reading. Noted so a later
 //! auditor knows where coverage stops.
 
+#![warn(dead_code)]
+
 pub(crate) mod classification;
 pub(crate) mod decode;
 pub(crate) mod encode;

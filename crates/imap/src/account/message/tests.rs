@@ -6,6 +6,68 @@ use crate::account::test_support::scripted_account_parts;
 use crate::connection::test_support::{driver_pair, preauth_greeting, read_line, respond, tag_of};
 use crate::types::Flag;
 use bifrost_types::container::MutationTarget;
+use bifrost_types::{ContainerId, FolderId, MembershipScope};
+
+#[tokio::test]
+async fn hydrate_preserves_shared_inventory_memberships() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let mut parts = scripted_account_parts(conn, 1);
+    parts.capabilities.pim_methods.message_hydrate = true;
+    let account = ImapAccount::new(parts);
+    let folder = MailboxName::new("#user/alice/INBOX").unwrap();
+    let owner = bifrost_types::PrincipalId("alice".into());
+    account
+        .folders
+        .ingest_shared(vec![crate::account::folder_registry::SharedFolderEntry {
+            info: crate::types::MailboxInfo {
+                name: folder.clone(),
+                ..Default::default()
+            },
+            owner: owner.clone(),
+            rights: None,
+            namespace_prefix: "#user/".into(),
+        }]);
+    let epoch = crate::types::UidValidity::new(7).unwrap();
+    let inventory = crate::account::inventory::fetch_to_inventory(
+        &folder,
+        epoch,
+        crate::types::FetchResponse {
+            uid: Some(1),
+            flags: Some(Vec::new()),
+            ..Default::default()
+        },
+        Some(&owner),
+    )
+    .unwrap();
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(&mut server, &format!(
+            "* FLAGS (\\Seen)\r\n* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 7] epoch\r\n{} OK selected\r\n",
+            tag_of(&select),
+        )).await;
+        let fetch = read_line(&mut server).await;
+        assert!(fetch.contains("UID FETCH"), "{fetch}");
+        respond(
+            &mut server,
+            &format!(
+                "* 1 FETCH (UID 1 FLAGS ())\r\n{} OK fetched\r\n",
+                tag_of(&fetch),
+            ),
+        )
+        .await;
+        server
+    });
+    let hydrated = message_hydrate(account, inventory.id.clone(), HydrationProjection::Headers)
+        .await
+        .unwrap();
+    assert_eq!(hydrated.memberships, inventory.memberships);
+    assert!(
+        hydrated
+            .memberships
+            .contains(&MembershipScope::Owner(owner))
+    );
+    let _server = script.await.unwrap();
+}
 
 #[test]
 fn locally_malformed_message_errors_carry_the_calling_operation() {
@@ -100,7 +162,10 @@ fn hydrated_message_maps_importance_from_the_important_keyword() {
     )
     .expect("uid present");
     assert_eq!(message.importance, Importance::High);
-    assert_eq!(message.containers, vec![ContainerId("INBOX".to_owned())]);
+    assert_eq!(
+        message.memberships,
+        vec![MembershipScope::Folder(FolderId("INBOX".to_owned()))]
+    );
     assert!(
         message.body_text.is_none(),
         "a headers projection carries no body"
@@ -255,6 +320,7 @@ async fn fetched_server_thread_handles_resolve_current_members() {
         )
         .unwrap();
         assert_eq!(inventory.thread_id, message.thread_id);
+        assert_eq!(inventory.memberships, message.memberships);
         assert_eq!(elsewhere.thread_id, message.thread_id);
         let thread = message.thread_id.unwrap();
         let script = tokio::spawn(async move {

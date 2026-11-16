@@ -53,7 +53,7 @@ pub fn object_change(uri: &str, kind: ObjectChangeKind) -> Change {
 /// Project one snapshot member onto an inventory entry. A member with no etag
 /// reports `ServerVersion::Unavailable` rather than a fabricated version.
 #[must_use]
-pub fn inventory_entry(entry: &SnapshotEntry) -> InventoryEntry {
+pub fn inventory_entry<D: crate::collection::Dialect>(entry: &SnapshotEntry) -> InventoryEntry {
     InventoryEntry {
         id: ObjectId(entry.uri.clone()),
         memberships: Vec::new(),
@@ -62,7 +62,7 @@ pub fn inventory_entry(entry: &SnapshotEntry) -> InventoryEntry {
             server_version: entry
                 .etag
                 .clone()
-                .map(ServerVersion::ETag)
+                .map(|tag| ServerVersion::etag(D::DAV.protocol(), D::OBJECT_TYPE, tag))
                 .unwrap_or(ServerVersion::Unavailable),
             size: None,
             flags_hash: bifrost_types::canonical_flags_hash(std::iter::empty::<&str>()),

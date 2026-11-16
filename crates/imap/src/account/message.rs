@@ -8,7 +8,6 @@ use super::{
 };
 use crate::types::{FetchAttr, MailboxName};
 use bifrost_types::compose::Address;
-use bifrost_types::container::ContainerId;
 use bifrost_types::hydration::{
     AttachmentSource, HydrationProjection, Importance, Message, MessageAttachment, ThreadHydration,
 };
@@ -119,11 +118,21 @@ async fn hydrate_decoded(
             Ok::<(), crate::Error>(())
         })
         .map_err(err)?;
-        messages.extend(
-            merged
-                .into_values()
-                .filter_map(|fetch| fetch_to_message(&folder, uidvalidity, fetch, projection)),
-        );
+        let shared_owner = account
+            .folders
+            .get(&folder)
+            .and_then(|entry| entry.shared_owner.clone());
+        // Opening shared mail must preserve the mailbox view inventory
+        // assigned it, including its discovered owner annotation.
+        messages.extend(merged.into_values().filter_map(|fetch| {
+            let mut message = fetch_to_message(&folder, uidvalidity, fetch, projection)?;
+            if let Some(owner) = &shared_owner {
+                message
+                    .memberships
+                    .push(bifrost_types::MembershipScope::Owner(owner.clone()));
+            }
+            Some(message)
+        }));
     }
     messages.sort_by(|a, b| a.id.0.cmp(&b.id.0));
     Ok(messages)
@@ -242,7 +251,7 @@ fn fetch_to_message(
         date: parsed
             .as_ref()
             .and_then(|message| message.headers.date("Date")),
-        containers: vec![ContainerId(folder.account_id())],
+        memberships: vec![super::membership_scope(folder)],
         importance,
         flags,
         body_text: decoded.as_ref().and_then(|body| body.text.clone()),

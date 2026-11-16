@@ -44,6 +44,10 @@ pub struct SearchCriteria {
 /// A structured search operand. The builder validates dates, flags and sets;
 /// caller-provided extension grammar stays explicitly raw.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(
+    dead_code,
+    reason = "Typed SEARCH supports operands beyond the account filter compiler"
+)]
 pub(crate) enum SearchKey {
     Keyword(&'static str),
     Date {
@@ -73,6 +77,10 @@ pub(crate) enum SearchKey {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Typed SEARCH builders support operands beyond the account filter compiler"
+)]
 impl SearchCriteria {
     /// Create a new, empty criteria builder.
     ///

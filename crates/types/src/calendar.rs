@@ -493,7 +493,8 @@ pub struct CalendarEvent {
     pub calendar_id: CalendarId,
     pub native_id: String,
     pub uid: Option<String>,
-    pub etag: Option<crate::EntityTag>,
+    /// Read-minted version to pass unchanged to conditional mutations.
+    pub version: Option<crate::mutation::ServerVersion>,
     pub provenance: CalendarProvenance,
     pub title: Option<String>,
     pub description: Option<String>,
@@ -783,7 +784,7 @@ mod tests {
             calendar_id: CalendarId("/cal/".to_string()),
             native_id: "/cal/one.ics".to_string(),
             uid: None,
-            etag: None,
+            version: None,
             provenance: CalendarProvenance {
                 provider: ProtocolKind::CalDav,
                 native: "/cal/one.ics".to_string(),

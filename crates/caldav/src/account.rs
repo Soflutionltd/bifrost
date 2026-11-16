@@ -684,7 +684,14 @@ impl Account for CalDavAccount {
                         &url,
                         body,
                         expected_etag.map_or_else(
-                            || PutCondition::from_tag(current.etag.as_ref()),
+                            || {
+                                PutCondition::from_tag(
+                                    current
+                                        .version
+                                        .as_ref()
+                                        .and_then(bifrost_types::ServerVersion::entity_tag),
+                                )
+                            },
                             |etag| PutCondition::from_etag(Some(etag)),
                         ),
                         AccountOperation::EventUpdate,
@@ -814,7 +821,12 @@ impl Account for CalDavAccount {
                 .put_event(
                     &url,
                     body,
-                    PutCondition::from_tag(current.etag.as_ref()),
+                    PutCondition::from_tag(
+                        current
+                            .version
+                            .as_ref()
+                            .and_then(bifrost_types::ServerVersion::entity_tag),
+                    ),
                     AccountOperation::EventRsvp,
                 )
                 .await
@@ -2654,7 +2666,7 @@ mod tests {
             calendar_id: CalendarId("/cal/".to_string()),
             native_id: "/cal/one.ics".to_string(),
             uid: None,
-            etag: None,
+            version: None,
             provenance: CalendarProvenance {
                 provider: ProtocolKind::CalDav,
                 native: "/cal/one.ics".to_string(),

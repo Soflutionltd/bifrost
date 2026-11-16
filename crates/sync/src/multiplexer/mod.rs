@@ -86,34 +86,10 @@ impl ScopeTokenGeneration {
 pub struct ScopeToken {
     generation: ScopeTokenGeneration,
     token: CancellationToken,
-    /// The poll task exited on a terminal verdict and left this entry behind
-    /// as a tombstone. The 1s scan reads any present entry as "owned", but a
-    /// tombstone is not an owner - it is a record that the scope is DEAD - so
-    /// paths that drive a scope on their own initiative (the push reconciler)
-    /// must be able to tell the two apart.
-    parked: bool,
     drive_generation: Option<crate::cursor::DriveGeneration>,
 }
 
 impl ScopeToken {
-    /// A terminal tombstone for `scope_tokens`: no owner, uncancelled, and
-    /// marked parked, which is exactly the state a poll task leaves behind
-    /// when its recovery verdict was `Terminal`. Both the 1s poll scan and
-    /// the push reconciler refuse to drive a scope holding one.
-    ///
-    /// Published because `ScopeTokens` is published while every field of an
-    /// entry is private, so nothing outside this module could otherwise place
-    /// an entry in the map at all.
-    #[must_use]
-    pub fn tombstone() -> Self {
-        Self {
-            generation: ScopeTokenGeneration::mint(),
-            token: CancellationToken::new(),
-            parked: true,
-            drive_generation: None,
-        }
-    }
-
     fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
     }
@@ -346,7 +322,10 @@ fn spawn_and_track_scope_poll(
     scheduler: crate::scheduler::Scheduler,
     scope: CursorScope,
 ) {
-    let scope_cancel = shutdown.child_token();
+    let scope_cancel = cursors
+        .scope_cancel(&scope)
+        .map(|token| token.child_token())
+        .unwrap_or_else(|| shutdown.child_token());
     let generation = ScopeTokenGeneration::mint();
     let drive_generation = cursors.drive_generation(&scope);
     scope_tokens.lock().expect("poisoned").insert(
@@ -354,14 +333,13 @@ fn spawn_and_track_scope_poll(
         ScopeToken {
             generation,
             token: scope_cancel.clone(),
-            parked: false,
             drive_generation: Some(drive_generation),
         },
     );
     let cleanup_tokens = Arc::clone(&scope_tokens);
     let cleanup_scope = scope.clone();
     tokio::spawn(async move {
-        let exit = spawn_scope_poll_inner(
+        spawn_scope_poll_inner(
             account_id,
             account,
             cursors,
@@ -377,23 +355,9 @@ fn spawn_and_track_scope_poll(
             scope,
         )
         .await;
-        // A terminally failed scope leaves its (uncancelled) token in the
-        // map as a tombstone: the 1s scan sees a live entry and never
-        // respawns the poll, so a terminal error really is terminal instead
-        // of a once-per-second re-drive. The scope-retiring paths still clear
-        // the entry, so a scope that is deleted-and-recreated respawns cleanly.
-        //
-        // Registry restart paths need not edit this map: discovery and push
-        // dispatch retire entries bound to an obsolete drive generation. A late
-        // terminal result can only park its original ownership generation.
-        match exit {
-            PollExit::Retire => retire_scope_token(&cleanup_tokens, &cleanup_scope, generation),
-            // Mark the tombstone as such, by identity, so the push reconciler
-            // can refuse to re-drive a terminally parked scope. Without the
-            // mark a later hint drove the scope again - the milder sibling of
-            // the once-per-second respawn loop the park exists to stop.
-            PollExit::Park => park_scope_token(&cleanup_tokens, &cleanup_scope, generation),
-        }
+        // Parking belongs to the registry. Task cleanup only retires this
+        // task's registration, and can never remove a successor's entry.
+        retire_scope_token(&cleanup_tokens, &cleanup_scope, generation);
     });
 }
 
@@ -412,74 +376,10 @@ fn retire_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: Sco
     }
 }
 
-/// Mark an exiting task's registration as a terminal tombstone, by identity.
-fn park_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: ScopeTokenGeneration) {
-    let mut g = tokens.lock().expect("poisoned");
-    if let Some(entry) = g.get_mut(scope)
-        && entry.generation == generation
-    {
-        entry.parked = true;
-    }
-}
-
-/// Stop the poll owner and leave a terminal tombstone for a push drive.
-///
-/// A push reconcile can reach a terminal recovery verdict while the poll
-/// worker is asleep on cadence. Cancelling that owner alone would make the
-/// one-second discovery loop respawn it, while merely marking it would leave
-/// it alive to poll again. Replace the matching registration with a fresh
-/// tombstone bound to the drive generation; the cancelled owner's cleanup is
-/// generation-checked and cannot remove the replacement.
-pub(crate) fn park_scope_for_drive(
-    tokens: &ScopeTokens,
-    cursors: &CursorRegistry,
-    scope: &CursorScope,
-    drive_generation: crate::cursor::DriveGeneration,
-) {
-    if cursors.drive_generation(scope) != drive_generation {
-        return;
-    }
-    let mut entries = tokens.lock().expect("poisoned");
-    if entries.get(scope).is_some_and(|entry| {
-        entry
-            .drive_generation
-            .is_some_and(|generation| generation != drive_generation)
-    }) {
-        return;
-    }
-    if let Some(owner) = entries.remove(scope) {
-        owner.cancel();
-    }
-    let mut tombstone = ScopeToken::tombstone();
-    tombstone.drive_generation = Some(drive_generation);
-    entries.insert(scope.clone(), tombstone);
-}
-
-/// Whether this scope is a terminal tombstone: a poll task exited on a
-/// terminal recovery verdict and nothing has cleared the entry since.
-///
-/// Reading `None` as "not parked" is the safe default - an unknown scope is
-/// one nothing has terminated - and so is an ACTIVE token, whose owner is
-/// polling it normally.
-#[must_use]
-pub fn scope_is_parked(tokens: &ScopeTokens, scope: &CursorScope) -> bool {
-    tokens
-        .lock()
-        .expect("poisoned")
-        .get(scope)
-        .is_some_and(|entry| entry.parked)
-}
-
-/// Ownership and terminal state belong to the registry drive incarnation.
-/// Comparing the existing fence covers both scope restart and reattach without
-/// requiring every recovery caller to remember a second reset operation. Merely
-/// clearing on account replacement would leave scope-only restarts stranded.
-/// Keeping task cleanup identity separate prevents an old task retiring its successor.
-pub(crate) fn retire_stale_scope_token(
-    tokens: &ScopeTokens,
-    cursors: &CursorRegistry,
-    scope: &CursorScope,
-) {
+/// Account replacement also retires retained scopes' old poll tasks, including
+/// a task stalled inside the old provider stream. The task's fence is ownership
+/// bookkeeping only; terminal state belongs entirely to the registry.
+fn retire_stale_scope_token(tokens: &ScopeTokens, cursors: &CursorRegistry, scope: &CursorScope) {
     let current = cursors.drive_generation(scope);
     let mut entries = tokens.lock().expect("poisoned");
     if entries.get(scope).is_some_and(|entry| {
@@ -517,6 +417,9 @@ fn spawn_missing_scope_polls(
 ) {
     for scope in cursors.all_scopes() {
         retire_stale_scope_token(&scope_tokens, &cursors, &scope);
+        if cursors.scope_is_parked(&scope) {
+            continue;
+        }
         let should_spawn = {
             let mut g = scope_tokens.lock().expect("poisoned");
             match g.get(&scope) {
@@ -676,7 +579,7 @@ async fn spawn_scope_poll_inner(
                     let advanced = advance_cursors
                         .snapshot(&advance_scope)
                         .is_some_and(|c| c.server_state.bytes != pre_advance_state);
-                    Ok((advanced, outcome, acc_arc.generation()))
+                    Ok((advanced, outcome, acc_arc.generation(), registry_generation))
                 }
             }) => driven,
         };
@@ -686,7 +589,7 @@ async fn spawn_scope_poll_inner(
             // cleanly; if the scope is re-established the 1s scan respawns us.
             return PollExit::Retire;
         };
-        let (advanced, outcome, generation) = match driven {
+        let (advanced, outcome, generation, drive_generation) = match driven {
             Ok(driven) => driven,
             Err(crate::engine::drive_start::StartRefused::ShuttingDown) => return PollExit::Retire,
             Err(crate::engine::drive_start::StartRefused::Paused) => continue,
@@ -719,6 +622,9 @@ async fn spawn_scope_poll_inner(
             config.poll_max,
         );
         if let Some(exit) = recovered.exit {
+            if exit == PollExit::Park {
+                cursors.park_scope_for_drive(&scope, drive_generation);
+            }
             return exit;
         }
         if matches!(
@@ -762,15 +668,9 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// How an exiting per-scope poll task leaves its `ScopeToken` entry.
-///
-/// `Retire` removes the entry so the 1s scan can respawn the scope when
-/// its cursor is (still or again) present. `Park` deliberately leaves the
-/// uncancelled entry behind as a tombstone: the scan reads a live token
-/// as "this scope is owned" and never respawns it, which is how a
-/// terminal recovery verdict stays terminal. Only an explicit
-/// scope-retiring path (`cancel_scope_token`, multiplexer shutdown)
-/// clears a parked entry.
+/// Whether the poll loop retired normally or reached a terminal verdict.
+/// The loop installs a terminal verdict in the registry under the failing
+/// drive's generation before returning. Task ownership always retires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollExit {
     Retire,
@@ -783,8 +683,7 @@ struct DriveRecovery {
 }
 
 /// A recovery delay cut short by detach or scope deletion. The scope is left
-/// RETIRED, never parked: the token is being cleared anyway, and parking would
-/// leave a tombstone behind for a scope nobody asked to keep.
+/// RETIRED, never parked: shutdown and deletion do not issue terminal verdicts.
 fn retired() -> DriveRecovery {
     DriveRecovery {
         advanced: false,

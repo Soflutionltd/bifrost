@@ -9,8 +9,8 @@ use crate::encoding::decode_base64url_nopad;
 use crate::headers::{find_header_value_case_insensitive, references_from_header};
 use crate::types::{GmailHeader, GmailLabel, GmailMessage, GmailPayload};
 use bifrost_types::{
-    AccountError, AccountFuture, Address, ContainerId, HydrationProjection, Importance, Message,
-    ObjectId, ThreadHydration, ThreadId,
+    AccountError, AccountFuture, Address, HydrationProjection, Importance, LabelId,
+    MembershipScope, Message, ObjectId, ThreadHydration, ThreadId,
 };
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -110,10 +110,10 @@ async fn message_from_gmail(
         reply_to: hydrated_address_list(headers, "Reply-To", &mut incomplete),
         subject: header_from(headers, "Subject"),
         date: internal_date(&message.internal_date),
-        containers: message
+        memberships: message
             .label_ids
             .iter()
-            .map(|id| ContainerId(id.clone()))
+            .map(|id| MembershipScope::Label(LabelId(id.clone())))
             .collect(),
         flags,
         // Gmail has no importance field; always Normal.
@@ -274,6 +274,32 @@ mod tests {
     use super::super::test_support::gmail_message;
     use super::*;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[tokio::test]
+    async fn hydrate_preserves_inventory_label_memberships() {
+        let message = gmail_message(serde_json::json!({
+            "id": "m1", "threadId": "t1",
+            "labelIds": ["INBOX", "Label_Ab", "Label_aB"]
+        }));
+        let inventory = super::super::super::inventory::inventory_entry_from_message(&message, &[]);
+        for projection in [
+            HydrationProjection::Headers,
+            HydrationProjection::Preview(8),
+            HydrationProjection::Full,
+            HydrationProjection::FullWithBlobs,
+        ] {
+            let hydrated = message_from_gmail(&[], &message, projection).await.unwrap();
+            assert_eq!(hydrated.memberships, inventory.memberships);
+            assert_eq!(
+                hydrated.memberships,
+                vec![
+                    MembershipScope::Label(LabelId("INBOX".into())),
+                    MembershipScope::Label(LabelId("Label_Ab".into())),
+                    MembershipScope::Label(LabelId("Label_aB".into())),
+                ]
+            );
+        }
+    }
 
     #[tokio::test]
     async fn hydrate_repeated_address_headers_preserves_siblings_and_marks_loss() {

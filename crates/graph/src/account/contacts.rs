@@ -218,8 +218,8 @@ pub(crate) async fn update(
     } else {
         get(account.clone(), contact.clone())
             .await?
-            .etag
-            .map(bifrost_types::EntityTag::into_string)
+            .version
+            .and_then(|version| version.entity_tag().map(|tag| tag.as_str().to_owned()))
     };
     let prefix = account.mailboxes.primary().api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
@@ -279,8 +279,8 @@ pub(crate) async fn delete_if_version(
     } else {
         get(account.clone(), contact.clone())
             .await?
-            .etag
-            .map(bifrost_types::EntityTag::into_string)
+            .version
+            .and_then(|version| version.entity_tag().map(|tag| tag.as_str().to_owned()))
     };
     let prefix = account.mailboxes.primary().api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
@@ -976,7 +976,13 @@ fn contact_from_graph(contact: GraphContact) -> ContactCard {
         id: ContactId(contact.id.clone()),
         address_book_id: contact.parent_folder_id.clone().map(AddressBookId),
         native_id: contact.id.clone(),
-        etag: contact.etag.map(Into::into),
+        version: contact.etag.map(|tag| {
+            bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::Graph,
+                bifrost_types::ObjectType::Contact,
+                tag,
+            )
+        }),
         provenance: ContactProvenance {
             provider: ProtocolKind::Graph,
             native: contact.id,
@@ -1445,7 +1451,13 @@ mod tests {
             let result = account
                 .contact_delete_if_version(
                     ContactId("one".into()),
-                    expected.map(|value| bifrost_types::ServerVersion::ETag(value.into())),
+                    expected.map(|value| {
+                        bifrost_types::ServerVersion::etag(
+                            bifrost_types::Protocol::Graph,
+                            bifrost_types::ObjectType::Contact,
+                            value,
+                        )
+                    }),
                 )
                 .await;
             if expected.is_some() {
@@ -1554,8 +1566,13 @@ mod tests {
                 account,
                 ContactId("contact-1".into()),
                 ContactPatch {
-                    expected_version: expected
-                        .map(|etag| bifrost_types::ServerVersion::ETag(etag.into())),
+                    expected_version: expected.map(|etag| {
+                        bifrost_types::ServerVersion::etag(
+                            bifrost_types::Protocol::Graph,
+                            bifrost_types::ObjectType::Contact,
+                            etag,
+                        )
+                    }),
                     display_name: Some(Some("Ada".into())),
                     ..Default::default()
                 },
@@ -1581,8 +1598,10 @@ mod tests {
     async fn contact_update_refuses_address_book_changes_before_io() {
         for expected_version in [
             None,
-            Some(bifrost_types::ServerVersion::ETag(
-                "W/\"caller-version\"".into(),
+            Some(bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::Graph,
+                bifrost_types::ObjectType::Contact,
+                "W/\"caller-version\"",
             )),
         ] {
             let (client, account) = test_account();
@@ -1849,7 +1868,13 @@ mod tests {
 
         assert_eq!(card.id.0, "contact-1");
         assert_eq!(card.display_name.as_deref(), Some("Ada Lovelace"));
-        assert_eq!(card.etag.as_deref(), Some("etag-1"));
+        assert_eq!(
+            card.version
+                .as_ref()
+                .and_then(bifrost_types::ServerVersion::entity_tag)
+                .map(bifrost_types::EntityTag::as_str),
+            Some("etag-1")
+        );
         assert_eq!(card.emails[0].kind.as_deref(), Some("work"));
         assert_eq!(card.phones[0].kind.as_deref(), Some("business"));
         assert_eq!(card.phones[1].kind.as_deref(), Some("home"));

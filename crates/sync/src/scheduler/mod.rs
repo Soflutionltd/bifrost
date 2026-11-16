@@ -49,11 +49,13 @@
 
 pub mod budget;
 pub mod lanes;
+mod priority;
+
+use priority::{LANES, OverflowPolicy, PriorityLanes, PushOutcome, lane_index};
 
 pub use budget::{BudgetGate, BudgetPermit, ConcurrencyBudget};
 pub use lanes::{LaneQueue, LaneSnapshot, WorkItem, WorkKind};
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -65,13 +67,10 @@ use bifrost_types::{AccountId, Priority};
 
 use crate::types::SchedulerConfig;
 
-/// Number of priority lanes. Mirrors `Priority`'s four variants.
-const LANES: usize = 4;
-
 /// Public scheduler handle.
 ///
-/// Holds one `LaneQueue` per priority plus the starvation counter, the
-/// admission lanes and the budget gate. Engine work uses `admit`;
+/// Holds independent work and admission lanes with shared queue and
+/// starvation mechanics, plus the budget gate. Engine work uses `admit`;
 /// external consumers keep the `submit` / `pull` work-item path, whose
 /// non-blocking `pull` semantics are unchanged.
 #[derive(Debug, Clone)]
@@ -96,29 +95,14 @@ impl Drop for SchedulerLife {
 
 #[derive(Debug)]
 struct SchedulerInner {
-    foreground: LaneQueue,
-    normal: LaneQueue,
-    background: LaneQueue,
-    bulk: LaneQueue,
-    starvation_floor: u32,
-    lane_capacity: usize,
-    state: Mutex<SchedulerState>,
-    admission: Mutex<AdmissionState>,
+    work: Mutex<PriorityLanes<WorkItem>>,
+    admission: Mutex<PriorityLanes<AdmissionRequest>>,
     budget: BudgetGate,
     submitted: Notify,
     admitted: Notify,
     stop_notify: Notify,
     stopped: AtomicBool,
     dispatcher_started: AtomicBool,
-}
-
-#[derive(Debug, Default)]
-struct SchedulerState {
-    /// Count of consecutive Foreground/Normal items pulled. Reset
-    /// whenever a Background or Bulk item is pulled. When the count
-    /// hits `starvation_floor` the next `pull` is forced to take from
-    /// the lower lanes.
-    higher_consecutive: u32,
 }
 
 /// One queued admission request. The permit travels back over `tx`, so
@@ -131,69 +115,20 @@ struct AdmissionRequest {
     tx: oneshot::Sender<Result<BudgetPermit, crate::Error>>,
 }
 
-#[derive(Debug, Default)]
-struct AdmissionState {
-    lanes: [VecDeque<AdmissionRequest>; LANES],
-    higher_consecutive: u32,
-}
-
-fn lane_index(priority: Priority) -> usize {
-    match priority {
-        Priority::Foreground => 0,
-        Priority::Normal => 1,
-        Priority::Background => 2,
-        Priority::Bulk => 3,
-        // `Priority` is `#[non_exhaustive]`; an unknown variant lands in
-        // the normal lane, matching `Scheduler::lane`.
-        _ => 1,
-    }
-}
-
-fn lane_priority(index: usize) -> Priority {
-    match index {
-        0 => Priority::Foreground,
-        2 => Priority::Background,
-        3 => Priority::Bulk,
-        _ => Priority::Normal,
-    }
-}
-
-impl AdmissionState {
+impl PriorityLanes<AdmissionRequest> {
     /// Drop requests whose caller has gone away.
     fn prune(&mut self) {
         for lane in &mut self.lanes {
-            lane.retain(|request| !request.tx.is_closed());
-        }
-    }
-
-    /// Lane visit order for the next grant. When the starvation floor
-    /// has been reached the lower lanes are visited first, exactly as
-    /// `Scheduler::try_pull` does for work items.
-    fn visit_order(&self, floor: u32) -> ([usize; LANES], bool) {
-        if self.higher_consecutive >= floor {
-            ([3, 2, 0, 1], true)
-        } else {
-            ([0, 1, 2, 3], false)
-        }
-    }
-
-    fn record_grant(&mut self, lane: usize, floor_hit: bool) {
-        if lane >= 2 {
-            self.higher_consecutive = 0;
-        } else {
-            if floor_hit {
-                self.higher_consecutive = 0;
-            }
-            self.higher_consecutive = self.higher_consecutive.saturating_add(1);
+            lane.queue.retain(|request| !request.tx.is_closed());
         }
     }
 
     /// Distinct budget classes present, in grant-preference order.
-    fn classes(&self, floor: u32) -> Vec<(AccountId, WorkKind)> {
-        let (order, _) = self.visit_order(floor);
+    fn classes(&self) -> Vec<(AccountId, WorkKind)> {
+        let order = self.visit_order();
         let mut out: Vec<(AccountId, WorkKind)> = Vec::new();
         for lane in order {
-            for request in &self.lanes[lane] {
+            for request in &self.lanes[lane].queue {
                 let class = (request.account.clone(), request.kind);
                 if !out.contains(&class) {
                     out.push(class);
@@ -203,33 +138,10 @@ impl AdmissionState {
         out
     }
 
-    /// Lane index of the most preferred non-empty lane, if any.
-    fn best_lane(&self, floor: u32) -> Option<usize> {
-        let (order, _) = self.visit_order(floor);
-        order.into_iter().find(|lane| !self.lanes[*lane].is_empty())
-    }
-
-    fn take_for_class(
-        &mut self,
-        account: &AccountId,
-        kind: WorkKind,
-        floor: u32,
-    ) -> Option<AdmissionRequest> {
-        let (order, floor_hit) = self.visit_order(floor);
-        for lane in order {
-            // Skip waiters whose `admit` future was dropped: handing them the
-            // permit would waste the grant while a live waiter keeps waiting.
-            let Some(position) = self.lanes[lane].iter().position(|request| {
-                request.account == *account && request.kind == kind && !request.tx.is_closed()
-            }) else {
-                continue;
-            };
-            if let Some(request) = self.lanes[lane].remove(position) {
-                self.record_grant(lane, floor_hit);
-                return Some(request);
-            }
-        }
-        None
+    fn take_for_class(&mut self, account: &AccountId, kind: WorkKind) -> Option<AdmissionRequest> {
+        self.take(|request| {
+            request.account == *account && request.kind == kind && !request.tx.is_closed()
+        })
     }
 }
 
@@ -248,18 +160,17 @@ impl Scheduler {
         budget: BudgetGate,
         lane_capacity: usize,
     ) -> Self {
-        // A zero floor would satisfy `higher_consecutive >= floor` before
-        // any work is granted, reversing the intended priority order.
-        let starvation_floor = cfg.starvation_floor.max(1);
         let inner = Arc::new(SchedulerInner {
-            foreground: LaneQueue::with_capacity(Priority::Foreground, lane_capacity),
-            normal: LaneQueue::with_capacity(Priority::Normal, lane_capacity),
-            background: LaneQueue::with_capacity(Priority::Background, lane_capacity),
-            bulk: LaneQueue::with_capacity(Priority::Bulk, lane_capacity),
-            starvation_floor,
-            lane_capacity: lane_capacity.max(1),
-            state: Mutex::new(SchedulerState::default()),
-            admission: Mutex::new(AdmissionState::default()),
+            work: Mutex::new(PriorityLanes::new(
+                lane_capacity,
+                cfg.starvation_floor,
+                OverflowPolicy::ShedOldest,
+            )),
+            admission: Mutex::new(PriorityLanes::new(
+                lane_capacity,
+                cfg.starvation_floor,
+                OverflowPolicy::Refuse,
+            )),
             budget,
             submitted: Notify::new(),
             admitted: Notify::new(),
@@ -276,7 +187,17 @@ impl Scheduler {
     }
 
     pub fn submit(&self, item: WorkItem) {
-        self.lane(item.kind.priority(item.priority)).push(item);
+        let priority = item.kind.priority(item.priority);
+        let mut work = self.inner.work.lock().expect("poisoned");
+        if work.push(priority, item) == PushOutcome::ShedOldest {
+            tracing::warn!(
+                target: "bifrost.sync.scheduler",
+                ?priority,
+                capacity = work.lanes[lane_index(priority)].capacity,
+                "lane full; shedding oldest work item"
+            );
+        }
+        drop(work);
         self.inner.submitted.notify_one();
     }
 
@@ -318,41 +239,7 @@ impl Scheduler {
     /// Non-blocking pull. Alias of [`Scheduler::pull`], named for
     /// symmetry with `pull_next`.
     pub fn try_pull(&self) -> Option<WorkItem> {
-        let mut state = self.inner.state.lock().expect("poisoned");
-        // If the starvation floor has been hit, take from the lowest
-        // non-empty lane and reset.
-        if state.higher_consecutive >= self.inner.starvation_floor {
-            if let Some(item) = self.inner.bulk.try_pop() {
-                state.higher_consecutive = 0;
-                return Some(item);
-            }
-            if let Some(item) = self.inner.background.try_pop() {
-                state.higher_consecutive = 0;
-                return Some(item);
-            }
-            // Both lower lanes empty; fall through to normal priority
-            // order. Reset so the floor doesn't fire on the very next
-            // pull and starve Foreground.
-            state.higher_consecutive = 0;
-        }
-
-        if let Some(item) = self.inner.foreground.try_pop() {
-            state.higher_consecutive = state.higher_consecutive.saturating_add(1);
-            return Some(item);
-        }
-        if let Some(item) = self.inner.normal.try_pop() {
-            state.higher_consecutive = state.higher_consecutive.saturating_add(1);
-            return Some(item);
-        }
-        if let Some(item) = self.inner.background.try_pop() {
-            state.higher_consecutive = 0;
-            return Some(item);
-        }
-        if let Some(item) = self.inner.bulk.try_pop() {
-            state.higher_consecutive = 0;
-            return Some(item);
-        }
-        None
+        self.inner.work.lock().expect("poisoned").take(|_| true)
     }
 
     /// Queue this operation for admission and wait for its concurrency
@@ -391,20 +278,24 @@ impl Scheduler {
             // this prune a cancelled waiter (a caller that stopped waiting
             // on a pause or shutdown) kept its lane slot until some later
             // wake, refusing live requests as "lane full" meanwhile.
-            admission.lanes[lane].retain(|request| !request.tx.is_closed());
-            if admission.lanes[lane].len() >= self.inner.lane_capacity {
+            admission.lanes[lane]
+                .queue
+                .retain(|request| !request.tx.is_closed());
+            let capacity = admission.lanes[lane].capacity;
+            if admission.push(priority, AdmissionRequest { account, kind, tx })
+                == PushOutcome::Refused
+            {
                 tracing::warn!(
                     target: "bifrost.sync.scheduler",
                     ?priority,
-                    capacity = self.inner.lane_capacity,
+                    capacity,
                     "admission lane full; refusing the incoming request"
                 );
                 return Err(crate::Error::Admission(crate::AdmissionFailure::LaneFull {
                     priority,
-                    capacity: self.inner.lane_capacity,
+                    capacity,
                 }));
             }
-            admission.lanes[lane].push_back(AdmissionRequest { account, kind, tx });
         }
         self.inner.admitted.notify_one();
         // The dispatcher dropped our request unanswered: it is gone, so no
@@ -425,40 +316,18 @@ impl Scheduler {
     /// here rather than as invisible semaphore waiters.
     #[must_use]
     pub fn admission_snapshot(&self) -> [LaneSnapshot; LANES] {
-        let admission = self.inner.admission.lock().expect("poisoned");
-        std::array::from_fn(|lane| LaneSnapshot {
-            priority: lane_priority(lane),
-            depth: admission.lanes[lane].len(),
-        })
+        self.inner.admission.lock().expect("poisoned").snapshot()
     }
 
     /// Snapshot lane depths for observability.
     #[must_use]
-    pub fn snapshot(&self) -> [LaneSnapshot; 4] {
-        [
-            self.inner.foreground.snapshot(),
-            self.inner.normal.snapshot(),
-            self.inner.background.snapshot(),
-            self.inner.bulk.snapshot(),
-        ]
+    pub fn snapshot(&self) -> [LaneSnapshot; LANES] {
+        self.inner.work.lock().expect("poisoned").snapshot()
     }
 
     #[must_use]
     pub fn budget(&self) -> BudgetGate {
         self.inner.budget.clone()
-    }
-
-    fn lane(&self, priority: Priority) -> &LaneQueue {
-        match priority {
-            Priority::Foreground => &self.inner.foreground,
-            Priority::Normal => &self.inner.normal,
-            Priority::Background => &self.inner.background,
-            Priority::Bulk => &self.inner.bulk,
-            // `Priority` is `#[non_exhaustive]`; any future variant
-            // falls through to the normal lane until the scheduler is
-            // updated to handle it explicitly.
-            _ => &self.inner.normal,
-        }
     }
 }
 
@@ -476,7 +345,6 @@ type PendingAcquire = BoxFuture<'static, (AccountId, WorkKind, Result<BudgetPerm
 /// cancellation-safe on `tokio::sync::Semaphore` and returns nothing to
 /// the pool that was not already there.
 async fn dispatch_admissions(inner: Arc<SchedulerInner>) {
-    let floor = inner.starvation_floor;
     loop {
         if inner.stopped.load(Ordering::SeqCst) {
             return;
@@ -489,8 +357,8 @@ async fn dispatch_admissions(inner: Arc<SchedulerInner>) {
         let (classes, top_lane, order) = {
             let mut admission = inner.admission.lock().expect("poisoned");
             admission.prune();
-            let (order, _) = admission.visit_order(floor);
-            (admission.classes(floor), admission.best_lane(floor), order)
+            let order = admission.visit_order();
+            (admission.classes(), admission.best_lane(), order)
         };
         let Some(top_lane) = top_lane else {
             tokio::select! {
@@ -532,12 +400,12 @@ async fn dispatch_admissions(inner: Arc<SchedulerInner>) {
                     let replan = {
                         let mut admission = inner.admission.lock().expect("poisoned");
                         admission.prune();
-                        let better = admission.best_lane(floor).is_some_and(|lane| {
+                        let better = admission.best_lane().is_some_and(|lane| {
                             preference_rank(&order, lane) < preference_rank(&order, top_lane)
                         });
                         better
                             || admission
-                                .classes(floor)
+                                .classes()
                                 .iter()
                                 .any(|class| !planned.contains(class))
                     };
@@ -562,7 +430,7 @@ async fn dispatch_admissions(inner: Arc<SchedulerInner>) {
                 // Preserve the budget verdict through the response channel.
                 // Only a full lane can clear by retrying this attachment.
                 let mut admission = inner.admission.lock().expect("poisoned");
-                if let Some(request) = admission.take_for_class(&account, kind, floor) {
+                if let Some(request) = admission.take_for_class(&account, kind) {
                     let _ = request.tx.send(Err(error));
                 }
                 continue;
@@ -570,7 +438,7 @@ async fn dispatch_admissions(inner: Arc<SchedulerInner>) {
         };
         let taken = {
             let mut admission = inner.admission.lock().expect("poisoned");
-            admission.take_for_class(&account, kind, floor)
+            admission.take_for_class(&account, kind)
         };
         match taken {
             // Send failure means the caller went away between selection
@@ -626,6 +494,27 @@ mod tests {
         assert_eq!(
             scheduler.try_pull().expect("bulk item").priority,
             Priority::Bulk
+        );
+    }
+
+    #[test]
+    fn idle_work_pulls_do_not_erase_starvation_relief() {
+        let scheduler = scheduler(1);
+        scheduler.submit(item(Priority::Foreground, "foreground"));
+        assert_eq!(
+            scheduler.pull().expect("first grant").priority,
+            Priority::Foreground
+        );
+        assert!(scheduler.pull().is_none());
+        scheduler.submit(item(Priority::Foreground, "foreground"));
+        scheduler.submit(item(Priority::Bulk, "bulk"));
+        assert_eq!(
+            scheduler.pull().expect("starvation relief").priority,
+            Priority::Bulk
+        );
+        assert_eq!(
+            scheduler.pull().expect("remaining work").priority,
+            Priority::Foreground
         );
     }
 

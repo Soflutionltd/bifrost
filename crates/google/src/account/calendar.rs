@@ -793,7 +793,13 @@ fn event_from_google(
         calendar_id: CalendarId(calendar_id.clone()),
         native_id: native.clone(),
         uid: event.i_cal_uid,
-        etag: event.etag.map(Into::into),
+        version: event.etag.map(|tag| {
+            bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::GoogleCalendar,
+                bifrost_types::ObjectType::CalendarEvent,
+                tag,
+            )
+        }),
         provenance: CalendarProvenance {
             provider: ProtocolKind::Gmail,
             native,
@@ -1668,7 +1674,11 @@ mod tests {
                 StatusCode::PRECONDITION_FAILED,
                 json!({"error": {"code": 412, "message": "stale", "errors": [{"reason": "conditionNotMet"}]}}),
             )]);
-            let expected = Some(bifrost_types::ServerVersion::ETag("\"caller-old\"".into()));
+            let expected = Some(bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::GoogleCalendar,
+                bifrost_types::ObjectType::CalendarEvent,
+                "\"caller-old\"",
+            ));
             let error = if delete {
                 delete_if_version(client, EventId(join_event_id("primary", "e1")), expected).await
             } else {
@@ -1730,7 +1740,11 @@ mod tests {
             client,
             EventId(join_event_id("primary", "e1")),
             EventPatch {
-                expected_version: Some(bifrost_types::ServerVersion::ETag("\"old\"".into())),
+                expected_version: Some(bifrost_types::ServerVersion::etag(
+                    bifrost_types::Protocol::GoogleCalendar,
+                    bifrost_types::ObjectType::CalendarEvent,
+                    "\"old\"",
+                )),
                 calendar_id: Some(CalendarId("other".into())),
                 title: Some(Some("new title".into())),
                 ..Default::default()
@@ -1764,7 +1778,11 @@ mod tests {
             "self@example.test".into(),
             EventId(join_event_id("primary", "e1")),
             RsvpStatus::Accepted,
-            Some(bifrost_types::ServerVersion::ETag("\"old\"".into())),
+            Some(bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::GoogleCalendar,
+                bifrost_types::ObjectType::CalendarEvent,
+                "\"old\"",
+            )),
         )
         .await
         .unwrap_err();

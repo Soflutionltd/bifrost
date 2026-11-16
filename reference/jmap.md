@@ -1256,6 +1256,12 @@ Outlook user must not see settings saved without confirmation.
 
 `thread_hydrate` does `Thread/get` then `Email/get` in order. `message_hydrate` selects headers / preview / full projections and returns blob handles without pre-downloading. `move_thread` and `delete_thread` from elsewhere add-to-target then remove-from-source. When the caller says the thread is already in Trash, `delete_thread` expands the thread and reads each member's active `mailboxIds`; only members present in the resolved Trash mailbox are destroyed, so Sent, Inbox, and other copies survive. The move path resolves the thread once and both membership legs use that fixed id set (`patch_mailbox_membership_of`); the cross-account container check runs for both containers before the resolve. Each leg used to run its own `Thread/get`, so a message delivered to the thread between the two resolves was removed from the source having never been added to the target - it lost its source membership and gained nothing. The two-leg non-atomicity itself is the documented cross-provider shape and remains; each leg now applies the same fixed id set in bounded `Email/set` batches.
 
+Typed message and thread hydration use inventory's membership vocabulary:
+primary mailbox ids are `MembershipScope::Mailbox`; foreign mailboxes pass
+through `qualify_foreign_memberships`, yielding qualified `Folder` memberships
+and `Owner(accountId)`. The shared qualifier keeps opening a message in the
+same mailbox view as inventory and bulk metadata hydration.
+
 ### PIM page cursors
 
 Malformed, retired and out-of-range page cursors are caller state errors:
@@ -1861,16 +1867,24 @@ default-method refusals.
 ## Caller versions on contact and event mutations
 
 Contact and event update patches, conditional deletes and conditional RSVP
-accept a nonempty `ServerVersion::StateAt` and send it as native `ifInState`.
+accept a nonempty read-minted `ServerVersion::StateAt` and send it as native
+`ifInState`. The value carries the native account ID and object type.
 RFC 8620 Section 5.3 requires a mismatching state to reject the entire set
 without changes. State belongs to the selected account and object type, not
 an individual object's ETag or query state. Reads needed to construct a patch
-never replace the caller state; a mismatch propagates as `ConcurrencyConflict`
-without a refresh or retry. Other version kinds and empty states are refused
-before I/O. Absent versions retain the ordinary unconditional paths.
-Capabilities advertise these doors only when the corresponding PIM account
-is supported. Contact and event reads still expose no shared type-state field;
-callers must already possess the appropriate native type state.
+never replace the caller state; a genuine stale state propagates as
+`ConcurrencyConflict` without a refresh or retry. Wrong-owner, wrong-type,
+other-kind and empty states are refused as Unsupported before I/O: an enterprise
+user must not retry an edit forever with a token that can never match.
+Absent versions retain ordinary mutation behavior. Capabilities advertise these
+doors only when the corresponding PIM account is supported.
+
+`ContactCard.version` and `CalendarEvent.version` expose the /get state on
+single reads and on every hydrated list/range/search item. Query state remains
+pagination metadata only. Email and Mailbox inventory states carry their distinct
+object types. Email hydration metadata and foreign inventory carry the selected
+native account ID, including shared accounts. Bulk admission validates the token
+against each target's resolved account before grouping or submitting a set.
 
 The bulk caller-state contract follows RFC 8620 Section 5.3:
 https://www.rfc-editor.org/rfc/rfc8620.html#section-5.3

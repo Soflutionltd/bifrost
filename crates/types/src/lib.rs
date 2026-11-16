@@ -193,9 +193,9 @@ pub use ids::{
 
 // Mutation + projection + hydration types.
 pub use mutation::{
-    Fingerprint, FlagOp, FlagOpValidationError, FlagTargetState, HydratedObject,
-    HydratedObjectKind, IdempotencyKey, MailMutationTarget, Projection, ProtocolSalt,
-    ServerVersion, canonical_flags_hash, flag_target_state,
+    EntityVersion, Fingerprint, FlagOp, FlagOpValidationError, FlagTargetState, HydratedObject,
+    HydratedObjectKind, IdempotencyKey, JmapStateVersion, MailMutationTarget, Projection,
+    ProtocolSalt, ServerVersion, canonical_flags_hash, flag_target_state,
 };
 
 // Pagination.

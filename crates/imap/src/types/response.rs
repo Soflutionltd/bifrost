@@ -816,6 +816,10 @@ impl ThreadNode<u32> {
 
 /// A solicited LIST entry and its correlated STATUS items (RFC 5819).
 #[derive(Debug, Clone)]
+#[allow(
+    dead_code,
+    reason = "Raw LIST-STATUS returns correlated entries even though account discovery uses LIST"
+)]
 pub(crate) struct ListStatusEntry {
     pub(crate) mailbox: MailboxInfo,
     pub(crate) status: Vec<StatusItem>,

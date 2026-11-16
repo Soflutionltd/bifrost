@@ -298,7 +298,11 @@ async fn fetch_batch<T: HttpTransport>(
         .call(EmailGet::new().ids(ids).properties(properties))
         .await?;
 
-    let state = response.state().to_string();
+    let state = bifrost_types::ServerVersion::jmap_state(
+        mail.id_str(),
+        bifrost_types::ObjectType::Email,
+        response.state().to_string(),
+    );
     let not_found = response.not_found().to_vec();
     let answer_context = response.answer_context;
     let items = reconcile_hydration(
@@ -348,7 +352,7 @@ fn reconcile_hydration(
     list: Vec<crate::email::Email>,
     not_found: &[EmailId],
     projection: Projection,
-    state: &str,
+    state: &bifrost_types::ServerVersion,
     owner: Option<&str>,
     answer_context: crate::core::answer::AnswerContext,
 ) -> Vec<ItemOutcome<HydratedObject>> {
@@ -496,7 +500,11 @@ mod tests {
             ],
             &[],
             Projection::FlagsOnly,
-            "s1",
+            &bifrost_types::ServerVersion::jmap_state(
+                "primary",
+                bifrost_types::ObjectType::Email,
+                "s1",
+            ),
             None,
             crate::core::answer::AnswerContext::default(),
         );
@@ -584,6 +592,68 @@ mod tests {
             "state": "session-1"
         }))
         .expect("session fixture parses")
+    }
+
+    #[tokio::test]
+    async fn read_minted_metadata_versions_retain_the_selected_native_account() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = crate::client::Client::with_transport(
+            HydrationTransport { requests },
+            hydration_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .unwrap();
+        let registry = crate::sync::registry::Registry::from_test(
+            crate::sync::registry::Slot::new(client.clone(), "primary"),
+            Arc::new(HashMap::from([(
+                "shared".into(),
+                crate::sync::registry::Slot::new(client, "shared"),
+            )])),
+        );
+        for (owner, route, id) in [
+            ("primary", HydrationRoute::Primary, "M1".to_owned()),
+            (
+                "shared",
+                HydrationRoute::Foreign("shared".into()),
+                super::super::foreign::encode_object("shared", "M1"),
+            ),
+        ] {
+            let batch = fetch_route(
+                &registry,
+                &route,
+                Projection::Metadata,
+                &mut vec![ObjectId(id)],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let [ItemOutcome::Succeeded(success)] = batch.items.as_slice() else {
+                panic!("{batch:?}");
+            };
+            let HydratedObjectKind::Metadata(entry) = &success.output.kind else {
+                panic!("expected metadata");
+            };
+            assert_eq!(
+                entry
+                    .fingerprint
+                    .server_version
+                    .expected_jmap_state(owner, bifrost_types::AccountOperation::UpdateFlags)
+                    .unwrap(),
+                "mail-state-2"
+            );
+            let other_owner = if owner == "primary" {
+                "shared"
+            } else {
+                "primary"
+            };
+            assert!(
+                entry
+                    .fingerprint
+                    .server_version
+                    .expected_jmap_state(other_owner, bifrost_types::AccountOperation::UpdateFlags)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -752,7 +822,11 @@ mod tests {
             vec![email("m1")],
             &[EmailId::new("m2")],
             Projection::FlagsOnly,
-            "s1",
+            &bifrost_types::ServerVersion::jmap_state(
+                "primary",
+                bifrost_types::ObjectType::Email,
+                "s1",
+            ),
             None,
             crate::core::answer::AnswerContext::default(),
         );
@@ -813,7 +887,11 @@ mod tests {
             vec![email("m1")],
             &[],
             Projection::FlagsOnly,
-            "s1",
+            &bifrost_types::ServerVersion::jmap_state(
+                "primary",
+                bifrost_types::ObjectType::Email,
+                "s1",
+            ),
             None,
             crate::core::answer::AnswerContext::default(),
         );
@@ -840,7 +918,11 @@ mod tests {
             vec![email("M1")],
             &[],
             Projection::FlagsOnly,
-            "s1",
+            &bifrost_types::ServerVersion::jmap_state(
+                "acct-9",
+                bifrost_types::ObjectType::Email,
+                "s1",
+            ),
             Some("acct-9"),
             crate::core::answer::AnswerContext::default(),
         );
@@ -880,7 +962,11 @@ mod tests {
             vec![answered],
             &[],
             Projection::Metadata,
-            "s1",
+            &bifrost_types::ServerVersion::jmap_state(
+                "acct-9",
+                bifrost_types::ObjectType::Email,
+                "s1",
+            ),
             Some("acct-9"),
             crate::core::answer::AnswerContext::default(),
         );
@@ -948,7 +1034,11 @@ mod tests {
             vec![answered],
             &[],
             Projection::Metadata,
-            "s1",
+            &bifrost_types::ServerVersion::jmap_state(
+                "primary",
+                bifrost_types::ObjectType::Email,
+                "s1",
+            ),
             None,
             crate::core::answer::AnswerContext::default(),
         );
@@ -987,7 +1077,11 @@ mod tests {
             vec![email("M1")],
             &[],
             Projection::FlagsOnly,
-            "s1",
+            &bifrost_types::ServerVersion::jmap_state(
+                "primary",
+                bifrost_types::ObjectType::Email,
+                "s1",
+            ),
             // Primary route: the account is not registered.
             None,
             crate::core::answer::AnswerContext::default(),
@@ -1025,7 +1119,11 @@ mod tests {
             // discarded on the same grounds.
             &[EmailId::new("also-a-stranger")],
             Projection::FlagsOnly,
-            "s1",
+            &bifrost_types::ServerVersion::jmap_state(
+                "primary",
+                bifrost_types::ObjectType::Email,
+                "s1",
+            ),
             None,
             crate::core::answer::AnswerContext::default(),
         );

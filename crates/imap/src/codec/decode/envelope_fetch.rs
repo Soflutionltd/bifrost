@@ -162,6 +162,7 @@ pub(super) fn envelope(
 ///
 /// Called after `* <n> FETCH ` is consumed.
 /// When `utf8_mode` is `WireMode::Utf8`, ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
+#[cfg(test)]
 pub(super) fn fetch_response_inner(
     input: &[u8],
     utf8_mode: crate::types::wire::WireMode,

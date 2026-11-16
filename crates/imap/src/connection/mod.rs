@@ -69,7 +69,7 @@ use stream::{CompressedStream, ImapStream, InnerStream};
 pub(crate) mod test_support;
 
 #[cfg(test)]
-#[path = "tests.rs"]
+#[path = "tests/mod.rs"]
 mod tests;
 
 // ---------------------------------------------------------------------------

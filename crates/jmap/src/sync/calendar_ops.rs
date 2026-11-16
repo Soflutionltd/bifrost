@@ -126,13 +126,16 @@ pub(crate) fn get<T: HttpTransport>(
         // cannot destroy a page of neighbours; with a page of one there is
         // no neighbour to protect, and swallowing the reason would leave
         // the caller with "no event" for an event the server did return.
-        let raw = get_raw_event(
+        let (raw, version) = get_raw_event(
             &calendars,
             CalendarEventId::new(event.0),
             AccountOperation::EventGet,
         )
         .await?;
-        event_from_jmap(raw, AccountOperation::EventGet)
+        event_from_jmap(raw, AccountOperation::EventGet).map(|mut event| {
+            event.version = Some(version);
+            event
+        })
     })
 }
 
@@ -176,11 +179,12 @@ pub(crate) fn update<T: HttpTransport>(
     patch: EventPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let calendars = require_calendars(calendars, AccountOperation::EventUpdate)?;
         let expected = super::mutation::caller_state(
             patch.expected_version.as_ref(),
             AccountOperation::EventUpdate,
+            calendars.id().as_str(),
         )?;
-        let calendars = require_calendars(calendars, AccountOperation::EventUpdate)?;
         let id = CalendarEventId::new(event.0);
         // A patch that changes only the recurrence rule carries neither the
         // event start nor its all-day flag, yet `UNTIL` conversion and the
@@ -192,7 +196,8 @@ pub(crate) fn update<T: HttpTransport>(
         // whole-map replacement without carrying the owner over would silently
         // delete the organizer from the event.
         let context = if event_patch_needs_current(&patch) {
-            let raw = get_raw_event(&calendars, id.clone(), AccountOperation::EventUpdate).await?;
+            let (raw, _) =
+                get_raw_event(&calendars, id.clone(), AccountOperation::EventUpdate).await?;
             event_context_from_patch(&patch, Some(&raw))
         } else {
             event_context_from_patch(&patch, None)
@@ -239,11 +244,12 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
     expected_version: Option<bifrost_types::ServerVersion>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let calendars = require_calendars(calendars, AccountOperation::EventDelete)?;
         let expected = super::mutation::caller_state(
             expected_version.as_ref(),
             AccountOperation::EventDelete,
+            calendars.id().as_str(),
         )?;
-        let calendars = require_calendars(calendars, AccountOperation::EventDelete)?;
         let id = CalendarEventId::new(event.0);
         let mut set = CalendarEventSet::new().destroy([id.clone()]);
         if let Some(state) = expected {
@@ -276,11 +282,15 @@ pub(crate) fn rsvp_if_version<T: HttpTransport>(
     expected_version: Option<bifrost_types::ServerVersion>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let expected =
-            super::mutation::caller_state(expected_version.as_ref(), AccountOperation::EventRsvp)?;
         let calendars = require_calendars(calendars, AccountOperation::EventRsvp)?;
+        let expected = super::mutation::caller_state(
+            expected_version.as_ref(),
+            AccountOperation::EventRsvp,
+            calendars.id().as_str(),
+        )?;
         let id = CalendarEventId::new(event.0);
-        let current = get_raw_event(&calendars, id.clone(), AccountOperation::EventRsvp).await?;
+        let (current, _) =
+            get_raw_event(&calendars, id.clone(), AccountOperation::EventRsvp).await?;
         let patch = jmap_rsvp_patch_from_participants(current.participants(), &self_emails, status)
             .map_err(|message| unsupported(AccountOperation::EventRsvp, message))?;
         let mut set = CalendarEventSet::new();
@@ -412,13 +422,17 @@ async fn get_events<T: HttpTransport>(
         .call(CalendarEventGet::new().ids(ids))
         .await
         .map_err(to_acct_err(operation))?;
+    let version = bifrost_types::ServerVersion::jmap_state(
+        calendars.id().as_str(),
+        bifrost_types::ObjectType::CalendarEvent,
+        response.state().to_string(),
+    );
     let not_found = response.not_found().to_vec();
-    Ok(reconcile_events(
-        requested,
-        &not_found,
-        response.into_list(),
-        operation,
-    ))
+    let mut hydrated = reconcile_events(requested, &not_found, response.into_list(), operation);
+    for event in &mut hydrated.events {
+        event.version = Some(version.clone());
+    }
+    Ok(hydrated)
 }
 
 /// Split a `CalendarEvent/get` answer into hydrated events and the ids the
@@ -472,11 +486,16 @@ async fn get_raw_event<T: HttpTransport>(
     calendars: &CalendarAccount<T>,
     id: CalendarEventId,
     operation: AccountOperation,
-) -> Result<JmapCalendarEvent, AccountError> {
+) -> Result<(JmapCalendarEvent, bifrost_types::ServerVersion), AccountError> {
     let response = calendars
         .call(CalendarEventGet::new().ids([id.clone()]))
         .await
         .map_err(to_acct_err(operation))?;
+    let version = bifrost_types::ServerVersion::jmap_state(
+        calendars.id().as_str(),
+        bifrost_types::ObjectType::CalendarEvent,
+        response.state().to_string(),
+    );
     let not_found = response.not_found().contains(&id);
     let answer_context = response.answer_context;
     super::single_get::require_one(
@@ -490,6 +509,7 @@ async fn get_raw_event<T: HttpTransport>(
             id: EventId(id.clone().into_string()),
         },
     )
+    .map(|event| (event, version))
 }
 
 /// The calendar page walk's parameters for the shared anchored, state-pinned

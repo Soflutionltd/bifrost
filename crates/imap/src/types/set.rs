@@ -227,6 +227,10 @@ impl<I: SetId> NumberSet<I> {
 
     /// Remove one UID while retaining sorted, disjoint ranges.
     /// Returns whether the UID was present before the removal.
+    #[allow(
+        dead_code,
+        reason = "Keep single-member finite-set removal beside the production range operation"
+    )]
     pub(crate) fn remove(&mut self, uid: u32) -> bool {
         let Ok(index) = self.ranges.binary_search_by(|range| {
             let end = range.end().unwrap_or(range.start());
@@ -372,6 +376,7 @@ pub(crate) struct UidSetDiff {
     pub(crate) removed: Vec<u32>,
 }
 
+#[cfg(test)]
 pub(crate) fn expand_range(range: UidRange) -> Vec<u32> {
     UidSet::from_ranges(vec![range]).to_uids()
 }
