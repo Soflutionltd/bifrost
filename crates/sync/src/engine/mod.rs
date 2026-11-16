@@ -37,13 +37,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::{AccountControl, InvalidationSink, PauseReason};
 use arc_swap::ArcSwap;
 use bifrost_types::{
-    Account, AccountCapabilities, AccountControl, AccountError, AccountFactory, AccountFuture,
-    AccountId, AccountStream, ChangeCursor, CursorEstablishment, CursorScope, DiagnosticText,
-    EngineDirective, ErrorScope, InvalidationSink, InventoryPartition, ItemOutcome,
-    MembershipScope, OpenedAccount, PauseReason, Priority, ReconcileAction, ReconcileAdvice,
-    RecoveryClass, SkippedScope, SyncEvent,
+    Account, AccountCapabilities, AccountError, AccountFactory, AccountFuture, AccountId,
+    AccountStream, ChangeCursor, CursorEstablishment, CursorScope, DiagnosticText, EngineDirective,
+    ErrorScope, InventoryPartition, ItemOutcome, MembershipScope, OpenedAccount, Priority,
+    ReconcileAction, ReconcileAdvice, RecoveryClass, SkippedScope, SyncEvent,
 };
 #[cfg(test)]
 use bifrost_types::{Checkpoint, PageBoundary};
@@ -1219,7 +1219,7 @@ impl SyncEngine {
             .accounts
             .get(account_id)
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        bifrost_types::Control::resume(&slot.control);
+        crate::Control::resume(&slot.control);
         Ok(())
     }
 

@@ -2618,16 +2618,27 @@ mod tests {
                 matches!(error, Error::AttemptHistory { .. }),
                 "the earlier attempt rides the body error: {error:?}"
             );
-            // Two markers, so the history and the body error each have to be
-            // scrubbed on their own: either one alone would satisfy a single
-            // check.
+            // History Debug retains local messages, but the body URL lives in
+            // a foreign source that Debug deliberately omits. Inspect that source
+            // separately so both credential redaction paths still have bite.
             let rendered = format!("{error:?} {error}");
-            for marker in ["upload.test", "body-read.test"] {
-                assert_eq!(
-                    rendered.contains(marker),
-                    !credential,
-                    "credential {credential}, streaming {streaming}, {marker}: {rendered}"
-                );
+            assert_eq!(
+                rendered.contains("upload.test"),
+                !credential,
+                "credential {credential}, streaming {streaming}: {rendered}"
+            );
+            let Error::Network {
+                message, source, ..
+            } = error.terminal()
+            else {
+                unreachable!()
+            };
+            if credential {
+                assert!(!rendered.contains("body-read.test"));
+                assert!(message.contains("detail withheld"));
+                assert!(source.is_none());
+            } else {
+                assert!(format!("{source:?}").contains("body-read.test"));
             }
         }
     }
@@ -4890,7 +4901,7 @@ mod tests {
             assert_eq!(script.requests().len(), 1);
             assert_eq!(script.remaining(), 1);
             assert!(
-                error
+                !error
                     .support_consented()
                     .support_text
                     .iter()

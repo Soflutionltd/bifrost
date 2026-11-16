@@ -320,18 +320,14 @@ nonsense state for a silent non-progressing scope.
 events, `Polled` after a fully successful poll and state commit, or a
 structured termination. Providers own successful poll cadence and end on
 their first failure; engine reconnect backoff resets only on `Polled` or
-a lifecycle change, and carries its count across account replacement. `WatchEvent` carries invalidation,
-connection-health, warning, and termination signals. `InvalidationSink`
-is synchronous so an out-of-process webhook or Pub/Sub receiver can
-feed the engine from a non-async thread. Its `SinkPush` result returns refused
-directives for resubmission after a pause or queue saturation. Invalidations
-are retained as bounded intent and may widen into a full reconcile; controls
-are handled synchronously and may overtake pending invalidations.
+a lifecycle change, and carries its count across account replacement.
 
-`Control::pause` and `Control::checkpoint_now` return
-`Result<DurableCheckpointSet, AccountError>`. The set describes the account's
-durable checkpoint boundary across cursor scopes and backfill partitions; an
-empty set means no durable checkpoint has been produced.
+Consumer controls and injected push ingress belong to `bifrost-sync`, which
+exports `Control`, `DurableCheckpointSet`, `InvalidationSink`, `SinkPush`,
+`WatchEvent`, `AccountControl`, and `PauseReason`. There are no compatibility
+re-exports here. `Checkpoint`, `Partition`, `Priority`, `InvalidationHint`,
+`HintPayload`, and `PushSource` remain shared protocol and transport vocabulary
+in `bifrost-types`; protocol push sessions yield `PushSessionEvent`.
 
 ### Inventory ranges and completeness
 
@@ -708,7 +704,8 @@ lane; subscribe only registers coverage. Registration maintenance checks
 `PushGate` before each request and retains committed gap obligations in
 account state until yielded. Effects needing to survive drop run in
 account-owned tasks or actors. SessionStop resolves on explicit stop or
-stopper drop. WatchEvent remains the external receiver-to-sink vocabulary.
+stopper drop. `bifrost-sync::WatchEvent` is the external receiver-to-sink
+vocabulary.
 
 ## MIME Message-ID extraction
 

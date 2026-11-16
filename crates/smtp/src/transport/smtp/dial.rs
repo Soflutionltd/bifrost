@@ -15,13 +15,13 @@ pub(super) async fn connect_async(info: &SmtpInfo) -> Result<AsyncSmtpConnection
     #[cfg(feature = "test-support")]
     let connector = info.connector.clone();
 
+    let plan = super::DialPlan::new(tls, unix_socket)?;
     #[cfg(feature = "test-support")]
     if connector.is_some() && (!matches!(tls, Tls::None) || unix_socket.is_some()) {
         return Err(crate::transport::smtp::error::invalid_input(
             "scripted connectors require plaintext TCP configuration",
         ));
     }
-    let plan = super::DialPlan::new(tls, unix_socket)?;
     if let Some(path) = unix_socket {
         #[cfg(unix)]
         {

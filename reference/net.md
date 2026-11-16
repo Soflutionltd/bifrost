@@ -264,9 +264,10 @@ is a credential, such as a pre-authenticated upload session. A caller declares
 such a request with `RequestBuilder::credential_url()`, and the transport then
 applies the redaction itself: to every error `send` returns, body buffering
 included, and to every error `send_streaming` returns or its body stream
-yields, after earlier-attempt evidence is attached. The guarantee covers
-transport-generated request text only; server response bodies and headers are
-evidence and are kept, so a server that echoes the URL is not scrubbed. The
+yields, after earlier-attempt evidence is attached. Raw server response bodies
+and headers remain available for protocol interpretation,
+but Debug omits their values and generic account diagnostics export only
+validated correlation ids, never body text or arbitrary header values. The
 flag is separate from `without_bearer_auth()` on purpose: Basic-auth requests
 to ordinary URLs are bearer-less too, and keep their URL in diagnostics.
 
@@ -1590,7 +1591,7 @@ pub fn into_account_error_with_throttle_scope(
 `operation` is required so in-flight non-idempotent failures cannot
 fall through the central recovery mapper as retry-safe. The
 conversion attaches `Cause::Attempt` when target-attempt evidence
-exists, preserves request / trace ids and capped body text from
+exists, preserves status, header names/counts and captured body byte counts from
 `Status`, `RateLimited`, and status-backed `RetryBudgetExhausted`,
 and leaves provider JSON interpretation to JMAP, Gmail, and Graph. The
 policy argument carries status overrides, resource hints, throttle scope and
@@ -1898,3 +1899,38 @@ admission callers; it cannot introduce zero through the typed account setter.
 
 Registry identities `HoldKey`, `LimitKey` and `QuotaScope` support typed ordering.
 `QuotaScope` exposes string access explicitly through `as_str`, without Deref.
+
+## Credential-safe response diagnostics
+
+`FinalResponse` Debug prints status, header names/count and captured body size.
+`Error` Debug retains locally generated Network and Tls messages and their
+transmission states, but omits other free-form strings and foreign sources.
+Credential-URL handling replaces those messages with fixed redaction text.
+RefreshFailed Debug omits its foreign source. Status-backed variants retain
+the redacted response evidence. Raw headers and capped bodies
+remain available to protocol code and error observers for typed interpretation.
+They are not safe to log directly.
+
+Generic account diagnostics export no response body text at any consent tier.
+Telemetry request_id uses the first valid value from x-request-id, request-id,
+x-ms-request-id, x-goog-request-id and x-guploader-uploadid, in that order.
+Telemetry trace_id uses traceparent's trace id, falling back to the portion
+before the first slash in a validated x-cloud-trace-context value.
+Traceparent must have exactly four lowercase hex fields of lengths 2/32/16/2,
+with a version other than ff and nonzero trace and parent ids.
+Other correlation values must be 1 to 256 ASCII bytes drawn from alphanumerics
+and `-_./;=`, with no whitespace. Case-insensitive substrings authorization,
+bearer, basic, password, secret, token, cookie, credential, api-key, api_key and
+apikey are rejected. The whole header is validated before extraction; an empty
+cloud trace id is rejected. Invalid values are skipped, never trimmed.
+These bounded shapes preserve provider escalation ids that enterprise users
+need while refusing recognizable echoed credentials. Opaque credentials that
+happen to match an id shape cannot be distinguished by shape alone.
+All other header values remain omitted. Support retains HTTP status, header
+names/counts and captured body byte counts. Body sizes describe the captured
+prefix, including any drain/truncation marker, rather than the full wire body.
+Typed classification, retry hints and protocol parsing still consume the original
+evidence. Arbitrary error pages and extension-header payloads cannot be scrubbed
+reliably; enterprise users expect support consent to protect credentials too.
+OAuth refresh diagnostics likewise retain typed causes and retry hints while
+omitting foreign error prose, which may quote a rejected credential.

@@ -177,7 +177,7 @@ fn tls_acknowledged_defensive_routes_to_protocol_partial_response() {
 }
 
 #[test]
-fn rate_limited_preserves_body_and_headers() {
+fn rate_limited_keeps_validated_ids_without_body_text() {
     let mut headers = HeaderMap::new();
     let (name, value) = header("x-request-id", "req-123");
     headers.insert(name, value);
@@ -209,12 +209,12 @@ fn rate_limited_preserves_body_and_headers() {
     // Account, never tenant-wide: Microsoft meters Outlook per mailbox, and this
     // layer has no target to name a narrower budget with.
     assert_eq!(telemetry.throttle_scope, Some(ThrottleScope::Account));
-    assert!(support_text_contains(&err, "TooManyRequests"));
+    assert!(!support_text_contains(&err, "TooManyRequests"));
     assert!(support_text_contains(&err, "x-ms-ags-diagnostic"));
 }
 
 #[test]
-fn retry_budget_exhausted_preserves_body_and_headers() {
+fn retry_budget_exhausted_omits_body_text() {
     let mut headers = HeaderMap::new();
     let (name, value) = header("x-request-id", "req-503");
     headers.insert(name, value);
@@ -240,7 +240,7 @@ fn retry_budget_exhausted_preserves_body_and_headers() {
         err.telemetry_fields().transmission_state,
         Some(TransmissionState::Acknowledged)
     );
-    assert!(support_text_contains(&err, "temporarily unavailable"));
+    assert!(!support_text_contains(&err, "temporarily unavailable"));
 }
 
 #[test]
@@ -435,7 +435,7 @@ fn encode_body_is_client_bug_without_attempt() {
 }
 
 #[test]
-fn auth_lost_refresh_response_preserves_headers_without_target_attempt() {
+fn auth_lost_refresh_response_keeps_validated_id_without_target_attempt() {
     let mut headers = HeaderMap::new();
     let (name, value) = header("x-request-id", "auth-401");
     headers.insert(name, value);
@@ -458,7 +458,7 @@ fn auth_lost_refresh_response_preserves_headers_without_target_attempt() {
     assert_eq!(err.telemetry_fields().status, Some(401));
     assert_eq!(err.telemetry_fields().request_id, Some("auth-401"));
     assert_eq!(err.telemetry_fields().transmission_state, None);
-    assert!(support_text_contains(&err, "invalid_grant"));
+    assert!(!support_text_contains(&err, "invalid_grant"));
 }
 
 #[test]
@@ -536,7 +536,7 @@ fn refresh_failed_with_deadline_propagates_to_recovery() {
 }
 
 #[test]
-fn status_400_body_is_not_duplicated_in_support_text() {
+fn status_400_body_text_is_not_exported() {
     let err = convert(
         Error::Status {
             code: StatusCode::BAD_REQUEST,
@@ -552,7 +552,7 @@ fn status_400_body_is_not_duplicated_in_support_text() {
         .iter()
         .filter(|text| text.contains("bad input"))
         .count();
-    assert_eq!(occurrences, 1);
+    assert_eq!(occurrences, 0);
 }
 
 #[test]
@@ -670,7 +670,7 @@ fn http_413_is_a_terminal_payload_refusal_without_throttling() {
         assert!(matches!(error.recovery(), RecoveryClass::ProviderRefused));
         assert_eq!(error.telemetry_fields().throttle_scope, None);
         assert!(error.throttle_budgets().is_empty());
-        assert!(support_text_contains(
+        assert!(!support_text_contains(
             &error,
             "attachment exceeds upload limit"
         ));
@@ -724,5 +724,174 @@ fn shared_http_status_policy_survives_attempt_history() {
         if matches!(status, 404 | 423) {
             assert!(error.throttle_budgets().is_empty());
         }
+    }
+}
+
+#[test]
+fn echoed_credentials_never_enter_debug_or_diagnostic_exports() {
+    let secret = "Bearer secret-password-cookie";
+    let mut headers = HeaderMap::new();
+    for name in [
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-request-id",
+        "traceparent",
+        "x-cloud-trace-context",
+        "x-ms-ags-diagnostic",
+    ] {
+        headers.insert(
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            reqwest::header::HeaderValue::from_static("Bearer secret-password-cookie"),
+        );
+    }
+    let response = FinalResponse {
+        status: StatusCode::BAD_REQUEST,
+        headers: headers.clone(),
+        body: Bytes::from_static(b"Bearer secret-password-cookie"),
+    };
+    let debug = format!("{response:?}");
+    assert!(!debug.contains(secret));
+    assert!(debug.contains("authorization"));
+    assert!(debug.contains("body_bytes"));
+    let error = Error::Status {
+        code: response.status,
+        headers,
+        body: response.body,
+    };
+    assert!(!format!("{error:?}").contains(secret));
+    let error = convert(error, ctx(AccountOperation::Search));
+    let export = format!("{:?}", error.support_internal());
+    assert!(!export.contains(secret), "{export}");
+    assert!(support_text_contains(&error, "captured body bytes"));
+    assert!(support_text_contains(&error, "authorization"));
+    assert_eq!(error.telemetry_fields().status, Some(400));
+    assert_eq!(error.telemetry_fields().request_id, None);
+}
+
+#[test]
+fn correlation_ids_validate_the_entire_header() {
+    let overlong = "a".repeat(257);
+    for name in [
+        "x-request-id",
+        "request-id",
+        "x-ms-request-id",
+        "x-goog-request-id",
+        "x-guploader-uploadid",
+        "x-cloud-trace-context",
+    ] {
+        for (value, accepted) in [
+            ("abc-123_DEF.456/789;o=1", true),
+            ("Bearer secret", false),
+            ("Bearer-secret", false),
+            ("Authorization=opaque", false),
+            ("password=opaque", false),
+            ("abc:123", false),
+            (" abc-123", false),
+            ("", false),
+            (overlong.as_str(), false),
+        ] {
+            let mut headers = HeaderMap::new();
+            let name = HeaderName::from_static(name);
+            headers.insert(name.clone(), HeaderValue::from_str(value).unwrap());
+            let error = convert(
+                Error::Status {
+                    code: StatusCode::BAD_REQUEST,
+                    headers,
+                    body: Bytes::new(),
+                },
+                ctx(AccountOperation::Search),
+            );
+            let telemetry = error.telemetry_fields();
+            let id = if name == "x-cloud-trace-context" {
+                telemetry.trace_id
+            } else {
+                telemetry.request_id
+            };
+            let expected = accepted.then_some(if name == "x-cloud-trace-context" {
+                "abc-123_DEF.456"
+            } else {
+                "abc-123_DEF.456/789;o=1"
+            });
+            assert_eq!(id, expected, "{name}");
+        }
+    }
+    for invalid in [
+        "zz-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-ggf067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz",
+        "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+    ] {
+        let mut headers = HeaderMap::new();
+        let (name, value) = header("traceparent", invalid);
+        headers.insert(name, value);
+        let error = convert(
+            Error::Status {
+                code: StatusCode::BAD_REQUEST,
+                headers,
+                body: Bytes::new(),
+            },
+            ctx(AccountOperation::Search),
+        );
+        assert_eq!(error.telemetry_fields().trace_id, None);
+    }
+}
+
+#[test]
+fn invalid_correlation_headers_fall_back_to_valid_provider_ids() {
+    let mut headers = HeaderMap::new();
+    for (name, value) in [
+        ("x-request-id", "Bearer-secret"),
+        ("x-ms-request-id", "12345678-1234-1234-1234-123456789abc"),
+        ("traceparent", "Bearer-secret"),
+        (
+            "x-cloud-trace-context",
+            "4bf92f3577b34da6a3ce929d0e0e4736/123;o=1",
+        ),
+    ] {
+        let (name, value) = header(name, value);
+        headers.insert(name, value);
+    }
+    let error = convert(
+        Error::Status {
+            code: StatusCode::BAD_REQUEST,
+            headers,
+            body: Bytes::new(),
+        },
+        ctx(AccountOperation::Search),
+    );
+    assert_eq!(
+        error.telemetry_fields().request_id,
+        Some("12345678-1234-1234-1234-123456789abc")
+    );
+    assert_eq!(
+        error.telemetry_fields().trace_id,
+        Some("4bf92f3577b34da6a3ce929d0e0e4736")
+    );
+}
+
+#[test]
+fn refresh_transport_messages_remain_private() {
+    for source in [
+        Error::Network {
+            message: "Bearer secret-refresh".to_owned(),
+            transmission_state: TransmissionState::Unsent,
+            source: None,
+        },
+        Error::Tls {
+            message: "Bearer secret-refresh".to_owned(),
+            transmission_state: TransmissionState::Unsent,
+        },
+    ] {
+        let error = Error::RefreshFailed {
+            retry_after: None,
+            source: Arc::new(source),
+        };
+        assert!(!format!("{error:?}").contains("secret-refresh"));
+        let error = convert(error, ctx(AccountOperation::Search));
+        assert!(!format!("{:?}", error.support_internal()).contains("secret-refresh"));
     }
 }

@@ -26,11 +26,11 @@ impl SmtpClient {
         let plan = super::DialPlan::new(&self.info.tls, self.info.unix_socket.as_deref())?;
         #[cfg(feature = "test-support")]
         if let Some(connector) = &self.info.connector {
-            // Scripted peers cannot prove TLS. Refuse before creating a peer,
-            // just as the async dialer does, rather than bypassing policy.
-            if !matches!(self.info.tls, Tls::None) {
+            // A scripted peer substitutes plaintext TCP only. Refuse a Unix
+            // route rather than silently ignoring the selected destination.
+            if !matches!(self.info.tls, Tls::None) || self.info.unix_socket.is_some() {
                 return Err(super::error::invalid_input(
-                    "scripted connectors require plaintext TLS mode",
+                    "scripted connectors require plaintext TCP configuration",
                 ));
             }
             let mut conn = SmtpConnection::from_scripted_peer(

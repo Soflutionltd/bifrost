@@ -465,7 +465,8 @@ impl DavDispatch {
         }
         transport_error(
             operation,
-            format!("failed to read OAuth access token: {error}"),
+            // Token sources are foreign code and may quote credentials in errors.
+            "failed to read OAuth access token".to_string(),
             self.protocol,
         )
     }
@@ -2695,6 +2696,31 @@ mod tests {
             },
             DavProtocol::CalDav,
         )
+    }
+
+    #[test]
+    fn token_source_diagnostics_do_not_quote_foreign_error_text() {
+        for make in [
+            (|| NetError::Network {
+                message: "Bearer secret-token password=secret-password".into(),
+                transmission_state: bifrost_types::TransmissionState::Unsent,
+                source: None,
+            }) as fn() -> NetError,
+            || NetError::RefreshFailed {
+                retry_after: None,
+                source: Arc::new(NetError::Network {
+                    message: "Bearer secret-token password=secret-password".into(),
+                    transmission_state: bifrost_types::TransmissionState::Unsent,
+                    source: None,
+                }),
+            },
+        ] {
+            let dispatch = bearer_dispatch(make);
+            let error = dispatch.token_read_error(make(), AccountOperation::SyncChanges);
+            let export = format!("{:?}", error.support_internal());
+            assert!(!export.contains("secret-token"), "{export}");
+            assert!(!export.contains("secret-password"), "{export}");
+        }
     }
 
     /// A credential the token source cannot mint is classified by WHY.

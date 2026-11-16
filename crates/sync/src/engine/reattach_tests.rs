@@ -8,8 +8,8 @@ use super::recovery::{
     re_establish_scope_with_backoff, run_parked_schema_reset,
 };
 use super::*;
+use crate::Control;
 use crate::test_common as common;
-use bifrost_types::Control;
 use bifrost_types::{
     AccountFuture, AttemptCause, Cause, ObjectType, PrimaryCause, ServerCause, ThrottleBudget,
     ThrottleKey, ThrottleScope, TransmissionState,
@@ -637,7 +637,7 @@ async fn round1_writer_response_keeps_cumulative_wait_allowance() {
 }
 
 async fn lock_boundary_case(exhaust: bool) {
-    use bifrost_types::Control;
+    use crate::Control;
     let factory = Arc::new(CountingQueue {
         inner: common::StubFactory::queue(vec![Arc::new(account()), Arc::new(account())]),
         opens: AtomicUsize::new(0),

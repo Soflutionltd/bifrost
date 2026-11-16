@@ -19,7 +19,7 @@ use bifrost_types::{
 use bytes::Bytes;
 use reqwest::{
     StatusCode,
-    header::{HeaderMap, HeaderName, RETRY_AFTER},
+    header::{HeaderMap, RETRY_AFTER},
 };
 
 use crate::error::{Error, FinalResponse, RangeFailureKind};
@@ -426,19 +426,15 @@ fn auth_lost(
     finish(builder, ctx)
 }
 
-/// `format!("{source}")` goes through `Display`, so any HTTP body the
-/// underlying refresh error carried is lost here. Accepted: the error
-/// contract's non-recursion rule on `source()` is binding, and the
-/// support-only summary plus `support_cause_from_source` below are the
-/// agreed fidelity - do not re-raise.
+// Foreign token-source text may quote a rejected credential. Keep only the
+// fixed summary, typed supporting cause and retry hint.
 fn refresh_failed(
     ctx: &NetErrorContext,
     retry_after: Option<RetryHint>,
     source: &Error,
 ) -> AccountError {
-    let mut builder = base_builder(ctx, PrimaryCause::Auth(AuthCause::RefreshTransient)).text(
-        DiagnosticText::support_only(format!("OAuth refresh failed: {source}")),
-    );
+    let mut builder = base_builder(ctx, PrimaryCause::Auth(AuthCause::RefreshTransient))
+        .text(DiagnosticText::support_only("OAuth refresh failed"));
 
     let cause = match source.terminal() {
         Error::Status { code, .. } => server_cause_from_status(code.as_u16(), retry_after),
@@ -623,103 +619,42 @@ fn response_diagnostics(
     body: &Bytes,
 ) -> AccountErrorBuilder {
     builder = builder.status(Some(status.as_u16()));
-    if let Some(id) = first_header(headers, REQUEST_ID_HEADERS) {
+    if let Some(id) = [
+        "x-request-id",
+        "request-id",
+        "x-ms-request-id",
+        "x-goog-request-id",
+        "x-guploader-uploadid",
+    ]
+    .iter()
+    .find_map(|name| correlation_header(headers, name))
+    {
         builder = builder.request_id(id);
     }
-    if let Some(trace_id) = trace_id_from_headers(headers) {
-        builder = builder.trace_id(trace_id);
+    let trace_id = headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .and_then(traceparent_trace_id)
+        .or_else(|| {
+            correlation_header(headers, "x-cloud-trace-context").and_then(|value| {
+                let id = value.split('/').next()?;
+                (!id.is_empty()).then(|| id.to_owned())
+            })
+        });
+    if let Some(id) = trace_id {
+        builder = builder.trace_id(id);
     }
-    for name in SUPPORT_ONLY_HEADER_TEXT {
-        if let Some(value) = header_text(headers, name) {
-            builder = builder.text(DiagnosticText::support_only(format!("{name}: {value}")));
-        }
+    // Support consent does not authorize disclosure of credentials echoed by a
+    // server. Preserve bounded structural evidence, never arbitrary wire text.
+    for name in headers.keys() {
+        builder = builder.text(DiagnosticText::support_only(format!(
+            "response header: {name}"
+        )));
     }
-    if let Some(text) = body_diagnostic(body) {
-        builder = builder.text(text);
-    }
-    builder
-}
-
-const REQUEST_ID_HEADERS: &[&str] = &[
-    "x-request-id",
-    "request-id",
-    "x-ms-request-id",
-    "x-goog-request-id",
-    "x-guploader-uploadid",
-];
-
-const SUPPORT_ONLY_HEADER_TEXT: &[&str] = &[
-    "traceparent",
-    "x-cloud-trace-context",
-    "x-ms-ags-diagnostic",
-];
-
-fn first_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
-    for name in names {
-        if let Some(value) = header_text(headers, name) {
-            return Some(value);
-        }
-    }
-    None
-}
-
-fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
-    let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
-    let value = headers.get(name)?;
-    let text = value.to_str().ok()?.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_owned())
-    }
-}
-
-fn trace_id_from_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = header_text(headers, "traceparent")
-        && let Some(trace_id) = traceparent_trace_id(&value)
-    {
-        return Some(trace_id);
-    }
-    header_text(headers, "x-cloud-trace-context").and_then(|value| {
-        let trace_id = match value.split_once('/') {
-            Some((trace_id, _)) => trace_id.trim(),
-            None => value.trim(),
-        };
-        if trace_id.is_empty() {
-            None
-        } else {
-            Some(trace_id.to_owned())
-        }
-    })
-}
-
-fn traceparent_trace_id(value: &str) -> Option<String> {
-    let mut parts = value.split('-');
-    let version = parts.next()?;
-    let trace_id = parts.next()?;
-    let parent_id = parts.next()?;
-    let flags = parts.next()?;
-    if parts.next().is_some()
-        || version.len() != 2
-        || trace_id.len() != 32
-        || parent_id.len() != 16
-        || flags.len() != 2
-    {
-        return None;
-    }
-    if !trace_id.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    Some(trace_id.to_owned())
-}
-
-fn body_diagnostic(body: &Bytes) -> Option<DiagnosticText> {
-    if body.is_empty() {
-        return None;
-    }
-    Some(DiagnosticText::support_only(format!(
-        "response body: {}",
-        String::from_utf8_lossy(body)
+    builder.text(DiagnosticText::support_only(format!(
+        "response evidence: {} headers, {} captured body bytes",
+        headers.len(),
+        body.len()
     )))
 }
 
@@ -735,6 +670,58 @@ fn maybe_support_text_from_option(value: Option<String>) -> Option<DiagnosticTex
     value.and_then(maybe_support_text)
 }
 
+// Enterprise support needs provider correlation ids, but echoed credentials must
+// never become telemetry. Validate the entire value before extracting any part.
+fn correlation_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    let value = headers.get(name)?.to_str().ok()?;
+    let lower = value.to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./;=".contains(&byte))
+        || [
+            "authorization",
+            "bearer",
+            "basic",
+            "password",
+            "secret",
+            "token",
+            "cookie",
+            "credential",
+            "api-key",
+            "api_key",
+            "apikey",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn traceparent_trace_id(value: &str) -> Option<String> {
+    if value.len() != 55 {
+        return None;
+    }
+    let parts: Vec<_> = value.split('-').collect();
+    if parts.len() != 4
+        || parts.iter().zip([2, 32, 16, 2]).any(|(part, len)| {
+            part.len() != len
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        || parts[0] == "ff"
+        || parts[1].bytes().all(|byte| byte == b'0')
+        || parts[2].bytes().all(|byte| byte == b'0')
+    {
+        return None;
+    }
+    Some(parts[1].to_owned())
+}
+
 fn retry_history_text(history: &[RetryHint]) -> Option<DiagnosticText> {
     if history.is_empty() {
         None
@@ -748,17 +735,17 @@ fn retry_history_text(history: &[RetryHint]) -> Option<DiagnosticText> {
 fn support_cause_from_source(error: &Error) -> Option<Cause> {
     match error {
         Error::AttemptHistory { source, .. } => support_cause_from_source(source),
-        Error::Network { message, .. } => Some(Cause::Transport(TransportCause::new(
+        Error::Network { .. } => Some(Cause::Transport(TransportCause::new(
             TransportErrorKind::Network,
-            maybe_support_text(message.clone()),
+            Some(DiagnosticText::support_only("token source network failure")),
         ))),
         Error::Timeout { .. } => Some(Cause::Transport(TransportCause::new(
             TransportErrorKind::Timeout,
             Some(DiagnosticText::support_only("request timed out")),
         ))),
-        Error::Tls { message, .. } => Some(Cause::Transport(TransportCause::new(
+        Error::Tls { .. } => Some(Cause::Transport(TransportCause::new(
             TransportErrorKind::Tls,
-            maybe_support_text(message.clone()),
+            Some(DiagnosticText::support_only("token source TLS failure")),
         ))),
         Error::AuthLost { .. } => Some(Cause::Auth(AuthCause::ReauthorizationRequired)),
         Error::RefreshFailed { .. } => Some(Cause::Auth(AuthCause::RefreshTransient)),

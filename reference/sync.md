@@ -8,6 +8,28 @@ observability. Depends only on `bifrost-types` (plus
 `bifrost-net` for the bandwidth meter); opaque to every protocol
 crate. Consumers wire one `Arc<dyn AccountFactory>` per account.
 
+## Consumer controls and injected push
+
+`consumer.rs` owns the engine's consumer API, exported from the crate root:
+`Control`, `DurableCheckpointSet`, `InvalidationSink`, `SinkPush`, `WatchEvent`,
+`AccountControl`, and `PauseReason`. These are not exported by `bifrost-types`.
+`control.rs` supplies `SyncControl`, the concrete `Control` implementation.
+The shared checkpoint, partition, priority, and invalidation hint vocabulary
+remains in `bifrost-types` because protocol and transport code also uses it.
+
+`Control::pause` and `Control::checkpoint_now` return
+`Result<DurableCheckpointSet, AccountError>`. The set covers all durable change
+scopes and backfill partitions for the account. It keeps the last checkpoint
+per durable lane, compares independently of lane order, and is empty before
+any checkpoint becomes durable. Its private lane identity helper lives with it.
+
+`InvalidationSink::push` is synchronous so a webhook or Pub/Sub receiver can
+inject `WatchEvent` from a non-async thread. `SinkPush::Refused` returns the
+event for resubmission after pause or saturation. Invalidations are retained as
+bounded intent and may widen into a full reconcile; controls are handled
+synchronously and may overtake pending invalidations. `AccountControl` reports
+capability changes, pause reasons, and resume signals to the consumer.
+
 ## Architecture
 
 ```

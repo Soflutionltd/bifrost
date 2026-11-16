@@ -45,17 +45,15 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
-- **Remaining paths by which a secret can reach `Debug` or diagnostics.**
-  Reported in passing, unverified. DAV wire types and URL diagnostics are
-  already redacted.
-  - CalDAV and CardDAV config `Debug` prints the raw `base_url`, and the
-    factory `Debug` includes the config.
-  - `crates/net/src/error.rs`: `FinalResponse` derives `Debug` over headers
-    and body.
-  - `crates/net/src/account_error.rs`: `response_diagnostics` keeps raw body
-    text and selected header values, which DAV transport errors can receive.
-  - `crates/dav-core/src/dispatch.rs`: token-source error text enters
-    diagnostics without credential sanitization.
+- **Provider crates still export raw server evidence into diagnostics.**
+  bifrost-net and the DAV crates now export only structural evidence (status,
+  header names, sizes, origins). Reported in passing, unverified:
+  - `crates/google/src/account/error.rs` exports provider messages, fallback
+    raw bodies and header ids; Calendar and People tests assert on that text.
+  - `crates/graph/src/error.rs` derives `Debug` over raw response evidence.
+  - `crates/jmap/src/sync/error.rs` exports arbitrary server descriptions.
+  - net's ordinary transport `Display` and account diagnostics still accept
+    free-form messages and sources.
 
 ## 2. Blocked on a live probe
 
@@ -292,16 +290,9 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
-- **Doc handoffs from the November 2026 resolution loop.** `reference/sync.md`'s
-  throttle overview and lookup discussion name a `ThrottleKey::Mailbox`
-  variant that does not exist (the enum has `Owner`, `Folder`, `Account` and
-  `Budget`). The SMTP transport unification into
-  `crates/smtp/src/transport/smtp/surface.rs` dropped the long rustdoc the old
-  `SmtpTransport` and `AsyncSmtpTransport` carried (pool behaviour, relay
-  guidance); restore it on the aliases or the generic types.
-- **SMTP scripted dialing disagrees on Unix sockets.** The blocking scripted
-  dialer can ignore a configured Unix socket while the async one rejects the
-  combination. Reported in passing, unverified.
+- **`reference/sync.md` names a `ThrottleKey::Mailbox` variant that does not
+  exist** in its throttle overview and lookup discussion (the enum has
+  `Owner`, `Folder`, `Account` and `Budget`).
 - **Lateral findings from the review of the primary-cause builder rewrite.**
   - Several producers mint a scope-directed state cause with a placeholder
     `CursorScope` and rely on a later `.scope(ErrorScope::Cursor(_))` to rebind

@@ -23,11 +23,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use bifrost_sync::Control;
 use bifrost_sync::{CheckpointStore, InMemoryCheckpointStore, SyncEngine};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountFactory, AccountId, AccountOperation, Change,
-    ChangeCursor, Control, CursorScope, FolderId, MembershipScope, ObjectType, PrimaryCause,
-    ScopeLifecycle, ScopeLifecycleEvent, StateCause, SyncEvent,
+    ChangeCursor, CursorScope, FolderId, MembershipScope, ObjectType, PrimaryCause, ScopeLifecycle,
+    ScopeLifecycleEvent, StateCause, SyncEvent,
 };
 
 use common::{StubAccount, StubFactory};
@@ -749,8 +750,8 @@ async fn a_schema_reset_whose_clear_keeps_failing_pauses_and_owes_its_scopes() {
         loop {
             if matches!(
                 events.recv().await.expect("control"),
-                bifrost_types::AccountControl::Pause(
-                    bifrost_types::PauseReason::RetryBudgetExhausted
+                bifrost_sync::AccountControl::Pause(
+                    bifrost_sync::PauseReason::RetryBudgetExhausted
                 )
             ) {
                 break;

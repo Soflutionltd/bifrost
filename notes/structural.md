@@ -58,18 +58,6 @@ parameter (`ItemOutcome<K, T>` / `BatchSuccess<K, T>`), `K = ObjectId` on the
 streaming lanes, a `SubmissionIndex` for positional ledgers, `BatchItemId` only
 where the caller mints it.
 
-## STR-012 - The engine's consumer API lives in the contract crate
-
-**Reported by:** types (needs owner: moves published items).
-
-`Control`, `DurableCheckpointSet`, `InvalidationSink`, `SinkPush`, `WatchEvent`,
-`AccountControl` and `PauseReason` are produced and consumed only by
-`bifrost-sync` and its consumer; no protocol crate touches them (JMAP uses
-`WatchEvent` in a test). `SyncControl` is the only `Control` implementation.
-They make `bifrost-types` the place an engine API change lands, and make
-`events.rs` mix stream plumbing, inventory, push ingress and control. Proposal:
-move them to `bifrost-sync`.
-
 ## STR-013 - Provider wire vocabularies in the neutral crate
 
 **Reported by:** types.

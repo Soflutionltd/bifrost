@@ -64,6 +64,18 @@ impl Runtime for Tokio {
 }
 
 /// Pooled transport selected by wire dialect and socket runtime.
+///
+/// Holds the connection configuration and creates connections as needed.
+/// SMTP sends recycle healthy connections for later messages, avoiding repeated
+/// connection setup and authentication. Concurrent sends can grow the pool up
+/// to its configured limit: SMTP cannot multiplex messages on one connection.
+/// Broken connections are discarded. LMTP deliveries retire their connections
+/// after the per-recipient final replies rather than reusing them.
+///
+/// Reuse the transport across sends to benefit from SMTP connection reuse.
+/// Cloning a transport shares its pool; constructing a new transport for every
+/// message creates a separate pool. Configure pool size, idle expiration and
+/// checkout probes with [`Builder::pool_config`] and [`PoolConfig`].
 #[allow(private_bounds)]
 pub struct Transport<D, R: Runtime> {
     pub(super) inner: Arc<R::Pool>,
@@ -94,6 +106,17 @@ pub struct Builder<D, R> {
 }
 
 /// Blocking SMTP transport.
+///
+/// Sends messages through an SMTP relay server. Use [`SmtpTransport::relay`]
+/// for implicit TLS on port 465, or [`SmtpTransport::starttls_relay`] for
+/// required STARTTLS on port 587. Both validate the server certificate against
+/// the supplied relay hostname. Required STARTTLS refuses to send credentials
+/// or messages if the server cannot upgrade the connection.
+///
+/// Retain this transport or a clone across sends to reuse its connection pool.
+/// See [`Transport`] for pooling behavior and [`SmtpTransportBuilder::pool_config`]
+/// for pool settings. `builder_dangerous` starts with plaintext configuration;
+/// use it only when configuring the connection security explicitly.
 pub type SmtpTransport = Transport<Smtp, Blocking>;
 /// Blocking LMTP transport, returning one reply per recipient.
 pub type LmtpTransport = Transport<Lmtp, Blocking>;
@@ -102,6 +125,19 @@ pub type SmtpTransportBuilder = Builder<Smtp, Blocking>;
 /// Blocking LMTP builder.
 pub type LmtpTransportBuilder = Builder<Lmtp, Blocking>;
 /// Tokio SMTP transport.
+///
+/// Asynchronously sends messages through an SMTP relay server using Tokio.
+/// Use [`AsyncSmtpTransport::relay`] for implicit TLS on port 465, or
+/// [`AsyncSmtpTransport::starttls_relay`] for required STARTTLS on port 587.
+/// Both validate the server certificate against the supplied relay hostname.
+/// Required STARTTLS refuses to send credentials or messages if the server
+/// cannot upgrade the connection.
+///
+/// Retain this transport or a clone across sends to reuse its connection pool.
+/// See [`Transport`] for pooling behavior and
+/// [`AsyncSmtpTransportBuilder::pool_config`] for pool settings.
+/// `builder_dangerous` starts with plaintext configuration; use it only when
+/// configuring the connection security explicitly.
 #[cfg(feature = "tokio")]
 pub type AsyncSmtpTransport = Transport<Smtp, Tokio>;
 /// Tokio LMTP transport, returning one reply per recipient.
@@ -124,7 +160,10 @@ impl<D: WireDialect, R> Builder<D, R> {
         }
     }
 
-    /// Substitute a fresh in-memory peer at stream creation. Plaintext only.
+    /// Substitute a fresh in-memory peer at stream creation. Plaintext TCP only.
+    ///
+    /// TLS modes other than `Tls::None` and Unix socket routes are refused
+    /// before the connector is invoked, using the same policy in both runtimes.
     #[cfg(feature = "test-support")]
     pub fn scripted_connector(mut self, connector: super::test_support::ScriptedConnector) -> Self {
         self.info.connector = Some(connector);

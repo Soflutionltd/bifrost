@@ -11,10 +11,10 @@
 //!
 //! All tests are in-process and deterministic.
 
+use bifrost_sync::Control;
 use bifrost_sync::{Boundary, BoundaryRequest, BoundaryView, SyncControl};
 use bifrost_types::{
-    AccountId, ChangeCursor, Checkpoint, Control, CursorScope, OpaqueChangeState, Priority,
-    ProtocolKind,
+    AccountId, ChangeCursor, Checkpoint, CursorScope, OpaqueChangeState, Priority, ProtocolKind,
 };
 use tokio::sync::watch;
 
@@ -80,7 +80,7 @@ async fn idle_checkpoint_request_returns_the_latest_durable_checkpoint() {
         .expect("idle checkpoint request");
     assert_eq!(
         checkpoint,
-        bifrost_types::DurableCheckpointSet::new(vec![sample_checkpoint(b"stale")])
+        bifrost_sync::DurableCheckpointSet::new(vec![sample_checkpoint(b"stale")])
     );
 }
 
@@ -88,7 +88,7 @@ async fn idle_checkpoint_request_returns_the_latest_durable_checkpoint() {
 async fn pause_with_no_checkpoint_traffic_returns_none() {
     let h = make_control();
     let result = h.control.pause().await.expect("idle pause");
-    assert_eq!(result, bifrost_types::DurableCheckpointSet::default());
+    assert_eq!(result, bifrost_sync::DurableCheckpointSet::default());
     assert_eq!(h.boundary.snapshot(), BoundaryRequest::Pause);
 }
 

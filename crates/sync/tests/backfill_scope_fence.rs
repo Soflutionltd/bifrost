@@ -27,15 +27,16 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bifrost_sync::Control;
 use bifrost_sync::{
     BackfillConfig, CheckpointStore, EngineConfig, InMemoryCheckpointStore, MultiplexerConfig,
     MultiplexerEvent, SyncEngine,
 };
 use bifrost_types::{
-    AccountFactory, AccountId, Checkpoint, Control, CoverageDomain, CursorScope, Fingerprint,
-    FolderId, InventoryBatch, InventoryCompletion, InventoryCoverageReport, InventoryEntry,
-    InventoryEvent, InventoryPartition, InventoryPartitioning, MembershipScope, ObjectId,
-    PageBoundary, PartitionEnd, ScopeLifecycle, ScopeLifecycleEvent, ServerVersion,
+    AccountFactory, AccountId, Checkpoint, CoverageDomain, CursorScope, Fingerprint, FolderId,
+    InventoryBatch, InventoryCompletion, InventoryCoverageReport, InventoryEntry, InventoryEvent,
+    InventoryPartition, InventoryPartitioning, MembershipScope, ObjectId, PageBoundary,
+    PartitionEnd, ScopeLifecycle, ScopeLifecycleEvent, ServerVersion,
 };
 
 const PAGE: u32 = 2;

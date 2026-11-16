@@ -4,8 +4,8 @@ mod common;
 #[path = "common/recovery.rs"]
 mod recovery;
 
+use bifrost_sync::Control as _;
 use bifrost_sync::{CheckpointStore, Error, InMemoryCheckpointStore, SyncEngine};
-use bifrost_types::Control as _;
 use bifrost_types::{
     Account, AccountError, AccountFactory, AccountFuture, AccountId, CursorScope, PushCapability,
     SubscriptionHandle,

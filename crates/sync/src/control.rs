@@ -1,6 +1,6 @@
 //! `Control` handle implementation.
 //!
-//! `bifrost_types::Control` is the consumer-facing trait. `SyncControl`
+//! `crate::Control` is the consumer-facing trait. `SyncControl`
 //! is the engine's concrete implementor: holds the boundary sender,
 //! the priority watch sender, the bandwidth meters, and the
 //! per-generation checkpoint signal.
@@ -9,10 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bifrost_types::{
-    AccountError, AccountId, Checkpoint, Control, CursorScope, DurableCheckpointSet, Partition,
-    Priority,
-};
+use crate::{Control, DurableCheckpointSet};
+use bifrost_types::{AccountError, AccountId, Checkpoint, CursorScope, Partition, Priority};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +24,7 @@ use bifrost_types::{AccountErrorKind, Cause, StateCause};
 #[non_exhaustive]
 pub enum EngineState {
     Running,
-    Paused(bifrost_types::PauseReason),
+    Paused(crate::PauseReason),
     Stopping,
 }
 
@@ -90,8 +88,7 @@ impl DurableStream {
 struct SyncControlInner {
     account: AccountId,
     engine_state: watch::Sender<EngineState>,
-    control_events:
-        std::sync::Mutex<Option<tokio::sync::broadcast::Sender<bifrost_types::AccountControl>>>,
+    control_events: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<crate::AccountControl>>>,
     boundary: Boundary,
     /// Watch channel carrying the latest persisted checkpoint and the
     /// generation in which quiescence was observed.
@@ -172,7 +169,7 @@ impl SyncControl {
 
     pub(crate) fn bind_control_events(
         &self,
-        events: tokio::sync::broadcast::Sender<bifrost_types::AccountControl>,
+        events: tokio::sync::broadcast::Sender<crate::AccountControl>,
     ) {
         *self
             .inner
@@ -186,7 +183,7 @@ impl SyncControl {
         self.inner.engine_state.subscribe()
     }
 
-    pub(crate) fn engine_pause(&self, reason: bifrost_types::PauseReason) {
+    pub(crate) fn engine_pause(&self, reason: crate::PauseReason) {
         let events = self
             .inner
             .control_events
@@ -203,7 +200,7 @@ impl SyncControl {
             .engine_state
             .send_replace(EngineState::Paused(reason));
         if let Some(events) = events.as_ref() {
-            let _ = events.send(bifrost_types::AccountControl::Pause(reason));
+            let _ = events.send(crate::AccountControl::Pause(reason));
         }
     }
 
@@ -724,7 +721,7 @@ impl Control for SyncControl {
             // new generation, not the old one.
             let gen_id =
                 CheckpointGeneration(self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1);
-            self.engine_pause(bifrost_types::PauseReason::ConsumerRequested);
+            self.engine_pause(crate::PauseReason::ConsumerRequested);
             self.publish_quiescence(gen_id);
             self.wait_for_checkpoint_at_or_after(gen_id).await
         })
@@ -770,7 +767,7 @@ impl Control for SyncControl {
         if self.inner.boundary.set_unless_stopped(BoundaryRequest::Run) {
             self.inner.engine_state.send_replace(EngineState::Running);
             if let Some(events) = events.as_ref() {
-                let _ = events.send(bifrost_types::AccountControl::Resume);
+                let _ = events.send(crate::AccountControl::Resume);
             }
         }
     }
@@ -818,26 +815,26 @@ mod tests {
         let control = control();
         let (events, mut receiver) = tokio::sync::broadcast::channel(8);
         control.bind_control_events(events);
-        control.engine_pause(bifrost_types::PauseReason::RetryBudgetExhausted);
+        control.engine_pause(crate::PauseReason::RetryBudgetExhausted);
         let state = control.engine_state();
         assert!(matches!(
             *state.borrow(),
-            EngineState::Paused(bifrost_types::PauseReason::RetryBudgetExhausted)
+            EngineState::Paused(crate::PauseReason::RetryBudgetExhausted)
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(bifrost_types::AccountControl::Pause(_))
+            Ok(crate::AccountControl::Pause(_))
         ));
         Control::resume(&control);
         assert!(matches!(*state.borrow(), EngineState::Running));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(bifrost_types::AccountControl::Resume)
+            Ok(crate::AccountControl::Resume)
         ));
         Control::resume(&control);
         assert!(receiver.try_recv().is_err());
         control.stop();
-        control.engine_pause(bifrost_types::PauseReason::RetryBudgetExhausted);
+        control.engine_pause(crate::PauseReason::RetryBudgetExhausted);
         Control::resume(&control);
         assert!(matches!(*state.borrow(), EngineState::Stopping));
         assert_eq!(control.inner.boundary.snapshot(), BoundaryRequest::Stop);
@@ -886,8 +883,8 @@ mod tests {
         })
     }
 
-    fn durable(checkpoint: Checkpoint) -> bifrost_types::DurableCheckpointSet {
-        bifrost_types::DurableCheckpointSet::new(vec![checkpoint])
+    fn durable(checkpoint: Checkpoint) -> crate::DurableCheckpointSet {
+        crate::DurableCheckpointSet::new(vec![checkpoint])
     }
 
     #[tokio::test]
@@ -902,7 +899,7 @@ mod tests {
         drop(activity);
         assert_eq!(
             waiter.await.expect("waiter task").expect("pause"),
-            bifrost_types::DurableCheckpointSet::default()
+            crate::DurableCheckpointSet::default()
         );
         assert!(
             control.begin_activity().is_none(),
@@ -1181,7 +1178,7 @@ mod tests {
 
         assert_eq!(
             control.pause().await.expect("pause"),
-            bifrost_types::DurableCheckpointSet::default()
+            crate::DurableCheckpointSet::default()
         );
     }
 
@@ -1226,7 +1223,7 @@ mod tests {
         assert_eq!(pending_len(&control), 0);
         assert_eq!(
             control.pause().await.expect("pause"),
-            bifrost_types::DurableCheckpointSet::default(),
+            crate::DurableCheckpointSet::default(),
             "abandonment must not invent a durable checkpoint"
         );
     }
@@ -1248,7 +1245,7 @@ mod tests {
 
         assert_eq!(
             waiter.await.expect("waiter task").expect("checkpoint"),
-            bifrost_types::DurableCheckpointSet::default()
+            crate::DurableCheckpointSet::default()
         );
         assert_eq!(control.inner.boundary.snapshot(), BoundaryRequest::Pause);
     }

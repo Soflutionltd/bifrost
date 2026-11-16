@@ -104,10 +104,23 @@ impl fmt::Debug for CalDavCredentials {
 }
 
 /// Configuration for a standalone CalDAV account.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CalDavConfig {
     pub base_url: String,
     pub credentials: CalDavCredentials,
+}
+
+// Support needs the origin; resource URLs can contain passwords or bearer tokens.
+impl fmt::Debug for CalDavConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CalDavConfig")
+            .field(
+                "base_url",
+                &bifrost_dav_core::url::diagnostic_origin(&self.base_url),
+            )
+            .field("credentials", &self.credentials)
+            .finish()
+    }
 }
 
 impl CalDavConfig {
@@ -204,5 +217,32 @@ mod tests {
             .await
             .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod config_debug_tests {
+    use super::*;
+
+    #[test]
+    fn config_and_factory_debug_omit_url_credentials() {
+        for url in [
+            "https://secret-user:secret-password@dav.example/secret-path?secret-query#secret-fragment",
+            "invalid-secret-url",
+        ] {
+            let config = CalDavConfig::new(
+                url,
+                CalDavCredentials::Basic {
+                    username: "user".into(),
+                    password: "password".into(),
+                },
+            );
+            let config_debug = format!("{config:?}");
+            let factory_debug = format!("{:?}", CalDavAccountFactory::new(config));
+            for debug in [config_debug, factory_debug] {
+                assert!(!debug.contains("secret"), "{debug}");
+                assert!(debug.contains("dav.example") || debug.contains("<invalid URL>"));
+            }
+        }
     }
 }

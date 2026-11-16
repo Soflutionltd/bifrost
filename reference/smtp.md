@@ -57,8 +57,11 @@ encoder, framing and network suites remain available without it.
 
 `test-support` exposes fresh `Transcript` factories through `ScriptedConnector`
 on both blocking and async SMTP/LMTP builders. Scripted connections require
-`Tls::None`; they refuse other TLS modes before invoking the factory, retain
-normal greeting, hello and authentication processing, and open no sockets.
+plaintext TCP configuration (`Tls::None` and no Unix socket route); both
+runtimes apply the real dial plan's platform and TLS/socket validation first,
+then refuse unsupported scripted configurations before invoking the factory.
+Accepted scripted connections retain normal greeting, hello and authentication
+processing, and open no sockets.
 The async-only OAuth resolver is compiled only with `tokio`; the blocking
 snapshot resolver remains available in every build.
 

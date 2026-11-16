@@ -270,7 +270,7 @@ async fn an_exhausted_downgrade_restart_pauses_without_deleting_the_scope_cursor
     let pause = tokio::time::timeout(BOUND, async {
         loop {
             match control.recv().await {
-                Ok(bifrost_types::AccountControl::Pause(reason)) => break reason,
+                Ok(bifrost_sync::AccountControl::Pause(reason)) => break reason,
                 // `AccountControl` is `#[non_exhaustive]`; anything else is
                 // not the pause this test waits for.
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -282,7 +282,7 @@ async fn an_exhausted_downgrade_restart_pauses_without_deleting_the_scope_cursor
     })
     .await
     .expect("the account never paused after every replacement open failed");
-    assert_eq!(pause, bifrost_types::PauseReason::RetryBudgetExhausted);
+    assert_eq!(pause, bifrost_sync::PauseReason::RetryBudgetExhausted);
     assert_eq!(
         opens.load(Ordering::SeqCst),
         4,

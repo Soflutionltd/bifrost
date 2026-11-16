@@ -10,23 +10,23 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use bifrost_sync::Control;
 use bifrost_sync::{Error, IdempotencyVendor, SyncEngine, run_readback_guard};
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountFactory, AccountFuture, Application, CompensationOutcome, Control,
-    PartialCommitBuilder, PrimaryLeg, RequestCause, RetryHint, ServerCause, StepEffect,
-    StepReplay, StepTargets, ThrottleBudget, ThrottleKey,
-    AccountId, AccountStream, AttachmentHandle, Batch, BlobHandle, ByteRange, Change, ChangeCursor,
-    CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
-    ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
-    DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
-    FlagOp, HostedAttachment, HydratedObject, HydratedObjectKind, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEvent, ItemOutcome,
-    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, OpenedAccount, Page,
-    PageBoundary, PrimaryCause, Priority, Projection, ProtocolKind, QuotaInfo, RsvpStatus,
-    ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
-    VacationConfig,
+    AccountFactory, AccountFuture, AccountId, AccountStream, Application, AttachmentHandle, Batch,
+    BlobHandle, ByteRange, Change, ChangeCursor, CloudUploadMeta, CompensationOutcome, ContactCard,
+    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, ContainerId, ContainerKind,
+    CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch, EventCreate,
+    EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
+    HostedAttachment, HydratedObject, HydratedObjectKind, HydrationProjection, IdempotencyKey,
+    Identity, IdentityId, IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope,
+    Message, MutationSuccess, MutationTarget, ObjectId, OpenedAccount, Page, PageBoundary,
+    PartialCommitBuilder, PrimaryCause, PrimaryLeg, Priority, Projection, ProtocolKind, QuotaInfo,
+    RequestCause, RetryHint, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt,
+    SendRequest, ServerCause, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    StepEffect, StepReplay, StepTargets, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
+    ThrottleBudget, ThrottleKey, VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -3393,7 +3393,7 @@ async fn a_read_back_engine_failure_blocks_reassertion_and_forwards_once() {
     let event = controls.recv().await.unwrap();
     assert!(matches!(
         event,
-        bifrost_types::AccountControl::Pause(bifrost_types::PauseReason::OperatorOverrideRequired)
+        bifrost_sync::AccountControl::Pause(bifrost_sync::PauseReason::OperatorOverrideRequired)
     ));
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
     assert!(matches!(

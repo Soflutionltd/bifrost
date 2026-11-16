@@ -25,9 +25,8 @@ use crate::delivery::{ChangeDelivery, EventScope, MultiplexerEvent};
 use crate::engine::supervisor::ReopenRequest;
 use crate::recovery::RecoveryPlan;
 use crate::throttle::ThrottleBucket;
-use bifrost_types::{
-    AccountId, InvalidationSink, SinkPush, SyncEvent, Warning, WarningKind, WatchEvent,
-};
+use crate::{InvalidationSink, SinkPush, WatchEvent};
+use bifrost_types::{AccountId, SyncEvent, Warning, WarningKind};
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -197,7 +196,6 @@ pub(crate) fn route_watch_event(
                 broadcast(target, SyncEvent::Terminated(fatal.into_inner()));
             }
         },
-        _ => target.ingress.request_full(),
     }
     SinkPush::Accepted
 }

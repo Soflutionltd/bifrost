@@ -1081,5 +1081,10 @@ DAV status classification retains body byte counts rather than raw refusal
 text, including for scoped missing-contact errors. Enterprise support needs
 status and response evidence without disclosing credentials echoed by a server;
 support consent alone does not make arbitrary response text safe. This policy
-covers DAV's own status classification. Net transport failures still retain
-net's response diagnostics and require the separate net redaction policy.
+covers DAV's own status classification. Net transport failures retain status, header names/counts and captured body
+byte counts under net's shared credential-safe diagnostics policy.
+
+Account configuration Debug renders only the credential-free HTTP(S) origin (or
+an invalid-URL marker). Factory Debug inherits this policy through its config.
+Standalone token lookup failures omit foreign error prose; transient refresh and
+permanent credential loss retain their typed recovery without quoting secrets.

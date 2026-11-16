@@ -157,12 +157,11 @@ pub use error::{
 
 // Stream-event types.
 pub use events::{
-    AccountControl, BackfillCheckpoint, BackfillProgress, Batch, BatchBoundaryError, Change,
-    Checkpoint, Control, DurableCheckpointSet, HintPayload, InvalidationHint, InvalidationSink,
-    InventoryBatch, InventoryCompletion, InventoryEntry, InventoryEvent, InventoryPartition,
-    InventoryPartitioning, ObjectChange, ObjectChangeKind, PageBoundary, PageCheckpoint, Partition,
-    PartitionEnd, PauseReason, Priority, Progress, PushSource, ScopeChange, ScopeChangeKind,
-    SinkPush, SyncEvent, WatchEvent, lift_complete_walk,
+    BackfillCheckpoint, BackfillProgress, Batch, BatchBoundaryError, Change, Checkpoint,
+    HintPayload, InvalidationHint, InventoryBatch, InventoryCompletion, InventoryEntry,
+    InventoryEvent, InventoryPartition, InventoryPartitioning, ObjectChange, ObjectChangeKind,
+    PageBoundary, PageCheckpoint, Partition, PartitionEnd, Priority, Progress, PushSource,
+    ScopeChange, ScopeChangeKind, SyncEvent, lift_complete_walk,
 };
 
 // Provider-native repair of coverage debt.

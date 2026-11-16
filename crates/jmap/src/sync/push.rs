@@ -466,7 +466,7 @@ fn union_data_types(subscriptions: &HashMap<SubscriptionHandle, DataTypeSet>) ->
 /// announces `Reconnected`. That is intended and was rejected as a defect;
 /// leave it.
 ///
-/// `WatchEvent::Reconnected` is defined in `bifrost-types` as a connection
+/// `PushSessionEvent::Reconnected` is defined in `bifrost-types` as a connection
 /// HEALTH transition, not as proof that any scope is subscribed, and the empty
 /// set is the applied desired state - the frame makes that state explicit on
 /// every newly opened connection rather than leaving it implied. The sync
@@ -759,16 +759,16 @@ fn session_hint(payload: HintPayload) -> InvalidationHint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bifrost_types::{PushSessionEnd as End, PushSessionEvent as E, WatchEvent};
+    use bifrost_types::{PushSessionEnd as End, PushSessionEvent as E};
     use futures::StreamExt;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::broadcast;
 
     /// Route one push frame exactly as the session does and hand each hint
     /// to `tx`, so the routing tests read hints one by one.
-    fn emit_push(push: PushObject, tx: &broadcast::Sender<WatchEvent>, routing: &PushRouting) {
+    fn emit_push(push: PushObject, tx: &broadcast::Sender<E>, routing: &PushRouting) {
         for hint in collect_push(&push.decompose(), routing) {
-            let _ = tx.send(WatchEvent::Invalidated { hint });
+            let _ = tx.send(E::Invalidated(hint));
         }
     }
 
@@ -827,7 +827,7 @@ mod tests {
         .await
     }
 
-    fn drain(rx: &mut broadcast::Receiver<WatchEvent>) -> Vec<WatchEvent> {
+    fn drain(rx: &mut broadcast::Receiver<E>) -> Vec<E> {
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
@@ -859,9 +859,9 @@ mod tests {
         PushRouting::new("acct-primary".to_string(), seeds.iter())
     }
 
-    fn hinted_scope(event: &WatchEvent) -> Option<CursorScope> {
+    fn hinted_scope(event: &E) -> Option<CursorScope> {
         match event {
-            WatchEvent::Invalidated { hint } => match &hint.payload {
+            E::Invalidated(hint) => match &hint.payload {
                 HintPayload::SpecificCursorScope(scope) => Some(scope.clone()),
                 _ => None,
             },
@@ -881,7 +881,7 @@ mod tests {
         let events = drain(&mut rx);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            WatchEvent::Invalidated { hint } => {
+            E::Invalidated(hint) => {
                 assert_eq!(hint.source, PushSource::JmapStateChange);
             }
             other => panic!("expected Invalidated, got {other:?}"),
@@ -905,7 +905,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            WatchEvent::Invalidated { hint }
+            E::Invalidated(hint)
                 if matches!(&hint.payload, HintPayload::Unknown)
         ));
     }

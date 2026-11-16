@@ -15,11 +15,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use bifrost_sync::WatchEvent;
 use bifrost_sync::{EngineConfig, SyncEngine};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountId, Batch,
     Checkpoint, CursorScope, ErrorScope, HintPayload, InvalidationHint, ObjectType, PageBoundary,
-    PrimaryCause, PushSource, StateCause, SyncEvent, WatchEvent,
+    PrimaryCause, PushSource, StateCause, SyncEvent,
 };
 
 /// A long cadence: any drive observed after attach's first pass came from the
@@ -102,7 +103,7 @@ async fn push_invalidation_drives_mid_poll_cadence_without_waiting_for_the_sleep
         engine
             .invalidation_sink()
             .push(account_id.clone(), unknown_hint()),
-        bifrost_types::SinkPush::Accepted
+        bifrost_sync::SinkPush::Accepted
     ));
 
     wait_until(
@@ -183,7 +184,7 @@ async fn a_push_drive_account_contract_error_is_published_and_parks_its_scope() 
         engine
             .invalidation_sink()
             .push(account_id.clone(), unknown_hint()),
-        bifrost_types::SinkPush::Accepted
+        bifrost_sync::SinkPush::Accepted
     ));
 
     wait_until(
@@ -219,7 +220,7 @@ async fn a_push_drive_account_contract_error_is_published_and_parks_its_scope() 
         engine
             .invalidation_sink()
             .push(account_id.clone(), specific_hint(sibling_scope.clone())),
-        bifrost_types::SinkPush::Accepted
+        bifrost_sync::SinkPush::Accepted
     ));
     wait_until(
         "the sibling hint acts as a barrier after the terminal sweep",
@@ -231,13 +232,13 @@ async fn a_push_drive_account_contract_error_is_published_and_parks_its_scope() 
         engine
             .invalidation_sink()
             .push(account_id.clone(), specific_hint(failed_scope)),
-        bifrost_types::SinkPush::Accepted
+        bifrost_sync::SinkPush::Accepted
     ));
     assert!(matches!(
         engine
             .invalidation_sink()
             .push(account_id.clone(), specific_hint(sibling_scope)),
-        bifrost_types::SinkPush::Accepted
+        bifrost_sync::SinkPush::Accepted
     ));
     wait_until(
         "the sibling hint completes after the terminal-scope hint",
@@ -319,7 +320,7 @@ async fn a_failed_hinted_scope_reaches_recovery_without_abandoning_its_siblings(
         engine
             .invalidation_sink()
             .push(account_id.clone(), unknown_hint()),
-        bifrost_types::SinkPush::Accepted
+        bifrost_sync::SinkPush::Accepted
     ));
 
     // Property one: the sweep did not stop at the first failure. Keyed on

@@ -110,7 +110,7 @@ impl MaintenanceGate<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bifrost_types::Control;
+    use crate::Control;
 
     #[tokio::test]
     async fn maintenance_is_counted_until_pause_reaches_quiescence() {

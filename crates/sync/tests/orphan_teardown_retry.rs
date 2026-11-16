@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
+use bifrost_sync::Control;
 use bifrost_sync::{EngineConfig, PushConfig, SyncControl, SyncEngine};
-use bifrost_types::{AccountFactory, AccountId, Control, CursorScope, FolderId, PushCapability};
+use bifrost_types::{AccountFactory, AccountId, CursorScope, FolderId, PushCapability};
 
 use common::{PushLog, StubAccount, StubFactory};
 

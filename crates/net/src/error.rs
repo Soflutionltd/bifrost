@@ -44,11 +44,23 @@ pub(crate) const STATUS_BODY_CONNECTION_MARKER: &[u8] = b" ... (body read failed
 /// `NetErrorContext` is likewise unsealed for the mirror-image reason - it is
 /// consumer-constructed and has no constructor. Both are considered; an audit
 /// that flags either as a missing seal has found the intended state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FinalResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Bytes,
+}
+
+// A server can echo credentials in any header or body, including on failure.
+impl std::fmt::Debug for FinalResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FinalResponse")
+            .field("status", &self.status)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("header_count", &self.headers.len())
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,7 +107,7 @@ pub enum RetryStopReason {
 /// Marked `#[non_exhaustive]` to allow new variants without breaking
 /// downstream matches.
 #[non_exhaustive]
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum Error {
     /// A protocol hook refused a target before dispatch. The shared attempt
     /// envelope still retains earlier responses and possible commits.
@@ -359,6 +371,115 @@ pub enum Error {
     },
 }
 
+// Debug must not expose raw response evidence or foreign error text.
+impl std::fmt::Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Status {
+                code,
+                headers,
+                body,
+            } => f
+                .debug_struct("Status")
+                .field("status", code)
+                .field("header_names", &headers.keys().collect::<Vec<_>>())
+                .field("header_count", &headers.len())
+                .field("body_bytes", &body.len())
+                .finish(),
+            Self::HopPolicy(_) => f.write_str("HopPolicy"),
+            Self::LocalHold { .. } => f.write_str("LocalHold"),
+            Self::AttemptHistory { source, evidence } => f
+                .debug_struct("AttemptHistory")
+                .field("source", source)
+                .field("evidence", evidence)
+                .finish(),
+            Self::Network {
+                message,
+                transmission_state,
+                ..
+            } => f
+                .debug_struct("Network")
+                .field("message", message)
+                .field("transmission_state", transmission_state)
+                .finish(),
+            Self::Timeout {
+                transmission_state, ..
+            } => f
+                .debug_struct("Timeout")
+                .field("transmission_state", transmission_state)
+                .finish(),
+            Self::Tls {
+                message,
+                transmission_state,
+            } => f
+                .debug_struct("Tls")
+                .field("message", message)
+                .field("transmission_state", transmission_state)
+                .finish(),
+            Self::UnexpectedResponse { response } => std::fmt::Debug::fmt(response, f),
+            Self::RetryBudgetExhausted {
+                final_response,
+                retry_after_history,
+                stop_reason,
+            } => f
+                .debug_struct("RetryBudgetExhausted")
+                .field("final_response", final_response)
+                .field("retry_after_history", retry_after_history)
+                .field("stop_reason", stop_reason)
+                .finish(),
+            Self::AuthLost {
+                transmission_state,
+                final_response,
+            } => f
+                .debug_struct("AuthLost")
+                .field("transmission_state", transmission_state)
+                .field("final_response", final_response)
+                .finish(),
+            Self::RateLimited {
+                retry_after,
+                final_response,
+            } => f
+                .debug_struct("RateLimited")
+                .field("retry_after", retry_after)
+                .field("final_response", final_response)
+                .finish(),
+            Self::Cancelled => f.write_str("Cancelled"),
+            Self::ResponseTooLarge { limit, .. } => f
+                .debug_struct("ResponseTooLarge")
+                .field("limit", limit)
+                .finish(),
+            Self::CostExceedsBurst { cost, burst, .. } => f
+                .debug_struct("CostExceedsBurst")
+                .field("cost", cost)
+                .field("burst", burst)
+                .finish(),
+            Self::EncodeBody { .. } => f.write_str("EncodeBody"),
+            Self::InvalidHeader { .. } => f.write_str("InvalidHeader"),
+            Self::InvalidRequest { field, .. } => f
+                .debug_struct("InvalidRequest")
+                .field("field", field)
+                .finish(),
+            Self::RefreshFailed { retry_after, .. } => f
+                .debug_struct("RefreshFailed")
+                .field("retry_after", retry_after)
+                .finish(),
+            Self::RangeNotHonored { kind, .. } => f
+                .debug_struct("RangeNotHonored")
+                .field("kind", kind)
+                .finish(),
+            Self::RedirectRejected { .. } => f.write_str("RedirectRejected"),
+            Self::UnauthenticatedRedirectHop { .. } => f.write_str("UnauthenticatedRedirectHop"),
+            Self::MalformedRedirect { kind, .. } => f
+                .debug_struct("MalformedRedirect")
+                .field("kind", kind)
+                .finish(),
+            Self::RedirectLoop { hops, .. } => {
+                f.debug_struct("RedirectLoop").field("hops", hops).finish()
+            }
+        }
+    }
+}
+
 impl Error {
     /// The error at the failing stage of a logical request. Earlier attempt
     /// evidence remains on `AttemptHistory`; classification must use the whole
@@ -436,6 +557,30 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_debug_keeps_local_messages_and_redacts_credential_urls() {
+        for error in [
+            Error::Network {
+                message: "DNS lookup failed".to_owned(),
+                transmission_state: TransmissionState::Unsent,
+                source: None,
+            },
+            Error::Tls {
+                message: "certificate verification failed".to_owned(),
+                transmission_state: TransmissionState::Unsent,
+            },
+        ] {
+            let message = match &error {
+                Error::Network { message, .. } | Error::Tls { message, .. } => message.clone(),
+                _ => unreachable!(),
+            };
+            assert!(format!("{error:?}").contains(&message));
+            let redacted = error.redact_request_text();
+            assert!(!format!("{redacted:?}").contains(&message));
+            assert!(format!("{redacted:?}").contains("detail withheld"));
+        }
+    }
 
     #[test]
     fn bodies_at_or_under_the_cap_pass_through_unchanged() {

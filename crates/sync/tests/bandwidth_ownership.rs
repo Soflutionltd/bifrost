@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bifrost_net::{BandwidthDirection, BandwidthRegistry};
+use bifrost_sync::Control;
 use bifrost_sync::SyncEngine;
 use bifrost_types::{
-    Account, AccountError, AccountFactory, AccountFuture, AccountId, Control, OpenedAccount,
+    Account, AccountError, AccountFactory, AccountFuture, AccountId, OpenedAccount,
 };
 
 struct Factory {

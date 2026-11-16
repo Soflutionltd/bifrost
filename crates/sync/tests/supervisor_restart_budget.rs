@@ -266,7 +266,7 @@ async fn three_failed_reopens_terminate_and_pause_the_account() {
     let pause = tokio::time::timeout(std::time::Duration::from_secs(600), async {
         loop {
             match control.recv().await {
-                Ok(bifrost_types::AccountControl::Pause(reason)) => break reason,
+                Ok(bifrost_sync::AccountControl::Pause(reason)) => break reason,
                 // `AccountControl` is `#[non_exhaustive]`; anything that
                 // is not the pause we are waiting for is skipped.
                 Ok(_) => {}
@@ -279,7 +279,7 @@ async fn three_failed_reopens_terminate_and_pause_the_account() {
     .expect("an exhausted reopen budget must pause the account");
     assert_eq!(
         pause,
-        bifrost_types::PauseReason::RetryBudgetExhausted,
+        bifrost_sync::PauseReason::RetryBudgetExhausted,
         "the pause names the budget, not a generic operator override"
     );
 

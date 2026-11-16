@@ -28,6 +28,7 @@
 pub mod backfill;
 mod backoff;
 pub mod cancel;
+mod consumer;
 pub mod control;
 pub mod cursor;
 pub mod delivery;
@@ -51,12 +52,12 @@ pub(crate) mod test_common;
 // Engine entry types.
 pub use engine::{SyncEngine, SyncEngineBuilder};
 
-// Control surface and priority (re-export from bifrost-types so
-// consumers can import them off the engine crate directly).
-pub use bifrost_types::{Control, Priority};
-
-// Push surface (sink + watch events).
-pub use bifrost_types::{InvalidationSink, SinkPush, WatchEvent};
+// Consumer controls and injected push ingress belong to the engine.
+pub use bifrost_types::Priority;
+pub use consumer::{
+    AccountControl, Control, DurableCheckpointSet, InvalidationSink, PauseReason, SinkPush,
+    WatchEvent,
+};
 
 // Engine-side error and the shared warning vocabulary. Terminal
 // account errors are surfaced through `bifrost_types::Fatal` (the

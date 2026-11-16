@@ -721,7 +721,7 @@ async fn a_subscriber_that_arrives_after_the_send_is_not_a_possible_reader() {
 /// then found the boundary already gone.
 #[tokio::test(start_paused = true)]
 async fn a_receiver_drop_sweep_wakes_a_boundary_waiter() {
-    use bifrost_types::Control as _;
+    use crate::Control as _;
 
     let h = delivery_harness(8);
     let a = h.subscribe();
@@ -745,14 +745,14 @@ async fn a_receiver_drop_sweep_wakes_a_boundary_waiter() {
         .expect("the sweep must wake a boundary waiter, not only the capacity gate");
     assert_eq!(
         released.expect("pause task").expect("pause"),
-        bifrost_types::DurableCheckpointSet::default(),
+        crate::DurableCheckpointSet::default(),
         "nothing became durable, so nothing may be reported as durable"
     );
 }
 
 #[tokio::test(start_paused = true)]
 async fn broadcast_lag_releases_boundary_waiters_that_can_never_be_acked() {
-    use bifrost_types::Control as _;
+    use crate::Control as _;
 
     let (tx, sentinel) = broadcast::channel(1);
     let control = lag_test_control();
@@ -780,7 +780,7 @@ async fn broadcast_lag_releases_boundary_waiters_that_can_never_be_acked() {
         .expect("a lost batch's registration must stop gating the boundary");
     assert_eq!(
         released.expect("pause task").expect("pause"),
-        bifrost_types::DurableCheckpointSet::default()
+        crate::DurableCheckpointSet::default()
     );
     drop(sentinel);
 }

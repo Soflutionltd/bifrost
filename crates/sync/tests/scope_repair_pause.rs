@@ -25,11 +25,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use bifrost_sync::Control;
 use bifrost_sync::{CheckpointStore, InMemoryCheckpointStore, SyncEngine};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountFactory, AccountId, AccountOperation, Change,
-    ChangeCursor, Control, CursorScope, ErrorScope, ObjectType, PrimaryCause, StateCause,
-    SyncEvent,
+    ChangeCursor, CursorScope, ErrorScope, ObjectType, PrimaryCause, StateCause, SyncEvent,
 };
 
 use common::{StubAccount, StubFactory};
