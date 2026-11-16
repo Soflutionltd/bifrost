@@ -31,7 +31,7 @@ use bifrost_types::{
     AccessErrorKind, AccountErrorKind, AuthErrorKind, RequestErrorKind, ServerErrorKind,
     SyncStateErrorKind,
 };
-use bifrost_types::{BatchFailure, BatchItemId, BatchSuccess};
+use bifrost_types::{BatchFailure, BatchSuccess};
 
 use crate::error::{
     Error, GmailCursorFailure, GmailErrorEnvelope, GmailLocalError, GmailResponseError,
@@ -102,6 +102,13 @@ pub(crate) struct GmailErrorContext {
 }
 
 impl GmailErrorContext {
+    pub(crate) fn identity(&self) -> bifrost_types::error::builder::AccountErrorContext {
+        bifrost_types::error::builder::AccountErrorContext::new(
+            provider_for(self),
+            protocol_for(self),
+        )
+    }
+
     pub(crate) fn base(operation: AccountOperation) -> Self {
         Self {
             surface: crate::quota::ApiSurface::Gmail,
@@ -384,12 +391,7 @@ pub(crate) fn mutation_error(
     // also lands as `Failed` per id with the cloned error.
     let outcomes = ids
         .iter()
-        .map(|id| {
-            ItemOutcome::Failed(BatchFailure::new(
-                BatchItemId(id.0.clone()),
-                account_error.clone(),
-            ))
-        })
+        .map(|id| ItemOutcome::Failed(BatchFailure::new(id.clone(), account_error.clone())))
         .collect();
     Ok(outcomes)
 }
@@ -411,8 +413,7 @@ pub(crate) fn shutdown_inflight_error(operation: AccountOperation) -> AccountErr
             "google account closed while a mutation request was in flight",
         )),
     )))
-    .provider(Provider::Gmail)
-    .protocol(Protocol::Gmail)
+    .context(GmailErrorContext::base(operation).identity())
     .operation(operation)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::InFlight,
@@ -426,12 +427,7 @@ pub(crate) fn shutdown_inflight_error(operation: AccountOperation) -> AccountErr
 /// empty patch.
 pub(crate) fn skipped_outcomes(ids: &[ObjectId]) -> Vec<ItemOutcome<MutationSuccess>> {
     ids.iter()
-        .map(|id| {
-            ItemOutcome::Succeeded(BatchSuccess::new(
-                BatchItemId(id.0.clone()),
-                MutationSuccess::Skipped,
-            ))
-        })
+        .map(|id| ItemOutcome::Succeeded(BatchSuccess::new(id.clone(), MutationSuccess::Skipped)))
         .collect()
 }
 
@@ -562,19 +558,6 @@ fn protocol_for(ctx: &GmailErrorContext) -> Protocol {
         crate::quota::ApiSurface::Calendar => Protocol::GoogleCalendar,
         crate::quota::ApiSurface::People => Protocol::GooglePeople,
         crate::quota::ApiSurface::Drive => Protocol::GoogleDrive,
-    }
-}
-
-trait GoogleProvider {
-    fn google_provider(self, ctx: &GmailErrorContext) -> Self;
-}
-
-impl GoogleProvider for AccountErrorBuilder {
-    fn google_provider(self, ctx: &GmailErrorContext) -> Self {
-        match provider_for(ctx) {
-            Some(provider) => self.provider(provider),
-            None => self,
-        }
     }
 }
 
@@ -736,8 +719,7 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
     policy.throttle_budget = project.map(|project| project.budget.clone());
 
     let mut builder = AccountErrorBuilder::new(policy.apply_throttle(cause))
-        .google_provider(ctx)
-        .protocol(protocol_for(ctx))
+        .context(ctx.identity())
         .operation(ctx.operation)
         .status(Some(status));
 
@@ -1056,8 +1038,7 @@ fn parse_failed(ctx: &GmailErrorContext, detail: String) -> AccountError {
             detail: Some(DiagnosticText::support_only(detail.clone())),
         },
     })
-    .google_provider(ctx)
-    .protocol(protocol_for(ctx))
+    .context(ctx.identity())
     .operation(ctx.operation)
     .text(DiagnosticText::support_only(detail))
     // Post-200 decode failures (`JsonDecode`, `Base64`): the response was
@@ -1075,8 +1056,7 @@ fn malformed_request(ctx: &GmailErrorContext, detail: String) -> AccountError {
     let mut builder = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
         detail: DiagnosticText::support_only(detail.clone()),
     }))
-    .google_provider(ctx)
-    .protocol(protocol_for(ctx))
+    .context(ctx.identity())
     .operation(ctx.operation)
     .text(DiagnosticText::support_only(detail));
     if let Some(scope) = ctx.scope.clone() {
@@ -1113,8 +1093,7 @@ fn provider_fault(
         },
     })
     .push_cause(Cause::Attempt(AttemptCause::new(state)))
-    .google_provider(ctx)
-    .protocol(protocol_for(ctx))
+    .context(ctx.identity())
     .operation(ctx.operation)
     .text(detail);
     if let Some(scope) = ctx.scope.clone() {
@@ -1130,7 +1109,7 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
         GmailLocalError::Unsupported { operation, detail } => {
             let mut builder = AccountError::unsupported(operation, protocol_for(ctx))
                 .into_builder()
-                .google_provider(ctx);
+                .context(ctx.identity());
             if let Some(scope) = ctx.scope.clone() {
                 builder = builder.scope(scope);
             }
@@ -1158,8 +1137,7 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             };
             let mut builder = fault
                 .builder(protocol_for(ctx), ctx.operation)
-                .google_provider(ctx)
-                .protocol(protocol_for(ctx))
+                .context(ctx.identity())
                 .operation(ctx.operation)
                 .scope(ErrorScope::Cursor(CursorScope::Account))
                 .text(DiagnosticText::support_only(detail));
@@ -1181,8 +1159,7 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             profile_email,
         } => bifrost_types::CursorDecodeFault::IdentityMismatch
             .builder(protocol_for(ctx), ctx.operation)
-            .google_provider(ctx)
-            .protocol(protocol_for(ctx))
+            .context(ctx.identity())
             .operation(ctx.operation)
             .scope(ErrorScope::Cursor(CursorScope::Account))
             .native_code("cursor_account_identity_mismatch")
@@ -1203,7 +1180,7 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             let mut builder =
                 AccountError::unsupported(AccountOperation::OpenBlobRange, protocol_for(ctx))
                     .into_builder()
-                    .google_provider(ctx)
+                    .context(ctx.identity())
                     .text(DiagnosticText::support_only(format!(
                         "gmail blob {blob_id} does not support range reads"
                     )));
@@ -1252,8 +1229,7 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             .push_cause(Cause::Attempt(AttemptCause::new(
                 TransmissionState::Acknowledged,
             )))
-            .google_provider(ctx)
-            .protocol(protocol_for(ctx))
+            .context(ctx.identity())
             .operation(ctx.operation)
             .text(detail);
             if let Some(scope) = ctx.scope.clone() {
@@ -1277,8 +1253,7 @@ fn internal(
         kind,
         Some(detail.clone()),
     )))
-    .google_provider(ctx)
-    .protocol(protocol_for(ctx))
+    .context(ctx.identity())
     .operation(ctx.operation)
     .text(detail);
     if let Some(state) = attempt {

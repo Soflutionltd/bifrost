@@ -510,6 +510,65 @@ mod tests {
             transcript.assert_exhausted();
         }
 
+        #[tokio::test(crate = "tokio")]
+        async fn recipient_payloads_survive_lmtp_rejection_and_final_status_drain() {
+            let transcript = Transcript::new("220 lmtp.example\r\n")
+                .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+                .expect(
+                    "RCPT TO:<second@example.com>\r\n",
+                    "550 second rejected\r\n",
+                )
+                .expect("RCPT TO:<third@example.com>\r\n", "250 third ok\r\n")
+                .expect("DATA\r\n", "354 send body\r\n")
+                .expect("body", "")
+                .expect("\r\n.\r\n", "250 first delivered\r\n550 third rejected\r\n");
+            let conn =
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Dialect::Lmtp)
+                    .await
+                    .unwrap();
+            let transport = AsyncLmtpTransport {
+                marker_: std::marker::PhantomData,
+                inner: pool_with(conn, Dialect::Lmtp).await,
+            };
+            let recipients = ["first", "second", "third"]
+                .into_iter()
+                .map(|name| {
+                    let address =
+                        bifrost_types::Address::named(name, format!("{name}@example.com"));
+                    BatchItem::new(
+                        BatchItemId(format!("opaque-{name}")),
+                        (
+                            crate::address::Address::try_from(&address).unwrap(),
+                            address,
+                        ),
+                    )
+                })
+                .collect();
+            let outcome = transport
+                .send_raw_batch_with_payload(
+                    Some("sender@example.com".parse().unwrap()),
+                    recipients,
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.succeeded().len(), 1);
+            assert_eq!(outcome.failed().len(), 2);
+            assert!(outcome.uncertain().is_empty());
+            assert_eq!(outcome.succeeded()[0].item.id.0, "opaque-first");
+            assert_eq!(outcome.failed()[0].item.id.0, "opaque-second");
+            assert_eq!(outcome.failed()[1].item.id.0, "opaque-third");
+            for entry in outcome.failed() {
+                let name = entry.item.id.0.strip_prefix("opaque-").unwrap();
+                assert_eq!(entry.item.input.address, format!("{name}@example.com"));
+                assert_eq!(entry.item.input.name.as_deref(), Some(name));
+            }
+            transcript.assert_exhausted();
+        }
+
         use std::sync::atomic::{AtomicU64, Ordering};
 
         use crate::transport::smtp::WireMetering;

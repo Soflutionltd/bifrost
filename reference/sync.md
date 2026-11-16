@@ -4829,7 +4829,9 @@ and the existing read-back policy. Retries create a fresh answered set, since a
 new submission legitimately answers the same target again. Enterprise users must
 never see unrelated messages counted or repeated answers overwrite a prior result.
 
-The answer id is the submitted `ObjectId` string, byte for byte: every provider
+The answer key has type `ObjectId`: streaming `ItemOutcome<T>` defaults its
+key parameter to `ObjectId`, and the campaign and read-back consume it directly
+without string coercion. It is the submitted identity, byte for byte: every provider
 echoes the id it was handed rather than re-minting it (IMAP carries the
 submitted spelling in `DecodedObjectId::id`, Graph, Google and JMAP key outcomes
 on the input id). Duplicate caller targets are dropped at campaign intake, first

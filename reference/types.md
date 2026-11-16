@@ -455,8 +455,19 @@ Batch and streaming mutations use the same closed three-lane model:
 - failed;
 - uncertain.
 
-`BatchOutcomeBuilder::finalize` enforces that every submitted
-`BatchItemId` appears exactly once, counting repeated ids as repeated
+Outcome envelopes carry their key as a type parameter: `ItemOutcome<T, K>`
+(default `K = ObjectId`), `BatchSuccess<T, K>`, `BatchFailure<K>`,
+`BatchUncertain<K>`, and `BatchOutcome<T, K>` (collected defaults use
+`K = BatchItemId`). Streaming hydration and mutation methods return keys that
+are the requested `ObjectId`, preserving qualification rather than using the
+hydrated object's id or a string conversion. Campaigns validate membership in
+the current submission before processing any outcome. Collected reaction reads
+also use `ObjectId`. Push subscriptions use `SubmissionIndex(usize)` so repeated
+scopes have distinct positional keys. Only caller-minted Vec batches use
+`BatchItemId(String)`.
+
+`BatchOutcomeBuilder::finalize` enforces that every submitted key of type `K`
+appears exactly once, counting repeated ids as repeated
 submissions. A whole-operation `Err` means
 nothing was transmitted. `Ok(BatchOutcome)` means every item is
 accounted for. `ItemOutcome::Uncertain` means the write may have landed

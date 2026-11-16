@@ -4,8 +4,8 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, AccountStream, BatchItemId, BatchOutcomeBuilder,
-    CursorScope, ErrorScope, SubscriptionHandle,
+    AccountError, AccountFuture, AccountOperation, AccountStream, BatchOutcomeBuilder, CursorScope,
+    ErrorScope, SubmissionIndex, SubscriptionHandle,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -426,11 +426,9 @@ pub(crate) fn push_subscribe(
         // Gmail exposes one account-wide history cursor. One watch therefore
         // covers every Account entry in this request, while unsupported
         // scopes remain independently pollable in the failed lane.
-        let expected: Vec<_> = (0..scopes.len())
-            .map(|index| BatchItemId(index.to_string()))
-            .collect();
+        let expected: Vec<_> = (0..scopes.len()).map(SubmissionIndex).collect();
         let mut outcomes = BatchOutcomeBuilder::new();
-        for (item, scope) in expected.iter().cloned().zip(scopes) {
+        for (item, scope) in expected.iter().copied().zip(scopes) {
             if matches!(&scope, CursorScope::Account) {
                 outcomes.push_succeeded(item, scope);
             } else {
@@ -1272,17 +1270,14 @@ mod tests {
         assert_eq!(subscription.outcomes().succeeded().len(), 1);
         assert_eq!(
             subscription.outcomes().succeeded()[0].item,
-            BatchItemId("0".to_owned())
+            SubmissionIndex(0)
         );
         assert_eq!(
             subscription.outcomes().succeeded()[0].output,
             CursorScope::Account
         );
         assert_eq!(subscription.outcomes().failed().len(), 1);
-        assert_eq!(
-            subscription.outcomes().failed()[0].item,
-            BatchItemId("1".to_owned())
-        );
+        assert_eq!(subscription.outcomes().failed()[0].item, SubmissionIndex(1));
         assert_eq!(
             subscription.outcomes().failed()[0].error.scope(),
             Some(&ErrorScope::Cursor(folder)),

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountError, AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess,
+    AccountError, AccountOperation, AccountStream, Batch, BatchFailure, BatchSuccess,
     BatchUncertain, ContainerId, FlagOp, ItemOutcome, LabelId, MembershipScope, MutationEffect,
     MutationSuccess, ObjectId, PageBoundary, SyncEvent, Warning, WarningKind,
 };
@@ -564,7 +564,7 @@ impl MutationProgress {
                         }
                     };
                     self.states[index] = MutationIdProgress::Finished(ItemOutcome::Succeeded(
-                        BatchSuccess::new(BatchItemId(self.ids[index].0.clone()), output),
+                        BatchSuccess::new(self.ids[index].clone(), output),
                     ));
                 }
             }
@@ -631,17 +631,14 @@ impl MutationProgress {
                     // The per-id ledger knows about earlier accepted bodies;
                     // the failing request's error alone cannot describe them.
                     Some(ItemOutcome::Uncertain(BatchUncertain::new(
-                        BatchItemId(id.0.clone()),
+                        id.clone(),
                         error.clone(),
                     )))
                 }
                 MutationIdProgress::Active {
                     in_flight: true, ..
                 } => {
-                    let outcome = ItemOutcome::from_submission_error(
-                        BatchItemId(id.0.clone()),
-                        error.clone(),
-                    );
+                    let outcome = ItemOutcome::from_submission_error(id.clone(), error.clone());
                     match outcome {
                         ItemOutcome::Uncertain(_) => Some(outcome),
                         // A known refusal leaves these ids for re-issue after
@@ -967,7 +964,7 @@ fn is_not_found(error: &GmailError) -> bool {
 
 fn failed_outcomes(ids: &[ObjectId], error: &AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
     ids.iter()
-        .map(|id| ItemOutcome::Failed(BatchFailure::new(BatchItemId(id.0.clone()), error.clone())))
+        .map(|id| ItemOutcome::Failed(BatchFailure::new(id.clone(), error.clone())))
         .collect()
 }
 
@@ -2092,7 +2089,7 @@ mod tests {
         progress.acknowledge(&ids[..1], 0, &[]);
         progress.finish_failures(
             vec![ItemOutcome::Failed(BatchFailure::new(
-                BatchItemId("refused".into()),
+                bifrost_types::ObjectId("refused".into()),
                 failure,
             ))],
             false,

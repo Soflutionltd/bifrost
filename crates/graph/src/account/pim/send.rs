@@ -208,7 +208,9 @@ fn send_as_rejection(available: bool, mailbox: &PrincipalId) -> AccountError {
         )),
     )
     .into_builder()
-    .provider(bifrost_types::Provider::Microsoft)
+    .context(
+        crate::account::graph_error::GraphErrorContext::graph(AccountOperation::Send).identity(),
+    )
     .try_build()
     .expect("valid Graph send-as rejection")
 }

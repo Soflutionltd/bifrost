@@ -363,8 +363,7 @@ fn shutdown_account_future_error(
             )),
         )),
     )
-    .provider(bifrost_types::Provider::Gmail)
-    .protocol(bifrost_types::Protocol::Gmail)
+    .context(error::GmailErrorContext::base(operation).identity())
     .operation(operation)
     .push_cause(Cause::Attempt(AttemptCause::new(
         bifrost_types::TransmissionState::InFlight,
@@ -384,7 +383,7 @@ fn shutdown_account_future_error(
 fn account_closed_error(operation: AccountOperation) -> AccountError {
     AccountError::account_closed(operation, bifrost_types::Protocol::Gmail)
         .into_builder()
-        .provider(bifrost_types::Provider::Gmail)
+        .context(error::GmailErrorContext::base(operation).identity())
         .try_build()
         .expect("valid closed account error classification")
 }

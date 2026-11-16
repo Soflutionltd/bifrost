@@ -219,7 +219,7 @@ pub(crate) async fn run_object_readback(
                     }
                     let (id, observation) = match item {
                         ItemOutcome::Succeeded(success) => {
-                            let id = ObjectId(success.item.0);
+                            let id = success.item;
                             if !report.objects.contains_key(&id) {
                                 continue;
                             }
@@ -265,11 +265,9 @@ pub(crate) async fn run_object_readback(
                             } else {
                                 ObjectReadback::Unresolved
                             };
-                            (ObjectId(f.item.0), result)
+                            (f.item, result)
                         }
-                        ItemOutcome::Uncertain(u) => {
-                            (ObjectId(u.item.0), ObjectReadback::Unresolved)
-                        }
+                        ItemOutcome::Uncertain(u) => (u.item, ObjectReadback::Unresolved),
                     };
                     if let Some(value) = report.objects.get_mut(&id) {
                         if observed.insert(id.clone()) {

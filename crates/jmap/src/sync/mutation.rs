@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, ErrorScope, FlagOp,
-    ItemOutcome, MembershipScope, MutationSuccess, ObjectId, PageBoundary, SyncEvent,
+    AccountOperation, AccountStream, Batch, BatchFailure, ErrorScope, FlagOp, ItemOutcome,
+    MembershipScope, MutationSuccess, ObjectId, PageBoundary, SyncEvent,
 };
 use futures::StreamExt;
 
@@ -124,7 +124,7 @@ pub(super) fn versioned_stream<T: HttpTransport>(
                     Ok(expected) => expected,
                     Err(error) => {
                         rejected.push(ItemOutcome::Failed(BatchFailure::new(
-                            BatchItemId(target.id.0), error,
+                            target.id, error,
                         )));
                         continue;
                     }
@@ -432,7 +432,7 @@ fn destination_rejection(
         return None;
     }
     Some(ItemOutcome::Failed(BatchFailure::new(
-        BatchItemId(target.0.clone()),
+        target.clone(),
         super::error::cross_account_destination(
             AccountOperation::BulkMove,
             &target.0,
@@ -549,7 +549,7 @@ fn state_mismatch_failed_batch(
             }),
         );
         results.push(ItemOutcome::Failed(BatchFailure::new(
-            BatchItemId(id.0.clone()),
+            id.clone(),
             account_error,
         )));
     }
@@ -1436,7 +1436,7 @@ mod tests {
     #[test]
     fn a_rejected_target_counts_toward_its_owners_batch() {
         let rejected = ItemOutcome::Failed(BatchFailure::new(
-            BatchItemId("m1".to_string()),
+            bifrost_types::ObjectId("m1".to_string()),
             super::super::error::cross_account_destination(
                 AccountOperation::BulkMove,
                 "m1",

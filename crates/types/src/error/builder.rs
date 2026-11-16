@@ -10,6 +10,21 @@ use super::message_key;
 use super::recovery;
 use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
 
+/// Identity of the API or transport leg that owns an error boundary.
+/// Composed accounts keep a separate context for each failing leg.
+#[derive(Clone, Copy, Debug)]
+pub struct AccountErrorContext {
+    provider: Option<Provider>,
+    protocol: Protocol,
+}
+
+impl AccountErrorContext {
+    #[must_use]
+    pub const fn new(provider: Option<Provider>, protocol: Protocol) -> Self {
+        Self { provider, protocol }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum TelemetryField {
     RequestId,
@@ -124,6 +139,16 @@ pub struct AccountErrorBuilder {
 }
 
 impl AccountErrorBuilder {
+    /// Apply the identity owned by the failing API or transport boundary.
+    #[must_use]
+    pub fn context(self, context: AccountErrorContext) -> Self {
+        let builder = self.protocol(context.protocol);
+        match context.provider {
+            Some(provider) => builder.provider(provider),
+            None => builder,
+        }
+    }
+
     #[must_use]
     pub fn new(primary_cause: PrimaryCause) -> Self {
         let status = match &primary_cause {
@@ -411,6 +436,7 @@ impl AccountErrorBuilder {
             &classification_chain,
             throttle_scope,
             self.idempotency_override,
+            self.protocol,
         );
         let leg_recovery = recovery.clone();
         let (partial_commit, recovery) = if let Some(record) = self.partial_commit {

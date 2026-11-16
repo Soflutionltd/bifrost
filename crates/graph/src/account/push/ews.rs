@@ -121,12 +121,12 @@ pub(super) fn ews_subscribable_folder_id(scope: &CursorScope) -> Option<String> 
 pub(super) async fn subscribe_ews(
     account: GraphAccount,
     eligible: Vec<(
-        bifrost_types::BatchItemId,
+        bifrost_types::SubmissionIndex,
         CursorScope,
         crate::account::scope::GraphScope,
     )>,
-    mut outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
-    expected: &[bifrost_types::BatchItemId],
+    mut outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope, bifrost_types::SubmissionIndex>,
+    expected: &[bifrost_types::SubmissionIndex],
 ) -> Result<ArmOutcome, AccountError> {
     let mut pending = Vec::with_capacity(eligible.len());
     for (item, scope, parsed) in eligible {
@@ -194,7 +194,7 @@ pub(super) fn translate_error_context() -> GraphErrorContext {
 pub(super) async fn translate_ews_scopes(
     account: &GraphAccount,
     pending: Vec<PendingEwsScope>,
-    outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope>,
+    outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope, bifrost_types::SubmissionIndex>,
 ) -> Result<Vec<EwsSubscriptionScope>, AccountError> {
     let mut translated = Vec::new();
     let mut chunk_failures: HashMap<String, AccountError> = HashMap::new();
@@ -247,7 +247,7 @@ pub(super) async fn translate_ews_scopes(
 
 /// One scope that passed the shape checks, carried with its lane id and the
 /// REST folder id the translation request will submit for it.
-pub(super) type PendingEwsScope = (bifrost_types::BatchItemId, CursorScope, String);
+pub(super) type PendingEwsScope = (bifrost_types::SubmissionIndex, CursorScope, String);
 
 /// The `inputIds` collections one subscription's translation needs.
 ///
@@ -301,7 +301,7 @@ pub(super) fn reconcile_translated_ews_scopes(
     pending: Vec<PendingEwsScope>,
     translated: Vec<TranslatedExchangeId>,
     chunk_failures: &HashMap<String, AccountError>,
-    outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope>,
+    outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope, bifrost_types::SubmissionIndex>,
 ) -> Vec<EwsSubscriptionScope> {
     let answers: HashMap<String, TranslatedExchangeId> = translated
         .into_iter()
@@ -409,7 +409,7 @@ mod replay_tests {
         let translated = translate_ews_scopes(
             &account,
             vec![(
-                bifrost_types::BatchItemId("f1".into()),
+                bifrost_types::SubmissionIndex(0),
                 CursorScope::Folder(bifrost_types::FolderId("f1".into())),
                 "f1".into(),
             )],

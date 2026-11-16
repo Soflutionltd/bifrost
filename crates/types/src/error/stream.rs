@@ -1,20 +1,24 @@
-use super::batch::{BatchFailure, BatchItemId, BatchSuccess, BatchUncertain};
+use super::batch::{BatchFailure, BatchSuccess, BatchUncertain};
 use super::{AccountError, Application};
+use crate::ObjectId;
 use crate::container::ContainerId;
 
-/// Per-item outcome in a streaming bulk operation. The three-lane
+/// Per-item outcome in a streaming bulk operation. Account streaming lanes
+/// use the default `ObjectId` key and echo the requested identity, including
+/// foreign qualification. A hydrated object's identity is checked separately.
+/// The three-lane
 /// model is closed by design: adding a fourth lane is a deliberate
 /// breaking change, not a smooth extension. Wildcard arms would let
 /// stale consumer policy silently apply to new lanes and lose audit
 /// signal.
 #[derive(Clone, Debug)]
-pub enum ItemOutcome<T> {
-    Succeeded(BatchSuccess<T>),
-    Failed(BatchFailure),
-    Uncertain(BatchUncertain),
+pub enum ItemOutcome<T, K = ObjectId> {
+    Succeeded(BatchSuccess<T, K>),
+    Failed(BatchFailure<K>),
+    Uncertain(BatchUncertain<K>),
 }
 
-impl<T> ItemOutcome<T> {
+impl<T, K> ItemOutcome<T, K> {
     /// Attribute a whole-submission failure to one submitted item.
     ///
     /// Transmission ambiguity is independent of retry advice: an idempotent
@@ -23,7 +27,7 @@ impl<T> ItemOutcome<T> {
     /// not turn an acknowledged refusal of that leg into an uncertain answer.
     /// An enterprise mail user expects ambiguous writes to be checked, while
     /// an explicit refusal remains a failure even after an earlier effect.
-    pub fn from_submission_error(item: BatchItemId, error: AccountError) -> Self {
+    pub fn from_submission_error(item: K, error: AccountError) -> Self {
         let application = error.partial_commit().map_or_else(
             || Application::from_leaf(&error),
             |record| record.primary().application,
@@ -128,8 +132,7 @@ mod tests {
                 )))
                 .try_build()
                 .expect("valid decorated submission error");
-            let outcome =
-                ItemOutcome::<()>::from_submission_error(BatchItemId("item".into()), error);
+            let outcome = ItemOutcome::<()>::from_submission_error(ObjectId("item".into()), error);
             assert_eq!(matches!(outcome, ItemOutcome::Uncertain(_)), uncertain);
         }
 
@@ -146,7 +149,7 @@ mod tests {
         .try_build()
         .expect("valid unreadable success");
         assert!(matches!(
-            ItemOutcome::<()>::from_submission_error(BatchItemId("item".into()), error),
+            ItemOutcome::<()>::from_submission_error(ObjectId("item".into()), error),
             ItemOutcome::Uncertain(_)
         ));
     }

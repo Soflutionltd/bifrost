@@ -298,7 +298,7 @@ async fn a_ledger_that_cannot_close_leaves_nothing_registered_in_either_mode() {
     let error = subscribe_eligible(
         account.clone(),
         vec![(
-            expected[0].clone(),
+            expected[0],
             email_scope("inbox"),
             crate::account::scope::GraphScope::parse(&email_scope("inbox")).expect("mail scope"),
         )],
@@ -337,7 +337,7 @@ async fn a_ledger_that_cannot_close_leaves_nothing_registered_in_either_mode() {
     let error = subscribe_eligible(
         account.clone(),
         vec![(
-            expected[0].clone(),
+            expected[0],
             email_scope("rest-inbox"),
             crate::account::scope::GraphScope::parse(&email_scope("rest-inbox"))
                 .expect("mail scope"),

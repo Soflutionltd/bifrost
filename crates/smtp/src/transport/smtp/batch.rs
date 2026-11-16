@@ -51,7 +51,7 @@ pub enum SubmissionStatus<'a> {
 /// Interpret SMTP or LMTP batch lanes for a message-submission consumer.
 /// The batch remains available for recipient-level receipt reporting.
 #[must_use]
-pub fn submission_status(outcome: &BatchOutcome<()>) -> SubmissionStatus<'_> {
+pub fn submission_status<K>(outcome: &BatchOutcome<(), K>) -> SubmissionStatus<'_> {
     // An Outlook user expects a partially delivered message to remain sent,
     // with the other recipients reported on the receipt. Retrying the whole
     // message would deliver a second copy to recipients who acknowledged it.

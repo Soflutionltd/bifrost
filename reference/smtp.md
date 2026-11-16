@@ -1102,8 +1102,8 @@ and that arm is live rather than latent: `BatchTransaction` records a negative
 end-of-data reply through `set_data_response` exactly as it records a positive
 one (see "PIPELINING"), so `DataFinal` is a phase a driver actually produces.
 Those lanes derive as a PERMANENT refusal: an SMTP 5xx is RFC 5321's permanent
-negative completion, and `bifrost-types`' `derive_server` reads the protocol
-from the `Cause::Wire(WireCause::Smtp(_))` every classified reply carries, so a
+negative completion, and `bifrost-types`' `derive_server` reads the error's
+`protocol` field, which the SMTP translator stamps as SMTP or LMTP, so a
 554 at the terminator is `ProviderRefused` rather than the HTTP 5xx
 `Retry(SameRequest)` it derived before (smtp-CR10, 2026-09-07; see
 `reference/error-model.md`, the Server row). After the body starts, LMTP `Accepted` at resolve time without a per-recipient `Final` is a programming bug caught by `debug_assert!` in debug builds and falls back to an `Uncertain` lane in release. Every failed and uncertain lane carries the envelope recipient as `DiagnosticText::support_only` so support exports preserve per-recipient correlation when N lanes share the same wire response text.
@@ -1338,7 +1338,7 @@ only the dialect: operation is always `Send`, idempotency is always false,
 provider decoration is preserved from a preclassified source, and transmission
 evidence comes only from the low-level error.
 
-`submission_status(&BatchOutcome<()>)` owns submission interpretation and borrows
+`submission_status(&BatchOutcome<(), K>)` owns submission interpretation and borrows
 the outcome without consuming its recipient lanes. `SubmissionStatus::Committed`
 means at least one recipient acknowledged delivery, even if others failed or
 remain uncertain. An enterprise Outlook user expects that message to remain
@@ -1420,3 +1420,12 @@ SMTP retains its protocol-specific token error mapping and blocking snapshot pat
 25, submission plaintext uses 587, and LMTP keeps 24 in every mode. Low-level
 SMTP `Tls` retains required versus opportunistic upgrade and connector parameters;
 those are transport capabilities beyond the shared encryption mode.
+
+Recipient batches can retain caller payloads with `send_raw_batch_with_payload`:
+inputs are `BatchItem<(Address, I)>` and outcome keys are `BatchItem<I>` in all
+three lanes. Caller ids are validated before sending; the closed ledger attaches
+payloads without parsing those ids. The account submission facade carries the
+original shared `Address`, including its display name, so failed and uncertain
+recipients are returned directly even when LMTP skips RCPT refusals during its
+final-status drain. Enterprise users receive the intended recipient on each
+failure receipt instead of a recipient inferred from lane position.

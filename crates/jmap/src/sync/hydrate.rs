@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bifrost_types::{
-    AccountStream, Batch, BatchItemId, BatchSuccess, HydratedObject, HydratedObjectKind,
-    ItemOutcome, ObjectId, PageBoundary, Projection, SyncEvent,
+    AccountStream, Batch, BatchSuccess, HydratedObject, HydratedObjectKind, ItemOutcome, ObjectId,
+    PageBoundary, Projection, SyncEvent,
 };
 use futures::StreamExt;
 
@@ -405,7 +405,7 @@ fn reconcile_hydration(
                     ),
                 );
                 items.push(ItemOutcome::Failed(bifrost_types::BatchFailure::new(
-                    BatchItemId(id.0.clone()),
+                    id.clone(),
                     error,
                 )));
                 continue;
@@ -413,7 +413,7 @@ fn reconcile_hydration(
         };
         if matches!(projection, Projection::FlagsOnly) && !email.has_keywords() {
             items.push(ItemOutcome::Failed(bifrost_types::BatchFailure::new(
-                BatchItemId(id.0.clone()),
+                id.clone(),
                 super::error::missing_property(
                     id.0.clone(),
                     "keywords",
@@ -458,7 +458,7 @@ fn reconcile_hydration(
             }
             _ => HydratedObjectKind::FlagsOnly(bifrost_types::FlagSet::new()),
         };
-        let item_id = BatchItemId(id.0.clone());
+        let item_id = id.clone();
         let hydrated = HydratedObject {
             id,
             kind,

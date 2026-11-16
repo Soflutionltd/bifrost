@@ -502,8 +502,7 @@ impl Campaign {
         // Validate before side effects, conflicts, throttles or accounting.
         // A mail user must never see an unrelated message counted, or a
         // repeated answer overwrite a result already reported this round.
-        let id = bifrost_types::ObjectId(id.0.clone());
-        if !submission.submitted.contains(&id) || !submission.answered.insert(id) {
+        if !submission.submitted.contains(id) || !submission.answered.insert(id.clone()) {
             self.first_error
                 .get_or_insert(Error::Account(mutation_outcome_contract_failure()));
             return false;
@@ -518,12 +517,12 @@ impl Campaign {
         {
             self.partial_commit_observations
                 .push(crate::mutation::PartialCommitObservation {
-                    target: Some(bifrost_types::ObjectId(id.0.clone())),
+                    target: Some(id.clone()),
                     error: error.clone(),
                 });
         }
         if let ItemOutcome::Failed(failure) = &item {
-            let id = bifrost_types::ObjectId(failure.item.0.clone());
+            let id = failure.item.clone();
             if self.expected_versions.contains_key(&id)
                 && matches!(
                     failure.error.kind(),
@@ -542,10 +541,7 @@ impl Campaign {
         if let ItemOutcome::Succeeded(success) = &item
             && let MutationSuccess::Downgraded { actual } = &success.output
         {
-            self.effects.insert(
-                bifrost_types::ObjectId(success.item.0.clone()),
-                actual.clone(),
-            );
+            self.effects.insert(success.item.clone(), actual.clone());
         }
         let error = match &item {
             ItemOutcome::Failed(failure) => Some(failure.error.clone()),
@@ -553,9 +549,9 @@ impl Campaign {
             _ => None,
         };
         let item_id = match &item {
-            ItemOutcome::Succeeded(s) => bifrost_types::ObjectId(s.item.0.clone()),
-            ItemOutcome::Failed(f) => bifrost_types::ObjectId(f.item.0.clone()),
-            ItemOutcome::Uncertain(u) => bifrost_types::ObjectId(u.item.0.clone()),
+            ItemOutcome::Succeeded(s) => s.item.clone(),
+            ItemOutcome::Failed(f) => f.item.clone(),
+            ItemOutcome::Uncertain(u) => u.item.clone(),
         };
         if let Some((directive, error)) = classify_item_outcome(
             item,
@@ -1268,7 +1264,7 @@ pub(crate) fn classify_item_outcome(
     use crate::recovery::RecoveryPlan;
     match item {
         ItemOutcome::Succeeded(success) => {
-            let id = bifrost_types::ObjectId(success.item.0);
+            let id = success.item;
             let bucket = match success.output {
                 MutationSuccess::Applied => MutationBucket::Applied,
                 MutationSuccess::Skipped => MutationBucket::Skipped,
@@ -1288,7 +1284,7 @@ pub(crate) fn classify_item_outcome(
             None
         }
         ItemOutcome::Failed(failure) => {
-            let id = bifrost_types::ObjectId(failure.item.0);
+            let id = failure.item;
             let original = failure.error.clone();
             // Per-item accounting is not a failed stream: retain provider advice
             // and shared holds without emitting one recovery log per item.
@@ -1355,7 +1351,7 @@ pub(crate) fn classify_item_outcome(
         }
         ItemOutcome::Uncertain(uncertain) => {
             crate::recovery::observe_failure_throttles(throttles, account_id, &uncertain.error);
-            let id = bifrost_types::ObjectId(uncertain.item.0);
+            let id = uncertain.item;
             outcomes.insert(
                 id,
                 MutationBucket::PendingReadback(uncertain_origin(&uncertain.error)),
@@ -1425,9 +1421,7 @@ mod campaign_tests {
     use super::*;
     use crate::engine::SyncEngine;
     use crate::mutation::idempotency::{IdempotencyKey, ProtocolSalt};
-    use bifrost_types::{
-        Batch, BatchItemId, BatchSuccess, MutationEffect, ObjectId, PageBoundary, SyncEvent,
-    };
+    use bifrost_types::{Batch, BatchSuccess, MutationEffect, ObjectId, PageBoundary, SyncEvent};
 
     #[test]
     fn declaration_matches_requires_every_unsent_target_on_the_replacement() {
@@ -1599,6 +1593,68 @@ mod campaign_tests {
         }
     }
 
+    #[test]
+    fn campaign_rejects_unsubmitted_object_in_every_outcome_lane() {
+        use bifrost_types::{BatchFailure, BatchUncertain, ProtocolKind};
+
+        let account_id = AccountId("unsubmitted-outcomes".into());
+        let account = crate::test_common::StubAccount::new(Vec::new());
+        let vendor = super::super::IdempotencyVendor::with_run_id(
+            bifrost_types::RunId("unsubmitted".into()),
+            Box::new(|_| ProtocolSalt::Imap),
+        );
+        let requested = ObjectId("requested".into());
+        let unrelated = ObjectId("not-submitted".into());
+        let error = AccountError::unsupported(
+            bifrost_types::AccountOperation::BulkDestroy,
+            bifrost_types::Protocol::Imap,
+        );
+        let items = [
+            ItemOutcome::Succeeded(BatchSuccess::new(
+                unrelated.clone(),
+                MutationSuccess::Applied,
+            )),
+            ItemOutcome::Failed(BatchFailure::new(unrelated.clone(), error.clone())),
+            ItemOutcome::Uncertain(BatchUncertain::new(unrelated.clone(), error)),
+        ];
+        for item in items {
+            let mut campaign = Campaign::new(
+                vec![requested.clone()].into(),
+                BulkPipelineOp::Destroy,
+                &account,
+                &account_id,
+                &vendor,
+                ProtocolKind::Imap,
+                &crate::types::EngineConfig::default(),
+            );
+            campaign
+                .outcomes
+                .insert(requested.clone(), MutationBucket::InFlight);
+            let mut submission =
+                Submission::new(vec![requested.clone()], tokio::time::Instant::now());
+            assert!(!campaign.record_item(
+                item,
+                &mut submission,
+                &crate::throttle::ThrottleBucket::new(),
+                &account_id,
+            ));
+            assert!(
+                matches!(campaign.first_error, Some(Error::Account(ref error))
+                if matches!(error.kind(), bifrost_types::AccountErrorKind::Internal(
+                    bifrost_types::InternalErrorKind::AccountContract
+                )))
+            );
+            assert_eq!(campaign.outcomes.len(), 1);
+            assert_eq!(campaign.outcomes[&requested], MutationBucket::InFlight);
+            assert!(!campaign.outcomes.contains_key(&unrelated));
+            assert!(submission.answered.is_empty());
+            assert!(submission.retry_ids.is_empty());
+            assert!(submission.directives.is_empty());
+            assert!(campaign.effects.is_empty());
+            assert!(campaign.partial_commit_observations.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn campaign_rejects_unknown_duplicate_and_missing_answers() {
         for (answers, applied) in [
@@ -1615,7 +1671,7 @@ mod campaign_tests {
                     // Separate pages ensure duplicate detection spans the stream.
                     SyncEvent::Batch(Batch {
                         items: vec![ItemOutcome::Succeeded(BatchSuccess::new(
-                            BatchItemId(answer.into()),
+                            bifrost_types::ObjectId(answer.into()),
                             MutationSuccess::Applied,
                         ))],
                         page_boundary: PageBoundary::Final,
@@ -1670,7 +1726,7 @@ mod campaign_tests {
         *stub.bulk_flags_script.lock().unwrap() = Some(vec![
             SyncEvent::Batch(Batch {
                 items: vec![ItemOutcome::Succeeded(BatchSuccess::new(
-                    BatchItemId("twice".into()),
+                    bifrost_types::ObjectId("twice".into()),
                     MutationSuccess::Applied,
                 ))],
                 page_boundary: PageBoundary::Final,
@@ -1791,7 +1847,10 @@ mod campaign_tests {
             let mut dedupe = 0;
             let mut advice = None;
             classify_item_outcome(
-                ItemOutcome::Failed(BatchFailure::new(BatchItemId("a".into()), error)),
+                ItemOutcome::Failed(BatchFailure::new(
+                    bifrost_types::ObjectId("a".into()),
+                    error,
+                )),
                 &mut outcomes,
                 &mut retry,
                 &mut dedupe,
@@ -1821,7 +1880,7 @@ mod campaign_tests {
         let mut dedupe = 0;
         let throttles = crate::throttle::ThrottleBucket::new();
         let item = ItemOutcome::Succeeded(BatchSuccess::new(
-            BatchItemId(id.0.clone()),
+            id.clone(),
             MutationSuccess::Downgraded {
                 actual: MutationEffect::MovedToContainer(bifrost_types::ContainerId(
                     "trash".into(),

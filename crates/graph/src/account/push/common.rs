@@ -3,7 +3,7 @@
 //! subscription handle mint.
 
 use bifrost_types::{
-    AccountError, AccountOperation, CursorScope, ErrorScope, Protocol, Provider, SubscriptionHandle,
+    AccountError, AccountOperation, CursorScope, ErrorScope, Protocol, SubscriptionHandle,
 };
 
 use crate::account::graph_error::{GraphErrorContext, into_account_error};
@@ -24,7 +24,7 @@ pub(crate) struct PushEndpoint {
 pub(super) fn unsupported_push_error() -> AccountError {
     AccountError::unsupported(AccountOperation::PushSubscribe, Protocol::Graph)
         .into_builder()
-        .provider(Provider::Microsoft)
+        .context(GraphErrorContext::graph(AccountOperation::PushSubscribe).identity())
         .try_build()
         .expect("valid account error classification")
 }
@@ -35,7 +35,7 @@ pub(super) fn unsupported_push_error() -> AccountError {
 pub(super) fn unsupported_push_scope_error(scope: CursorScope) -> AccountError {
     AccountError::unsupported(AccountOperation::PushSubscribe, Protocol::Graph)
         .into_builder()
-        .provider(Provider::Microsoft)
+        .context(GraphErrorContext::graph(AccountOperation::PushSubscribe).identity())
         .scope(ErrorScope::Cursor(scope))
         .try_build()
         .expect("valid account error classification")
@@ -67,7 +67,9 @@ pub(super) fn unsupported_push_scope_error(scope: CursorScope) -> AccountError {
 /// classified, already scope-correlated - and every other failure's causes
 /// ride along as secondary chain evidence, so the per-scope diagnosis the
 /// ledger held is not lost with the ledger.
-pub(super) fn no_subscribable_push_scopes(failed: &[bifrost_types::BatchFailure]) -> AccountError {
+pub(super) fn no_subscribable_push_scopes(
+    failed: &[bifrost_types::BatchFailure<bifrost_types::SubmissionIndex>],
+) -> AccountError {
     let Some((first, rest)) = failed.split_first() else {
         // Unreachable through `push_subscribe`: an arm answers `None` only
         // when every eligible scope was filed on the failed lane. Answer the
@@ -93,7 +95,7 @@ pub(super) fn no_subscribable_push_scopes(failed: &[bifrost_types::BatchFailure]
 pub(super) fn account_closed_error() -> AccountError {
     AccountError::account_closed(AccountOperation::PushSubscribe, Protocol::Graph)
         .into_builder()
-        .provider(Provider::Microsoft)
+        .context(GraphErrorContext::graph(AccountOperation::PushSubscribe).identity())
         .try_build()
         .expect("valid closed account error classification")
 }
@@ -287,8 +289,8 @@ mod tests {
     #[test]
     fn all_failed_scopes_preserve_the_first_recovery_and_every_cause() {
         use bifrost_types::{
-            AccountErrorBuilder, AttemptCause, BatchFailure, BatchItemId, Cause, PrimaryCause,
-            ServerCause, TransmissionState, TransportCause, TransportErrorKind,
+            AccountErrorBuilder, AttemptCause, BatchFailure, Cause, PrimaryCause, ServerCause,
+            SubmissionIndex, TransmissionState, TransportCause, TransportErrorKind,
         };
 
         let first = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
@@ -308,8 +310,8 @@ mod tests {
         .expect("valid sibling evidence");
         let expected_len = first.chain().iter().count() + sibling.chain().iter().count();
         let merged = super::no_subscribable_push_scopes(&[
-            BatchFailure::new(BatchItemId("first".into()), first.clone()),
-            BatchFailure::new(BatchItemId("sibling".into()), sibling),
+            BatchFailure::new(SubmissionIndex(0), first.clone()),
+            BatchFailure::new(SubmissionIndex(1), sibling),
         ]);
         assert_eq!(merged.kind(), first.kind());
         assert_eq!(merged.recovery(), first.recovery());

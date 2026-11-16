@@ -33,17 +33,17 @@ async fn non_notify_push_reports_the_folder_beyond_its_budget_as_poll_only() {
         .outcomes()
         .succeeded()
         .iter()
-        .map(|item| item.item.0.clone())
+        .map(|item| item.item.0)
         .collect();
     assert_eq!(
         succeeded,
-        vec!["0", "1"],
+        vec![0, 1],
         "every folder up to and including the budget is pushed",
     );
     assert_eq!(result.outcomes().failed().len(), 1);
     assert_eq!(
         result.outcomes().failed()[0].item.0,
-        "2",
+        2,
         "the first folder past the budget, and only it, is rejected",
     );
     assert!(
@@ -101,15 +101,15 @@ async fn a_composed_dav_collection_scope_is_refused_by_push_admission() {
         .outcomes()
         .succeeded()
         .iter()
-        .map(|item| item.item.0.clone())
+        .map(|item| item.item.0)
         .collect();
     assert_eq!(
         succeeded,
-        vec!["1"],
+        vec![1],
         "the DAV collection must not be reported as pushed, and must not block the mail sibling",
     );
     assert_eq!(result.outcomes().failed().len(), 1);
-    assert_eq!(result.outcomes().failed()[0].item.0, "0");
+    assert_eq!(result.outcomes().failed()[0].item.0, 0);
     drop(server);
     account.close().await.unwrap();
 }

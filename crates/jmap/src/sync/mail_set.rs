@@ -3,8 +3,8 @@ use super::state_cache;
 use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailGet, EmailId, EmailSet};
 use bifrost_types::{
-    AccountOperation, BatchFailure, BatchItemId, BatchSuccess, ErrorScope, ItemOutcome,
-    MutationSuccess, ObjectId,
+    AccountOperation, BatchFailure, BatchSuccess, ErrorScope, ItemOutcome, MutationSuccess,
+    ObjectId,
 };
 type MailAccount<T> = super::registry::Slot<T>;
 
@@ -73,10 +73,7 @@ pub(super) fn classify_set_response(
     operation: AccountOperation,
 ) -> ItemOutcome<MutationSuccess> {
     match raw {
-        Ok(()) => ItemOutcome::Succeeded(BatchSuccess::new(
-            BatchItemId(id.0.clone()),
-            MutationSuccess::Applied,
-        )),
+        Ok(()) => ItemOutcome::Succeeded(BatchSuccess::new(id.clone(), MutationSuccess::Applied)),
         Err(crate::Error::Set(set_error)) => {
             let ctx = super::error::JmapErrorContext::new(operation);
             let item_scope = Some(ErrorScope::Message {
@@ -89,19 +86,16 @@ pub(super) fn classify_set_response(
                 crate::core::set::SetErrorType::NotFound
             ) && operation.skips_absent_target()
             {
-                ItemOutcome::Succeeded(BatchSuccess::new(
-                    BatchItemId(id.0.clone()),
-                    MutationSuccess::Skipped,
-                ))
+                ItemOutcome::Succeeded(BatchSuccess::new(id.clone(), MutationSuccess::Skipped))
             } else {
                 ItemOutcome::Failed(BatchFailure::new(
-                    BatchItemId(id.0.clone()),
+                    id.clone(),
                     super::error::set_error_to_account_error(set_error, ctx, item_scope),
                 ))
             }
         }
         Err(err) => ItemOutcome::Failed(BatchFailure::new(
-            BatchItemId(id.0.clone()),
+            id.clone(),
             super::error::into_account_error(
                 err,
                 super::error::JmapErrorContext::new(operation).with_scope(ErrorScope::Message {

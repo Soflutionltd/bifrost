@@ -18,7 +18,7 @@
 //! Exactly-once is a property of the types rather than of an assertion.
 //! [`TargetBatch::settle`] drives the classification itself: it walks its own
 //! targets and hands the caller one [`Target`] at a time - a non-`Clone`
-//! permit carrying the id and the `BatchItemId` stamped from it - and the
+//! permit carrying the decoded id and its requested `ObjectId` - and the
 //! caller must hand back the [`Sealed`] outcome that permit produced.
 //! `Sealed` has no constructor but [`Target::seal`], which consumes the
 //! permit, so a classifier cannot answer for an id twice (the permit is
@@ -34,9 +34,7 @@
 
 use super::error::excluded_from_operand_error;
 
-use bifrost_types::{
-    AccountError, AccountOperation, BatchFailure, BatchItemId, BatchSuccess, ItemOutcome,
-};
+use bifrost_types::{AccountError, AccountOperation, BatchFailure, BatchSuccess, ItemOutcome};
 
 use super::envelope::DecodedObjectId;
 use crate::types::{MailboxName, Uid, UidSetExpr};
@@ -224,7 +222,7 @@ pub(crate) enum Verdict<T> {
 /// [`Sealed`] outcome.
 pub(crate) struct Target {
     id: DecodedObjectId,
-    item: BatchItemId,
+    item: bifrost_types::ObjectId,
 }
 
 impl Target {
@@ -282,8 +280,8 @@ impl Drop for TargetBatch {
     }
 }
 
-fn item_id(id: &DecodedObjectId) -> BatchItemId {
-    BatchItemId(id.id.0.clone())
+fn item_id(id: &DecodedObjectId) -> bifrost_types::ObjectId {
+    id.id.clone()
 }
 
 #[cfg(test)]

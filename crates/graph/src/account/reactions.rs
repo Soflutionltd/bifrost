@@ -24,7 +24,7 @@
 use std::collections::HashSet;
 
 use bifrost_types::{
-    AccountError, AccountOperation, BatchItemId, BatchOutcome, BatchOutcomeBuilder, ErrorScope,
+    AccountError, AccountOperation, BatchOutcome, BatchOutcomeBuilder, ErrorScope,
     MessageReactionState, ObjectId,
 };
 use serde::Deserialize;
@@ -62,7 +62,7 @@ fn reactions_count_property_id() -> String {
 pub(crate) async fn message_reactions(
     account: GraphAccount,
     ids: &[ObjectId],
-) -> Result<BatchOutcome<MessageReactionState>, AccountError> {
+) -> Result<BatchOutcome<MessageReactionState, ObjectId>, AccountError> {
     let operation = AccountOperation::MessageReactionsRead;
     // Dedupe while preserving order: `finalize` treats a repeated id as a
     // duplicate-lane invariant violation, and a caller asking twice about
@@ -73,7 +73,7 @@ pub(crate) async fn message_reactions(
         .filter(|id| seen.insert(id.0.clone()))
         .cloned()
         .collect();
-    let expected: Vec<BatchItemId> = unique.iter().map(|id| BatchItemId(id.0.clone())).collect();
+    let expected = unique.clone();
 
     // Public-folder ids name EWS items, not Graph messages, and this
     // Graph-only extended-property surface has no EWS implementation. Fail
@@ -89,7 +89,7 @@ pub(crate) async fn message_reactions(
     let mut builder = BatchOutcomeBuilder::new();
     for id in unsupported {
         builder.push_failed(
-            BatchItemId(id.0.clone()),
+            id.clone(),
             unsupported_item_error(operation, ErrorScope::Message { id: id.0.into() }),
         );
     }
@@ -111,7 +111,7 @@ pub(crate) async fn message_reactions(
             message_batch_url(&account, id, &suffix, operation)
         });
         for (id, error) in rejected {
-            builder.push_failed(BatchItemId(id.0.clone()), error);
+            builder.push_failed(id.clone(), error);
         }
         let (chunk, urls): (Vec<ObjectId>, Vec<String>) = routable.into_iter().unzip();
         if chunk.is_empty() {
@@ -157,7 +157,7 @@ pub(crate) async fn message_reactions(
                 let ctx = GraphErrorContext::graph(operation);
                 let error = into_account_error(e, ctx);
                 for id in &chunk {
-                    builder.push_uncertain(BatchItemId(id.0.clone()), error.clone());
+                    builder.push_uncertain(id.clone(), error.clone());
                 }
             }
         }
@@ -175,10 +175,10 @@ pub(crate) async fn message_reactions(
 /// this module - `Internal(InvariantViolated)` - never the provider's
 /// contract breach it used to be filed as.
 fn finalize_reactions(
-    builder: BatchOutcomeBuilder<MessageReactionState>,
-    expected: &[BatchItemId],
+    builder: BatchOutcomeBuilder<MessageReactionState, ObjectId>,
+    expected: &[bifrost_types::ObjectId],
     operation: AccountOperation,
-) -> Result<BatchOutcome<MessageReactionState>, AccountError> {
+) -> Result<BatchOutcome<MessageReactionState, ObjectId>, AccountError> {
     builder.finalize(expected).map_err(|e| {
         into_account_error(
             GraphError::Internal {
@@ -210,7 +210,7 @@ fn classify_chunk(
     chunk: &[ObjectId],
     responses: Vec<BatchResponseItem>,
     operation: AccountOperation,
-    builder: &mut BatchOutcomeBuilder<MessageReactionState>,
+    builder: &mut BatchOutcomeBuilder<MessageReactionState, ObjectId>,
     replayable: &[bool],
 ) {
     let mut answered: HashSet<usize> = HashSet::new();
@@ -219,7 +219,7 @@ fn classify_chunk(
         let message_id = &chunk[index];
         if (200..300).contains(&item.status) {
             builder.push_succeeded(
-                BatchItemId(message_id.0.clone()),
+                message_id.clone(),
                 reaction_state(message_id, item.body.as_ref()),
             );
         } else {
@@ -228,7 +228,7 @@ fn classify_chunk(
                 id: (message_id.0.clone()).into(),
             });
             builder.push_failed(
-                BatchItemId(message_id.0.clone()),
+                message_id.clone(),
                 super::graph_error::batch_status_error(item.status, headers, body, &ctx),
             );
         }
@@ -244,7 +244,7 @@ fn classify_chunk(
     for (index, message_id) in chunk.iter().enumerate() {
         if !answered.contains(&index) {
             builder.push_uncertain(
-                BatchItemId(message_id.0.clone()),
+                message_id.clone(),
                 batch_response_missing(
                     operation,
                     Some(ErrorScope::Message {
@@ -508,7 +508,9 @@ mod tests {
                 &mut builder,
                 &[true],
             );
-            let outcome = builder.finalize(&[BatchItemId("m1".into())]).unwrap();
+            let outcome = builder
+                .finalize(&[bifrost_types::ObjectId("m1".into())])
+                .unwrap();
             assert!(outcome.succeeded().is_empty());
             assert!(outcome.uncertain().is_empty());
             assert_eq!(outcome.failed().len(), 1);
@@ -544,9 +546,9 @@ mod tests {
         );
         let outcome = builder
             .finalize(&[
-                BatchItemId("ok".to_string()),
-                BatchItemId("gone".to_string()),
-                BatchItemId("unanswered".to_string()),
+                bifrost_types::ObjectId("ok".to_string()),
+                bifrost_types::ObjectId("gone".to_string()),
+                bifrost_types::ObjectId("unanswered".to_string()),
             ])
             .expect("every id lands in exactly one lane");
 
@@ -588,12 +590,15 @@ mod tests {
     fn broken_reaction_accounting_is_internal_not_a_provider_fault() {
         let mut builder = BatchOutcomeBuilder::new();
         builder.push_succeeded(
-            BatchItemId("m1".to_string()),
+            bifrost_types::ObjectId("m1".to_string()),
             reaction_state(&oid("m1"), None),
         );
         let error = finalize_reactions(
             builder,
-            &[BatchItemId("m1".to_string()), BatchItemId("m2".to_string())],
+            &[
+                bifrost_types::ObjectId("m1".to_string()),
+                bifrost_types::ObjectId("m2".to_string()),
+            ],
             AccountOperation::MessageReactionsRead,
         )
         .expect_err("an unaccounted id must fail finalize");
@@ -624,7 +629,7 @@ mod tests {
             &vec![true; chunk.len()],
         );
         let outcome = builder
-            .finalize(&[BatchItemId("m1".to_string())])
+            .finalize(&[bifrost_types::ObjectId("m1".to_string())])
             .expect("finalize");
         assert!(outcome.succeeded().is_empty());
         assert_eq!(outcome.failed().len(), 1);
@@ -648,7 +653,7 @@ mod tests {
             &vec![true; chunk.len()],
         );
         let outcome = builder
-            .finalize(&[BatchItemId("m1".to_string())])
+            .finalize(&[bifrost_types::ObjectId("m1".to_string())])
             .expect("finalize");
         assert_eq!(outcome.succeeded().len(), 1);
         assert!(outcome.failed().is_empty());
@@ -670,7 +675,10 @@ mod tests {
             &vec![true; chunk.len()],
         );
         let outcome = builder
-            .finalize(&[BatchItemId("a".to_string()), BatchItemId("b".to_string())])
+            .finalize(&[
+                bifrost_types::ObjectId("a".to_string()),
+                bifrost_types::ObjectId("b".to_string()),
+            ])
             .expect("finalize");
         let ids: Vec<&str> = outcome
             .iter()

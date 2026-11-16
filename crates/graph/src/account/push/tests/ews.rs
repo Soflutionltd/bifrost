@@ -58,7 +58,7 @@ async fn exchange_id_translation_posts_each_wire_chunk_and_accumulates_answers()
     let pending: Vec<_> = (0..=TRANSLATE_EXCHANGE_IDS_MAX_INPUTS)
         .map(|index| {
             (
-                bifrost_types::BatchItemId(index.to_string()),
+                bifrost_types::SubmissionIndex(index),
                 CursorScope::FolderType {
                     folder: FolderId(format!("f{index}")),
                     ty: ObjectType::Email,
@@ -244,12 +244,12 @@ fn a_translation_answer_with_neither_target_nor_error_is_a_contract_violation() 
 fn scopes_sharing_a_folder_translate_once_and_both_resolve() {
     let pending = vec![
         (
-            bifrost_types::BatchItemId("0".to_string()),
+            bifrost_types::SubmissionIndex(0),
             email_scope("rest-shared"),
             "rest-shared".to_string(),
         ),
         (
-            bifrost_types::BatchItemId("1".to_string()),
+            bifrost_types::SubmissionIndex(1),
             CursorScope::FolderType {
                 folder: FolderId("rest-shared".to_string()),
                 ty: ObjectType::Contact,
@@ -282,7 +282,7 @@ fn translation_requests_stay_inside_the_graph_input_id_cap() {
         .enumerate()
         .map(|(index, folder)| {
             (
-                bifrost_types::BatchItemId(index.to_string()),
+                bifrost_types::SubmissionIndex(index),
                 email_scope(folder),
                 folder.clone(),
             )
@@ -311,7 +311,7 @@ async fn a_failed_translation_chunk_fails_only_its_own_scopes() {
     let pending: Vec<PendingEwsScope> = (0..=TRANSLATE_EXCHANGE_IDS_MAX_INPUTS)
         .map(|index| {
             (
-                bifrost_types::BatchItemId(index.to_string()),
+                bifrost_types::SubmissionIndex(index),
                 email_scope(&format!("f{index}")),
                 format!("f{index}"),
             )
@@ -353,7 +353,7 @@ async fn a_failed_translation_chunk_fails_only_its_own_scopes() {
     let failure = &outcomes.failed()[0];
     assert_eq!(
         failure.item,
-        bifrost_types::BatchItemId(TRANSLATE_EXCHANGE_IDS_MAX_INPUTS.to_string())
+        bifrost_types::SubmissionIndex(TRANSLATE_EXCHANGE_IDS_MAX_INPUTS)
     );
     // The failed scope carries the transport error, not the
     // "translateExchangeIds omitted an answer" contract violation it would
@@ -468,7 +468,7 @@ fn spawn_subscribe_ews(
     let account = account.clone();
     let (item, scope, _) = pending(&["inbox"]).remove(0);
     tokio::spawn(async move {
-        let expected = vec![item.clone()];
+        let expected = vec![item];
         subscribe_ews(
             account,
             vec![(

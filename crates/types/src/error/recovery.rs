@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::error::ServerCause;
+use crate::error::{ServerCause, WireCause};
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
@@ -8,12 +8,12 @@ use crate::cursor::CursorScope;
 use crate::ids::{AccountId, FolderId, PrincipalId};
 
 use super::account_error::AccountError;
-use super::cause::{AccessCause, Cause, CauseChain, StateCause, TransmissionState, WireCause};
+use super::cause::{AccessCause, Cause, CauseChain, StateCause, TransmissionState};
 use super::kind::{
     AccessErrorKind, AccountErrorKind, AuthErrorKind, MailboxUnavailableKind, ProtocolErrorKind,
     RequestErrorKind, ResourceKind, ServerErrorKind, SyncStateErrorKind,
 };
-use super::scope::{AccountOperation, ErrorScope};
+use super::scope::{AccountOperation, ErrorScope, Protocol};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -532,6 +532,7 @@ pub(crate) fn derive(
     chain: &CauseChain,
     throttle_scope: Option<ThrottleScope>,
     idempotency_override: Option<bool>,
+    protocol: Option<Protocol>,
 ) -> RecoveryClass {
     let tx_state = transmission_state(chain).unwrap_or(TransmissionState::Unsent);
     let idempotent = idempotency_override
@@ -589,7 +590,7 @@ pub(crate) fn derive(
         AccountErrorKind::Authentication(kind) => derive_auth(*kind, chain),
         AccountErrorKind::Authorization(kind) => derive_access(*kind, chain),
         AccountErrorKind::Server(kind) => {
-            derive_server(*kind, tx_state, idempotent, chain, throttle_scope)
+            derive_server(*kind, tx_state, idempotent, chain, throttle_scope, protocol)
         }
         AccountErrorKind::SyncState(_) => derive_sync_state(chain),
         AccountErrorKind::ConcurrencyConflict => RecoveryClass::Retry(RetryAdvice {
@@ -756,6 +757,7 @@ fn derive_server(
     idempotent: bool,
     chain: &CauseChain,
     throttle_scope: Option<ThrottleScope>,
+    protocol: Option<Protocol>,
 ) -> RecoveryClass {
     let retry_hint = server_retry_hint(chain);
     match kind {
@@ -793,16 +795,17 @@ fn derive_server(
                 // permanent refusal at `DataFinal` derived `Retry(SameRequest)`
                 // and told the consumer to resend a whole message body to a
                 // server that had just permanently refused it. The protocol is
-                // read from the cause chain: every SMTP reply the translator
-                // classifies carries SMTP wire evidence, and no
-                // other protocol mints that cause. Ruled smtp-CR10, 2026-09-07.
-                Some(500..=599) if !smtp_reply(chain) => transient_retry_or_reconcile(
-                    tx_state,
-                    idempotent,
-                    RetryReason::ServerUnavailable,
-                    retry_hint,
-                    None,
-                ),
+                // supplied by the failing leg's error context. An enterprise
+                // user expects a permanent mail refusal to stay refused.
+                Some(500..=599) if !matches!(protocol, Some(Protocol::Smtp | Protocol::Lmtp)) => {
+                    transient_retry_or_reconcile(
+                        tx_state,
+                        idempotent,
+                        RetryReason::ServerUnavailable,
+                        retry_hint,
+                        None,
+                    )
+                }
                 // No numeric status (IMAP NO/BAD without response code,
                 // SMTP transport shutdown without final reply) combined
                 // with an in-flight attempt: idempotent ops retry,
@@ -946,17 +949,6 @@ fn access_resource(chain: &CauseChain) -> Option<ResourceKind> {
         Cause::Access(AccessCause::PermissionDenied { resource }) => *resource,
         _ => None,
     })
-}
-
-/// Whether the failure is an SMTP (or LMTP) reply, whose numeric status
-/// classes carry RFC 5321 semantics rather than HTTP's. See `derive_server`.
-/// The wire evidence owns the meaning of these digits. Account protocol is
-/// diagnostic metadata and can identify an enclosing IMAP submission account;
-/// restamping that metadata must not turn a permanent SMTP refusal into retry.
-fn smtp_reply(chain: &CauseChain) -> bool {
-    chain
-        .iter()
-        .any(|cause| matches!(cause.wire(), Some(WireCause::Smtp(_))))
 }
 
 pub(crate) fn server_retry_hint(chain: &CauseChain) -> Option<RetryHint> {
@@ -1166,6 +1158,7 @@ mod tests {
             &transport_chain(TransmissionState::Unsent),
             None,
             None,
+            None,
         );
 
         assert!(matches!(
@@ -1185,6 +1178,7 @@ mod tests {
             None,
             Some(AccountOperation::Send),
             &transport_chain(TransmissionState::InFlight),
+            None,
             None,
             None,
         );
@@ -1207,6 +1201,7 @@ mod tests {
             None,
             Some(AccountOperation::SyncChanges),
             &transport_chain(TransmissionState::InFlight),
+            None,
             None,
             None,
         );
@@ -1239,6 +1234,7 @@ mod tests {
             &transport_chain(TransmissionState::Acknowledged),
             None,
             None,
+            None,
         );
     }
 
@@ -1250,6 +1246,7 @@ mod tests {
             None,
             Some(AccountOperation::Send),
             &transport_chain(TransmissionState::Acknowledged),
+            None,
             None,
             None,
         );
@@ -1265,6 +1262,7 @@ mod tests {
             None,
             Some(AccountOperation::SyncChanges),
             &chain(Cause::Auth(crate::error::AuthCause::RefreshTransient)),
+            None,
             None,
             None,
         );
@@ -1290,6 +1288,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -1307,6 +1306,7 @@ mod tests {
             None,
             Some(AccountOperation::UpdateFlags),
             &chain(Cause::State(StateCause::ConcurrencyConflict)),
+            None,
             None,
             None,
         );
@@ -1332,6 +1332,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         );
 
         assert_eq!(recovery, RecoveryClass::ClientBug);
@@ -1346,6 +1347,7 @@ mod tests {
             &chain(Cause::Wire(crate::error::WireCause::Jmap(
                 crate::error::JmapMethod::ServerPartialFail,
             ))),
+            None,
             None,
             None,
         );
@@ -1365,6 +1367,7 @@ mod tests {
                 retry_hint: Some(hint),
             })),
             Some(ThrottleScope::Account),
+            None,
             None,
         );
 
@@ -1394,6 +1397,7 @@ mod tests {
                 Cause::Attempt(AttemptCause::new(TransmissionState::InFlight)),
             ]),
             Some(ThrottleScope::Account),
+            None,
             None,
         );
 
@@ -1430,6 +1434,7 @@ mod tests {
             ]),
             Some(ThrottleScope::Account),
             None,
+            None,
         );
 
         assert!(matches!(
@@ -1454,6 +1459,7 @@ mod tests {
                 Cause::Server(ServerCause::Unavailable { retry_hint: None }),
                 Cause::Attempt(AttemptCause::new(TransmissionState::InFlight)),
             ]),
+            None,
             None,
             None,
         );
@@ -1484,6 +1490,7 @@ mod tests {
             ]),
             None,
             None,
+            None,
         );
 
         assert!(recovery.is_retryable());
@@ -1498,12 +1505,14 @@ mod tests {
             &chain(Cause::Server(ServerCause::Error { status: Some(503) })),
             None,
             None,
+            None,
         );
         let refused = derive(
             &AccountErrorKind::Server(ServerErrorKind::Error { status: Some(451) }),
             None,
             Some(AccountOperation::SyncChanges),
             &chain(Cause::Server(ServerCause::Error { status: Some(451) })),
+            None,
             None,
             None,
         );
@@ -1513,41 +1522,28 @@ mod tests {
     }
 
     /// An SMTP 5xx is permanent (RFC 5321 4.2.1), whatever the HTTP rule says
-    /// about the same digits. The protocol is read from the wire cause, so the
-    /// same kind and status with no SMTP cause keeps the HTTP derivation.
-    /// Ablation: without the `smtp_reply` guard the 554 derives a retry that
-    /// resends a whole message to a server that permanently refused it.
+    /// about the same digits. Protocol identity belongs to the failing leg.
     #[test]
     fn an_smtp_5xx_is_a_permanent_refusal_not_a_retry() {
-        let smtp = CauseChain::new(vec![
-            Cause::Server(ServerCause::Error { status: Some(554) }),
-            Cause::Wire(WireCause::Smtp(crate::error::EnhancedStatusCode::new(
-                554, None, None,
-            ))),
-            Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)),
-        ]);
-        let refused = derive(
-            &AccountErrorKind::Server(ServerErrorKind::Error { status: Some(554) }),
-            None,
-            Some(AccountOperation::Send),
-            &smtp,
-            None,
-            None,
-        );
-        assert_eq!(refused, RecoveryClass::ProviderRefused);
-
-        let http = derive(
-            &AccountErrorKind::Server(ServerErrorKind::Error { status: Some(554) }),
-            None,
-            Some(AccountOperation::Send),
-            &chain(Cause::Server(ServerCause::Error { status: Some(554) })),
-            None,
-            None,
-        );
-        assert!(
-            http.is_retryable(),
-            "the same digits without an SMTP cause keep the HTTP rule: {http:?}"
-        );
+        for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+            let error = crate::error::AccountErrorBuilder::new(crate::error::PrimaryCause::Server(
+                ServerCause::Error { status: Some(554) },
+            ))
+            .protocol(protocol)
+            .try_build()
+            .expect("valid server failure without optional wire diagnostics");
+            assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused);
+        }
+        let error = crate::error::AccountErrorBuilder::new(crate::error::PrimaryCause::Server(
+            ServerCause::Error { status: Some(554) },
+        ))
+        .protocol(Protocol::Graph)
+        .push_cause(Cause::Wire(WireCause::Smtp(
+            crate::error::EnhancedStatusCode::new(554, None, None),
+        )))
+        .try_build()
+        .expect("valid server failure with secondary evidence");
+        assert!(error.recovery().is_retryable());
     }
 
     #[test]
@@ -1562,6 +1558,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         );
         let account = derive(
             &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
@@ -1570,6 +1567,7 @@ mod tests {
             &chain(Cause::State(StateCause::CursorInvalid {
                 scope: CursorScope::Account,
             })),
+            None,
             None,
             None,
         );
@@ -1607,6 +1605,7 @@ mod tests {
             &transport_chain(TransmissionState::InFlight),
             None,
             None,
+            None,
         );
         // Arm 2: partial-response signal, non-idempotent op. The only arm
         // that also asks for dedupe-by-client-id.
@@ -1617,6 +1616,7 @@ mod tests {
             &chain(Cause::Wire(crate::error::WireCause::Jmap(
                 crate::error::JmapMethod::ServerPartialFail,
             ))),
+            None,
             None,
             None,
         );
@@ -1630,6 +1630,7 @@ mod tests {
                 Cause::Internal(InternalCause::new(InternalErrorKind::Panicked, None)),
                 Cause::Attempt(AttemptCause::new(TransmissionState::InFlight)),
             ]),
+            None,
             None,
             None,
         );
@@ -1701,6 +1702,7 @@ mod tests {
                 &CauseChain::new(causes),
                 None,
                 None,
+                None,
             )
         };
         let reconcile = RecoveryClass::Reconcile(ReconcileAdvice {
@@ -1766,6 +1768,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         );
         let operator = derive(
             &AccountErrorKind::SyncState(SyncStateErrorKind::OperatorOverrideNeeded),
@@ -1774,6 +1777,7 @@ mod tests {
             &chain(Cause::State(StateCause::OperatorOverrideNeeded {
                 reason: OperatorOverrideReason::EstablishRetryBudgetExhausted,
             })),
+            None,
             None,
             None,
         );
@@ -1805,6 +1809,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         );
         let permanent = derive(
             &AccountErrorKind::Authorization(AccessErrorKind::MailboxUnavailable {
@@ -1815,6 +1820,7 @@ mod tests {
             &chain(Cause::Access(AccessCause::MailboxUnavailable {
                 kind: MailboxUnavailableKind::Permanent,
             })),
+            None,
             None,
             None,
         );
@@ -2032,6 +2038,7 @@ mod tests {
             })),
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -2051,6 +2058,7 @@ mod tests {
             &chain(Cause::State(StateCause::ScopeRevoked {
                 scope: CursorScope::Folder(crate::FolderId("Shared/alice".into())),
             })),
+            None,
             None,
             None,
         );
@@ -2122,6 +2130,7 @@ mod tests {
                 ))),
                 None,
                 override_,
+                None,
             );
             let RecoveryClass::Reconcile(advice) = recovery else {
                 panic!("{recovery:?}")
@@ -2137,7 +2146,8 @@ mod tests {
                     TransmissionState::InFlight
                 ))),
                 None,
-                None
+                None,
+                None,
             ),
             RecoveryClass::Retry(_)
         ));

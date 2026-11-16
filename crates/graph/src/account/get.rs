@@ -2,9 +2,9 @@ use bifrost_types::FlagSet;
 use std::collections::HashSet;
 
 use bifrost_types::{
-    AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess, Checkpoint,
-    CursorScope, ErrorScope, FolderId, HydratedObject, HydratedObjectKind, ItemOutcome,
-    MembershipScope, ObjectId, ObjectType, PageBoundary, Projection, SyncEvent,
+    AccountOperation, AccountStream, Batch, BatchFailure, BatchSuccess, Checkpoint, CursorScope,
+    ErrorScope, FolderId, HydratedObject, HydratedObjectKind, ItemOutcome, MembershipScope,
+    ObjectId, ObjectType, PageBoundary, Projection, SyncEvent,
 };
 #[cfg(test)]
 use bytes::Bytes;
@@ -137,7 +137,7 @@ async fn fetch_ews_outcomes(
 ) -> Vec<ItemOutcome<HydratedObject>> {
     let mut outcomes = Vec::new();
     for (id, folder) in ids {
-        let batch_id = BatchItemId(id.0.clone());
+        let batch_id = id.clone();
         let Some(routing) = account.public_folders.public_folder_routing(folder).await else {
             // The routing map starts empty on every reopen and is filled by
             // public-folder discovery, which can skip a folder after a
@@ -321,7 +321,7 @@ async fn fetch_batch(
                 id: (id.0.clone()).into(),
             });
         outcomes.push(ItemOutcome::Failed(BatchFailure::new(
-            BatchItemId(id.0.clone()),
+            id.clone(),
             into_account_error(error, ctx),
         )));
     }
@@ -436,7 +436,7 @@ fn reconcile_hydration_responses(
     for (index, item) in super::batch_routing::resolve_answers(0..ids.len(), responses) {
         seen_indices.insert(index);
         let id = ids[index].clone();
-        let batch_id = BatchItemId(id.0.clone());
+        let batch_id = id.clone();
         if !(200..=299).contains(&item.status) {
             // Per-item failure: build a structured AccountError via
             // the same response classifier the top-level boundary
@@ -500,7 +500,7 @@ fn reconcile_hydration_responses(
             continue;
         }
         outcomes.push(ItemOutcome::Failed(BatchFailure::new(
-            BatchItemId(id.0.clone()),
+            id.clone(),
             super::graph_error::batch_response_missing(
                 AccountOperation::Hydrate,
                 Some(ErrorScope::Message {

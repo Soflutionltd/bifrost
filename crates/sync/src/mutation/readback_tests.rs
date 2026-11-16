@@ -449,7 +449,7 @@ impl Account for ScriptAccount {
 
 fn success(id: &str, output_id: &str, flags: &[&str]) -> ItemOutcome<HydratedObject> {
     ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
-        bifrost_types::BatchItemId(id.into()),
+        bifrost_types::ObjectId(id.into()),
         HydratedObject {
             id: ObjectId(output_id.into()),
             kind: HydratedObjectKind::FlagsOnly(flags.iter().map(|s| (*s).to_owned()).collect()),
@@ -556,7 +556,7 @@ async fn a_per_item_engine_failure_is_reported_not_absorbed() {
             .into_iter()
             .map(|id| {
                 ItemOutcome::Failed(bifrost_types::BatchFailure::new(
-                    bifrost_types::BatchItemId(id.into()),
+                    bifrost_types::ObjectId(id.into()),
                     error.clone(),
                 ))
             })
@@ -573,7 +573,7 @@ async fn a_per_item_engine_failure_is_reported_not_absorbed() {
 
 #[tokio::test]
 async fn destroy_readback_requires_message_not_found() {
-    use bifrost_types::{BatchFailure, BatchItemId, RequestCause, ResourceKind};
+    use bifrost_types::{BatchFailure, RequestCause, ResourceKind};
 
     let cases = [
         ("message", ResourceKind::Message),
@@ -600,7 +600,10 @@ async fn destroy_readback_requires_message_not_found() {
                     }))
                     .try_build()
                     .expect("valid not-found classification");
-                ItemOutcome::Failed(BatchFailure::new(BatchItemId((*id).into()), error))
+                ItemOutcome::Failed(BatchFailure::new(
+                    bifrost_types::ObjectId((*id).into()),
+                    error,
+                ))
             })
             .collect(),
     );
@@ -630,7 +633,7 @@ async fn move_readback_bridges_native_mailbox_membership_but_never_owner_tags() 
         (owner.clone(), owner, ObjectReadback::Unsatisfied),
     ] {
         let item = ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
-            bifrost_types::BatchItemId("message".into()),
+            bifrost_types::ObjectId("message".into()),
             HydratedObject {
                 id: ObjectId("message".into()),
                 kind: HydratedObjectKind::Metadata(bifrost_types::InventoryEntry {

@@ -23,38 +23,63 @@ impl<I> BatchItem<I> {
     }
 }
 
-/// Returned from `Account` methods that take a `Vec<BatchItem<_>>`.
+/// Collected outcomes keyed by submission identity. The default `BatchItemId`
+/// belongs to caller-minted `Vec<BatchItem<_>>` inputs; object reads use
+/// `ObjectId`, and positional ledgers use `SubmissionIndex`.
 /// Immutable: lanes are populated via `BatchOutcomeBuilder` and frozen
 /// by `finalize`. The three lanes are closed by design - adding a
 /// fourth lane is a deliberate breaking change.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct BatchOutcome<T> {
-    succeeded: Vec<BatchSuccess<T>>,
-    failed: Vec<BatchFailure>,
-    uncertain: Vec<BatchUncertain>,
+pub struct BatchOutcome<T, K = BatchItemId> {
+    succeeded: Vec<BatchSuccess<T, K>>,
+    failed: Vec<BatchFailure<K>>,
+    uncertain: Vec<BatchUncertain<K>>,
     order: Vec<BatchLane>,
 }
 
-impl<T> BatchOutcome<T> {
+impl<T, K> BatchOutcome<T, K> {
     #[must_use]
-    pub fn succeeded(&self) -> &[BatchSuccess<T>] {
+    pub fn succeeded(&self) -> &[BatchSuccess<T, K>] {
         &self.succeeded
     }
 
     #[must_use]
-    pub fn failed(&self) -> &[BatchFailure] {
+    pub fn failed(&self) -> &[BatchFailure<K>] {
         &self.failed
     }
 
     #[must_use]
-    pub fn uncertain(&self) -> &[BatchUncertain] {
+    pub fn uncertain(&self) -> &[BatchUncertain<K>] {
         &self.uncertain
     }
 
-    /// Iterate over per-item outcomes in submission order (the order
-    /// the `BatchItem`s appeared in the original input vec).
-    pub fn iter(&self) -> impl Iterator<Item = BatchItemOutcome<'_, T>> {
+    /// Attach caller payloads to a closed ledger without changing lanes or order.
+    /// The mapper is called once per entry; it must preserve submission identity.
+    #[must_use]
+    pub fn map_keys<L>(self, mut map: impl FnMut(K) -> L) -> BatchOutcome<T, L> {
+        BatchOutcome {
+            succeeded: self
+                .succeeded
+                .into_iter()
+                .map(|entry| BatchSuccess::new(map(entry.item), entry.output))
+                .collect(),
+            failed: self
+                .failed
+                .into_iter()
+                .map(|entry| BatchFailure::new(map(entry.item), entry.error))
+                .collect(),
+            uncertain: self
+                .uncertain
+                .into_iter()
+                .map(|entry| BatchUncertain::new(map(entry.item), entry.error))
+                .collect(),
+            order: self.order,
+        }
+    }
+
+    /// Iterate over per-item outcomes in builder push order.
+    pub fn iter(&self) -> impl Iterator<Item = BatchItemOutcome<'_, T, K>> {
         self.order.iter().map(|lane| match lane {
             BatchLane::Succeeded(index) => BatchItemOutcome::Succeeded(
                 self.succeeded
@@ -81,14 +106,14 @@ impl<T> BatchOutcome<T> {
 /// submitted id appears exactly once across the three lanes and
 /// returns the immutable outcome.
 #[derive(Clone, Debug)]
-pub struct BatchOutcomeBuilder<T> {
-    succeeded: Vec<BatchSuccess<T>>,
-    failed: Vec<BatchFailure>,
-    uncertain: Vec<BatchUncertain>,
+pub struct BatchOutcomeBuilder<T, K = BatchItemId> {
+    succeeded: Vec<BatchSuccess<T, K>>,
+    failed: Vec<BatchFailure<K>>,
+    uncertain: Vec<BatchUncertain<K>>,
     order: Vec<BatchLane>,
 }
 
-impl<T> Default for BatchOutcomeBuilder<T> {
+impl<T, K> Default for BatchOutcomeBuilder<T, K> {
     fn default() -> Self {
         Self {
             succeeded: Vec::new(),
@@ -99,25 +124,25 @@ impl<T> Default for BatchOutcomeBuilder<T> {
     }
 }
 
-impl<T> BatchOutcomeBuilder<T> {
+impl<T, K> BatchOutcomeBuilder<T, K> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn push_succeeded(&mut self, item: BatchItemId, output: T) {
+    pub fn push_succeeded(&mut self, item: K, output: T) {
         let index = self.succeeded.len();
         self.succeeded.push(BatchSuccess::new(item, output));
         self.order.push(BatchLane::Succeeded(index));
     }
 
-    pub fn push_failed(&mut self, item: BatchItemId, error: AccountError) {
+    pub fn push_failed(&mut self, item: K, error: AccountError) {
         let index = self.failed.len();
         self.failed.push(BatchFailure::new(item, error));
         self.order.push(BatchLane::Failed(index));
     }
 
-    pub fn push_uncertain(&mut self, item: BatchItemId, error: AccountError) {
+    pub fn push_uncertain(&mut self, item: K, error: AccountError) {
         let index = self.uncertain.len();
         self.uncertain.push(BatchUncertain::new(item, error));
         self.order.push(BatchLane::Uncertain(index));
@@ -133,26 +158,26 @@ impl<T> BatchOutcomeBuilder<T> {
     /// silently received no outcome at all. Producers whose ids can repeat
     /// (`push_subscribe`, where two requested scopes may name the same
     /// folder) already key on submission position, so they are unaffected.
-    /// Returns `Err(BatchInvariantError)` on any violation; protocol
+    /// Returns `Err(BatchInvariantError<K>)` on any violation; protocol
     /// crates with bugs that miscount items surface them here rather
     /// than silently shipping a wrong outcome.
-    pub fn finalize(
-        self,
-        expected: &[BatchItemId],
-    ) -> Result<BatchOutcome<T>, BatchInvariantError> {
+    pub fn finalize(self, expected: &[K]) -> Result<BatchOutcome<T, K>, BatchInvariantError<K>>
+    where
+        K: Clone + Eq + std::hash::Hash,
+    {
         // Index `expected` once. The membership test used to be a
         // linear `expected.iter().any(..)` of `String` comparisons
         // inside the per-item loop, i.e. O(n*m) on a hot mutation path:
         // a 1000-item Gmail batch cost roughly a million string
         // compares to prove an invariant that is almost always
         // satisfied.
-        let mut remaining: HashMap<&BatchItemId, usize> = HashMap::new();
+        let mut remaining: HashMap<&K, usize> = HashMap::new();
         for id in expected {
             *remaining.entry(id).or_default() += 1;
         }
-        let known: HashSet<&BatchItemId> = remaining.keys().copied().collect();
-        let mut duplicates: Vec<BatchItemId> = Vec::new();
-        let mut unknown: Vec<BatchItemId> = Vec::new();
+        let known: HashSet<&K> = remaining.keys().copied().collect();
+        let mut duplicates: Vec<K> = Vec::new();
+        let mut unknown: Vec<K> = Vec::new();
 
         for id in self
             .succeeded
@@ -204,16 +229,16 @@ impl<T> BatchOutcomeBuilder<T> {
 /// one lane. Tests inside protocol crates catch this before it ships.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct BatchInvariantError {
+pub struct BatchInvariantError<K = BatchItemId> {
     /// Submitted ids that did not appear in any lane.
-    pub missing: Vec<BatchItemId>,
+    pub missing: Vec<K>,
     /// Ids that appeared in more than one lane.
-    pub duplicates: Vec<BatchItemId>,
+    pub duplicates: Vec<K>,
     /// Ids appearing in a lane that were not in the submitted vec.
-    pub unknown: Vec<BatchItemId>,
+    pub unknown: Vec<K>,
 }
 
-impl fmt::Display for BatchInvariantError {
+impl<K> fmt::Display for BatchInvariantError<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -225,7 +250,7 @@ impl fmt::Display for BatchInvariantError {
     }
 }
 
-impl std::error::Error for BatchInvariantError {}
+impl<K: fmt::Debug> std::error::Error for BatchInvariantError<K> {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BatchLane {
@@ -235,56 +260,60 @@ enum BatchLane {
 }
 
 #[derive(Clone, Debug)]
-pub enum BatchItemOutcome<'a, T> {
-    Succeeded(&'a BatchSuccess<T>),
-    Failed(&'a BatchFailure),
-    Uncertain(&'a BatchUncertain),
+pub enum BatchItemOutcome<'a, T, K = BatchItemId> {
+    Succeeded(&'a BatchSuccess<T, K>),
+    Failed(&'a BatchFailure<K>),
+    Uncertain(&'a BatchUncertain<K>),
 }
 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct BatchSuccess<T> {
-    pub item: BatchItemId,
+pub struct BatchSuccess<T, K = BatchItemId> {
+    pub item: K,
     pub output: T,
 }
 
-impl<T> BatchSuccess<T> {
+impl<T, K> BatchSuccess<T, K> {
     #[must_use]
-    pub fn new(item: BatchItemId, output: T) -> Self {
+    pub fn new(item: K, output: T) -> Self {
         Self { item, output }
     }
 }
 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct BatchFailure {
-    pub item: BatchItemId,
+pub struct BatchFailure<K = BatchItemId> {
+    pub item: K,
     pub error: AccountError,
 }
 
-impl BatchFailure {
+impl<K> BatchFailure<K> {
     #[must_use]
-    pub fn new(item: BatchItemId, error: AccountError) -> Self {
+    pub fn new(item: K, error: AccountError) -> Self {
         Self { item, error }
     }
 }
 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct BatchUncertain {
-    pub item: BatchItemId,
+pub struct BatchUncertain<K = BatchItemId> {
+    pub item: K,
     pub error: AccountError,
 }
 
-impl BatchUncertain {
+impl<K> BatchUncertain<K> {
     #[must_use]
-    pub fn new(item: BatchItemId, error: AccountError) -> Self {
+    pub fn new(item: K, error: AccountError) -> Self {
         Self { item, error }
     }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct BatchItemId(pub String);
+
+/// Zero-based position in the original submission, including repeated inputs.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct SubmissionIndex(pub usize);
 
 /// Pre-flight validation for Vec-batch input. Protocol crates that build a
 /// `Vec<BatchItem<_>>` interface must call this before any byte crosses the
@@ -363,6 +392,32 @@ mod tests {
         }))
         .try_build()
         .expect("valid account error classification")
+    }
+
+    #[test]
+    fn typed_keys_and_payload_mapping_preserve_all_lanes_and_order() {
+        let expected = [SubmissionIndex(2), SubmissionIndex(0), SubmissionIndex(1)];
+        let mut builder = BatchOutcomeBuilder::new();
+        builder.push_uncertain(expected[0], error());
+        builder.push_succeeded(expected[1], "delivered");
+        builder.push_failed(expected[2], error());
+        let outcome = builder
+            .finalize(&expected)
+            .unwrap()
+            .map_keys(|key| BatchItem::new(BatchItemId(format!("opaque-{}", key.0)), key));
+        assert_eq!(outcome.succeeded()[0].output, "delivered");
+        assert_eq!(outcome.succeeded()[0].item.input, SubmissionIndex(0));
+        assert_eq!(outcome.failed()[0].item.input, SubmissionIndex(1));
+        assert_eq!(outcome.uncertain()[0].item.input, SubmissionIndex(2));
+        let order: Vec<_> = outcome
+            .iter()
+            .map(|entry| match entry {
+                BatchItemOutcome::Succeeded(entry) => entry.item.input,
+                BatchItemOutcome::Failed(entry) => entry.item.input,
+                BatchItemOutcome::Uncertain(entry) => entry.item.input,
+            })
+            .collect();
+        assert_eq!(order, expected);
     }
 
     fn ids(strs: &[&str]) -> Vec<BatchItemId> {

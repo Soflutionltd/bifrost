@@ -5,10 +5,9 @@ use std::time::Instant;
 #[cfg(test)]
 use bifrost_types::{AccountErrorKind, ResourceKind};
 use bifrost_types::{
-    AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess, Checkpoint,
-    CursorScope, Fingerprint, HydratedObject, HydratedObjectKind, InventoryEntry, ItemOutcome,
-    LabelId, MembershipScope, ObjectId, PageBoundary, Projection, ServerVersion, SyncEvent,
-    ThreadId,
+    AccountOperation, AccountStream, Batch, BatchFailure, BatchSuccess, Checkpoint, CursorScope,
+    Fingerprint, HydratedObject, HydratedObjectKind, InventoryEntry, ItemOutcome, LabelId,
+    MembershipScope, ObjectId, PageBoundary, Projection, ServerVersion, SyncEvent, ThreadId,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -549,10 +548,9 @@ pub(crate) fn get_stream_cancellable(
             async move {
                 // Clone the id so a failing hydrate can attach
                 // `ErrorScope::Message { id }` to the resulting
-                // `AccountError` (and so the per-item lane carries it as
-                // a `BatchItemId`); moved into `hydrate_one`, the error
-                // scope would carry an empty string.
-                let id_for_error = id.0.clone();
+                // `AccountError` and echo the requested `ObjectId` in the
+                // per-item lane, even after `hydrate_one` takes ownership.
+                let id_for_error = id.clone();
                 let result = hydrate_one(&client, &label_names, id, projection).await;
                 (id_for_error, result)
             }
@@ -571,14 +569,14 @@ pub(crate) fn get_stream_cancellable(
             match result {
                 Ok(hydrated) => {
                     items.push(ItemOutcome::Succeeded(BatchSuccess::new(
-                        BatchItemId(id_for_error),
+                        id_for_error,
                         hydrated,
                     )));
                 }
                 Err(err) => {
                     let account_error = error::into_account_error(
                         err,
-                        error::GmailErrorContext::hydrate_message(id_for_error.clone()),
+                        error::GmailErrorContext::hydrate_message(id_for_error.0.clone()),
                     );
                     if !account_error.recovery().is_item_local() {
                         if stream_error.is_none() {
@@ -586,7 +584,7 @@ pub(crate) fn get_stream_cancellable(
                         }
                     } else {
                         items.push(ItemOutcome::Failed(BatchFailure::new(
-                            BatchItemId(id_for_error),
+                            id_for_error,
                             account_error,
                         )));
                     }

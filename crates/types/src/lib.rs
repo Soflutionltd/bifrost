@@ -152,10 +152,10 @@ pub use error::{
     ReconcileAction, ReconcileAdvice, ReconcileGuidance, ReconcileReason, RecoveryClass,
     RemediationAction, RequestCause, RequestErrorKind, ResourceKind, RetryAdvice, RetryDisposition,
     RetryHint, RetryReason, ServerCause, ServerErrorKind, StateCause, StrategyDowngrade,
-    SupportExportConsented, SupportExportInternal, SupportExportMinimal, SyncStateErrorKind,
-    TelemetryToken, TelemetryView, Throttle, ThrottleBudget, ThrottleKey, ThrottleScope,
-    ThrottleWork, TransmissionState, TransportCause, TransportErrorKind, UnsupportedReason,
-    Warning, WarningKind, WireCause, validate_batch_input,
+    SubmissionIndex, SupportExportConsented, SupportExportInternal, SupportExportMinimal,
+    SyncStateErrorKind, TelemetryToken, TelemetryView, Throttle, ThrottleBudget, ThrottleKey,
+    ThrottleScope, ThrottleWork, TransmissionState, TransportCause, TransportErrorKind,
+    UnsupportedReason, Warning, WarningKind, WireCause, validate_batch_input,
 };
 
 // Stream-event types.

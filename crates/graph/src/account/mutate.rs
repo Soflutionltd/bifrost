@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bifrost_types::{
-    AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchUncertain, Checkpoint,
-    ErrorScope, FlagOp, ItemOutcome, MembershipScope, MutationSuccess, ObjectId, PageBoundary,
+    AccountOperation, AccountStream, Batch, BatchFailure, BatchUncertain, Checkpoint, ErrorScope,
+    FlagOp, ItemOutcome, MembershipScope, MutationSuccess, ObjectId, PageBoundary,
     ProtocolErrorKind, SyncEvent,
 };
 use futures::StreamExt;
@@ -79,7 +79,7 @@ pub(crate) fn bulk_set_flags_if_version_stream(
                         bifrost_types::Protocol::Graph,
                     ).map_err(|error| {
                         error.into_builder()
-                            .provider(bifrost_types::Provider::Microsoft)
+                            .context(super::graph_error::GraphErrorContext::graph(AccountOperation::UpdateFlags).identity())
                             .try_build()
                             .expect("valid Graph version refusal")
                     })?;
@@ -104,7 +104,7 @@ pub(crate) fn bulk_set_flags_if_version_stream(
                         ids.push(target.id);
                     }
                     Err(error) => rejected.push(ItemOutcome::Failed(BatchFailure::new(
-                        BatchItemId(target.id.0), error,
+                        target.id, error,
                     ))),
                 }
             }
@@ -243,9 +243,7 @@ async fn submit_batch_with_version(
         return Ok(vec![SyncEvent::Batch(Batch {
             items: ids
                 .iter()
-                .map(|id| {
-                    ItemOutcome::Failed(BatchFailure::new(BatchItemId(id.0.clone()), error.clone()))
-                })
+                .map(|id| ItemOutcome::Failed(BatchFailure::new(id.clone(), error.clone())))
                 .collect(),
             page_boundary: PageBoundary::Page,
             server_latency: Duration::default(),
@@ -280,7 +278,7 @@ async fn submit_batch_with_version(
         .into_iter()
         .map(|id| {
             ItemOutcome::Failed(BatchFailure::new(
-                BatchItemId(id.0.clone()),
+                id.clone(),
                 super::graph_error::unsupported_item_error(
                     operation_for_kind(kind),
                     ErrorScope::Message { id: id.0.into() },
@@ -332,7 +330,7 @@ async fn submit_batch_with_version(
                 // either, since the terminal `Request(Malformed)` it would
                 // raise names the whole request rather than the one id.
                 preflight_outcomes.push(ItemOutcome::Failed(BatchFailure::new(
-                    BatchItemId(id.0.clone()),
+                    id.clone(),
                     into_account_error(
                         error,
                         GraphErrorContext::graph(operation_for_kind(kind)).with_scope(
@@ -358,7 +356,7 @@ async fn submit_batch_with_version(
             // `Unsupported(BulkMove)` shape that suggests the protocol
             // doesn't support moves at all. (graph-F4 / F1b)
             preflight_outcomes.push(ItemOutcome::Failed(BatchFailure::new(
-                BatchItemId(id.0.clone()),
+                id.clone(),
                 super::graph_error::invalid_item_error(
                     operation_for_kind(kind),
                     bifrost_types::ErrorScope::Message {
@@ -478,7 +476,7 @@ fn append_batch_failure(
             })
             .try_build()
             .expect("valid account error classification");
-        let item = BatchItemId(id.0.clone());
+        let item = id.clone();
         outcomes.push(ItemOutcome::from_submission_error(item, scoped));
     }
 }
@@ -584,7 +582,7 @@ fn reconcile_mutation_responses(
             } else {
                 crate::account::batch::AbsentMeans::Failure
             },
-            BatchItemId(id.0.clone()),
+            id.clone(),
             operation_for_kind(kind),
             scope,
             budget_for(&id),
@@ -596,7 +594,7 @@ fn reconcile_mutation_responses(
             continue;
         }
         item_outcomes.push(ItemOutcome::Uncertain(BatchUncertain::new(
-            BatchItemId(id.0.clone()),
+            id.clone(),
             super::graph_error::batch_response_missing(
                 operation_for_kind(kind),
                 Some(ErrorScope::Message {
@@ -647,7 +645,7 @@ async fn refresh_missing_etags(
                     // failed lane so the consumer sees structured
                     // evidence rather than a misclassified terminal.
                     failed.push(ItemOutcome::Failed(BatchFailure::new(
-                        BatchItemId(id.0.clone()),
+                        id.clone(),
                         protocol_violation(
                             ProtocolErrorKind::MissingField,
                             operation_for_kind(kind),
@@ -664,15 +662,12 @@ async fn refresh_missing_etags(
             }
             Err(error) if skips_absent_message(&error, operation_for_kind(kind)) => {
                 failed.push(ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
-                    BatchItemId(id.0.clone()),
+                    id.clone(),
                     MutationSuccess::Skipped,
                 )));
             }
             Err(error) => {
-                failed.push(ItemOutcome::Failed(BatchFailure::new(
-                    BatchItemId(id.0.clone()),
-                    error,
-                )));
+                failed.push(ItemOutcome::Failed(BatchFailure::new(id.clone(), error)));
             }
         }
     }

@@ -50,6 +50,9 @@ use bifrost_types::{BatchSuccess, ItemOutcome, MutationSuccess};
 use crate::core::error::{JMAPError, MethodErrorType, ProblemDetails, ProblemType};
 use crate::core::set::{SetError, SetErrorType};
 
+const ERROR_CONTEXT: bifrost_types::error::builder::AccountErrorContext =
+    bifrost_types::error::builder::AccountErrorContext::new(None, Protocol::Jmap);
+
 // State-bearing contracts own their recovery scope. A caller cannot describe
 // an anchored or state-based request without saying which cursor to restart.
 #[derive(Clone, Debug)]
@@ -503,7 +506,7 @@ pub(crate) fn search_unknown_account(
                  which this session cannot reach"
         ))),
     }))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(operation)
     .try_build()
     .expect("valid account error classification")
@@ -532,7 +535,7 @@ pub(crate) fn search_cross_account_filter(
                  one Email/query cannot span two accounts"
         ))),
     }))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(operation)
     .try_build()
     .expect("valid account error classification")
@@ -582,7 +585,7 @@ pub(crate) fn search_result_set_superseded(operation: AccountOperation) -> Accou
     AccountErrorBuilder::new(PrimaryCause::State(
         bifrost_types::StateCause::ConcurrencyConflict,
     ))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(operation)
     .text(DiagnosticText::support_only(
         "search result set changed between pages \
@@ -622,7 +625,7 @@ pub(crate) fn no_mappable_push_scopes() -> AccountError {
             "no requested cursor scope maps to a JMAP push data type",
         )),
     }))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::PushSubscribe)
     .try_build()
     .expect("valid account error classification")
@@ -660,7 +663,7 @@ pub(crate) fn cross_account_destination(
                  one Email/set cannot span two accounts"
         ))),
     }))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(operation)
     .scope(ErrorScope::Message {
         id: (target_id.to_string()).into(),
@@ -725,7 +728,7 @@ pub(crate) fn contract_violation(
             detail: Some(DiagnosticText::support_only(message)),
         },
     })
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(operation);
     if let Some(scope) = scope {
         builder = builder.scope(scope);
@@ -889,7 +892,7 @@ pub(crate) fn unregistered_foreign_scope(
     AccountErrorBuilder::new(PrimaryCause::State(StateCause::ScopeRevoked {
         scope: scope.clone(),
     }))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(operation)
     .scope(ErrorScope::Cursor(scope))
     .text(DiagnosticText::support_only(
@@ -927,7 +930,7 @@ fn missing_core_capability() -> AccountError {
     AccountErrorBuilder::new(PrimaryCause::State(StateCause::CapabilityChanged {
         delta: None,
     }))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::Discover)
     .text(DiagnosticText::support_only(
         "JMAP session does not advertise the core capability",
@@ -943,7 +946,7 @@ pub(super) fn session_state_changed() -> AccountError {
     AccountErrorBuilder::new(PrimaryCause::State(StateCause::CapabilityChanged {
         delta: None,
     }))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::ScopeLifecycle)
     .text(DiagnosticText::support_only(
         "JMAP response sessionState diverged from the open session",
@@ -969,7 +972,7 @@ fn unusable_core_limits() -> AccountError {
             )),
         },
     })
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::Discover)
     .try_build()
     .expect("valid account error classification")
@@ -1005,7 +1008,7 @@ pub(super) fn malformed_required_capability(uri: &str) -> AccountError {
             ))),
         },
     })
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::Discover)
     .try_build()
     .expect("valid account error classification")
@@ -1048,7 +1051,7 @@ pub(super) fn missing_shared_rights(container_id: &str, op: AccountOperation) ->
             ))),
         },
     })
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(op)
     .try_build()
     .expect("valid account error classification")
@@ -1060,7 +1063,7 @@ pub(super) fn invalid_attachment_handle(op: AccountOperation) -> AccountError {
             "JMAP attachment handle has no source account; upload it again before sending",
         ),
     }))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(op)
     .try_build()
     .expect("valid attachment handle classification")
@@ -1077,7 +1080,7 @@ pub(super) fn scheduled_requires_envelope() -> AccountError {
             ),
         }),
     )
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::Send)
     .try_build()
     .expect("valid account error classification")
@@ -1091,7 +1094,7 @@ pub(super) fn reschedule_missing_field(detail: &'static str) -> AccountError {
             detail: Some(DiagnosticText::support_only(detail)),
         },
     })
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::RescheduleSend)
     .try_build()
     .expect("valid account error classification")
@@ -1102,7 +1105,7 @@ pub(super) fn reschedule_not_found(id: &str) -> AccountError {
         what: ResourceKind::Message,
         id: Some(id.to_string()),
     }))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::RescheduleSend)
     .try_build()
     .expect("valid account error classification")
@@ -1166,7 +1169,7 @@ pub(super) fn invalid_argument(
         field: Some(field),
         message: Some(DiagnosticText::support_only(message)),
     }))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(operation)
     .try_build()
     .expect("valid account error classification")
@@ -1213,7 +1216,7 @@ pub(super) fn page_concurrency_conflict(
     message: String,
 ) -> AccountError {
     AccountErrorBuilder::new(PrimaryCause::State(StateCause::ConcurrencyConflict))
-        .protocol(Protocol::Jmap)
+        .context(ERROR_CONTEXT)
         .operation(operation)
         .text(DiagnosticText::support_only(message))
         .try_build()
@@ -1252,7 +1255,7 @@ pub(super) fn raw_message_not_found(id: &str) -> AccountError {
         id: Some(id.to_owned()),
     }))
     .operation(AccountOperation::OpenRawRfc822)
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .try_build()
     .expect("valid account error classification")
 }
@@ -1261,7 +1264,7 @@ pub(super) fn invalid_timestamp(operation: AccountOperation, message: String) ->
     AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
         detail: DiagnosticText::user_safe(message),
     }))
-    .protocol(Protocol::Jmap)
+    .context(ERROR_CONTEXT)
     .operation(operation)
     .try_build()
     .expect("valid timestamp refusal")
@@ -1293,7 +1296,7 @@ fn build(primary: PrimaryCause, ctx: &JmapErrorContext) -> AccountErrorBuilder {
 
 fn build_with(ctx: &JmapErrorContext, primary: PrimaryCause) -> AccountErrorBuilder {
     let mut builder = AccountErrorBuilder::new(primary)
-        .protocol(Protocol::Jmap)
+        .context(ERROR_CONTEXT)
         .operation(ctx.operation);
     if let Some(scope) = ctx.scope() {
         builder = builder.scope(scope);

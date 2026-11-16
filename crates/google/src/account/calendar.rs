@@ -692,8 +692,10 @@ fn decode_cross_calendar_cursor(
                 bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Unsent),
             ))
             .operation(AccountOperation::EventSearch)
-            .provider(bifrost_types::Provider::Google)
-            .protocol(bifrost_types::Protocol::GoogleCalendar)
+            .context(
+                super::error::GmailErrorContext::calendar_collection(AccountOperation::EventSearch)
+                    .identity(),
+            )
             .text(bifrost_types::DiagnosticText::support_only(
                 "cross-calendar search cursor references a calendar no longer listed; \
                  restart the search",

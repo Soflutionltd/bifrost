@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, AccountStream, BatchItemId, BatchOutcomeBuilder,
-    CursorScope, HintPayload, InvalidationHint, PushSource, SubscriptionHandle,
+    AccountError, AccountFuture, AccountOperation, AccountStream, BatchOutcomeBuilder, CursorScope,
+    HintPayload, InvalidationHint, PushSource, SubmissionIndex, SubscriptionHandle,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -91,9 +91,7 @@ pub(crate) fn push_subscribe(
         let handle = SubscriptionHandle(format!("imap-idle-{id}"));
         // Batch item ids are submission positions, per the cross-crate
         // contract in `reference/error-model.md`.
-        let expected: Vec<_> = (0..scopes.len())
-            .map(|index| BatchItemId(index.to_string()))
-            .collect();
+        let expected: Vec<_> = (0..scopes.len()).map(SubmissionIndex).collect();
         let mut outcomes = BatchOutcomeBuilder::new();
         let accepted = {
             let mut subscriptions = account
@@ -109,7 +107,7 @@ pub(crate) fn push_subscribe(
                 .map(|folder| folder.account_id())
                 .collect();
             let mut accepted = HashSet::new();
-            for (item, scope) in expected.iter().cloned().zip(scopes.iter().cloned()) {
+            for (item, scope) in expected.iter().copied().zip(scopes.iter().cloned()) {
                 let CursorScope::Folder(folder) = &scope else {
                     outcomes.push_failed(item, unsupported_push_scope_error());
                     continue;

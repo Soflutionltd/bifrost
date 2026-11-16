@@ -418,6 +418,40 @@ macro_rules! transport_methods {
         Ok(result)
     }
 
+    /// Send recipients while returning the caller's payload in every outcome lane.
+    /// Opaque caller ids are validated before sending; payloads never pass through
+    /// an address or submission-position string conversion.
+    #[cfg(feature = "account-error")]
+    pub $($async)* fn send_raw_batch_with_payload<I>(
+        &self,
+        from: Option<Address>,
+        recipients: Vec<BatchItem<(Address, I)>>,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<BatchOutcome<(), BatchItem<I>>, AccountError> {
+        bifrost_types::error::validate_batch_input(
+            &recipients,
+            $dialect.into(),
+            bifrost_types::error::AccountOperation::Send,
+        )?;
+        let mut payloads = std::collections::HashMap::new();
+        let recipients = recipients
+            .into_iter()
+            .map(|item| {
+                let (address, payload) = item.input;
+                payloads.insert(item.id.clone(), payload);
+                BatchItem::new(item.id, address)
+            })
+            .collect();
+        let outcome = self.send_raw_batch_with_options(from, recipients, email, options) $($wait)* ?;
+        Ok(outcome.map_keys(|id| {
+            let payload = payloads
+                .remove(&id)
+                .expect("closed recipient ledger names a submitted id once");
+            BatchItem::new(id, payload)
+        }))
+    }
+
     /// Account-oriented multi-recipient send over the configured dialect.
     ///
     /// Validates batch input, runs MAIL FROM / RCPT TO / DATA body, and returns

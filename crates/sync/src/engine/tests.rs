@@ -2908,11 +2908,11 @@ fn rejected_push_scopes_are_not_treated_as_covered() {
     let accepted = CursorScope::Folder(FolderId("accepted".into()));
     let rejected = CursorScope::Folder(FolderId("rejected".into()));
     let expected = vec![
-        bifrost_types::BatchItemId("0".into()),
-        bifrost_types::BatchItemId("1".into()),
+        bifrost_types::SubmissionIndex(0),
+        bifrost_types::SubmissionIndex(1),
     ];
     let mut builder = bifrost_types::BatchOutcomeBuilder::new();
-    builder.push_succeeded(expected[0].clone(), accepted.clone());
+    builder.push_succeeded(expected[0], accepted.clone());
     let operation = bifrost_types::AccountOperation::PushSubscribe;
     let error = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Request(
         bifrost_types::RequestCause::Unsupported { operation },
@@ -2921,7 +2921,7 @@ fn rejected_push_scopes_are_not_treated_as_covered() {
     .scope(bifrost_types::ErrorScope::Cursor(rejected))
     .try_build()
     .expect("valid unsupported push error");
-    builder.push_failed(expected[1].clone(), error);
+    builder.push_failed(expected[1], error);
     let result = bifrost_types::PushSubscription::new(
         Some(bifrost_types::SubscriptionHandle("handle".into())),
         builder
@@ -3015,11 +3015,11 @@ fn retry_sweep_leaves_readback_and_engine_blocked_ids_alone() {
 /// same downgrade, burning the campaign's attempts to no purpose.
 #[test]
 fn a_downgraded_mutation_keeps_its_bucket_and_is_not_retried_or_read_back() {
-    use bifrost_types::{BatchItemId, BatchSuccess, ItemOutcome, MutationSuccess};
+    use bifrost_types::{BatchSuccess, ItemOutcome, MutationSuccess};
 
     let id = bifrost_types::ObjectId("message".into());
     let item: ItemOutcome<MutationSuccess> = ItemOutcome::Succeeded(BatchSuccess::new(
-        BatchItemId("message".into()),
+        bifrost_types::ObjectId("message".into()),
         MutationSuccess::Downgraded {
             actual: bifrost_types::MutationEffect::MovedToContainer(bifrost_types::ContainerId(
                 "trash".into(),
@@ -3063,14 +3063,14 @@ fn a_downgraded_mutation_keeps_its_bucket_and_is_not_retried_or_read_back() {
 
 #[test]
 fn per_item_engine_failure_returns_the_directive_for_forwarding() {
-    use bifrost_types::{
-        AccountOperation, BatchFailure, BatchItemId, ItemOutcome, MutationSuccess,
-    };
+    use bifrost_types::{AccountOperation, BatchFailure, ItemOutcome, MutationSuccess};
     let scope = CursorScope::Folder(FolderId("INBOX".into()));
     let error =
         crate::engine_errors::restart_scope_error(scope.clone(), AccountOperation::UpdateFlags);
-    let item: ItemOutcome<MutationSuccess> =
-        ItemOutcome::Failed(BatchFailure::new(BatchItemId("message".into()), error));
+    let item: ItemOutcome<MutationSuccess> = ItemOutcome::Failed(BatchFailure::new(
+        bifrost_types::ObjectId("message".into()),
+        error,
+    ));
     let mut outcomes = std::collections::HashMap::new();
     let mut retry = Vec::new();
     let mut dedupe = 0;

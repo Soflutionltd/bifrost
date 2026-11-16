@@ -788,8 +788,8 @@ destroy, move, and hydration in `get.rs` - all route through it:
   batch and *drives the classification itself*: it walks its own
   targets and calls the caller once per target with a `Target`, returning the
   `Sealed` outcome that call produced.
-  - `Target` is a non-`Clone` permit carrying the id and the `BatchItemId`
-    stamped from it. It is consumed by `Target::seal(Verdict)`, which is the
+  - `Target` is a non-`Clone` permit carrying the decoded id and the requested
+    `ObjectId` used as the outcome key. It is consumed by `Target::seal(Verdict)`, which is the
     only constructor of `Sealed`.
   - So a classifier cannot answer twice for an id (the permit has moved),
     cannot skip one (it owes a `Sealed` per call and has no other way to make
@@ -1126,7 +1126,7 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
 - Per-recipient outcome: SMTP answers per envelope recipient in three lanes.
   When any recipient was accepted the send is `Ok`, and every failed or
   uncertain recipient rides `SendReceipt::recipients_not_accepted` (address
-  mapped back by the lane's envelope index, outcome `Failed` / `Uncertain`, its
+  carried as the lane key's payload, outcome `Failed` / `Uncertain`, its
   own error re-stamped to the call's operation), never resent. `Err` is
   returned only when no recipient acknowledged acceptance; then an uncertain
   recipient's error (InFlight evidence) outranks a failed one's, because a
@@ -1248,7 +1248,7 @@ Opening a shared message must preserve the mailbox view inventory assigned it.
 
 `get_stream` and the bulk mutation streams retain at most `TARGET_BUFFER_ITEMS` (256, in `account/mod.rs`) decoded target ids at once. A full window flushes immediately and a partial window flushes when input closes; 256 is two `BATCH_ITEMS` pages, small enough that a caller streaming millions of ids never materializes them all and large enough that a per-folder UID command still covers a useful range rather than degenerating into one command per id. Each window is grouped into per-folder UID commands, with folders visited by display name and wire identity within that window.
 
-Output ordering is therefore input-window order, then folder display-name order with wire identity breaking ties within a window; FETCH response order within a folder remains server-driven. This is weaker than the previous guarantee, which drained the whole input before visiting folders lexically, so ids for one folder could previously never be split across batches. bifrost-sync tolerates the weaker contract because it keys results by `ObjectId` rather than by arrival position, and `BatchOutcome` carries its own submission-order index (`reference/error-model.md`); nothing downstream may start depending on cross-window ordering. Every requested id is still answered exactly once. Command response bodies retain their separate byte budgets.
+Output ordering is therefore input-window order, then folder display-name order with wire identity breaking ties within a window; FETCH response order within a folder remains server-driven. This is weaker than the previous guarantee, which drained the whole input before visiting folders lexically, so ids for one folder could previously never be split across batches. bifrost-sync tolerates the weaker contract because it keys results by `ObjectId` rather than by arrival position, and `BatchOutcome` carries its own builder push-order index (`reference/error-model.md`); nothing downstream may start depending on cross-window ordering. Every requested id is still answered exactly once. Command response bodies retain their separate byte budgets.
 
 - Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(SyncState(CursorInvalid))` with `Engine(RestartScope(Folder))` recovery and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails. The per-folder error path in turn only downgrades ids that still lack a published outcome (`run_folder_get` prunes the caller's unresolved set as it publishes), so a FETCH failure after the stale batch cannot put one id in two lanes.
 - Wire selection and conversion kind are chosen together by one projection
@@ -1776,7 +1776,7 @@ window rather than growing without bound behind a folder group that never fills.
 no send unless it has something to say.
 
 Batch shape carries no meaning downstream: bifrost-sync's mutation consumer keys
-per-item outcomes by `ObjectId` and reads `BatchOutcome`'s own submission-order
+per-item outcomes by `ObjectId` and reads `BatchOutcome`'s own builder push-order
 index, never batch position or batch size. The invariant that holds is per-id:
 every submitted id is answered exactly once, across all three lanes.
 

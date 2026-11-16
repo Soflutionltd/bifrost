@@ -24,15 +24,15 @@ async fn a_folder_scope_with_an_unsendable_name_is_refused_not_misreported() {
         .outcomes()
         .succeeded()
         .iter()
-        .map(|item| item.item.0.clone())
+        .map(|item| item.item.0)
         .collect();
     assert_eq!(
         succeeded,
-        vec!["1"],
+        vec![1],
         "the invalid name must not be reported as pushed, and must not block the valid sibling",
     );
     assert_eq!(result.outcomes().failed().len(), 1);
-    assert_eq!(result.outcomes().failed()[0].item.0, "0");
+    assert_eq!(result.outcomes().failed()[0].item.0, 0);
     assert!(
         result.outcomes().failed()[0]
             .error

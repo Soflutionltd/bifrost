@@ -134,12 +134,12 @@ pub(crate) struct GraphSubscriptionState {
 pub(super) async fn subscribe_graph(
     account: GraphAccount,
     eligible: Vec<(
-        bifrost_types::BatchItemId,
+        bifrost_types::SubmissionIndex,
         CursorScope,
         crate::account::scope::GraphScope,
     )>,
-    mut outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
-    expected: &[bifrost_types::BatchItemId],
+    mut outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope, bifrost_types::SubmissionIndex>,
+    expected: &[bifrost_types::SubmissionIndex],
 ) -> Result<ArmOutcome, AccountError> {
     let Some(endpoint) = account.push_config.endpoint().cloned() else {
         return Err(unsupported_push_error());
@@ -149,7 +149,7 @@ pub(super) async fn subscribe_graph(
     // where the caller sees exactly which scope was declined and keeps
     // polling coverage for it, while its subscribable siblings still get a
     // live subscription.
-    let mut grouped: HashMap<String, Vec<(bifrost_types::BatchItemId, CursorScope)>> =
+    let mut grouped: HashMap<String, Vec<(bifrost_types::SubmissionIndex, CursorScope)>> =
         HashMap::new();
     for (item, scope, parsed) in eligible {
         match parsed.subscription_resource(&account) {
@@ -248,11 +248,11 @@ pub(super) async fn subscribe_graph(
 /// Everything the spawned subscribe task owns.
 struct SubscribeRequest {
     endpoint: super::common::PushEndpoint,
-    grouped: HashMap<String, Vec<(bifrost_types::BatchItemId, CursorScope)>>,
+    grouped: HashMap<String, Vec<(bifrost_types::SubmissionIndex, CursorScope)>>,
     /// The random part of the handle, minted before any create.
     token: String,
-    outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
-    expected: Vec<bifrost_types::BatchItemId>,
+    outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope, bifrost_types::SubmissionIndex>,
+    expected: Vec<bifrost_types::SubmissionIndex>,
 }
 
 /// The spawned half of the webhook `push_subscribe`: create, register, and
@@ -328,7 +328,7 @@ async fn create_and_register(
         {
             Ok(response) => {
                 for (item, scope) in &covered {
-                    outcomes.push_succeeded(item.clone(), scope.clone());
+                    outcomes.push_succeeded(*item, scope.clone());
                 }
                 subscriptions.push(GraphSubscriptionState {
                     server_id: response.id,

@@ -93,7 +93,8 @@ pub(crate) struct GraphResponseError {
     pub(crate) body: Bytes,
     /// `error.code` decoded into the typed signal enum. Stable
     /// Microsoft codes map onto named variants; everything else lands
-    /// in `GraphSignal::Unknown { code }` carrying the verbatim token.
+    /// in `GraphSignal::Unknown { code }` carrying a shape-checked token
+    /// (empty when rejected).
     /// `None` distinguishes "no Graph error envelope was parseable"
     /// from "envelope decoded with an empty `code`"; the boundary
     /// translates the former into `WireCause::MalformedResponse` while
@@ -232,7 +233,10 @@ impl GraphResponseError {
                 let code = envelope.error.code.unwrap_or_default();
                 let signal = classify_code(&code);
                 let inner = envelope.error.inner_error.map(|ie| GraphInnerError {
-                    code: ie.code,
+                    code: ie
+                        .code
+                        .as_deref()
+                        .and_then(bifrost_net::account_error::correlation_id),
                     message: ie.message,
                     request_id: ie.request_id,
                     client_request_id: ie.client_request_id,
@@ -257,7 +261,7 @@ impl GraphResponseError {
 /// Map a Graph `error.code` token onto the typed wire signal. Stable
 /// Microsoft tokens land on named `GraphSignal` variants; unknown
 /// tokens (and the empty string) fall through to `Unknown { code }`
-/// carrying the verbatim provider string so the audit can flag stable
+/// carrying only a shape-checked provider string so the audit can flag stable
 /// codes that need to be promoted under the wire-enum escape hatch.
 #[must_use]
 pub(crate) fn classify_code(code: &str) -> GraphSignal {
@@ -280,7 +284,7 @@ pub(crate) fn classify_code(code: &str) -> GraphSignal {
         "PreconditionFailed" => GraphSignal::PreconditionFailed,
         "NotFound" => GraphSignal::NotFound,
         other => GraphSignal::Unknown {
-            code: other.to_string(),
+            code: bifrost_net::account_error::correlation_id(other).unwrap_or_default(),
         },
     }
 }
@@ -338,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_code_preserves_verbatim_token() {
+    fn unknown_code_preserves_shape_checked_token() {
         let json = r#"{"error":{"code":"SomeUnknownCode","message":"unknown"}}"#;
         let err = GraphResponseError::from_response(
             StatusCode::BAD_REQUEST,

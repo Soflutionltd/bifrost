@@ -897,7 +897,7 @@ fn invalid_batch_statuses_are_contract_violations() {
             HeaderMap::new(),
             Bytes::new(),
             crate::account::batch::AbsentMeans::Failure,
-            bifrost_types::BatchItemId("m1".into()),
+            bifrost_types::ObjectId("m1".into()),
             AccountOperation::UpdateFlags,
             ErrorScope::Message { id: "m1".into() },
             None,
@@ -914,7 +914,7 @@ fn mutation_2xx_is_applied() {
         HeaderMap::new(),
         Bytes::new(),
         crate::account::batch::AbsentMeans::Failure,
-        bifrost_types::BatchItemId("m1".to_string()),
+        bifrost_types::ObjectId("m1".to_string()),
         AccountOperation::UpdateFlags,
         ErrorScope::Message {
             id: ("m1".to_string()).into(),
@@ -934,7 +934,7 @@ fn mutation_destroy_404_is_skipped() {
         HeaderMap::new(),
         Bytes::new(),
         crate::account::batch::AbsentMeans::Success,
-        bifrost_types::BatchItemId("m1".to_string()),
+        bifrost_types::ObjectId("m1".to_string()),
         AccountOperation::BulkDestroy,
         ErrorScope::Message {
             id: ("m1".to_string()).into(),
@@ -954,7 +954,7 @@ fn mutation_non_destroy_404_is_failed_notfound() {
         HeaderMap::new(),
         Bytes::new(),
         crate::account::batch::AbsentMeans::Failure,
-        bifrost_types::BatchItemId("m1".to_string()),
+        bifrost_types::ObjectId("m1".to_string()),
         AccountOperation::SetIsRead,
         ErrorScope::Message {
             id: ("m1".to_string()).into(),
@@ -979,7 +979,7 @@ fn mutation_412_is_failed_concurrency_conflict_not_skipped() {
         HeaderMap::new(),
         Bytes::new(),
         crate::account::batch::AbsentMeans::Failure,
-        bifrost_types::BatchItemId("m1".to_string()),
+        bifrost_types::ObjectId("m1".to_string()),
         AccountOperation::UpdateFlags,
         ErrorScope::Message {
             id: ("m1".to_string()).into(),
@@ -1004,7 +1004,7 @@ fn mutation_429_carries_retry_hint_and_throttle_scope() {
         headers(&[("retry-after", "10")]),
         Bytes::new(),
         crate::account::batch::AbsentMeans::Failure,
-        bifrost_types::BatchItemId("m1".to_string()),
+        bifrost_types::ObjectId("m1".to_string()),
         AccountOperation::BulkMove,
         ErrorScope::Message {
             id: ("m1".to_string()).into(),
@@ -1039,7 +1039,7 @@ fn mutation_429_routes_non_idempotent_with_retry_classification() {
         HeaderMap::new(),
         Bytes::new(),
         crate::account::batch::AbsentMeans::Failure,
-        bifrost_types::BatchItemId("m1".to_string()),
+        bifrost_types::ObjectId("m1".to_string()),
         AccountOperation::BulkMove,
         ErrorScope::Message {
             id: ("m1".to_string()).into(),

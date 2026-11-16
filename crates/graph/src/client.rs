@@ -1395,8 +1395,12 @@ fn outlook_configuration_refusal(reason: String) -> bifrost_net::Error {
             },
         },
     ))
-    .protocol(bifrost_types::Protocol::Ews)
-    .provider(bifrost_types::Provider::Microsoft)
+    .context(
+        crate::account::graph_error::GraphErrorContext::ews(
+            bifrost_types::AccountOperation::Discover,
+        )
+        .identity(),
+    )
     .try_build()
     .expect("valid configuration refusal");
     bifrost_net::Error::HopPolicy(Box::new(error))

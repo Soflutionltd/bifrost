@@ -14,7 +14,7 @@ pub mod warning;
 pub use account_error::{AccountError, HINTLESS_HOLD_WAIT, HoldTarget};
 pub use batch::{
     BatchFailure, BatchInvariantError, BatchItem, BatchItemId, BatchItemOutcome, BatchOutcome,
-    BatchOutcomeBuilder, BatchSuccess, BatchUncertain, validate_batch_input,
+    BatchOutcomeBuilder, BatchSuccess, BatchUncertain, SubmissionIndex, validate_batch_input,
 };
 pub use builder::{AccountErrorBuildError, AccountErrorBuilder};
 pub use cause::{

@@ -236,8 +236,7 @@ pub fn refused_mail_target(
     Box::pin(futures::stream::once(async move {
         crate::SyncEvent::Batch(crate::Batch {
             items: vec![crate::ItemOutcome::Failed(crate::BatchFailure::new(
-                crate::BatchItemId(id.0),
-                error,
+                id, error,
             ))],
             page_boundary: crate::PageBoundary::Page,
             server_latency: std::time::Duration::ZERO,

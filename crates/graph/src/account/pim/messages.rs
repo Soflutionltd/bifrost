@@ -827,7 +827,7 @@ async fn submit_write_batch_resource(
             } else {
                 absent
             },
-            bifrost_types::BatchItemId(item.id.clone()),
+            bifrost_types::SubmissionIndex(index),
             operation,
             scope,
             target

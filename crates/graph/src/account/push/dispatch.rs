@@ -33,7 +33,7 @@ pub(crate) async fn push_subscribe(
     let expected = push_item_ids(scopes.len());
     let mut outcomes = bifrost_types::BatchOutcomeBuilder::new();
     let mut eligible = Vec::with_capacity(scopes.len());
-    for (item, scope) in expected.iter().cloned().zip(scopes) {
+    for (item, scope) in expected.iter().copied().zip(scopes) {
         let parsed = match crate::account::scope::GraphScope::parse(&scope) {
             Ok(parsed) if !matches!(parsed, crate::account::scope::GraphScope::PublicFolder(_)) => {
                 parsed
@@ -59,7 +59,7 @@ pub(crate) async fn push_subscribe(
 /// (none when every eligible scope failed) and the finalized outcomes.
 pub(super) type ArmOutcome = (
     Option<SubscriptionHandle>,
-    bifrost_types::BatchOutcome<CursorScope>,
+    bifrost_types::BatchOutcome<CursorScope, bifrost_types::SubmissionIndex>,
 );
 
 /// Dispatch the eligible scopes to the configured arm and shape its answer.
@@ -75,12 +75,12 @@ pub(super) type ArmOutcome = (
 pub(super) async fn subscribe_eligible(
     account: GraphAccount,
     eligible: Vec<(
-        bifrost_types::BatchItemId,
+        bifrost_types::SubmissionIndex,
         CursorScope,
         crate::account::scope::GraphScope,
     )>,
-    outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
-    expected: &[bifrost_types::BatchItemId],
+    outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope, bifrost_types::SubmissionIndex>,
+    expected: &[bifrost_types::SubmissionIndex],
 ) -> Result<bifrost_types::PushSubscription, AccountError> {
     let (handle, outcomes) = match &account.push_config {
         PushConfig::Webhook(_) => subscribe_graph(account, eligible, outcomes, expected).await?,
@@ -110,10 +110,8 @@ pub(super) async fn subscribe_eligible(
 /// Positional ids for one `push_subscribe` request's scopes. The lanes are
 /// keyed on submission position because `CursorScope` is not an id and two
 /// requested scopes can legitimately name the same folder.
-pub(super) fn push_item_ids(len: usize) -> Vec<bifrost_types::BatchItemId> {
-    (0..len)
-        .map(|index| bifrost_types::BatchItemId(index.to_string()))
-        .collect()
+pub(super) fn push_item_ids(len: usize) -> Vec<bifrost_types::SubmissionIndex> {
+    (0..len).map(bifrost_types::SubmissionIndex).collect()
 }
 
 /// Close the per-scope ledger, or report that this crate's accounting broke.
@@ -128,9 +126,10 @@ pub(super) fn push_item_ids(len: usize) -> Vec<bifrost_types::BatchItemId> {
 /// Called by each arm BEFORE it registers a handle or wakes a session, never
 /// after: see `subscribe_eligible`.
 pub(super) fn finalize_push_outcomes(
-    outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
-    expected: &[bifrost_types::BatchItemId],
-) -> Result<bifrost_types::BatchOutcome<CursorScope>, AccountError> {
+    outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope, bifrost_types::SubmissionIndex>,
+    expected: &[bifrost_types::SubmissionIndex],
+) -> Result<bifrost_types::BatchOutcome<CursorScope, bifrost_types::SubmissionIndex>, AccountError>
+{
     outcomes.finalize(expected).map_err(|error| {
         into_account_error(
             GraphError::Internal {
@@ -174,7 +173,7 @@ mod tests {
     fn broken_push_accounting_is_internal_not_a_provider_fault() {
         let expected = push_item_ids(2);
         let mut outcomes = BatchOutcomeBuilder::new();
-        outcomes.push_succeeded(expected[0].clone(), CursorScope::Account);
+        outcomes.push_succeeded(expected[0], CursorScope::Account);
         let error = finalize_push_outcomes(outcomes, &expected)
             .expect_err("an unfiled scope must fail finalize");
         assert_eq!(

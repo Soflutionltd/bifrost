@@ -63,7 +63,7 @@ use crate::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
 #[non_exhaustive]
 pub struct PushSubscription {
     handle: Option<SubscriptionHandle>,
-    outcomes: crate::error::BatchOutcome<CursorScope>,
+    outcomes: crate::error::BatchOutcome<CursorScope, crate::SubmissionIndex>,
 }
 
 /// A mismatch between a push subscription handle and its succeeded scopes.
@@ -88,7 +88,7 @@ impl PushSubscription {
     }
 
     /// Per-scope subscription results.
-    pub fn outcomes(&self) -> &crate::error::BatchOutcome<CursorScope> {
+    pub fn outcomes(&self) -> &crate::error::BatchOutcome<CursorScope, crate::SubmissionIndex> {
         &self.outcomes
     }
 
@@ -97,7 +97,7 @@ impl PushSubscription {
         self,
     ) -> (
         Option<SubscriptionHandle>,
-        crate::error::BatchOutcome<CursorScope>,
+        crate::error::BatchOutcome<CursorScope, crate::SubmissionIndex>,
     ) {
         (self.handle, self.outcomes)
     }
@@ -105,7 +105,7 @@ impl PushSubscription {
     /// Build a result only when the handle agrees with the succeeded lane.
     pub fn new(
         handle: Option<SubscriptionHandle>,
-        outcomes: crate::error::BatchOutcome<CursorScope>,
+        outcomes: crate::error::BatchOutcome<CursorScope, crate::SubmissionIndex>,
     ) -> Result<Self, PushSubscriptionBuildError> {
         match (handle.is_some(), !outcomes.succeeded().is_empty()) {
             (true, false) => Err(PushSubscriptionBuildError::HandleWithoutSucceededScopes),
@@ -129,10 +129,10 @@ impl PushSubscription {
         scopes: &[CursorScope],
     ) -> Result<Self, PushSubscriptionBuildError> {
         let expected: Vec<_> = (0..scopes.len())
-            .map(|index| crate::error::BatchItemId(index.to_string()))
+            .map(crate::error::SubmissionIndex)
             .collect();
         let mut builder = crate::error::BatchOutcomeBuilder::new();
-        for (item, scope) in expected.iter().cloned().zip(scopes.iter().cloned()) {
+        for (item, scope) in expected.iter().copied().zip(scopes.iter().cloned()) {
             builder.push_succeeded(item, scope);
         }
         let outcomes = builder
@@ -233,7 +233,8 @@ pub trait Account: Send + Sync {
     fn message_reactions(
         &self,
         _ids: &[ObjectId],
-    ) -> AccountFuture<Result<crate::BatchOutcome<MessageReactionState>, AccountError>> {
+    ) -> AccountFuture<Result<crate::BatchOutcome<MessageReactionState, ObjectId>, AccountError>>
+    {
         let error =
             AccountError::unsupported(AccountOperation::MessageReactionsRead, self.protocol());
         Box::pin(async move { Err(error) })
@@ -428,7 +429,9 @@ pub trait Account: Send + Sync {
     /// successful hydrations emit `Succeeded`, locally-invalid or
     /// remotely-rejected ids emit `Failed`, transport drops that
     /// leave the item state ambiguous emit `Uncertain`. This is the
-    /// same lane shape every other streaming bulk surface uses.
+    /// same lane shape every other streaming bulk surface uses. Every lane's
+    /// key is the requested `ObjectId`, preserving its original qualification;
+    /// a success payload's identity does not replace that correlation key.
     ///
     /// A `FlagsOnly` success carries the object's whole flag state. When the
     /// provider cannot establish the object's whole flag state from the
@@ -606,7 +609,8 @@ pub trait Account: Send + Sync {
     /// directly.
     ///
     /// Returns per-item `ItemOutcome<MutationSuccess>` envelopes.
-    /// Every pulled item produces exactly one outcome. Locally-invalid
+    /// Every pulled item produces exactly one outcome keyed by that requested
+    /// `ObjectId`. Locally-invalid
     /// items emit `Failed` rather than poisoning the stream. Early
     /// termination via `SyncEvent::Terminated(AccountError)` covers
     /// only already-pulled items.
@@ -1468,8 +1472,8 @@ impl std::fmt::Debug for OpenedAccount {
 mod push_subscription_tests {
     use super::*;
     use crate::error::{
-        AccountErrorBuilder, AccountErrorKind, BatchItemId, BatchOutcome, BatchOutcomeBuilder,
-        PrimaryCause, RequestCause,
+        AccountErrorBuilder, AccountErrorKind, BatchOutcome, BatchOutcomeBuilder, PrimaryCause,
+        RequestCause, SubmissionIndex,
     };
 
     #[test]
@@ -1496,27 +1500,27 @@ mod push_subscription_tests {
         }
     }
 
-    fn outcomes_with_success() -> BatchOutcome<CursorScope> {
-        let item = BatchItemId("0".to_string());
+    fn outcomes_with_success() -> BatchOutcome<CursorScope, crate::SubmissionIndex> {
+        let item = SubmissionIndex(0);
         let mut builder = BatchOutcomeBuilder::new();
-        builder.push_succeeded(item.clone(), CursorScope::Account);
+        builder.push_succeeded(item, CursorScope::Account);
         builder.finalize(&[item]).expect("complete outcomes")
     }
 
-    fn outcomes_with_failure() -> BatchOutcome<CursorScope> {
+    fn outcomes_with_failure() -> BatchOutcome<CursorScope, crate::SubmissionIndex> {
         let operation = AccountOperation::PushSubscribe;
         let error = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Unsupported {
             operation,
         }))
         .try_build()
         .expect("valid unsupported error");
-        let item = BatchItemId("0".to_string());
+        let item = SubmissionIndex(0);
         let mut builder = BatchOutcomeBuilder::new();
-        builder.push_failed(item.clone(), error);
+        builder.push_failed(item, error);
         builder.finalize(&[item]).expect("complete outcomes")
     }
 
-    fn empty_outcomes() -> BatchOutcome<CursorScope> {
+    fn empty_outcomes() -> BatchOutcome<CursorScope, crate::SubmissionIndex> {
         BatchOutcomeBuilder::new()
             .finalize(&[])
             .expect("empty outcomes")

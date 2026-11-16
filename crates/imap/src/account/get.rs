@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use bifrost_types::{
-    AccountError, AccountOperation, AccountStream, BatchFailure, BatchItemId, BatchUncertain,
-    HydratedObject, HydratedObjectKind, ItemOutcome, PageBoundary, Projection, SyncEvent,
+    AccountError, AccountOperation, AccountStream, BatchFailure, BatchUncertain, HydratedObject,
+    HydratedObjectKind, ItemOutcome, PageBoundary, Projection, SyncEvent,
 };
 
 use super::error::{
@@ -45,10 +45,7 @@ pub(crate) fn get_stream(
         return Box::pin(
             ids.map(move |id| {
                 batch(
-                    vec![ItemOutcome::Failed(BatchFailure::new(
-                        BatchItemId(id.0),
-                        error.clone(),
-                    ))],
+                    vec![ItemOutcome::Failed(BatchFailure::new(id, error.clone()))],
                     PageBoundary::Page,
                     None,
                     0,
@@ -77,7 +74,7 @@ pub(crate) fn get_stream(
                     // bifrost-shaped value that the caller will fail to
                     // hydrate elsewhere anyway) into the structured
                     // failure lane.
-                    let item_id = BatchItemId(id.0.clone());
+                    let item_id = id.clone();
                     let outcome = ItemOutcome::Failed(BatchFailure::new(item_id, err));
                     if tx
                         .send(batch(vec![outcome], PageBoundary::Page, None, 0))
@@ -153,7 +150,7 @@ async fn flush_get_groups(
                 let uncertain: Vec<ItemOutcome<HydratedObject>> = pending
                     .into_iter()
                     .map(|id| {
-                        let item = BatchItemId(id.id.0);
+                        let item = id.id;
                         ItemOutcome::Uncertain(BatchUncertain::new(item, account_err.clone()))
                     })
                     .collect();
@@ -193,7 +190,7 @@ fn failed_hydration(
 ) -> Vec<ItemOutcome<HydratedObject>> {
     ids.into_iter()
         .map(|id| {
-            let item = BatchItemId(id.id.0);
+            let item = id.id;
             ItemOutcome::Failed(BatchFailure::new(item, error.clone()))
         })
         .collect()

@@ -43,6 +43,13 @@ pub(crate) struct GraphErrorContext {
 }
 
 impl GraphErrorContext {
+    pub(crate) fn identity(&self) -> bifrost_types::error::builder::AccountErrorContext {
+        bifrost_types::error::builder::AccountErrorContext::new(
+            Some(Provider::Microsoft),
+            self.protocol,
+        )
+    }
+
     #[must_use]
     pub(crate) fn graph(operation: AccountOperation) -> Self {
         Self {
@@ -256,9 +263,8 @@ fn net_transport_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> Acco
     );
     let builder = error
         .into_builder()
-        .protocol(ctx.protocol)
-        .operation(ctx.operation)
-        .provider(Provider::Microsoft);
+        .context(ctx.identity())
+        .operation(ctx.operation);
     let builder = match &ctx.scope {
         Some(scope) => builder.scope(scope.clone()),
         None => builder,
@@ -674,7 +680,12 @@ fn response_to_account_error(
     if !matches!(cause, PrimaryCause::Protocol { .. })
         && let Some(signal) = signal.as_ref()
     {
-        builder = builder.push_cause(Cause::Wire(WireCause::Graph(signal.clone())));
+        builder = builder.push_cause(Cause::Wire(WireCause::Graph(match signal {
+            GraphSignal::Unknown { code } => GraphSignal::Unknown {
+                code: bifrost_net::account_error::correlation_id(code).unwrap_or_default(),
+            },
+            signal => signal.clone(),
+        })));
     }
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     builder = response_diagnostics(builder, status, &headers, &body, inner.as_ref());
@@ -682,8 +693,8 @@ fn response_to_account_error(
     // Keep the provider code, but never export free-form response prose.
     if let Some(code) = inner
         .as_ref()
-        .and_then(|inner| inner.code.as_ref())
-        .filter(|code| !code.trim().is_empty())
+        .and_then(|inner| inner.code.as_deref())
+        .and_then(bifrost_net::account_error::correlation_id)
     {
         builder = builder.text(DiagnosticText::support_only(format!(
             "innerError.code: {code}"
@@ -829,9 +840,8 @@ fn classify_no_envelope(
 
 fn base_builder(ctx: &GraphErrorContext, cause: PrimaryCause) -> AccountErrorBuilder {
     AccountErrorBuilder::new(http_error_policy(ctx).apply_throttle(cause))
-        .protocol(ctx.protocol)
+        .context(ctx.identity())
         .operation(ctx.operation)
-        .provider(Provider::Microsoft)
 }
 
 fn finish(builder: AccountErrorBuilder, ctx: &GraphErrorContext) -> AccountError {
@@ -958,7 +968,7 @@ pub(crate) fn ews_shared_scope_error(
 pub(crate) fn unsupported_account_error(operation: AccountOperation) -> AccountError {
     AccountError::unsupported(operation, Protocol::Graph)
         .into_builder()
-        .provider(Provider::Microsoft)
+        .context(GraphErrorContext::graph(operation).identity())
         .try_build()
         .expect("valid account error classification")
 }
@@ -976,7 +986,7 @@ pub(crate) fn unsupported_item_error(
 ) -> AccountError {
     AccountError::unsupported(operation, Protocol::Graph)
         .into_builder()
-        .provider(Provider::Microsoft)
+        .context(GraphErrorContext::graph(operation).identity())
         .scope(scope)
         .try_build()
         .expect("valid account error classification")
@@ -992,8 +1002,7 @@ pub(crate) fn invalid_account_error(
         detail: DiagnosticText::support_only(detail.into()),
     }))
     .operation(operation)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
+    .context(GraphErrorContext::graph(operation).identity())
     .try_build()
     .expect("valid account error classification")
 }
@@ -1016,8 +1025,7 @@ pub(crate) fn invalid_argument_account_error(
         message: Some(DiagnosticText::support_only(detail.into())),
     }))
     .operation(operation)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
+    .context(GraphErrorContext::graph(operation).identity())
     .try_build()
     .expect("valid account error classification")
 }
@@ -1037,8 +1045,7 @@ pub(crate) fn invalid_item_error(
         detail: DiagnosticText::support_only(detail.into()),
     }))
     .operation(operation)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
+    .context(GraphErrorContext::graph(operation).identity())
     .scope(scope)
     .try_build()
     .expect("valid account error classification")
@@ -1064,8 +1071,7 @@ pub(crate) fn stale_local_state_error(
             bifrost_types::TransmissionState::Unsent,
         )))
         .operation(operation)
-        .provider(Provider::Microsoft)
-        .protocol(Protocol::Graph)
+        .context(GraphErrorContext::graph(operation).identity())
         .scope(scope)
         .text(DiagnosticText::support_only(detail.into()))
         .try_build()
@@ -1096,8 +1102,7 @@ pub(crate) fn unroutable_public_resource_error(
     }))
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(operation)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
+    .context(GraphErrorContext::graph(operation).identity())
     .scope(scope)
     .text(DiagnosticText::support_only(detail.into()))
     .try_build()
@@ -1120,7 +1125,7 @@ pub(crate) fn unroutable_public_resource_error(
 /// change, so it classifies `Request(Malformed)` -> `ClientBug`. The scope
 /// names the folder whose id was rejected - without it the operator sees
 /// "a subscription failed" and not which container - and the provider's
-/// verbatim code rides as a typed `WireCause::Graph` for the support export.
+/// shape-checked code rides as a typed `WireCause::Graph` for the support export.
 #[must_use]
 pub(crate) fn id_translation_refused(
     operation: AccountOperation,
@@ -1134,8 +1139,7 @@ pub(crate) fn id_translation_refused(
         detail: detail.clone(),
     }))
     .operation(operation)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
+    .context(GraphErrorContext::graph(operation).identity())
     .scope(scope)
     .text(detail);
     if let Some(code) = code.as_deref() {
@@ -1175,7 +1179,7 @@ pub(crate) fn cursor_error_to_account_error(
     let decode_builder = |fault: bifrost_types::CursorDecodeFault| {
         fault
             .builder(ctx.protocol, ctx.operation)
-            .provider(Provider::Microsoft)
+            .context(ctx.identity())
             .text(DiagnosticText::support_only(decode_detail))
     };
     let builder = match error {
@@ -1283,8 +1287,7 @@ pub(crate) fn protocol_violation(
         },
     })
     .operation(operation)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
+    .context(GraphErrorContext::graph(operation).identity())
     .text(detail);
     if let Some(scope) = scope {
         builder = builder.scope(scope);
@@ -1331,8 +1334,7 @@ pub(crate) fn batch_response_missing(
         },
     })
     .operation(operation)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
+    .context(GraphErrorContext::graph(operation).identity())
     .text(detail);
     if !subrequest_replayable {
         builder = builder.idempotency_override(false);
@@ -1378,19 +1380,19 @@ pub(crate) fn batch_status_error(
 /// rate limited with retry-after + throttle scope, 5xx -> unavailable.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn mutation_item_outcome(
+pub(crate) fn mutation_item_outcome<K>(
     status: u16,
     headers: HeaderMap,
     body: bytes::Bytes,
     absent: crate::account::batch::AbsentMeans,
-    item_id: bifrost_types::BatchItemId,
+    item_id: K,
     operation: AccountOperation,
     scope: ErrorScope,
     // The mailbox budget the item's sub-request was charged to, stamped on
     // a throttled outcome. The outer `$batch` cannot carry it (it mixes
     // mailboxes); each item can.
     budget: Option<bifrost_types::ThrottleBudget>,
-) -> bifrost_types::ItemOutcome<bifrost_types::MutationSuccess> {
+) -> bifrost_types::ItemOutcome<bifrost_types::MutationSuccess, K> {
     use bifrost_types::{BatchFailure, BatchSuccess, ItemOutcome, MutationSuccess};
 
     if (200..300).contains(&status) {
@@ -1413,3 +1415,87 @@ mod unsupported_constructor_tests;
 
 #[cfg(test)]
 mod replay_tests;
+
+#[cfg(test)]
+mod export_policy_tests {
+    use super::*;
+
+    #[test]
+    fn rest_codes_are_shape_checked_without_changing_status_classification() {
+        for code in [
+            "Bearer private-value",
+            "secret",
+            "line\nbreak",
+            "non-ascii-\u{e9}",
+            &"x".repeat(257),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "error": { "code": code, "innerError": { "code": code } }
+            }))
+            .expect("JSON fixture");
+            let error = response_to_account_error(
+                GraphResponseError::from_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    HeaderMap::new(),
+                    body.into(),
+                ),
+                &GraphErrorContext::graph(AccountOperation::SyncChanges),
+            );
+            assert!(error.recovery().is_retryable());
+            let exported =
+                serde_json::to_string(&error.support_internal()).expect("support export");
+            assert!(
+                !exported.contains(code),
+                "rejected code reached internal export"
+            );
+            assert!(error.chain().iter().any(|cause| matches!(
+                cause.wire(), Some(WireCause::Graph(GraphSignal::Unknown { code })) if code.is_empty()
+            )));
+        }
+        let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+            .with_scope(ErrorScope::Cursor(CursorScope::Account));
+        for (code, restart) in [("InvalidDeltaToken", true), ("NewProviderCode", false)] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "error": { "code": code, "innerError": { "code": "InnerDetail123" } }
+            }))
+            .expect("JSON fixture");
+            let error = response_to_account_error(
+                GraphResponseError::from_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    HeaderMap::new(),
+                    body.into(),
+                ),
+                &ctx,
+            );
+            assert_eq!(error.recovery().requires_engine_action(), restart);
+            let exported =
+                serde_json::to_string(&error.support_internal()).expect("support export");
+            assert!(exported.contains(code));
+            assert!(exported.contains("InnerDetail123"));
+        }
+    }
+
+    #[test]
+    fn directly_constructed_response_cannot_export_unchecked_codes() {
+        let response = GraphResponseError {
+            status: StatusCode::BAD_REQUEST,
+            headers: HeaderMap::new(),
+            body: bytes::Bytes::new(),
+            signal: Some(GraphSignal::Unknown {
+                code: "Bearer private-value".into(),
+            }),
+            message: None,
+            inner: Some(GraphInnerError {
+                code: Some("secret".into()),
+                ..Default::default()
+            }),
+        };
+        let error = response_to_account_error(
+            response,
+            &GraphErrorContext::graph(AccountOperation::SyncChanges),
+        );
+        let exported = serde_json::to_string(&error.support_internal()).expect("support export");
+        assert!(!exported.contains("Bearer private-value"));
+        assert!(!exported.contains("secret"));
+    }
+}

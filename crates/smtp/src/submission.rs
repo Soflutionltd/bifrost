@@ -81,12 +81,17 @@ impl Submission {
             .map_err(|_| submission_invalid("invalid SMTP reverse-path address"))?;
         let options = build_send_options(hold)?;
         let mut locally_failed = Vec::new();
-        let recipients: Vec<BatchItem<SmtpAddress>> = envelope
+        let recipients: Vec<BatchItem<(SmtpAddress, bifrost_types::Address)>> = envelope
             .recipients
             .iter()
             .enumerate()
             .filter_map(|(index, address)| match SmtpAddress::try_from(address) {
-                Ok(address) => Some(BatchItem::new(BatchItemId(index.to_string()), address)),
+                Ok(smtp_address) => Some(BatchItem::new(
+                    // An opaque caller token; the returned payload owns the
+                    // original address, so no reader decodes this spelling.
+                    BatchItemId(format!("recipient-{index}")),
+                    (smtp_address, address.clone()),
+                )),
                 Err(_) => {
                     locally_failed.push(RecipientNotAccepted::new(
                         address.clone(),
@@ -106,7 +111,7 @@ impl Submission {
 
         let outcome = self
             .transport
-            .send_raw_batch_with_options(Some(from), recipients, raw, &options)
+            .send_raw_batch_with_payload(Some(from), recipients, raw, &options)
             .await?;
 
         // One shared DATA, three-lane per-recipient outcome. An `Err` from
@@ -140,7 +145,7 @@ impl Submission {
             }
         }
         let mut not_accepted = locally_failed;
-        not_accepted.extend(not_accepted_recipients(&envelope.recipients, &outcome));
+        not_accepted.extend(not_accepted_recipients(&outcome));
         #[cfg(feature = "tracing")]
         if !not_accepted.is_empty() {
             tracing::warn!(
@@ -162,31 +167,25 @@ impl Submission {
     }
 }
 
-/// Map the failed and uncertain lanes back to their envelope recipients.
-/// Each lane entry carries the `BatchItemId` `send_rfc5322` assigned (the
-/// envelope index); the mapping goes by that id, never by position within a
-/// lane, since LMTP's final-status drain skips rejected recipients. An id
-/// that names no envelope entry cannot come from bifrost-smtp, which checks
-/// one answer per submitted id; it is skipped rather than invented.
+/// Return the original caller address from each failed or uncertain lane.
+/// LMTP may omit rejected recipients from its final-status drain, so neither
+/// lane position nor an address reparsed from an identifier can identify them.
 fn not_accepted_recipients<T>(
-    recipients: &[bifrost_types::Address],
-    outcome: &bifrost_types::BatchOutcome<T>,
+    outcome: &bifrost_types::BatchOutcome<T, BatchItem<bifrost_types::Address>>,
 ) -> Vec<RecipientNotAccepted> {
-    let address = |id: &BatchItemId| {
-        id.0.parse::<usize>()
-            .ok()
-            .and_then(|index| recipients.get(index))
-            .cloned()
-    };
-    let failed = outcome.failed().iter().filter_map(|lane| {
-        address(&lane.item).map(|address| {
-            RecipientNotAccepted::new(address, RecipientOutcome::Failed, lane.error.clone())
-        })
+    let failed = outcome.failed().iter().map(|lane| {
+        RecipientNotAccepted::new(
+            lane.item.input.clone(),
+            RecipientOutcome::Failed,
+            lane.error.clone(),
+        )
     });
-    let uncertain = outcome.uncertain().iter().filter_map(|lane| {
-        address(&lane.item).map(|address| {
-            RecipientNotAccepted::new(address, RecipientOutcome::Uncertain, lane.error.clone())
-        })
+    let uncertain = outcome.uncertain().iter().map(|lane| {
+        RecipientNotAccepted::new(
+            lane.item.input.clone(),
+            RecipientOutcome::Uncertain,
+            lane.error.clone(),
+        )
     });
     failed.chain(uncertain).collect()
 }

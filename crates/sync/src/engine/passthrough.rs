@@ -513,7 +513,10 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
         ids: &[bifrost_types::ObjectId],
-    ) -> Result<bifrost_types::BatchOutcome<bifrost_types::MessageReactionState>, Error> {
+    ) -> Result<
+        bifrost_types::BatchOutcome<bifrost_types::MessageReactionState, bifrost_types::ObjectId>,
+        Error,
+    > {
         Ok(self
             .live_account(account_id)?
             .message_reactions(ids)

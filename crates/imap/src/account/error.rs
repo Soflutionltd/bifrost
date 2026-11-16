@@ -59,7 +59,14 @@ pub(crate) struct ImapErrorContext {
     pub(crate) extra_text: Vec<DiagnosticText>,
 }
 
+const ERROR_CONTEXT: bifrost_types::error::builder::AccountErrorContext =
+    bifrost_types::error::builder::AccountErrorContext::new(None, Protocol::Imap);
+
 impl ImapErrorContext {
+    fn identity(&self) -> bifrost_types::error::builder::AccountErrorContext {
+        bifrost_types::error::builder::AccountErrorContext::new(self.provider, Protocol::Imap)
+    }
+
     pub(crate) fn operation(operation: AccountOperation) -> Self {
         Self {
             operation,
@@ -185,12 +192,10 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
             .as_ref()
             .clone()
             .into_builder()
+            .context(ctx.identity())
             .operation(ctx.operation);
         if let Some(scope) = ctx.scope {
             builder = builder.scope(scope);
-        }
-        if let Some(provider) = ctx.provider {
-            builder = builder.provider(provider);
         }
         if let Some(idempotent) = ctx.idempotency_override {
             builder = builder.idempotency_override(idempotent);
@@ -228,14 +233,11 @@ fn finish_translation(
     // and diagnostics, including mailbox responses translated outside changes.
     let diagnostic_scope = ctx.scope.clone();
     let mut builder = AccountErrorBuilder::new(primary_cause)
-        .protocol(Protocol::Imap)
+        .context(ctx.identity())
         .operation(ctx.operation);
 
     if let Some(scope) = diagnostic_scope {
         builder = builder.scope(scope);
-    }
-    if let Some(provider) = ctx.provider {
-        builder = builder.provider(provider);
     }
     if let Some(override_) = ctx.idempotency_override {
         builder = builder.idempotency_override(override_);
@@ -364,7 +366,7 @@ pub(crate) fn modseq_reset(
     AccountErrorBuilder::new(PrimaryCause::State(StateCause::CursorInvalid {
         scope: super::folder_scope(folder),
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::SyncChanges)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
     .text(DiagnosticText::support_only(format!(
@@ -384,7 +386,7 @@ pub(crate) fn incomplete_uid_baseline(folder: &MailboxName) -> AccountError {
     AccountErrorBuilder::new(PrimaryCause::State(StateCause::CursorInvalid {
         scope: super::folder_scope(folder),
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::SyncChanges)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
     .text(DiagnosticText::support_only(format!(
@@ -410,7 +412,7 @@ pub(crate) fn strategy_failure(folder: &MailboxName, downgrade: StrategyDowngrad
     AccountErrorBuilder::new(PrimaryCause::State(StateCause::StrategyFailure {
         downgrade,
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::SyncChanges)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
     .try_build()
@@ -1237,7 +1239,7 @@ pub(super) fn invalid_move_destination_error() -> AccountError {
     AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
         detail: DiagnosticText::support_only("bulk-move destination is not a sendable mailbox"),
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::BulkMove)
     .try_build()
     .expect("valid account error classification")
@@ -1253,7 +1255,7 @@ pub(super) fn concurrency_conflict_error(
     folder: &MailboxName,
 ) -> AccountError {
     AccountErrorBuilder::new(PrimaryCause::State(StateCause::ConcurrencyConflict))
-        .protocol(Protocol::Imap)
+        .context(ERROR_CONTEXT)
         .operation(operation)
         .scope(bifrost_types::ErrorScope::Cursor(
             bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
@@ -1273,7 +1275,7 @@ pub(super) fn uidvalidity_changed_error(
     AccountErrorBuilder::new(PrimaryCause::State(StateCause::CursorInvalid {
         scope: super::folder_scope(folder),
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(operation)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
     .text(DiagnosticText::support_only(
@@ -1291,7 +1293,7 @@ pub(super) fn store_failed_error(
     folder: &MailboxName,
 ) -> AccountError {
     AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::Error { status: None }))
-        .protocol(Protocol::Imap)
+        .context(ERROR_CONTEXT)
         .operation(operation)
         .scope(bifrost_types::ErrorScope::Cursor(
             bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
@@ -1336,7 +1338,7 @@ pub(super) fn or_folder_restriction_error(op: AccountOperation) -> AccountError 
                  is not OR-ed with other criteria",
         )),
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(op)
     .try_build()
     .expect("valid account error classification")
@@ -1376,7 +1378,7 @@ pub(super) fn non_empty_mailbox(folder: &MailboxName) -> AccountError {
     AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::PreconditionFailed {
         detail: DiagnosticText::support_only("refusing to delete non-empty IMAP mailbox"),
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(AccountOperation::ContainerDelete)
     .scope(ErrorScope::Cursor(CursorScope::Folder(
         bifrost_types::FolderId(folder.account_id()),
@@ -1398,7 +1400,7 @@ pub(super) fn pim_malformed(op: AccountOperation, detail: impl Into<String>) -> 
     AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
         detail: DiagnosticText::support_only(detail.into()),
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(op)
     .try_build()
     .expect("valid account error classification")
@@ -1422,7 +1424,7 @@ pub(super) fn restamp(err: AccountError, op: AccountOperation) -> AccountError {
 /// telemetry and recovery attribute the failure to this account.
 pub(super) fn stamp_imap_protocol(err: AccountError) -> AccountError {
     err.into_builder()
-        .protocol(Protocol::Imap)
+        .context(ERROR_CONTEXT)
         .try_build()
         .expect("valid account error classification")
 }
@@ -1441,7 +1443,7 @@ pub(super) fn folder_of(
         AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
             detail: DiagnosticText::support_only(format!("not an IMAP folder identity: {err}")),
         }))
-        .protocol(Protocol::Imap)
+        .context(ERROR_CONTEXT)
         .operation(op)
         .try_build()
         .expect("valid account error classification")
@@ -1454,7 +1456,7 @@ pub(super) fn not_sticky(folder: &MailboxName, op: AccountOperation) -> AccountE
     AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Unsupported {
         operation: op,
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(op)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
     .text(DiagnosticText::support_only(
@@ -1473,7 +1475,7 @@ pub(super) fn excluded_from_operand_error(
             "message id could not be placed in an IMAP UID operand",
         ),
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(operation)
     .scope(bifrost_types::ErrorScope::Cursor(super::folder_scope(
         folder,
@@ -1496,7 +1498,7 @@ pub(super) fn malformed(detail: &str, op: AccountOperation) -> AccountError {
     AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
         detail: DiagnosticText::support_only(detail.to_owned()),
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(op)
     .try_build()
     .expect("valid account error classification")
@@ -1533,7 +1535,7 @@ pub(super) fn search_folders_conflict(
             b.as_str()
         ))),
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(op)
     .try_build()
     .expect("valid account error classification")
@@ -1566,7 +1568,7 @@ fn fetched_message_not_found(id: &bifrost_types::ObjectId, op: AccountOperation)
         what: ResourceKind::Message,
         id: Some(id.0.clone()),
     }))
-    .protocol(Protocol::Imap)
+    .context(ERROR_CONTEXT)
     .operation(op)
     .scope(ErrorScope::Message { id: id.clone() })
     .push_cause(Cause::Attempt(AttemptCause::new(
@@ -1706,7 +1708,7 @@ pub(super) mod test_support {
 
     pub(in crate::account) fn expired_auth() -> AccountError {
         AccountErrorBuilder::new(PrimaryCause::Auth(AuthCause::Expired))
-            .protocol(Protocol::Imap)
+            .context(ERROR_CONTEXT)
             .operation(AccountOperation::UpdateFlags)
             .try_build()
             .expect("auth error")
@@ -1714,7 +1716,7 @@ pub(super) mod test_support {
 
     pub(in crate::account) fn incompatible_schema() -> AccountError {
         AccountErrorBuilder::new(PrimaryCause::State(StateCause::SchemaIncompatible))
-            .protocol(Protocol::Imap)
+            .context(ERROR_CONTEXT)
             .operation(AccountOperation::UpdateFlags)
             .try_build()
             .expect("schema error")
@@ -1724,7 +1726,7 @@ pub(super) mod test_support {
         AccountErrorBuilder::new(PrimaryCause::Access(AccessCause::PermissionDenied {
             resource: None,
         }))
-        .protocol(Protocol::Imap)
+        .context(ERROR_CONTEXT)
         .operation(AccountOperation::UpdateFlags)
         .try_build()
         .expect("personal-folder permission error")
@@ -1734,7 +1736,7 @@ pub(super) mod test_support {
         AccountErrorBuilder::new(PrimaryCause::Server(
             bifrost_types::ServerCause::Unavailable { retry_hint: None },
         ))
-        .protocol(Protocol::Imap)
+        .context(ERROR_CONTEXT)
         .operation(AccountOperation::UpdateFlags)
         .try_build()
         .expect("server error")
@@ -1744,7 +1746,7 @@ pub(super) mod test_support {
         AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::Unavailable {
             retry_hint: None,
         }))
-        .protocol(Protocol::Imap)
+        .context(ERROR_CONTEXT)
         .operation(AccountOperation::UpdateFlags)
         .push_cause(Cause::Attempt(AttemptCause::new(state)))
         .try_build()

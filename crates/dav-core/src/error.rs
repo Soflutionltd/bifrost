@@ -29,6 +29,10 @@ pub enum DavProtocol {
 }
 
 impl DavProtocol {
+    fn identity(self) -> bifrost_types::error::builder::AccountErrorContext {
+        bifrost_types::error::builder::AccountErrorContext::new(None, self.protocol())
+    }
+
     #[must_use]
     pub fn protocol(self) -> Protocol {
         match self {
@@ -118,7 +122,7 @@ pub fn not_found_error(
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )))
-    .protocol(protocol.protocol())
+    .context(protocol.identity())
     .operation(operation)
     .try_build()
     .expect("valid account error classification")
@@ -155,7 +159,7 @@ pub fn missing_field_error(
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )))
-    .protocol(protocol.protocol())
+    .context(protocol.identity())
     .operation(operation)
     .try_build()
     .expect("valid account error classification")
@@ -171,7 +175,7 @@ pub fn local_error(
         field: Some(protocol.field()),
         message: Some(DiagnosticText::support_only(message)),
     }))
-    .protocol(protocol.protocol())
+    .context(protocol.identity())
     .operation(operation)
     .try_build()
     .expect("valid account error classification")
@@ -201,7 +205,7 @@ pub fn parse_error(
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )))
-    .protocol(protocol.protocol())
+    .context(protocol.identity())
     .operation(operation)
     .try_build()
     .expect("valid account error classification")
@@ -230,7 +234,7 @@ pub fn transport_error(
         Some(DiagnosticText::support_only(message)),
     )))
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
-    .protocol(protocol.protocol())
+    .context(protocol.identity())
     .operation(operation)
     .try_build()
     .expect("valid account error classification")
@@ -257,7 +261,7 @@ pub fn response_read_error(
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )))
-    .protocol(protocol.protocol())
+    .context(protocol.identity())
     .operation(operation)
     .try_build()
     .expect("valid acknowledged response-overflow classification")
@@ -333,7 +337,7 @@ fn status_error_for(
         .push_cause(Cause::Attempt(AttemptCause::new(
             TransmissionState::Acknowledged,
         )))
-        .protocol(protocol.protocol())
+        .context(protocol.identity())
         .operation(operation)
         .status(Some(status.as_u16()));
     let mut builder = builder;

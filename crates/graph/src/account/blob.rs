@@ -8,7 +8,7 @@ use serde_json::Value;
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountOperation, AccountStream, Batch, BlobCapabilities,
     BlobEncoding, BlobHandle, BlobId, ByteRange, Checkpoint, DiagnosticText, ErrorScope, ObjectId,
-    PageBoundary, PrimaryCause, Protocol, ProtocolErrorKind, Provider, SyncEvent, WireCause,
+    PageBoundary, PrimaryCause, Protocol, ProtocolErrorKind, SyncEvent, WireCause,
 };
 
 use super::GraphAccount;
@@ -319,8 +319,7 @@ fn open_blob_inner_stream(
                         } },
                     )
                     .operation(op)
-                    .provider(Provider::Microsoft)
-                    .protocol(Protocol::Graph)
+                    .context(GraphErrorContext::graph(op).identity())
                     .scope(ErrorScope::Account)
                     .try_build()
                 .expect("valid account error classification");
@@ -379,8 +378,7 @@ pub(crate) fn open_raw_rfc822(
                         } },
                     )
                     .operation(op)
-                    .provider(Provider::Microsoft)
-                    .protocol(Protocol::Graph)
+                    .context(GraphErrorContext::graph(op).identity())
                     .scope(ErrorScope::Message { id: (message.0.clone() ).into()})
                     .try_build()
                     .expect("valid account error classification");
@@ -470,7 +468,7 @@ impl From<crate::error::GraphError> for BlobFetchError {
 fn unsupported_range_error() -> bifrost_types::AccountError {
     AccountError::unsupported(AccountOperation::OpenBlobRange, Protocol::Graph)
         .into_builder()
-        .provider(Provider::Microsoft)
+        .context(GraphErrorContext::graph(AccountOperation::OpenBlobRange).identity())
         .scope(ErrorScope::Account)
         .try_build()
         .expect("valid account error classification")

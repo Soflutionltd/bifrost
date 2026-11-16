@@ -1008,7 +1008,13 @@ impl Account for GraphAccount {
         &self,
         ids: &[bifrost_types::ObjectId],
     ) -> AccountFuture<
-        Result<bifrost_types::BatchOutcome<bifrost_types::MessageReactionState>, AccountError>,
+        Result<
+            bifrost_types::BatchOutcome<
+                bifrost_types::MessageReactionState,
+                bifrost_types::ObjectId,
+            >,
+            AccountError,
+        >,
     > {
         let account = self.clone();
         let ids = ids.to_vec();

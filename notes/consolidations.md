@@ -26,19 +26,11 @@ this file's.
 
 **Reported by:** types.
 
-The wildcard mappings are gone: `From<ProtocolKind> for Protocol` and
-`From<ProtocolKind> for ProtocolSalt` live in bifrost-types,
-`Account::protocol()` is required, and the campaign `protocol` parameter is
-documented as the consumer's salt namespace. Residue:
-
-- `recovery::derive_server` decides "is this an SMTP reply" from
-  `Cause::Wire(WireCause::Smtp(_))` (`smtp_reply`), not from the error's own
-  `protocol` field, so one error answers "which protocol" with two fields.
-- Providers stamp `.provider(..)` and `.protocol(..)` at each builder call
-  (Gmail about 15 sites, Graph about 14) although the account knows both once;
-  an account-owned error context would stamp them at the boundary.
-- Collapsing the vocabularies (`ProtocolKind`, `Protocol`, `Provider`,
-  `ProtocolSalt`, `PushSource`) removes published items and needs the owner.
+Recovery reads the error's own `protocol` field, and each account stamps
+provider and protocol once through `AccountErrorContext`. Residue: collapsing
+the vocabularies (`ProtocolKind`, `Protocol`, `Provider`, `ProtocolSalt` -
+now in bifrost-sync - and `PushSource`) removes published items and needs the
+owner.
 
 ## CON-047 - May this URL carry the account credential?
 

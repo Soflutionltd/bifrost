@@ -65,11 +65,7 @@ pub(super) fn pending(folders: &[&str]) -> Vec<PendingEwsScope> {
             let scope = email_scope(folder);
             let source_id =
                 ews_subscribable_folder_id(&scope).expect("a primary folder scope is pending");
-            (
-                bifrost_types::BatchItemId(index.to_string()),
-                scope,
-                source_id,
-            )
+            (bifrost_types::SubmissionIndex(index), scope, source_id)
         })
         .collect()
 }
@@ -77,7 +73,8 @@ pub(super) fn pending(folders: &[&str]) -> Vec<PendingEwsScope> {
 /// A fresh per-request ledger for a call made below `push_subscribe`
 /// (`reconcile_translated_ews_scopes`, or `subscribe_eligible` driven with a
 /// lane list of the test's choosing).
-pub(super) fn ledger() -> bifrost_types::BatchOutcomeBuilder<CursorScope> {
+pub(super) fn ledger()
+-> bifrost_types::BatchOutcomeBuilder<CursorScope, bifrost_types::SubmissionIndex> {
     bifrost_types::BatchOutcomeBuilder::new()
 }
 

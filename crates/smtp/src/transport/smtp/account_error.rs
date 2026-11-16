@@ -62,6 +62,10 @@ pub(crate) struct SmtpErrorContext {
 }
 
 impl SmtpErrorContext {
+    fn identity(&self) -> bifrost_types::error::builder::AccountErrorContext {
+        bifrost_types::error::builder::AccountErrorContext::new(None, self.protocol.into())
+    }
+
     pub(crate) fn send(protocol: Dialect) -> Self {
         Self { protocol }
     }
@@ -262,7 +266,7 @@ fn build_basic(
     diagnostic: Option<&str>,
     extra: Option<Cause>,
 ) -> AccountError {
-    let mut builder = AccountErrorBuilder::new(cause).protocol(ctx.protocol.into());
+    let mut builder = AccountErrorBuilder::new(cause).context(ctx.identity());
     builder = apply_context(builder, ctx);
     if let Some(state) = attempt {
         builder = builder.push_cause(Cause::Attempt(AttemptCause::new(to_types_state(state))));
@@ -290,7 +294,7 @@ fn build_transport(
         kind,
         diagnostic.map(|t| DiagnosticText::support_only(t.to_owned())),
     )))
-    .protocol(ctx.protocol.into());
+    .context(ctx.identity());
     builder = apply_context(builder, ctx);
     if let Some(state) = attempt {
         builder = builder.push_cause(Cause::Attempt(AttemptCause::new(to_types_state(state))));
@@ -303,7 +307,7 @@ fn build_transport(
 
 fn apply_context(builder: AccountErrorBuilder, ctx: &SmtpErrorContext) -> AccountErrorBuilder {
     builder
-        .protocol(ctx.protocol.into())
+        .context(ctx.identity())
         .operation(AccountOperation::Send)
         .idempotency_override(false)
 }
@@ -360,7 +364,7 @@ pub(crate) fn response_to_account_error(
     }
 
     let mut builder = AccountErrorBuilder::new(primary_cause)
-        .protocol(ctx.protocol.into())
+        .context(ctx.identity())
         .status(Some(status))
         .native_code(native);
     builder = apply_context(builder, ctx);

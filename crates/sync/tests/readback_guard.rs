@@ -244,10 +244,7 @@ impl Account for FlagsAccount {
                         kind: HydratedObjectKind::FlagsOnly(flags),
                         blobs: Vec::new(),
                     };
-                    ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
-                        bifrost_types::BatchItemId(id.0),
-                        hydrated,
-                    ))
+                    ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(id, hydrated))
                 })
                 .collect();
             SyncEvent::Batch(Batch {
@@ -345,7 +342,7 @@ impl Account for FlagsAccount {
                 let items = ids
                     .into_iter()
                     .map(|id| {
-                        let item = bifrost_types::BatchItemId(id.0.clone());
+                        let item = id.clone();
                         if mode == COHORT_ERROR_IN_SECOND
                             || mode == COHORT_UNCERTAIN
                             || (mode == COHORT_RETRY_BESIDE_UNCERTAIN && id.0 == "b")
@@ -409,7 +406,7 @@ impl Account for FlagsAccount {
                 let items = targets
                     .map(|id| {
                         ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
-                            bifrost_types::BatchItemId(id.0),
+                            id,
                             MutationSuccess::Applied,
                         ))
                     })
@@ -449,7 +446,7 @@ impl Account for FlagsAccount {
                         .expect("valid rate-limited server error");
                     SyncEvent::Batch(Batch {
                         items: vec![ItemOutcome::Failed(bifrost_types::BatchFailure::new(
-                            bifrost_types::BatchItemId(ids[0].0.clone()),
+                            ids[0].clone(),
                             error,
                         ))],
                         page_boundary: PageBoundary::Final,
@@ -479,12 +476,9 @@ impl Account for FlagsAccount {
                 .try_build()
                 .expect("valid engine-blocked error");
                 let items = vec![
-                    ItemOutcome::Failed(bifrost_types::BatchFailure::new(
-                        bifrost_types::BatchItemId(ids[0].0.clone()),
-                        blocked,
-                    )),
+                    ItemOutcome::Failed(bifrost_types::BatchFailure::new(ids[0].clone(), blocked)),
                     ItemOutcome::Uncertain(bifrost_types::BatchUncertain::new(
-                        bifrost_types::BatchItemId(ids[1].0.clone()),
+                        ids[1].clone(),
                         retryable_transport(),
                     )),
                 ];
@@ -502,7 +496,7 @@ impl Account for FlagsAccount {
                 let items = targets
                     .map(|id| {
                         ItemOutcome::Failed(bifrost_types::BatchFailure::new(
-                            bifrost_types::BatchItemId(id.0),
+                            id,
                             AccountErrorBuilder::new(PrimaryCause::State(
                                 bifrost_types::StateCause::CapabilityChanged { delta: None },
                             ))
@@ -548,10 +542,7 @@ impl Account for FlagsAccount {
                         }
                         .try_build()
                         .expect("valid engine-directive error");
-                        ItemOutcome::Failed(bifrost_types::BatchFailure::new(
-                            bifrost_types::BatchItemId(id.0),
-                            error,
-                        ))
+                        ItemOutcome::Failed(bifrost_types::BatchFailure::new(id, error))
                     })
                     .collect();
                 SyncEvent::Batch(Batch {
@@ -577,8 +568,7 @@ impl Account for FlagsAccount {
                 .expect("valid engine-blocked error");
                 SyncEvent::Batch(Batch {
                     items: vec![ItemOutcome::Failed(bifrost_types::BatchFailure::new(
-                        bifrost_types::BatchItemId(first.0),
-                        error,
+                        first, error,
                     ))],
                     page_boundary: PageBoundary::Final,
                     server_latency: std::time::Duration::ZERO,
@@ -614,7 +604,7 @@ impl Account for FlagsAccount {
             let items = targets
                 .map(|id| {
                     ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
-                        bifrost_types::BatchItemId(id.0),
+                        id,
                         MutationSuccess::Applied,
                     ))
                 })
@@ -639,7 +629,7 @@ impl Account for FlagsAccount {
         destination: MembershipScope,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         let item = ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
-            bifrost_types::BatchItemId(format!("{destination:?}")),
+            bifrost_types::ObjectId(format!("{destination:?}")),
             MutationSuccess::Applied,
         ));
         Box::pin(stream::iter([SyncEvent::Batch(Batch {
@@ -2270,7 +2260,7 @@ impl ReassertAccount {
                 let items = ids
                     .into_iter()
                     .filter_map(|id| {
-                        let item = bifrost_types::BatchItemId(id.0.clone());
+                        let item = id.clone();
                         let kind = match observations.get(&id)? {
                             Observation::Flags(flags) => {
                                 HydratedObjectKind::FlagsOnly(flags.clone())
@@ -2374,7 +2364,7 @@ impl ReassertAccount {
                 let items = targets
                     .into_iter()
                     .filter_map(|target| {
-                        let item = bifrost_types::BatchItemId(target.id.0.clone());
+                        let item = target.id.clone();
                         match script.items.get(&target.id).unwrap_or(&ItemScript::Omit) {
                             ItemScript::Applied => Some(ItemOutcome::Succeeded(
                                 bifrost_types::BatchSuccess::new(item, MutationSuccess::Applied),

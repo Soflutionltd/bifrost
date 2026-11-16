@@ -65,11 +65,16 @@ consuming account stamps the protocol at the boundary.
 Protocol and provider remain properties of the failing leg, rather than a
 blanket account stamp. Composed accounts can fail through DAV, SMTP, EWS or
 Google auxiliary APIs while their primary protocol stays IMAP, Graph or Gmail.
+`AccountErrorContext` in `error::builder` owns provider and protocol identity
+for a translation boundary; builders apply it through `.context(..)`. Provider
+contexts choose the actual failing API once: Gmail, Calendar, People and Drive;
+Graph REST or EWS; SMTP or LMTP; IMAP, JMAP and DAV keep their own identities.
+Provider-neutral rendering errors acquire identity only at the account boundary.
 `ProtocolKind` cursor provenance converts exhaustively to `Protocol` inside
-`bifrost-types`. SMTP reply classification deliberately reads wire evidence:
-the numeric 5xx class is permanent for SMTP/LMTP, even when enclosing account
-metadata identifies another protocol. Restamping metadata must not change retry
-semantics.
+`bifrost-types`. Server recovery reads the error's protocol field: SMTP and LMTP
+5xx replies are permanent refusals, while HTTP 5xx replies are transient.
+Optional wire diagnostics never supply a competing protocol identity. Contexts
+must preserve the failing leg when decorating errors from composed accounts.
 
 Local unsupported refusals may attach `UnsupportedReason` through
 `AccountErrorBuilder::unsupported_reason`, read through
@@ -370,8 +375,8 @@ operation is treated idempotent). The rules at altitude (read
   IMAP `NO`/`BAD` not in-flight) -> `ProviderRefused`. The 5xx rule is
   HTTP's, and it does not apply to an SMTP reply: RFC 5321 4.2.1 defines
   the 5yz class as PERMANENT negative completion, so `derive_server` reads
-  the protocol from the cause chain (`Cause::Wire(WireCause::Smtp(_))`,
-  which only the SMTP translator mints) and derives an SMTP 5xx as
+  the error's own `protocol` field (stamped by the failing leg's
+  `AccountErrorContext`) and derives an SMTP or LMTP 5xx as
   `ProviderRefused`. Before that row a 554 at the end-of-data terminator
   was `Retry(SameRequest)`: advice to resend a whole message body to a
   server that had just permanently refused it. Pinned by
@@ -515,9 +520,9 @@ timing). `StateCause` carries engine-directive payloads
 `OperatorOverrideNeeded { reason }`).
 
 `WireCause` preserves native diagnostic evidence. Its raw code does not
-classify the error, but an SMTP wire cause in the classification prefix marks
-an SMTP reply: a 5xx reply is a permanent refusal, unlike an HTTP 5xx retry.
-Wire causes appended during decoration do not affect this decision. The native
+classify the error or choose its protocol. The failing leg's protocol field
+chooses the meaning of numeric statuses: SMTP and LMTP 5xx replies are permanent
+refusals, unlike HTTP 5xx retries. Wire causes do not affect this decision. The native
 vocabulary preserved for support exports includes:
 `Graph(GraphSignal)`, `Jmap(JmapMethod)`, `Imap(ImapResponseCode)`,
 `Smtp(EnhancedStatusCode)`, `Gmail(GmailSignal)`, and
@@ -553,18 +558,22 @@ classification the producer made.
 
 ## Batch and stream outcomes
 
-`batch.rs`. `BatchOutcome<T>` (`#[non_exhaustive]`, immutable) is the
+`batch.rs`. `BatchOutcome<T, K = BatchItemId>` (`#[non_exhaustive]`, immutable) is the
 **three-lane** result of a `Vec<BatchItem<_>>` operation:
-`succeeded: [BatchSuccess<T>]`, `failed: [BatchFailure]`,
-`uncertain: [BatchUncertain]`, plus an `order` index so `iter()`
-replays submission order. The lanes are closed by design - a fourth
+`succeeded: [BatchSuccess<T, K>]`, `failed: [BatchFailure<K>]`,
+`uncertain: [BatchUncertain<K>]`, plus an `order` index so `iter()`
+replays builder push order. The lanes are closed by design - a fourth
 lane is a deliberate breaking change, never a wildcard-absorbed
 extension. `BatchFailure` and `BatchUncertain` each carry an
 `AccountError`; the uncertain lane is the batch analogue of an
 `InFlight` non-idempotent drop and always queues for read-back.
 
-`BatchItemId(String)` correlates each lane entry back to its submitted
-`BatchItem`. `BatchOutcomeBuilder` accumulates via `push_succeeded` /
+The key type `K` distinguishes identity domains. `BatchItemId(String)`
+correlates caller-minted Vec-batch entries back to their submitted `BatchItem`;
+`ObjectId` keys object operations; `SubmissionIndex(usize)` keys positional
+ledgers. `BatchInvariantError<K>` retains typed missing, duplicate and unknown
+keys. `BatchOutcome::map_keys` can attach a caller payload after ledger closure,
+preserving every lane and the order index. `BatchOutcomeBuilder` accumulates via `push_succeeded` /
 `push_failed` / `push_uncertain`, then `finalize(&expected)` enforces
 the **accounting invariant**: every submitted id appears in exactly one
 lane, with no missing / duplicate / unknown ids, else
@@ -597,18 +606,22 @@ Protocol crates know their own failing leg and must stamp it explicitly.
 
 The same three lanes carry `push_subscribe`, whose input is a scope list
 rather than a `Vec<BatchItem<_>>`. `PushSubscription { handle, outcomes }`
-puts a `BatchOutcome<CursorScope>` beside an optional handle: the handle
+puts a `BatchOutcome<CursorScope, SubmissionIndex>` beside an optional handle: the handle
 covers exactly the succeeded lane, refused scopes carry their own
 scope-correlated `AccountError` in the failed lane, and the handle is absent
-when no scope was accepted. `BatchItemId`s are the scopes' submission
+when no scope was accepted. `SubmissionIndex` keys are the scopes' submission
 positions, because a `CursorScope` is not an id and one request may legitimately
 name the same folder twice. No fourth lane and no parallel contract: an
 `Err(_)` from `push_subscribe` still means no scope was subscribed at all.
 
-`stream.rs`. `ItemOutcome<T>` is the streaming counterpart -
-`Succeeded(BatchSuccess<T>)` / `Failed(BatchFailure)` /
-`Uncertain(BatchUncertain)` - the same closed three-lane model, emitted
-per item instead of collected. `ItemOutcome::from_submission_error(item, error)`
+`stream.rs`. `ItemOutcome<T, K = ObjectId>` is the streaming counterpart -
+`Succeeded(BatchSuccess<T, K>)` / `Failed(BatchFailure<K>)` /
+`Uncertain(BatchUncertain<K>)` - the same closed three-lane model, emitted
+per item instead of collected. Account streaming methods use `ObjectId` keys,
+echoing the requested identity without converting through `BatchItemId`.
+The mutation campaign checks each key against the current submission before
+accounting or recovery side effects; hydrated payload identity is independently
+checked by read-back. `ItemOutcome::from_submission_error(item, error)`
 owns whole-submission failure attribution. It uses the partial record's primary
 application when present, otherwise `Application::from_leaf`: classification-prefix
 InFlight, unreadable-success evidence or reconciling leaf recovery is Uncertain;
@@ -707,6 +720,13 @@ remain absent from Debug and diagnostic prose. Protocol code still receives raw
 wire evidence for typed interpretation; it must not export arbitrary server text
 as diagnostic detail. Token-source failure diagnostics preserve classification
 and retry hints without foreign error prose.
+
+Graph REST unknown error codes and `innerError.code` pass through the public
+`bifrost_net::account_error::correlation_id` shape check before entering exported
+cause chains or diagnostic text. Rejected unknown codes retain an empty unknown
+signal and status-based classification; rejected inner codes are omitted. Known
+Graph codes are classified before filtering, so names containing credential
+markers (for example `InvalidDeltaToken`) retain their typed meaning.
 
 All export structs are `Serialize`; `TelemetryView` projects the
 recovery fields (disposition/reason/throttle for retry,

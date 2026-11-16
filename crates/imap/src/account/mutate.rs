@@ -15,8 +15,8 @@ use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 
 use bifrost_types::{
-    AccountError, AccountErrorKind, AccountOperation, AccountStream, BatchFailure, BatchItemId,
-    FlagOp, ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol, SyncEvent,
+    AccountError, AccountErrorKind, AccountOperation, AccountStream, BatchFailure, FlagOp,
+    ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol, SyncEvent,
 };
 use futures::StreamExt;
 
@@ -169,7 +169,7 @@ pub(super) fn mutation_stream(
                 // set otherwise costs one channel send per target.
                 let mut rejected = Vec::new();
                 while let Some(id) = targets.next().await {
-                    let item = BatchItemId(id.0);
+                    let item = id;
                     rejected.push(ItemOutcome::Failed(BatchFailure::new(item, error.clone())));
                     if rejected.len() >= account.config.mutation_batch_size.max(1)
                         && flush_items(&mut rejected, &tx).await.is_err()
@@ -202,7 +202,7 @@ pub(super) fn mutation_stream(
                         .push(decoded);
                 }
                 Err(err) => {
-                    let item_id = BatchItemId(id.0.clone());
+                    let item_id = id.clone();
                     undecodable.push(ItemOutcome::Failed(BatchFailure::new(item_id, err)));
                 }
             }
@@ -323,12 +323,7 @@ async fn flush_mutation_groups(
                 }
                 let outcomes = unaccounted
                     .into_iter()
-                    .map(|id| {
-                        ItemOutcome::from_submission_error(
-                            BatchItemId(id.id.0),
-                            account_err.clone(),
-                        )
-                    })
+                    .map(|id| ItemOutcome::from_submission_error(id.id, account_err.clone()))
                     .collect();
                 if tx
                     .send(batch(outcomes, PageBoundary::Page, None, bytes_in))
@@ -1264,7 +1259,7 @@ fn mutation_verdict(
 fn failed_all(ids: Vec<DecodedObjectId>, error: AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
     ids.into_iter()
         .map(|id| {
-            let item = BatchItemId(id.id.0);
+            let item = id.id;
             ItemOutcome::Failed(BatchFailure::new(item, error.clone()))
         })
         .collect()
@@ -1939,7 +1934,7 @@ mod tests {
             mutation_verdict(uid, &outcome, AccountOperation::UpdateFlags, &folder())
         });
         assert_eq!(outcomes.len(), 3);
-        let failed: Vec<&BatchFailure> = outcomes
+        let failed: Vec<&BatchFailure<bifrost_types::ObjectId>> = outcomes
             .iter()
             .filter_map(|outcome| match outcome {
                 ItemOutcome::Failed(failure) => Some(failure),
@@ -2061,7 +2056,7 @@ mod tests {
             2,
             "the failing group must not erase outcomes proven for other groups",
         );
-        let failed: Vec<&BatchFailure> = results
+        let failed: Vec<&BatchFailure<bifrost_types::ObjectId>> = results
             .iter()
             .filter_map(|outcome| match outcome {
                 ItemOutcome::Failed(failure) => Some(failure),
@@ -2071,7 +2066,7 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(
             failed[0].item,
-            BatchItemId(
+            bifrost_types::ObjectId(
                 super::super::encode_object_id(
                     &folder(),
                     crate::types::UidValidity::new(7).expect("nonzero epoch"),

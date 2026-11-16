@@ -34,6 +34,14 @@ pub struct NetErrorContext {
     pub scope: Option<ErrorScope>,
 }
 
+impl NetErrorContext {
+    /// The failing leg's identity, shared with provider-owned translations.
+    #[must_use]
+    pub fn identity(&self) -> bifrost_types::error::builder::AccountErrorContext {
+        bifrost_types::error::builder::AccountErrorContext::new(self.provider, self.protocol)
+    }
+}
+
 /// Classify a local token-source failure (`TokenSource::current` or
 /// `snapshot`) for a protocol that authenticates with the token.
 ///
@@ -556,13 +564,9 @@ fn malformed_response_cause(ctx: &NetErrorContext, detail: String) -> WireCause 
 }
 
 fn base_builder(ctx: &NetErrorContext, cause: PrimaryCause) -> AccountErrorBuilder {
-    let builder = AccountErrorBuilder::new(cause)
-        .protocol(ctx.protocol)
-        .operation(ctx.operation);
-    match ctx.provider {
-        Some(provider) => builder.provider(provider),
-        None => builder,
-    }
+    AccountErrorBuilder::new(cause)
+        .context(ctx.identity())
+        .operation(ctx.operation)
 }
 
 fn finish(builder: AccountErrorBuilder, ctx: &NetErrorContext) -> AccountError {

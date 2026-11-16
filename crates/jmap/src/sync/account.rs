@@ -499,10 +499,10 @@ impl Account for JmapAccount {
         // failure. Nothing is registered on the wire, so no handle is minted.
         if !scopes.is_empty() && routed_scopes.is_empty() {
             let expected = (0..scopes.len())
-                .map(|index| bifrost_types::BatchItemId(index.to_string()))
+                .map(bifrost_types::SubmissionIndex)
                 .collect::<Vec<_>>();
             let mut outcomes = bifrost_types::BatchOutcomeBuilder::new();
-            for (id, scope) in expected.iter().cloned().zip(scopes) {
+            for (id, scope) in expected.iter().copied().zip(scopes) {
                 outcomes.push_failed(
                     id,
                     super::error::unsupported_error(
@@ -547,10 +547,10 @@ impl Account for JmapAccount {
                 .map(|registered| registered && accepted.next().unwrap_or(false))
                 .collect();
             let expected = (0..scopes.len())
-                .map(|index| bifrost_types::BatchItemId(index.to_string()))
+                .map(bifrost_types::SubmissionIndex)
                 .collect::<Vec<_>>();
             let mut outcomes = bifrost_types::BatchOutcomeBuilder::new();
-            for ((id, scope), accepted) in expected.iter().cloned().zip(scopes).zip(accepted) {
+            for ((id, scope), accepted) in expected.iter().copied().zip(scopes).zip(accepted) {
                 if accepted {
                     outcomes.push_succeeded(id, scope);
                 } else {

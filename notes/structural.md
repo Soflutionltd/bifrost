@@ -24,40 +24,6 @@ Each entry names the hunt scope(s) that reported it. Where hunters disagreed,
 both readings are recorded. The raw reports are in the commit that precedes
 this file's.
 
-## STR-005 - `BatchItemId(String)` has three meanings
-
-**Reported by:** types (LATENT), sync-engine.
-
-The sync-engine hunter counted about 50 hand-minted `BatchItemId(id.0.clone())`
-sites across imap, jmap, graph, google, types and the tests, and noted the
-engine's per-object accounting (`outcomes: HashMap<ObjectId, MutationBucket>`)
-is correct only if every implementor mints the item id byte-identically to the
-submitted `ObjectId` - qualification layers such as JMAP foreign ids are where a
-mismatch would appear. Its proposal: object mutations yield `ItemOutcome` keyed
-by the submitted `ObjectId` (or a `BatchItemId` constructible only from
-`&ObjectId`), and the campaign checks each outcome against the submitted set,
-closing BUG-007 - the IMAP `Target` permit lifted into `bifrost-types` for every
-mail mutation door. The sync-lanes hunter adds that `mutation/readback.rs`
-asserts "`BatchItemId` is an `ObjectId`" by string coercion
-(`ObjectId(success.item.0)`, `ObjectId(f.item.0)`) at four sites. The smtp-sasl
-hunter adds the positional meaning's own round trip: IMAP `send_rfc5322` mints
-`BatchItemId(index.to_string())` and `not_accepted_recipients` parses it back with
-`id.0.parse::<usize>()`, skipping ids that do not parse; `SmtpBatchRecipient` could
-carry the caller's own payload (a generic `BatchItem<T>` already exists in
-bifrost-types), handing IMAP its `bifrost_types::Address` back from the lane.
-
-Streaming mutation and hydration lanes mint `BatchItemId(object_id.0)`
-(`mutation.rs::refused_mail_target`, every provider) and the engine turns it
-back with `ObjectId(item.0)` in `sync/src/mutation/readback.rs` and many places
-in `sync/src/engine/bulk.rs`. `PushSubscription::all_succeeded` uses
-`BatchItemId(index.to_string())`, a position. Vec-batch surfaces use
-caller-supplied ids checked by `validate_batch_input`. Nothing makes "the
-streaming lane id is the requested ObjectId" true; the IMAP `Target` permit work
-found a site stamping the hydrated id instead. Proposal: make the key a type
-parameter (`ItemOutcome<K, T>` / `BatchSuccess<K, T>`), `K = ObjectId` on the
-streaming lanes, a `SubmissionIndex` for positional ledgers, `BatchItemId` only
-where the caller mints it.
-
 ## STR-013 - Provider wire vocabularies in the neutral crate
 
 **Reported by:** types.
