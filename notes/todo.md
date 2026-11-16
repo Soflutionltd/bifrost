@@ -309,21 +309,6 @@ Narrow edge cases, audits with no known defect, and design work.
     Shared-account contacts and calendars have no routing door: the optional
     families live once on `Registry::families` and select the primary account
     (capability question).
-  - sync: a retained slot `Arc` keeps its watch and broadcast channels open
-    past detach (documented in `reference/sync.md`). Closing them reliably
-    needs `delivery/mod.rs` and `control.rs`, and `SyncControl` clones each
-    retain the control sender, so dropping the slot alone is not enough. The
-    detach comment in `engine/mod.rs` still describes cross-attachment
-    registry inheritance, which no longer happens.
-  - sync: `SyncEngine::detach` cancels the slot token before its push
-    teardown, so an account- or resource-scoped 429 observed during detach's
-    own unsubscribe is dropped by the retired-slot throttle fence; a reattach
-    right afterwards does not honour it unless the provider stamped a budget.
-    Teardown traffic should probably still record holds.
-  - sync: pages and markers that carry a checkpoint still register before
-    broadcasting separately, a stale-delivery window like the one
-    `publish_inventory` closed by checking the fence and sending under
-    coverage ownership.
 
 - **Lateral findings from the review of the design-hunt batch, unverified.**
   Each wants its own check and, where marked, a ruling.
@@ -332,9 +317,22 @@ Narrow edge cases, audits with no known defect, and design work.
   - JMAP: a capability dropped mid-session yields terminal `Unsupported` where
     `CapabilityChanged` may fit (ruling).
   - SMTP: a rejected batch DATA reports per-recipient RCPT rejections. Batch
-    sends have no BDAT entry point (ruling). Blocking pool replenishment
-    returns without releasing its live reservation if shutdown lands during
-    connection creation.
+    sends have no BDAT entry point (ruling). `reference/smtp.md` describes
+    async pool recycle behaviour in two conflicting ways.
+  - sync: two tests are missing around the guarded send in
+    `crates/sync/src/delivery/mod.rs`. Nothing pins that a change-lane
+    inventory page whose publication a concurrent live publication superseded
+    is still broadcast (only backfill receipts go through the publication
+    check; sending the change page is what keeps the survivor's
+    acknowledgement honest). The discard arm of
+    `registered_pages_and_markers_are_not_sent_after_invalidation` passes
+    through the boundary-removal refusal, so the `fenced_backfill.excludes`
+    clause is not bitten independently.
+  - sync: a backfill page mid-publish in the synchronous window of
+    `DetachingAccount::begin` (delivery closed before control stop) is
+    forfeited as a backfill discard, so the next attach re-walks the scope
+    instead of resuming. Conservative and documented; narrowing the window is
+    optional.
   - sync: the operator-override warning moved from `user_safe` to
     `support_only` (ruling). `AckOutcome` is not `#[must_use]`: adding it is clean in
     production but about fifty test call sites discard the value.

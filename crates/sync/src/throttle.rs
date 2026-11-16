@@ -62,10 +62,20 @@ impl ThrottleBucket {
     }
 
     /// Give one attachment a recording fence while retaining provider holds.
-    pub(crate) fn for_slot(&self, shutdown: tokio_util::sync::CancellationToken) -> Self {
+    pub(crate) fn for_slot(&self, retirement: tokio_util::sync::CancellationToken) -> Self {
         Self {
             waits: std::sync::Arc::clone(&self.waits),
-            recording_slot: Some(shutdown),
+            recording_slot: Some(retirement),
+        }
+    }
+
+    /// End attachment recording after its owned teardown, independently of
+    /// worker cancellation. Serialize with record so no write crosses retirement.
+    pub(crate) fn retire(&self) {
+        if let Ok(_waits) = self.waits.lock()
+            && let Some(retirement) = &self.recording_slot
+        {
+            retirement.cancel();
         }
     }
 

@@ -62,8 +62,6 @@ pub(crate) enum RecoveryFollowUp {
 /// workers park. Consumers flip `AccountControl::Resume` (engine-side
 /// helper on `SyncEngine`) to unpause.
 pub(in crate::engine) fn engine_pause(ctx: &RecoveryContext<'_>, reason: PauseReason) {
-    ctx.control
-        .bind_control_events(ctx.account_control_tx.clone());
     ctx.control.engine_pause(reason);
 }
 

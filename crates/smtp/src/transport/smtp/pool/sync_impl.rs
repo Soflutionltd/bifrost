@@ -38,6 +38,27 @@ pub(crate) struct PooledConnection {
     pool: Arc<Pool>,
 }
 
+// Own admission until a connection takes over its eventual release. Declare
+// this before the idle-set lock so unwinding drops the lock before notifying.
+struct LiveReservation<'a> {
+    pool: &'a Pool,
+    transferred: bool,
+}
+
+impl LiveReservation<'_> {
+    fn transfer(mut self) {
+        self.transferred = true;
+    }
+}
+
+impl Drop for LiveReservation<'_> {
+    fn drop(&mut self) {
+        if !self.transferred {
+            self.pool.release_live();
+        }
+    }
+}
+
 impl Pool {
     pub(crate) fn new(config: PoolConfig, client: SmtpClient) -> Arc<Self> {
         Self::with_worker(config, client, |worker| {
@@ -113,13 +134,10 @@ impl Pool {
                     #[cfg(feature = "tracing")]
                     let mut created = 0;
                     for _ in count..(min_idle as usize) {
-                        if !pool.try_reserve() {
-                            break;
-                        }
-                        let conn = match pool.client.connection() {
-                            Ok(conn) => conn,
+                        match pool.replenish(|| pool.client.connection()) {
+                            Ok(true) => {}
+                            Ok(false) => break,
                             Err(err) => {
-                                pool.release_live();
                                 #[cfg(feature = "tracing")]
                                 tracing::warn!("couldn't create idle connection {}", err);
                                 #[cfg(not(feature = "tracing"))]
@@ -127,21 +145,7 @@ impl Pool {
 
                                 break;
                             }
-                        };
-
-                        let mut connections = pool
-                            .connections
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let Some(connections) = connections.as_mut() else {
-                            // The transport was shut down
-                            return;
-                        };
-
-                        connections.push(ParkedConnection::park(conn));
-                        // A replenished connection is a newly available
-                        // one, exactly like a recycled one.
-                        pool.available.notify_one();
+                        }
 
                         #[cfg(feature = "tracing")]
                         {
@@ -184,6 +188,33 @@ impl Pool {
         }
 
         pool
+    }
+
+    fn replenish(
+        &self,
+        connect: impl FnOnce() -> Result<SmtpConnection, Error>,
+    ) -> Result<bool, Error> {
+        if !self.try_reserve() {
+            return Ok(false);
+        }
+        let reservation = LiveReservation {
+            pool: self,
+            transferred: false,
+        };
+        let conn = connect()?;
+        let mut connections = self
+            .connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(connections) = connections.as_mut() else {
+            // Shutdown won the race with setup. Drop the connection and return
+            // admission so a stopped transport retains no phantom live slot.
+            return Ok(false);
+        };
+        connections.push(ParkedConnection::park(conn));
+        reservation.transfer();
+        self.available.notify_one();
+        Ok(true)
     }
 
     /// Park an already-established connection so a test can exercise checkout
@@ -314,14 +345,14 @@ impl Pool {
                     #[cfg(feature = "tracing")]
                     tracing::debug!("creating a new connection");
 
-                    let conn = match self.client.connection() {
-                        Ok(conn) => conn,
-                        Err(error) => {
-                            self.release_live();
-                            return Err(error);
-                        }
+                    let reservation = LiveReservation {
+                        pool: self,
+                        transferred: false,
                     };
-                    return Ok(PooledConnection::wrap(conn, Arc::clone(self)));
+                    let conn = self.client.connection()?;
+                    let conn = PooledConnection::wrap(conn, Arc::clone(self));
+                    reservation.transfer();
+                    return Ok(conn);
                 }
             }
         }
@@ -495,6 +526,67 @@ mod tests {
         SmtpClient {
             info: Default::default(),
         }
+    }
+
+    fn scripted_connection() -> SmtpConnection {
+        use crate::transport::smtp::{Dialect, extension::ClientId, test_support::Transcript};
+
+        SmtpConnection::from_transcript(
+            Transcript::new("220 peer\r\n").expect("EHLO localhost\r\n", "250 peer\r\n"),
+            &ClientId::Domain("localhost".into()),
+            Dialect::Smtp,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replenishment_releases_admission_when_shutdown_wins_setup() {
+        let pool = Pool::new(PoolConfig::new().max_size(1), client());
+        assert!(
+            !pool
+                .replenish(|| {
+                    assert_eq!(pool.live.load(Ordering::Acquire), 1);
+                    pool.shutdown();
+                    Ok(scripted_connection())
+                })
+                .unwrap()
+        );
+        assert_eq!(pool.live.load(Ordering::Acquire), 0);
+        pool.shutdown();
+        assert_eq!(pool.live.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn replenishment_transfers_admission_until_the_connection_is_released() {
+        let pool = Pool::new(
+            PoolConfig::new().max_size(1).test_on_checkout(false),
+            client(),
+        );
+        assert!(pool.replenish(|| Ok(scripted_connection())).unwrap());
+        assert_eq!(pool.live.load(Ordering::Acquire), 1);
+        assert!(!pool.replenish(|| panic!("pool is full")).unwrap());
+        let conn = pool.connection().unwrap();
+        pool.shutdown();
+        assert_eq!(pool.live.load(Ordering::Acquire), 1);
+        drop(conn);
+        assert_eq!(pool.live.load(Ordering::Acquire), 0);
+        pool.shutdown();
+        assert_eq!(pool.live.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn replenishment_releases_admission_on_setup_error_or_unwind() {
+        let pool = Pool::new(PoolConfig::new().max_size(1), client());
+        assert!(
+            pool.replenish(|| Err(error::connection("setup failed")))
+                .is_err()
+        );
+        assert_eq!(pool.live.load(Ordering::Acquire), 0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pool.replenish(|| panic!("setup panicked"));
+        }));
+        assert!(result.is_err());
+        assert_eq!(pool.live.load(Ordering::Acquire), 0);
     }
 
     #[test]

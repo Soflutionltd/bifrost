@@ -82,16 +82,26 @@ This preserves the user's expectation that detaching one attachment cannot
 silently disable the account they attach next.
 
 The slot's throttle handle shares engine deadlines but carries this attachment's
-shutdown token as its recording fence. Already recorded account and resource
-holds survive detach; late writes through the retired handle cannot add or
-extend them. Explicit provider-budget holds remain recordable after retirement
+separate retirement token as its recording fence. Worker shutdown at the start
+of detach does not retire recording. Retirement happens after account close
+and push-registry cleanup, before releasing engine registrations and the
+lifecycle reservation. Holds observed during that teardown window survive:
+a user reattaching immediately after a provider 429 must honor its wait.
+Already recorded account and resource holds survive detach; writes through
+the retired handle cannot add or extend them. Retirement and recording share
+the deadline-map lock so a concurrent write cannot cross that boundary.
+Explicit provider-budget holds remain recordable after retirement
 because their identity is independent of the attachment.
 
-Channel ownership is not yet detachable in the same way as the writer:
-retaining a slot Arc retains its watch senders, its change delivery sender and
-its account-control sender. Consumer streams can therefore remain open past
-detach while that Arc exists. Shutdown stops workers but does not itself close
-these channels.
+Control channel ownership is detachable: `SyncControl` clones share one
+optional account-control sender, taken by `stop` at the start of detach.
+The slot publishes and subscribes through that handle rather than retaining
+another sender. Existing control receivers drain buffered events then see
+`Closed`, even if a slot Arc or consumer control clone survives. The retained
+engine-state watch publishes `Stopping` and closes at the same boundary;
+late subscribers see that terminal snapshot on a closed watch. Pause and
+checkpoint requests on a stopped control return an account-detached error,
+including when the account was already quiescent. Resume cannot revive it.
 
 The engine uses distinct names for three independent mechanisms:
 `cursor::coverage::PublicationStream` keys publication supersession and
@@ -319,7 +329,13 @@ attach still in flight, both yield `AccountNotAttached`. Pinned by
 Throttle deadlines are engine-owned and survive detach until expiry. They
 describe provider holds on stable account identities or shared budgets, so
 detaching and reattaching must not let a user bypass a provider wait. Expired
-entries are pruned opportunistically during throttle lookup.
+entries are pruned opportunistically during throttle lookup. Account close
+refusals are observed before retirement, as are subscription cleanup failures
+that arrive during the teardown window. Workers, queued requests and racing
+reattach cleanup can still finish in that window; their observations describe
+the draining attachment and are accepted. Once teardown retires the handle,
+even those paths cannot extend account or resource holds inherited by a new
+attachment. Explicit provider budgets remain independent of retirement.
 
 Once detach claims the reservation and removes the slot, it synchronously
 raises the teardown signals (`DetachingAccount::begin`: inert departure sweep,
@@ -5020,6 +5036,37 @@ can update account affordances after negotiation. Pre-open capability errors
 may carry no delta because the replacement snapshot is not available yet.
 Bandwidth control watches and snapshots carry `Option<BandwidthCap>` throughout;
 only application to the shared net budget extracts the positive numeric rate.
+
+Delivery owns its broadcast sender in the subscriber mutex. `ChangeDelivery::close`
+synchronously takes that sender, so retained delivery or slot Arcs cannot keep
+it open. Existing receivers drain buffered events before observing closure;
+subscriptions after close are immediately closed and sends reach nobody.
+Detach calls it exactly once, in `DetachingAccount::begin`, after
+`begin_teardown` makes the departure sweep inert and before `SyncControl::stop`
+closes the control and engine-state channels and worker shutdown is tripped.
+So change receivers see the end of stream first, then the control streams. No
+teardown step after that point publishes to consumers: a page or marker a
+draining worker sends is refused, its publication retired and its backfill
+loss noted, which with the sweep already inert is the same forfeiture as a
+receiver dropped at detach. Warnings raised during teardown go to tracing
+only. A user who detached an account expects its feed to end, not to keep
+receiving events from a mailbox they removed.
+
+Checkpoint-bearing inventory pages and completion markers recheck ownership
+through the same `PendingCoverage::with_scope_fence` send operation as
+checkpoint-free inventory. For backfill pages and markers the guard also verifies
+that the publication remains registered and is not excluded by a backfill
+discard fence. This matters because a bounded discard leaves the producer's
+scope fence unchanged. Change-lane pages are not rechecked for registration: a
+concurrent live publication on the same stream may supersede the entry between
+registration and send, folding its claim into the survivor, and suppressing the
+page then would let that survivor's acknowledgement certify items never sent. Delivery
+membership is locked before coverage; the synchronous guarded callback only
+sends, with no writer access or cancellation point. Backfill delivery stamping
+runs after the coverage guard releases and before delivery membership unlocks.
+A reset after the send may retire its registration, making that stamp a no-op.
+A refused send retires the publication and records backfill loss so the user
+gets a retry rather than a completed folder with missing messages.
 
 Fusion establishment stops without installing a terminal cursor when any page,
 including a checkpoint-free page or Done, reaches no numbered receiver. Retiring

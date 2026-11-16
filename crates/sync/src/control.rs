@@ -87,7 +87,8 @@ impl DurableStream {
 
 struct SyncControlInner {
     account: AccountId,
-    engine_state: watch::Sender<EngineState>,
+    engine_state: std::sync::Mutex<Option<watch::Sender<EngineState>>>,
+    engine_state_rx: watch::Receiver<EngineState>,
     control_events: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<crate::AccountControl>>>,
     boundary: Boundary,
     /// Watch channel carrying the latest persisted checkpoint and the
@@ -148,10 +149,12 @@ impl SyncControl {
             checkpoints: DurableCheckpointSet::default(),
             quiescent: true,
         });
+        let (engine_state, engine_state_rx) = watch::channel(EngineState::Running);
         Self {
             inner: Arc::new(SyncControlInner {
                 account,
-                engine_state: watch::channel(EngineState::Running).0,
+                engine_state: std::sync::Mutex::new(Some(engine_state)),
+                engine_state_rx,
                 control_events: std::sync::Mutex::new(None),
                 boundary,
                 checkpoint_tx,
@@ -171,16 +174,47 @@ impl SyncControl {
         &self,
         events: tokio::sync::broadcast::Sender<crate::AccountControl>,
     ) {
-        *self
+        let mut target = self
             .inner
             .control_events
             .lock()
-            .expect("control events lock") = Some(events);
+            .expect("control events lock");
+        if self.inner.boundary.snapshot() != BoundaryRequest::Stop {
+            *target = Some(events);
+        }
+    }
+
+    pub(crate) fn control_events(&self) -> tokio::sync::broadcast::Receiver<crate::AccountControl> {
+        let events = self
+            .inner
+            .control_events
+            .lock()
+            .expect("control events lock");
+        events.as_ref().map_or_else(
+            || tokio::sync::broadcast::channel(1).1,
+            tokio::sync::broadcast::Sender::subscribe,
+        )
+    }
+
+    pub(crate) fn publish_control(&self, event: crate::AccountControl) {
+        if let Some(events) = self
+            .inner
+            .control_events
+            .lock()
+            .expect("control events lock")
+            .as_ref()
+        {
+            let _ = events.send(event);
+        }
     }
 
     /// Latest recovery state, retained for consumers subscribing after an automatic pause.
+    /// Detach publishes Stopping and closes this watch, even with surviving clones.
     pub fn engine_state(&self) -> watch::Receiver<EngineState> {
-        self.inner.engine_state.subscribe()
+        let mut state = self.inner.engine_state_rx.clone();
+        // Match Sender::subscribe: historical changes are already observed.
+        state.borrow_and_update();
+        state
     }
 
     pub(crate) fn engine_pause(&self, reason: crate::PauseReason) {
@@ -196,22 +230,39 @@ impl SyncControl {
             .boundary
             .set_unless_stopped(BoundaryRequest::Pause);
         // A late subscriber needs the reason a corporate mailbox stopped syncing.
-        self.inner
+        if let Some(state) = self
+            .inner
             .engine_state
-            .send_replace(EngineState::Paused(reason));
+            .lock()
+            .expect("engine state lock")
+            .as_ref()
+        {
+            state.send_replace(EngineState::Paused(reason));
+        }
         if let Some(events) = events.as_ref() {
             let _ = events.send(crate::AccountControl::Pause(reason));
         }
     }
 
     pub(crate) fn stop(&self) {
-        let _events = self
+        let mut events = self
             .inner
             .control_events
             .lock()
             .expect("control events lock");
         self.inner.boundary.set(BoundaryRequest::Stop);
-        self.inner.engine_state.send_replace(EngineState::Stopping);
+        if let Some(state) = self
+            .inner
+            .engine_state
+            .lock()
+            .expect("engine state lock")
+            .take()
+        {
+            state.send_replace(EngineState::Stopping);
+        }
+        // Shared ownership is closable: retained controls and slot Arcs cannot
+        // keep the detached account's consumer control stream alive.
+        events.take();
     }
 
     /// Apply both controls with their watch borrows held through each setter.
@@ -623,8 +674,9 @@ impl SyncControl {
     /// sender at its top - so from that moment no outstanding registration
     /// can ever be acknowledged, and a quiescence this waiter is holding out
     /// for cannot arrive. The checkpoint watch alone cannot deliver that
-    /// verdict: the consumer's own `SyncControl` clone keeps the sender
-    /// alive, so the channel never closes under it. Before this arm existed
+    /// verdict while the writer drains: Stop closes the public control streams,
+    /// but the internal checkpoint watch stays alive for final durable updates.
+    /// Before this arm existed
     /// the waiter's only rescue was incidental - a receiver dropped inside
     /// the teardown window ran the departure sweep, which retired the
     /// registrations and republished quiescence - and the sweep is now
@@ -641,7 +693,10 @@ impl SyncControl {
         loop {
             {
                 let snap = rx.borrow();
-                if snap.generation >= generation && snap.quiescent {
+                if boundary.peek() != BoundaryRequest::Stop
+                    && snap.generation >= generation
+                    && snap.quiescent
+                {
                     return Ok(snap.checkpoints.clone());
                 }
             }
@@ -716,6 +771,9 @@ impl Control for SyncControl {
         >,
     > {
         Box::pin(async move {
+            if self.inner.boundary.snapshot() == BoundaryRequest::Stop {
+                return Err(control_wait_ended("control: account detached"));
+            }
             // Bump the generation BEFORE flipping the boundary so
             // `record_checkpoint` calls that race with us land in the
             // new generation, not the old one.
@@ -737,6 +795,9 @@ impl Control for SyncControl {
         >,
     > {
         Box::pin(async move {
+            if self.inner.boundary.snapshot() == BoundaryRequest::Stop {
+                return Err(control_wait_ended("control: account detached"));
+            }
             let gen_id =
                 CheckpointGeneration(self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1);
             // Read-and-install is one atomic step, so a `Pause` landing
@@ -765,7 +826,15 @@ impl Control for SyncControl {
             .lock()
             .expect("control events lock");
         if self.inner.boundary.set_unless_stopped(BoundaryRequest::Run) {
-            self.inner.engine_state.send_replace(EngineState::Running);
+            if let Some(state) = self
+                .inner
+                .engine_state
+                .lock()
+                .expect("engine state lock")
+                .as_ref()
+            {
+                state.send_replace(EngineState::Running);
+            }
             if let Some(events) = events.as_ref() {
                 let _ = events.send(crate::AccountControl::Resume);
             }

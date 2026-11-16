@@ -165,7 +165,9 @@ async fn control_calls_never_resurrect_a_stopping_account() {
         tokio::task::yield_now().await;
         recorder.record_checkpoint(sample_checkpoint(b"cp")).await;
     });
-    assert!(result.is_ok(), "the final flush still satisfies the waiter");
+    // A stopped control is closed: the request is refused as detached rather
+    // than certified by a final flush the consumer can no longer rely on.
+    assert!(result.is_err(), "a stopped control refuses checkpoint_now");
     assert_eq!(
         h.boundary.snapshot(),
         BoundaryRequest::Stop,

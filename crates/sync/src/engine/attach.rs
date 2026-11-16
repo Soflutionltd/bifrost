@@ -229,7 +229,7 @@ impl SyncEngine {
             Arc::clone(&pending_coverage),
         );
 
-        control.bind_control_events(account_control_tx.clone());
+        control.bind_control_events(account_control_tx);
 
         let (ack_tx, ack_rx) = mpsc::channel::<WriterRequest>(256);
         let writer = WriterHandle::new(ack_tx);
@@ -355,7 +355,8 @@ impl SyncEngine {
 
         // Shutdown token tree: per-slot child of engine root.
         let shutdown = self.root_cancel.child_token();
-        let throttles = Arc::new(throttle_bucket.for_slot(shutdown.clone()));
+        // Retirement is the end of owned teardown, not worker shutdown.
+        let throttles = Arc::new(throttle_bucket.for_slot(CancellationToken::new()));
 
         // ArcSwap holds the current `Arc<dyn Account>` so spawned
         // workers see post-reopen handles immediately.
@@ -556,7 +557,6 @@ impl SyncEngine {
             cursors: Arc::clone(&cursors),
             account_id: account_id.clone(),
             control: control.clone(),
-            account_control_tx: account_control_tx.clone(),
             throttles: Arc::clone(&throttles),
             boundary: boundary.clone(),
             capabilities: Arc::clone(&capabilities),

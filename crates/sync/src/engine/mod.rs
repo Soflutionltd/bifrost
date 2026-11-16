@@ -335,6 +335,8 @@ impl DetachingAccount {
         // Through the delivery gate, so a sweep already running finishes -
         // discard request included - before the flag is observed.
         slot.delivery.begin_teardown(&slot.coverage);
+        // Close consumer delivery independently of retained slot ownership.
+        slot.delivery.close();
         // Ask running workers to checkpoint cleanly, then stop.
         slot.control.stop();
         // Trip shutdown before awaiting workers. Some account-level
@@ -559,6 +561,7 @@ impl DetachingAccount {
         match close_within(current.as_ref().as_ref(), self.timeout).await {
             CloseOutcome::Closed => {}
             CloseOutcome::Refused(e) => {
+                crate::recovery::observe_failure_throttles(&slot.throttles, account_id, &e);
                 tracing::warn!(target: "bifrost.sync.changes", error=?e, "account close failed");
             }
             CloseOutcome::TimedOut => {
@@ -577,11 +580,9 @@ impl DetachingAccount {
         // Nothing can reach them after this point - `unsubscribe_push`
         // rejects with `AccountNotAttached` and reattach only runs on an
         // attached slot - so leaving them behind does not preserve a
-        // teardown opportunity; it only means a later attach of the same
-        // `AccountId` inherits handles minted by a dead connection and
-        // hands them to the provider as if they were live. A handle whose
-        // connection is gone is not retryable, so dropping is strictly
-        // better than carrying.
+        // teardown opportunity. This registry belongs only to this attachment;
+        // a later attach creates an independent registry. Drop unreachable
+        // connection-local handles rather than retaining dead resources.
         //
         // This does NOT delete the server-side subscriptions: per
         // `reference/types.md` that stays the consumer's job via
@@ -601,6 +602,11 @@ impl DetachingAccount {
                  keeps delivering until they expire",
             );
         }
+        // Workers were stopped at begin(), but provider teardown can still
+        // return a 429 while we drain or close. An enterprise user reattaching
+        // must honor that wait. Retire recording only now, before releasing
+        // the reservation; later responses cannot extend a successor's holds.
+        slot.throttles.retire();
         // Release while this attachment still holds the lifecycle reservation,
         // even when callers retain an Arc to the retired slot.
         drop(
@@ -1208,7 +1214,7 @@ impl SyncEngine {
             .accounts
             .get(account_id)
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        Ok(slot.account_control_tx.subscribe())
+        Ok(slot.control.control_events())
     }
 
     /// Consumer-driven resume. Flips the boundary back to `Run` and

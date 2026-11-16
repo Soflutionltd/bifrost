@@ -209,11 +209,11 @@ impl Drop for ChangesReceiver {
 ///
 /// Live changes do NOT go through [`ChangeDelivery::publish_backfill`]: they
 /// consume no capacity and are never swept, so they are never stamped. A live
-/// publication that expects an ACKNOWLEDGEMENT still goes through
-/// [`Self::publish_acknowledgeable`], which takes the lock only to read the live
-/// numbered set at the send; checkpoint-free inventory pages, barrier pages
-/// included, use it too. Events nobody acknowledges - warnings, terminations -
-/// send on [`Self::publish_unacked`] directly and take no lock.
+/// publication sent by `PagePublisher` uses the coverage-guarded inventory
+/// send, including checkpoint-free pages whose prefix Done will certify.
+/// Other acknowledgeable publications use [`Self::publish_acknowledgeable`].
+/// Events nobody acknowledges - warnings, terminations -
+/// send on [`Self::publish_unacked`] directly and share the delivery lock.
 ///
 /// The raw broadcast sender is deliberately not exposed (no `sender()` accessor,
 /// no `changes_tx` on the handle): a raw send bypasses the numbered-receiver
@@ -222,7 +222,6 @@ impl Drop for ChangesReceiver {
 /// or [`Self::publish_unacked`].
 #[derive(Debug)]
 pub struct ChangeDelivery {
-    tx: broadcast::Sender<MultiplexerEvent>,
     state: StdMutex<SubscriberState>,
 }
 
@@ -382,7 +381,8 @@ impl PagePublisher {
         event.publication = Some(id.clone());
         let reached = self
             .delivery
-            .publish_backfill(event, &self.coverage, Some(&id));
+            .publish_inventory_if_fence(event, &self.coverage, &scope, fence)
+            .unwrap_or(false);
         if !reached {
             self.coverage.note_undelivered(&scope, 1);
             self.control.retire_publication(id);
@@ -390,8 +390,8 @@ impl PagePublisher {
         reached
     }
 
-    /// Register against the walk's original fence, then send and retire an
-    /// unreachable publication synchronously. Cancellation cannot split these
+    /// Register against the walk's original fence, recheck under the send guard,
+    /// then send and retire an unreachable publication synchronously. Cancellation cannot split these
     /// steps. A mail user must get a retry rather than a completed empty folder.
     pub fn publish_page(
         &self,
@@ -416,12 +416,10 @@ impl PagePublisher {
             .control
             .publish_checkpoint_if_fence(checkpoint, claim, fence)?;
         event.publication = Some(id.clone());
-        let reached = if backfill {
-            self.delivery
-                .publish_backfill(event, &self.coverage, Some(&id))
-        } else {
-            self.delivery.publish_acknowledgeable(event)
-        };
+        let reached = self
+            .delivery
+            .publish_inventory_if_fence(event, &self.coverage, &scope, fence)
+            .unwrap_or(false);
         if !reached {
             if backfill {
                 self.coverage.note_undelivered(&scope, 1);
@@ -450,6 +448,7 @@ impl ReceiverSequence {
 
 #[derive(Debug)]
 struct SubscriberState {
+    tx: Option<broadcast::Sender<MultiplexerEvent>>,
     /// How many consumer receivers this account has ever handed out.
     next: ReceiverSequence,
     /// Bound by the first numbered subscription; this ledger alone owns membership.
@@ -459,6 +458,7 @@ struct SubscriberState {
 impl Default for SubscriberState {
     fn default() -> Self {
         Self {
+            tx: None,
             next: ReceiverSequence(0),
             coverage: None,
         }
@@ -491,8 +491,27 @@ impl ChangeDelivery {
     #[must_use]
     pub fn new(tx: broadcast::Sender<MultiplexerEvent>) -> Self {
         Self {
-            tx,
-            state: StdMutex::new(SubscriberState::default()),
+            state: StdMutex::new(SubscriberState {
+                tx: Some(tx),
+                ..SubscriberState::default()
+            }),
+        }
+    }
+
+    /// Close delivery even when workers or callers retain this gate's Arc.
+    /// Buffered events remain readable; subsequent subscriptions are closed.
+    /// Call synchronously when detach removes the slot, before worker teardown.
+    pub fn close(&self) {
+        self.guard().tx.take();
+    }
+
+    fn receiver(state: &SubscriberState) -> broadcast::Receiver<MultiplexerEvent> {
+        if let Some(tx) = &state.tx {
+            tx.subscribe()
+        } else {
+            let (tx, receiver) = broadcast::channel(1);
+            drop(tx);
+            receiver
         }
     }
 
@@ -516,7 +535,11 @@ impl ChangeDelivery {
             tracing::error!("refusing unregistered checkpoint publication");
             return UnackedPublication::Refused;
         }
-        match self.tx.send(event) {
+        let state = self.guard();
+        let Some(tx) = &state.tx else {
+            return UnackedPublication::NoReceivers;
+        };
+        match tx.send(event) {
             Ok(receivers) => UnackedPublication::Published(receivers),
             Err(_) => UnackedPublication::NoReceivers,
         }
@@ -573,10 +596,13 @@ impl ChangeDelivery {
         // guarantee, not a tested one: the interleaving it rules out cannot be
         // staged from a test, because any hook placed between the send and the
         // stamp would have to take this lock to subscribe and would simply
-        // deadlock. `publish_backfill` is the only path that sends a backfill
-        // batch, so there is no second ordering to get wrong.
+        // deadlock. The guarded inventory send uses the same delivery lock
+        // around its send and stamp.
         let issued = state.next;
-        let _ = self.tx.send(event);
+        let Some(tx) = &state.tx else {
+            return false;
+        };
+        let _ = tx.send(event);
         if let Some(id) = publication {
             coverage.mark_delivered(id, issued);
         }
@@ -604,16 +630,19 @@ impl ChangeDelivery {
     /// [`PagePublisher::publish_inventory`]: Done certifies their prefix, so a
     /// page nobody numbered received must read as undelivered. Events that
     /// expect no acknowledgement - warnings, terminations - go on
-    /// [`Self::publish_unacked`] directly and take no lock.
+    /// [`Self::publish_unacked`] directly and share the delivery lock.
     pub fn publish_acknowledgeable(&self, event: MultiplexerEvent) -> bool {
         let state = self.guard();
-        let _ = self.tx.send(event);
+        let Some(tx) = &state.tx else {
+            return false;
+        };
+        let _ = tx.send(event);
         let reached = state.min_live().is_some();
         drop(state);
         reached
     }
 
-    /// Order checkpoint-free inventory sends with reset under the fence owner.
+    /// Order inventory pages and checkpoint markers with reset under the fence owner.
     fn publish_inventory_if_fence(
         &self,
         event: MultiplexerEvent,
@@ -629,10 +658,22 @@ impl ChangeDelivery {
         // min_live reads coverage too, so resolve it before taking the fence
         // guard. Membership cannot change while `state` remains held.
         let reached = state.min_live().is_some();
-        let result = coverage.with_scope_fence(scope, fence, || {
-            let _ = self.tx.send(event);
-            reached
+        let publication = event.publication.clone();
+        let backfill = matches!(&event.checkpoint, Some(Checkpoint::Backfill(_)));
+        // Only a backfill receipt is rechecked for registration. A change-lane
+        // entry can be legitimately superseded by a concurrent live publication
+        // between registration and this send; its claim is folded into the
+        // survivor, so suppressing the page would certify items never sent.
+        let receipt = publication.as_ref().filter(|_| backfill);
+        let result = coverage.with_scope_fence(scope, fence, receipt, || {
+            state.tx.as_ref().is_some_and(|tx| tx.send(event).is_ok()) && reached
         });
+        if result == Some(true)
+            && backfill
+            && let Some(id) = &publication
+        {
+            coverage.mark_delivered(id, state.next);
+        }
         drop(state);
         result
     }
@@ -655,18 +696,16 @@ impl ChangeDelivery {
     /// Unnumbered, so it is invisible to the subscriber gate, to the delivery
     /// decision above, and to the backfill bound; it carries no control handle,
     /// so its lag warns without abandoning anything; and it carries no coverage
-    /// handle, so its read and its departure touch no ledger. Nothing here takes
-    /// the lock, because there is nothing to order: the numbering is exact
-    /// without it, and the only thing an observer's subscribe changes is the
-    /// broadcast's receiver count, which nothing reads any more.
+    /// handle, so its read and its departure touch no ledger. The delivery lock
+    /// orders its subscription against close without updating membership.
     ///
     /// Held WEAK-free on purpose: an observer keeps no reference back here at
-    /// all, so it cannot keep the sender alive past `detach` any more than a
+    /// all, so it cannot keep the sender alive past `close` any more than a
     /// numbered receiver can.
     #[must_use]
     pub fn observe(&self) -> ChangesReceiver {
         ChangesReceiver {
-            inner: Some(self.tx.subscribe()),
+            inner: Some(Self::receiver(&self.guard())),
             control: None,
             subscription: None,
             coverage: None,
@@ -680,8 +719,7 @@ impl ChangeDelivery {
     /// long as any consumer held a receiver, so a consumer draining the ring
     /// after `detach` would wait in `recv()` for ever instead of seeing
     /// `Closed`: it would be keeping the last sender alive itself. The engine
-    /// must be able to close the channel by dropping the slot, and a weak handle
-    /// is what lets it.
+    /// closes delivery explicitly at detach, including when a slot Arc survives.
     ///
     /// The first subscription binds the coverage ledger; all later ones must
     /// use the same Arc. A mismatch is refused with an immediately closed,
@@ -694,6 +732,14 @@ impl ChangeDelivery {
         coverage: Arc<crate::cursor::PendingCoverage>,
     ) -> ChangesReceiver {
         let mut state = self.guard();
+        if state.tx.is_none() {
+            return ChangesReceiver {
+                inner: Some(Self::receiver(&state)),
+                control: None,
+                subscription: None,
+                coverage: None,
+            };
+        }
         // One delivery gate cannot number receivers against different ledgers.
         // Binding under the send/depart lock preserves the existing lock order.
         let refusal = if let Some(bound) = &state.coverage {
@@ -724,7 +770,7 @@ impl ChangeDelivery {
         // Subscribe INSIDE the lock: a receiver created here is numbered against
         // exactly the set of batches already sent, with no window in which a
         // send could slip between the two and be mis-attributed.
-        let inner = self.tx.subscribe();
+        let inner = Self::receiver(&state);
         let seq = state.next;
         state.next.admit();
         coverage.receiver_joined(seq);
@@ -791,7 +837,7 @@ impl ChangeDelivery {
              checkpoint. Boundary waits (pause / checkpoint_now) stay usable, but the \
              checkpoint they report may predate the retired batches.",
         ));
-        let _ = self.tx.send(MultiplexerEvent::unacked(
+        let _ = self.publish_unacked(MultiplexerEvent::unacked(
             EventScope::Account,
             Arc::new(SyncEvent::Warning(warning)),
         ));

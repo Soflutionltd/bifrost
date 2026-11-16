@@ -132,7 +132,6 @@ impl Harness {
             cursors,
             account_id,
             control,
-            account_control_tx: broadcast::channel(8).0,
             throttles,
             boundary: boundary.clone(),
             capabilities: Arc::new(std::sync::RwLock::new(caps)),

@@ -938,6 +938,16 @@ Canonicalization follows RFC 6376 for empty bodies and missing final CRLFs. Rela
 
 ## Pool
 
+Blocking setup owns a live-slot reservation guard until the connection is
+parked or handed to checkout. Setup failure, unwinding, and shutdown during
+replenishment release that reservation exactly once; successful handoff leaves
+release to the connection's existing recycle or shutdown path. The guard is
+created before the idle-set lock so releasing admission cannot re-lock a mutex
+still held by the same thread. Replenishment that observes shutdown stops its
+pass through normal cleanup, also releasing expired connections removed earlier
+in that pass. A stopped transport must not retain phantom live connections.
+Async setup already owns a semaphore permit with the same release-on-drop rule.
+
 Async recycle spawns bounded `abort()` teardown for broken or retired connections and for returns to a closed pool. The task retains the admission permit until teardown finishes, so replacement connections cannot exceed the live-connection bound. Abort closes the stream without sending QUIT.
 
 `PoolConfig` configures min idle, max size, idle timeout, and the checkout NOOP probe. `max_size` bounds all live connections, checked out and idle, in both the blocking and async pools; checkout waits for a slot instead of dialing past the bound. Zero is rejected at checkout. Recycling refuses connections that are `Broken` and connections flagged for retirement by an LMTP final-status drain (see "Connection state and cancel-safety"). `min_idle` defaults to 0: no background pool worker is started, and expired connections are discarded at checkout. A positive `min_idle` enables the worker that expires and replenishes warm connections without exceeding `max_size`. An idle timeout of zero disables expiration; a positive-`min_idle` worker checks for replacements once per second so a zero timeout cannot create a zero-delay loop. `test_on_checkout(false)` opts out of the default NOOP probe for callers willing to retry one stale idle connection; it does not permit a connection already marked `Broken` to be reused. It buys nothing for LMTP transports, whose connections are retired at recycle and therefore never checked out idle.

@@ -882,3 +882,86 @@ async fn changes_receiver_surfaces_broadcast_lag_as_lag_warning() {
     ));
     drop(sentinel);
 }
+
+#[test]
+fn closing_retained_delivery_drains_then_closes_every_receiver() {
+    let h = delivery_harness(4);
+    let mut numbered = h.subscribe();
+    let mut observer = h.delivery.observe();
+    let retained = Arc::clone(&h.delivery);
+    let _ = h.delivery.publish_unacked(warning_event("buffered"));
+    h.delivery.close();
+    retained.close();
+    assert!(numbered.try_recv().is_ok());
+    assert!(observer.try_recv().is_ok());
+    for receiver in [&mut numbered, &mut observer] {
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
+    }
+    assert!(matches!(
+        retained.observe().try_recv(),
+        Err(broadcast::error::TryRecvError::Closed)
+    ));
+    assert!(matches!(
+        h.subscribe().try_recv(),
+        Err(broadcast::error::TryRecvError::Closed)
+    ));
+    assert_eq!(
+        retained.publish_unacked(warning_event("late")),
+        UnackedPublication::NoReceivers
+    );
+}
+
+#[test]
+fn registered_pages_and_markers_are_not_sent_after_invalidation() {
+    for marker in [false, true] {
+        for discard in [false, true] {
+            let h = delivery_harness(4);
+            let mut receiver = h.subscribe();
+            let scope = CursorScope::Account;
+            let fence = h.coverage.scope_fence(&scope);
+            let checkpoint = Delivery::backfill_page("registered");
+            let claim = crate::cursor::CoverageClaim {
+                reports: Vec::new(),
+                generation: h.coverage.next_generation(),
+            };
+            let id = if marker {
+                h.control
+                    .publish_walk_marker_if_fence(
+                        checkpoint.clone(),
+                        h.coverage.undelivered_watermark(&scope),
+                        fence,
+                    )
+                    .expect("marker registered")
+            } else {
+                h.control
+                    .publish_checkpoint_if_fence(checkpoint.clone(), claim, fence)
+                    .expect("page registered")
+            };
+            // Stage the exact gap between registration and the guarded send.
+            if discard {
+                h.coverage.invalidate_scope_backfill(&scope, Some(&id));
+                assert_eq!(h.coverage.scope_fence(&scope), fence);
+            } else {
+                h.coverage.invalidate_scope(&scope);
+            }
+            let event = MultiplexerEvent {
+                scope: EventScope::Cursor(scope.clone()),
+                event: Arc::new(SyncEvent::Done(Some(checkpoint.clone()))),
+                checkpoint: Some(checkpoint),
+                publication: Some(id),
+            };
+            assert_eq!(
+                h.delivery
+                    .publish_inventory_if_fence(event, &h.coverage, &scope, fence),
+                None
+            );
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+}

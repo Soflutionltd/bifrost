@@ -483,9 +483,8 @@ pub(in crate::engine) async fn reattach_account_paced(
             let delta = bifrost_types::CapabilityDelta::between(&capabilities, next.capabilities());
             *capabilities = next.capabilities().clone();
             if !delta.is_empty() {
-                let _ = ctx
-                    .account_control_tx
-                    .send(AccountControl::CapabilitiesChanged(delta));
+                ctx.control
+                    .publish_control(AccountControl::CapabilitiesChanged(delta));
             }
         }
         // Sealed against detach like every registry write (see

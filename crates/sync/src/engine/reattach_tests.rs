@@ -1495,3 +1495,129 @@ async fn consumer_teardown_records_shared_holds_and_keeps_only_orphans() {
     );
     fixture.engine.detach(&fixture.id).await.expect("detach");
 }
+
+/// The old shutdown-token fence drops both observations made after begin().
+/// The final assertion also catches a retirement boundary that never closes.
+#[tokio::test(start_paused = true)]
+async fn detach_records_teardown_holds_then_fences_the_retained_slot() {
+    let mut initial = account();
+    initial.close_error = Some(
+        teardown_throttle(70, None)
+            .into_builder()
+            .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Account))
+            .try_build()
+            .expect("account hold"),
+    );
+    let factory: Arc<dyn AccountFactory> = Arc::new(common::StubFactory::queue(vec![
+        Arc::new(initial),
+        Arc::new(account()),
+    ]));
+    let fixture = Fixture::new(Arc::clone(&factory)).await;
+    let teardown = DetachingAccount {
+        slot: Arc::clone(&fixture.slot),
+        teardown_writer: None,
+        timeout: fixture.engine.config.detach_timeout,
+    };
+    teardown.begin();
+    assert!(fixture.slot.shutdown.is_cancelled());
+    let folder = ThrottleKey::Folder {
+        account: fixture.id.clone(),
+        folder: bifrost_types::FolderId("teardown-folder".into()),
+    };
+    fixture.slot.throttles.record(
+        folder.clone(),
+        tokio::time::Instant::now() + Duration::from_secs(40),
+    );
+    fixture.engine.detach(&fixture.id).await.expect("detach");
+    fixture
+        .engine
+        .attach(fixture.id.clone(), factory)
+        .await
+        .expect("reattach");
+    let successor = Arc::clone(
+        fixture
+            .engine
+            .accounts
+            .get(&fixture.id)
+            .expect("successor")
+            .value(),
+    );
+    assert_eq!(
+        successor
+            .throttles
+            .wait_for_account(&fixture.id, tokio::time::Instant::now()),
+        Some(Duration::from_secs(70)),
+    );
+    assert_eq!(
+        successor
+            .throttles
+            .wait_for(&folder, tokio::time::Instant::now()),
+        Some(Duration::from_secs(40)),
+    );
+    for key in [ThrottleKey::Account(fixture.id.clone()), folder.clone()] {
+        fixture
+            .slot
+            .throttles
+            .record(key, tokio::time::Instant::now() + Duration::from_secs(120));
+    }
+    assert_eq!(
+        successor
+            .throttles
+            .wait_for_account(&fixture.id, tokio::time::Instant::now()),
+        Some(Duration::from_secs(70)),
+    );
+    assert_eq!(
+        successor
+            .throttles
+            .wait_for(&folder, tokio::time::Instant::now()),
+        Some(Duration::from_secs(40)),
+    );
+    fixture
+        .engine
+        .detach(&fixture.id)
+        .await
+        .expect("detach successor");
+}
+
+/// Before detachable control ownership, the retained slot and clone each keep
+/// consumer streams open, and a quiescent stopped control reports success.
+#[tokio::test]
+async fn detach_closes_control_streams_with_a_retained_slot_and_control_clone() {
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![Arc::new(
+        account(),
+    )])))
+    .await;
+    let control = fixture.slot.control.clone();
+    let mut events = fixture
+        .engine
+        .account_control_stream(&fixture.id)
+        .expect("control stream");
+    let mut state = control.engine_state();
+    fixture.engine.detach(&fixture.id).await.expect("detach");
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+    ));
+    assert!(matches!(
+        *state.borrow_and_update(),
+        crate::control::EngineState::Stopping
+    ));
+    assert!(state.has_changed().is_err());
+    let late_state = control.engine_state();
+    assert!(matches!(
+        *late_state.borrow(),
+        crate::control::EngineState::Stopping
+    ));
+    assert!(late_state.has_changed().is_err());
+    assert!(Control::pause(&control).await.is_err());
+    assert!(Control::checkpoint_now(&control).await.is_err());
+    Control::resume(&control);
+    assert!(matches!(
+        *state.borrow(),
+        crate::control::EngineState::Stopping
+    ));
+    assert!(matches!(
+        control.control_events().try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+    ));
+}

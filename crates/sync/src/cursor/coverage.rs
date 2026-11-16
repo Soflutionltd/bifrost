@@ -1867,17 +1867,36 @@ impl PendingCoverage {
     }
 
     /// Run a synchronous send while the expected producer fence still holds.
+    /// A supplied backfill receipt must also remain registered and survive
+    /// discard. Change-lane receipts are not supplied: supersession may fold them.
     /// The caller must already hold delivery membership and must not acquire
     /// delivery, coverage or writer locks inside `send`.
     pub(crate) fn with_scope_fence<T>(
         &self,
         scope: &CursorScope,
         expected: ScopeFence,
+        publication: Option<&AckToken>,
         send: impl FnOnce() -> T,
     ) -> Option<T> {
         let ledger = self.guard();
         if ledger.fences.scope_fence(scope) != expected {
             return None;
+        }
+        if let Some(id) = publication {
+            let entry = ledger
+                .ring
+                .boundaries
+                .iter()
+                .find(|entry| entry.id == *id)?;
+            if matches!(entry.stream, PublicationStream::Backfill(..))
+                && ledger
+                    .fences
+                    .fenced_backfill
+                    .get(scope)
+                    .is_some_and(|fence| fence.excludes(id))
+            {
+                return None;
+            }
         }
         let result = send();
         drop(ledger);

@@ -68,13 +68,8 @@ pub(crate) struct AccountSlot {
     /// aborts each worker on timeout so tasks do not leak past the
     /// configured deadline.
     pub workers: std::sync::Mutex<Vec<WorkerTask>>,
-    /// Per-account control stream. Engine publishes
-    /// `AccountControl::Pause(reason)` when the engine has automatically
-    /// paused the account (operator-override directive, retry budget
-    /// exhausted, tenant throttle). Consumers subscribe via
-    /// `SyncEngine::account_control_stream`.
-    pub account_control_tx: broadcast::Sender<AccountControl>,
-    /// Sentinel receiver keeps the account-control channel alive.
+    /// Sentinel receiver permits control publication with no consumer.
+    /// Sender ownership lives only in the closable SyncControl handle.
     #[allow(dead_code)]
     pub _account_control_sentinel: broadcast::Receiver<AccountControl>,
     /// Notify fired when a new real subscriber arrives on

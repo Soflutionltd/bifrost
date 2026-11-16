@@ -30,7 +30,7 @@ async fn retirement_preserves_known_holds_but_fences_late_account_observations()
         .expect("provider refusal")
     };
     retired.observe(&account, &refusal(30));
-    shutdown.cancel();
+    retired.retire();
     let late = refusal(120);
     assert_eq!(
         retired.observe(&account, &late),
