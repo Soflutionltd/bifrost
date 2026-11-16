@@ -2,7 +2,7 @@ use std::{
     fmt::{self, Debug},
     ops::{Deref, DerefMut},
     sync::{
-        Arc, Condvar, Mutex, TryLockError,
+        Arc, Condvar, Mutex, OnceLock, TryLockError,
         atomic::{AtomicU32, Ordering},
         mpsc,
     },
@@ -18,11 +18,14 @@ use crate::transport::smtp::{error, transport::SmtpClient};
 
 pub(crate) struct Pool {
     config: PoolConfig,
+    // Checkout rejects poison. Cleanup recovers ownership to release resources,
+    // including during unwinding, without a second panic.
     connections: Mutex<Option<Vec<ParkedConnection>>>,
     available: Condvar,
     live: AtomicU32,
     thread_terminator: Option<mpsc::SyncSender<()>>,
     client: SmtpClient,
+    worker_error: OnceLock<std::io::Error>,
 }
 
 struct ParkedConnection {
@@ -37,6 +40,19 @@ pub(crate) struct PooledConnection {
 
 impl Pool {
     pub(crate) fn new(config: PoolConfig, client: SmtpClient) -> Arc<Self> {
+        Self::with_worker(config, client, |worker| {
+            thread::Builder::new()
+                .name("bifrost-smtp-connection-pool".into())
+                .spawn(worker)
+                .map(|_| ())
+        })
+    }
+
+    fn with_worker(
+        config: PoolConfig,
+        client: SmtpClient,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) -> Arc<Self> {
         let (thread_terminator, thread_rx) = if config.min_idle > 0 {
             let (thread_tx, thread_rx) = mpsc::sync_channel(1);
             (Some(thread_tx), Some(thread_rx))
@@ -51,6 +67,7 @@ impl Pool {
             live: AtomicU32::new(0),
             thread_terminator,
             client,
+            worker_error: OnceLock::new(),
         });
 
         if let Some(thread_rx) = thread_rx {
@@ -60,105 +77,110 @@ impl Pool {
             let idle_timeout = pool_.config.idle_timeout;
             let pool = Arc::downgrade(&pool_);
 
-            thread::Builder::new()
-                .name("bifrost-smtp-connection-pool".into())
-                .spawn(move || {
-                    while let Some(pool) = pool.upgrade() {
-                        #[cfg(feature = "tracing")]
-                        tracing::trace!("running cleanup tasks");
+            let spawned = spawn(Box::new(move || {
+                while let Some(pool) = pool.upgrade() {
+                    #[cfg(feature = "tracing")]
+                    tracing::trace!("running cleanup tasks");
 
-                        #[allow(clippy::needless_collect)]
-                        let (count, dropped) = {
-                            let mut connections = pool.connections.lock().unwrap();
-                            let Some(connections) = connections.as_mut() else {
-                                // The transport was shut down
-                                return;
-                            };
-
-                            let to_drop = connections
-                                .iter()
-                                .enumerate()
-                                .rev()
-                                .filter(|(_, conn)| {
-                                    idle_connection_expired(conn.idle_duration(), idle_timeout)
-                                })
-                                .map(|(i, _)| i)
-                                .collect::<Vec<_>>();
-                            let dropped = to_drop
-                                .into_iter()
-                                .map(|i| connections.remove(i))
-                                .collect::<Vec<_>>();
-
-                            (connections.len(), dropped)
+                    #[allow(clippy::needless_collect)]
+                    let (count, dropped) = {
+                        let mut connections = pool
+                            .connections
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let Some(connections) = connections.as_mut() else {
+                            // The transport was shut down
+                            return;
                         };
 
-                        #[cfg(feature = "tracing")]
-                        let mut created = 0;
-                        for _ in count..(min_idle as usize) {
-                            if !pool.try_reserve() {
+                        let to_drop = connections
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .filter(|(_, conn)| {
+                                idle_connection_expired(conn.idle_duration(), idle_timeout)
+                            })
+                            .map(|(i, _)| i)
+                            .collect::<Vec<_>>();
+                        let dropped = to_drop
+                            .into_iter()
+                            .map(|i| connections.remove(i))
+                            .collect::<Vec<_>>();
+
+                        (connections.len(), dropped)
+                    };
+
+                    #[cfg(feature = "tracing")]
+                    let mut created = 0;
+                    for _ in count..(min_idle as usize) {
+                        if !pool.try_reserve() {
+                            break;
+                        }
+                        let conn = match pool.client.connection() {
+                            Ok(conn) => conn,
+                            Err(err) => {
+                                pool.release_live();
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!("couldn't create idle connection {}", err);
+                                #[cfg(not(feature = "tracing"))]
+                                let _ = err;
+
                                 break;
                             }
-                            let conn = match pool.client.connection() {
-                                Ok(conn) => conn,
-                                Err(err) => {
-                                    pool.release_live();
-                                    #[cfg(feature = "tracing")]
-                                    tracing::warn!("couldn't create idle connection {}", err);
-                                    #[cfg(not(feature = "tracing"))]
-                                    let _ = err;
+                        };
 
-                                    break;
-                                }
-                            };
+                        let mut connections = pool
+                            .connections
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let Some(connections) = connections.as_mut() else {
+                            // The transport was shut down
+                            return;
+                        };
 
-                            let mut connections = pool.connections.lock().unwrap();
-                            let Some(connections) = connections.as_mut() else {
-                                // The transport was shut down
-                                return;
-                            };
-
-                            connections.push(ParkedConnection::park(conn));
-                            // A replenished connection is a newly available
-                            // one, exactly like a recycled one.
-                            pool.available.notify_one();
-
-                            #[cfg(feature = "tracing")]
-                            {
-                                created += 1;
-                            }
-                        }
+                        connections.push(ParkedConnection::park(conn));
+                        // A replenished connection is a newly available
+                        // one, exactly like a recycled one.
+                        pool.available.notify_one();
 
                         #[cfg(feature = "tracing")]
-                        if created > 0 {
-                            tracing::debug!("created {} idle connections", created);
-                        }
-
-                        if !dropped.is_empty() {
-                            #[cfg(feature = "tracing")]
-                            tracing::debug!("dropped {} idle connections", dropped.len());
-
-                            for conn in dropped {
-                                let mut conn = conn.unpark();
-                                conn.abort();
-                                pool.release_live();
-                            }
-                        }
-
-                        drop(pool);
-
-                        match thread_rx.recv_timeout(pool_worker_interval(idle_timeout)) {
-                            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                // The transport was shut down
-                                return;
-                            }
-                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        {
+                            created += 1;
                         }
                     }
-                })
-                // Thread creation can fail under OS resource pressure; this is
-                // not a local ownership invariant. Propagating it requires a
-                // fallible pool construction policy at the transport builder.
-                .expect("couldn't spawn the Pool thread");
+
+                    #[cfg(feature = "tracing")]
+                    if created > 0 {
+                        tracing::debug!("created {} idle connections", created);
+                    }
+
+                    if !dropped.is_empty() {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("dropped {} idle connections", dropped.len());
+
+                        for conn in dropped {
+                            let mut conn = conn.unpark();
+                            conn.abort();
+                            pool.release_live();
+                        }
+                    }
+
+                    drop(pool);
+
+                    match thread_rx.recv_timeout(pool_worker_interval(idle_timeout)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            // The transport was shut down
+                            return;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            }));
+            if let Err(error) = spawned {
+                // Keep construction infallible, but never dial after worker
+                // startup failed. A send queue needs a retryable typed error.
+                let _ = pool_.worker_error.set(error);
+            }
         }
 
         pool
@@ -172,7 +194,7 @@ impl Pool {
         assert!(self.try_reserve(), "test connection fits pool bound");
         self.connections
             .lock()
-            .expect("connection pool lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_mut()
             .expect("pool is not shut down")
             .push(ParkedConnection::park(conn));
@@ -184,13 +206,18 @@ impl Pool {
     pub(crate) fn idle_count_for_test(&self) -> usize {
         self.connections
             .lock()
-            .expect("connection pool lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map_or(0, Vec::len)
     }
 
     pub(crate) fn shutdown(&self) {
-        let connections = { self.connections.lock().unwrap().take() };
+        let connections = {
+            self.connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        };
         if let Some(connections) = connections {
             for conn in connections {
                 conn.unpark().abort();
@@ -209,6 +236,13 @@ impl Pool {
     }
 
     pub(crate) fn connection(self: &Arc<Self>) -> Result<PooledConnection, Error> {
+        if let Some(error) = self.worker_error.get() {
+            // Not `connection_io`: thread creation reports EAGAIN as
+            // `WouldBlock`, which that helper would misclassify as a timeout.
+            return Err(error::connection(format!(
+                "could not start connection pool worker: {error}"
+            )));
+        }
         if self.config.max_size == 0 {
             return Err(error::invalid_input(
                 "pool max_size must be greater than zero",
@@ -309,7 +343,10 @@ impl Pool {
             #[cfg(feature = "tracing")]
             tracing::debug!("recycling connection");
 
-            let mut connections_guard = self.connections.lock().unwrap();
+            let mut connections_guard = self
+                .connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             if let Some(connections) = connections_guard.as_mut() {
                 if connections.len() >= self.config.max_size as usize {
@@ -384,7 +421,12 @@ impl Drop for Pool {
         #[cfg(feature = "tracing")]
         tracing::debug!("dropping Pool");
 
-        if let Some(connections) = self.connections.get_mut().unwrap().take() {
+        if let Some(connections) = self
+            .connections
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             for conn in connections {
                 drop(conn);
             }
@@ -442,5 +484,49 @@ impl Drop for PooledConnection {
             .take()
             .expect("SmtpConnection hasn't been taken yet");
         self.pool.recycle(conn);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client() -> SmtpClient {
+        SmtpClient {
+            info: Default::default(),
+        }
+    }
+
+    #[test]
+    fn refused_worker_is_a_checkout_error_without_dialing() {
+        let pool = Pool::with_worker(PoolConfig::new().min_idle(1), client(), |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "thread quota",
+            ))
+        });
+        for _ in 0..2 {
+            let error = pool.connection().err().expect("checkout must fail");
+            assert!(error.is_connection());
+            assert!(error.to_string().contains("thread quota"));
+        }
+        pool.shutdown();
+    }
+
+    #[test]
+    fn poisoned_pool_rejects_checkout_but_can_shutdown_and_drop() {
+        let pool = Pool::new(PoolConfig::new(), client());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pool.connections.lock().unwrap();
+            panic!("poison the idle set");
+        }));
+        assert!(
+            pool.connection()
+                .err()
+                .expect("checkout must fail")
+                .is_internal()
+        );
+        pool.shutdown();
+        drop(pool);
     }
 }

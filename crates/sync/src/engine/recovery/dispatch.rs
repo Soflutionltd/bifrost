@@ -288,15 +288,7 @@ async fn handle_engine_directive(
             broadcast_warning(
                 &ctx.delivery,
                 None,
-                bifrost_types::Warning::support_only(
-                    bifrost_types::WarningKind::Engine(
-                        bifrost_types::EngineNotice::OperatorOverrideRequired(reason.clone()),
-                    ),
-                    reason.to_string(),
-                )
-                .with_scope(ErrorScope::Account)
-                .with_error(error.clone())
-                .with_protocol_detail(DiagnosticText::support_only(reason.to_string())),
+                operator_override_warning(reason, error),
             );
             engine_pause(ctx, PauseReason::OperatorOverrideRequired);
         }
@@ -334,4 +326,79 @@ pub(in crate::engine) fn stale_generation(ctx: &RecoveryContext<'_>) -> bool {
         );
     }
     stale
+}
+
+/// Keep the bounded reason for routing and the rejected advice for support.
+/// An operator must be able to identify what the engine could not handle.
+fn operator_override_warning(
+    reason: bifrost_types::OperatorOverrideReason,
+    error: AccountError,
+) -> bifrost_types::Warning {
+    let detail = match &reason {
+        bifrost_types::OperatorOverrideReason::UnsupportedRecoveryClassification => {
+            format!(
+                "unsupported recovery classification: {:?}",
+                error.recovery()
+            )
+        }
+        _ => reason.to_string(),
+    };
+    bifrost_types::Warning::support_only(
+        bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::OperatorOverrideRequired(
+            reason,
+        )),
+        detail.clone(),
+    )
+    .with_scope(ErrorScope::Account)
+    .with_error(error)
+    .with_protocol_detail(DiagnosticText::support_only(detail))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::operator_override_warning;
+    use bifrost_types::{
+        AccountErrorBuilder, AuthCause, DetailVisibility, EngineNotice, ErrorScope,
+        OperatorOverrideReason, PrimaryCause, StateCause, WarningKind,
+    };
+
+    #[test]
+    fn unsupported_recovery_warning_retains_rejected_classification() {
+        // No current RecoveryClass reaches the future-variant fallback. Feed
+        // its bounded reason into the real warning constructor with distinct
+        // advice, so erasing the classification cannot satisfy this test.
+        for (cause, classification) in [
+            (PrimaryCause::Auth(AuthCause::Expired), "AuthLost"),
+            (
+                PrimaryCause::State(StateCause::SchemaIncompatible),
+                "Engine(SchemaIncompatible)",
+            ),
+        ] {
+            let error = AccountErrorBuilder::new(cause)
+                .try_build()
+                .expect("valid failure");
+            assert_eq!(format!("{:?}", error.recovery()), classification);
+            let warning = operator_override_warning(
+                OperatorOverrideReason::UnsupportedRecoveryClassification,
+                error,
+            );
+            let expected = format!("unsupported recovery classification: {classification}");
+            assert_eq!(warning.message.as_str(), expected);
+            assert_eq!(warning.message.visibility, DetailVisibility::SupportOnly);
+            let detail = warning.protocol_detail.expect("support evidence");
+            assert_eq!(detail.as_str(), expected);
+            assert_eq!(detail.visibility, DetailVisibility::SupportOnly);
+            assert!(matches!(
+                warning.kind,
+                WarningKind::Engine(EngineNotice::OperatorOverrideRequired(
+                    OperatorOverrideReason::UnsupportedRecoveryClassification
+                ))
+            ));
+            assert_eq!(warning.scope, Some(ErrorScope::Account));
+            assert_eq!(
+                format!("{:?}", warning.error.expect("original error").recovery()),
+                classification
+            );
+        }
+    }
 }

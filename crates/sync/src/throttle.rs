@@ -31,12 +31,16 @@ use tokio::time::Instant;
 /// key before `wait_until`" deadlines and answers "how long should I
 /// pause work that maps to this key now?".
 ///
-/// One bucket per `SyncEngine`, shared by every attached account.
+/// One deadline map per `SyncEngine`, shared by every attached account through
+/// a slot-fenced view.
 /// `Budget` keys cross account boundaries by design: a key names a
 /// provider budget, and every account whose work is charged to it pauses
 /// on it. `Owner`, `Folder` and `Account` keys are per-account. Detach does not
 /// erase deadlines: a new attachment of the same account still honors the
 /// provider hold until it expires.
+/// A retired slot cannot add account or resource deadlines. Explicit provider
+/// budgets remain recordable after retirement because they name the server
+/// limit independently of the slot.
 ///
 /// A budget reaches an account by DECLARATION: a wait site asks
 /// `Account::throttle_keys` what its work consumes and looks each returned
@@ -47,13 +51,22 @@ use tokio::time::Instant;
 /// this module. They are in-memory only; nothing persists a throttle wait.
 #[derive(Debug, Default)]
 pub struct ThrottleBucket {
-    waits: std::sync::Mutex<HashMap<ThrottleKey, Instant>>,
+    waits: std::sync::Arc<std::sync::Mutex<HashMap<ThrottleKey, Instant>>>,
+    recording_slot: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl ThrottleBucket {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Give one attachment a recording fence while retaining provider holds.
+    pub(crate) fn for_slot(&self, shutdown: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            waits: std::sync::Arc::clone(&self.waits),
+            recording_slot: Some(shutdown),
+        }
     }
 
     /// Observe every error leg and return the longest local pacing deadline.
@@ -80,6 +93,24 @@ impl ThrottleBucket {
         let Ok(mut waits) = self.waits.lock() else {
             return;
         };
+        // An enterprise user expects an already observed 429 to survive a
+        // reconnect, so retirement never erases existing deadlines. But an
+        // AccountId can now name a different attachment: a retired request
+        // cannot add or extend that attachment's account/resource holds.
+        // Explicit provider budgets name a stable server limit independently
+        // of the attachment and remain shareable even from a late response.
+        if !matches!(&key, ThrottleKey::Budget(_))
+            && self
+                .recording_slot
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            return;
+        }
+        Self::insert(&mut waits, key, wait_until);
+    }
+
+    fn insert(waits: &mut HashMap<ThrottleKey, Instant>, key: ThrottleKey, wait_until: Instant) {
         waits
             .entry(key)
             .and_modify(|existing| {

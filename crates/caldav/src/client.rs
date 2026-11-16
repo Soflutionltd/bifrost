@@ -9,7 +9,9 @@ use std::fmt;
 pub(crate) use bifrost_dav_core::PutCondition;
 use bifrost_dav_core::{CALDAV_NAMESPACE, DavDispatch, DavProtocol, escape_xml};
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery};
-use bifrost_net::{AccountId, AccountNet};
+use bifrost_net::AccountId;
+#[cfg(test)]
+use bifrost_net::AccountNet;
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountOperation, CursorScope, DiagnosticText, ErrorScope,
     FolderId, ObjectType, PrimaryCause, Protocol, StateCause,
@@ -103,9 +105,12 @@ impl CalDavClient {
         }
     }
 
-    /// The account handle carrying this account's meter, priority and cap.
-    pub(crate) fn net(&self) -> &AccountNet {
-        self.dav.net()
+    pub(crate) fn set_priority(&self, priority: bifrost_types::Priority) {
+        self.dav.set_priority(priority);
+    }
+
+    pub(crate) fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
+        self.dav.set_bandwidth_cap(bps);
     }
 
     #[cfg(test)]

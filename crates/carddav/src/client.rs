@@ -8,7 +8,9 @@ use bifrost_dav_core::{
     CARDDAV_NAMESPACE, DavDispatch, DavProtocol, escape_xml, filter_unsupported,
 };
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery, PutCondition};
-use bifrost_net::{AccountId, AccountNet};
+use bifrost_net::AccountId;
+#[cfg(test)]
+use bifrost_net::AccountNet;
 use bifrost_types::{AccountError, AccountOperation, ErrorScope};
 use reqwest::Method;
 #[cfg(test)]
@@ -184,9 +186,12 @@ impl CardDavClient {
         }
     }
 
-    /// The account handle carrying this account's meter, priority and cap.
-    pub(crate) fn net(&self) -> &AccountNet {
-        self.dav.net()
+    pub(crate) fn set_priority(&self, priority: bifrost_types::Priority) {
+        self.dav.set_priority(priority);
+    }
+
+    pub(crate) fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
+        self.dav.set_bandwidth_cap(bps);
     }
 
     #[cfg(test)]

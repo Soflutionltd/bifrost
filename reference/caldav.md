@@ -1739,3 +1739,16 @@ Account configuration Debug renders only the credential-free HTTP(S) origin (or
 an invalid-URL marker). Factory Debug inherits this policy through its config.
 Standalone token lookup failures omit foreign error prose; transient refresh and
 permanent credential loss retain their typed recovery without quoting secrets.
+
+## Dispatcher transport boundary
+
+`DavDispatch` owns the wire-capable `AccountNet` privately inside its dispatch
+module and exposes no handle accessor. Dialect clients retain only the dispatcher;
+account priority and bandwidth controls forward through dedicated setters.
+Every verb using that transport must therefore enter the dispatcher, including
+custom requests through `send_raw_request`, which applies admission, credential
+and redirect policy despite its name. Enterprise users expect the same
+credential boundary on every DAV operation. A compile-fail doctest pins the
+absence of the raw handle accessor: restoring it makes the example compile and
+fails that test. Constructors still accept injected transports for composition
+and hermetic wire scripts; injection does not expose the stored handle again.

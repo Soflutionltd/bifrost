@@ -231,7 +231,8 @@ mod tests {
 
     /// Once the slot's token is cancelled, an orphan is refused: detach cancels
     /// before it takes, so a write ordered after the take must see the
-    /// cancellation and leave nothing behind for a later attach to inherit.
+    /// cancellation and leave no unreachable cleanup obligation in this slot.
+    /// A later attachment has its own registry independently of this check.
     #[test]
     fn a_cancelled_slot_refuses_orphans_and_leaves_no_entry() {
         let shutdown = CancellationToken::new();
@@ -243,7 +244,7 @@ mod tests {
         assert_eq!(registry.len(), 0);
         assert!(
             registry.take().is_empty(),
-            "a later attach of the same id inherits nothing"
+            "the retired registry contains no unreachable cleanup obligation"
         );
     }
 

@@ -116,6 +116,22 @@ impl DavByteTally {
 
 /// A DAV client's transport half: the account handle, credentials, and the set
 /// of origins those credentials may reach.
+///
+/// The transport handle stays private to this module. Account controls expose
+/// only setters, so a dialect verb cannot skip admission, credentials or the
+/// redirect policy by obtaining the underlying handle. Enterprise users expect
+/// the same credential boundary for every DAV operation.
+///
+/// This must not compile: restoring a raw handle accessor would let dialect
+/// verbs send requests without DAV policy.
+///
+/// ```compile_fail
+/// use bifrost_dav_core::DavDispatch;
+/// use bifrost_net::AccountNet;
+/// fn bypass(dispatch: &DavDispatch) -> &AccountNet {
+///     dispatch.net()
+/// }
+/// ```
 #[derive(Clone)]
 pub struct DavDispatch {
     net: AccountNet,
@@ -246,11 +262,14 @@ impl DavDispatch {
         }
     }
 
-    /// The account handle, for the priority and bandwidth-cap doors the
-    /// `Account` impls forward onto it.
-    #[must_use]
-    pub fn net(&self) -> &AccountNet {
-        &self.net
+    /// Update account admission priority without exposing a wire-capable handle.
+    pub fn set_priority(&self, priority: bifrost_types::Priority) {
+        self.net.set_priority(priority);
+    }
+
+    /// Update the shared account bandwidth cap without exposing its transport.
+    pub fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
+        self.net.set_bandwidth_cap(bps);
     }
 
     /// Start a request the caller will finish with its own headers and body.

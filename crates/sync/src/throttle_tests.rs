@@ -9,6 +9,58 @@ use std::time::Duration;
 use std::time::SystemTime;
 use tokio::time::Instant;
 
+/// Removing the slot fence extends the successor's account hold to 120 seconds.
+/// Clearing the bucket on retirement instead loses the original 30-second hold.
+#[tokio::test(start_paused = true)]
+async fn retirement_preserves_known_holds_but_fences_late_account_observations() {
+    let shared = ThrottleBucket::new();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let retired = shared.for_slot(shutdown.clone());
+    let successor = shared.for_slot(tokio_util::sync::CancellationToken::new());
+    let account = AccountId("retiring".into());
+    let refusal = |seconds| {
+        AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: Some(RetryHint::After(Duration::from_secs(seconds))),
+        }))
+        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
+        .operation(AccountOperation::SyncChanges)
+        .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Account))
+        .try_build()
+        .expect("provider refusal")
+    };
+    retired.observe(&account, &refusal(30));
+    shutdown.cancel();
+    let late = refusal(120);
+    assert_eq!(
+        retired.observe(&account, &late),
+        Some(Instant::now() + Duration::from_secs(120)),
+        "late cleanup still receives its own local pacing deadline"
+    );
+    assert_eq!(
+        successor.wait_for_account(&account, Instant::now()),
+        Some(Duration::from_secs(30))
+    );
+    let budget = bifrost_types::ThrottleBudget::new("provider-limit");
+    let late = late
+        .into_builder()
+        .with_throttle(|throttle| throttle.add_budget(budget.clone()))
+        .try_build()
+        .expect("budget refusal");
+    retired.observe(&account, &late);
+    assert_eq!(
+        successor.wait_for(&ThrottleKey::Budget(budget), Instant::now()),
+        Some(Duration::from_secs(120)),
+        "an explicitly named server budget survives even a late response"
+    );
+    successor.observe(&account, &refusal(60));
+    assert_eq!(
+        shared.wait_for_account(&account, Instant::now()),
+        Some(Duration::from_secs(60)),
+        "the successor has its own live recording fence"
+    );
+}
+
 // A hintless rate limit: `resolve_throttle_key` stamps a throttle scope on
 // it, and the builder admits a throttle scope only on rate-limit or quota
 // kinds, so a transport fixture would fail to build.

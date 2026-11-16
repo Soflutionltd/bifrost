@@ -309,15 +309,21 @@ Narrow edge cases, audits with no known defect, and design work.
     Shared-account contacts and calendars have no routing door: the optional
     families live once on `Registry::families` and select the primary account
     (capability question).
-  - DAV: the dispatcher tests now call `send_raw_request` directly, so a crate
-    verb that bypassed the dispatcher would go unnoticed.
-  - sync: engine-wide `AccountId`-keyed throttles can receive late holds from a
-    retired slot, which a reattach of the same id inherits. A retained slot `Arc` keeps its
-    watch and broadcast channels open past detach. The integration test
-    `an_orphan_restored_after_detachs_take_is_not_inherited_by_the_next_attach`
-    no longer bites on removing the shutdown check in
-    `SubscriptionRegistry::restore_orphans` (only the unit test does), since
-    the registry is now per-slot; its doc still claims that ablation.
+  - sync: a retained slot `Arc` keeps its watch and broadcast channels open
+    past detach (documented in `reference/sync.md`). Closing them reliably
+    needs `delivery/mod.rs` and `control.rs`, and `SyncControl` clones each
+    retain the control sender, so dropping the slot alone is not enough. The
+    detach comment in `engine/mod.rs` still describes cross-attachment
+    registry inheritance, which no longer happens.
+  - sync: `SyncEngine::detach` cancels the slot token before its push
+    teardown, so an account- or resource-scoped 429 observed during detach's
+    own unsubscribe is dropped by the retired-slot throttle fence; a reattach
+    right afterwards does not honour it unless the provider stamped a budget.
+    Teardown traffic should probably still record holds.
+  - sync: pages and markers that carry a checkpoint still register before
+    broadcasting separately, a stale-delivery window like the one
+    `publish_inventory` closed by checking the fence and sending under
+    coverage ownership.
 
 - **Lateral findings from the review of the design-hunt batch, unverified.**
   Each wants its own check and, where marked, a ruling.
@@ -326,13 +332,11 @@ Narrow edge cases, audits with no known defect, and design work.
   - JMAP: a capability dropped mid-session yields terminal `Unsupported` where
     `CapabilityChanged` may fit (ruling).
   - SMTP: a rejected batch DATA reports per-recipient RCPT rejections. Batch
-    sends have no BDAT entry point (ruling). An LMTP final 421 marks the
-    remaining recipients uncertain without reading their finals. The blocking
-    pool still panics when the OS refuses to create a worker thread, and
-    mutex-poison assertions remain.
+    sends have no BDAT entry point (ruling). Blocking pool replenishment
+    returns without releasing its live reservation if shutdown lands during
+    connection creation.
   - sync: the operator-override warning moved from `user_safe` to
-    `support_only` (ruling). `plan_recovery` lost its unhandled-classification
-    detail. `AckOutcome` is not `#[must_use]`: adding it is clean in
+    `support_only` (ruling). `AckOutcome` is not `#[must_use]`: adding it is clean in
     production but about fifty test call sites discard the value.
   - Graph: `public_folder` change events carry `Owner` memberships that only
     `Account` cursors cover.
@@ -427,8 +431,6 @@ Narrow edge cases, audits with no known defect, and design work.
     coverage report from the warning.
   - Backfill runner `Stop` pages now write the barrier before the removal
     projection can fail.
-  - `PagePublisher::publish_inventory`'s checkpoint-free fence check is not
-    atomic with the publish.
   - `UnsupportedReason` is not carried into the ledger or telemetry exports,
     and only JMAP sets it.
   - A library batching bug that overflows `maxCallsInRequest` would surface as

@@ -1,13 +1,13 @@
-//! An orphan must not land in the registry after detach has taken it.
+//! A retired attachment's orphan must not reach the next attachment.
 //!
 //! A push handle whose server-side delete was refused is registered as an orphan
 //! so a later reopen or `unsubscribe_push` can retry it. `detach` discards the
-//! account's registry entry, and a later `attach` of the same `AccountId` starts
-//! from whatever is registered under it, handing it to the provider as if live.
+//! attachment's registry, and a later `attach` of the same `AccountId` starts
+//! with its own fresh registry.
 //! Detach cancels the slot's shutdown token BEFORE it takes the entry, but it
 //! does not wait for consumer-driven reattaches, so an orphan written by one
-//! that is still unwinding lands after the take unless the write itself observes
-//! the teardown.
+//! that is still unwinding can attempt a restore after the take. Per-slot
+//! registry ownership isolates that attempt from the new attachment.
 //!
 //! The staging uses the park gates to place detach squarely between an aborting
 //! reattach's cleanup delete and the write of its refusal.
@@ -53,12 +53,13 @@ async fn settle(mut done: impl FnMut() -> bool) {
 
 /// The ordinary abort's unwind restores a refused replacement handle as an
 /// orphan. Detach lands while that delete is parked, so the restore happens
-/// after detach's registry take, and must be refused rather than inherited by
-/// the next attach of the same id.
+/// after detach's registry take. The next attach of the same id must not
+/// inherit it.
 ///
-/// Ablation: restoring through the bare, unchecked write (as the unwind did)
-/// leaves the replacement's handle registered under the id, and the second
-/// incarnation's `unsubscribe_push` hands it to `later`.
+/// This pins cross-attachment isolation through per-slot registry ownership.
+/// It does not pin `restore_orphans`' shutdown check: removing that check can
+/// leave a record in the retired registry without exposing it to `later`.
+/// The registry unit test pins refusal of that late write itself.
 ///
 /// Detach now waits for the reopen lock this parked reattach holds, so the
 /// interleaving is reachable only through that wait's timeout, after which

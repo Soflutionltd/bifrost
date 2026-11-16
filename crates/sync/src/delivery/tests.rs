@@ -221,6 +221,78 @@ fn an_unreachable_page_is_retired_and_records_the_walk_loss() {
     );
 }
 
+/// Projection is caller-controlled iteration, so it can deterministically
+/// reset after the old implementation's early fence read and before its send.
+/// That implementation publishes and leaves a stale batch in the receiver.
+#[test]
+fn checkpoint_free_inventory_checks_the_fence_at_the_send() {
+    for account_reset in [false, true] {
+        let h = delivery_harness(4);
+        let mut receiver = h.subscribe();
+        let (writer_tx, writer_rx) = mpsc::channel(4);
+        drop(writer_rx);
+        let publisher = PagePublisher::new(
+            Arc::clone(&h.delivery),
+            h.control.clone(),
+            writer_tx,
+            CancellationToken::new(),
+        );
+        let scope = CursorScope::Account;
+        let fence = h.coverage.scope_fence(&scope);
+        let generation = h.coverage.next_generation();
+        let batch = bifrost_types::InventoryBatch {
+            items: Vec::new(),
+            removed: Vec::new(),
+            page_boundary: bifrost_types::PageBoundary::Page,
+            server_latency: std::time::Duration::ZERO,
+            bytes_in: 0,
+            checkpoint: bifrost_types::PageCheckpoint::None,
+            coverage: bifrost_types::InventoryCoverageReport::complete(
+                bifrost_types::CoverageDomain::full(scope.clone()),
+            ),
+        };
+        let id = bifrost_types::ObjectId("stale".into());
+        let ids = std::iter::once_with(|| {
+            if account_reset {
+                h.coverage.raise_account_fence();
+            } else {
+                h.coverage.invalidate_scope(&scope);
+            }
+            &id
+        });
+        let result = publisher
+            .publish_inventory(&scope, &batch, ids, [], None, generation, fence)
+            .expect("valid inventory projection");
+        assert!(matches!(result, InventoryPublication::Refused(_)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        // Refusal must release both locks and leave the replacement walk usable.
+        let result = publisher
+            .publish_inventory(
+                &scope,
+                &batch,
+                [&id],
+                [],
+                None,
+                generation,
+                h.coverage.scope_fence(&scope),
+            )
+            .expect("replacement inventory projection");
+        assert!(matches!(result, InventoryPublication::Published));
+        assert!(matches!(
+            receiver
+                .try_recv()
+                .expect("replacement page")
+                .event
+                .as_ref(),
+            SyncEvent::Batch(_)
+        ));
+    }
+}
+
 #[tokio::test]
 async fn numbered_subscribers_cannot_split_between_coverage_ledgers() {
     let h = delivery_harness(4);

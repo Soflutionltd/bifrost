@@ -993,24 +993,21 @@ impl<P: Projection> ProtocolMachine for Transaction<P> {
                     error::parse("intermediate LMTP final status"),
                 ),
                 OpOutcome::Reply(response) => {
-                    let closing = closing_channel(&response);
-                    self.progress().recipients[index] = RecipientStatus::Final(response.clone());
-                    if closing {
-                        // A final 421 is definitive for this recipient only.
-                        // Preserve preceding answers; remaining recipients are
-                        // ambiguous because the body has already been offered.
-                        return self.abort_with(
-                            SmtpCommandPhase::LmtpFinalStatus,
-                            error::status(response),
-                        );
-                    }
+                    // RFC 2033 sections 4.2, 4.3 and 5 assign one final
+                    // reply to each accepted recipient, even after a 421.
+                    // An enterprise queue must retain every received answer
+                    // rather than risk retrying a recipient already delivered.
+                    self.progress().recipients[index] = RecipientStatus::Final(response);
                     if let Some(next) = self.progress().next_accepted(index + 1) {
                         self.stage = TransactionStage::FinalStatus(next);
                         Step::Run(Op::ReadGrouped)
                     } else {
+                        let closing = self.progress().recipients.iter().any(|status| {
+                            matches!(status, RecipientStatus::Final(reply) if closing_channel(reply))
+                        });
                         self.stage = TransactionStage::DrainClosing;
                         Step::Run(Op::CloseLmtpDrain {
-                            restore_ok: !P::BATCH,
+                            restore_ok: !P::BATCH && !closing,
                         })
                     }
                 }

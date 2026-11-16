@@ -1774,40 +1774,42 @@ async fn rcpt_reply_read_failure_reports_unsent_not_uncertain() {
 #[tokio::test]
 async fn lmtp_drains_one_final_status_per_accepted_recipient() {
     for &adapter in ADAPTERS {
-        for second_status in [250, 550] {
-            let hello = ClientId::Domain("client.example".to_owned());
-            let recipients = vec![
-                "first@example.com".parse().unwrap(),
-                "second@example.com".parse().unwrap(),
-            ];
-            let transcript = Transcript::new("220 lmtp.example\r\n")
-                .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
-                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
-                .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
-                .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
-                .expect("DATA\r\n", "354 send body\r\n")
-                .expect("body", "")
-                .expect(
-                    "\r\n.\r\n",
-                    format!("250 first delivered\r\n{second_status} second status\r\n"),
-                );
-            let envelope =
-                Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+        for first_status in [250, 421] {
+            for second_status in [250, 550] {
+                let hello = ClientId::Domain("client.example".to_owned());
+                let recipients = vec![
+                    "first@example.com".parse().unwrap(),
+                    "second@example.com".parse().unwrap(),
+                ];
+                let transcript = Transcript::new("220 lmtp.example\r\n")
+                    .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+                    .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                    .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+                    .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+                    .expect("DATA\r\n", "354 send body\r\n")
+                    .expect("body", "")
+                    .expect(
+                        "\r\n.\r\n",
+                        format!("{first_status} first status\r\n{second_status} second status\r\n"),
+                    );
+                let envelope =
+                    Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
 
-            let mut connection =
-                Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Lmtp)
-                    .await
-                    .unwrap();
-            let statuses = connection.send_lmtp(&envelope, b"body").await.unwrap();
+                let mut connection =
+                    Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Lmtp)
+                        .await
+                        .unwrap();
+                let statuses = connection.send_lmtp(&envelope, b"body").await.unwrap();
 
-            assert_eq!(statuses.len(), 2);
-            assert!(statuses[0].is_positive());
-            assert!(statuses[1].has_code(second_status));
-            // Surplus bytes below the read buffer are undetectable without a
-            // blocking read, so a completed LMTP drain retires the connection.
-            assert!(connection.should_retire());
-            assert!(!connection.has_broken());
-            transcript.assert_exhausted();
+                assert_eq!(statuses.len(), 2);
+                assert!(statuses[0].has_code(first_status));
+                assert!(statuses[1].has_code(second_status));
+                // Surplus bytes below the read buffer are undetectable without a
+                // blocking read, so a completed LMTP drain retires the connection.
+                assert!(connection.should_retire());
+                assert_eq!(connection.has_broken(), first_status == 421);
+                transcript.assert_exhausted();
+            }
         }
     }
 }
@@ -2860,5 +2862,55 @@ async fn pipelined_rcpt_reply_read_failure_reports_unsent_not_uncertain() {
         assert!(outcome.uncertain().is_empty());
         assert_eq!(outcome.failed().len(), 32);
         assert_eq!(outcome.failed()[1].item.0, "item-1");
+    }
+}
+
+#[tokio::test]
+async fn lmtp_421_does_not_hide_received_finals_or_invent_missing_ones() {
+    for &adapter in ADAPTERS {
+        for tail in ["250 second delivered\r\n", "550 second rejected\r\n", ""] {
+            let hello = ClientId::Domain("client.example".to_owned());
+            let transcript = Transcript::new("220 lmtp.example\r\n")
+                .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+                .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+                .expect("DATA\r\n", "354 send body\r\n")
+                .expect("body", "")
+                .expect("\r\n.\r\n", format!("421 first unavailable\r\n{tail}"));
+            let batch = ["first@example.com", "second@example.com"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, address)| SmtpBatchRecipient {
+                    id: BatchItemId(format!("item-{index}")),
+                    address: address.parse().unwrap(),
+                })
+                .collect();
+            let mut connection =
+                Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Lmtp)
+                    .await
+                    .unwrap();
+            let outcome = connection
+                .send_lmtp_batch(
+                    Some("sender@example.com".parse().unwrap()),
+                    batch,
+                    b"body",
+                    &Default::default(),
+                )
+                .await
+                .unwrap()
+                .resolve();
+            assert_eq!(
+                outcome.succeeded().len(),
+                usize::from(tail.starts_with("250"))
+            );
+            assert_eq!(
+                outcome.failed().len(),
+                1 + usize::from(tail.starts_with("550"))
+            );
+            assert_eq!(outcome.uncertain().len(), usize::from(tail.is_empty()));
+            assert!(connection.has_broken());
+            transcript.assert_exhausted();
+        }
     }
 }

@@ -405,9 +405,15 @@ after that drop. The async worker's two `OnceLock` cells each have one setter in
 the constructor. Ready bandwidth admission installs a grant, and polling the
 peer only borrows the inner stream, leaving that grant available for completion.
 No server input or cancelled future can violate these ownership assertions.
-This does not cover mutex poisoning or the blocking pool worker thread spawn:
-the latter still panics on OS thread creation failure because pool construction
-is currently infallible.
+Pool checkout reports poisoned mutex state as an `Internal` error. Worker,
+recycle, shutdown and destructor paths recover the guarded ownership with
+`PoisonError::into_inner`; poison is not cleared, so recovered idle connections
+cannot be checked out. Cleanup must remain possible during unwinding without a
+second panic. Test-only parking assertions require an open pool with capacity.
+The blocking builder remains infallible: OS worker creation failure is retained
+by the pool and returned as a connection error on every checkout before dialing.
+An enterprise send queue needs a typed local resource failure instead of a
+process panic.
 
 ## Connection state and cancel-safety
 
@@ -660,7 +666,8 @@ open, and the next checkout's `MAIL FROM` drew `503 bad sequence`.
 `a_rejected_bdat_last_resets_the_transaction_before_the_connection_is_reused`
 pins it in both halves.
 
-One reply overrides all of that at every transaction boundary: `421`
+Outside the LMTP per-recipient final drain, one reply overrides those
+transaction boundary decisions: `421`
 means "closing transmission channel" (RFC 5321 4.2.3), and `core::closing_channel`
 is asked ahead of every reset-or-keep decision a negative reply reaches. The
 reset-or-keep rules reason about the transaction; a 421 is about the
@@ -852,11 +859,14 @@ source.
 
 Per-recipient response model: vector length equals envelope recipient count. RCPT-time rejection responses are preserved at the original recipient index; accepted recipients receive the post-DATA delivery response in original order.
 
-A final 421 ends the drain immediately and aborts the connection. Batch
-reporting preserves earlier final answers and the recipient answered by the
-421; later accepted recipients remain uncertain with in-flight evidence.
-Waiting for further replies after the peer announces closure would replace a
-definitive refusal with a later transport failure.
+A final 421 is definitive for its recipient but does not end the final-status
+drain. RFC 2033 sections 4.2, 4.3 and 5 require processing each received reply
+in accepted-recipient order, for DATA and BDAT LAST alike. The client continues
+reading the remaining finals; only recipients whose final reply was not received
+remain uncertain with in-flight evidence. A completed drain containing a 421
+keeps the connection broken and retired. Batch reporting retains every received
+answer even when a later read fails. An enterprise queue must not retry an
+already delivered recipient just because an earlier recipient was refused.
 
 Direct LMTP sends expose only that ordered response vector. Use the account-oriented batch send API when the caller needs each recipient's RCPT-versus-final-status phase and recovery classification.
 

@@ -85,8 +85,10 @@ pub(crate) struct AccountSlot {
     /// `EngineDirective::*` raised mid-stream through here so the
     /// reopen listener dispatches via `handle_engine_directive`.
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
-    /// Engine-wide throttle bucket (shared by every slot so tenant /
-    /// provider deadlines cross accounts). Recovery paths record waits
+    /// Slot-fenced view of engine-wide deadlines (shared so tenant /
+    /// provider budgets cross accounts). Retirement refuses new account and
+    /// resource holds without erasing existing waits or late provider-budget
+    /// evidence. Recovery paths record waits
     /// keyed by `ThrottleKey`; the per-scope poll loop and the push
     /// reconciler consult it before driving work.
     pub throttles: Arc<crate::throttle::ThrottleBucket>,
@@ -289,6 +291,9 @@ mod tests {
             .await
             .expect("attach");
         let retired = engine.slot(&account_id).expect("slot");
+        let hold = bifrost_types::ThrottleKey::Account(account_id.clone());
+        let known_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        retired.throttles.record(hold.clone(), known_deadline);
         tokio::time::timeout(Duration::from_millis(100), engine.detach(&account_id))
             .await
             .expect("retaining the slot must not spend the writer timeout")
@@ -303,6 +308,22 @@ mod tests {
             .await
             .expect("fresh attach");
         let fresh = engine.slot(&account_id).expect("fresh slot");
+        // Removing attach's per-slot view makes this late write extend the
+        // successor's hold. Erasing holds on detach instead loses the known
+        // deadline below. Both outcomes violate reconnect pacing.
+        retired.throttles.record(
+            hold.clone(),
+            tokio::time::Instant::now() + Duration::from_secs(120),
+        );
+        let now = tokio::time::Instant::now();
+        assert!(
+            known_deadline > now,
+            "the carryover assertion needs a live hold"
+        );
+        assert_eq!(
+            fresh.throttles.wait_for(&hold, now),
+            known_deadline.checked_duration_since(now)
+        );
         let handle = bifrost_types::SubscriptionHandle("fresh-handle".into());
         assert!(fresh.subscriptions.record(handle.clone(), Vec::new()));
         assert!(!retired.subscriptions.record(

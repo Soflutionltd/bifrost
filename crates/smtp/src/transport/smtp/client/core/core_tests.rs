@@ -1239,43 +1239,66 @@ fn dialect_and_body_framing_share_envelope_and_recipient_accounting() {
     }
 }
 
+/// A per-recipient 421 is that recipient's final answer (RFC 2033): the drain
+/// keeps reading the remaining recipients' finals, and only a read that fails
+/// after it leaves the unanswered recipients uncertain. The connection is
+/// never restored to Ok once any final reply announced the channel closing.
 #[test]
-fn a_closing_lmtp_final_preserves_answers_and_stops_the_drain() {
+fn a_closing_lmtp_final_preserves_answers_and_keeps_draining() {
     for pipelined in [false, true] {
-        let script = || {
-            vec![
-                OpOutcome::Reply(ok_reply()),
-                OpOutcome::Reply(ok_reply()),
-                OpOutcome::Reply(ok_reply()),
-                OpOutcome::Reply(ok_reply()),
-                OpOutcome::Reply(intermediate()),
-                OpOutcome::Reply(ok_reply()),
-                OpOutcome::Reply(closing()),
-            ]
-        };
-        let progress = SendProgress::new(Dialect::Lmtp, batch_recipients(3));
-        let mut machine =
-            BatchTransaction::batch(mail(), rcpts(3), pipelined, BodyKind::Data, progress);
-        let mut harness = Harness::new(script());
-        let result = harness.run(&mut machine).unwrap().resolve();
-        assert_eq!(result.succeeded()[0].item.0, "item-0");
-        assert_eq!(result.failed()[0].item.0, "item-1");
-        assert_eq!(result.uncertain()[0].item.0, "item-2");
-        assert_eq!(harness.ops.last().unwrap(), "ABORT");
-        assert_eq!(
-            harness
-                .ops
-                .iter()
-                .filter(|op| op.as_str() == "READG")
-                .count(),
-            if pipelined { 6 } else { 2 }
-        );
-        let mut machine = DirectLmtp::new(mail(), rcpts(3), pipelined, BodyKind::Data);
-        let mut harness = Harness::new(script());
-        let error = harness.run(&mut machine).unwrap_err();
-        assert_eq!(error.status().map(u16::from), Some(421));
-        assert_eq!(error.phase(), Some(SmtpCommandPhase::LmtpFinalStatus));
-        assert_eq!(error.attempt(), Some(SmtpTransmissionState::InFlight));
+        for tail_fails in [false, true] {
+            let script = || {
+                vec![
+                    OpOutcome::Reply(ok_reply()),
+                    OpOutcome::Reply(ok_reply()),
+                    OpOutcome::Reply(ok_reply()),
+                    OpOutcome::Reply(ok_reply()),
+                    OpOutcome::Reply(intermediate()),
+                    OpOutcome::Reply(ok_reply()),
+                    OpOutcome::Reply(closing()),
+                    if tail_fails {
+                        network_failure()
+                    } else {
+                        OpOutcome::Reply(ok_reply())
+                    },
+                ]
+            };
+            let progress = SendProgress::new(Dialect::Lmtp, batch_recipients(3));
+            let mut machine =
+                BatchTransaction::batch(mail(), rcpts(3), pipelined, BodyKind::Data, progress);
+            let mut harness = Harness::new(script());
+            let result = harness.run(&mut machine).unwrap().resolve();
+            assert_eq!(result.succeeded()[0].item.0, "item-0");
+            assert_eq!(result.failed()[0].item.0, "item-1");
+            if tail_fails {
+                assert_eq!(result.uncertain()[0].item.0, "item-2");
+                assert_eq!(harness.ops.last().unwrap(), "ABORT");
+            } else {
+                assert_eq!(result.succeeded()[1].item.0, "item-2");
+                assert!(result.uncertain().is_empty());
+                assert_eq!(harness.ops.last().unwrap(), "DRAIN:false");
+            }
+            assert_eq!(
+                harness
+                    .ops
+                    .iter()
+                    .filter(|op| op.as_str() == "READG")
+                    .count(),
+                if pipelined { 7 } else { 3 }
+            );
+            let mut machine = DirectLmtp::new(mail(), rcpts(3), pipelined, BodyKind::Data);
+            let mut harness = Harness::new(script());
+            let output = harness.run(&mut machine);
+            if tail_fails {
+                let error = output.unwrap_err();
+                assert_eq!(error.phase(), Some(SmtpCommandPhase::LmtpFinalStatus));
+            } else {
+                let statuses = output.expect("every final status was read");
+                assert_eq!(statuses.len(), 3);
+                assert!(statuses[1].has_code(421));
+                assert_eq!(harness.ops.last().unwrap(), "DRAIN:false");
+            }
+        }
     }
 }
 

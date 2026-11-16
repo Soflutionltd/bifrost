@@ -205,7 +205,7 @@ impl SyncEngine {
         // Mutex because recovery paths cross task boundaries). Shared
         // across accounts so a `Budget` deadline recorded by one account
         // pauses every sibling declaring the same budget.
-        let throttles = Arc::clone(&self.throttles);
+        let throttle_bucket = Arc::clone(&self.throttles);
 
         // Load before publishing registrations or spawning producers. Failure
         // unwinds the opened account without leaving a running unseeded lane.
@@ -355,6 +355,7 @@ impl SyncEngine {
 
         // Shutdown token tree: per-slot child of engine root.
         let shutdown = self.root_cancel.child_token();
+        let throttles = Arc::new(throttle_bucket.for_slot(shutdown.clone()));
 
         // ArcSwap holds the current `Arc<dyn Account>` so spawned
         // workers see post-reopen handles immediately.

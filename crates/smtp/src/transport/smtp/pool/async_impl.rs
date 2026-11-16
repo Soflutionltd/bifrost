@@ -17,6 +17,8 @@ use crate::{Executor, TokioExecutor, executor::SpawnHandle};
 
 pub(crate) struct Pool {
     config: PoolConfig,
+    // Checkout rejects poison; worker and teardown recover ownership so an
+    // unwinding caller cannot cause a second panic while releasing resources.
     connections: Mutex<Option<Vec<ParkedConnection>>>,
     admission: Arc<Semaphore>,
     available: Notify,
@@ -78,8 +80,10 @@ impl Pool {
                         Some(pool) => {
                             #[allow(clippy::needless_collect)]
                             let (count, dropped) = {
-                                let mut connections =
-                                    pool.connections.lock().expect("connection pool lock");
+                                let mut connections = pool
+                                    .connections
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 let Some(connections) = connections.as_mut() else {
                                     // The transport was shut down
                                     return;
@@ -121,8 +125,10 @@ impl Pool {
                                     }
                                 };
 
-                                let mut connections =
-                                    pool.connections.lock().expect("connection pool lock");
+                                let mut connections = pool
+                                    .connections
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 let Some(connections) = connections.as_mut() else {
                                     // The transport was shut down
                                     return;
@@ -184,7 +190,7 @@ impl Pool {
                 let connections = self
                     .connections
                     .lock()
-                    .expect("connection pool lock")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
                 let pool = Arc::clone(self);
                 let (done, mut completed) = tokio::sync::watch::channel(false);
@@ -231,7 +237,10 @@ impl Pool {
         loop {
             let notified = self.available.notified();
             let conn = {
-                let mut connections = self.connections.lock().expect("connection pool lock");
+                let mut connections = self
+                    .connections
+                    .lock()
+                    .map_err(|_| error::internal("connection pool lock poisoned"))?;
                 let Some(connections) = connections.as_mut() else {
                     // The transport was shut down
                     return Err(error::transport_shutdown());
@@ -292,7 +301,8 @@ impl Pool {
                             // lock before touching the network.
                             {
                                 let connections =
-                                    self.connections.lock().expect("connection pool lock");
+                                    self.connections.lock()
+                                        .map_err(|_| error::internal("connection pool lock poisoned"))?;
                                 match connections.as_ref() {
                                     None => {
                                         drop(connections);
@@ -333,7 +343,7 @@ impl Pool {
             .expect("test connection fits pool bound");
         self.connections
             .lock()
-            .expect("connection pool lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_mut()
             .expect("pool is not shut down")
             .push(ParkedConnection::park(conn, permit));
@@ -345,7 +355,7 @@ impl Pool {
     pub(crate) fn idle_count_for_test(&self) -> usize {
         self.connections
             .lock()
-            .expect("connection pool lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map_or(0, Vec::len)
     }
@@ -373,7 +383,10 @@ impl Pool {
             #[cfg(feature = "tracing")]
             tracing::debug!("recycling connection");
 
-            let mut connections_guard = self.connections.lock().expect("connection pool lock");
+            let mut connections_guard = self
+                .connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             if let Some(connections) = connections_guard.as_mut() {
                 connections.push(ParkedConnection::park(conn, permit));
@@ -426,7 +439,7 @@ impl Drop for Pool {
         let _ = self
             .connections
             .get_mut()
-            .expect("connection pool lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         let _ = self.handle.take();
     }
@@ -511,6 +524,28 @@ mod tests {
     use crate::transport::smtp::{
         Dialect, client::AsyncSmtpConnection, extension::ClientId, test_support::Transcript,
     };
+
+    #[cfg(feature = "account-error")]
+    #[tokio::test]
+    async fn poisoned_pool_rejects_checkout_but_can_shutdown_and_drop() {
+        let pool = super::Pool::new(
+            super::PoolConfig::new(),
+            crate::transport::smtp::async_transport::AsyncSmtpClient::for_pool_test(),
+        );
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pool.connections.lock().unwrap();
+            panic!("poison the idle set");
+        }));
+        assert!(
+            pool.connection()
+                .await
+                .err()
+                .expect("checkout must fail")
+                .is_internal()
+        );
+        pool.shutdown().await;
+        drop(pool);
+    }
 
     #[tokio::test(crate = "tokio", start_paused = true)]
     async fn discarded_connection_keeps_admission_until_shutdown_finishes() {

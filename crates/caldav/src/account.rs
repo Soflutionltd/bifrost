@@ -341,11 +341,11 @@ impl Account for CalDavAccount {
     }
 
     fn set_priority(&self, priority: Priority) {
-        self.client.net().set_priority(priority);
+        self.client.set_priority(priority);
     }
 
     fn set_bandwidth_cap(&self, bps: Option<bifrost_types::BandwidthCap>) {
-        self.client.net().set_bandwidth_cap(bps);
+        self.client.set_bandwidth_cap(bps);
     }
 
     fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {

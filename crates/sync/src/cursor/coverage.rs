@@ -1866,6 +1866,24 @@ impl PendingCoverage {
         self.guard().fences.scope_fence(scope)
     }
 
+    /// Run a synchronous send while the expected producer fence still holds.
+    /// The caller must already hold delivery membership and must not acquire
+    /// delivery, coverage or writer locks inside `send`.
+    pub(crate) fn with_scope_fence<T>(
+        &self,
+        scope: &CursorScope,
+        expected: ScopeFence,
+        send: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let ledger = self.guard();
+        if ledger.fences.scope_fence(scope) != expected {
+            return None;
+        }
+        let result = send();
+        drop(ledger);
+        Some(result)
+    }
+
     /// Best-effort boundary release for a caller that holds only a checkpoint
     /// value - the public [`crate::SyncControl::record_checkpoint`] hook. Every
     /// engine-internal path uses [`PendingCoverage::acknowledge_publication`],

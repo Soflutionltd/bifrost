@@ -81,6 +81,18 @@ fresh attachment's sink, budget, backfill projection, throttles or meter.
 This preserves the user's expectation that detaching one attachment cannot
 silently disable the account they attach next.
 
+The slot's throttle handle shares engine deadlines but carries this attachment's
+shutdown token as its recording fence. Already recorded account and resource
+holds survive detach; late writes through the retired handle cannot add or
+extend them. Explicit provider-budget holds remain recordable after retirement
+because their identity is independent of the attachment.
+
+Channel ownership is not yet detachable in the same way as the writer:
+retaining a slot Arc retains its watch senders, its change delivery sender and
+its account-control sender. Consumer streams can therefore remain open past
+detach while that Arc exists. Shutdown stops workers but does not itself close
+these channels.
+
 The engine uses distinct names for three independent mechanisms:
 `cursor::coverage::PublicationStream` keys publication supersession and
 acknowledgement, `engine::backfill_bound::BackfillBound` waits for unread-page
@@ -4068,7 +4080,13 @@ variant; the engine dispatches every termination through
 `RecoveryClass` is non-exhaustive, so this boundary cannot enforce
 compile-time exhaustiveness. It matches the three actionable advice variants
 directly, validates terminal errors with `Fatal::try_from`, and routes unknown
-nonterminal advice to operator override rather than panicking or replaying. `Engine(EngineDirective::*)` directives drive
+nonterminal advice to operator override rather than panicking or replaying.
+The operator warning retains the bounded `UnsupportedRecoveryClassification`
+reason and the original error. Its support-only message and protocol detail
+include the rejected recovery classification's debug representation, so an
+operator can identify which advice the engine could not handle. Classification
+text remains diagnostic evidence, never a new dispatch input.
+`Engine(EngineDirective::*)` directives drive
 `restart-scope` / `restart-account` / `downgrade-strategy` /
 `downgrade-capability` / `schema-clear` / `operator-override` /
 `disable-scope` flows. `DisableScope` quarantines a single cursor scope
@@ -4176,6 +4194,19 @@ reason. The reason rides on the warning's free-form fields; the
 `ThrottleKey::{Owner, Folder, Account, Budget}`. `Budget` is the only key that
 crosses accounts. `ThrottleScope::CurrentOperation` is a per-call hint and
 never enters the bucket.
+
+Each attachment receives a view of the shared deadlines fenced by its shutdown
+token. Detach preserves deadlines already observed: an enterprise user who
+reattaches after a 429 must still honor that server wait. After retirement, the
+old view cannot add or extend `Account`, `Owner` or `Folder` deadlines, since
+the account id can now belong to a successor attachment. This applies even to
+a provider response completing late. Such a response still returns its local
+pacing deadline to cleanup. `Budget` observations remain shared even when late:
+an explicitly named provider limit describes server capacity independently of
+the slot, and reattaching must not bypass it. Providers needing a late hold to
+cross attachment boundaries must stamp that stable budget identity. The new
+attachment has its own live recording fence and consults the existing shared
+deadlines.
 
 A 429 retried entirely inside `bifrost-net` does not reach this bucket: the
 engine records returned `AccountError` evidence, not individual HTTP responses.

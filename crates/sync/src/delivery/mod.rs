@@ -298,7 +298,18 @@ impl PagePublisher {
         } else {
             // This page belongs to the prefix Done would certify, even though
             // it has no standalone acknowledgement. Fusion must retry if lost.
-            self.delivery.publish_acknowledgeable(event)
+            let Some(reached) =
+                self.delivery
+                    .publish_inventory_if_fence(event, &self.coverage, scope, fence)
+            else {
+                return Ok(InventoryPublication::Refused(
+                    crate::cursor::CoverageClaim {
+                        reports: Vec::new(),
+                        generation,
+                    },
+                ));
+            };
+            reached
         };
         Ok(if reached {
             InventoryPublication::Published
@@ -600,6 +611,30 @@ impl ChangeDelivery {
         let reached = state.min_live().is_some();
         drop(state);
         reached
+    }
+
+    /// Order checkpoint-free inventory sends with reset under the fence owner.
+    fn publish_inventory_if_fence(
+        &self,
+        event: MultiplexerEvent,
+        coverage: &crate::cursor::PendingCoverage,
+        scope: &CursorScope,
+        fence: crate::cursor::ScopeFence,
+    ) -> Option<bool> {
+        // Membership always precedes coverage. The callback only sends: it
+        // neither re-enters coverage nor calls the writer. A reset that wins
+        // first refuses this old page; otherwise the send precedes the reset.
+        // Users must not see stale inventory newly published after a reset.
+        let state = self.guard();
+        // min_live reads coverage too, so resolve it before taking the fence
+        // guard. Membership cannot change while `state` remains held.
+        let reached = state.min_live().is_some();
+        let result = coverage.with_scope_fence(scope, fence, || {
+            let _ = self.tx.send(event);
+            reached
+        });
+        drop(state);
+        result
     }
 
     /// Whether any NUMBERED receiver is live: the subscriber gate's question.
