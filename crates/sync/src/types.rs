@@ -124,7 +124,7 @@ pub struct BackfillConfig {
     /// used to outrun a consumer as a matter of routine, overwrite unread
     /// pages, and trigger lag abandonment plus a re-read from the last durable
     /// checkpoint. A backfill producer takes one permit per published page and
-    /// returns it when a consumer receiver READS that page off the stream.
+    /// returns it once every eligible live numbered receiver READS that page.
     ///
     /// Reading, not acknowledging. What overruns a ring is pages nobody has
     /// taken out of it, while an acknowledgement is a promise about the
@@ -162,9 +162,10 @@ pub struct BackfillConfig {
     /// `SyncEngine::account_changes_observer` instead: an observer counts for
     /// neither the subscriber gate nor the bound and carries no such obligation.
     ///
-    /// The bound is also narrower than "the producer follows the slowest reader":
-    /// it follows the slowest live numbered reader among pages NOT YET
-    /// ACKNOWLEDGED, and an acknowledgement frees a page for every receiver. With
+    /// Capacity returns once every eligible live numbered receiver has READ
+    /// the page; no acknowledgement is required. The bound follows those reads
+    /// only while the publication remains registered: removing its registration
+    /// also removes any remaining charge for every receiver. With
     /// two numbered receivers where the ACKNOWLEDGER is the faster one, its
     /// acknowledgements can therefore run the producer past the slower numbered
     /// receiver until it lags. Two acknowledging receivers are not a supported

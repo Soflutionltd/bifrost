@@ -310,3 +310,48 @@ async fn setup_cancellation_reclaims_the_transport_and_lease_before_readiness() 
     );
     assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn setup_panic_before_readiness_reclaims_transport_and_lease() {
+    let (client, mut peer) = tokio::io::duplex(256);
+    let reader = reader(client, BandwidthBudget::default());
+    let inbound = reader.metering().inbound_counter();
+    let (released, mut release) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(Default::default());
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let setup = setup_then_drive(
+        reader,
+        Setup {
+            host: "imap.invalid".into(),
+            tls_mode: TlsMode::None,
+            tls_connector: connector(),
+            timeout: Duration::from_secs(1),
+            tls_active: Arc::default(),
+        },
+        cmd_rx,
+        state_tx,
+        DriverEventSink::new(events_tx, None),
+        ready_tx,
+    );
+    let driver = crate::connection::DriverTask::spawn(
+        async move {
+            tokio::pin!(setup);
+            std::future::poll_fn(|cx| -> std::task::Poll<()> {
+                assert!(setup.as_mut().poll(cx).is_pending());
+                panic!("injected setup panic");
+            })
+            .await;
+        },
+        inbound,
+        vec![Box::new(Released(Some(released)))],
+    );
+    // Readiness is lost on unwind, never reported as successful setup.
+    assert!(ready_rx.await.is_err());
+    let join = driver.handle.lock().await.take().unwrap().await;
+    assert!(join.unwrap_err().is_panic());
+    assert!(driver.has_exited());
+    assert_eq!(release.try_recv(), Ok(()));
+    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+}

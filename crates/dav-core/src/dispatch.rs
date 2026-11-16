@@ -18,8 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use base64::Engine as _;
 use bifrost_net::{
     AccessToken, AccountNet, AccountSpec, CoordinatedTokenSource, Error as NetError,
-    FollowRedirects, HopCredential, HopPolicy, MethodRewrite, Net, NetErrorContext, TokenSource,
-    coordinate,
+    FollowRedirects, HopCredential, HopPolicy, MethodRewrite, Net, TokenSource, coordinate,
 };
 use bifrost_types::{AccountError, AccountId, AccountOperation};
 use bytes::Bytes;
@@ -459,15 +458,7 @@ impl DavDispatch {
             error,
             NetError::AuthLost { .. } | NetError::RefreshFailed { .. }
         ) {
-            return into_account_error(
-                error,
-                NetErrorContext {
-                    provider: None,
-                    protocol: self.protocol.protocol(),
-                    operation,
-                    scope: None,
-                },
-            );
+            return into_account_error(error, self.protocol, operation);
         }
         transport_error(
             operation,
@@ -478,15 +469,7 @@ impl DavDispatch {
 
     /// Use the shared classification funnel for standalone credential timeout.
     fn redirect_error(&self, error: NetError, operation: AccountOperation) -> AccountError {
-        into_account_error(
-            error,
-            NetErrorContext {
-                provider: None,
-                protocol: self.protocol.protocol(),
-                operation,
-                scope: None,
-            },
-        )
+        into_account_error(error, self.protocol, operation)
     }
 
     /// Send one logical DAV exchange through net's retry and hop engine.
@@ -654,12 +637,8 @@ impl DavDispatch {
                     if prior.verdict() == bifrost_net::CommitEvidence::MayHaveCommitted {
                         return Err(into_account_error(
                             response.into_status_error(),
-                            NetErrorContext {
-                                provider: None,
-                                protocol: self.protocol.protocol(),
-                                operation,
-                                scope: None,
-                            },
+                            self.protocol,
+                            operation,
                         ));
                     }
                 }
@@ -682,15 +661,7 @@ impl DavDispatch {
                         self.protocol,
                     ));
                 }
-                Err(into_account_error(
-                    error,
-                    NetErrorContext {
-                        provider: None,
-                        protocol: self.protocol.protocol(),
-                        operation,
-                        scope: None,
-                    },
-                ))
+                Err(into_account_error(error, self.protocol, operation))
             }
         }
     }
@@ -1085,15 +1056,7 @@ fn response_read_error_with_history(
         protocol,
     )
     .into_builder();
-    let evidence = into_account_error(
-        error,
-        NetErrorContext {
-            provider: None,
-            protocol: protocol.protocol(),
-            operation,
-            scope: None,
-        },
-    );
+    let evidence = into_account_error(error, protocol, operation);
     for cause in evidence.chain().iter() {
         builder = builder.push_cause(cause.clone());
     }
@@ -1177,6 +1140,30 @@ mod tests {
         )
     }
 
+    /// Parsing can erase empty userinfo. The raw spelling must be refused
+    /// before the trusted parsed origin can dispatch any credentials.
+    #[tokio::test]
+    async fn raw_userinfo_is_refused_before_dispatch_for_both_protocols() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            let script = dav_script([answer(StatusCode::OK)]);
+            let dispatch = protocol_dispatch(scripted_dav_net(&script), protocol);
+            for url in [
+                "https://@dav.example.test/private",
+                "https://user:pass@dav.example.test/private",
+            ] {
+                let error = dispatch
+                    .send_raw_request(
+                        dispatch.request(Method::GET, url),
+                        AccountOperation::SyncInventory,
+                    )
+                    .await
+                    .expect_err("raw userinfo must be refused before normalization");
+                assert!(matches!(error.kind(), AccountErrorKind::Request(_)));
+                assert!(transcripts(&script).is_empty());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn credential_origins_and_redirect_admission_hold_for_both_protocols() {
         for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
@@ -1244,12 +1231,44 @@ mod tests {
                 .unwrap_err();
             let sent = transcripts(&script);
             assert_eq!(sent.len(), 2);
+            assert!(
+                sent.iter()
+                    .all(|request| request.url.starts_with("https://")),
+                "no request, including its credentials, may reach the refused plaintext home"
+            );
+            assert_eq!(sent[0].url, format!("{BASE}/"));
             assert_eq!(sent[1].url, "https://homes.example.test/next/");
             assert_eq!(sent[1].method, *crate::PROPFIND);
             assert_eq!(
                 sent[1].headers[AUTHORIZATION],
                 sent[0].headers[AUTHORIZATION]
             );
+
+            // A refusal after an admitted HTTPS hop must not put either a
+            // request or its freshly minted credential on the refused wire.
+            for refused in [
+                "http://plain.example.test/home/",
+                "https://unadmitted.example.test/home/",
+            ] {
+                let script = dav_script([dav_redirect(StatusCode::FOUND, refused)]);
+                let mut dispatch = protocol_dispatch(scripted_dav_net(&script), protocol);
+                dispatch.admit_discovered_urls([
+                    "https://homes.example.test/home/".into(),
+                    "http://plain.example.test/home/".into(),
+                ]);
+                dispatch
+                    .send_raw_request(
+                        dispatch.request(Method::GET, "https://homes.example.test/home/"),
+                        AccountOperation::SyncInventory,
+                    )
+                    .await
+                    .expect_err("unadmitted redirect is refused");
+                let sent = transcripts(&script);
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].url, "https://homes.example.test/home/");
+                assert_eq!(sent[0].headers[AUTHORIZATION], "Basic dXNlcjpwYXNz");
+                assert!(sent.iter().all(|request| request.url != refused));
+            }
         }
     }
 

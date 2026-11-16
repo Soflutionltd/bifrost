@@ -426,6 +426,13 @@ pub(crate) async fn delete_if_version(
     expected_version: Option<bifrost_types::ServerVersion>,
 ) -> Result<(), AccountError> {
     public::reject_event(&event, AccountOperation::EventDelete)?;
+    // Users expect caller versions to be enforced only by advertised atomic
+    // operations, even if the account's capability declaration changes later.
+    account.capabilities.mutation.concurrency.gate_version(
+        AccountOperation::EventDelete,
+        expected_version.as_ref(),
+        bifrost_types::Protocol::Graph,
+    )?;
     let etag = if let Some(version) = &expected_version {
         Some(
             version
@@ -1365,6 +1372,33 @@ mod tests {
             );
             assert!(client.take_rest_requests().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn caller_event_delete_version_requires_advertised_guard() {
+        let client = crate::client::GraphClient::new("token");
+        let mut account =
+            GraphAccount::new_for_tests(client.clone(), super::super::PushMode::GraphSubscriptions);
+        account.capabilities.mutation.concurrency = bifrost_types::MutationConcurrency::StateBased;
+        client.script_rest([crate::client::ScriptedRestResponse::empty(
+            reqwest::StatusCode::NO_CONTENT,
+        )]);
+        let error = delete_if_version(
+            account,
+            EventId("calendar::one".into()),
+            Some(bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::Graph,
+                bifrost_types::ObjectType::CalendarEvent,
+                "W/\"stale\"",
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventDelete)
+        );
+        assert!(client.take_rest_requests().is_empty());
     }
 
     #[tokio::test]

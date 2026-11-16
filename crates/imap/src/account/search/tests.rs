@@ -5,7 +5,7 @@ use bifrost_types::container::ContainerId;
 use bifrost_types::{AccountErrorKind, Cause, RequestCause, RequestErrorKind};
 
 #[test]
-fn search_folder_offsets_survive_registry_rebuild_with_display_ties() {
+fn search_folder_order_survives_registry_rebuild_with_display_ties() {
     let names = [
         MailboxName::new("a").unwrap(),
         MailboxName::from_wire("a".into(), b"&AGE-", false),
@@ -553,4 +553,17 @@ fn not_wraps_its_inner_criteria_and_keeps_the_folder() {
         part.folder.as_ref().map(MailboxName::as_str),
         Some("Archive")
     );
+}
+
+#[test]
+fn flatten_thread_deep_chain_preserves_preorder() {
+    let mut root = ThreadNode::new(Some(50_000), Vec::new());
+    for uid in (1..50_000).rev() {
+        root = ThreadNode::new(Some(uid), vec![root]);
+    }
+    let root = ThreadNode::new(None, vec![root, ThreadNode::new(Some(50_001), Vec::new())]);
+    let mut uids = Vec::new();
+    flatten_thread(&root, &mut uids);
+    assert!(uids.into_iter().eq(1..=50_001));
+    drop(root);
 }

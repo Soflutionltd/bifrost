@@ -732,8 +732,10 @@ classified `SyncState(SchemaIncompatible)`, deriving to
 also deletes the backfill checkpoint, and without the re-walk the objects
 already backfilled would keep their pre-correction id spelling.
 Folder-scoped cursors must name an equivalent collection URL in their payload;
-a mismatch is rejected as schema-incompatible before polling. Legacy type
-scopes have no collection URL to compare.
+a mismatch is rejected as scoped `SyncState(CursorInvalid)` before polling,
+restarting the requested collection. An enterprise user expects that collection
+to rebuild without clearing unrelated durable state. Legacy type scopes have
+no collection URL to compare.
 Cursor entry counts are checked against the remaining payload before
 allocation. Multiget response hrefs are rebased onto the same resolved
 absolute native-id namespace the snapshot, inventory, and changes lanes
@@ -1048,3 +1050,9 @@ landed DELETE, which can itself return 404. The account door cannot distinguish
 that committed attempt from prior absence, and a preflight read would add a race.
 Aligning this door requires changing the client/dispatch replay contract, rather
 than manufacturing NotFound or successful writes at the account boundary.
+
+Discovery credential scenarios and wire assertions live in dav-core's
+`test_support::discovery`, parameterized by `DavProtocol`. Thin tests in both
+clients supply their real discovery and collection-listing calls, preserving
+coverage of dialect property parsing, origin admission and effective-URL href
+resolution without a reverse dependency from dav-core.

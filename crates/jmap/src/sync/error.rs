@@ -1407,12 +1407,16 @@ fn convert_problem(
         .and_then(|t| retry_after_from_net(t.net.as_ref()));
 
     let primary = match (details.error(), details.limit(), status_u16) {
-        (ProblemType::JMAP(JMAPError::Limit), Some("maxConcurrentRequests"), _) => {
-            PrimaryCause::Server(ServerCause::RateLimited {
-                throttle: Default::default(),
-                retry_hint,
-            })
-        }
+        // Concurrent uploads and API requests both recover when in-flight work
+        // finishes. An Outlook user expects a retry, not an input-error prompt.
+        (
+            ProblemType::JMAP(JMAPError::Limit),
+            Some("maxConcurrentRequests" | "maxConcurrentUpload"),
+            _,
+        ) => PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint,
+        }),
         // An enterprise user expects an oversized attachment or request to
         // identify the input limit, not retry the same payload indefinitely.
         (ProblemType::JMAP(JMAPError::Limit), Some(limit), _)
@@ -2684,6 +2688,10 @@ mod tests {
                 "maxConcurrentRequests",
                 AccountErrorKind::Server(ServerErrorKind::RateLimited),
             ),
+            (
+                "maxConcurrentUpload",
+                AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            ),
         ] {
             let err = into_account_error(
                 crate::Error::Problem {
@@ -2701,6 +2709,28 @@ mod tests {
             );
             assert_eq!(err.kind(), &expected, "{limit}");
         }
+    }
+
+    #[test]
+    fn concurrent_upload_limit_overrides_http_input_error() {
+        let err = into_account_error(
+            from_net(bifrost_net::Error::Status {
+                code: reqwest::StatusCode::BAD_REQUEST,
+                headers: retry_after_headers("120"),
+                body:
+                    br#"{"type":"urn:ietf:params:jmap:error:limit","limit":"maxConcurrentUpload"}"#
+                        .as_slice()
+                        .into(),
+            }),
+            JmapErrorContext::new(AccountOperation::Send),
+        );
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Server(ServerErrorKind::RateLimited)
+        );
+        // Budgets are attached only when the policy configures one, so pin
+        // the recovery class instead, as the maxConcurrentRequests tests do.
+        assert!(matches!(err.recovery(), RecoveryClass::Retry(_)));
     }
 
     #[test]

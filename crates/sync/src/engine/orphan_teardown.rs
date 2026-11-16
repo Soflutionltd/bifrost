@@ -60,7 +60,7 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
                 throttles: &ctx.throttles,
                 account_id: &ctx.account_id,
                 shutdown: &ctx.shutdown,
-                boundary: &ctx.boundary,
+                boundary: ctx.boundary.subscribe(),
                 // Timer-driven: refuse and retry on the next tick.
                 wait_for_run: false,
             };

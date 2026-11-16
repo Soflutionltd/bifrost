@@ -438,11 +438,11 @@ struct BoundaryEntry {
     /// `delivered_at` is absent from this list; see
     /// [`BoundaryEntry::page_unread`].
     ///
-    /// The precise guarantee, and it is narrower than "the bound follows the
-    /// slowest numbered reader": the bound follows the slowest live numbered
-    /// reader among pages NOT YET ACKNOWLEDGED, and an ACKNOWLEDGEMENT frees a
-    /// page for every receiver. This list lives on the entry, so every path that
-    /// resolves the publication - `acknowledge_publication`,
+    /// Receipt by every eligible live numbered receiver returns capacity;
+    /// acknowledgement is not required. The bound follows the slowest reader
+    /// only while the publication remains registered: removing the registration
+    /// removes any remaining reader charge too. This list lives on the entry,
+    /// so every path that resolves the publication - `acknowledge_publication`,
     /// `acknowledge_checkpoint`, `retire_publication`, and the supersession fold
     /// in `register_in` when the survivor's page is later acknowledged - takes
     /// the reader set with the record, including the evidence that some slower
@@ -1405,8 +1405,9 @@ impl PendingCoverage {
     /// Record that the numbered receiver `receiver_seq` has READ the
     /// publication's batch.
     ///
-    /// This is what returns backfill stream capacity, so the producer runs exactly
-    /// as far ahead as the SLOWEST subscribed consumer reads and no further.
+    /// This returns backfill stream capacity while the publication remains
+    /// registered, following the slowest eligible numbered consumer's reads.
+    /// Removing the registration also removes any remaining reader charge.
     /// Idempotent per receiver, and per receiver rather than per page because a
     /// page is out of the ring's way only once everyone who could still be
     /// holding it has taken it out - see [`BoundaryEntry::readers`].

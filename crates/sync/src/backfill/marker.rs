@@ -1,9 +1,109 @@
 //! Consumer-acknowledged completion marker publication.
 use crate::delivery::{EventScope, MultiplexerEvent};
 use crate::engine::backfill_bound::BackfillBound;
-use bifrost_types::{BackfillCheckpoint, Batch, Checkpoint, CursorScope, PageBoundary, SyncEvent};
+use bifrost_types::{
+    BackfillCheckpoint, Batch, Checkpoint, CursorScope, PageBoundary, Partition, SyncEvent,
+};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Engine-owned durable backfill key. Existing key spellings remain readable,
+/// and unknown keys retain their original bytes.
+/// Inventory grammar is delegated to the types-owned codec; only completion
+/// markers and their legacy proof rules belong to this engine layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackfillKey {
+    Full,
+    Time {
+        from: Option<i64>,
+        to: Option<i64>,
+    },
+    Uid {
+        uid_validity: u32,
+        from: u64,
+        to: u64,
+    },
+    Page {
+        from: u32,
+        to: u32,
+    },
+    Complete,
+    LegacyComplete,
+    Opaque(Partition),
+}
+
+impl BackfillKey {
+    #[must_use]
+    pub fn decode(partition: &Partition) -> Self {
+        let Ok(text) = std::str::from_utf8(&partition.0) else {
+            return Self::Opaque(partition.clone());
+        };
+        match text {
+            "complete" => return Self::LegacyComplete,
+            "complete:v2" => return Self::Complete,
+            _ => {}
+        }
+        use bifrost_types::wire::partition::InventoryKey;
+        match InventoryKey::decode(partition) {
+            InventoryKey::Full => Self::Full,
+            InventoryKey::Time { from, to } => Self::Time { from, to },
+            InventoryKey::Uid {
+                uid_validity,
+                from,
+                to,
+            } => Self::Uid {
+                uid_validity,
+                from,
+                to,
+            },
+            InventoryKey::Page { from, to } => Self::Page { from, to },
+            _ => Self::Opaque(partition.clone()),
+        }
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Partition {
+        use bifrost_types::wire::partition::InventoryKey;
+        let inventory = match self {
+            Self::Full => InventoryKey::Full,
+            Self::Time { from, to } => InventoryKey::Time {
+                from: *from,
+                to: *to,
+            },
+            Self::Uid {
+                uid_validity,
+                from,
+                to,
+            } => InventoryKey::Uid {
+                uid_validity: *uid_validity,
+                from: *from,
+                to: *to,
+            },
+            Self::Page { from, to } => InventoryKey::Page {
+                from: *from,
+                to: *to,
+            },
+            Self::Complete => return Partition(b"complete:v2".to_vec()),
+            Self::LegacyComplete => return Partition(b"complete".to_vec()),
+            Self::Opaque(partition) => return partition.clone(),
+        };
+        inventory.encode()
+    }
+
+    /// Whether this key names a completion marker, including legacy markers.
+    #[must_use]
+    pub fn is_completion(&self) -> bool {
+        matches!(self, Self::Complete | Self::LegacyComplete)
+    }
+
+    /// Legacy empty-plan markers require one inventory recheck. Counts on new
+    /// markers are ordinary counts, never an ordering discriminator.
+    #[must_use]
+    pub fn proves_completion(&self, items_done: u64) -> bool {
+        matches!(self, Self::Complete) || matches!(self, Self::LegacyComplete) && items_done > 1
+    }
+}
 
 /// Broadcast a durable backfill-completion marker for a scope. The marker
 /// is a synthetic empty `Batch` carrying a `BackfillCheckpoint` on the
@@ -39,7 +139,7 @@ pub(crate) async fn emit_backfill_complete(
     };
     let marker = BackfillCheckpoint {
         scope: scope.clone(),
-        partition: crate::backfill::partitioner::completion_partition(),
+        partition: BackfillKey::Complete.encode(),
         progress_marker: None,
         progress: total_seen.completion_progress(),
         envelope_version: bifrost_types::TraitEnvelopeVersion::new(crate::cursor::ENGINE_VERSION),
@@ -167,4 +267,30 @@ pub(crate) enum MarkerOutcome {
     Withheld,
     /// The account is tearing down.
     ShuttingDown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackfillKey, Partition};
+
+    #[test]
+    fn durable_key_codec_reads_existing_rows() {
+        for bytes in [
+            "full",
+            "time::123",
+            "time:-456:",
+            "uid:7:9",
+            "page:500:1000",
+            "complete",
+            "complete:v2",
+            "future:opaque",
+            "page:broken",
+        ] {
+            let partition = Partition(bytes.as_bytes().to_vec());
+            assert_eq!(BackfillKey::decode(&partition).encode(), partition);
+        }
+        assert!(!BackfillKey::LegacyComplete.proves_completion(1));
+        assert!(BackfillKey::LegacyComplete.proves_completion(2));
+        assert!(BackfillKey::Complete.proves_completion(0));
+    }
 }

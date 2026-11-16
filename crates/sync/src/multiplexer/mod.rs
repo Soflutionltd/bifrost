@@ -522,6 +522,12 @@ async fn spawn_scope_poll_inner(
         // destroy a branch mid-poll, so synchronous page registration and
         // broadcast cannot be split. Dropping the future releases the lease,
         // scheduler permit, activity guard and stream.
+        // Claim the scope lease before scheduler admission. Poll and push are
+        // interchangeable producers for this cursor: queueing both for budget
+        // would spend scarce permits waiting for the same lease and delay
+        // unrelated scopes. Users expect one serialized drive per scope, with
+        // other scopes still able to sync. The lease owner may wait for budget;
+        // the other producer waits without a permit.
         let driven = tokio::select! {
             () = shutdown.cancelled() => return PollExit::Retire,
             () = scope_cancel.cancelled() => return PollExit::Retire,

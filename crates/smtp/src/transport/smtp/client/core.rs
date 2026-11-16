@@ -656,6 +656,9 @@ impl<P: Projection> Transaction<P> {
     }
 }
 
+// The adapter interface admits outcomes from every effect. Reject a mismatched
+// read as an internal error and abort, retaining send evidence for the caller;
+// unwinding here would lose the receipt an enterprise send queue needs.
 impl<P: Projection> ProtocolMachine for Transaction<P> {
     type Output = P::Output;
     fn step(&mut self, outcome: OpOutcome) -> Step<Self::Output> {
@@ -697,7 +700,10 @@ impl<P: Projection> ProtocolMachine for Transaction<P> {
                 OpOutcome::Reply(response) => {
                     self.rejection(SmtpCommandPhase::MailFrom, response, false)
                 }
-                _ => unreachable!("read yields a reply or failure"),
+                _ => self.abort_with(
+                    SmtpCommandPhase::MailFrom,
+                    error::internal("read effect did not return a reply"),
+                ),
             },
             TransactionStage::RcptReply(index) => match outcome {
                 OpOutcome::Failed(error) => self.abort_with(SmtpCommandPhase::RcptTo, error),
@@ -717,7 +723,10 @@ impl<P: Projection> ProtocolMachine for Transaction<P> {
                         self.recipients[next].to_string(),
                     )
                 }
-                _ => unreachable!("read yields a reply or failure"),
+                _ => self.abort_with(
+                    SmtpCommandPhase::RcptTo,
+                    error::internal("read effect did not return a reply"),
+                ),
             },
             TransactionStage::WindowWritten(start) => match outcome {
                 OpOutcome::Failed(error) => self.abort_with(
@@ -771,7 +780,10 @@ impl<P: Projection> ProtocolMachine for Transaction<P> {
                     };
                     self.step(OpOutcome::Done)
                 }
-                _ => unreachable!("read yields a reply or failure"),
+                _ => self.abort_with(
+                    SmtpCommandPhase::MailFrom,
+                    error::internal("read effect did not return a reply"),
+                ),
             },
             TransactionStage::MailRejectedDrain {
                 remaining,
@@ -854,7 +866,10 @@ impl<P: Projection> ProtocolMachine for Transaction<P> {
                         Step::Run(Op::CloseReplyGroup)
                     }
                 }
-                _ => unreachable!("read yields a reply or failure"),
+                _ => self.abort_with(
+                    SmtpCommandPhase::RcptTo,
+                    error::internal("read effect did not return a reply"),
+                ),
             },
             TransactionStage::WindowClosing {
                 end,
@@ -885,7 +900,10 @@ impl<P: Projection> ProtocolMachine for Transaction<P> {
                 OpOutcome::Reply(response) => {
                     self.rejection(SmtpCommandPhase::DataCommand, response, true)
                 }
-                _ => unreachable!("read yields a reply or failure"),
+                _ => self.abort_with(
+                    SmtpCommandPhase::DataCommand,
+                    error::internal("read effect did not return a reply"),
+                ),
             },
             TransactionStage::BodyWritten => match outcome {
                 OpOutcome::Failed(error) => self.abort_with(self.body.body_phase(), error),
@@ -934,7 +952,10 @@ impl<P: Projection> ProtocolMachine for Transaction<P> {
                         self.finish(Ok(()))
                     }
                 }
-                _ => unreachable!("read yields a reply or failure"),
+                _ => self.abort_with(
+                    self.body.final_phase(),
+                    error::internal("read effect did not return a reply"),
+                ),
             },
             TransactionStage::GroupOpened => match outcome {
                 OpOutcome::Failed(error) if P::BATCH => {
@@ -986,7 +1007,10 @@ impl<P: Projection> ProtocolMachine for Transaction<P> {
                         })
                     }
                 }
-                _ => unreachable!("read yields a reply or failure"),
+                _ => self.abort_with(
+                    SmtpCommandPhase::LmtpFinalStatus,
+                    error::internal("read effect did not return a reply"),
+                ),
             },
             TransactionStage::DrainClosing => match outcome {
                 OpOutcome::Failed(error) if !P::BATCH => {

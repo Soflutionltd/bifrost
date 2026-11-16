@@ -8,9 +8,9 @@
 //! Each protocol Account impl translates the AST into the
 //! provider's native shape; `provider_query`, when set, is
 //! concatenated as the protocol expects (Gmail and Graph append a
-//! raw query string; JMAP submits it as a `text` filter; IMAP
-//! ignores it unless the consumer wired a Sieve-flavored
-//! interpretation in their adapter).
+//! raw query string; JMAP submits it as a `text` filter; IMAP uses
+//! raw SEARCH criteria, replacing ALL or conjoining them with the
+//! structured filter).
 
 use std::time::SystemTime;
 

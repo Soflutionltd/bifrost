@@ -22,9 +22,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 
-/// Unit-consumer assertions observe declined responses alongside the deferred
-/// disposition. Wire transcripts separately pin the driver's immediate event
-/// delivery and its suppression of already-emitted critical codes.
+/// Record immediate declines separately from completion-time disposition.
+/// Tests must drain and assert declines before finalizing, so retaining a
+/// response until completion cannot masquerade as declining it at receipt.
 pub(crate) struct RecordedConsumer<C> {
     inner: C,
     declined: Vec<UntaggedResponse>,
@@ -38,6 +38,10 @@ pub(crate) fn record_consumer<C: dispatch::Consumer>(inner: C) -> RecordedConsum
 }
 
 impl<C: dispatch::Consumer> RecordedConsumer<C> {
+    pub(crate) fn take_declined(&mut self) -> Vec<UntaggedResponse> {
+        std::mem::take(&mut self.declined)
+    }
+
     pub(crate) fn on_response(
         &mut self,
         response: UntaggedResponse,
@@ -61,10 +65,11 @@ impl<C: dispatch::Consumer> dispatch::Consumer for RecordedConsumer<C> {
         notify: NotifyFlags,
         ctx: &dispatch::ConsumerContext,
     ) -> Option<UntaggedResponse> {
-        if let Some(response) = self.inner.on_response(response, notify, ctx) {
-            self.declined.push(response);
+        let declined = self.inner.on_response(response, notify, ctx);
+        if let Some(response) = &declined {
+            self.declined.push(response.clone());
         }
-        None
+        declined
     }
 
     fn finalize(
@@ -72,16 +77,12 @@ impl<C: dispatch::Consumer> dispatch::Consumer for RecordedConsumer<C> {
         tagged: crate::types::response::TaggedResponse,
         ctx: &dispatch::ConsumerContext,
     ) -> dispatch::Finalized<Self::Output> {
-        let Self {
-            inner,
-            mut declined,
-        } = *self;
-        let finalized = Box::new(inner).finalize(tagged, ctx);
-        declined.extend(finalized.reclassified_as_events);
-        dispatch::Finalized {
-            output: finalized.output,
-            reclassified_as_events: declined,
-        }
+        let Self { inner, declined } = *self;
+        assert!(
+            declined.is_empty(),
+            "assert immediate declines with take_declined before finalizing: {declined:?}"
+        );
+        Box::new(inner).finalize(tagged, ctx)
     }
 }
 

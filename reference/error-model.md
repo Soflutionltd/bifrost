@@ -97,8 +97,9 @@ secondary wire layers; readers do not need to repeat that distinction.
 Setters are `#[must_use]` consuming-self decorators: operation, scope, provider,
 protocol, secondary evidence, diagnostics, idempotency, unsupported reason,
 partial commitment and `with_throttle`. A throttle refinement receives a
-`&mut Throttle` only for rate-limit and quota causes; other causes have no
-payload to modify. Local-hold provenance cannot be cleared by decoration.
+`&mut Throttle` only for rate-limit and quota causes; `try_build` rejects a
+refinement on other causes with `ThrottleNotApplicable`. Local-hold provenance
+cannot be cleared by decoration.
 
 `ServerCause::{RateLimited, QuotaExhausted}` each carry a `Throttle` containing
 optional scope, budget identities and local-hold provenance. These fields
@@ -110,11 +111,14 @@ routing; unrelated diagnostic scope cannot erase it. An enterprise user losing
 one delegated folder expects only that folder quarantined, and an expired
 collection token must restart the exact cursor advertised by the account.
 
-`ServerCause::Error { status }` owns the server-error status. Its kind and
-`DiagnosticInfo::status` are projections, recomputed on every build; a missing
-primary status never borrows another cause's status. Other error families
-retain independent diagnostic response status because an authentication or
-request refusal also needs its actual HTTP/SMTP status recorded.
+`ServerCause::Error { status }` owns the classification status. Its kind is
+recomputed on every build; a missing primary status never borrows another
+cause's status. A fresh builder initializes `DiagnosticInfo::status` from that
+primary status. The `.status(..)` decorator replaces diagnostic status for every
+family, including an explicit `None`, and survives `into_builder`. Diagnostics
+never change classification or recovery. This preserves actual response evidence
+supplied by a later protocol boundary without changing whether replay is safe;
+an enterprise user expects support telemetry to retain the observed response.
 
 The terminator remains **`try_build` -> `Result<AccountError,
 AccountErrorBuildError>`**. The Err arm diagnoses producer bugs. Transmission,
@@ -123,20 +127,29 @@ that these cause payloads cannot encode. Remaining build errors are:
 
 - `EmptyChain`: the defensive chain boundary; every builder supplies a primary.
 - `UnsupportedReasonNotApplicable`: a local refusal reason on another family.
+- `ThrottleNotApplicable`: a throttle refinement on a non-throttle primary.
 - `TransportAcknowledged`: transport failure combined with an acknowledged
   attempt in the classification prefix.
 - `PartialCommitAlreadyAttached`, `PartialCommitEmpty`,
   `PartialCommitApplication`, `PartialCommitCompensation` and
   `PartialCommitNested`: contradictory or invalid operation-effect evidence.
 
-Kind/cause agreement and throttle/cursor applicability checks are unnecessary:
+Kind/cause agreement and cursor applicability checks are unnecessary:
 the primary cause determines the kind and carries the applicable typed data.
 The fallible terminator and translation-boundary expects remain intentional.
+Independent attempt evidence can contradict the primary; a shared decorator can
+supply a refusal reason for another family; a multi-leg record requires reference,
+application and attachment validation. Removing these checks would accept unsafe
+replay evidence or silently discard committed work. They cannot be proved by the
+primary cause payload alone.
 
 On success `try_build` derives `recovery` (`recovery::derive`),
 `remediation` (`recovery::suggest`), and `message_key`
 (`message_key::derive`) from the validated parts, then freezes the
 Arc. Derivation is pure: same parts in, same classification out.
+A malformed sync-state chain passed directly to the internal derivation helper
+fails closed as terminal `InternalFailure`; it never panics or invents a cursor
+target. The builder's primary-derived kind prevents that shape in normal use.
 
 ## AccountErrorKind and message keys
 

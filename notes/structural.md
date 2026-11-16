@@ -222,16 +222,6 @@ minting (`PendingCoverage::next_generation`, still `pub`) did not move to the
 writer. Worth doing only if a new ordering defect shows the wide internal
 surface is the cause.
 
-## STR-043 - The backfill lane is split across `backfill/` and `engine/backfill.rs` along the wrong seam
-
-**Reported by:** sync-lanes.
-
-Plan, marker and scan moved into `backfill/`, and the parking tests moved to
-`engine/`. What remains: the ack writer (`engine/writer/acknowledge.rs`)
-still reads the partition key format directly through
-`backfill::partitioner::is_completion_partition` rather than through a typed
-key owned by `backfill/marker.rs`.
-
 ## STR-046 - A partitioning framework with no producer imposes its costs on every consumer
 
 **Reported by:** sync-lanes (published; not a deletion recommendation).
@@ -485,16 +475,4 @@ dropping the `E` parameter needs the owner. `ConnectionOptions` exists "keeping 
 dial signature stable across features" - a symptom of the parameter list living in
 the wrong place.
 
-## STR-152 - bifrost-dav-core is half a consolidation; the account layer is still mirrored in caldav and carddav
-
-**Reported by:** net-dav (its other "substantial rewrite" verdict).
-
-The dialect trait, the generic collection kernel, the shared `Unsupported`
-lanes, the shared failure helpers and the move onto net's `statuses_as_data`
-exchange landed. What remains: the discovery-level credential tests
-(`discovered_cross_origin_https_home_receives_credentials`,
-`cross_origin_redirect_is_redispatched_with_credentials`,
-`discovered_plaintext_home_never_receives_credentials`) are still twinned in
-both `client.rs` test modules and could move into dav-core, parameterized over
-both dialects.
 

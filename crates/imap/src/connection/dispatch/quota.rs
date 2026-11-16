@@ -492,7 +492,7 @@ mod tests {
         };
         consumer.on_response(
             UntaggedResponse::QuotaRoot {
-                mailbox: noncanonical,
+                mailbox: noncanonical.clone(),
                 roots: Vec::new(),
             },
             NotifyFlags::default(),
@@ -515,6 +515,13 @@ mod tests {
             &context,
         );
 
+        assert_eq!(
+            consumer.take_declined(),
+            vec![UntaggedResponse::QuotaRoot {
+                mailbox: noncanonical,
+                roots: Vec::new(),
+            }]
+        );
         let finalized = Box::new(consumer).finalize(
             TaggedResponse {
                 tag: "A001".into(),

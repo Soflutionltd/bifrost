@@ -7,6 +7,7 @@
 
 pub mod cursor;
 pub mod ledger;
+pub mod partition;
 
 /// A malformed or unreadable durable representation.
 #[derive(Debug, thiserror::Error)]

@@ -225,7 +225,10 @@ fn contract_violation(
 fn checkpoint_protocol(checkpoint: Option<&bifrost_types::Checkpoint>) -> bifrost_types::Protocol {
     use bifrost_types::{Checkpoint, Protocol};
     let Some(Checkpoint::Change(cursor)) = checkpoint else {
-        // A backfill checkpoint carries no protocol tag at all.
+        // A backfill checkpoint carries no protocol tag at all. Do not guess
+        // from the primary account protocol: a composed account can emit this
+        // checkpoint from a different protocol leg, and operators need honest
+        // provenance rather than blame assigned to the wrong implementation.
         return Protocol::Unknown;
     };
     cursor.server_state.protocol.into()

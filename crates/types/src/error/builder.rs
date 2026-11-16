@@ -54,6 +54,8 @@ pub enum AccountErrorBuildError {
     /// guarantees it, and a future builder entry point must fail here
     /// rather than freeze a causeless error.
     EmptyChain,
+    /// A throttle refinement requires a rate-limit or quota primary cause.
+    ThrottleNotApplicable { kind: AccountErrorKind },
     /// A local unsupported reason is meaningful only on Unsupported errors.
     UnsupportedReasonNotApplicable { kind: AccountErrorKind },
     /// `Transport(_)` kind combined with an `Attempt(Acknowledged)`
@@ -71,6 +73,9 @@ impl fmt::Display for AccountErrorBuildError {
             | Self::PartialCommitApplication { .. }
             | Self::PartialCommitCompensation { .. }
             | Self::PartialCommitNested { .. } => write!(f, "invalid partial commitment: {self:?}"),
+            Self::ThrottleNotApplicable { kind } => {
+                write!(f, "throttle refinement is not applicable to {kind:?}")
+            }
             Self::UnsupportedReasonNotApplicable { kind } => {
                 write!(f, "unsupported reason is not applicable to {kind:?}")
             }
@@ -105,6 +110,7 @@ pub struct AccountErrorBuilder {
     original_error: Option<AccountError>,
     partial_commit: Option<PartialCommitBuilder>,
     partial_commit_duplicate: bool,
+    throttle_not_applicable: bool,
     primary_cause: PrimaryCause,
     chain_extras: Vec<Cause>,
     classification_cause_count: Option<usize>,
@@ -120,10 +126,15 @@ pub struct AccountErrorBuilder {
 impl AccountErrorBuilder {
     #[must_use]
     pub fn new(primary_cause: PrimaryCause) -> Self {
+        let status = match &primary_cause {
+            PrimaryCause::Server(super::cause::ServerCause::Error { status }) => *status,
+            _ => None,
+        };
         Self {
             original_error: None,
             partial_commit: None,
             partial_commit_duplicate: false,
+            throttle_not_applicable: false,
             primary_cause,
             chain_extras: Vec::new(),
             classification_cause_count: None,
@@ -131,7 +142,10 @@ impl AccountErrorBuilder {
             operation: None,
             provider: None,
             protocol: None,
-            diagnostics: DiagnosticInfo::default(),
+            diagnostics: DiagnosticInfo {
+                status,
+                ..DiagnosticInfo::default()
+            },
             idempotency_override: None,
             unsupported_reason: None,
         }
@@ -151,6 +165,7 @@ impl AccountErrorBuilder {
             original_error: parts.original_error,
             partial_commit: parts.partial_commit.map(|r| r.builder()),
             partial_commit_duplicate: false,
+            throttle_not_applicable: false,
             primary_cause: parts.primary_cause,
             chain_extras: parts.chain_extras,
             classification_cause_count: Some(parts.classification_cause_count),
@@ -228,10 +243,14 @@ impl AccountErrorBuilder {
     /// "server responded with an error this protocol does not carry a
     /// numeric status for" (IMAP `NO`/`BAD` without a response code).
     /// Builders must not synthesize sentinel values like `0`; pass `None`
-    /// instead. For ServerCause::Error, try_build projects this value from
-    /// the primary cause; this setter decorates the other error families.
+    /// instead. This is diagnostic evidence only and never changes recovery.
+    /// ServerCause::Error initializes it from the primary status; an explicit
+    /// setter replaces it, including on a rebuilt error.
     #[must_use]
     pub fn status(mut self, status: Option<u16>) -> Self {
+        // Support must see the observed response supplied by the boundary,
+        // even when the primary lacked a status. Keep recovery independent so
+        // diagnostic decoration cannot authorize replay of a user's write.
         self.diagnostics.status = status;
         self
     }
@@ -295,7 +314,8 @@ impl AccountErrorBuilder {
 
     /// Decorate provider throttle evidence when the primary cause is rate-limit
     /// or quota exhaustion. Other causes have no throttle payload to refine.
-    /// This cannot change the primary classification or redirect cursor recovery.
+    /// `try_build` rejects refinements on other primary causes. This cannot
+    /// change the primary classification or redirect cursor recovery.
     #[must_use]
     pub fn with_throttle(mut self, refine: impl FnOnce(&mut super::cause::Throttle)) -> Self {
         if let Some(throttle) = self.primary_cause.throttle_mut() {
@@ -304,6 +324,8 @@ impl AccountErrorBuilder {
             // An outer decoration cannot claim ownership of a deadline the
             // transport already installed. Preserve the original provenance.
             throttle.local_hold |= local_hold;
+        } else {
+            self.throttle_not_applicable = true;
         }
         self
     }
@@ -328,18 +350,21 @@ impl AccountErrorBuilder {
         if let Some(scope) = self.primary_cause.cursor_scope() {
             self.scope = Some(ErrorScope::Cursor(scope.clone()));
         }
-        if let PrimaryCause::Server(super::cause::ServerCause::Error { status }) =
-            &self.primary_cause
-        {
-            self.diagnostics.status = *status;
-        }
         let throttle_scope = self
             .primary_cause
             .throttle()
             .and_then(|throttle| throttle.scope);
+        if self.throttle_not_applicable {
+            return Err(AccountErrorBuildError::ThrottleNotApplicable { kind });
+        }
+        // Keep this relational check: a shared decoration builder can receive
+        // any primary family, while a refusal reason is meaningful only here.
         if self.unsupported_reason.is_some() && !matches!(kind, AccountErrorKind::Unsupported(_)) {
             return Err(AccountErrorBuildError::UnsupportedReasonNotApplicable { kind });
         }
+        // Records describe several independently supplied legs and references.
+        // A primary cause cannot prove their consistency or unique attachment;
+        // retaining a fallible terminator avoids silently losing committed work.
         if self.partial_commit_duplicate {
             return Err(AccountErrorBuildError::PartialCommitAlreadyAttached);
         }
@@ -364,7 +389,8 @@ impl AccountErrorBuilder {
         .ok_or(AccountErrorBuildError::EmptyChain)?;
 
         // Transport(_) cannot pair with an Acknowledged Attempt. The
-        // wire-level evidence contradicts the kind.
+        // wire-level evidence contradicts the kind. Keep this check because
+        // attempts are independent evidence, not part of the transport payload.
         if matches!(kind, AccountErrorKind::Transport(_))
             && classification_chain.iter().any(|cause| {
                 matches!(
@@ -609,6 +635,20 @@ mod tests {
     }
 
     #[test]
+    fn throttle_refinement_rejects_non_throttle_primary() {
+        let mut called = false;
+        let result = AccountError::account_closed(AccountOperation::Send, Protocol::Jmap)
+            .into_builder()
+            .with_throttle(|_| called = true)
+            .try_build();
+        assert!(!called);
+        assert!(matches!(
+            result,
+            Err(AccountErrorBuildError::ThrottleNotApplicable { .. })
+        ));
+    }
+
+    #[test]
     fn transport_acknowledged_rejected() {
         let err = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause {
             kind: TransportErrorKind::Network,
@@ -737,8 +777,15 @@ mod primary_cause_tests {
     }
 
     #[test]
-    fn primary_server_status_owns_classification_and_diagnostics() {
+    fn primary_server_status_owns_classification_but_diagnostics_can_be_refined() {
         for (status, retryable) in [(Some(503), true), (Some(403), false), (None, false)] {
+            let default =
+                AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::Error { status }))
+                    .try_build()
+                    .unwrap();
+            assert_eq!(default.telemetry_fields().status, status);
+            let cleared = default.into_builder().status(None).try_build().unwrap();
+            assert_eq!(cleared.telemetry_fields().status, None);
             let error =
                 AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::Error { status }))
                     .operation(AccountOperation::Hydrate)
@@ -750,7 +797,7 @@ mod primary_cause_tests {
                 error.kind(),
                 &AccountErrorKind::Server(ServerErrorKind::Error { status })
             );
-            assert_eq!(error.telemetry_fields().status, status);
+            assert_eq!(error.telemetry_fields().status, Some(418));
             assert_eq!(error.recovery().is_retryable(), retryable);
             let rebuilt = error
                 .clone()
@@ -760,7 +807,7 @@ mod primary_cause_tests {
                 .unwrap();
             assert_eq!(rebuilt.kind(), error.kind());
             assert_eq!(rebuilt.recovery(), error.recovery());
-            assert_eq!(rebuilt.telemetry_fields().status, status);
+            assert_eq!(rebuilt.telemetry_fields().status, Some(500));
         }
     }
 

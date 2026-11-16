@@ -616,6 +616,8 @@ fn parse_thread_node(input: &[u8], depth: u32) -> IResult<&[u8], ThreadNode> {
         }
     }
 
+    // Move branches into the tree: cloning a nested branch would recursively
+    // walk an unbounded linear reply chain despite the parenthesis depth cap.
     // Build the tree from the chain and branch groups.
     //
     // chain_uids:    [6]
@@ -629,7 +631,7 @@ fn parse_thread_node(input: &[u8], depth: u32) -> IResult<&[u8], ThreadNode> {
     // Result: 3 -> 6 -> [(4->23), (44->7->96)]
     //
     // We build bottom-up: start from the deepest chain UID.
-    let children = build_thread_tree(&chain_uids, &branch_groups);
+    let children = build_thread_tree(&chain_uids, branch_groups);
 
     let mut node = ThreadNode::new(root_id, children);
 
@@ -656,11 +658,11 @@ fn parse_thread_node(input: &[u8], depth: u32) -> IResult<&[u8], ThreadNode> {
 /// has one entry with all those groups.
 pub(super) fn build_thread_tree(
     chain_uids: &[Option<u32>],
-    branch_groups: &[Vec<ThreadNode>],
+    mut branch_groups: Vec<Vec<ThreadNode>>,
 ) -> Vec<ThreadNode> {
     if chain_uids.is_empty() {
         // No bare UIDs  -  all children are nested groups (e.g. `((1)(2))`).
-        return branch_groups.iter().flatten().cloned().collect();
+        return branch_groups.into_iter().flatten().collect();
     }
 
     // Build bottom-up from the last chain UID.
@@ -668,7 +670,7 @@ pub(super) fn build_thread_tree(
 
     // Start with the branches after the last UID as its children.
     let last_children: Vec<ThreadNode> = if last < branch_groups.len() {
-        branch_groups[last].clone()
+        std::mem::take(&mut branch_groups[last])
     } else {
         vec![]
     };
@@ -679,7 +681,7 @@ pub(super) fn build_thread_tree(
     // Walk backwards through the remaining chain UIDs.
     for i in (0..last).rev() {
         let mut children: Vec<ThreadNode> = if i < branch_groups.len() {
-            branch_groups[i].clone()
+            std::mem::take(&mut branch_groups[i])
         } else {
             vec![]
         };

@@ -22,6 +22,7 @@
 //! dev-dependency.
 
 pub mod collection;
+pub mod discovery;
 
 use std::sync::Arc;
 use std::time::Duration;

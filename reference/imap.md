@@ -98,8 +98,9 @@ correlate by exact string, and the decoder also accepts spellings the encoder
 never mints (legacy `imap1`, leading-zero numerals). Inventory and changes keep
 minting `imap2`, which is how stored legacy ids migrate.
 Search concatenates selectable folders in display-name order with canonical
-wire octets and mode breaking ties, keeping offset pagination stable across
-registry rebuilds.
+wire octets and mode breaking ties, keeping folder order deterministic across
+registry rebuilds. Search resumes by folder and UID position, not by offset;
+this ordering does not promise a stable snapshot when mail or folders change.
 Canonical validated names retain their existing string ids; literal names
 beginning with the reserved prefix and control-bearing names are escaped too. Scope routing, grouping, command-response correlation, push admission
 and error/throttle keys use this same identity. LIST-STATUS pairs duplicate
@@ -116,7 +117,10 @@ Every IMAP command - APPEND and MULTIAPPEND included - is a `types::Command`, en
 
 `WireCommand` is a list of segments, each a list of `Bytes` chunks. A segment ends exactly on a synchronizing literal marker; the sender writes every chunk of a segment, flushes once, and waits for `+` before the next segment (RFC 3501 Section 4.3). The boundaries are STRUCTURAL: `CommandWriter` records each one as it emits the marker, so no code rescans encoded bytes to rediscover framing, and marker-shaped bytes inside a literal payload cannot be mistaken for a boundary because nothing looks. `CommandWriter` is the one place literal framing is decided: `string(data, utf8)` makes the quoted-versus-literal choice (NUL is rejected when the whole command is finished, so mailbox and metadata identities are never rewritten; printable ASCII is quoted, plus valid UTF-8 in UTF-8 mode, with control characters and DEL always a literal), and `literal` / `literal_bytes` choose the `+` modifier once, from the live `EncodeOptions` - LITERAL+ any size, LITERAL- and rev2 up to 4096 octets (RFC 7888 Sections 4-5, RFC 9051 Section 4.3) - with the literal8 form (`~{n}`) additionally needing an advertised BINARY on a non-rev2 connection (RFC 7888 Section 6, RFC 9051 Section 9). Admission establishes command capability prerequisites, including MULTIAPPEND and BINARY for NUL-bearing APPEND bodies outside the UTF8 wrapper; the encoder chooses body representation; the writer owns literal markers and segment boundaries. `literal_bytes` carries a payload by reference (a reference-count bump), which is how a message body reaches the socket uncopied. `WireCommand`'s `Debug` prints only its shape, and `AppendMessage`'s prints the body's length, so `?cmd` tracing cannot log a message or a credential literal.
 
-Typed SEARCH string operands use `CommandWriter::string` with the live UTF-8 mode. CR and LF are retained as data and emitted in literals; NUL remains refused. The builder's explicit text view is for callers requesting raw syntax and diagnostics, and does not determine typed command framing. Account filter compilation preserves the operands and Boolean grouping through `SearchPlan`; provider queries enter as raw criteria. Raw criteria retain arbitrary extension grammar, caller-written literals and explicit additional capability requirements, so no existing search expression is removed. An enterprise user searching message text expects the same bytes to be searched regardless of connection encoding.
+Typed SEARCH string operands use `CommandWriter::string` with the live UTF-8 mode. CR and LF are retained as data and emitted in literals; NUL remains refused. The builder's explicit text view is for callers requesting raw syntax and diagnostics, and does not determine typed command framing. Account filter compilation preserves the operands and Boolean grouping through `SearchPlan`; provider queries enter as raw criteria. A nonblank `SearchRequest::provider_query`
+is trimmed and structurally validated, replaces an `ALL` plan, and otherwise
+is conjoined with the structured filter using IMAP implicit AND. Blank queries
+are ignored. This escape accepts IMAP SEARCH syntax, not Sieve syntax. Raw criteria retain arbitrary extension grammar, caller-written literals and explicit additional capability requirements, so no existing search expression is removed. An enterprise user searching message text expects the same bytes to be searched regardless of connection encoding.
 
 Caller-written literals in raw SEARCH-family criteria are the one place literal syntax enters from outside the encoder. `validate_search_criteria_crlf` judges the caller's ORIGINAL markers first (a `{n+}` the connection cannot take is `MissingCapability`, never silently rewritten); the walk (`write_criteria`) then copies every non-marker byte and every payload verbatim, skipping each payload by its declared length, and re-emits only the marker through the writer - a `~{n}` as literal8, so the literal8 rule applies. Two spellings can therefore differ from the caller's: a count with leading zeros is written canonically, and a `~{n+}` the connection may not send non-synchronizing loses its `+` and becomes a real segment boundary.
 
@@ -640,10 +644,11 @@ PLAIN, OAuth and CRAM-MD5. `AuthenticateScramConsumer` supplies SCRAM constructi
 and delegates to the same framing consumer. SASL-IR and deferred initial
 responses use identical payloads. The shared client owns every mechanism's
 challenge position, OAuth error answer and SCRAM proof state; the consumer owns
-base64 and CRLF. Binary CRAM-MD5 challenges remain accepted. On tagged OK,
+base64 and CRLF. CRAM-MD5 accepts one raw binary challenge and refuses
+additional continuations; completion before its response is also refused. On tagged OK,
 `finish()` refuses incomplete or unverified authentication, including success
 after an OAuth error continuation. The driver retires such a session.
-OAuth fields containing frame delimiters are local invalid input before any
+OAuth identity and token fields containing SOH, NUL, CR or LF are local invalid input before any
 AUTHENTICATE write; enterprise users expect a refusal rather than credentials
 silently changed into another identity or token.
 
@@ -670,6 +675,10 @@ the repository owner's ruling, an enterprise client should not send
 credentials or a SCRAM exchange over an unencrypted channel by default, and
 SCRAM cannot protect the mail traffic that follows. CRAM-MD5 remains opt-in (`with_cram_md5`) and the legacy
 IMAP LOGIN command remains opt-in (`with_login`).
+
+OAuth selection prefers OAUTHBEARER over XOAUTH2 when both are advertised.
+An OAuth error continuation is acknowledged with the mechanism-specific reply
+(empty for XOAUTH2, SOH for OAUTHBEARER); a later success is still refused.
 
 `authenticate_best(credentials, policy)` intersects server-advertised, policy-allowed, and credentials-supported mechanisms, then runs the strongest. SASL-IR is used when advertised or implied by IMAP4rev2; malformed mechanism names are rejected before any wire write. `AuthOutcome` carries the selected mechanism.
 
@@ -931,7 +940,7 @@ The public account module re-exports the factory and config types (`ImapAccountF
 
 The one published surface beside the factory, added at the owner's request for consumers that track arrivals per folder by UID instead of running change streams (a message moved in with an old INTERNALDATE has a fresh UID, so a UID watermark sees what a date search misses). It is IMAP-specific on purpose: UIDVALIDITY and UID have no meaning on the other providers, so it is not on the `Account` trait.
 
-- `ImapMessageRef::parse(&ObjectId)` is the fallible typed view of a message id: container (the canonical `containers_list` spelling, wire identity preserved), `UidValidity`, `Uid`. It normalises every spelling the decoder accepts (`imap1`, leading zeros); `object_id()` mints the canonical `imap2` id. The `Account` methods still answer under the exact submitted string; the ref is the place that canonicalises.
+- `ImapMessageRef::parse(&ObjectId)` is the fallible typed view of a message id: container (the canonical `containers_list` spelling, wire identity preserved), `UidValidity`, `Uid`. It normalises every spelling the decoder accepts (`imap1`, leading zeros); `object_id()` mints the canonical `imap2` id. Equality and hashing use mailbox identity plus UIDVALIDITY and UID, ignoring the cached container spelling, including exact INBOX case. INBOX children remain case-sensitive and distinct noncanonical wire identities remain distinct. The `Account` methods still answer under the exact submitted string; the ref is the place that canonicalises.
 - `ImapAccountFactory::open_with_poller(account_id)` opens through the same construction path as `open` and returns the `OpenedAccount` plus an `ImapPoller` over the same instance (shared pool and registry). Closing the account closes the poller (each call checks `closed` before checkout); a later open is a new instance an old poller never follows.
 - `ImapPoller::observe` reports UIDVALIDITY, UIDNEXT and EXISTS from one EXAMINE. A missing or zero UIDVALIDITY or UIDNEXT is `ProviderFailure::Missing`, never a guessed 0 (unlike `cursor_from_select`, whose Basic cursor retains absent UIDNEXT and encodes its existing zero sentinel). A `UIDNOTSTICKY` folder (RFC 4315) is `Unsupported(op)` scoped to `Cursor(Folder)`, since UID tracking would see a generation change on every selection.
 - `ImapPoller::list_uids(container, UidScan)` enumerates one generation. A UIDVALIDITY other than the scan's answers `UidListing::GenerationChanged` and lists nothing. The bound is `through` clamped to UIDNEXT - 1, and `from` above it returns an empty page with `completed_through: None` without sending a SEARCH, so `*` is never sent and the `n:*` rule (a range past the highest UID still matches it) cannot surface a UID below `from`. Otherwise it searches `UID lo:hi` windows of 65,536 UIDs (so no SEARCH nears the 1,000,000-UID ESEARCH expansion cap), at most 16 per call, filtering each to its window, sorting and deduplicating. The invariant: `refs` are exactly the UIDs the server reported in `from..=completed_through`; when the limit cuts a window, `completed_through` is the last kept UID; `next_from` resumes past it while the bound is not reached. UID-position continuation is expunge-stable. With an open `through` the bound is re-derived per call, so a caller needing a finite pass freezes it.
@@ -1201,6 +1210,8 @@ default feature). SMTP has no path back to IMAP, so this is acyclic.
 
 With `ImapAccountConfig::with_manage_sieve(ManageSieveConfig)`, IMAP advertises `filter_rule_shape: Scripts` and all five filter flags true; `crate::sieve` speaks ManageSieve over implicit TLS / STARTTLS / plaintext, reuses the account credentials with shared SASL SCRAM (both hashes and channel
 binding), PLAIN, XOAUTH2 or OAUTHBEARER, and maps scripts to `FilterScript { language: Sieve }`. Without it, filter flags stay false and calls return `Unsupported`.
+ManageSieve prefers OAUTHBEARER over XOAUTH2 when both are advertised.
+It uses the same OAuth field validation and error-continuation handling as IMAP.
 ManageSieve frames quoted or literal base64 challenges and quoted client replies.
 SCRAM server-final can arrive as a challenge or in `OK (SASL "...")` success
 data; success requires shared verification in both forms. Certificate binding

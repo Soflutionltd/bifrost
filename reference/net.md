@@ -549,6 +549,17 @@ observing the response for its provider hold.
 Retry waits apply `honor_retry_after_cap` after parsing; that cap does not
 rewrite server evidence.
 
+A 429 absorbed by this retry loop is not returned as an `AccountError` to
+`bifrost-sync`, so it does not populate the engine's shared throttle bucket.
+`observe_errors` still sees the response before retry and can record a provider
+hold in net's shared registry. Only requests using the matching `hold_gate`
+encounter that hold before dispatch. Declaring the same engine throttle budget
+alone does not propagate an absorbed response to work using another transport
+or net gate. A terminal server throttle can reach the engine through ordinary
+error translation; a net `LocalHold` instead supplies operation-only pacing,
+as described above. Successful retries remain transparent to the user without
+promising that every intermediate 429 pauses all work sharing an engine budget.
+
 ### Replay safety
 
 Every provider request declares `ReplayPolicy` at its call site:

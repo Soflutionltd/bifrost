@@ -224,6 +224,14 @@ for its next `Op`; the adapter performs it and feeds back an `OpOutcome`
 `Reply`, never a `Failed`: telling a routine rejection apart from a transport
 failure is exactly the decision the core exists to make in one place.
 
+The shared effect interface admits outcomes for all operation kinds. A read
+receiving a non-reply success, token resolution receiving a non-token success,
+or a session authentication stage holding the wrong exchange returns the existing
+`ErrorKind::Internal` instead of panicking. These invariant failures abort the
+connection, including failures before AUTH, and retain command phase and
+transaction transmission evidence through the normal error projection. An
+enterprise send queue needs that evidence to decide whether retry is safe.
+
 One `Transaction<P>` covers the send surface. Its `Dialect` selects one SMTP
 final reply or one LMTP final status per accepted recipient. `RecipientPolicy`
 is explicit: `FailFast` stops direct SMTP before the body on any recipient

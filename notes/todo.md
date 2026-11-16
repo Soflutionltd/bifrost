@@ -45,16 +45,10 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
-- **Poll and push change drives wait for scheduler admission while holding the
-  scope drive lease.** Both `spawn_scope_poll_inner`
-  (`crates/sync/src/multiplexer/mod.rs`) and the push reconciler
-  (`crates/sync/src/push/reconciler.rs`) call `DriveStart::admit_drive` inside
-  the `CursorRegistry::with_drive` closure, so a queued admission owns the
-  lease and blocks the other producer on that scope until budget frees.
-  `reference/sync.md` contradicts itself: the scheduler section says admission
-  happens before `with_drive` so a queued task never owns a lease, while the
-  drive-start section says the lease is claimed first and admission rechecked
-  after. Decide the order, make code and both passages agree.
+- **DAV raw-URL refusals put caller-supplied userinfo, password included, into
+  diagnostics.** `crates/dav-core/src/dispatch.rs` interpolates the URL
+  userinfo into a support-only `local_error`. Reported by a fixer in passing,
+  unverified.
 
 ## 2. Blocked on a live probe
 
@@ -291,13 +285,10 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
-- **IMAP THREAD trees still recurse on deep replies (priority-low, real
-  stack-overflow surface).** `ThreadNode::addressed` is now iterative, but
-  `flatten_thread` and the drop glue of the nested `ThreadNode` tree still
-  recurse, so a long linear reply chain within the parser's nesting cap can
-  still overflow the stack downstream of the conversion, which makes the
-  iterative conversion pointless on its own. Ablation confirmed the recursive
-  conversion overflows a 50,000-deep chain in a debug test thread.
+- **IMAP `ThreadNode` still derives recursive `Clone`, `Debug`, equality and
+  hashing.** Flattening, drop and parser construction are iterative now, but
+  those derives still recurse on a deep reply chain. `reference/imap.md` does
+  not yet describe the iterative THREAD handling.
 - **Lateral findings from the review of the primary-cause builder rewrite.**
   - Several producers mint a scope-directed state cause with a placeholder
     `CursorScope` and rely on a later `.scope(ErrorScope::Cursor(_))` to rebind
@@ -305,33 +296,24 @@ Narrow edge cases, audits with no known defect, and design work.
     carries no cursor scope the placeholder now routes recovery silently; the
     old builder rejected that shape. Correct for Gmail history today, but the
     placeholder pattern hides a missing scope elsewhere.
-  - `AccountErrorBuilder::with_throttle` is a silent no-op on a non-throttle
-    cause, where the old `throttle_scope` setter failed the build. Callers that
-    reclassify a hold (`sync::throttle::resolve_throttle_key`) cannot tell that
-    nothing was stamped.
-  - `recovery::derive_sync_state` ends in `unreachable!` for a non-state
-    outermost cause. Sound while every `AccountError` comes from the builder,
-    but it is a panic in a published library path if a second construction
-    route appears.
-  - A `.status(..)` set on a `ServerCause::Error` error is now overwritten by
-    the cause's status in telemetry, so a site that classified `Error { None }`
-    but knew the HTTP status loses it from diagnostics.
+  - Transport derivation still panics in debug builds on acknowledged
+    transport evidence, while release builds treat it as in-flight.
 - **Lateral findings from the review of the November 2026 resolution batch.**
   - IMAP: an ESEARCH answer without the UID indicator to a UID SEARCH is now a
     hard protocol error; a lenient server that omits the indicator fails every
-    search. No fixed-value test pins the escaped `~imap-wire:` mailbox id form.
+    search.
   - JMAP: one server-minted id containing the owner separator now fails the
     whole response; needs a ruling on dropping that item versus failing all.
     Shared-account contacts and calendars have no routing door: the optional
     families live once on `Registry::families` and select the primary account
     (capability question).
   - DAV: the dispatcher tests now call `send_raw_request` directly, so a crate
-    verb that bypassed the dispatcher would go unnoticed. The admitted-https
-    redirect test does not assert that no credential reached the wire on the
-    refused hops.
+    verb that bypassed the dispatcher would go unnoticed.
   - sync: engine-wide `AccountId`-keyed throttles can receive late holds from a
-    retired slot, which a reattach of the same id inherits. `MaintenanceGate`
-    still exposes the raw boundary sender. A retained slot `Arc` keeps its
+    retired slot, which a reattach of the same id inherits. `engine/bulk.rs`
+    still takes a raw boundary sender only to subscribe, and
+    `reference/sync.md` does not say `MaintenanceGate` holds a read-only
+    boundary view. A retained slot `Arc` keeps its
     watch and broadcast channels open past detach. The integration test
     `an_orphan_restored_after_detachs_take_is_not_inherited_by_the_next_attach`
     no longer bites on removing the shutdown check in
@@ -340,50 +322,43 @@ Narrow edge cases, audits with no known defect, and design work.
 
 - **Lateral findings from the review of the design-hunt batch, unverified.**
   Each wants its own check and, where marked, a ruling.
-  - DAV: `reference/caldav.md` and `reference/carddav.md` call a cursor scope
-    mismatch schema-incompatible; the code treats it as `CursorInvalid`.
-    `dav-core` `http_error_policy_for_protocol` has an `unreachable!` panic
-    path. The pre-dispatch raw-URL trust check has no test.
-  - Google: the 404 `Message` fallback now also labels a scopeless 403 as
-    `NoPermission` on `Message` for filter and directory calls.
-  - net: `server_cause_from_status` returns a `Server` cause for unlisted 4xx
-    statuses.
-  - IMAP: `ImapMessageRef` equality depends on the container spelling,
-    including INBOX case, contradicting its doc. The stricter OAuth and
-    CRAM-MD5 handling and ManageSieve's OAUTHBEARER preference are not in
-    `reference/imap.md`.
-  - SASL: `AGENTS.md` still calls `bifrost-sasl` private although it is
-    published. `strip_frame_delim` in `crates/sasl/src/oauth.rs` still
+  - SASL: `strip_frame_delim` in `crates/sasl/src/oauth.rs` still
     rewrites for callers that bypass `SaslClient`.
   - JMAP: a capability dropped mid-session yields terminal `Unsupported` where
-    `CapabilityChanged` may fit (ruling). The foreign-discovery paragraph of
-    `reference/jmap.md` names a constructor that is now test-only. An all-day
-    event with no start loses its all-day flag.
+    `CapabilityChanged` may fit (ruling). An all-day event with no start loses
+    its all-day flag: `EventTime` in `crates/types/src/calendar.rs` derives
+    all-day only from a parsed date, so the fix is a types change (the limit is
+    documented in `jmap/src/sync/calendar_mapping.rs` and `reference/jmap.md`).
   - SMTP: a rejected batch DATA reports per-recipient RCPT rejections. Batch
     sends have no BDAT entry point (ruling). An LMTP final 421 marks the
-    remaining recipients uncertain without reading their finals. `Session` and
-    `Transaction` use `unreachable!` on impossible outcomes.
+    remaining recipients uncertain without reading their finals. Three
+    `unreachable!` sites remain in `net.rs` and `async_net.rs`, plus lifecycle
+    `expect` assertions.
   - sync: the operator-override warning moved from `user_safe` to
     `support_only` (ruling). `plan_recovery` lost its unhandled-classification
-    detail. `ThrottleScope::Mailbox` no longer names what it means. Several
+    detail. `ThrottleScope::Mailbox` (defined in
+    `crates/types/src/error/recovery.rs`) also covers owners and folders; a
+    rename such as `ScopedResource` is proposed. Several
     engine sites still hold raw `WriterRequest` senders instead of
-    `WriterHandle`. `publish_warning` stamps `Account` scope on unscoped
-    warnings. `AckOutcome` is not `#[must_use]`: adding it is clean in
+    `WriterHandle`. `AckOutcome` is not `#[must_use]`: adding it is clean in
     production but about fifty test call sites discard the value.
+  - `reference/sync.md`: the scheduler section describes overflow as poll
+    cadence and push skipping, but `engine/drive_start.rs` retries internally
+    with `ADMISSION_RETRY`. It and `reference/types.md` should also name
+    `backfill/marker.rs` and `wire::partition` as the partition key owners.
+  - `reference/net.md` could say `Server` is the fallback cause for unlisted
+    4xx statuses.
+  - Cursor wire: the inner scope and payload decoders accept unconsumed bytes
+    within declared fields, and `parse_envelope` computes `scope_end + 4`
+    unchecked, which can overflow on 32-bit targets.
+  - Graph contact and event updates validate caller ETags without calling
+    `gate_version`.
   - Graph: `public_folder` change events carry `Owner` memberships that only
     `Account` cursors cover.
   - Calendars: CalDAV and JMAP normalize floating times to UTC.
 
 - **Residue of the 413, JMAP limit, stale UIDVALIDITY and hold-provenance
   batch (November 2026).** Each is small; none is a known live defect.
-  - The backfill partition-key format is written twice:
-    `InventoryPartition::durable_key` in bifrost-types and `BackfillKey` in
-    `crates/sync/src/backfill/partitioner.rs`, held together only by a
-    round-trip test.
-  - A 429 absorbed inside bifrost-net's retries no longer reaches the engine
-    throttle budget, so another work item sharing that budget meets the hold
-    only through net's local gate. Undocumented in `reference/net.md` and
-    `reference/sync.md`.
   - Honest backfill completion counts removed the old ordering safety net
     (`items_done = total_seen + 1`) for external `CheckpointStore`
     implementations that still select the resume row by greatest
@@ -391,27 +366,6 @@ Narrow edge cases, audits with no known defect, and design work.
   - Engine direct PIM and hydration passthroughs return `RestartScope` advice
     to the caller without dispatching it, so a stale-UIDVALIDITY folder is
     re-inventoried only when the sync lane next notices. A delay, not a loss.
-  - Graph contact and event `delete_if_version` do not call `gate_version`
-    the way mail `bulk_set_flags_if_version` does.
-  - JMAP's local `maxSizeRequest` guard refuses as `Request(Malformed)`
-    while the server's own refusal of the same limit is now
-    `PayloadTooLarge`.
-  - `maxConcurrentUpload` is not named in JMAP `convert_problem`, so it falls
-    to the status fallback rather than `RateLimited`.
-  - Backfill-checkpoint boundary violations still report `Protocol::Unknown`
-    (`engine_errors.rs::checkpoint_protocol`) although the engine knows the
-    account's protocol.
-- **The backfill bound docs say an acknowledgement frees capacity; the code
-  frees it on receipt.** `engine/backfill_bound.rs` documents the permit as the
-  consumer's receipt of the page (`ChangesReceiver::note_receipt`), but the
-  `BackfillConfig::lane_capacity` doc in `crates/sync/src/types.rs`, the
-  `readers` field doc in `crates/sync/src/cursor/coverage.rs` and
-  `reference/sync.md` still say "an acknowledgement frees a page for every
-  receiver". Reconcile the prose with the receipt bound (doc-only).
-- **`reference/jmap.md` misstates the `CallNotFound` classification.** It lists
-  `CallNotFound -> Protocol(MissingField)`; `crates/jmap/src/sync/error.rs`
-  maps it to `Protocol(PartialResponse)` with `Acknowledged` transmission
-  evidence (an omitted call is unanswered). Fix the reference.
 - **JMAP raw-message reads collapse two failures into `NotFound(Message)`.**
   `open_raw_rfc822` in `crates/jmap/src/sync/blob.rs` takes the same
   `raw_message_not_found` lane when the correlated Email has no `blobId` and
@@ -419,10 +373,6 @@ Narrow edge cases, audits with no known defect, and design work.
   second is a server answering a different object than asked, which reads as a
   contract violation rather than a vanished message. Needs a call on whether to
   split them.
-- **Cursor envelope decoding accepts trailing bytes.** `parse_envelope` in
-  `crates/types/src/wire/cursor.rs` checks only `bytes.len() < payload_end`,
-  so bytes after the payload are silently ignored rather than refused as
-  `Malformed`. Check the ledger codec for the same shape when fixing.
 - **Reattach and first subscribe disagree on accounts with no push lanes.**
   Reattach now carries a desired subscription only when
   `effective_push_lanes` of the replacement is non-empty
@@ -452,16 +402,6 @@ Narrow edge cases, audits with no known defect, and design work.
   carries only a position, so it is accepted for a different `SearchRequest`.
   A position is meaningful under any query, so this resumes rather than
   corrupts, but JMAP and Graph bind their search cursors to owner and state.
-- **IMAP `provider_query` is documented as ignored but is sent as raw SEARCH
-  criteria.** The module doc of `crates/types/src/search.rs` says IMAP ignores
-  `provider_query` unless an adapter interprets it; `search_plan`
-  (`crates/imap/src/account/pim.rs`) validates it structurally and substitutes
-  or appends it to the UID SEARCH criteria, and reference/imap.md has no
-  paragraph on it. One of the two is wrong; the doc is the likelier one.
-- **reference/imap.md still says search keeps "offset pagination stable"** in
-  the object-id section, while search pages by position since the bifrost#2
-  fix; the test `search_folder_offsets_survive_registry_rebuild_with_display_ties`
-  keeps the old word too.
 - **No persistence contract for a `ChangeCursor` held outside the engine.**
   bifrost#3 offered it as the alternative to the UID polling surface; the
   surface landed instead. The cursor codec lives in bifrost-sync and nothing
@@ -505,9 +445,6 @@ Narrow edge cases, audits with no known defect, and design work.
   - IMAP setup has one total deadline across greeting, CAPABILITY, STARTTLS
     and the TLS handshake where each phase used to get its own, so a slow
     STARTTLS server gets less time than before.
-  - The setup panic path (`driver/setup.rs`) has no test.
-  - The IMAP test double `RecordedConsumer` (`connection/test_support.rs`) turns declined responses back into
-    finalize output, so consumer tests cannot tell keep from decline.
   - `unsubscribe_push` cancelled after taking the registry discards in-flight
     and unattempted handles. Marking orphans in place instead risks the
     retrier racing the delete to `NotFound`.
@@ -521,10 +458,6 @@ Narrow edge cases, audits with no known defect, and design work.
     and only JMAP sets it.
   - A library batching bug that overflows `maxCallsInRequest` would surface as
     `PayloadTooLarge` rather than an internal fault.
-  - No test bites `Campaign::declaration_matches` (`crates/sync/src/mutation/campaign.rs`):
-    changing its `all` to `any` passes the whole bifrost-sync suite. A
-    multi-target cohort where only some targets still map to the cohort
-    identity after a reattach would pin it.
 - **Session cap does not span account incarnations.** A failed or cancelled
   factory open, or a closing incarnation during reopen, can leave a transport
   tail that the next incarnation's cap does not count.

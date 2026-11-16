@@ -889,14 +889,14 @@ fn thread_truncated_input() {
 /// `build_thread_tree` with an empty chain and empty branch groups (RFC 5256 Section 4).
 #[test]
 fn build_thread_tree_empty() {
-    let result = build_thread_tree(&[], &[]);
+    let result = build_thread_tree(&[], vec![]);
     assert!(result.is_empty());
 }
 
 /// `build_thread_tree` with a single UID and no branches (RFC 5256 Section 4).
 #[test]
 fn build_thread_tree_single_uid() {
-    let result = build_thread_tree(&[Some(42)], &[vec![]]);
+    let result = build_thread_tree(&[Some(42)], vec![vec![]]);
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].id, Some(42));
     assert!(result[0].children.is_empty());
@@ -1322,4 +1322,35 @@ fn regression_esearch_unknown_key_no_value() {
         return;
     }
     panic!("expected ESEARCH response");
+}
+
+#[test]
+fn thread_deep_linear_branch_converts_and_drops() {
+    // Only two levels of parentheses, but 50,000 reply links. Nesting the
+    // chain in a branch also exercises ownership transfer during tree building.
+    let mut input = String::from("THREAD (50001 (");
+    for uid in 1..=50_000 {
+        if uid > 1 {
+            input.push(' ');
+        }
+        input.push_str(&uid.to_string());
+    }
+    input.push_str("))\r\n");
+    let (_, response) = parse_untagged_thread(input.as_bytes()).unwrap();
+    let UntaggedResponse::Thread(roots) = response else {
+        panic!("expected THREAD");
+    };
+    for root in roots {
+        let root = root.addressed::<crate::types::Uid>();
+        assert_eq!(root.id, Some(50_001));
+        let mut node = &root.children[0];
+        for uid in 1..=50_000 {
+            assert_eq!(node.id, Some(uid));
+            if uid < 50_000 {
+                node = &node.children[0];
+            }
+        }
+        assert!(node.children.is_empty());
+        drop(root);
+    }
 }

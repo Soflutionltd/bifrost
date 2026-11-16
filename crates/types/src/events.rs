@@ -157,24 +157,27 @@ impl InventoryPartition {
     ///
     /// This exhaustive match lives with the non-exhaustive enum so a future
     /// partition cannot silently share a fallback key with another partition.
+    /// The wire codec owns the grammar shared with engine resume decoding.
     #[must_use]
     pub fn durable_key(&self) -> Partition {
-        let text = match self {
-            Self::Full => "full".to_owned(),
-            Self::Time(window) => format!(
-                "time:{}:{}",
-                window.from().map(|v| v.to_string()).unwrap_or_default(),
-                window.to().map(|v| v.to_string()).unwrap_or_default(),
-            ),
-            Self::Uid(window) => format!(
-                "uid:{}:{}:{}",
-                window.uid_validity(),
-                window.from(),
-                window.to(),
-            ),
-            Self::Page(window) => format!("page:{}:{}", window.from(), window.to()),
+        use crate::wire::partition::InventoryKey;
+        let key = match self {
+            Self::Full => InventoryKey::Full,
+            Self::Time(window) => InventoryKey::Time {
+                from: window.from(),
+                to: window.to(),
+            },
+            Self::Uid(window) => InventoryKey::Uid {
+                uid_validity: window.uid_validity(),
+                from: window.from(),
+                to: window.to(),
+            },
+            Self::Page(window) => InventoryKey::Page {
+                from: window.from(),
+                to: window.to(),
+            },
         };
-        Partition(text.into_bytes())
+        key.encode()
     }
 }
 

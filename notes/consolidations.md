@@ -22,22 +22,6 @@ Each entry names the hunt scope(s) that reported it. Where hunters disagreed,
 both readings are recorded. The raw reports are in the commit that precedes
 this file's.
 
-## CON-002 - What class of failure is this? (kind and cause restated at every builder)
-
-**Reported by:** types (LATENT), graph.
-
-Landed: `AccountErrorBuilder::new(PrimaryCause)` derives the kind, throttle
-data lives in the rate/quota causes, scope-directed state causes carry their
-`CursorScope`, `Cause::Protocol { kind, wire }` carries the protocol sub-kind,
-and `TransportKind` folded into `TransportErrorKind`. Residue:
-
-- `try_build` and its `.expect(..)` sites remain. It still validates
-  transmission evidence (`TransportAcknowledged`), unsupported reasons on
-  non-Unsupported kinds, and partial-commit attachment, none of which the
-  primary cause type makes unconstructable yet.
-- `DiagnosticInfo::status` is still a free setter for every family except
-  `ServerCause::Error`, whose status `try_build` projects over it.
-
 ## CON-003 - Which protocol is this? (six vocabularies, mapped outside their crate)
 
 **Reported by:** types.

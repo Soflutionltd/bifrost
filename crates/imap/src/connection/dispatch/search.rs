@@ -801,12 +801,13 @@ mod tests {
         );
         feed(&mut consumer, UntaggedResponse::Expunge(2));
 
-        let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx());
-        assert_eq!(result.output.unwrap().ids, vec![4]);
         assert_eq!(
-            result.reclassified_as_events,
+            consumer.take_declined(),
             vec![UntaggedResponse::Exists(1), UntaggedResponse::Expunge(2)]
         );
+        let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx());
+        assert_eq!(result.output.unwrap().ids, vec![4]);
+        assert!(result.reclassified_as_events.is_empty());
     }
 
     /// Tagless winner: surplus tagless ESEARCH and legacy SEARCH are dropped.

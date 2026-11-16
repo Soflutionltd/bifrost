@@ -379,7 +379,7 @@ pub(super) async fn persist_ack_request(
     }
 
     if let Checkpoint::Backfill(b) = &req.checkpoint
-        && crate::backfill::partitioner::is_completion_partition(&b.partition)
+        && crate::backfill::marker::BackfillKey::decode(&b.partition).is_completion()
         && let Some(reason) = completion_refusal(coverage, &candidate, b, req.publication.as_ref())
     {
         tracing::warn!(

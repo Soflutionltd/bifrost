@@ -513,6 +513,11 @@ impl ChangeDelivery {
 
     /// Announce a warning without an acknowledgement obligation.
     pub fn publish_warning(&self, scope: EventScope, mut warning: bifrost_types::Warning) {
+        // The publisher supplies the affected delivery domain even when the
+        // warning has no narrower identity. Keep that account attribution so
+        // users can locate an advisory in their account, while preserving any
+        // more specific identity the producer supplied. Account here does not
+        // claim that every cursor failed or authorize account-wide recovery.
         if warning.scope.is_none() {
             warning.scope = Some(match &scope {
                 EventScope::Cursor(scope) => bifrost_types::ErrorScope::Cursor(scope.clone()),

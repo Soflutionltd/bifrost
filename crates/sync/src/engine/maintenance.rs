@@ -9,7 +9,9 @@ pub(super) struct MaintenanceGate<'a> {
     pub throttles: &'a crate::throttle::ThrottleBucket,
     pub account_id: &'a AccountId,
     pub shutdown: &'a CancellationToken,
-    pub boundary: &'a Boundary,
+    // Maintenance observes control requests; it must not obtain authority to
+    // overwrite a concurrent pause, checkpoint request or terminal Stop.
+    pub boundary: crate::cancel::BoundaryView,
     /// Ruling (wave 7): what a non-`Run` boundary means for this caller.
     /// `true` for caller-driven repair: an enterprise user who asked for a
     /// repair expects it to run once a checkpoint barrier or pause lifts,
@@ -32,12 +34,12 @@ impl MaintenanceGate<'_> {
         ),
         Error,
     > {
-        let mut boundary = self.boundary.sender().subscribe();
+        let mut boundary = self.boundary.clone();
         loop {
             if self.shutdown.is_cancelled() {
                 return Err(Error::ShuttingDown);
             }
-            let request = *boundary.borrow_and_update();
+            let request = boundary.peek();
             match request {
                 BoundaryRequest::Run => {}
                 BoundaryRequest::Pause | BoundaryRequest::CheckpointNow if self.wait_for_run => {
@@ -45,7 +47,7 @@ impl MaintenanceGate<'_> {
                         biased;
                         () = self.shutdown.cancelled() => return Err(Error::ShuttingDown),
                         changed = boundary.changed() => {
-                            if changed.is_err() {
+                            if changed.is_none() {
                                 return Err(Error::ShuttingDown);
                             }
                         }
@@ -131,7 +133,7 @@ mod tests {
             throttles: &slot.throttles,
             account_id: &id,
             shutdown: &slot.shutdown,
-            boundary: &slot.boundary,
+            boundary: slot.boundary.subscribe(),
             wait_for_run: false,
         };
         let held = gate.acquire(&[]).await.expect("running maintenance");
@@ -165,7 +167,7 @@ mod tests {
             throttles: &slot.throttles,
             account_id: &id,
             shutdown: &slot.shutdown,
-            boundary: &slot.boundary,
+            boundary: slot.boundary.subscribe(),
             wait_for_run: false,
         };
         assert!(matches!(gate.acquire(&[]).await, Err(Error::Paused)));
@@ -196,7 +198,7 @@ mod tests {
             throttles: &slot.throttles,
             account_id: &id,
             shutdown: &slot.shutdown,
-            boundary: &Boundary::from(boundary_tx.clone()),
+            boundary: Boundary::from(boundary_tx.clone()).subscribe(),
             wait_for_run: true,
         };
         let mut waiting = Box::pin(gate.acquire(&[]));
@@ -262,7 +264,7 @@ mod tests {
             throttles: &slot.throttles,
             account_id: &id,
             shutdown: &slot.shutdown,
-            boundary: &Boundary::from(boundary_tx.clone()),
+            boundary: Boundary::from(boundary_tx.clone()).subscribe(),
             wait_for_run: false,
         };
         let mut queued = Box::pin(gate.acquire(&[]));

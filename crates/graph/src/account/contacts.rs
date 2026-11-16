@@ -266,6 +266,13 @@ pub(crate) async fn delete_if_version(
             AccountOperation::ContactDelete,
         ));
     }
+    // Users expect caller versions to be enforced only by advertised atomic
+    // operations, even if the account's capability declaration changes later.
+    account.capabilities.mutation.concurrency.gate_version(
+        AccountOperation::ContactDelete,
+        expected_version.as_ref(),
+        bifrost_types::Protocol::Graph,
+    )?;
     let etag = if let Some(version) = &expected_version {
         Some(
             version
@@ -1423,6 +1430,33 @@ mod tests {
         assert_eq!(top_for_limit(Some(10), 250), 10);
         assert_eq!(top_for_limit(Some(9999), 250), 250);
         assert_eq!(top_for_limit(None, 999), 250);
+    }
+
+    #[tokio::test]
+    async fn caller_contact_delete_version_requires_advertised_guard() {
+        let client = crate::client::GraphClient::new("token");
+        let mut account =
+            GraphAccount::new_for_tests(client.clone(), super::super::PushMode::GraphSubscriptions);
+        account.capabilities.mutation.concurrency = bifrost_types::MutationConcurrency::StateBased;
+        client.script_rest([crate::client::ScriptedRestResponse::empty(
+            reqwest::StatusCode::NO_CONTENT,
+        )]);
+        let error = delete_if_version(
+            account,
+            ContactId("one".into()),
+            Some(bifrost_types::ServerVersion::etag(
+                bifrost_types::Protocol::Graph,
+                bifrost_types::ObjectType::Contact,
+                "W/\"stale\"",
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::ContactDelete)
+        );
+        assert!(client.take_rest_requests().is_empty());
     }
 
     #[tokio::test]

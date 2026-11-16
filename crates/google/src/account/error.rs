@@ -1033,13 +1033,13 @@ fn http_error_policy(ctx: &GmailErrorContext) -> bifrost_net::HttpErrorPolicy {
     bifrost_net::HttpErrorPolicy {
         status: bifrost_net::StatusPolicy {
             // Explicit hints preserve operation-specific meanings such as a
-            // blob miss naming its parent message. Collection scopes keep
-            // their own kind; Gmail's scope-less fallback is a message.
+            // blob miss naming its parent message. Without a resource or
+            // scope, permission and absence errors cannot identify a message:
+            // users expect filter and directory refusals to name no false target.
             resource: ctx
                 .resource
                 .and_then(GmailResource::to_resource_kind)
-                .or_else(|| ctx.scope.as_ref().and_then(ErrorScope::resource))
-                .or(Some(ResourceKind::Message)),
+                .or_else(|| ctx.scope.as_ref().and_then(ErrorScope::resource)),
             // Only the history endpoint proves history loss. Enterprise users
             // expect unrelated resource errors to preserve sync progress.
             overrides: if history {
@@ -1679,6 +1679,25 @@ mod tests {
             acc.kind(),
             AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
         ));
+    }
+
+    #[test]
+    fn scopeless_permission_errors_do_not_invent_a_message_resource() {
+        for operation in [
+            AccountOperation::FilterCreate,
+            AccountOperation::DirectorySearch,
+        ] {
+            for body in ["", r#"{"error":{"code":403}}"#] {
+                let error = into_account_error(
+                    gmail_response(403, body),
+                    GmailErrorContext::base(operation),
+                );
+                assert!(error.chain().iter().any(|cause| matches!(
+                    cause,
+                    Cause::Access(AccessCause::PermissionDenied { resource: None })
+                )));
+            }
+        }
     }
 
     #[test]

@@ -91,6 +91,10 @@ pub(super) fn event_from_jmap(
             ))
         })?;
     let timezone = event.time_zone().as_value().map(ToString::to_string);
+    // With no start, EventTime is Unspecified and cannot retain showWithoutTime:
+    // its all-day sense requires a parsed date. Preserve the missing observation
+    // rather than inventing a date or hiding a damaged meeting from the user.
+    // Retaining that independent flag requires extending the shared EventTime model.
     let start = EventTime::from_observed(
         shared_time_from_jmap(raw_start, is_all_day),
         timezone.clone(),

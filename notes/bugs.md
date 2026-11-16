@@ -68,9 +68,6 @@ Design:
   (documented in both `account.rs` files).
 - CalDAV and CardDAV updates sent without a strong validator can recreate a
   resource deleted after it was fetched.
-- IMAP `account/inventory.rs::run_inventory` takes a `scope` parameter it does
-  not use (renamed `_scope` to pass the gate); wire it or drop it once its
-  intended role is known.
 - Sync `engine/reattach.rs` closes the replaced account (`close_owed`) without
   a time bound, and `retire_stranded` awaits provider cleanup without one;
   bounding either means deciding when to abandon an obligation cancellation

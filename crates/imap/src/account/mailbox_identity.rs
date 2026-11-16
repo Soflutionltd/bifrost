@@ -67,6 +67,30 @@ mod account_identity_tests {
     use super::MailboxName;
 
     #[test]
+    fn escaped_account_ids_keep_their_persisted_bytes() {
+        // Fixed vectors pin the mode byte, wire octets and unpadded base64url
+        // spelling independently of the encoder/decoder round-trip.
+        let cases = [
+            (
+                MailboxName::from_wire("a".into(), b"&AGE-", false),
+                "~imap-wire:ACZBR0Ut",
+            ),
+            (
+                MailboxName::from_wire("\u{fffd}".into(), &[0xff], true),
+                "~imap-wire:Af8",
+            ),
+            (
+                MailboxName::new("~imap-wire:literal").unwrap(),
+                "~imap-wire:AH5pbWFwLXdpcmU6bGl0ZXJhbA",
+            ),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(name.account_id(), expected);
+            assert_eq!(MailboxName::from_account_id(expected).unwrap(), name);
+        }
+    }
+
+    #[test]
     fn equal_canonical_names_have_equal_escaped_ids_in_both_modes() {
         for display in ["~imap-wire:literal", "~imap-wire:旅行", "line\r\nbreak"] {
             let caller = MailboxName::from_decoded(display.into());

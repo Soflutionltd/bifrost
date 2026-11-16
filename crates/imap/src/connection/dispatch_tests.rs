@@ -98,14 +98,13 @@ fn fetch_byte_estimate_counts_gmail_labels() {
 }
 
 /// A tagged NO still fails the command after partial FETCH data, AND the
-/// `Either` response that arrived before it survives the failure. `* N EXISTS`
-/// is routed to the in-flight consumer as ambiguous data, and `ProtocolState`
-/// models none of EXISTS / EXPUNGE / VANISHED, so `reclassified_as_events` is
-/// the only way out. The solicited FETCH payload is deliberately NOT surrendered
+/// `Either` response that arrived before it is declined immediately. `* N EXISTS`
+/// must reach the driver before completion rather than wait for finalization.
+/// The solicited FETCH payload is deliberately NOT surrendered
 /// (see `FetchConsumer::finalize`): it is read-only query data the caller was
 /// never going to get, and re-emitting it would flood the event sink.
 #[test]
-fn fetch_consumer_propagates_terminal_no_and_surrenders_buffered_events() {
+fn fetch_consumer_declines_events_before_terminal_no() {
     let mut consumer = crate::connection::test_support::record_consumer(FetchConsumer::new());
     let ctx = default_ctx();
 
@@ -120,6 +119,7 @@ fn fetch_consumer_propagates_terminal_no_and_surrenders_buffered_events() {
         &ctx,
     );
 
+    assert_eq!(consumer.take_declined(), vec![UntaggedResponse::Exists(12)]);
     let finalized = Box::new(consumer).finalize(tagged_no(), &ctx);
     let err = match finalized.output {
         Err(err) => err,
@@ -130,9 +130,8 @@ fn fetch_consumer_propagates_terminal_no_and_surrenders_buffered_events() {
     );
     assert_eq!(
         finalized.reclassified_as_events,
-        vec![UntaggedResponse::Exists(12)],
-        "the ambiguous EXISTS must be surrendered exactly once, and the \
-         solicited FETCH payload must not join it"
+        Vec::new(),
+        "neither the declined EXISTS nor solicited FETCH is deferred"
     );
 }
 
@@ -157,6 +156,7 @@ async fn streaming_fetch_consumer_propagates_terminal_no_and_closes_channel() {
         &ctx,
     );
 
+    assert_eq!(consumer.take_declined(), vec![UntaggedResponse::Exists(12)]);
     let finalized = Box::new(consumer).finalize(tagged_no(), &ctx);
     let err = match finalized.output {
         Err(err) => err,
@@ -167,8 +167,8 @@ async fn streaming_fetch_consumer_propagates_terminal_no_and_closes_channel() {
     );
     assert_eq!(
         finalized.reclassified_as_events,
-        vec![UntaggedResponse::Exists(12)],
-        "a failed streaming FETCH must not swallow an EXISTS the server volunteered"
+        Vec::new(),
+        "the declined EXISTS must not be returned again at completion"
     );
 
     let first = rx.recv().await.expect("first FETCH should be delivered");
@@ -248,6 +248,10 @@ fn search_consumer_keeps_the_solicited_reply_when_uid_expansion_is_incomplete() 
     );
     consumer.on_response(UntaggedResponse::Expunge(7), NotifyFlags::default(), &ctx);
 
+    assert_eq!(
+        consumer.take_declined(),
+        vec![UntaggedResponse::Exists(1), UntaggedResponse::Expunge(7)]
+    );
     let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
     assert!(matches!(
         result.output,
@@ -260,8 +264,8 @@ fn search_consumer_keeps_the_solicited_reply_when_uid_expansion_is_incomplete() 
     ));
     assert_eq!(
         result.reclassified_as_events,
-        vec![UntaggedResponse::Exists(1), UntaggedResponse::Expunge(7)],
-        "only unsolicited responses may become events, in wire order"
+        Vec::new(),
+        "immediately declined events must not be deferred"
     );
 }
 
@@ -286,12 +290,13 @@ fn search_consumer_drops_the_surplus_esearch_on_success() {
         &ctx,
     );
 
+    assert_eq!(consumer.take_declined(), vec![UntaggedResponse::Exists(1)]);
     let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
     assert_eq!(result.output.unwrap().ids, vec![4]);
     assert_eq!(
         result.reclassified_as_events,
-        vec![UntaggedResponse::Exists(1)],
-        "only the unsolicited EXISTS may become an event"
+        Vec::new(),
+        "the declined EXISTS must not be returned again at completion"
     );
 }
 
@@ -695,4 +700,23 @@ fn enable_consumer_missing_enabled_returns_empty() {
             .is_empty()
     );
     assert!(result.reclassified_as_events.is_empty());
+}
+
+#[test]
+fn recorded_consumer_preserves_immediate_decline_and_defers_nothing() {
+    let mut consumer = crate::connection::test_support::record_consumer(FetchConsumer::new());
+    let ctx = default_ctx();
+    assert_eq!(
+        Consumer::on_response(
+            &mut consumer,
+            UntaggedResponse::Exists(12),
+            NotifyFlags::default(),
+            &ctx,
+        ),
+        Some(UntaggedResponse::Exists(12))
+    );
+    assert_eq!(consumer.take_declined(), vec![UntaggedResponse::Exists(12)]);
+    let finalized = Box::new(consumer).finalize(tagged_ok(), &ctx);
+    assert!(finalized.output.is_ok());
+    assert!(finalized.reclassified_as_events.is_empty());
 }

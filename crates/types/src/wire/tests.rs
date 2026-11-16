@@ -183,3 +183,42 @@ fn request_refusal_tags_are_versioned_and_roundtrip() {
         }
     }
 }
+
+/// A persisted row must not silently decode just its valid prefix.
+#[test]
+fn cursor_envelopes_reject_bytes_after_the_declared_payload() {
+    let checkpoints = [
+        crate::Checkpoint::Change(crate::ChangeCursor {
+            scope: CursorScope::Account,
+            server_state: crate::OpaqueChangeState {
+                protocol: crate::ProtocolKind::Jmap,
+                envelope_version: crate::PayloadVersion::new(1),
+                bytes: vec![7],
+            },
+            advanced_through: None,
+            envelope_version: crate::TraitEnvelopeVersion::new(cursor::ENGINE_VERSION),
+        }),
+        crate::Checkpoint::Backfill(crate::BackfillCheckpoint {
+            scope: CursorScope::Account,
+            partition: crate::InventoryPartition::Full.durable_key(),
+            progress_marker: None,
+            progress: crate::BackfillProgress {
+                items_done: 0,
+                items_estimated: None,
+            },
+            envelope_version: crate::TraitEnvelopeVersion::new(cursor::ENGINE_VERSION),
+        }),
+    ];
+    for checkpoint in checkpoints {
+        let encoded = cursor::encode_envelope(&checkpoint);
+        assert_eq!(cursor::decode_envelope(&encoded).unwrap(), checkpoint);
+        for suffix in [vec![0], encoded.clone()] {
+            let mut extended = encoded.clone();
+            extended.extend_from_slice(&suffix);
+            assert!(matches!(
+                cursor::decode_envelope(&extended),
+                Err(DecodeError::Malformed(_))
+            ));
+        }
+    }
+}

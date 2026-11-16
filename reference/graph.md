@@ -3300,3 +3300,8 @@ classified error. Primary and accessible shared mail continue. An Outlook user
 can inspect the failed grant without mistaking the missing share for an empty
 mailbox. Outlook service configuration refusals retain
 `OperatorOverrideReason::OutlookConfiguration` and support-only detail.
+
+Contact and event conditional deletes pass caller-version admission through
+`MutationConcurrency::gate_version` before reads or writes. The advertised
+atomic door and the native If-Match guard must both hold; users expect a
+versioned delete never to silently become an unconditional delete.

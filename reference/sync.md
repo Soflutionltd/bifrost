@@ -1596,8 +1596,9 @@ charge (`PendingCoverage::backfill_charge_holders`). A receiver that only
 watches should be an observer, which carries no such obligation.
 
 **The precise guarantee, which is narrower than "the slowest reader".** The
-bound follows the slowest live numbered reader among pages NOT YET
-ACKNOWLEDGED; an ACKNOWLEDGEMENT frees a page for every receiver. The reader
+bound charges each registered page until every eligible live numbered receiver
+has RECEIVED it; acknowledgement is not required to return capacity. Removing
+the registration also removes any remaining charge for every receiver. The reader
 set lives on the boundary entry, so every path that resolves the publication -
 `acknowledge_publication`, `acknowledge_checkpoint`, `retire_publication`, and
 the supersession fold in `register_in` - removes the record together with the
@@ -1626,8 +1627,9 @@ subscriber never held the page and can never re-charge it, and a departing
 receiver stops charging what it was holding (`PendingCoverage::receiver_departed`,
 called from the departure sweep under the delivery lock) so a slow reader that
 walks away does not park the producer for the life of the attachment. The
-producer therefore runs exactly as far ahead as the slowest consumer READS, and the
-consumer may acknowledge on any schedule it likes - including never, at the
+producer therefore follows the slowest eligible consumer's READS while the
+registration survives, subject to the removal caveat above. The consumer may
+acknowledge on any schedule it likes - including never, at the
 usual cost of never advancing its durable cursor. Read and acknowledged free
 different things: a read returns lane capacity, an acknowledgement retires the
 registration, its boundary waiter and its coverage claim. Acknowledging a page
@@ -2849,9 +2851,12 @@ the backfill operator-barrier writer query (admitted separately, so a large
 scope never holds one sync permit across its whole multi-partition walk),
 mutation attempts, the mutation READ-BACK guard (which runs after the attempt
 loop released the campaign's permit and would otherwise hydrate unbudgeted),
-and deferred inventory fusion. Admission for a change drive happens before
-`CursorRegistry::with_drive`, so a queued task never owns a scope lease, and
-the permit is released before recovery handoff and cadence sleeps.
+and deferred inventory fusion. A change drive enters
+`CursorRegistry::with_drive` before requesting admission: the scope lease owner
+may queue for budget, while the other producer waits for the lease without a
+scheduler permit. This keeps duplicate poll and push work from occupying scarce
+permits while unrelated scopes need to sync. The permit and lease are released
+before recovery handoff and cadence sleeps.
 
 `admit` returns `Error::Admission(AdmissionFailure::LaneFull { .. })` when its lane is at capacity - the incoming
 request is refused rather than displacing an older waiter. Repeating work paths
@@ -4125,6 +4130,19 @@ reason. The reason rides on the warning's free-form fields; the
 crosses accounts. `ThrottleScope::CurrentOperation` is a per-call hint and
 never enters the bucket.
 
+A 429 retried entirely inside `bifrost-net` does not reach this bucket: the
+engine records returned `AccountError` evidence, not individual HTTP responses.
+Protocol error observers can record the response in net's shared hold registry;
+requests using the matching `hold_gate` then encounter that hold before dispatch,
+including net-internal retries. Another work item declaring the same engine
+budget is not parked by the engine for an absorbed response. It encounters the
+hold only if its transport uses that shared net gate; work on other transports
+or gates gets no engine-wide protection from that response. A surfaced ordinary
+server throttle can populate the engine bucket, while a net `LocalHold` remains
+operation-only pacing to avoid recording net's deadline again. This boundary
+keeps successful transport retries transparent to the user; it is not a promise
+that every observed HTTP throttle pauses all work sharing an engine budget.
+
 Keys reach the work they hold two ways. A key LIFTED from a
 `ThrottleScope` (see below) is the account's own `Account` key or one of its
 `Mailbox` keys. A key DECLARED by `Account::throttle_keys` for
@@ -4185,6 +4203,10 @@ inherit a scope's adaptive poll cadence.
 Poll and push claim the registry drive lease before asking this gate for
 budget, then recheck the registry generation after admission and before the
 wire. They therefore retain no scheduler permit while waiting for that lease.
+The lease owner can wait for budget, account holds or scheduler overflow pacing;
+the competing producer waits behind it. This is deliberate serialization of
+interchangeable poll and push work, preserving permits for unrelated scopes
+rather than prioritizing a second drive of the same cursor.
 Backfill partitions, deferred inventory, mutation submissions and read-back,
 orphan teardown and operator repair use the same gate. Their reactions to a
 scope-local hold remain local: park the walk, requeue the scope, defer the hint

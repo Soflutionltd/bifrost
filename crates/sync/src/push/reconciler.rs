@@ -262,6 +262,12 @@ impl Reconciler {
             // that, a scope deleted while one of our drives was parked on a
             // wedged provider stream kept the scope's drive lease, and the
             // replacement incarnation waited on `claim_drive` forever.
+            // Claim the scope lease before scheduler admission. Poll and push are
+            // interchangeable producers for this cursor: queueing both for budget
+            // would spend scarce permits waiting for the same lease and delay
+            // unrelated scopes. Users expect one serialized drive per scope, with
+            // other scopes still able to sync. The lease owner may wait for budget;
+            // the other producer waits without a permit.
             let driven = tokio::select! {
                 () = self.shutdown.cancelled() => return Ok(()),
                 driven = self

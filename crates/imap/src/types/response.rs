@@ -779,6 +779,18 @@ impl<I> ThreadNode<I> {
     }
 }
 
+impl<I> Drop for ThreadNode<I> {
+    fn drop(&mut self) {
+        // A flat wire group can encode an arbitrarily deep reply chain.
+        // Detach descendants before dropping each node so teardown uses a
+        // heap worklist instead of one stack frame per message.
+        let mut pending = std::mem::take(&mut self.children);
+        while let Some(mut node) = pending.pop() {
+            pending.append(&mut node.children);
+        }
+    }
+}
+
 impl<I> Default for ThreadNode<I> {
     fn default() -> Self {
         Self::new(None, Vec::new())
@@ -786,22 +798,26 @@ impl<I> Default for ThreadNode<I> {
 }
 
 impl ThreadNode<u32> {
-    pub(crate) fn addressed<I>(self) -> ThreadNode<I> {
+    pub(crate) fn addressed<I>(mut self) -> ThreadNode<I> {
         // A single parenthesized THREAD group can encode a long linear
         // chain without exceeding the parser's nesting cap. Converting units
         // must not add a recursive walk that overflows on that valid input.
         let mut pending = vec![(
             self.id,
-            self.children.into_iter(),
+            std::mem::take(&mut self.children).into_iter(),
             Vec::<ThreadNode<I>>::new(),
         )];
         loop {
             let Some((id, mut remaining, converted)) = pending.pop() else {
                 unreachable!("the root returns when its frame completes");
             };
-            if let Some(child) = remaining.next() {
+            if let Some(mut child) = remaining.next() {
                 pending.push((id, remaining, converted));
-                pending.push((child.id, child.children.into_iter(), Vec::new()));
+                pending.push((
+                    child.id,
+                    std::mem::take(&mut child.children).into_iter(),
+                    Vec::new(),
+                ));
             } else {
                 let completed = ThreadNode::new(id, converted);
                 if let Some(parent) = pending.last_mut() {

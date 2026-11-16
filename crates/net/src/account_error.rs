@@ -804,6 +804,11 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
     }
 }
 
+// Server is the shared table's fallback category, not a claim that the status
+// is 5xx. Preserve unlisted 4xx status evidence too: users need the actual
+// refusal for diagnosis, and guessing malformed input or permission loss would
+// invent a recovery policy. Provider-specific primary classifications remain
+// separate from this context-free supporting cause.
 fn server_cause_from_status(code: u16, retry_hint: Option<RetryHint>) -> Option<Cause> {
     match Cause::from(classify_status(
         code,

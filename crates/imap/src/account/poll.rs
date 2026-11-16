@@ -71,10 +71,26 @@ impl std::error::Error for InvalidImapRef {}
 /// but differ on the wire stay distinct. [`ImapMessageRef::object_id`]
 /// mints the canonical spelling the account itself mints today. The
 /// `Account` methods still answer under the exact string submitted to them.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct ImapMessageRef {
     container: ContainerId,
     message: MessageRef,
+}
+
+// The container is a presentation cache. An enterprise user expects the same
+// message identity for INBOX in any case, as MailboxName equality specifies.
+impl PartialEq for ImapMessageRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.message == other.message
+    }
+}
+
+impl Eq for ImapMessageRef {}
+
+impl std::hash::Hash for ImapMessageRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.message, state);
+    }
 }
 
 impl ImapMessageRef {
@@ -568,6 +584,32 @@ mod tests {
             ImapMessageRef::new(&ContainerId("INBOX".into()), nz(7), nz(9)).unwrap(),
             canonical
         );
+    }
+
+    #[test]
+    fn ref_equality_and_hash_use_mailbox_identity() {
+        use std::collections::HashSet;
+
+        let inbox = ImapMessageRef::new(&ContainerId("INBOX".into()), nz(7), nz(9)).unwrap();
+        let lower = ImapMessageRef::parse(&ObjectId("imap2:5:inbox:7:9".into())).unwrap();
+        assert_ne!(inbox.container(), lower.container());
+        assert_eq!(inbox, lower);
+        let mut refs = HashSet::new();
+        refs.insert(inbox.clone());
+        assert!(refs.contains(&lower));
+        for (folder, epoch, uid) in [("INBOX/Sub", 7, 9), ("INBOX", 8, 9), ("INBOX", 7, 10)] {
+            let different =
+                ImapMessageRef::new(&ContainerId(folder.into()), nz(epoch), nz(uid)).unwrap();
+            assert_ne!(inbox, different);
+        }
+        let child = ImapMessageRef::new(&ContainerId("INBOX/Sub".into()), nz(7), nz(9)).unwrap();
+        let lower_child =
+            ImapMessageRef::new(&ContainerId("inbox/Sub".into()), nz(7), nz(9)).unwrap();
+        assert_ne!(child, lower_child);
+        let wire = MailboxName::from_wire("a".into(), b"&AGE-", false);
+        let wire_ref = ImapMessageRef::from_parts(&wire, nz(7), nz(9));
+        let text_ref = ImapMessageRef::new(&ContainerId("a".into()), nz(7), nz(9)).unwrap();
+        assert_ne!(wire_ref, text_ref);
     }
 
     #[test]

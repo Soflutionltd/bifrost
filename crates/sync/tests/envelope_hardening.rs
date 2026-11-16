@@ -145,14 +145,12 @@ fn every_truncation_of_a_backfill_envelope_fails_cleanly() {
 }
 
 #[test]
-fn trailing_garbage_after_payload_is_tolerated() {
-    // The decoder is length-prefixed; extra bytes past the declared
-    // payload are ignored rather than rejected. Pinned so a future
-    // strict-length change is a deliberate decision, not drift.
+fn trailing_garbage_after_payload_is_rejected() {
+    // The cursor envelope decoder must consume the payload exactly;
+    // extra bytes past the declared payload are refused.
     let mut bytes = change_envelope(CursorScope::Account);
     bytes.extend_from_slice(b"garbage");
-    let decoded = decode_envelope(&bytes).expect("trailing bytes ignored");
-    assert!(matches!(decoded, Checkpoint::Change(_)));
+    assert!(decode_envelope(&bytes).is_err());
 }
 
 #[test]

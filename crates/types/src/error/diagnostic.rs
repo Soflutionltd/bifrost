@@ -14,6 +14,7 @@ use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
 pub struct DiagnosticInfo {
     pub request_id: Option<TelemetryToken>,
     pub trace_id: Option<TelemetryToken>,
+    /// Observed response status for diagnostics; never a recovery input.
     pub status: Option<u16>,
     pub native_code: Option<TelemetryToken>,
     pub text: Vec<DiagnosticText>,

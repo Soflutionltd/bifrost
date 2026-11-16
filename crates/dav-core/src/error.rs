@@ -991,19 +991,19 @@ mod tests {
 /// Keep generic transport throttles on the same account budget as DAV statuses.
 pub(crate) fn net_account_error(
     error: bifrost_net::Error,
-    ctx: bifrost_net::NetErrorContext,
+    protocol: DavProtocol,
+    operation: AccountOperation,
 ) -> AccountError {
-    let policy = http_error_policy_for_protocol(ctx.protocol);
-    bifrost_net::into_account_error_with_throttle_scope(error, ctx, policy)
-}
-
-fn http_error_policy_for_protocol(protocol: Protocol) -> bifrost_net::HttpErrorPolicy {
-    let dialect = match protocol {
-        Protocol::CalDav => DavProtocol::CalDav,
-        Protocol::CardDav => DavProtocol::CardDav,
-        _ => unreachable!("DAV transport must name its dialect"),
+    // Keep the closed dialect through classification: accepting the open
+    // account protocol enum here would make a non-DAV caller a panic path.
+    let policy = http_error_policy(protocol.resource());
+    let ctx = bifrost_net::NetErrorContext {
+        provider: None,
+        protocol: protocol.protocol(),
+        operation,
+        scope: None,
     };
-    http_error_policy(dialect.resource())
+    bifrost_net::into_account_error_with_throttle_scope(error, ctx, policy)
 }
 
 fn http_error_policy(resource: ResourceKind) -> bifrost_net::HttpErrorPolicy {
@@ -1048,12 +1048,8 @@ mod net_policy_tests {
                         retry_after_history: vec![],
                         stop_reason: bifrost_net::RetryStopReason::AttemptBudget,
                     },
-                    bifrost_net::NetErrorContext {
-                        provider: None,
-                        protocol: protocol.protocol(),
-                        operation: AccountOperation::Discover,
-                        scope: None,
-                    },
+                    protocol,
+                    AccountOperation::Discover,
                 );
                 assert_eq!(
                     response.kind(),
@@ -1087,12 +1083,8 @@ mod net_policy_tests {
                     headers: reqwest::header::HeaderMap::new(),
                     body: bytes::Bytes::new(),
                 },
-                bifrost_net::NetErrorContext {
-                    provider: None,
-                    protocol: protocol.protocol(),
-                    operation: AccountOperation::Discover,
-                    scope: None,
-                },
+                protocol,
+                AccountOperation::Discover,
             );
             assert_eq!(
                 error.telemetry_fields().throttle_scope,

@@ -1792,92 +1792,41 @@ mod tests {
     /// discovered over HTTPS, so it is credential-bearing.
     #[tokio::test]
     async fn discovered_cross_origin_https_home_receives_credentials() {
-        let script = discovery_script("https://books.example.test/homes/ada/");
-        let mut client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        let home = client
-            .discover_addressbook_home()
-            .await
-            .expect("cross-origin home is discovered")
-            .home;
-        assert_eq!(home, "https://books.example.test/homes/ada/");
-        client.admit_discovered_urls(std::iter::once(home.clone()));
-        client
-            .list_addressbooks(&home)
-            .await
-            .expect("cross-origin home is credential-bearing");
-
-        let requests = transcripts(&script);
-        assert_eq!(requests.len(), 3);
-        assert_eq!(requests[2].url, "https://books.example.test/homes/ada/");
-        assert_eq!(
-            requests[2]
-                .headers
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer token")
-        );
+        bifrost_dav_core::test_support::discovery::discovered_home(
+            bifrost_dav_core::DavProtocol::CardDav,
+            false,
+            |net, expected_home| async move {
+                let mut client = CardDavClient::with_account_net("https://dav.example.test", net);
+                let home = client.discover_addressbook_home().await?.home;
+                assert_eq!(home, expected_home);
+                client.admit_discovered_urls(std::iter::once(home.clone()));
+                client.list_addressbooks(&home).await?;
+                Ok(home)
+            },
+        )
+        .await;
     }
 
     /// The reviewer-found hole this pins: a cross-origin hop followed inside
     /// reqwest arrives with `Authorization` stripped and cannot get it back.
     /// The manual re-dispatch must therefore carry fresh credentials to the
     /// admitted target - the assertion that bites is the auth header on the
-    /// SECOND transcript entry, and the href assertion additionally keeps
-    /// round 3's guarantee that resolution uses the post-redirect URI.
+    /// second transcript entry in the shared scenario. Its href assertion
+    /// also keeps resolution tied to the post-redirect URI.
     #[tokio::test]
     async fn cross_origin_redirect_is_redispatched_with_credentials() {
-        let mut redirect_headers = HeaderMap::new();
-        redirect_headers.insert(
-            reqwest::header::LOCATION,
-            HeaderValue::from_static("https://books.example.test/dav/homes/ada/"),
-        );
-        let script = dav_script([
-            DavResponse {
-                status: StatusCode::MOVED_PERMANENTLY,
-                headers: redirect_headers,
-                body: String::new(),
-                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                    .expect("test DAV URL"),
+        bifrost_dav_core::test_support::discovery::redirected_home(
+            bifrost_dav_core::DavProtocol::CardDav,
+            |net, home| async move {
+                let mut client = CardDavClient::with_account_net("https://dav.example.test", net);
+                client.admit_discovered_urls(std::iter::once(home.to_string()));
+                let collections = client
+                    .list_addressbooks("https://dav.example.test/collections/ada/")
+                    .await?;
+                Ok(collections[0].href.clone())
             },
-            DavResponse {
-                status: StatusCode::MULTI_STATUS,
-                headers: HeaderMap::new(),
-                body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>team/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:addressbook/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
-                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                    .expect("test DAV URL"),
-            },
-        ]);
-        let mut client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-        client.admit_discovered_urls(std::iter::once(
-            "https://books.example.test/homes/ada/".to_string(),
-        ));
-
-        let books = client
-            .list_addressbooks("https://dav.example.test/books/ada/")
-            .await
-            .expect("cross-origin redirect is followed with credentials");
-
-        let requests = transcripts(&script);
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].url, "https://books.example.test/dav/homes/ada/");
-        assert_eq!(
-            requests[1].method,
-            Method::from_bytes(b"PROPFIND").expect("PROPFIND method")
-        );
-        assert_eq!(
-            requests[1]
-                .headers
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer token")
-        );
-        assert_eq!(
-            books[0].href,
-            "https://books.example.test/dav/homes/ada/team/"
-        );
+        )
+        .await;
     }
 
     /// RFC 4918 resolves a relative href against the EFFECTIVE request URI.
@@ -1927,31 +1876,19 @@ mod tests {
     /// plaintext origin, credential-bearing or otherwise.
     #[tokio::test]
     async fn discovered_plaintext_home_never_receives_credentials() {
-        let script = discovery_script("http://books.example.test/homes/ada/");
-        let mut client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        let home = client
-            .discover_addressbook_home()
-            .await
-            .expect("home href is still reported")
-            .home;
-        assert_eq!(home, "http://books.example.test/homes/ada/");
-        client.admit_discovered_urls(std::iter::once(home.clone()));
-        client
-            .list_addressbooks(&home)
-            .await
-            .expect_err("a downgraded discovered origin is refused");
-
-        let requests = transcripts(&script);
-        assert_eq!(requests.len(), 2);
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.url.starts_with("https://dav.example.test/")),
-            "no request reached the plaintext origin: {:?}",
-            requests.iter().map(|r| &r.url).collect::<Vec<_>>()
-        );
+        bifrost_dav_core::test_support::discovery::discovered_home(
+            bifrost_dav_core::DavProtocol::CardDav,
+            true,
+            |net, expected_home| async move {
+                let mut client = CardDavClient::with_account_net("https://dav.example.test", net);
+                let home = client.discover_addressbook_home().await?.home;
+                assert_eq!(home, expected_home);
+                client.admit_discovered_urls(std::iter::once(home.clone()));
+                client.list_addressbooks(&home).await?;
+                Ok(home)
+            },
+        )
+        .await;
     }
 
     /// A cross-address-book `contact_update` MOVES the resource, and a restated

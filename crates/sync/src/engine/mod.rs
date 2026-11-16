@@ -735,7 +735,7 @@ impl SyncEngine {
             throttles: &slot.throttles,
             account_id,
             shutdown: &slot.shutdown,
-            boundary: &slot.boundary,
+            boundary: slot.boundary.subscribe(),
             // Caller-driven: wait out a pause or checkpoint barrier.
             wait_for_run: true,
         };

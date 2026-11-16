@@ -626,11 +626,13 @@ fn search_page_cursor_error(op: AccountOperation, detail: impl Into<String>) -> 
 }
 
 fn flatten_thread(node: &ThreadNode, out: &mut Vec<u32>) {
-    if let Some(uid) = node.id {
-        out.push(uid);
-    }
-    for child in &node.children {
-        flatten_thread(child, out);
+    // Reply depth is not bounded by the wire grammar's parenthesis cap.
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if let Some(uid) = node.id {
+            out.push(uid);
+        }
+        pending.extend(node.children.iter().rev());
     }
 }
 

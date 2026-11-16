@@ -225,6 +225,10 @@ fn parse_envelope(bytes: &[u8]) -> Result<CursorEnvelope, Error> {
             "cursor envelope: truncated payload".into(),
         ));
     }
+    // One stored row is exactly one envelope; accepting a prefix hides corruption.
+    if bytes.len() != payload_end {
+        return Err(Error::Malformed("cursor envelope: trailing bytes".into()));
+    }
     Ok(CursorEnvelope {
         version,
         kind,

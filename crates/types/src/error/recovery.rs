@@ -847,7 +847,10 @@ fn derive_sync_state(chain: &CauseChain) -> RecoveryClass {
                 reason: reason.clone(),
             })
         }
-        _ => unreachable!("sync-state kinds are derived from primary state causes"),
+        // The builder derives kind from this primary, so this is defensive.
+        // A future construction path must fail closed rather than crash or
+        // restart an unrelated cursor. Users expect a reportable local failure.
+        _ => RecoveryClass::InternalFailure,
     }
 }
 
@@ -1208,6 +1211,14 @@ mod tests {
         );
 
         assert!(recovery.is_retryable());
+    }
+
+    #[test]
+    fn malformed_sync_state_evidence_fails_closed() {
+        assert_eq!(
+            derive_sync_state(&transport_chain(TransmissionState::Unsent)),
+            RecoveryClass::InternalFailure
+        );
     }
 
     /// `Transport + Acknowledged` is a producer-bug shape. In debug

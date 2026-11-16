@@ -2195,3 +2195,8 @@ results to reload that caller-owned walk without resetting account sync state.
 Cross-calendar search retains its calendar-id/provider-token position inside
 the same envelope; disappearance of its calendar remains a state-refresh
 conflict.
+
+HTTP resource fallback uses only the operation resource hint or typed scope.
+Scopeless filter and directory errors do not invent a Message subject on 403
+or 404: users expect permission and absence reports to identify only known
+resources. A 404 without either hint retains the generic HTTP status error.

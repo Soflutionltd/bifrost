@@ -58,17 +58,19 @@ enum Exchange {
     Scram(ScramExchange),
 }
 
+// Stage and exchange travel through a shared adapter interface. A mismatch is
+// an internal error, not a reason to unwind a caller sending enterprise mail.
 impl Authentication {
-    fn scram(&mut self) -> &mut ScramExchange {
+    fn scram(&mut self) -> Result<&mut ScramExchange, Error> {
         match &mut self.exchange {
-            Exchange::Scram(exchange) => exchange,
-            _ => unreachable!("SCRAM stage owns a SCRAM exchange"),
+            Exchange::Scram(exchange) => Ok(exchange),
+            _ => Err(error::internal("SCRAM stage has no SCRAM exchange")),
         }
     }
-    fn sasl(&mut self) -> &mut bifrost_sasl::SaslClient {
+    fn sasl(&mut self) -> Result<&mut bifrost_sasl::SaslClient, Error> {
         match &mut self.exchange {
-            Exchange::Sasl(client) => client,
-            _ => unreachable!("SASL stage owns a resolved client"),
+            Exchange::Sasl(client) => Ok(client),
+            _ => Err(error::internal("SASL stage has no resolved client")),
         }
     }
 }
@@ -173,7 +175,9 @@ impl Session {
         let info = self.info.as_ref().expect("server info lives until finish");
         if let Some(mechanism) = oauth_mechanism(&mechanisms, info, &credentials) {
             let Credentials::OAuth2 { identity, .. } = &credentials else {
-                unreachable!("OAuth selection requires OAuth credentials")
+                return Err(error::internal(
+                    "OAuth selection requires OAuth credentials",
+                ));
             };
             self.auth = Some(Authentication {
                 mechanism,
@@ -230,8 +234,8 @@ impl Session {
         let exchange = self
             .auth
             .as_mut()
-            .map(Authentication::scram)
-            .expect("SCRAM exchange");
+            .ok_or_else(|| error::internal("missing SCRAM authentication"))?
+            .scram()?;
         match exchange.step(&server_final)? {
             ScramStep::Complete => Ok(()),
             ScramStep::Reply(_) => Err(error::parse("unexpected SCRAM reply after server-final")),
@@ -270,11 +274,14 @@ impl Session {
             }
             Stage::Token => {
                 let OpOutcome::Token(token) = outcome else {
-                    unreachable!("token effect returns a token")
+                    return Err(error::internal("token effect did not return a token"));
                 };
-                let auth = self.auth.as_mut().expect("selected auth");
+                let auth = self
+                    .auth
+                    .as_mut()
+                    .ok_or_else(|| error::internal("missing selected authentication"))?;
                 let Exchange::ResolvingToken { identity } = &auth.exchange else {
-                    unreachable!("token stage owns a pending OAuth identity")
+                    return Err(error::internal("token stage has no pending OAuth identity"));
                 };
                 let mut client = auth.mechanism.oauth_client(identity, token.as_str())?;
                 let command = Auth::new(auth.mechanism, &mut client)?;
@@ -284,7 +291,7 @@ impl Session {
             Stage::Upgraded => self.send_hello(),
             stage => {
                 let OpOutcome::Reply(response) = outcome else {
-                    unreachable!("read effect returns a reply")
+                    return Err(error::internal("read effect did not return a reply"));
                 };
                 // AUTH allows 334 challenges; session completion requires the
                 // actual terminal code so an extra challenge cannot become Ready.
@@ -313,9 +320,12 @@ impl Session {
                         Ok(Step::Run(Op::UpgradeTls(tls)))
                     }
                     Stage::Sasl => {
-                        let auth = self.auth.as_mut().expect("selected auth");
+                        let auth = self
+                            .auth
+                            .as_mut()
+                            .ok_or_else(|| error::internal("missing selected authentication"))?;
                         if response.has_code(334) {
-                            let command = Auth::new_from_response(auth.sasl(), &response)?;
+                            let command = Auth::new_from_response(auth.sasl()?, &response)?;
                             self.write_then(command, Stage::Sasl)
                         } else {
                             if !response.has_code(235) {
@@ -323,7 +333,7 @@ impl Session {
                             }
                             // An enterprise user needs a completed mechanism,
                             // even when the server claims authentication early.
-                            auth.sasl().finish()?;
+                            auth.sasl()?.finish()?;
                             self.response = Some(response);
                             self.send_hello()
                         }
@@ -335,8 +345,8 @@ impl Session {
                         let first: Secret = self
                             .auth
                             .as_mut()
-                            .map(Authentication::scram)
-                            .expect("SCRAM exchange")
+                            .ok_or_else(|| error::internal("missing SCRAM authentication"))?
+                            .scram()?
                             .client_first();
                         self.continuation(first.as_str(), Stage::ScramChallenge)
                     }
@@ -345,8 +355,8 @@ impl Session {
                         match self
                             .auth
                             .as_mut()
-                            .map(Authentication::scram)
-                            .expect("SCRAM exchange")
+                            .ok_or_else(|| error::internal("missing SCRAM authentication"))?
+                            .scram()?
                             .step(&first)?
                         {
                             ScramStep::Reply(final_line) => {
@@ -376,7 +386,7 @@ impl Session {
                         self.response = Some(response);
                         self.send_hello()
                     }
-                    _ => unreachable!("non-reply stages handled above"),
+                    _ => Err(error::internal("non-reply stage reached reply handling")),
                 }
             }
         }
@@ -414,10 +424,11 @@ impl ProtocolMachine for Session {
         // they have not changed the stream and must not close a usable connection.
         // Token resolution and credential preparation still precede AUTH.
         // A local refusal here leaves the connection usable for repair/retry.
+        // Internal mismatches instead abort: stream synchronization is unproven.
         let local_start = matches!(stage, Stage::Start(_) | Stage::Token);
         match self.advance(stage, outcome) {
             Ok(step) => step,
-            Err(error) if local_start => {
+            Err(error) if local_start && !error.is_internal() => {
                 let phase = if matches!(phase, SmtpCommandPhase::Auth { .. }) {
                     self.phase()
                 } else {

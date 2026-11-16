@@ -24,7 +24,7 @@ pub(crate) fn backfill_complete_recorded(checkpoint: Option<&BackfillCheckpoint>
         // Larger legacy markers prove a nonempty walk and remain valid. An
         // enterprise mail user expects a possibly skipped empty folder to be
         // checked once; new empty inventories earn the versioned marker.
-        crate::backfill::partitioner::BackfillKey::decode(&ck.partition)
+        crate::backfill::marker::BackfillKey::decode(&ck.partition)
             .proves_completion(ck.progress.items_done)
     })
 }
