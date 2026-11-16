@@ -287,21 +287,20 @@ mod tests {
     #[test]
     fn all_failed_scopes_preserve_the_first_recovery_and_every_cause() {
         use bifrost_types::{
-            AccountErrorBuilder, AttemptCause, BatchFailure, BatchItemId, Cause, ServerCause,
-            ServerErrorKind, TransmissionState, TransportCause, TransportErrorKind, TransportKind,
+            AccountErrorBuilder, AttemptCause, BatchFailure, BatchItemId, Cause, PrimaryCause,
+            ServerCause, TransmissionState, TransportCause, TransportErrorKind,
         };
 
-        let first = AccountErrorBuilder::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-        )
+        let first = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+            TransportErrorKind::Network,
+            None,
+        )))
         .idempotency_override(false)
         .try_build()
         .expect("valid transport failure");
-        let sibling = AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        )
+        let sibling = AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::Unavailable {
+            retry_hint: None,
+        }))
         .push_cause(Cause::Attempt(AttemptCause::new(
             TransmissionState::Acknowledged,
         )))

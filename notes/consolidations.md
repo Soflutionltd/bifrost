@@ -26,53 +26,17 @@ this file's.
 
 **Reported by:** types (LATENT), graph.
 
-The graph hunter found holes in the pairwise check: `access_kind_matches_cause`
-matches `MailboxUnavailable { .. }` against `MailboxUnavailable { .. }`, so a
-`Transient` kind paired with a `Permanent` cause builds cleanly, and
-`server_kind_matches_cause` accepts any status when one side is `None`. Graph's
-`classify`, `classify_by_status`, `soap_fault_to_account_error` and
-`autodiscover_error` write about forty literal pairs such as
-`(AccountErrorKind::NotFound(r), Cause::Request(RequestCause::NotFound { what: r,
-.. }))`, and Graph adds a third parallel copy - its classifiers' throttle bool
-(BUG-083). Its owner is the same: `AccountErrorBuilder::from_cause(cause)`
-deriving the kind, with a separate constructor taking the protocol sub-kind for
-the `Wire` case.
+Landed: `AccountErrorBuilder::new(PrimaryCause)` derives the kind, throttle
+data lives in the rate/quota causes, scope-directed state causes carry their
+`CursorScope`, `Cause::Protocol { kind, wire }` carries the protocol sub-kind,
+and `TransportKind` folded into `TransportErrorKind`. Residue:
 
-Every producer answers it twice, `AccountErrorBuilder::new(kind, cause)`, and
-`recovery::kind_matches_cause` rejects disagreement at runtime. The pairs are
-nearly 1:1: `AuthErrorKind`/`AuthCause`, `AccessErrorKind`/`AccessCause`,
-`SyncStateErrorKind`/`StateCause`, `ServerErrorKind`/`ServerCause`,
-`InternalErrorKind`/`InternalCause::kind`, and `TransportErrorKind`/
-`TransportKind`, which are the same three variants under two names. Exceptions
-are small: `Request(Malformed)` accepts `Malformed | InvalidArgument`;
-`Protocol(_)` accepts any `Wire(_)` (the protocol kind is not in the cause at
-all); `ServerErrorKind::Error`'s status may be absent on either side.
-
-Builder-time invariants are further runtime checks of shapes a type could make
-unconstructable: `throttle_scope`/`throttle_budget` only on `RateLimited |
-QuotaExhausted` (they belong inside those `ServerCause` variants);
-`CursorInvalid` requires an `ErrorScope::Cursor` (it belongs in
-`StateCause::CursorInvalid { scope }`). The sibling scope-requiring kinds
-disagree on the rule: `CursorInvalid` without a cursor scope is rejected, while
-`ScopeRevoked` and `ScopeCapabilityLost` without one silently become
-`RestartAccount` (`derive_sync_state`).
-
-Related: HTTP/SMTP status lives in three places - `ServerErrorKind::Error {
-status }`, `ServerCause::Error { status }`, and `DiagnosticInfo::status`.
-`recovery::derive_server` reads the kind's, falling back to the cause chain; the
-diagnostic copy is never consulted; `kind_matches_cause` accepts `None` on
-either side. One status, owned by the cause.
-
-Owner: make the cause primary. `AccountErrorBuilder::new(cause)` with
-`Cause::kind()` derived; move `ProtocolErrorKind` into `WireCause` (or a
-`Cause::Protocol { kind, wire }`); carry throttle and scope data in the causes
-that need them. Deletes `kind_matches_cause`, `KindCauseMismatch`,
-`ThrottleScopeNotApplicable`, `ThrottleBudgetNotApplicable`,
-`CursorInvalidWithoutScope` and most of roughly 350 `try_build().expect(..)`
-sites. The hunter calls this a big rewrite of every error translation boundary
-and the right one. Changing the builder signature is a shape change; removing
-`TransportKind` or the build-error variants removes published items and needs
-the owner.
+- `try_build` and its `.expect(..)` sites remain. It still validates
+  transmission evidence (`TransportAcknowledged`), unsupported reasons on
+  non-Unsupported kinds, and partial-commit attachment, none of which the
+  primary cause type makes unconstructable yet.
+- `DiagnosticInfo::status` is still a free setter for every family except
+  `ServerCause::Error`, whose status `try_build` projects over it.
 
 ## CON-003 - Which protocol is this? (six vocabularies, mapped outside their crate)
 

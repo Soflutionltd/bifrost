@@ -171,18 +171,16 @@ pub enum EngineNotice {
 mod tests {
     use super::*;
     use crate::{
-        AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope, FolderId,
-        ServerCause, ServerErrorKind,
+        AccountErrorBuilder, AccountOperation, CursorScope, FolderId, PrimaryCause, ServerCause,
     };
 
     #[test]
     fn skipped_discovery_retains_classification_and_explicit_scope() {
         let failure_scope = ErrorScope::Cursor(CursorScope::Folder(FolderId("calendars".into())));
         let scope = ErrorScope::Account;
-        let error = AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        )
+        let error = AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::Unavailable {
+            retry_hint: None,
+        }))
         .scope(failure_scope)
         .operation(AccountOperation::DiscoverCursorScopes)
         .try_build()

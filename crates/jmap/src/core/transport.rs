@@ -61,7 +61,7 @@ impl TransportError {
     // Preserve this custom-transport door until the account error boundary
     // supports an explicit unknown-provenance failure; inventing net evidence
     // here would mislead retry and partial-commit decisions. The shared
-    // TransportErrorKind and TransportKind vocabularies have only Network,
+    // TransportErrorKind and TransportErrorKind vocabularies have only Network,
     // Timeout and Tls; none represents unknown provenance. Replacing this
     // fallback requires that shared owner, not message parsing in JMAP.
     pub(crate) fn new(message: impl Into<String>) -> Self {

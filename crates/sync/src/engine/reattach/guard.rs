@@ -394,13 +394,13 @@ mod tests {
             .await
             .expect("attach");
         let slot = Arc::clone(engine.accounts.get(&id).expect("slot").value());
-        let error = bifrost_types::AccountErrorBuilder::new(
-            bifrost_types::AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),
-            bifrost_types::Cause::Server(bifrost_types::ServerCause::RateLimited {
+        let error = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Server(
+            bifrost_types::ServerCause::RateLimited {
+                throttle: Default::default(),
                 retry_hint: Some(bifrost_types::RetryHint::After(Duration::from_secs(37))),
-            }),
-        )
-        .throttle_scope(bifrost_types::ThrottleScope::Account)
+            },
+        ))
+        .with_throttle(|throttle| throttle.scope = Some(bifrost_types::ThrottleScope::Account))
         .try_build()
         .expect("throttle");
         let mut replacement = StubAccount::new(vec![]);

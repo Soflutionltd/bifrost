@@ -225,12 +225,14 @@ impl<D: Dialect> DavCollectionAccount<D> {
         if let CursorScope::Folder(folder) | CursorScope::FolderType { folder, .. } = &cursor.scope
             && !same_dav_url(&folder.0, &decoded.collection_url)
         {
-            return Err(scoped(CursorDecodeFault::ScopeMismatch)
-                .text(DiagnosticText::support_only(
-                    "cursor collection does not match its folder scope",
-                ))
-                .try_build()
-                .expect("valid cursor scope fault"));
+            return Err(scoped(CursorDecodeFault::ScopeMismatch {
+                scope: cursor.scope.clone(),
+            })
+            .text(DiagnosticText::support_only(
+                "cursor collection does not match its folder scope",
+            ))
+            .try_build()
+            .expect("valid cursor scope fault"));
         }
         Ok(CollectionSnapshot {
             collection_url: decoded.collection_url,
@@ -378,10 +380,9 @@ impl<D: Dialect> DavCollectionAccount<D> {
         {
             return error;
         }
-        let mut builder = AccountErrorBuilder::new(
-            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
-            Cause::State(StateCause::ScopeRevoked),
-        )
+        let mut builder = AccountErrorBuilder::new(PrimaryCause::State(StateCause::ScopeRevoked {
+            scope: scope.clone(),
+        }))
         .protocol(D::DAV.protocol())
         .scope(ErrorScope::Cursor(scope.clone()));
         if let Some(operation) = error.operation() {

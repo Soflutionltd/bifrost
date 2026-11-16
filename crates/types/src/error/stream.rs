@@ -101,8 +101,8 @@ pub enum MutationEffect {
 mod tests {
     use super::*;
     use crate::error::{
-        AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause, Cause,
-        ProtocolErrorKind, ServerCause, ServerErrorKind, TransmissionState,
+        AccountErrorBuilder, AccountOperation, AttemptCause, Cause, PrimaryCause,
+        ProtocolErrorKind, ServerCause, TransmissionState,
     };
 
     #[test]
@@ -112,10 +112,9 @@ mod tests {
             (AttemptCause::new(TransmissionState::Acknowledged), false),
             (AttemptCause::new(TransmissionState::InFlight), true),
         ] {
-            let error = AccountErrorBuilder::new(
-                AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-            )
+            let error = AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::Unavailable {
+                retry_hint: None,
+            }))
             .operation(AccountOperation::UpdateFlags)
             .push_cause(Cause::Attempt(attempt))
             .try_build()
@@ -134,15 +133,15 @@ mod tests {
             assert_eq!(matches!(outcome, ItemOutcome::Uncertain(_)), uncertain);
         }
 
-        let error = AccountErrorBuilder::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-            Cause::Wire(crate::error::WireCause::MalformedResponse {
+        let error = AccountErrorBuilder::new(PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::ParseFailed,
+            wire: crate::error::WireCause::MalformedResponse {
                 protocol: crate::error::Protocol::Graph,
                 detail: Some(crate::error::DiagnosticText::support_only(
                     "unreadable success",
                 )),
-            }),
-        )
+            },
+        })
         .push_cause(Cause::Attempt(AttemptCause::unreadable_success()))
         .try_build()
         .expect("valid unreadable success");

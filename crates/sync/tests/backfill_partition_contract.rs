@@ -17,22 +17,19 @@ use bifrost_sync::Error;
 use bifrost_sync::backfill::{BackfillRunner, LiveSupersedes};
 use bifrost_sync::delivery::{ChangeDelivery, PagePublisher};
 use bifrost_types::{
-    Account, AccountErrorBuilder, AccountErrorKind, Cause, Checkpoint, CoverageDomain, CursorScope,
+    Account, AccountErrorBuilder, AccountErrorKind, Checkpoint, CoverageDomain, CursorScope,
     DiagnosticText, InternalErrorKind, InventoryBatch, InventoryCompletion,
     InventoryCoverageReport, InventoryEvent, InventoryObligation, InventoryPartition,
-    ObligationKey, PageBoundary, PageCheckpoint, PartitionEnd, RegionRecovery, RequestCause,
-    RequestErrorKind,
+    ObligationKey, PageBoundary, PageCheckpoint, PartitionEnd, PrimaryCause, RegionRecovery,
+    RequestCause,
 };
 
 use common::{StubAccount, cursor_for};
 
 fn barrier(scope: &CursorScope) -> InventoryCoverageReport {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only("unidentifiable value"),
-        }),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only("unidentifiable value"),
+    }))
     .try_build()
     .expect("valid account error classification");
     InventoryCoverageReport::degraded(

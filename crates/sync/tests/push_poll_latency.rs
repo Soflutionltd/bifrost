@@ -17,9 +17,9 @@ use std::time::Duration;
 
 use bifrost_sync::{EngineConfig, SyncEngine};
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountId, Batch, Cause,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountId, Batch,
     Checkpoint, CursorScope, ErrorScope, HintPayload, InvalidationHint, ObjectType, PageBoundary,
-    PushSource, StateCause, SyncEvent, SyncStateErrorKind, WatchEvent,
+    PrimaryCause, PushSource, StateCause, SyncEvent, WatchEvent,
 };
 
 /// A long cadence: any drive observed after attach's first pass came from the
@@ -45,10 +45,9 @@ fn unknown_hint() -> WatchEvent {
 /// `Engine(RestartScope(scope))` - a SCOPE-BOUND directive, which is the half
 /// of the recovery space that must not end a multi-scope hint sweep.
 fn scope_bound_restart(scope: &CursorScope) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-        Cause::State(StateCause::CursorInvalid),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::CursorInvalid {
+        scope: scope.clone(),
+    }))
     .scope(ErrorScope::Cursor(scope.clone()))
     .operation(bifrost_types::AccountOperation::SyncChanges)
     .try_build()

@@ -1022,13 +1022,10 @@ fn patch_error(operation: AccountOperation, error: PatchError) -> AccountError {
             "CalDAV event reached the patch writer without its source iCalendar body"
         }
     };
-    AccountErrorBuilder::new(
-        AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-        Cause::Internal(InternalCause::new(
-            InternalErrorKind::InvariantViolated,
-            Some(DiagnosticText::support_only(detail)),
-        )),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Internal(InternalCause::new(
+        InternalErrorKind::InvariantViolated,
+        Some(DiagnosticText::support_only(detail)),
+    )))
     .protocol(Protocol::CalDav)
     .operation(operation)
     .try_build()
@@ -3910,14 +3907,12 @@ mod tests {
 #[cfg(test)]
 mod partial_commit_tests {
     use super::*;
-    use bifrost_types::{ReconcileAction, RecoveryClass, RetryHint, ServerCause, ServerErrorKind};
+    use bifrost_types::{ReconcileAction, RecoveryClass, RetryHint, ServerCause};
     fn throttled() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited {
-                retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(37))),
-            }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(37))),
+        }))
         .try_build()
         .unwrap()
     }

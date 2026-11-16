@@ -14,17 +14,16 @@ use tokio::time::Instant;
 
 use bifrost_sync::ThrottleBucket;
 use bifrost_types::{
-    AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, AttemptCause, AuthCause,
-    AuthErrorKind, Cause, EngineDirective, FolderId, RecoveryClass, ResourceKind, StateCause,
-    SyncStateErrorKind, ThrottleKey, ThrottleScope, TransmissionState, TransportCause,
-    TransportErrorKind, TransportKind,
+    AccountErrorBuilder, AccountId, AccountOperation, AttemptCause, AuthCause, Cause,
+    EngineDirective, FolderId, PrimaryCause, RecoveryClass, ResourceKind, StateCause, ThrottleKey,
+    ThrottleScope, TransmissionState, TransportCause, TransportErrorKind,
 };
 
 fn retry_error() -> bifrost_types::AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+        TransportErrorKind::Network,
+        None,
+    )))
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(AccountOperation::SyncChanges)
     .try_build()
@@ -32,10 +31,10 @@ fn retry_error() -> bifrost_types::AccountError {
 }
 
 fn reconcile_error() -> bifrost_types::AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+        TransportErrorKind::Network,
+        None,
+    )))
     .operation(AccountOperation::Send)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::InFlight,
@@ -45,23 +44,17 @@ fn reconcile_error() -> bifrost_types::AccountError {
 }
 
 fn schema_incompatible_error() -> bifrost_types::AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-        Cause::State(StateCause::SchemaIncompatible),
-    )
-    .operation(AccountOperation::SyncChanges)
-    .try_build()
-    .expect("valid")
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::SchemaIncompatible))
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid")
 }
 
 fn terminal_auth_lost() -> bifrost_types::AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Authentication(AuthErrorKind::Expired),
-        Cause::Auth(AuthCause::Expired),
-    )
-    .operation(AccountOperation::SyncChanges)
-    .try_build()
-    .expect("valid")
+    AccountErrorBuilder::new(PrimaryCause::Auth(AuthCause::Expired))
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid")
 }
 
 /// One assertion per RecoveryClass arm exercised through the

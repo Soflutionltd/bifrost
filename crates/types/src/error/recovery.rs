@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::error::ServerCause;
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
@@ -6,10 +8,7 @@ use crate::cursor::CursorScope;
 use crate::ids::{AccountId, FolderId, PrincipalId};
 
 use super::account_error::AccountError;
-use super::cause::{
-    AccessCause, AuthCause, Cause, CauseChain, RequestCause, ServerCause, StateCause,
-    TransmissionState, WireCause,
-};
+use super::cause::{AccessCause, Cause, CauseChain, StateCause, TransmissionState, WireCause};
 use super::kind::{
     AccessErrorKind, AccountErrorKind, AuthErrorKind, MailboxUnavailableKind, ProtocolErrorKind,
     RequestErrorKind, ResourceKind, ServerErrorKind, SyncStateErrorKind,
@@ -527,7 +526,7 @@ impl From<&str> for OperatorOverrideReason {
 // scan this entire chain because its diagnostic suffix has been excluded.
 pub(crate) fn derive(
     kind: &AccountErrorKind,
-    scope: Option<&ErrorScope>,
+    _scope: Option<&ErrorScope>,
     operation: Option<AccountOperation>,
     chain: &CauseChain,
     throttle_scope: Option<ThrottleScope>,
@@ -591,7 +590,7 @@ pub(crate) fn derive(
         AccountErrorKind::Server(kind) => {
             derive_server(*kind, tx_state, idempotent, chain, throttle_scope)
         }
-        AccountErrorKind::SyncState(kind) => derive_sync_state(*kind, scope, chain),
+        AccountErrorKind::SyncState(_) => derive_sync_state(chain),
         AccountErrorKind::ConcurrencyConflict => RecoveryClass::Retry(RetryAdvice {
             disposition: RetryDisposition::AfterStateRefresh,
             retry_hint: None,
@@ -709,149 +708,6 @@ pub(crate) fn suggest(
     }
 }
 
-pub(crate) fn kind_matches_cause(kind: &AccountErrorKind, cause: &Cause) -> bool {
-    match (kind, cause) {
-        (AccountErrorKind::AccountClosed, Cause::State(StateCause::AccountClosed)) => true,
-        (AccountErrorKind::ControlWaitEnded, Cause::State(StateCause::ControlWaitEnded { .. })) => {
-            true
-        }
-        (AccountErrorKind::Transport(kind), Cause::Transport(cause)) => *kind == cause.error_kind(),
-        (AccountErrorKind::Authentication(kind), Cause::Auth(cause)) => {
-            auth_kind_matches_cause(*kind, cause)
-        }
-        (AccountErrorKind::Authorization(kind), Cause::Access(cause)) => {
-            access_kind_matches_cause(*kind, cause)
-        }
-        (AccountErrorKind::Server(kind), Cause::Server(cause)) => {
-            server_kind_matches_cause(*kind, cause)
-        }
-        (AccountErrorKind::SyncState(kind), Cause::State(cause)) => {
-            sync_kind_matches_cause(*kind, cause)
-        }
-        (AccountErrorKind::Protocol(_), Cause::Wire(_)) => true,
-        (AccountErrorKind::Internal(kind), Cause::Internal(cause)) => *kind == cause.kind,
-        (AccountErrorKind::ConcurrencyConflict, Cause::State(StateCause::ConcurrencyConflict)) => {
-            true
-        }
-        (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed { .. } | RequestCause::InvalidArgument { .. }),
-        )
-        | (
-            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
-            Cause::Request(RequestCause::PayloadTooLarge { .. }),
-        )
-        | (
-            AccountErrorKind::Request(RequestErrorKind::PreconditionFailed),
-            Cause::Request(RequestCause::PreconditionFailed { .. }),
-        )
-        | (
-            AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid),
-            Cause::Request(RequestCause::BatchInputInvalid { .. } | RequestCause::BatchInputEmpty),
-        ) => true,
-        (AccountErrorKind::NotFound(kind), Cause::Request(RequestCause::NotFound { what, .. })) => {
-            kind == what
-        }
-        (
-            AccountErrorKind::Unsupported(op),
-            Cause::Request(RequestCause::Unsupported { operation }),
-        ) => op == operation,
-        _ => false,
-    }
-}
-
-fn auth_kind_matches_cause(kind: AuthErrorKind, cause: &AuthCause) -> bool {
-    matches!(
-        (kind, cause),
-        (AuthErrorKind::Expired, AuthCause::Expired)
-            | (AuthErrorKind::RefreshTransient, AuthCause::RefreshTransient)
-            | (AuthErrorKind::Revoked, AuthCause::Revoked)
-            | (
-                AuthErrorKind::ReauthorizationRequired,
-                AuthCause::ReauthorizationRequired
-            )
-    )
-}
-
-fn access_kind_matches_cause(kind: AccessErrorKind, cause: &AccessCause) -> bool {
-    matches!(
-        (kind, cause),
-        (
-            AccessErrorKind::AdminConsentRequired,
-            AccessCause::AdminConsentRequired { .. }
-        ) | (
-            AccessErrorKind::ConditionalAccessBlocked,
-            AccessCause::ConditionalAccessBlocked
-        ) | (AccessErrorKind::PolicyBlocked, AccessCause::PolicyBlocked)
-            | (
-                AccessErrorKind::InsufficientScope,
-                AccessCause::InsufficientScope { .. }
-            )
-            | (
-                AccessErrorKind::PermissionDenied,
-                AccessCause::PermissionDenied { .. }
-            )
-            | (
-                AccessErrorKind::AccountDisabled,
-                AccessCause::AccountDisabled
-            )
-            | (
-                AccessErrorKind::MailboxUnavailable { .. },
-                AccessCause::MailboxUnavailable { .. }
-            )
-            | (
-                AccessErrorKind::MailboxNotLicensed,
-                AccessCause::MailboxNotLicensed
-            )
-    )
-}
-
-fn server_kind_matches_cause(kind: ServerErrorKind, cause: &ServerCause) -> bool {
-    match (kind, cause) {
-        (ServerErrorKind::Unavailable, ServerCause::Unavailable { .. })
-        | (ServerErrorKind::RateLimited, ServerCause::RateLimited { .. })
-        | (ServerErrorKind::QuotaExhausted, ServerCause::QuotaExhausted { .. }) => true,
-        (
-            ServerErrorKind::Error { status },
-            ServerCause::Error {
-                status: cause_status,
-            },
-        ) => match (status, cause_status) {
-            (Some(kind_status), Some(cause_status)) => kind_status == *cause_status,
-            (None, _) | (_, None) => true,
-        },
-        _ => false,
-    }
-}
-
-fn sync_kind_matches_cause(kind: SyncStateErrorKind, cause: &StateCause) -> bool {
-    matches!(
-        (kind, cause),
-        (SyncStateErrorKind::CursorInvalid, StateCause::CursorInvalid)
-            | (
-                SyncStateErrorKind::StrategyFailure,
-                StateCause::StrategyFailure { .. }
-            )
-            | (
-                SyncStateErrorKind::ScopeCapabilityLost,
-                StateCause::ScopeCapabilityLost
-            )
-            | (
-                SyncStateErrorKind::SchemaIncompatible,
-                StateCause::SchemaIncompatible
-            )
-            | (
-                SyncStateErrorKind::CapabilityChanged,
-                StateCause::CapabilityChanged { .. }
-            )
-            | (
-                SyncStateErrorKind::OperatorOverrideNeeded,
-                StateCause::OperatorOverrideNeeded { .. }
-            )
-            | (SyncStateErrorKind::ScopeRevoked, StateCause::ScopeRevoked)
-    )
-}
-
 fn derive_auth(kind: AuthErrorKind, chain: &CauseChain) -> RecoveryClass {
     match kind {
         AuthErrorKind::RefreshTransient => RecoveryClass::Retry(RetryAdvice {
@@ -924,7 +780,8 @@ fn derive_server(
             throttle_scope,
         ),
         ServerErrorKind::Error { status } => {
-            let status = status.or_else(|| server_status(chain));
+            // Status is projected from the primary ServerCause; diagnostic or
+            // sibling status cannot change its recovery.
             match status {
                 // The 5xx rule is HTTP's: a server-side failure the client did
                 // nothing to cause, worth a retry. An SMTP 5xx is the opposite
@@ -936,7 +793,7 @@ fn derive_server(
                 // and told the consumer to resend a whole message body to a
                 // server that had just permanently refused it. The protocol is
                 // read from the cause chain: every SMTP reply the translator
-                // classifies carries `Cause::Wire(WireCause::Smtp(_))`, and no
+                // classifies carries SMTP wire evidence, and no
                 // other protocol mints that cause. Ruled smtp-CR10, 2026-09-07.
                 Some(500..=599) if !smtp_reply(chain) => transient_retry_or_reconcile(
                     tx_state,
@@ -963,74 +820,35 @@ fn derive_server(
     }
 }
 
-fn derive_sync_state(
-    kind: SyncStateErrorKind,
-    scope: Option<&ErrorScope>,
-    chain: &CauseChain,
-) -> RecoveryClass {
-    match kind {
-        // CursorInvalid without a cursor scope is rejected at build
-        // time (see `AccountErrorBuildError::CursorInvalidWithoutScope`),
-        // so this branch can safely require the scope. The fallback
-        // remains for the central recovery table's deterministic
-        // behavior; in practice `try_build` prevents it.
-        SyncStateErrorKind::CursorInvalid => match cursor_scope(scope) {
-            Some(scope) => RecoveryClass::Engine(EngineDirective::RestartScope(scope)),
-            None => RecoveryClass::Engine(EngineDirective::RestartAccount),
-        },
-        SyncStateErrorKind::StrategyFailure => RecoveryClass::Engine(
-            EngineDirective::DowngradeStrategy(strategy_downgrade(chain)),
-        ),
-        SyncStateErrorKind::ScopeCapabilityLost => match cursor_scope(scope) {
-            Some(scope) => {
-                RecoveryClass::Engine(EngineDirective::DowngradeCapabilityForScope(scope))
-            }
-            None => RecoveryClass::Engine(EngineDirective::RestartAccount),
-        },
-        // A revoked single shared folder quarantines that scope without
-        // escalating account-wide. `ScopeRevoked` requires a cursor scope
-        // to be meaningful; rather than add a `try_build` invariant, the
-        // scope-less case falls back to a full reopen (matching the
-        // `ScopeCapabilityLost` shape above). The IMAP producer always
-        // threads the scope, so the fallback is unreachable in practice.
-        SyncStateErrorKind::ScopeRevoked => match cursor_scope(scope) {
-            Some(scope) => RecoveryClass::Engine(EngineDirective::DisableScope(scope)),
-            None => RecoveryClass::Engine(EngineDirective::RestartAccount),
-        },
-        SyncStateErrorKind::SchemaIncompatible => {
+fn derive_sync_state(chain: &CauseChain) -> RecoveryClass {
+    // Scope-directed failures carry a typed cursor identity on the primary
+    // cause. Diagnostic scopes and secondary state evidence cannot retarget it.
+    match chain.outermost() {
+        Cause::State(StateCause::CursorInvalid { scope }) => {
+            RecoveryClass::Engine(EngineDirective::RestartScope(scope.clone()))
+        }
+        Cause::State(StateCause::ScopeCapabilityLost { scope }) => {
+            RecoveryClass::Engine(EngineDirective::DowngradeCapabilityForScope(scope.clone()))
+        }
+        Cause::State(StateCause::ScopeRevoked { scope }) => {
+            RecoveryClass::Engine(EngineDirective::DisableScope(scope.clone()))
+        }
+        Cause::State(StateCause::StrategyFailure { downgrade }) => {
+            RecoveryClass::Engine(EngineDirective::DowngradeStrategy(*downgrade))
+        }
+        Cause::State(StateCause::SchemaIncompatible) => {
             RecoveryClass::Engine(EngineDirective::SchemaIncompatible)
         }
-        // Capability shifts no longer have a dedicated `EngineDirective`
-        // variant. `StateCause::CapabilityChanged { delta }` retains the
-        // (optional) delta payload for forensic exports; recovery maps
-        // the shift to a full account reopen so discovery re-runs.
-        SyncStateErrorKind::CapabilityChanged => {
+        Cause::State(StateCause::CapabilityChanged { .. }) => {
             RecoveryClass::Engine(EngineDirective::RestartAccount)
         }
-        SyncStateErrorKind::OperatorOverrideNeeded => {
+        Cause::State(StateCause::OperatorOverrideNeeded { reason }) => {
             RecoveryClass::Engine(EngineDirective::OperatorOverrideRequired {
-                reason: operator_reason(chain)
-                    .unwrap_or_else(|| "operator override required".into()),
+                reason: reason.clone(),
             })
         }
+        _ => unreachable!("sync-state kinds are derived from primary state causes"),
     }
-}
-
-fn strategy_downgrade(chain: &CauseChain) -> StrategyDowngrade {
-    chain
-        .iter()
-        .find_map(|cause| match cause {
-            Cause::State(StateCause::StrategyFailure { downgrade }) => Some(*downgrade),
-            _ => None,
-        })
-        .unwrap_or(StrategyDowngrade::QResyncToCondstore)
-}
-
-fn operator_reason(chain: &CauseChain) -> Option<OperatorOverrideReason> {
-    chain.iter().find_map(|cause| match cause {
-        Cause::State(StateCause::OperatorOverrideNeeded { reason }) => Some(reason.clone()),
-        _ => None,
-    })
 }
 
 fn derive_protocol(
@@ -1126,13 +944,6 @@ fn access_resource(chain: &CauseChain) -> Option<ResourceKind> {
     })
 }
 
-fn server_status(chain: &CauseChain) -> Option<u16> {
-    chain.iter().find_map(|cause| match cause {
-        Cause::Server(ServerCause::Error { status }) => *status,
-        _ => None,
-    })
-}
-
 /// Whether the failure is an SMTP (or LMTP) reply, whose numeric status
 /// classes carry RFC 5321 semantics rather than HTTP's. See `derive_server`.
 /// The wire evidence owns the meaning of these digits. Account protocol is
@@ -1141,14 +952,7 @@ fn server_status(chain: &CauseChain) -> Option<u16> {
 fn smtp_reply(chain: &CauseChain) -> bool {
     chain
         .iter()
-        .any(|cause| matches!(cause, Cause::Wire(WireCause::Smtp(_))))
-}
-
-pub(crate) fn cursor_scope(scope: Option<&ErrorScope>) -> Option<CursorScope> {
-    match scope {
-        Some(ErrorScope::Cursor(scope)) => Some(scope.clone()),
-        _ => None,
-    }
+        .any(|cause| matches!(cause.wire(), Some(WireCause::Smtp(_))))
 }
 
 pub(crate) fn server_retry_hint(chain: &CauseChain) -> Option<RetryHint> {
@@ -1171,7 +975,7 @@ fn retry_later(recovery: &RecoveryClass) -> Option<RemediationAction> {
 mod tests {
     use super::*;
     use crate::error::{
-        AttemptCause, InternalCause, InternalErrorKind, TransportCause, TransportKind,
+        AttemptCause, InternalCause, InternalErrorKind, TransportCause, TransportErrorKind,
     };
 
     fn chain(cause: Cause) -> CauseChain {
@@ -1342,7 +1146,7 @@ mod tests {
     fn transport_chain(state: TransmissionState) -> CauseChain {
         CauseChain::new(vec![
             Cause::Transport(TransportCause {
-                kind: TransportKind::Network,
+                kind: TransportErrorKind::Network,
                 message: None,
             }),
             Cause::Attempt(AttemptCause::new(state)),
@@ -1448,7 +1252,7 @@ mod tests {
             &AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient),
             None,
             Some(AccountOperation::SyncChanges),
-            &chain(Cause::Auth(AuthCause::RefreshTransient)),
+            &chain(Cause::Auth(crate::error::AuthCause::RefreshTransient)),
             None,
             None,
         );
@@ -1511,7 +1315,7 @@ mod tests {
             &AccountErrorKind::Request(RequestErrorKind::Malformed),
             None,
             None,
-            &chain(Cause::Request(RequestCause::Malformed {
+            &chain(Cause::Request(crate::error::RequestCause::Malformed {
                 detail: crate::error::DiagnosticText::support_only("bad request"),
             })),
             None,
@@ -1545,6 +1349,7 @@ mod tests {
             None,
             Some(AccountOperation::Search),
             &chain(Cause::Server(ServerCause::RateLimited {
+                throttle: Default::default(),
                 retry_hint: Some(hint),
             })),
             Some(ThrottleScope::Account),
@@ -1571,6 +1376,7 @@ mod tests {
             Some(AccountOperation::Send),
             &CauseChain::new(vec![
                 Cause::Server(ServerCause::QuotaExhausted {
+                    throttle: Default::default(),
                     retry_hint: Some(hint),
                 }),
                 Cause::Attempt(AttemptCause::new(TransmissionState::InFlight)),
@@ -1604,7 +1410,10 @@ mod tests {
             None,
             Some(AccountOperation::Send),
             &CauseChain::new(vec![
-                Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
+                Cause::Server(ServerCause::QuotaExhausted {
+                    throttle: Default::default(),
+                    retry_hint: None,
+                }),
                 Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)),
             ]),
             Some(ThrottleScope::Account),
@@ -1655,7 +1464,10 @@ mod tests {
             None,
             Some(AccountOperation::SyncChanges),
             &CauseChain::new(vec![
-                Cause::Server(ServerCause::RateLimited { retry_hint: None }),
+                Cause::Server(ServerCause::RateLimited {
+                    throttle: Default::default(),
+                    retry_hint: None,
+                }),
                 Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)),
             ]),
             None,
@@ -1727,13 +1539,15 @@ mod tests {
     }
 
     #[test]
-    fn cursor_invalid_uses_scope_when_available() {
+    fn cursor_invalid_uses_its_cause_scope() {
         let scope = ErrorScope::Cursor(crate::CursorScope::Account);
         let scoped = derive(
             &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
             Some(&scope),
             Some(AccountOperation::SyncChanges),
-            &chain(Cause::State(StateCause::CursorInvalid)),
+            &chain(Cause::State(StateCause::CursorInvalid {
+                scope: CursorScope::Account,
+            })),
             None,
             None,
         );
@@ -1741,7 +1555,9 @@ mod tests {
             &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
             None,
             Some(AccountOperation::SyncChanges),
-            &chain(Cause::State(StateCause::CursorInvalid)),
+            &chain(Cause::State(StateCause::CursorInvalid {
+                scope: CursorScope::Account,
+            })),
             None,
             None,
         );
@@ -1752,7 +1568,7 @@ mod tests {
         ));
         assert_eq!(
             account,
-            RecoveryClass::Engine(EngineDirective::RestartAccount)
+            RecoveryClass::Engine(EngineDirective::RestartScope(CursorScope::Account))
         );
     }
 
@@ -1806,23 +1622,24 @@ mod tests {
             None,
         );
 
-        let recorded = crate::error::AccountErrorBuilder::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-            Cause::Wire(crate::error::WireCause::MalformedResponse {
-                protocol: crate::error::Protocol::Jmap,
-                detail: None,
-            }),
-        )
-        .partial_commit(crate::error::PartialCommitBuilder::new(
-            crate::error::PrimaryLeg::new(
-                crate::error::StepEffect::Submitted,
-                crate::error::StepTargets::unknown(),
-                crate::error::StepReplay::Blocking,
-                crate::error::Application::Uncertain,
-            ),
-        ))
-        .try_build()
-        .unwrap();
+        let recorded =
+            crate::error::AccountErrorBuilder::new(crate::error::PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ParseFailed,
+                wire: crate::error::WireCause::MalformedResponse {
+                    protocol: crate::error::Protocol::Jmap,
+                    detail: None,
+                },
+            })
+            .partial_commit(crate::error::PartialCommitBuilder::new(
+                crate::error::PrimaryLeg::new(
+                    crate::error::StepEffect::Submitted,
+                    crate::error::StepTargets::unknown(),
+                    crate::error::StepReplay::Blocking,
+                    crate::error::Application::Uncertain,
+                ),
+            ))
+            .try_build()
+            .unwrap();
         for recovery in [&transport_drop, &partial, &internal, recorded.recovery()] {
             let RecoveryClass::Reconcile(advice) = recovery else {
                 panic!("expected Reconcile, got {recovery:?}");
@@ -2050,123 +1867,105 @@ mod tests {
     /// types-D12: build a representative `AccountError` per
     /// `RecoveryClass` shape and verify `Fatal::try_from` succeeds iff
     /// the variant is terminal. We construct each error through the
-    /// builder using a kind/cause pair that produces the target
+    /// builder using a primary cause that produces the target
     /// recovery class.
     #[test]
     fn fatal_try_from_round_trips_terminal_only() {
         use crate::CursorScope;
-        use crate::error::{AccountErrorBuilder, AccountErrorKind, RequestErrorKind};
+        use crate::error::AccountErrorBuilder;
 
         let terminal_cases: Vec<(&str, AccountError)> = vec![
             (
                 "AuthLost",
-                build(
-                    AccountErrorKind::Authentication(AuthErrorKind::Expired),
-                    Cause::Auth(AuthCause::Expired),
-                ),
+                build(crate::error::PrimaryCause::Auth(
+                    crate::error::AuthCause::Expired,
+                )),
             ),
             (
                 "NeedsAdminConsent",
-                build(
-                    AccountErrorKind::Authorization(AccessErrorKind::AdminConsentRequired),
-                    Cause::Access(AccessCause::AdminConsentRequired { needed: "x" }),
-                ),
+                build(crate::error::PrimaryCause::Access(
+                    AccessCause::AdminConsentRequired { needed: "x" },
+                )),
             ),
             (
                 "NeedsPolicyChange",
-                build(
-                    AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
-                    Cause::Access(AccessCause::PolicyBlocked),
-                ),
+                build(crate::error::PrimaryCause::Access(
+                    AccessCause::PolicyBlocked,
+                )),
             ),
             (
                 "NoPermission",
-                build(
-                    AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-                    Cause::Access(AccessCause::PermissionDenied { resource: None }),
-                ),
+                build(crate::error::PrimaryCause::Access(
+                    AccessCause::PermissionDenied { resource: None },
+                )),
             ),
             (
                 "Unsupported",
-                AccountErrorBuilder::new(
-                    AccountErrorKind::Unsupported(AccountOperation::Send),
-                    Cause::Request(RequestCause::Unsupported {
+                AccountErrorBuilder::new(crate::error::PrimaryCause::Request(
+                    crate::error::RequestCause::Unsupported {
                         operation: AccountOperation::Send,
-                    }),
-                )
+                    },
+                ))
                 .try_build()
                 .expect("valid"),
             ),
             (
                 "ClientBug",
-                AccountErrorBuilder::new(
-                    AccountErrorKind::Request(RequestErrorKind::Malformed),
-                    Cause::Request(RequestCause::Malformed {
+                AccountErrorBuilder::new(crate::error::PrimaryCause::Request(
+                    crate::error::RequestCause::Malformed {
                         detail: crate::error::DiagnosticText::support_only("x"),
-                    }),
-                )
+                    },
+                ))
                 .try_build()
                 .expect("valid"),
             ),
             (
                 "ProviderContractViolation",
-                build(
-                    AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-                    Cause::Wire(crate::error::WireCause::Jmap(
-                        crate::error::JmapMethod::NotJson,
-                    )),
-                ),
+                build(crate::error::PrimaryCause::Protocol {
+                    kind: ProtocolErrorKind::ParseFailed,
+                    wire: crate::error::WireCause::Jmap(crate::error::JmapMethod::NotJson),
+                }),
             ),
             (
                 "ProviderRefused",
-                build(
-                    AccountErrorKind::Server(ServerErrorKind::Error { status: Some(451) }),
-                    Cause::Server(ServerCause::Error { status: Some(451) }),
-                ),
+                build(crate::error::PrimaryCause::Server(ServerCause::Error {
+                    status: Some(451),
+                })),
             ),
             (
                 "UnknownPermanent",
-                build(
-                    AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-                    Cause::Wire(crate::error::WireCause::Jmap(
-                        crate::error::JmapMethod::Unknown { code: "x".into() },
-                    )),
-                ),
+                build(crate::error::PrimaryCause::Protocol {
+                    kind: ProtocolErrorKind::Unknown,
+                    wire: crate::error::WireCause::Jmap(crate::error::JmapMethod::Unknown {
+                        code: "x".into(),
+                    }),
+                }),
             ),
             (
                 "InternalFailure",
-                build(
-                    AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-                    Cause::Internal(InternalCause::new(
-                        InternalErrorKind::InvariantViolated,
-                        None,
-                    )),
-                ),
+                build(crate::error::PrimaryCause::Internal(InternalCause::new(
+                    InternalErrorKind::InvariantViolated,
+                    None,
+                ))),
             ),
         ];
         let non_terminal_cases: Vec<(&str, AccountError)> = vec![
             (
                 "Retry",
-                AccountErrorBuilder::new(
-                    AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
-                    Cause::Transport(TransportCause {
-                        kind: TransportKind::Network,
-                        message: None,
-                    }),
-                )
+                AccountErrorBuilder::new(crate::error::PrimaryCause::Transport(TransportCause {
+                    kind: TransportErrorKind::Network,
+                    message: None,
+                }))
                 .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
                 .try_build()
                 .expect("valid"),
             ),
             (
                 "Reconcile",
-                AccountErrorBuilder::new(
-                    AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
-                    Cause::Transport(TransportCause {
-                        kind: TransportKind::Network,
-                        message: None,
-                    }),
-                )
+                AccountErrorBuilder::new(crate::error::PrimaryCause::Transport(TransportCause {
+                    kind: TransportErrorKind::Network,
+                    message: None,
+                }))
                 .operation(AccountOperation::Send)
                 .push_cause(Cause::Attempt(AttemptCause::new(
                     TransmissionState::InFlight,
@@ -2176,10 +1975,9 @@ mod tests {
             ),
             (
                 "Engine",
-                build(
-                    AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-                    Cause::State(StateCause::SchemaIncompatible),
-                ),
+                build(crate::error::PrimaryCause::State(
+                    StateCause::SchemaIncompatible,
+                )),
             ),
         ];
 
@@ -2203,8 +2001,9 @@ mod tests {
 
         // Silence unused: helper for cursor-scoped engine variants.
         let _scoped = build_with_scope(
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
+            crate::error::PrimaryCause::State(StateCause::CursorInvalid {
+                scope: CursorScope::Account,
+            }),
             ErrorScope::Cursor(CursorScope::Account),
         );
     }
@@ -2216,7 +2015,9 @@ mod tests {
             &AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
             Some(&scope),
             Some(AccountOperation::SyncChanges),
-            &chain(Cause::State(StateCause::ScopeRevoked)),
+            &chain(Cause::State(StateCause::ScopeRevoked {
+                scope: CursorScope::Folder(crate::FolderId("Shared/alice".into())),
+            })),
             None,
             None,
         );
@@ -2230,19 +2031,23 @@ mod tests {
     }
 
     #[test]
-    fn scope_revoked_without_scope_falls_back_to_restart_account() {
+    fn scope_revoked_routes_without_diagnostic_scope() {
         let recovery = derive(
             &AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
             None,
             Some(AccountOperation::SyncChanges),
-            &chain(Cause::State(StateCause::ScopeRevoked)),
+            &chain(Cause::State(StateCause::ScopeRevoked {
+                scope: CursorScope::Folder(crate::FolderId("Shared/alice".into())),
+            })),
             None,
             None,
         );
 
         assert_eq!(
             recovery,
-            RecoveryClass::Engine(EngineDirective::RestartAccount)
+            RecoveryClass::Engine(EngineDirective::DisableScope(CursorScope::Folder(
+                crate::FolderId("Shared/alice".into())
+            )))
         );
     }
 
@@ -2255,18 +2060,17 @@ mod tests {
         assert!(!recovery.is_terminal());
     }
 
-    fn build(kind: AccountErrorKind, primary_cause: Cause) -> AccountError {
-        crate::error::AccountErrorBuilder::new(kind, primary_cause)
+    fn build(primary_cause: crate::error::PrimaryCause) -> AccountError {
+        crate::error::AccountErrorBuilder::new(primary_cause)
             .try_build()
             .expect("valid account error classification")
     }
 
     fn build_with_scope(
-        kind: AccountErrorKind,
-        primary_cause: Cause,
+        primary_cause: crate::error::PrimaryCause,
         scope: ErrorScope,
     ) -> AccountError {
-        crate::error::AccountErrorBuilder::new(kind, primary_cause)
+        crate::error::AccountErrorBuilder::new(primary_cause)
             .scope(scope)
             .try_build()
             .expect("valid account error classification")

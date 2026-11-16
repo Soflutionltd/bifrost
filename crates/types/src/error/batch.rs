@@ -5,8 +5,8 @@ use serde::Serialize;
 
 use super::account_error::AccountError;
 use super::builder::AccountErrorBuilder;
-use super::cause::{BatchInputInvalidItem, BatchInputInvalidReason, Cause, RequestCause};
-use super::kind::{AccountErrorKind, RequestErrorKind};
+use super::cause::{BatchInputInvalidItem, BatchInputInvalidReason, PrimaryCause, RequestCause};
+
 use super::scope::AccountOperation;
 use crate::Protocol;
 
@@ -345,31 +345,22 @@ fn batch_input_error(
     operation: AccountOperation,
     cause: RequestCause,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid),
-        Cause::Request(cause),
-    )
-    .protocol(protocol)
-    .operation(operation)
-    .try_build()
-    .expect("valid batch input error classification")
+    AccountErrorBuilder::new(PrimaryCause::Request(cause))
+        .protocol(protocol)
+        .operation(operation)
+        .try_build()
+        .expect("valid batch input error classification")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{
-        AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, RequestCause,
-        RequestErrorKind,
-    };
+    use crate::error::{AccountErrorBuilder, Cause, DiagnosticText, PrimaryCause, RequestCause};
 
     fn error() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("bad input"),
-            }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("bad input"),
+        }))
         .try_build()
         .expect("valid account error classification")
     }

@@ -12,10 +12,9 @@ use bifrost_types::ThrottleScope;
 use std::time::{Duration, SystemTime};
 
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause, AuthCause,
-    AuthErrorKind, Cause, DiagnosticText, ErrorScope, Protocol, ProtocolErrorKind, Provider,
-    RequestCause, RequestErrorKind, RetryHint, ServerCause, ServerErrorKind, TransmissionState,
-    TransportCause, TransportErrorKind, TransportKind, WireCause,
+    AccountError, AccountErrorBuilder, AccountOperation, AttemptCause, AuthCause, Cause,
+    DiagnosticText, ErrorScope, PrimaryCause, Protocol, ProtocolErrorKind, Provider, RequestCause,
+    RetryHint, ServerCause, TransmissionState, TransportCause, TransportErrorKind, WireCause,
 };
 use bytes::Bytes;
 use reqwest::{
@@ -158,7 +157,6 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
         }
         Error::LocalHold { held, evidence, .. } => {
             let hint = RetryHint::After(held.deadline.remaining());
-            let kind = held.kind.server_kind();
             let cause = held.kind.server_cause(hint);
             let commit = evidence.verdict();
             let (attempts, ledger) = evidence.into_parts();
@@ -169,7 +167,7 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
                 .collect();
             let state = ledger.transmission_state();
             let mut builder = push_attempt(
-                base_builder(&ctx, AccountErrorKind::Server(kind), Cause::Server(cause)),
+                base_builder(&ctx, policy.apply_throttle(PrimaryCause::Server(cause))),
                 state,
             );
             for error in evidence {
@@ -181,8 +179,7 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
                 builder = builder.idempotency_override(false);
             }
             builder = builder.text(DiagnosticText::support_only(diagnostics));
-            builder = policy.apply_throttle(builder, true);
-            builder = builder.local_hold();
+            builder = builder.with_throttle(|throttle| throttle.local_hold = true);
             finish(builder, &ctx)
         }
         Error::Network {
@@ -191,7 +188,6 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
             source,
         } => transport_or_partial(
             &ctx,
-            TransportKind::Network,
             TransportErrorKind::Network,
             message,
             transmission_state,
@@ -199,7 +195,6 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
         ),
         Error::Timeout { transmission_state } => transport_or_partial(
             &ctx,
-            TransportKind::Timeout,
             TransportErrorKind::Timeout,
             "request timed out".to_owned(),
             transmission_state,
@@ -210,7 +205,6 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
             transmission_state,
         } => transport_or_partial(
             &ctx,
-            TransportKind::Tls,
             TransportErrorKind::Tls,
             message,
             transmission_state,
@@ -257,8 +251,10 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
                 let detail = retry_history_text(&retry_after_history);
                 let mut builder = base_builder(
                     &ctx,
-                    AccountErrorKind::Transport(TransportErrorKind::Network),
-                    Cause::Transport(TransportCause::new(TransportKind::Network, detail.clone())),
+                    PrimaryCause::Transport(TransportCause::new(
+                        TransportErrorKind::Network,
+                        detail.clone(),
+                    )),
                 );
                 if let Some(text) = detail {
                     builder = builder.text(text);
@@ -281,9 +277,8 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
         Error::Cancelled => {
             let builder = base_builder(
                 &ctx,
-                AccountErrorKind::Transport(TransportErrorKind::Network),
-                Cause::Transport(TransportCause::new(
-                    TransportKind::Network,
+                PrimaryCause::Transport(TransportCause::new(
+                    TransportErrorKind::Network,
                     Some(DiagnosticText::support_only("request cancelled")),
                 )),
             )
@@ -323,11 +318,13 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
         Error::UnexpectedResponse { response } => {
             let builder = base_builder(
                 &ctx,
-                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-                malformed_response_cause(
-                    &ctx,
-                    format!("unexpected HTTP response {}", response.status),
-                ),
+                PrimaryCause::Protocol {
+                    kind: ProtocolErrorKind::ContractViolation,
+                    wire: malformed_response_cause(
+                        &ctx,
+                        format!("unexpected HTTP response {}", response.status),
+                    ),
+                },
             );
             let builder =
                 response_diagnostics(builder, response.status, &response.headers, &response.body);
@@ -354,8 +351,10 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
         } => {
             let builder = base_builder(
                 &ctx,
-                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-                malformed_response_cause(&ctx, message),
+                PrimaryCause::Protocol {
+                    kind: ProtocolErrorKind::ContractViolation,
+                    wire: malformed_response_cause(&ctx, message),
+                },
             );
             let builder = response_diagnostics(
                 builder,
@@ -383,8 +382,7 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
 
 fn transport_or_partial(
     ctx: &NetErrorContext,
-    transport_kind: TransportKind,
-    error_kind: TransportErrorKind,
+    transport_kind: TransportErrorKind,
     message: String,
     transmission_state: TransmissionState,
     source_message: Option<String>,
@@ -402,8 +400,7 @@ fn transport_or_partial(
     let diagnostic = maybe_support_text(message.clone());
     let mut builder = base_builder(
         ctx,
-        AccountErrorKind::Transport(error_kind),
-        Cause::Transport(TransportCause::new(transport_kind, diagnostic.clone())),
+        PrimaryCause::Transport(TransportCause::new(transport_kind, diagnostic.clone())),
     );
     if let Some(text) = diagnostic {
         builder = builder.text(text);
@@ -419,11 +416,7 @@ fn auth_lost(
     transmission_state: Option<TransmissionState>,
     final_response: Option<&FinalResponse>,
 ) -> AccountError {
-    let mut builder = base_builder(
-        ctx,
-        AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-        Cause::Auth(AuthCause::ReauthorizationRequired),
-    );
+    let mut builder = base_builder(ctx, PrimaryCause::Auth(AuthCause::ReauthorizationRequired));
     if let Some(response) = final_response {
         builder = response_diagnostics(builder, response.status, &response.headers, &response.body);
     }
@@ -443,14 +436,9 @@ fn refresh_failed(
     retry_after: Option<RetryHint>,
     source: &Error,
 ) -> AccountError {
-    let mut builder = base_builder(
-        ctx,
-        AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient),
-        Cause::Auth(AuthCause::RefreshTransient),
-    )
-    .text(DiagnosticText::support_only(format!(
-        "OAuth refresh failed: {source}"
-    )));
+    let mut builder = base_builder(ctx, PrimaryCause::Auth(AuthCause::RefreshTransient)).text(
+        DiagnosticText::support_only(format!("OAuth refresh failed: {source}")),
+    );
 
     let cause = match source.terminal() {
         Error::Status { code, .. } => server_cause_from_status(code.as_u16(), retry_after),
@@ -464,9 +452,11 @@ fn refresh_failed(
             ServerCause::Unavailable {
                 retry_hint: Some(_)
             } | ServerCause::RateLimited {
-                retry_hint: Some(_)
+                retry_hint: Some(_),
+                ..
             } | ServerCause::QuotaExhausted {
-                retry_hint: Some(_)
+                retry_hint: Some(_),
+                ..
             }
         ))
     );
@@ -490,8 +480,10 @@ fn rate_limited(
     let retry_hint = retry_after;
     let mut builder = base_builder(
         ctx,
-        AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited { retry_hint }),
+        policy.apply_throttle(PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint,
+        })),
     );
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     builder = response_diagnostics(
@@ -500,7 +492,6 @@ fn rate_limited(
         &final_response.headers,
         &final_response.body,
     );
-    builder = policy.apply_throttle(builder, true);
     finish(builder, ctx)
 }
 
@@ -512,16 +503,15 @@ fn status_error(
     retry_hint_param: Option<RetryHint>,
     policy: &HttpErrorPolicy,
 ) -> AccountError {
-    let class = classify_status(
+    let cause = classify_status(
         status.as_u16(),
         ctx.scope.as_ref(),
         retry_hint_param,
         policy.status,
     );
-    let mut builder = base_builder(ctx, class.kind, class.cause);
+    let mut builder = base_builder(ctx, policy.apply_throttle(cause));
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     builder = response_diagnostics(builder, status, headers, body);
-    builder = policy.apply_throttle(builder, class.throttles);
     finish(builder, ctx)
 }
 
@@ -551,8 +541,7 @@ fn invalid_argument_builder(
     let message = maybe_support_text(detail);
     let mut builder = base_builder(
         ctx,
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
+        PrimaryCause::Request(RequestCause::InvalidArgument {
             field: Some(field),
             message: message.clone(),
         }),
@@ -570,8 +559,10 @@ fn contract_violation(
 ) -> AccountError {
     let builder = base_builder(
         ctx,
-        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-        malformed_response_cause(ctx, detail),
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::ContractViolation,
+            wire: malformed_response_cause(ctx, detail),
+        },
     );
     finish(push_attempt(builder, transmission_state), ctx)
 }
@@ -583,25 +574,23 @@ fn partial_response(
 ) -> AccountError {
     let builder = base_builder(
         ctx,
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        malformed_response_cause(ctx, detail),
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::PartialResponse,
+            wire: malformed_response_cause(ctx, detail),
+        },
     );
     finish(push_attempt(builder, transmission_state), ctx)
 }
 
-fn malformed_response_cause(ctx: &NetErrorContext, detail: String) -> Cause {
-    Cause::Wire(WireCause::MalformedResponse {
+fn malformed_response_cause(ctx: &NetErrorContext, detail: String) -> WireCause {
+    WireCause::MalformedResponse {
         protocol: ctx.protocol,
         detail: maybe_support_text(detail),
-    })
+    }
 }
 
-fn base_builder(
-    ctx: &NetErrorContext,
-    kind: AccountErrorKind,
-    cause: Cause,
-) -> AccountErrorBuilder {
-    let builder = AccountErrorBuilder::new(kind, cause)
+fn base_builder(ctx: &NetErrorContext, cause: PrimaryCause) -> AccountErrorBuilder {
+    let builder = AccountErrorBuilder::new(cause)
         .protocol(ctx.protocol)
         .operation(ctx.operation);
     match ctx.provider {
@@ -760,20 +749,21 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
     match error {
         Error::AttemptHistory { source, .. } => support_cause_from_source(source),
         Error::Network { message, .. } => Some(Cause::Transport(TransportCause::new(
-            TransportKind::Network,
+            TransportErrorKind::Network,
             maybe_support_text(message.clone()),
         ))),
         Error::Timeout { .. } => Some(Cause::Transport(TransportCause::new(
-            TransportKind::Timeout,
+            TransportErrorKind::Timeout,
             Some(DiagnosticText::support_only("request timed out")),
         ))),
         Error::Tls { message, .. } => Some(Cause::Transport(TransportCause::new(
-            TransportKind::Tls,
+            TransportErrorKind::Tls,
             maybe_support_text(message.clone()),
         ))),
         Error::AuthLost { .. } => Some(Cause::Auth(AuthCause::ReauthorizationRequired)),
         Error::RefreshFailed { .. } => Some(Cause::Auth(AuthCause::RefreshTransient)),
         Error::RateLimited { retry_after, .. } => Some(Cause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
             retry_hint: *retry_after,
         })),
         Error::RetryBudgetExhausted {
@@ -787,7 +777,7 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
             final_response: None,
             ..
         } => Some(Cause::Transport(TransportCause::new(
-            TransportKind::Network,
+            TransportErrorKind::Network,
             Some(DiagnosticText::support_only("retry budget exhausted")),
         ))),
         Error::Status { code, headers, .. } => server_cause_from_status(
@@ -795,7 +785,7 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
             parse_retry_after_hint(headers.get(RETRY_AFTER)),
         ),
         Error::Cancelled => Some(Cause::Transport(TransportCause::new(
-            TransportKind::Network,
+            TransportErrorKind::Network,
             Some(DiagnosticText::support_only("request cancelled")),
         ))),
         Error::HopPolicy(_)
@@ -815,7 +805,12 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
 }
 
 fn server_cause_from_status(code: u16, retry_hint: Option<RetryHint>) -> Option<Cause> {
-    match classify_status(code, None, retry_hint, StatusPolicy::default()).cause {
+    match Cause::from(classify_status(
+        code,
+        None,
+        retry_hint,
+        StatusPolicy::default(),
+    )) {
         cause @ Cause::Server(_) => Some(cause),
         _ => None,
     }
@@ -846,7 +841,7 @@ mod retry_hint_tests {
         );
         assert_eq!(
             error.kind(),
-            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+            &bifrost_types::AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
         );
         assert!(error.chain().iter().any(|cause| matches!(cause,
             Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged)));

@@ -3,7 +3,7 @@
 //! answers.
 
 use bifrost_types::{
-    AccountErrorKind, AccountOperation, Cause, CursorScope, ErrorScope, FolderId, ObjectType,
+    AccountErrorKind, AccountOperation, CursorScope, ErrorScope, FolderId, ObjectType,
     ProtocolErrorKind, TransmissionState,
 };
 
@@ -204,12 +204,9 @@ fn a_per_id_translation_failure_names_its_scope_and_the_provider_code() {
         Some(&ErrorScope::Cursor(email_scope("rest-stale")))
     );
     let carries_code = error.chain().iter().any(|cause| {
-        matches!(
-            cause,
-            Cause::Wire(bifrost_types::WireCause::Graph(
+        matches!(cause.wire(), Some(bifrost_types::WireCause::Graph(
                 bifrost_types::GraphSignal::Unknown { code }
-            )) if code == "ErrorInvalidIdMalformed"
-        )
+            )) if code == "ErrorInvalidIdMalformed")
     });
     assert!(carries_code, "the provider code must survive to support");
 }

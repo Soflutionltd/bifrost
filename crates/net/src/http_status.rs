@@ -1,9 +1,8 @@
 //! Shared HTTP status classification and provider-declared refinements.
 
 use bifrost_types::{
-    AccessCause, AccessErrorKind, AccountErrorBuilder, AccountErrorKind, AuthCause, AuthErrorKind,
-    Cause, DiagnosticText, ErrorScope, RequestCause, RequestErrorKind, ResourceKind, RetryHint,
-    ServerCause, ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleBudget, ThrottleScope,
+    AccessCause, AuthCause, DiagnosticText, ErrorScope, PrimaryCause, RequestCause, ResourceKind,
+    RetryHint, ServerCause, StateCause, ThrottleBudget, ThrottleScope,
 };
 
 /// A provider exception to the common HTTP table. Typed response-body signals
@@ -21,31 +20,6 @@ pub enum StatusOverride {
 pub struct StatusPolicy {
     pub resource: Option<ResourceKind>,
     pub overrides: &'static [(u16, StatusOverride)],
-}
-
-#[derive(Clone, Debug)]
-pub struct StatusClass {
-    pub kind: AccountErrorKind,
-    pub cause: Cause,
-    pub throttles: bool,
-}
-
-impl StatusClass {
-    /// Also used after a provider's typed signal overrides the status fallback.
-    #[must_use]
-    pub fn new(kind: AccountErrorKind, cause: Cause) -> Self {
-        let throttles = matches!(
-            kind,
-            AccountErrorKind::Server(
-                ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted
-            )
-        );
-        Self {
-            kind,
-            cause,
-            throttles,
-        }
-    }
 }
 
 /// Status and throttle policy carried through the complete transport funnel.
@@ -68,20 +42,16 @@ impl From<Option<ThrottleScope>> for HttpErrorPolicy {
 impl HttpErrorPolicy {
     /// Stamp provider throttle identity once, only on the final classification.
     #[must_use]
-    pub fn apply_throttle(
-        &self,
-        mut builder: AccountErrorBuilder,
-        throttles: bool,
-    ) -> AccountErrorBuilder {
-        if throttles {
+    pub fn apply_throttle(&self, mut cause: PrimaryCause) -> PrimaryCause {
+        if let Some(throttle) = cause.throttle_mut() {
             if let Some(scope) = self.throttle_scope {
-                builder = builder.throttle_scope(scope);
+                throttle.scope = Some(scope);
             }
             if let Some(budget) = &self.throttle_budget {
-                builder = builder.throttle_budget(budget.clone());
+                throttle.add_budget(budget.clone());
             }
         }
-        builder
+        cause
     }
 }
 
@@ -96,78 +66,64 @@ pub fn classify_status(
     scope: Option<&ErrorScope>,
     retry_hint: Option<RetryHint>,
     policy: StatusPolicy,
-) -> StatusClass {
+) -> PrimaryCause {
     let resource = policy
         .resource
         .or_else(|| scope.and_then(ErrorScope::resource));
     let override_class = policy.overrides.iter().find(|(status, _)| *status == code);
-    let (kind, cause) = match override_class.map(|(_, class)| class) {
-        Some(StatusOverride::ConcurrencyConflict) => (
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
-        ),
-        Some(StatusOverride::CursorInvalid) if matches!(scope, Some(ErrorScope::Cursor(_))) => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-        ),
+    match override_class.map(|(_, class)| class) {
+        Some(StatusOverride::ConcurrencyConflict) => {
+            PrimaryCause::State(StateCause::ConcurrencyConflict)
+        }
+        Some(StatusOverride::CursorInvalid) if matches!(scope, Some(ErrorScope::Cursor(_))) => {
+            PrimaryCause::State(StateCause::CursorInvalid {
+                scope: scope
+                    .and_then(|scope| match scope {
+                        ErrorScope::Cursor(scope) => Some(scope.clone()),
+                        _ => None,
+                    })
+                    .expect("cursor scope checked"),
+            })
+        }
         _ => match code {
-            400 | 422 => (
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed {
-                    detail: DiagnosticText::support_only(format!("HTTP {code} malformed request")),
-                }),
-            ),
-            401 => (
-                AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-                Cause::Auth(AuthCause::ReauthorizationRequired),
-            ),
-            403 => (
-                AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-                Cause::Access(AccessCause::PermissionDenied { resource }),
-            ),
+            400 | 422 => PrimaryCause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(format!("HTTP {code} malformed request")),
+            }),
+            401 => PrimaryCause::Auth(AuthCause::ReauthorizationRequired),
+            403 => PrimaryCause::Access(AccessCause::PermissionDenied { resource }),
             404 if resource.is_some() => {
                 let what = resource.expect("resource checked");
-                (
-                    AccountErrorKind::NotFound(what),
-                    Cause::Request(RequestCause::NotFound {
-                        what,
-                        id: scope.and_then(ErrorScope::object_id).map(str::to_owned),
-                    }),
-                )
+                PrimaryCause::Request(RequestCause::NotFound {
+                    what,
+                    id: scope.and_then(ErrorScope::object_id).map(str::to_owned),
+                })
             }
-            409 | 412 => (
-                AccountErrorKind::ConcurrencyConflict,
-                Cause::State(StateCause::ConcurrencyConflict),
-            ),
+            409 | 412 => PrimaryCause::State(StateCause::ConcurrencyConflict),
             // An enterprise user with an oversized attachment needs a size
             // refusal so they can reduce it, rather than a client-bug report.
-            413 => (
-                AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
-                Cause::Request(RequestCause::PayloadTooLarge {
-                    detail: DiagnosticText::support_only("HTTP 413 payload too large"),
-                }),
-            ),
-            410 if matches!(scope, Some(ErrorScope::Cursor(_))) => (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
-            ),
-            408 | 502 | 503 | 504 => (
-                AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_hint }),
-            ),
-            429 => (
-                AccountErrorKind::Server(ServerErrorKind::RateLimited),
-                Cause::Server(ServerCause::RateLimited { retry_hint }),
-            ),
-            507 => (
-                AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                Cause::Server(ServerCause::QuotaExhausted { retry_hint }),
-            ),
-            _ => (
-                AccountErrorKind::Server(ServerErrorKind::Error { status: Some(code) }),
-                Cause::Server(ServerCause::Error { status: Some(code) }),
-            ),
+            413 => PrimaryCause::Request(RequestCause::PayloadTooLarge {
+                detail: DiagnosticText::support_only("HTTP 413 payload too large"),
+            }),
+            410 if matches!(scope, Some(ErrorScope::Cursor(_))) => {
+                PrimaryCause::State(StateCause::CursorInvalid {
+                    scope: scope
+                        .and_then(|scope| match scope {
+                            ErrorScope::Cursor(scope) => Some(scope.clone()),
+                            _ => None,
+                        })
+                        .expect("cursor scope checked"),
+                })
+            }
+            408 | 502 | 503 | 504 => PrimaryCause::Server(ServerCause::Unavailable { retry_hint }),
+            429 => PrimaryCause::Server(ServerCause::RateLimited {
+                throttle: Default::default(),
+                retry_hint,
+            }),
+            507 => PrimaryCause::Server(ServerCause::QuotaExhausted {
+                throttle: Default::default(),
+                retry_hint,
+            }),
+            _ => PrimaryCause::Server(ServerCause::Error { status: Some(code) }),
         },
-    };
-    StatusClass::new(kind, cause)
+    }
 }

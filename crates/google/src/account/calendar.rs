@@ -685,10 +685,9 @@ fn decode_cross_calendar_cursor(
         .iter()
         .position(|candidate| candidate == &calendar_id)
         .ok_or_else(|| {
-            bifrost_types::AccountErrorBuilder::new(
-                bifrost_types::AccountErrorKind::ConcurrencyConflict,
-                bifrost_types::Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-            )
+            bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::State(
+                bifrost_types::StateCause::ConcurrencyConflict,
+            ))
             .push_cause(bifrost_types::Cause::Attempt(
                 bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Unsent),
             ))
@@ -2450,7 +2449,7 @@ mod tests {
             error
                 .chain()
                 .iter()
-                .any(|cause| matches!(cause, Cause::Wire(WireCause::GoogleCalendar(_))))
+                .any(|cause| matches!(cause.wire(), Some(WireCause::GoogleCalendar(_))))
         );
 
         let requests = script.requests();

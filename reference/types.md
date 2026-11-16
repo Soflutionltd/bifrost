@@ -950,3 +950,15 @@ it and `try_build` rejects it on other kinds. It lets an enterprise client expla
 which feature or request shape is unavailable without parsing support prose.
 Ledger vocabulary version 14 appends request subkind tags 2 and 3. Historical
 rows keep their existing bytes and reject those tags before version 14.
+
+## Cause-owned error construction
+
+`AccountErrorBuilder::new` accepts `PrimaryCause`, which excludes bare attempts
+and unclassified wire evidence. Its exhaustive `kind()` projection owns the
+public kind; protocol primary causes retain their subkind and wire payload.
+`TransportErrorKind` is shared by transport causes and classifications.
+Rate/quota causes carry `Throttle`; scope-directed state causes require
+`CursorScope`. Decoration and partial-commit evidence retain their existing
+fallible validation. See `reference/error-model.md` for the construction and
+rebinding contracts. Stored ledger kind tags and diagnostic bytes are unchanged;
+this reshapes live construction, not persisted vocabulary.

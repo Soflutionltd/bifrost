@@ -21,21 +21,21 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use bifrost_types::{
-    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountFactory, AccountFuture, AccountId, AccountStream, AttachmentHandle, Batch,
-    BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor,
-    Checkpoint, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
-    ContactSearchRequest, ContainerId, ContainerKind, ConvenienceShape, CursorDescriptor,
-    CursorEstablishment, CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate,
-    EventId, EventPatch, EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp,
-    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEvent, InventoryPartition, InventoryPartitioning,
-    ItemOutcome, MembershipScope, Message, MutationCapabilities, MutationConcurrency,
-    MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page,
-    Priority, Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass,
-    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
-    ThreadHydration, ThreadId, VacationConfig,
+    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountFactory, AccountFuture,
+    AccountId, AccountStream, AttachmentHandle, Batch, BatchingPolicy, BlobHandle,
+    BlobRangeSupport, ByteRange, Change, ChangeCursor, Checkpoint, CloudUploadMeta, ContactCard,
+    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, ContainerId, ContainerKind,
+    ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope,
+    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
+    FilterRuleShape, FilterValidation, FlagOp, HostedAttachment, HydratedObject,
+    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
+    InventoryEvent, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
+    Message, MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
+    MutationTarget, ObjectId, OpaqueChangeState, Page, PrimaryCause, Priority, Projection,
+    ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RsvpStatus,
+    ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
+    VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -44,10 +44,9 @@ use futures::StreamExt;
 use futures::stream;
 
 pub fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(op),
-        Cause::Request(bifrost_types::RequestCause::Unsupported { operation: op }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(
+        bifrost_types::RequestCause::Unsupported { operation: op },
+    ))
     .operation(op)
     .try_build()
     .expect("valid account error classification")
@@ -56,13 +55,10 @@ pub fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
 /// A classified transport failure for a provider that refuses to close. There
 /// is no `AccountOperation::Close`, so this is tagged by its cause alone.
 pub fn close_refused() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
-        Cause::Transport(bifrost_types::TransportCause::new(
-            bifrost_types::TransportKind::Network,
-            None,
-        )),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Transport(bifrost_types::TransportCause::new(
+        bifrost_types::TransportErrorKind::Network,
+        None,
+    )))
     .try_build()
     .expect("valid account error classification")
 }
@@ -70,13 +66,10 @@ pub fn close_refused() -> AccountError {
 /// A classified transport failure for a provider that could not delete a push
 /// subscription - a Graph 503 on the DELETE, a JMAP socket that died.
 pub fn push_teardown_refused() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
-        Cause::Transport(bifrost_types::TransportCause::new(
-            bifrost_types::TransportKind::Network,
-            None,
-        )),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Transport(bifrost_types::TransportCause::new(
+        bifrost_types::TransportErrorKind::Network,
+        None,
+    )))
     .try_build()
     .expect("valid account error classification")
 }

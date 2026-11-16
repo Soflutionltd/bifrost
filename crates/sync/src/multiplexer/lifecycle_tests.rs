@@ -1,8 +1,5 @@
 use super::*;
-use bifrost_types::{
-    AccountErrorBuilder, AccountErrorKind, AccountOperation, AuthCause, AuthErrorKind, Cause,
-    StateCause, SyncStateErrorKind,
-};
+use bifrost_types::{AccountErrorBuilder, AccountOperation, AuthCause, PrimaryCause, StateCause};
 
 use crate::delivery::tests::{account_change_checkpoint, lag_test_control, lag_test_control_over};
 use crate::multiplexer::tests::{scope_tokens, track};
@@ -67,14 +64,9 @@ async fn a_lifecycle_termination_is_stamped_with_its_streams_incarnation() {
         .lock()
         .expect("scripts")
         .push_back(vec![bifrost_types::ScopeLifecycleEvent::Terminated(
-            bifrost_types::AccountErrorBuilder::new(
-                bifrost_types::AccountErrorKind::SyncState(
-                    bifrost_types::SyncStateErrorKind::CapabilityChanged,
-                ),
-                bifrost_types::Cause::State(bifrost_types::StateCause::CapabilityChanged {
-                    delta: None,
-                }),
-            )
+            bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::State(
+                bifrost_types::StateCause::CapabilityChanged { delta: None },
+            ))
             .try_build()
             .expect("restart error"),
         )]);
@@ -404,13 +396,13 @@ async fn lifecycle_retry_records_hold_and_honours_hint_without_shortening_backof
     let account = AccountId("lifecycle".into());
     let throttles = crate::throttle::ThrottleBucket::default();
     for (hint, expected) in [(600, 600), (1, 30)] {
-        let error = AccountErrorBuilder::new(
-            AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),
-            Cause::Server(bifrost_types::ServerCause::RateLimited {
+        let error = AccountErrorBuilder::new(PrimaryCause::Server(
+            bifrost_types::ServerCause::RateLimited {
+                throttle: Default::default(),
                 retry_hint: Some(bifrost_types::RetryHint::After(Duration::from_secs(hint))),
-            }),
-        )
-        .throttle_scope(bifrost_types::ThrottleScope::Account)
+            },
+        ))
+        .with_throttle(|throttle| throttle.scope = Some(bifrost_types::ThrottleScope::Account))
         .try_build()
         .expect("valid lifecycle throttle");
         assert_eq!(
@@ -431,13 +423,10 @@ async fn lifecycle_retry_records_hold_and_honours_hint_without_shortening_backof
 
 #[test]
 fn lifecycle_terminal_errors_do_not_reconnect_or_reopen() {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::Authentication(AuthErrorKind::Expired),
-        Cause::Auth(AuthCause::Expired),
-    )
-    .operation(AccountOperation::SyncChanges)
-    .try_build()
-    .expect("valid terminal authentication error");
+    let error = AccountErrorBuilder::new(PrimaryCause::Auth(AuthCause::Expired))
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid terminal authentication error");
 
     assert_eq!(
         lifecycle_termination(&error),
@@ -450,10 +439,9 @@ fn lifecycle_terminal_errors_do_not_reconnect_or_reopen() {
 /// reopen that never succeeds cannot silence lifecycle observation.
 #[test]
 fn lifecycle_account_reopen_errors_wait_for_the_generation_change() {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged { delta: None }),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::State(StateCause::CapabilityChanged {
+        delta: None,
+    }))
     .operation(AccountOperation::SyncChanges)
     .try_build()
     .expect("valid account-reopen recovery error");
@@ -469,13 +457,10 @@ fn lifecycle_account_reopen_errors_wait_for_the_generation_change() {
 /// process lifetime. Hand the error over once, then reconnect on backoff.
 #[test]
 fn lifecycle_non_reopen_directives_reconnect_instead_of_parking() {
-    let schema = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-        Cause::State(StateCause::SchemaIncompatible),
-    )
-    .operation(AccountOperation::SyncChanges)
-    .try_build()
-    .expect("valid schema recovery error");
+    let schema = AccountErrorBuilder::new(PrimaryCause::State(StateCause::SchemaIncompatible))
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid schema recovery error");
     assert_eq!(
         lifecycle_termination(&schema),
         LifecycleTermination::ForwardAndReconnect

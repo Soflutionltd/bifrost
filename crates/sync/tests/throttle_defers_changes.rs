@@ -31,9 +31,9 @@ use std::time::Duration;
 
 use bifrost_sync::{EngineConfig, MultiplexerConfig, SyncEngine};
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountId,
-    AccountOperation, AttemptCause, Cause, Change, ChangeCursor, CursorScope, ObjectType,
-    ServerCause, ServerErrorKind, SyncEvent, ThrottleScope, TransmissionState,
+    AccountError, AccountErrorBuilder, AccountFactory, AccountId, AccountOperation, AttemptCause,
+    Cause, Change, ChangeCursor, CursorScope, ObjectType, PrimaryCause, ServerCause, SyncEvent,
+    ThrottleScope, TransmissionState,
 };
 
 /// The scope that fails. Its terminations carry the provider deadline.
@@ -50,17 +50,15 @@ const POLL: Duration = Duration::from_secs(1);
 const RETRY_AFTER: Duration = Duration::from_secs(300);
 
 fn throttled(scope: ThrottleScope, after: Duration) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited {
-            retry_hint: Some(bifrost_types::RetryHint::After(after)),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+        throttle: Default::default(),
+        retry_hint: Some(bifrost_types::RetryHint::After(after)),
+    }))
     // Unsent, so the classification is `Retry` (the poll loop's throttle
     // recorder arm) rather than the mid-flight `Reconcile` a send would get.
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(AccountOperation::SyncChanges)
-    .throttle_scope(scope)
+    .with_throttle(|throttle| throttle.scope = Some(scope))
     .try_build()
     .expect("valid account error")
 }

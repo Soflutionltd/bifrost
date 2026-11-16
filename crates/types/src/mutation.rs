@@ -379,15 +379,14 @@ impl FlagOp {
         protocol: crate::error::Protocol,
     ) -> Result<(), crate::error::AccountError> {
         self.validate().map_err(|error| {
-            crate::error::AccountErrorBuilder::new(
-                crate::error::AccountErrorKind::Request(crate::error::RequestErrorKind::Malformed),
-                crate::error::Cause::Request(crate::error::RequestCause::InvalidArgument {
+            crate::error::AccountErrorBuilder::new(crate::error::PrimaryCause::Request(
+                crate::error::RequestCause::InvalidArgument {
                     field: Some("flags"),
                     message: Some(crate::error::DiagnosticText::support_only(
                         error.to_string(),
                     )),
-                }),
-            )
+                },
+            ))
             .operation(crate::error::AccountOperation::UpdateFlags)
             .protocol(protocol)
             .try_build()

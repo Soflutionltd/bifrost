@@ -2,6 +2,8 @@ use crate::dialect::CalDavDialect;
 #[cfg(test)]
 use crate::parse::CalDavMultigetReport;
 use bifrost_dav_core::collection::{DavCollectionClient, Dialect, MultigetFetch, QUERY_HREF_PROPS};
+#[cfg(test)]
+use bifrost_types::{AccountErrorKind, Cause, SyncStateErrorKind};
 use std::fmt;
 
 pub(crate) use bifrost_dav_core::PutCondition;
@@ -9,8 +11,8 @@ use bifrost_dav_core::{CALDAV_NAMESPACE, DavDispatch, DavProtocol, escape_xml};
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery};
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    DiagnosticText, ErrorScope, FolderId, ObjectType, Protocol, StateCause, SyncStateErrorKind,
+    AccountError, AccountErrorBuilder, AccountOperation, CursorScope, DiagnosticText, ErrorScope,
+    FolderId, ObjectType, PrimaryCause, Protocol, StateCause,
 };
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Method, StatusCode};
@@ -569,10 +571,12 @@ fn cursor_invalid_error(calendar_url: &str, status: StatusCode, body: String) ->
     // Restart exactly the collection/type cursor discovery advertises. An
     // enterprise user's expired calendar token must rebuild that calendar,
     // rather than poll the same stale token forever under a different key.
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-        Cause::State(StateCause::CursorInvalid),
-    )
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::State(StateCause::CursorInvalid {
+        scope: CursorScope::FolderType {
+            folder: FolderId(calendar_url.to_string()),
+            ty: ObjectType::CalendarEvent,
+        },
+    }))
     .protocol(Protocol::CalDav)
     .operation(AccountOperation::SyncChanges)
     .scope(ErrorScope::Cursor(CursorScope::FolderType {

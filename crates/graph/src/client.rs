@@ -1388,16 +1388,13 @@ struct OutlookAuth {
 /// An enterprise Outlook user cannot repair either by changing caller input or
 /// reauthorizing the Graph token, so both are `SyncState(OperatorOverrideNeeded)`.
 fn outlook_configuration_refusal(reason: String) -> bifrost_net::Error {
-    let error = bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::SyncState(
-            bifrost_types::SyncStateErrorKind::OperatorOverrideNeeded,
-        ),
-        bifrost_types::Cause::State(bifrost_types::StateCause::OperatorOverrideNeeded {
+    let error = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::State(
+        bifrost_types::StateCause::OperatorOverrideNeeded {
             reason: bifrost_types::OperatorOverrideReason::OutlookConfiguration {
                 detail: bifrost_types::DiagnosticText::support_only(reason),
             },
-        }),
-    )
+        },
+    ))
     .protocol(bifrost_types::Protocol::Ews)
     .provider(bifrost_types::Provider::Microsoft)
     .try_build()

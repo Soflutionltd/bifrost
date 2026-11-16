@@ -269,15 +269,13 @@ fn hold_until_rfc3339(at: std::time::SystemTime) -> Result<String, AccountError>
 
 fn submission_invalid(detail: &str) -> AccountError {
     use bifrost_types::{
-        AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, DiagnosticText, Protocol,
-        RequestCause, RequestErrorKind,
+        AccountErrorBuilder, AccountOperation, DiagnosticText, Protocol, RequestCause,
     };
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
+    AccountErrorBuilder::new(bifrost_types::PrimaryCause::Request(
+        RequestCause::Malformed {
             detail: DiagnosticText::support_only(detail),
-        }),
-    )
+        },
+    ))
     // The SMTP facade owns envelope and HOLDUNTIL validation, even when
     // composed into IMAP. Support needs the failing transport vocabulary.
     .protocol(Protocol::Smtp)

@@ -9,8 +9,8 @@
 use bifrost_types::ServerCause;
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause, Cause,
-    DiagnosticText, Protocol, ProtocolErrorKind, RequestCause, RequestErrorKind, ResourceKind,
-    ServerErrorKind, TransmissionState, TransportCause, TransportErrorKind, TransportKind,
+    DiagnosticText, PrimaryCause, Protocol, ProtocolErrorKind, RequestCause, RequestErrorKind,
+    ResourceKind, ServerErrorKind, TransmissionState, TransportCause, TransportErrorKind,
     WireCause,
 };
 use reqwest::StatusCode;
@@ -111,13 +111,10 @@ pub fn not_found_error(
     protocol: DavProtocol,
 ) -> AccountError {
     // Always about one item resource the server returned.
-    AccountErrorBuilder::new(
-        AccountErrorKind::NotFound(protocol.item_resource()),
-        Cause::Request(RequestCause::NotFound {
-            what: protocol.item_resource(),
-            id: Some(id.into()),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::NotFound {
+        what: protocol.item_resource(),
+        id: Some(id.into()),
+    }))
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )))
@@ -148,13 +145,13 @@ pub fn missing_field_error(
     message: impl Into<String>,
     protocol: DavProtocol,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
-        Cause::Wire(WireCause::MalformedResponse {
+    AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::MissingField,
+        wire: WireCause::MalformedResponse {
             protocol: protocol.protocol(),
             detail: Some(DiagnosticText::support_only(message)),
-        }),
-    )
+        },
+    })
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )))
@@ -170,13 +167,10 @@ pub fn local_error(
     message: impl Into<String>,
     protocol: DavProtocol,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some(protocol.field()),
-            message: Some(DiagnosticText::support_only(message)),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::InvalidArgument {
+        field: Some(protocol.field()),
+        message: Some(DiagnosticText::support_only(message)),
+    }))
     .protocol(protocol.protocol())
     .operation(operation)
     .try_build()
@@ -197,13 +191,13 @@ pub fn parse_error(
     message: impl Into<String>,
     protocol: DavProtocol,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-        Cause::Wire(WireCause::MalformedResponse {
+    AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::ParseFailed,
+        wire: WireCause::MalformedResponse {
             protocol: protocol.protocol(),
             detail: Some(DiagnosticText::support_only(message)),
-        }),
-    )
+        },
+    })
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )))
@@ -231,13 +225,10 @@ pub fn transport_error(
     message: impl Into<String>,
     protocol: DavProtocol,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(
-            TransportKind::Network,
-            Some(DiagnosticText::support_only(message)),
-        )),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+        TransportErrorKind::Network,
+        Some(DiagnosticText::support_only(message)),
+    )))
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .protocol(protocol.protocol())
     .operation(operation)
@@ -256,13 +247,13 @@ pub fn response_read_error(
     message: String,
     protocol: DavProtocol,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::MalformedResponse {
+    AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::PartialResponse,
+        wire: WireCause::MalformedResponse {
             protocol: protocol.protocol(),
             detail: Some(DiagnosticText::support_only(message)),
-        }),
-    )
+        },
+    })
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )))
@@ -338,14 +329,14 @@ fn status_error_for(
         bifrost_net::request::parse_retry_after_hint(headers.get(reqwest::header::RETRY_AFTER));
     let policy = http_error_policy(resource);
     let class = bifrost_net::classify_status(status.as_u16(), None, retry_hint, policy.status);
-    let builder = AccountErrorBuilder::new(class.kind, class.cause)
+    let builder = AccountErrorBuilder::new(policy.apply_throttle(class))
         .push_cause(Cause::Attempt(AttemptCause::new(
             TransmissionState::Acknowledged,
         )))
         .protocol(protocol.protocol())
         .operation(operation)
         .status(Some(status.as_u16()));
-    let mut builder = policy.apply_throttle(builder, class.throttles);
+    let mut builder = builder;
     let body = body.trim();
     if !body.is_empty() {
         builder = builder.text(DiagnosticText::support_only(body.to_string()));
@@ -536,9 +527,9 @@ mod tests {
                 );
                 let hint = Some(RetryHint::After(std::time::Duration::from_secs(300)));
                 assert!(error.chain().iter().any(|cause| matches!(cause,
-                    Cause::Server(ServerCause::RateLimited { retry_hint }
+                    Cause::Server(ServerCause::RateLimited { throttle: _,  retry_hint }
                         | ServerCause::Unavailable { retry_hint }
-                        | ServerCause::QuotaExhausted { retry_hint }) if *retry_hint == hint)));
+                        | ServerCause::QuotaExhausted { throttle: _,  retry_hint }) if *retry_hint == hint)));
                 let RecoveryClass::Retry(advice) = error.recovery() else {
                     panic!("temporary/quota status must retain retry advice: {error:?}");
                 };
@@ -590,9 +581,9 @@ mod tests {
                         protocol,
                     );
                     assert!(error.chain().iter().any(|cause| matches!(cause,
-                        Cause::Server(ServerCause::RateLimited { retry_hint }
+                        Cause::Server(ServerCause::RateLimited { throttle: _,  retry_hint }
                             | ServerCause::Unavailable { retry_hint }
-                            | ServerCause::QuotaExhausted { retry_hint }) if *retry_hint == hint)));
+                            | ServerCause::QuotaExhausted { throttle: _,  retry_hint }) if *retry_hint == hint)));
                     let RecoveryClass::Retry(advice) = error.recovery() else {
                         panic!("temporary/quota status must retain retry advice: {error:?}");
                     };

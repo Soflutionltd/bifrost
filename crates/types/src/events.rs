@@ -570,10 +570,7 @@ impl InventoryCompletion {
 mod inventory_completion_tests {
     use super::*;
     use crate::coverage::{InventoryObligation, ObligationKey, RegionRecovery};
-    use crate::error::{
-        AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, RequestCause,
-        RequestErrorKind,
-    };
+    use crate::error::{AccountErrorBuilder, DiagnosticText, PrimaryCause, RequestCause};
 
     fn checkpoint() -> Checkpoint {
         Checkpoint::Backfill(BackfillCheckpoint {
@@ -586,12 +583,9 @@ mod inventory_completion_tests {
     }
 
     fn with_barrier() -> InventoryCoverageReport {
-        let error = AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("barrier"),
-            }),
-        )
+        let error = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("barrier"),
+        }))
         .try_build()
         .expect("valid error");
         InventoryCoverageReport::degraded(

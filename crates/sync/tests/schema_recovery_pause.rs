@@ -25,9 +25,9 @@ use std::time::Duration;
 
 use bifrost_sync::{CheckpointStore, InMemoryCheckpointStore, SyncEngine};
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountId,
-    AccountOperation, Cause, Change, ChangeCursor, Control, CursorScope, FolderId, MembershipScope,
-    ObjectType, ScopeLifecycle, ScopeLifecycleEvent, StateCause, SyncEvent, SyncStateErrorKind,
+    AccountError, AccountErrorBuilder, AccountFactory, AccountId, AccountOperation, Change,
+    ChangeCursor, Control, CursorScope, FolderId, MembershipScope, ObjectType, PrimaryCause,
+    ScopeLifecycle, ScopeLifecycleEvent, StateCause, SyncEvent,
 };
 
 use common::{StubAccount, StubFactory};
@@ -44,13 +44,10 @@ const POLL_CADENCE_PASSED: Duration = Duration::from_secs(200);
 
 /// Derives `Engine(SchemaIncompatible)`.
 fn schema_incompatible() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-        Cause::State(StateCause::SchemaIncompatible),
-    )
-    .operation(AccountOperation::SyncChanges)
-    .try_build()
-    .expect("valid account error classification")
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::SchemaIncompatible))
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// An account with two scopes whose changes stream terminates with a schema

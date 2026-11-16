@@ -30,8 +30,7 @@ use base64::engine::general_purpose::STANDARD;
 
 use crate::compose::{Address, AttachmentInline, SendRequest};
 use crate::error::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, DiagnosticText,
-    RequestCause, RequestErrorKind,
+    AccountError, AccountErrorBuilder, AccountOperation, DiagnosticText, PrimaryCause, RequestCause,
 };
 
 /// Bifrost's own reverse-path / recipient pair, in `Address` space.
@@ -629,12 +628,9 @@ fn unsupported(operation: AccountOperation) -> AccountError {
 // the consuming crate stamps its protocol via the account-boundary
 // context as the error propagates.
 fn malformed(detail: &str) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(detail),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only(detail),
+    }))
     .operation(AccountOperation::Send)
     .try_build()
     .expect("valid account error classification")
@@ -744,7 +740,7 @@ mod tests {
             .expect_err("uploaded handles rejected");
         assert_eq!(
             *err.kind(),
-            AccountErrorKind::Unsupported(AccountOperation::AttachmentUpload)
+            crate::error::AccountErrorKind::Unsupported(AccountOperation::AttachmentUpload)
         );
     }
 
@@ -758,7 +754,7 @@ mod tests {
             .expect_err("no recipient");
         assert_eq!(
             *err.kind(),
-            AccountErrorKind::Request(RequestErrorKind::Malformed)
+            crate::error::AccountErrorKind::Request(crate::error::RequestErrorKind::Malformed)
         );
     }
 
@@ -997,7 +993,7 @@ mod tests {
         let err = format_rfc5322_date(ts).expect_err("pre-1900 rejected");
         assert_eq!(
             *err.kind(),
-            AccountErrorKind::Request(RequestErrorKind::Malformed)
+            crate::error::AccountErrorKind::Request(crate::error::RequestErrorKind::Malformed)
         );
     }
 

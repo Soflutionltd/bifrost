@@ -3,15 +3,13 @@ use crate::error::*;
 use std::time::Duration;
 
 fn throttle() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited {
-            retry_hint: Some(RetryHint::After(Duration::from_secs(37))),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+        throttle: Default::default(),
+        retry_hint: Some(RetryHint::After(Duration::from_secs(37))),
+    }))
     .operation(AccountOperation::EventUpdate)
-    .throttle_scope(ThrottleScope::Mailbox)
-    .throttle_budget(ThrottleBudget::new("budget"))
+    .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Mailbox))
+    .with_throttle(|throttle| throttle.add_budget(ThrottleBudget::new("budget")))
     .try_build()
     .unwrap()
 }
@@ -84,13 +82,10 @@ fn partial_commit_local_refusal_after_blocking_prefix_is_terminal() {
 }
 #[test]
 fn partial_commit_uncertain_blocking_leg_allows_send_after_observation() {
-    let leaf = AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause {
-            kind: TransportKind::Network,
-            message: None,
-        }),
-    )
+    let leaf = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause {
+        kind: TransportErrorKind::Network,
+        message: None,
+    }))
     .operation(AccountOperation::Send)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::InFlight,
@@ -247,10 +242,10 @@ fn partial_commit_dedupe_follows_the_record_not_the_table() {
             matches!(effect, StepEffect::Created | StepEffect::Submitted)
         );
     }
-    let leaf = classified(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::Jmap(JmapMethod::ServerPartialFail)),
-    );
+    let leaf = classified(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::PartialResponse,
+        wire: WireCause::Jmap(JmapMethod::ServerPartialFail),
+    });
     assert!(
         matches!(leaf.recovery(),RecoveryClass::Reconcile(a) if a.guidance.actions.contains(&ReconcileAction::DedupeByClientId))
     );
@@ -354,8 +349,8 @@ fn partial_commit_telemetry_summary_has_no_targets() {
     );
 }
 
-fn classified(kind: AccountErrorKind, cause: Cause) -> AccountError {
-    AccountErrorBuilder::new(kind, cause)
+fn classified(cause: PrimaryCause) -> AccountError {
+    AccountErrorBuilder::new(cause)
         .operation(AccountOperation::Send)
         .try_build()
         .unwrap()
@@ -363,14 +358,10 @@ fn classified(kind: AccountErrorKind, cause: Cause) -> AccountError {
 #[test]
 fn partial_commit_auth_and_permission_legs_stay_barriers() {
     for leaf in [
-        classified(
-            AccountErrorKind::Authentication(AuthErrorKind::Revoked),
-            Cause::Auth(AuthCause::Revoked),
-        ),
-        classified(
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied { resource: None }),
-        ),
+        classified(PrimaryCause::Auth(AuthCause::Revoked)),
+        classified(PrimaryCause::Access(AccessCause::PermissionDenied {
+            resource: None,
+        })),
     ] {
         let error = attach(leaf.clone(), StepReplay::Blocking, StepEffect::Copied);
         assert_eq!(error.recovery(), leaf.recovery());
@@ -378,13 +369,13 @@ fn partial_commit_auth_and_permission_legs_stay_barriers() {
 }
 #[test]
 fn partial_commit_unreadable_blocking_leg_requires_a_check() {
-    let leaf = AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-        Cause::Wire(WireCause::MalformedResponse {
+    let leaf = AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::ParseFailed,
+        wire: WireCause::MalformedResponse {
             protocol: Protocol::Jmap,
             detail: None,
-        }),
-    )
+        },
+    })
     .operation(AccountOperation::Send)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
@@ -424,13 +415,13 @@ fn partial_commit_unreadable_blocking_leg_requires_a_check() {
 #[test]
 fn partial_commit_unreadable_success_answer_is_uncertain() {
     let leaf = |attempt: AttemptCause| {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-            Cause::Wire(WireCause::MalformedResponse {
+        AccountErrorBuilder::new(PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::ParseFailed,
+            wire: WireCause::MalformedResponse {
                 protocol: Protocol::Gmail,
                 detail: None,
-            }),
-        )
+            },
+        })
         .operation(AccountOperation::EventUpdate)
         .push_cause(Cause::Attempt(attempt))
         .try_build()
@@ -496,14 +487,8 @@ fn partial_commit_unreadable_success_answer_is_uncertain() {
 }
 #[test]
 fn partial_commit_mixed_sibling_prerequisites_keep_both_in_plan() {
-    let leaf = classified(
-        AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient),
-        Cause::Auth(AuthCause::RefreshTransient),
-    );
-    let conflict = classified(
-        AccountErrorKind::ConcurrencyConflict,
-        Cause::State(StateCause::ConcurrencyConflict),
-    );
+    let leaf = classified(PrimaryCause::Auth(AuthCause::RefreshTransient));
+    let conflict = classified(PrimaryCause::State(StateCause::ConcurrencyConflict));
     let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
         StepEffect::Updated,
         StepTargets::unknown(),
@@ -530,14 +515,10 @@ fn partial_commit_mixed_sibling_prerequisites_keep_both_in_plan() {
 }
 #[test]
 fn partial_commit_distinct_sibling_directives_are_all_planned() {
-    let leaf = classified(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged { delta: None }),
-    );
-    let sibling = classified(
-        AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-        Cause::State(StateCause::SchemaIncompatible),
-    );
+    let leaf = classified(PrimaryCause::State(StateCause::CapabilityChanged {
+        delta: None,
+    }));
+    let sibling = classified(PrimaryCause::State(StateCause::SchemaIncompatible));
     let mut record = PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
     record.failed_sibling(
         None,
@@ -555,10 +536,9 @@ fn partial_commit_distinct_sibling_directives_are_all_planned() {
 }
 #[test]
 fn partial_commit_directive_does_not_lift_never() {
-    let leaf = classified(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged { delta: None }),
-    );
+    let leaf = classified(PrimaryCause::State(StateCause::CapabilityChanged {
+        delta: None,
+    }));
     let error = attach(leaf, StepReplay::Blocking, StepEffect::Moved);
     // A committed Blocking step keeps the reconcile at the head: performing
     // the directive and replaying would repeat the move.
@@ -572,17 +552,13 @@ fn partial_commit_directive_does_not_lift_never() {
 }
 #[test]
 fn partial_commit_gating_leg_keeps_directive_off_the_headline() {
-    let leaf = classified(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged { delta: None }),
-    );
-    let sibling = AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause {
-            kind: TransportKind::Network,
-            message: None,
-        }),
-    )
+    let leaf = classified(PrimaryCause::State(StateCause::CapabilityChanged {
+        delta: None,
+    }));
+    let sibling = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause {
+        kind: TransportErrorKind::Network,
+        message: None,
+    }))
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::InFlight,
     )))
@@ -635,10 +611,9 @@ fn partial_commit_terminal_sibling_bars_reassertion() {
 }
 #[test]
 fn partial_commit_permission_barrier_outranks_gating() {
-    let permission = classified(
-        AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-        Cause::Access(AccessCause::PermissionDenied { resource: None }),
-    );
+    let permission = classified(PrimaryCause::Access(AccessCause::PermissionDenied {
+        resource: None,
+    }));
     let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
         StepEffect::Submitted,
         StepTargets::unknown(),
@@ -665,10 +640,10 @@ fn partial_commit_permission_barrier_outranks_gating() {
 }
 #[test]
 fn partial_commit_internal_failure_after_send_is_a_barrier() {
-    let leaf = AccountErrorBuilder::new(
-        AccountErrorKind::Internal(InternalErrorKind::Panicked),
-        Cause::Internal(InternalCause::new(InternalErrorKind::Panicked, None)),
-    )
+    let leaf = AccountErrorBuilder::new(PrimaryCause::Internal(InternalCause::new(
+        InternalErrorKind::Panicked,
+        None,
+    )))
     .operation(AccountOperation::Send)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::InFlight,
@@ -690,10 +665,10 @@ fn partial_commit_internal_failure_after_send_is_a_barrier() {
 }
 #[test]
 fn partial_commit_projected_retry_keeps_quota_reason() {
-    let leaf = classified(
-        AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-        Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
-    );
+    let leaf = classified(PrimaryCause::Server(ServerCause::QuotaExhausted {
+        throttle: Default::default(),
+        retry_hint: None,
+    }));
     let error = attach(leaf, StepReplay::Repeatable, StepEffect::Created);
     assert!(
         matches!(error.recovery(), RecoveryClass::Retry(a) if a.reason == RetryReason::QuotaExhausted)
@@ -763,59 +738,32 @@ fn partial_commit_effectless_read_after_blocking_create_is_protected() {
 #[test]
 fn partial_commit_application_from_leaf_always_validates() {
     let cases = vec![
-        (
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-        ),
-        (
-            AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient),
-            Cause::Auth(AuthCause::RefreshTransient),
-        ),
-        (
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied { resource: None }),
-        ),
-        (
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-        ),
-        (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged { delta: None }),
-        ),
-        (
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
-        ),
-        (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("bad request"),
-            }),
-        ),
-        (
-            AccountErrorKind::NotFound(ResourceKind::Message),
-            Cause::Request(RequestCause::NotFound {
-                what: ResourceKind::Message,
-                id: None,
-            }),
-        ),
-        (
-            AccountErrorKind::Unsupported(AccountOperation::Send),
-            Cause::Request(RequestCause::Unsupported {
-                operation: AccountOperation::Send,
-            }),
-        ),
-        (
-            AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-            Cause::Wire(WireCause::Jmap(JmapMethod::ServerPartialFail)),
-        ),
-        (
-            AccountErrorKind::Internal(InternalErrorKind::Panicked),
-            Cause::Internal(InternalCause::new(InternalErrorKind::Panicked, None)),
-        ),
+        PrimaryCause::Transport(TransportCause::new(TransportErrorKind::Network, None)),
+        PrimaryCause::Auth(AuthCause::RefreshTransient),
+        PrimaryCause::Access(AccessCause::PermissionDenied { resource: None }),
+        PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: None,
+        }),
+        PrimaryCause::State(StateCause::CapabilityChanged { delta: None }),
+        PrimaryCause::State(StateCause::ConcurrencyConflict),
+        PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("bad request"),
+        }),
+        PrimaryCause::Request(RequestCause::NotFound {
+            what: ResourceKind::Message,
+            id: None,
+        }),
+        PrimaryCause::Request(RequestCause::Unsupported {
+            operation: AccountOperation::Send,
+        }),
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::PartialResponse,
+            wire: WireCause::Jmap(JmapMethod::ServerPartialFail),
+        },
+        PrimaryCause::Internal(InternalCause::new(InternalErrorKind::Panicked, None)),
     ];
-    for (kind, cause) in cases {
+    for cause in cases {
         for attempt in [
             None,
             Some(TransmissionState::Unsent),
@@ -823,8 +771,7 @@ fn partial_commit_application_from_leaf_always_validates() {
             Some(TransmissionState::Acknowledged),
         ] {
             for op in [AccountOperation::Send, AccountOperation::UpdateFlags] {
-                let mut builder =
-                    AccountErrorBuilder::new(kind.clone(), cause.clone()).operation(op);
+                let mut builder = AccountErrorBuilder::new(cause.clone()).operation(op);
                 if let Some(state) = attempt {
                     builder = builder.push_cause(Cause::Attempt(AttemptCause::new(state)));
                 }
@@ -894,10 +841,10 @@ fn partial_commit_validation_rejects_inconsistent_records() {
         build(record),
         AccountErrorBuildError::PartialCommitApplication { .. }
     ));
-    let leaf = AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-    )
+    let leaf = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+        TransportErrorKind::Network,
+        None,
+    )))
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::InFlight,
     )))
@@ -915,10 +862,10 @@ fn partial_commit_validation_rejects_inconsistent_records() {
         build(record),
         AccountErrorBuildError::PartialCommitApplication { .. }
     ));
-    let unsent = AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-    )
+    let unsent = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+        TransportErrorKind::Network,
+        None,
+    )))
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .try_build()
     .unwrap();
@@ -1097,10 +1044,10 @@ fn partial_commit_validation_rejects_inconsistent_records() {
 }
 #[test]
 fn partial_commit_transport_drop_after_blocking_prefix_reconciles() {
-    let leaf = AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-    )
+    let leaf = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+        TransportErrorKind::Network,
+        None,
+    )))
     .operation(AccountOperation::EventUpdate)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::InFlight,
@@ -1119,10 +1066,10 @@ fn partial_commit_transport_drop_after_blocking_prefix_reconciles() {
 }
 #[test]
 fn partial_commit_unconfirmed_cleanup_of_a_gating_leg_is_not_residual() {
-    let drop = AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-    )
+    let drop = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+        TransportErrorKind::Network,
+        None,
+    )))
     .operation(AccountOperation::Send)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::InFlight,
@@ -1154,10 +1101,10 @@ fn partial_commit_unconfirmed_cleanup_of_a_gating_leg_is_not_residual() {
 }
 #[test]
 fn partial_commit_repeatable_commit_keeps_the_leg_reason() {
-    let leaf = AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-    )
+    let leaf = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+        TransportErrorKind::Network,
+        None,
+    )))
     .operation(AccountOperation::Send)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::InFlight,

@@ -1468,8 +1468,8 @@ mod tests {
         // A People failure carries the People wire signal, not Gmail's: it is
         // not a Gmail fault and must not send the user to grant mail permissions.
         assert!(error.chain().iter().any(|cause| matches!(
-            cause,
-            bifrost_types::Cause::Wire(bifrost_types::WireCause::GooglePeople(_))
+            cause.wire(),
+            Some(bifrost_types::WireCause::GooglePeople(_))
         )));
         assert!(
             error

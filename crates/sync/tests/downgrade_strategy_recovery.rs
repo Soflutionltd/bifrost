@@ -26,9 +26,9 @@ use std::time::Duration;
 
 use bifrost_sync::{CheckpointStore, InMemoryCheckpointStore, SyncEngine};
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountFuture, AccountId,
-    AccountOperation, Cause, Change, ChangeCursor, CursorScope, ErrorScope, ObjectType, StateCause,
-    StrategyDowngrade, SyncEvent, SyncStateErrorKind,
+    AccountError, AccountErrorBuilder, AccountFactory, AccountFuture, AccountId, AccountOperation,
+    Change, ChangeCursor, CursorScope, ErrorScope, ObjectType, PrimaryCause, StateCause,
+    StrategyDowngrade, SyncEvent,
 };
 
 use common::{StubAccount, StubFactory};
@@ -40,12 +40,9 @@ const BOUND: Duration = Duration::from_secs(8);
 const SCOPE: CursorScope = CursorScope::Type(ObjectType::Email);
 
 fn downgrade_error(scope: ErrorScope) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::StrategyFailure),
-        Cause::State(StateCause::StrategyFailure {
-            downgrade: StrategyDowngrade::CondstoreToBasic,
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::StrategyFailure {
+        downgrade: StrategyDowngrade::CondstoreToBasic,
+    }))
     .operation(AccountOperation::SyncChanges)
     .scope(scope)
     .try_build()

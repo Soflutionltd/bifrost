@@ -20,7 +20,7 @@ use std::sync::Arc;
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountFuture, AccountId, AccountOperation, AccountStream, AddressBook, AddressBookId,
-    AttachmentHandle, BlobHandle, ByteRange, Calendar, CalendarEvent, Cause, Change, ChangeCursor,
+    AttachmentHandle, BlobHandle, ByteRange, Calendar, CalendarEvent, Change, ChangeCursor,
     CloudUploadMeta, ContactCard, ContactCorpus, ContactCreate, ContactId, ContactPatch,
     ContactProvenance, ContactSearchRequest, ContainerId, ContainerKind, ContainerList, CostClass,
     CursorDescriptor, CursorEstablishment, CursorScope, DiagnosticText, DirectoryCard,
@@ -29,10 +29,10 @@ use bifrost_types::{
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
     IdentityPatch, Importance, InternalCause, InternalErrorKind, InventoryEvent,
     InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope, Message,
-    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Protocol, ProtocolKind, QuotaInfo,
-    RsvpStatus, SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, SkippedScope, SubscriptionHandle, SyncEvent, SyncStrategy,
-    ThreadHydration, ThreadId, VacationConfig,
+    MutationSuccess, MutationTarget, ObjectId, Page, PrimaryCause, Priority, Protocol,
+    ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendReceipt, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SkippedScope, SubscriptionHandle,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -1130,15 +1130,12 @@ fn write_error(operation: AccountOperation, error: VCardWriteError) -> AccountEr
 }
 
 fn directory_gateway_invariant_error(operation: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-        Cause::Internal(InternalCause::new(
-            InternalErrorKind::InvariantViolated,
-            Some(DiagnosticText::support_only(
-                "CardDAV directory search was enabled without an admitted gateway",
-            )),
+    AccountErrorBuilder::new(PrimaryCause::Internal(InternalCause::new(
+        InternalErrorKind::InvariantViolated,
+        Some(DiagnosticText::support_only(
+            "CardDAV directory search was enabled without an admitted gateway",
         )),
-    )
+    )))
     .protocol(Protocol::CardDav)
     .operation(operation)
     .try_build()
@@ -2877,14 +2874,12 @@ mod directory_tests;
 mod partial_commit_tests {
     use super::*;
     use bifrost_types::StepEffect;
-    use bifrost_types::{ReconcileAction, RecoveryClass, RetryHint, ServerCause, ServerErrorKind};
+    use bifrost_types::{ReconcileAction, RecoveryClass, RetryHint, ServerCause};
     fn throttled() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited {
-                retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(37))),
-            }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(37))),
+        }))
         .try_build()
         .unwrap()
     }

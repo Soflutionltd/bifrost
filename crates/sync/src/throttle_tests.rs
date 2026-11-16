@@ -1,9 +1,9 @@
 use super::*;
 use crate::recovery::reconcile_delay;
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, AttemptCause,
-    Cause, CursorScope, ErrorScope, PrincipalId, RecoveryClass, RetryHint, ServerCause,
-    ServerErrorKind, ThrottleKey, ThrottleScope, TransmissionState,
+    AccountError, AccountErrorBuilder, AccountId, AccountOperation, AttemptCause, Cause,
+    CursorScope, ErrorScope, PrimaryCause, PrincipalId, RecoveryClass, RetryHint, ServerCause,
+    ThrottleKey, ThrottleScope, TransmissionState,
 };
 use std::time::Duration;
 use std::time::SystemTime;
@@ -13,10 +13,10 @@ use tokio::time::Instant;
 // it, and the builder admits a throttle scope only on rate-limit or quota
 // kinds, so a transport fixture would fail to build.
 fn throttled_error(scope: Option<ErrorScope>) -> AccountError {
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-    )
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+        throttle: Default::default(),
+        retry_hint: None,
+    }))
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(AccountOperation::SyncChanges);
     if let Some(scope) = scope {
@@ -80,15 +80,14 @@ async fn net_local_hold_paces_without_recording_an_engine_hold() {
 
                 // Local provenance belongs to each leg. A real sibling throttle
                 // still enters the bucket, without re-recording the primary.
-                let server = AccountErrorBuilder::new(
-                    AccountErrorKind::Server(ServerErrorKind::RateLimited),
-                    Cause::Server(ServerCause::RateLimited {
+                let server =
+                    AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+                        throttle: Default::default(),
                         retry_hint: Some(RetryHint::After(Duration::from_secs(3))),
-                    }),
-                )
-                .throttle_budget(budget.clone())
-                .try_build()
-                .unwrap();
+                    }))
+                    .with_throttle(|throttle| throttle.add_budget(budget.clone()))
+                    .try_build()
+                    .unwrap();
                 let mut record =
                     PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
                 record.failed_sibling(
@@ -243,17 +242,15 @@ fn wait_for_account_excludes_mailbox_keys() {
 #[test]
 fn reconcile_throttle_is_recorded_for_the_account() {
     let account = AccountId("a".into());
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited {
-            retry_hint: Some(RetryHint::After(Duration::from_secs(30))),
-        }),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+        throttle: Default::default(),
+        retry_hint: Some(RetryHint::After(Duration::from_secs(30))),
+    }))
     .operation(AccountOperation::Send)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::InFlight,
     )))
-    .throttle_scope(ThrottleScope::Account)
+    .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Account))
     .try_build()
     .expect("valid");
     let RecoveryClass::Reconcile(advice) = error.recovery() else {
@@ -286,14 +283,14 @@ fn reconcile_throttle_is_recorded_for_the_account() {
 fn a_stamped_budget_is_recorded_alone_and_holds_without_a_hint() {
     let account = AccountId("a".into());
     let budget = bifrost_types::ThrottleBudget::new("test|mailbox:x");
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+        throttle: Default::default(),
+        retry_hint: None,
+    }))
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(AccountOperation::SyncChanges)
-    .throttle_scope(ThrottleScope::Account)
-    .throttle_budget(budget.clone())
+    .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Account))
+    .with_throttle(|throttle| throttle.add_budget(budget.clone()))
     .try_build()
     .expect("valid");
     let RecoveryClass::Retry(advice) = error.recovery() else {
@@ -322,13 +319,14 @@ fn a_stamped_budget_is_recorded_alone_and_holds_without_a_hint() {
 fn a_hintless_mailbox_throttle_holds_its_mailbox_for_the_fallback() {
     let account = AccountId("a".into());
     let build = |scope: ThrottleScope, error_scope: Option<ErrorScope>| {
-        let mut builder = AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-        )
-        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
-        .operation(AccountOperation::SyncChanges)
-        .throttle_scope(scope);
+        let mut builder =
+            AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+                throttle: Default::default(),
+                retry_hint: None,
+            }))
+            .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
+            .operation(AccountOperation::SyncChanges)
+            .with_throttle(|throttle| throttle.scope = Some(scope));
         if let Some(error_scope) = error_scope {
             builder = builder.scope(error_scope);
         }

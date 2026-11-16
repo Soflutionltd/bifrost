@@ -16,8 +16,8 @@
 //! `BatchOutcome<()>`.
 
 use bifrost_types::error::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause, BatchItem,
-    BatchItemId, BatchOutcome, Cause, DiagnosticText, ProtocolErrorKind, TransmissionState,
+    AccountError, AccountErrorBuilder, AccountOperation, AttemptCause, BatchItem, BatchItemId,
+    BatchOutcome, Cause, DiagnosticText, PrimaryCause, ProtocolErrorKind, TransmissionState,
     WireCause,
 };
 
@@ -344,15 +344,15 @@ fn with_recipient_text(error: AccountError, address: &Address) -> AccountError {
 }
 
 fn partial_completion_error(protocol: Dialect, address: &Address) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::MalformedResponse {
+    AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::PartialResponse,
+        wire: WireCause::MalformedResponse {
             protocol: protocol.into(),
             detail: Some(DiagnosticText::support_only(format!(
                 "transport drop after body write; recipient {address} uncertain"
             ))),
-        }),
-    )
+        },
+    })
     .protocol(protocol.into())
     .operation(AccountOperation::Send)
     .idempotency_override(false)

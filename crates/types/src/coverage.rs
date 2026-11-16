@@ -508,8 +508,7 @@ mod tests {
     use crate::ObjectType;
     use crate::cursor::CursorScope;
     use crate::error::{
-        AccountError, AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, RequestCause,
-        RequestErrorKind,
+        AccountError, AccountErrorBuilder, DiagnosticText, PrimaryCause, RequestCause,
     };
 
     fn scope() -> CursorScope {
@@ -517,12 +516,9 @@ mod tests {
     }
 
     fn error() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("unrepresentable inventory result"),
-            }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("unrepresentable inventory result"),
+        }))
         .try_build()
         .expect("valid account error classification")
     }

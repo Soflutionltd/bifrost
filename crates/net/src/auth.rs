@@ -82,24 +82,19 @@ impl TokenSnapshot {
         protocol: bifrost_types::Protocol,
         operation: bifrost_types::AccountOperation,
     ) -> Option<bifrost_types::AccountError> {
-        use bifrost_types::{
-            AccountErrorBuilder, AccountErrorKind, AuthCause, AuthErrorKind, Cause, DiagnosticText,
-        };
+        use bifrost_types::{AccountErrorBuilder, AuthCause, DiagnosticText, PrimaryCause};
         if !matches!(self, Self::Contended) {
             return None;
         }
         Some(
-            AccountErrorBuilder::new(
-                AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient),
-                Cause::Auth(AuthCause::RefreshTransient),
-            )
-            .protocol(protocol)
-            .operation(operation)
-            .text(DiagnosticText::support_only(
-                "OAuth token cache is busy; retry when ready",
-            ))
-            .try_build()
-            .expect("valid local credential contention"),
+            AccountErrorBuilder::new(PrimaryCause::Auth(AuthCause::RefreshTransient))
+                .protocol(protocol)
+                .operation(operation)
+                .text(DiagnosticText::support_only(
+                    "OAuth token cache is busy; retry when ready",
+                ))
+                .try_build()
+                .expect("valid local credential contention"),
         )
     }
 }

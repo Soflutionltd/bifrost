@@ -1,7 +1,5 @@
 use super::*;
-use bifrost_types::{
-    AccountErrorBuilder, AccountErrorKind, AccountOperation, AuthCause, AuthErrorKind, Cause,
-};
+use bifrost_types::{AccountErrorBuilder, AccountOperation, AuthCause, PrimaryCause};
 
 use crate::delivery::tests::account_change_checkpoint;
 fn ms(n: u64) -> Duration {
@@ -88,14 +86,14 @@ async fn fresh_bad_checkpoint_terminates_only_its_cursor_scope() {
 async fn a_cancelled_scope_does_not_wait_out_its_retry_hint() {
     let scope = CursorScope::Account;
     let (reopen_tx, _reopen_rx) = mpsc::channel(1);
-    let error = bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),
-        bifrost_types::Cause::Server(bifrost_types::ServerCause::RateLimited {
+    let error = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Server(
+        bifrost_types::ServerCause::RateLimited {
+            throttle: Default::default(),
             retry_hint: Some(bifrost_types::RetryHint::After(
                 std::time::Duration::from_secs(600),
             )),
-        }),
-    )
+        },
+    ))
     .try_build()
     .expect("valid rate-limited server error");
     let scope_cancel = CancellationToken::new();
@@ -208,13 +206,10 @@ async fn shutdown_unparks_an_engine_directive_send_against_a_full_reopen_channel
 async fn terminal_drive_outcome_parks_the_scope_instead_of_retiring_it() {
     let scope = CursorScope::Account;
     let (reopen_tx, mut reopen_rx) = mpsc::channel(1);
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::Authentication(AuthErrorKind::Expired),
-        Cause::Auth(AuthCause::Expired),
-    )
-    .operation(AccountOperation::SyncChanges)
-    .try_build()
-    .expect("valid terminal authentication error");
+    let error = AccountErrorBuilder::new(PrimaryCause::Auth(AuthCause::Expired))
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid terminal authentication error");
 
     let recovery = handle_drive_outcome(
         &scope,

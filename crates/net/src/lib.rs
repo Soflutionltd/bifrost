@@ -63,9 +63,7 @@ pub use auth::{
 };
 pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 pub use budget::{BandwidthBudget, BandwidthDirection, BandwidthRegistry, Reservation};
-pub use http_status::{
-    HttpErrorPolicy, StatusClass, StatusOverride, StatusPolicy, classify_status,
-};
+pub use http_status::{HttpErrorPolicy, StatusOverride, StatusPolicy, classify_status};
 // Shared identity / priority / byte-range / future-alias types live
 // in bifrost-types so the engine, the protocol crates, and this
 // crate all speak the same language. Re-exported here for ergonomic

@@ -354,12 +354,10 @@ fn shutdown_account_future_error(
     operation: AccountOperation,
     idempotency: Option<bool>,
 ) -> AccountError {
-    use bifrost_types::{AccountErrorBuilder, AccountErrorKind, AttemptCause, Cause};
+    use bifrost_types::{AccountErrorBuilder, AttemptCause, Cause, PrimaryCause};
 
-    let builder = AccountErrorBuilder::new(
-        AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
-        Cause::Transport(bifrost_types::TransportCause::new(
-            bifrost_types::TransportKind::Network,
+    let builder = AccountErrorBuilder::new(PrimaryCause::Transport(bifrost_types::TransportCause::new(
+            bifrost_types::TransportErrorKind::Network,
             Some(bifrost_types::DiagnosticText::support_only(
                 "google account closed while an operation future was active; provider outcome may be unknown",
             )),

@@ -2411,9 +2411,9 @@ mod tests {
 
     use super::{ClaimLookup, CoverageClaim, PendingCoverage, PublicationStream};
     use bifrost_types::{
-        AccountErrorBuilder, AccountErrorKind, Cause, ChangeCursor, Checkpoint, CoverageDomain,
-        CursorScope, DiagnosticText, InventoryCoverageReport, InventoryObligation, ObjectId,
-        ObjectType, ObligationKey, OpaqueChangeState, ProtocolKind, RequestCause, RequestErrorKind,
+        AccountErrorBuilder, ChangeCursor, Checkpoint, CoverageDomain, CursorScope, DiagnosticText,
+        InventoryCoverageReport, InventoryObligation, ObjectId, ObjectType, ObligationKey,
+        OpaqueChangeState, PrimaryCause, ProtocolKind, RequestCause,
     };
 
     fn scope() -> CursorScope {
@@ -2602,12 +2602,9 @@ mod tests {
     }
 
     fn degraded(key: &str) -> InventoryCoverageReport {
-        let error = AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("unrepresentable"),
-            }),
-        )
+        let error = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("unrepresentable"),
+        }))
         .try_build()
         .expect("valid account error classification");
         InventoryCoverageReport::degraded(

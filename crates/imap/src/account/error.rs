@@ -29,11 +29,10 @@
 
 use bifrost_types::{
     AccessCause, AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation,
-    AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText, ErrorScope,
-    ImapResponseCode, InternalCause, InternalErrorKind, Protocol, ProtocolErrorKind, Provider,
-    RequestCause, RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause,
-    StrategyDowngrade, SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause,
-    TransportErrorKind, TransportKind, WireCause,
+    AttemptCause, AuthCause, Cause, CursorScope, DiagnosticText, ErrorScope, ImapResponseCode,
+    InternalCause, InternalErrorKind, PrimaryCause, Protocol, ProtocolErrorKind, Provider,
+    RequestCause, ResourceKind, ServerCause, StateCause, StrategyDowngrade, ThrottleScope,
+    TransmissionState, TransportCause, TransportErrorKind, WireCause,
 };
 
 use crate::Error;
@@ -217,32 +216,22 @@ fn finish_translation(
     ctx: ImapErrorContext,
 ) -> AccountError {
     let Translation {
-        kind,
         primary_cause,
         wire_code,
         attempt: explicit_attempt,
-        throttle_scope,
         diagnostic_text,
         native_code,
     } = translation;
-    let is_transport = matches!(kind, AccountErrorKind::Transport(_));
+    let is_transport = matches!(primary_cause.kind(), AccountErrorKind::Transport(_));
 
-    // CursorInvalid requires a cursor scope or `try_build` rejects
-    // (`CursorInvalidWithoutScope`). Folder-scoped producers use
-    // `ImapErrorContext::with_folder_scope(&mailbox)` so the scope
-    // is `ErrorScope::Cursor(Folder(id))` rather than
-    // `ErrorScope::Mailbox { id }`.
-    let scope_for_kind = ctx.scope.clone();
-    let mut builder = match kind {
-        // Classification tables return parts so they can retain wire evidence.
-        AccountErrorKind::Unsupported(operation) => {
-            AccountError::unsupported(operation, Protocol::Imap).into_builder()
-        }
-        _ => AccountErrorBuilder::new(kind, primary_cause).protocol(Protocol::Imap),
-    }
-    .operation(ctx.operation);
+    // Folder-scoped producers use the same typed cursor identity for recovery
+    // and diagnostics, including mailbox responses translated outside changes.
+    let diagnostic_scope = ctx.scope.clone();
+    let mut builder = AccountErrorBuilder::new(primary_cause)
+        .protocol(Protocol::Imap)
+        .operation(ctx.operation);
 
-    if let Some(scope) = scope_for_kind {
+    if let Some(scope) = diagnostic_scope {
         builder = builder.scope(scope);
     }
     if let Some(provider) = ctx.provider {
@@ -250,9 +239,6 @@ fn finish_translation(
     }
     if let Some(override_) = ctx.idempotency_override {
         builder = builder.idempotency_override(override_);
-    }
-    if let Some(throttle) = throttle_scope {
-        builder = builder.throttle_scope(throttle);
     }
     if let Some(code) = native_code {
         builder = builder.native_code(code);
@@ -375,10 +361,9 @@ pub(crate) fn modseq_reset(
     previous: crate::types::ModSeq,
     current: Option<crate::types::ModSeq>,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-        Cause::State(StateCause::CursorInvalid),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::CursorInvalid {
+        scope: super::folder_scope(folder),
+    }))
     .protocol(Protocol::Imap)
     .operation(AccountOperation::SyncChanges)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
@@ -396,10 +381,9 @@ pub(crate) fn modseq_reset(
 /// membership baseline. Current server state cannot reconstruct past consumer
 /// state, so the engine must inventory the scope again.
 pub(crate) fn incomplete_uid_baseline(folder: &MailboxName) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-        Cause::State(StateCause::CursorInvalid),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::CursorInvalid {
+        scope: super::folder_scope(folder),
+    }))
     .protocol(Protocol::Imap)
     .operation(AccountOperation::SyncChanges)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
@@ -423,10 +407,9 @@ pub(crate) fn incomplete_uid_baseline(folder: &MailboxName) -> AccountError {
 /// a future strategy with no weaker peer would need exactly this.
 #[allow(dead_code)]
 pub(crate) fn strategy_failure(folder: &MailboxName, downgrade: StrategyDowngrade) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::StrategyFailure),
-        Cause::State(StateCause::StrategyFailure { downgrade }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::StrategyFailure {
+        downgrade,
+    }))
     .protocol(Protocol::Imap)
     .operation(AccountOperation::SyncChanges)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
@@ -469,7 +452,7 @@ pub(crate) fn permission_denied(error: &Error, ctx: &ImapErrorContext) -> bool {
     }
     let kind = match inner {
         Error::OAuthToken(classified) => classified.kind().clone(),
-        other => classify(other, ctx).kind,
+        other => classify(other, ctx).primary_cause.kind(),
     };
     matches!(
         kind,
@@ -509,26 +492,22 @@ pub(crate) fn shared_folder_error(
 // ---------------------------------------------------------------------
 
 struct Translation {
-    kind: AccountErrorKind,
-    primary_cause: Cause,
+    primary_cause: PrimaryCause,
     wire_code: Option<ImapResponseCode>,
     /// Explicit attempt-state override (used by `Bye` during command
     /// response loop, etc.). When `None`, the builder uses the
     /// `Error::attempt()` evidence.
     attempt: Option<TransmissionState>,
-    throttle_scope: Option<ThrottleScope>,
     diagnostic_text: Option<DiagnosticText>,
     native_code: Option<String>,
 }
 
 impl Translation {
-    fn new(kind: AccountErrorKind, primary_cause: Cause) -> Self {
+    fn new(primary_cause: PrimaryCause) -> Self {
         Self {
-            kind,
             primary_cause,
             wire_code: None,
             attempt: None,
-            throttle_scope: None,
             diagnostic_text: None,
             native_code: None,
         }
@@ -538,13 +517,10 @@ impl Translation {
 /// A client-side failure: `Internal(kind)`, never a provider fault. The
 /// attempt state is whatever the error carries (`Error::attempt()`).
 fn internal(kind: InternalErrorKind, detail: String) -> Translation {
-    Translation::new(
-        AccountErrorKind::Internal(kind),
-        Cause::Internal(InternalCause::new(
-            kind,
-            Some(DiagnosticText::support_only(detail)),
-        )),
-    )
+    Translation::new(PrimaryCause::Internal(InternalCause::new(
+        kind,
+        Some(DiagnosticText::support_only(detail)),
+    )))
 }
 
 fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
@@ -559,40 +535,31 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
         Error::Transport {
             kind: crate::error::TransportFailure::Io(crate::error::IoFailure(source)),
             ..
-        } => Translation::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause::new(
-                TransportKind::Network,
-                Some(DiagnosticText::support_only(source.to_string())),
-            )),
-        ),
+        } => Translation::new(PrimaryCause::Transport(TransportCause::new(
+            TransportErrorKind::Network,
+            Some(DiagnosticText::support_only(source.to_string())),
+        ))),
         Error::Transport {
             kind: crate::error::TransportFailure::Timeout,
             ..
-        } => Translation::new(
-            AccountErrorKind::Transport(TransportErrorKind::Timeout),
-            Cause::Transport(TransportCause::new(TransportKind::Timeout, None)),
-        ),
+        } => Translation::new(PrimaryCause::Transport(TransportCause::new(
+            TransportErrorKind::Timeout,
+            None,
+        ))),
         Error::Transport {
             kind: crate::error::TransportFailure::Closed,
             ..
-        } => Translation::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause::new(
-                TransportKind::Network,
-                Some(DiagnosticText::support_only("IMAP connection closed")),
-            )),
-        ),
+        } => Translation::new(PrimaryCause::Transport(TransportCause::new(
+            TransportErrorKind::Network,
+            Some(DiagnosticText::support_only("IMAP connection closed")),
+        ))),
         Error::Transport {
             kind: crate::error::TransportFailure::DriverGone,
             ..
-        } => Translation::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause::new(
-                TransportKind::Network,
-                Some(DiagnosticText::support_only("IMAP driver task gone")),
-            )),
-        ),
+        } => Translation::new(PrimaryCause::Transport(TransportCause::new(
+            TransportErrorKind::Network,
+            Some(DiagnosticText::support_only("IMAP driver task gone")),
+        ))),
         // Client-side failures (`reference/error-model.md`): the driver
         // panicked, never the server's fault. Its attempt state is the
         // caller's phase (`observe_driver_panic`), so a non-idempotent
@@ -614,48 +581,34 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             let mut translation = classify_auth(text, code.as_ref(), *mechanism);
             if let Some(refusal) = scram {
                 use bifrost_sasl::RefusalClass;
-                let (kind, cause) = match refusal.refusal_class() {
-                    RefusalClass::Credential => (
-                        AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-                        Cause::Auth(AuthCause::ReauthorizationRequired),
-                    ),
-                    RefusalClass::Policy => (
-                        AccountErrorKind::Authorization(
-                            bifrost_types::AccessErrorKind::PolicyBlocked,
-                        ),
-                        Cause::Access(AccessCause::PolicyBlocked),
-                    ),
-                    RefusalClass::Protocol => (
-                        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-                        Cause::Wire(WireCause::MalformedResponse {
+                let cause = match refusal.refusal_class() {
+                    RefusalClass::Credential => {
+                        PrimaryCause::Auth(AuthCause::ReauthorizationRequired)
+                    }
+                    RefusalClass::Policy => PrimaryCause::Access(AccessCause::PolicyBlocked),
+                    RefusalClass::Protocol => PrimaryCause::Protocol {
+                        kind: ProtocolErrorKind::ContractViolation,
+                        wire: WireCause::MalformedResponse {
                             protocol: Protocol::Imap,
                             detail: Some(DiagnosticText::support_only(text.to_owned())),
-                        }),
-                    ),
-                    RefusalClass::Unavailable => (
-                        AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                        Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-                    ),
+                        },
+                    },
+                    RefusalClass::Unavailable => {
+                        PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None })
+                    }
                     _ => unreachable!("unmapped SCRAM refusal class"),
                 };
-                translation.kind = kind;
                 translation.primary_cause = cause;
             }
             translation
         }
         Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(failure)) => {
-            let mut t = Translation::new(
-                AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
-                Cause::Access(AccessCause::PolicyBlocked),
-            );
+            let mut t = Translation::new(PrimaryCause::Access(AccessCause::PolicyBlocked));
             t.diagnostic_text = Some(DiagnosticText::support_only(failure.to_string()));
             t
         }
         Error::LocalRefusal(crate::error::LocalRefusal::StartTlsUnavailable) => {
-            let mut t = Translation::new(
-                AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
-                Cause::Access(AccessCause::PolicyBlocked),
-            );
+            let mut t = Translation::new(PrimaryCause::Access(AccessCause::PolicyBlocked));
             // PREAUTH can make the required upgrade illegal even when the
             // greeting advertises STARTTLS. Describe the session requirement.
             t.diagnostic_text = Some(DiagnosticText::support_only(
@@ -672,58 +625,60 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
         Error::Bye { text, code, .. } => {
             classify_status(text, code.as_ref(), StatusFallback::Bye, ctx)
         }
-        Error::Provider(crate::error::ProviderFailure::Protocol(msg)) => Translation::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Imap,
-                detail: Some(DiagnosticText::support_only(msg.clone())),
-            }),
-        ),
+        Error::Provider(crate::error::ProviderFailure::Protocol(msg)) => {
+            Translation::new(PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ContractViolation,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Imap,
+                    detail: Some(DiagnosticText::support_only(msg.clone())),
+                },
+            })
+        }
         // Same recovery class as `Protocol` (`ProviderContractViolation`);
         // the kind only records that the server omitted something mandatory.
-        Error::Provider(crate::error::ProviderFailure::Missing(msg)) => Translation::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Imap,
-                detail: Some(DiagnosticText::support_only(msg.clone())),
-            }),
-        ),
-        Error::Provider(crate::error::ProviderFailure::Parse(msg)) => Translation::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Imap,
-                detail: Some(DiagnosticText::support_only(msg.clone())),
-            }),
-        ),
-        Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(msg)) => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+        Error::Provider(crate::error::ProviderFailure::Missing(msg)) => {
+            Translation::new(PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::MissingField,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Imap,
+                    detail: Some(DiagnosticText::support_only(msg.clone())),
+                },
+            })
+        }
+        Error::Provider(crate::error::ProviderFailure::Parse(msg)) => {
+            Translation::new(PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ParseFailed,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Imap,
+                    detail: Some(DiagnosticText::support_only(msg.clone())),
+                },
+            })
+        }
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(msg)) => {
+            Translation::new(PrimaryCause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only(msg.clone()),
-            }),
-        ),
+            }))
+        }
         // Local refusals, all made before the first byte. None of them is a
         // provider fault (`reference/error-model.md`, "Local refusals").
-        Error::LocalRefusal(crate::error::LocalRefusal::InvalidState(msg)) => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+        Error::LocalRefusal(crate::error::LocalRefusal::InvalidState(msg)) => {
+            Translation::new(PrimaryCause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only(msg.clone()),
-            }),
-        ),
+            }))
+        }
         Error::LocalRefusal(crate::error::LocalRefusal::StateChangedBeforeSend(msg)) => {
-            let mut t = Translation::new(
-                AccountErrorKind::ConcurrencyConflict,
-                Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-            );
+            let mut t = Translation::new(PrimaryCause::State(
+                bifrost_types::StateCause::ConcurrencyConflict,
+            ));
             t.diagnostic_text = Some(DiagnosticText::support_only(msg.clone()));
             t.attempt = Some(TransmissionState::Unsent);
             t
         }
         Error::LocalRefusal(crate::error::LocalRefusal::UnsupportedOperation(msg)) => {
             let operation = ctx.operation;
-            let mut t = Translation::new(
-                AccountErrorKind::Unsupported(operation),
-                Cause::Request(RequestCause::Unsupported { operation }),
-            );
+            let mut t = Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
+                operation,
+            }));
             t.diagnostic_text = Some(DiagnosticText::support_only(msg.clone()));
             t
         }
@@ -737,22 +692,18 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
         } => internal(InternalErrorKind::RuntimeFailure, msg.clone()),
         Error::LocalRefusal(crate::error::LocalRefusal::MissingCapability(cap)) => {
             let operation = ctx.operation;
-            let mut t = Translation::new(
-                AccountErrorKind::Unsupported(operation),
-                Cause::Request(RequestCause::Unsupported { operation }),
-            );
+            let mut t = Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
+                operation,
+            }));
             t.diagnostic_text = Some(DiagnosticText::support_only(cap.clone()));
             t
         }
         Error::LocalRefusal(crate::error::LocalRefusal::AppendLimit { size, limit }) => {
-            Translation::new(
-                AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
-                Cause::Request(RequestCause::PayloadTooLarge {
-                    detail: DiagnosticText::support_only(format!(
-                        "message size {size} exceeds server APPENDLIMIT of {limit}"
-                    )),
-                }),
-            )
+            Translation::new(PrimaryCause::Request(RequestCause::PayloadTooLarge {
+                detail: DiagnosticText::support_only(format!(
+                    "message size {size} exceeds server APPENDLIMIT of {limit}"
+                )),
+            }))
         }
         // These budgets protect the implementation's retained results. An
         // Outlook user did not submit malformed data by opening a large mail.
@@ -790,12 +741,9 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             t
         }
         Error::LocalRefusal(crate::error::LocalRefusal::InvalidAppendDate(msg)) => {
-            Translation::new(
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed {
-                    detail: DiagnosticText::support_only(msg.clone()),
-                }),
-            )
+            Translation::new(PrimaryCause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(msg.clone()),
+            }))
         }
     }
 }
@@ -818,63 +766,51 @@ fn classify_sieve(
     let mut t = match code {
         // Explicitly transient: the server asked to be retried. Deriving
         // this terminal was the imap-S1 defect.
-        Some(Sc::TryLater) => Translation::new(
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        ),
-        Some(Sc::Quota) => {
-            let mut t = Translation::new(
-                AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
-            );
-            // Sieve quotas (script count, script size) are per-account.
-            t.throttle_scope = Some(ThrottleScope::Account);
-            t
+        Some(Sc::TryLater) => Translation::new(PrimaryCause::Server(ServerCause::Unavailable {
+            retry_hint: None,
+        })),
+        Some(Sc::Quota) => Translation::new(PrimaryCause::Server(ServerCause::QuotaExhausted {
+            throttle: bifrost_types::Throttle {
+                scope: Some(ThrottleScope::Account),
+                ..Default::default()
+            },
+            retry_hint: None,
+        })),
+        Some(Sc::NonExistent) => Translation::new(PrimaryCause::Request(RequestCause::NotFound {
+            what: ResourceKind::Filter,
+            id: None,
+        })),
+        Some(Sc::AlreadyExists) => {
+            Translation::new(PrimaryCause::State(StateCause::ConcurrencyConflict))
         }
-        Some(Sc::NonExistent) => Translation::new(
-            AccountErrorKind::NotFound(ResourceKind::Filter),
-            Cause::Request(RequestCause::NotFound {
-                what: ResourceKind::Filter,
-                id: None,
-            }),
-        ),
-        Some(Sc::AlreadyExists) => Translation::new(
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
-        ),
         // Deleting or overwriting the active script. A precondition the
         // caller must satisfy (deactivate first), not a server fault.
-        Some(Sc::Active) => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::PreconditionFailed),
-            Cause::Request(RequestCause::PreconditionFailed {
+        Some(Sc::Active) => {
+            Translation::new(PrimaryCause::Request(RequestCause::PreconditionFailed {
                 detail: DiagnosticText::support_only(
                     "ManageSieve refused the operation on the ACTIVE script",
                 ),
-            }),
-        ),
+            }))
+        }
         // Mechanism / channel strength refusals during AUTHENTICATE.
-        Some(Sc::AuthTooWeak | Sc::EncryptNeeded) => Translation::new(
-            AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
-            Cause::Access(AccessCause::PolicyBlocked),
-        ),
-        Some(Sc::TransitionNeeded | Sc::Sasl) => Translation::new(
-            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-            Cause::Auth(AuthCause::ReauthorizationRequired),
-        ),
+        Some(Sc::AuthTooWeak | Sc::EncryptNeeded) => {
+            Translation::new(PrimaryCause::Access(AccessCause::PolicyBlocked))
+        }
+        Some(Sc::TransitionNeeded | Sc::Sasl) => {
+            Translation::new(PrimaryCause::Auth(AuthCause::ReauthorizationRequired))
+        }
         Some(Sc::Referral) => {
             let operation = ctx.operation;
-            Translation::new(
-                AccountErrorKind::Unsupported(operation),
-                Cause::Request(RequestCause::Unsupported { operation }),
-            )
+            Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
+                operation,
+            }))
         }
         // `WARNINGS` and `TAG` are advisory and ride on `OK` too, so on a
         // rejection they say nothing about why. Unknown extension codes
         // likewise. Both take the status-level default.
-        Some(Sc::Warnings | Sc::Tag | Sc::Other(_)) | None => Translation::new(
-            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
-            Cause::Server(ServerCause::Error { status: None }),
-        ),
+        Some(Sc::Warnings | Sc::Tag | Sc::Other(_)) | None => {
+            Translation::new(PrimaryCause::Server(ServerCause::Error { status: None }))
+        }
     };
 
     if let Some(code) = code {
@@ -910,29 +846,18 @@ fn classify_auth(
     code: Option<&ResponseCode>,
     mechanism: Option<crate::types::AuthMechanism>,
 ) -> Translation {
-    let (kind, cause) = match code {
-        Some(ResponseCode::Expired) => (
-            AccountErrorKind::Authentication(AuthErrorKind::Expired),
-            Cause::Auth(AuthCause::Expired),
-        ),
-        Some(ResponseCode::AuthenticationFailed) | None => (
-            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-            Cause::Auth(AuthCause::ReauthorizationRequired),
-        ),
-        Some(ResponseCode::AuthorizationFailed) => (
-            AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied { resource: None }),
-        ),
-        Some(ResponseCode::PrivacyRequired) => (
-            AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
-            Cause::Access(AccessCause::PolicyBlocked),
-        ),
-        _ => (
-            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-            Cause::Auth(AuthCause::ReauthorizationRequired),
-        ),
+    let cause = match code {
+        Some(ResponseCode::Expired) => PrimaryCause::Auth(AuthCause::Expired),
+        Some(ResponseCode::AuthenticationFailed) | None => {
+            PrimaryCause::Auth(AuthCause::ReauthorizationRequired)
+        }
+        Some(ResponseCode::AuthorizationFailed) => {
+            PrimaryCause::Access(AccessCause::PermissionDenied { resource: None })
+        }
+        Some(ResponseCode::PrivacyRequired) => PrimaryCause::Access(AccessCause::PolicyBlocked),
+        _ => PrimaryCause::Auth(AuthCause::ReauthorizationRequired),
     };
-    let mut t = Translation::new(kind, cause);
+    let mut t = Translation::new(cause);
     let mechanism = mechanism.map(crate::types::AuthMechanism::name);
     let detail = match (text.is_empty(), mechanism) {
         (false, Some(mechanism)) => Some(format!("{text} (mechanism {mechanism})")),
@@ -990,20 +915,15 @@ fn classify_status(
 
 fn fallback_status(_text: &str, fallback: &StatusFallback) -> Translation {
     match fallback {
-        StatusFallback::No => Translation::new(
-            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
-            Cause::Server(ServerCause::Error { status: None }),
-        ),
-        StatusFallback::Bad => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("server returned BAD with no response code"),
-            }),
-        ),
-        StatusFallback::Bye => Translation::new(
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        ),
+        StatusFallback::No => {
+            Translation::new(PrimaryCause::Server(ServerCause::Error { status: None }))
+        }
+        StatusFallback::Bad => Translation::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("server returned BAD with no response code"),
+        })),
+        StatusFallback::Bye => Translation::new(PrimaryCause::Server(ServerCause::Unavailable {
+            retry_hint: None,
+        })),
     }
 }
 
@@ -1035,245 +955,232 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         _ => ThrottleScope::Account,
     };
 
+    // A mailbox response can arrive outside a cursor operation. Without a
+    // known folder, rediscover the account instead of inventing a scope. Users
+    // expect lost selected state to recover without quarantining another folder.
+    let cursor_state = |capability_lost| {
+        let scope = match ctx.scope.as_ref() {
+            Some(ErrorScope::Cursor(scope)) => Some(scope.clone()),
+            Some(ErrorScope::Mailbox { id }) => {
+                Some(CursorScope::Folder(bifrost_types::FolderId(id.0.clone())))
+            }
+            _ => None,
+        };
+        match scope {
+            Some(scope) if capability_lost => {
+                PrimaryCause::State(StateCause::ScopeCapabilityLost { scope })
+            }
+            Some(scope) => PrimaryCause::State(StateCause::CursorInvalid { scope }),
+            None => PrimaryCause::State(StateCause::CapabilityChanged { delta: None }),
+        }
+    };
     let t = match code {
         // Each arm produces an owned Translation. Some arms below mutate
         // it locally before yielding; the outer binding stays immutable.
         // Auth / policy
-        ResponseCode::AuthenticationFailed => Translation::new(
-            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-            Cause::Auth(AuthCause::ReauthorizationRequired),
-        ),
-        ResponseCode::Expired => Translation::new(
-            AccountErrorKind::Authentication(AuthErrorKind::Expired),
-            Cause::Auth(AuthCause::Expired),
-        ),
-        ResponseCode::AuthorizationFailed | ResponseCode::NoPerm => Translation::new(
-            AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied {
+        ResponseCode::AuthenticationFailed => {
+            Translation::new(PrimaryCause::Auth(AuthCause::ReauthorizationRequired))
+        }
+        ResponseCode::Expired => Translation::new(PrimaryCause::Auth(AuthCause::Expired)),
+        ResponseCode::AuthorizationFailed | ResponseCode::NoPerm => {
+            Translation::new(PrimaryCause::Access(AccessCause::PermissionDenied {
                 resource: resource_from_scope(),
-            }),
-        ),
-        ResponseCode::PrivacyRequired | ResponseCode::ContactAdmin => Translation::new(
-            AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
-            Cause::Access(AccessCause::PolicyBlocked),
-        ),
-        ResponseCode::MetadataNoPrivate => Translation::new(
-            AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied {
+            }))
+        }
+        ResponseCode::PrivacyRequired | ResponseCode::ContactAdmin => {
+            Translation::new(PrimaryCause::Access(AccessCause::PolicyBlocked))
+        }
+        ResponseCode::MetadataNoPrivate => {
+            Translation::new(PrimaryCause::Access(AccessCause::PermissionDenied {
                 resource: Some(ResourceKind::Mailbox),
-            }),
-        ),
+            }))
+        }
 
         // Transient server
         ResponseCode::Unavailable
         | ResponseCode::InUse
         | ResponseCode::Corruption
-        | ResponseCode::TempFail(_) => Translation::new(
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        ),
-        ResponseCode::ServerBug => Translation::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
+        | ResponseCode::TempFail(_) => {
+            Translation::new(PrimaryCause::Server(ServerCause::Unavailable {
+                retry_hint: None,
+            }))
+        }
+        ResponseCode::ServerBug => Translation::new(PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::ContractViolation,
+            wire: WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
                 detail: Some(DiagnosticText::support_only("server returned [SERVERBUG]")),
-            }),
-        ),
+            },
+        }),
 
         // Mailbox / cursor state
-        ResponseCode::ExpungeIssued | ResponseCode::Closed => Translation::new(
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-        ),
-        ResponseCode::UidNotSticky => Translation::new(
-            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeCapabilityLost),
-            Cause::State(StateCause::ScopeCapabilityLost),
-        ),
-        ResponseCode::NoModSeq => Translation::new(
-            AccountErrorKind::SyncState(SyncStateErrorKind::StrategyFailure),
-            Cause::State(StateCause::StrategyFailure {
+        ResponseCode::ExpungeIssued | ResponseCode::Closed => Translation::new(cursor_state(false)),
+        ResponseCode::UidNotSticky => Translation::new(cursor_state(true)),
+        ResponseCode::NoModSeq => {
+            Translation::new(PrimaryCause::State(StateCause::StrategyFailure {
                 downgrade: StrategyDowngrade::CondstoreToBasic,
-            }),
-        ),
+            }))
+        }
         ResponseCode::Modified(_)
         | ResponseCode::AlreadyExists
         | ResponseCode::HasChildren
-        | ResponseCode::NoUpdate(_) => Translation::new(
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
-        ),
+        | ResponseCode::NoUpdate(_) => {
+            Translation::new(PrimaryCause::State(StateCause::ConcurrencyConflict))
+        }
         ResponseCode::NonExistent => {
             let resource = resource_from_scope().unwrap_or(ResourceKind::Mailbox);
-            Translation::new(
-                AccountErrorKind::NotFound(resource),
-                Cause::Request(RequestCause::NotFound {
-                    what: resource,
-                    id: id_from_scope(),
-                }),
-            )
+            Translation::new(PrimaryCause::Request(RequestCause::NotFound {
+                what: resource,
+                id: id_from_scope(),
+            }))
         }
-        ResponseCode::TryCreate => Translation::new(
-            AccountErrorKind::NotFound(ResourceKind::Mailbox),
-            Cause::Request(RequestCause::NotFound {
+        ResponseCode::TryCreate => {
+            Translation::new(PrimaryCause::Request(RequestCause::NotFound {
                 what: ResourceKind::Mailbox,
                 id: id_from_scope(),
-            }),
-        ),
+            }))
+        }
 
         // Quota / limits
         ResponseCode::OverQuota => {
-            let mut t = Translation::new(
-                AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
-            );
-            t.throttle_scope = Some(ThrottleScope::Account);
-            t
+            Translation::new(PrimaryCause::Server(ServerCause::QuotaExhausted {
+                throttle: bifrost_types::Throttle {
+                    scope: Some(ThrottleScope::Account),
+                    ..Default::default()
+                },
+                retry_hint: None,
+            }))
         }
-        ResponseCode::Limit => {
-            let mut t = Translation::new(
-                AccountErrorKind::Server(ServerErrorKind::RateLimited),
-                Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-            );
-            t.throttle_scope = Some(mailbox_throttle());
-            t
-        }
+        ResponseCode::Limit => Translation::new(PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: bifrost_types::Throttle {
+                scope: Some(mailbox_throttle()),
+                ..Default::default()
+            },
+            retry_hint: None,
+        })),
         ResponseCode::MetadataTooMany => {
-            let mut t = Translation::new(
-                AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
-            );
-            t.throttle_scope = Some(ThrottleScope::Account);
-            t
+            Translation::new(PrimaryCause::Server(ServerCause::QuotaExhausted {
+                throttle: bifrost_types::Throttle {
+                    scope: Some(ThrottleScope::Account),
+                    ..Default::default()
+                },
+                retry_hint: None,
+            }))
         }
         ResponseCode::TooBig
         | ResponseCode::MaxConvertMessages(_)
         | ResponseCode::MaxConvertParts(_)
-        | ResponseCode::MetadataMaxSize(_) => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
-            Cause::Request(RequestCause::PayloadTooLarge {
+        | ResponseCode::MetadataMaxSize(_) => {
+            Translation::new(PrimaryCause::Request(RequestCause::PayloadTooLarge {
                 detail: DiagnosticText::support_only(
                     ImapResponseCode::from(code).code().to_owned(),
                 ),
-            }),
-        ),
+            }))
+        }
 
         // Unsupported / unknown feature
         ResponseCode::BadCharset(_) => {
             let operation = ctx.operation;
-            Translation::new(
-                AccountErrorKind::Unsupported(operation),
-                Cause::Request(RequestCause::Unsupported { operation }),
-            )
+            Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
+                operation,
+            }))
         }
         ResponseCode::Cannot | ResponseCode::Annotate(_) | ResponseCode::Annotations(_) => {
             let operation = ctx.operation;
-            Translation::new(
-                AccountErrorKind::Unsupported(operation),
-                Cause::Request(RequestCause::Unsupported { operation }),
-            )
+            Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
+                operation,
+            }))
         }
-        ResponseCode::BadComparator(_) => Translation::new(
-            AccountErrorKind::Unsupported(AccountOperation::Search),
-            Cause::Request(RequestCause::Unsupported {
+        ResponseCode::BadComparator(_) => {
+            Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
                 operation: AccountOperation::Search,
-            }),
-        ),
-        ResponseCode::BadEvent(_) | ResponseCode::UndefinedFilter(_) => Translation::new(
-            AccountErrorKind::Unsupported(AccountOperation::PushSubscribe),
-            Cause::Request(RequestCause::Unsupported {
+            }))
+        }
+        ResponseCode::BadEvent(_) | ResponseCode::UndefinedFilter(_) => {
+            Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
                 operation: AccountOperation::PushSubscribe,
-            }),
-        ),
+            }))
+        }
         ResponseCode::UnknownCte => {
             let operation = ctx.operation;
-            Translation::new(
-                AccountErrorKind::Unsupported(operation),
-                Cause::Request(RequestCause::Unsupported { operation }),
-            )
+            Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
+                operation,
+            }))
         }
-        ResponseCode::CompressionActive => Translation::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
+        ResponseCode::CompressionActive => Translation::new(PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::ContractViolation,
+            wire: WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
                 detail: Some(DiagnosticText::support_only(
                     "server returned [COMPRESSIONACTIVE]",
                 )),
-            }),
-        ),
+            },
+        }),
         ResponseCode::UseAttr => {
             let operation = ctx.operation;
-            Translation::new(
-                AccountErrorKind::Unsupported(operation),
-                Cause::Request(RequestCause::Unsupported { operation }),
-            )
+            Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
+                operation,
+            }))
         }
 
         // Referral and URL
         ResponseCode::Referral(_) => {
             let operation = ctx.operation;
-            Translation::new(
-                AccountErrorKind::Unsupported(operation),
-                Cause::Request(RequestCause::Unsupported { operation }),
-            )
+            Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
+                operation,
+            }))
         }
-        ResponseCode::NewName(_) => Translation::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::MalformedResponse {
+        ResponseCode::NewName(_) => Translation::new(PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::Unknown,
+            wire: WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
                 detail: Some(DiagnosticText::support_only("[NEWNAME]")),
-            }),
-        ),
+            },
+        }),
         ResponseCode::UrlMech(_) => {
             let operation = ctx.operation;
-            Translation::new(
-                AccountErrorKind::Unsupported(operation),
-                Cause::Request(RequestCause::Unsupported { operation }),
-            )
+            Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
+                operation,
+            }))
         }
-        ResponseCode::BadUrl(_) => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+        ResponseCode::BadUrl(_) => {
+            Translation::new(PrimaryCause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only("[BADURL]"),
-            }),
-        ),
+            }))
+        }
 
         // Parse and bug
-        ResponseCode::Parse => Translation::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-            Cause::Wire(WireCause::MalformedResponse {
+        ResponseCode::Parse => Translation::new(PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::ParseFailed,
+            wire: WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
                 detail: Some(DiagnosticText::support_only("[PARSE]")),
-            }),
-        ),
-        ResponseCode::ClientBug => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            },
+        }),
+        ResponseCode::ClientBug => {
+            Translation::new(PrimaryCause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only("[CLIENTBUG]"),
-            }),
-        ),
+            }))
+        }
 
         // Search / saved-result / notification
-        ResponseCode::NotSaved => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+        ResponseCode::NotSaved => {
+            Translation::new(PrimaryCause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only("[NOTSAVED]"),
-            }),
-        ),
-        ResponseCode::NotificationOverflow(_) => Translation::new(
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-        ),
+            }))
+        }
+        ResponseCode::NotificationOverflow(_) => Translation::new(cursor_state(false)),
 
         // Other / unknown
-        ResponseCode::Other { name, value } => Translation::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Imap(ImapResponseCode::Unknown {
+        ResponseCode::Other { name, value } => Translation::new(PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::Unknown,
+            wire: WireCause::Imap(ImapResponseCode::Unknown {
                 code: name.clone(),
                 value: value
                     .as_ref()
                     .map(|v| DiagnosticText::support_only(v.clone())),
-            })),
-        ),
+            }),
+        }),
 
         // Informational / state-carrying codes that don't change error semantics.
         // The caller will fall back to status classification.
@@ -1327,12 +1234,9 @@ fn response_code_payload(code: &ResponseCode) -> Option<DiagnosticText> {
 }
 
 pub(super) fn invalid_move_destination_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only("bulk-move destination is not a sendable mailbox"),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only("bulk-move destination is not a sendable mailbox"),
+    }))
     .protocol(Protocol::Imap)
     .operation(AccountOperation::BulkMove)
     .try_build()
@@ -1348,17 +1252,14 @@ pub(super) fn concurrency_conflict_error(
     operation: AccountOperation,
     folder: &MailboxName,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::ConcurrencyConflict,
-        Cause::State(StateCause::ConcurrencyConflict),
-    )
-    .protocol(Protocol::Imap)
-    .operation(operation)
-    .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
-    ))
-    .try_build()
-    .expect("valid account error classification")
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::ConcurrencyConflict))
+        .protocol(Protocol::Imap)
+        .operation(operation)
+        .scope(bifrost_types::ErrorScope::Cursor(
+            bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
+        ))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Stop access to an obsolete UID generation and request folder re-inventory.
@@ -1369,10 +1270,9 @@ pub(super) fn uidvalidity_changed_error(
     operation: AccountOperation,
     folder: &MailboxName,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-        Cause::State(StateCause::CursorInvalid),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::CursorInvalid {
+        scope: super::folder_scope(folder),
+    }))
     .protocol(Protocol::Imap)
     .operation(operation)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
@@ -1390,23 +1290,20 @@ pub(super) fn store_failed_error(
     operation: AccountOperation,
     folder: &MailboxName,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
-        Cause::Server(ServerCause::Error { status: None }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(operation)
-    .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
-    ))
-    .push_cause(Cause::Attempt(AttemptCause::new(
-        TransmissionState::Acknowledged,
-    )))
-    .text(DiagnosticText::support_only(
-        "STORE command failed with no per-item response code",
-    ))
-    .try_build()
-    .expect("valid account error classification")
+    AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::Error { status: None }))
+        .protocol(Protocol::Imap)
+        .operation(operation)
+        .scope(bifrost_types::ErrorScope::Cursor(
+            bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
+        ))
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )))
+        .text(DiagnosticText::support_only(
+            "STORE command failed with no per-item response code",
+        ))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 pub(super) fn finish_partial(
@@ -1431,17 +1328,14 @@ pub(super) fn message_not_found_error(id: &super::envelope::DecodedObjectId) -> 
 /// A folder restriction (`SearchFilter::In`) nested inside an `Or` has no
 /// faithful single-mailbox IMAP SEARCH encoding.
 pub(super) fn or_folder_restriction_error(op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("folder"),
-            message: Some(DiagnosticText::support_only(
-                "a folder restriction (In) inside an Or cannot be expressed as a \
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::InvalidArgument {
+        field: Some("folder"),
+        message: Some(DiagnosticText::support_only(
+            "a folder restriction (In) inside an Or cannot be expressed as a \
                  single-mailbox IMAP SEARCH; restructure the query so folder scoping \
                  is not OR-ed with other criteria",
-            )),
-        }),
-    )
+        )),
+    }))
     .protocol(Protocol::Imap)
     .operation(op)
     .try_build()
@@ -1479,12 +1373,9 @@ pub(super) fn expunged_message(id: bifrost_types::ObjectId) -> AccountError {
 /// Deleting a non-empty mailbox needs an explicit caller decision. An Outlook
 /// user expects to empty it first, not a bug report or an automatic retry.
 pub(super) fn non_empty_mailbox(folder: &MailboxName) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::PreconditionFailed),
-        Cause::Request(RequestCause::PreconditionFailed {
-            detail: DiagnosticText::support_only("refusing to delete non-empty IMAP mailbox"),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::PreconditionFailed {
+        detail: DiagnosticText::support_only("refusing to delete non-empty IMAP mailbox"),
+    }))
     .protocol(Protocol::Imap)
     .operation(AccountOperation::ContainerDelete)
     .scope(ErrorScope::Cursor(CursorScope::Folder(
@@ -1504,12 +1395,9 @@ pub(super) fn non_empty_mailbox(folder: &MailboxName) -> AccountError {
 /// attributable to the PIM call that produced it. The recovery class is
 /// `ClientBug` for all of them; the operation is the telemetry.
 pub(super) fn pim_malformed(op: AccountOperation, detail: impl Into<String>) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(detail.into()),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only(detail.into()),
+    }))
     .protocol(Protocol::Imap)
     .operation(op)
     .try_build()
@@ -1550,12 +1438,9 @@ pub(super) fn folder_of(
     op: AccountOperation,
 ) -> Result<MailboxName, AccountError> {
     MailboxName::from_account_id(&container.0).map_err(|err| {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(format!("not an IMAP folder identity: {err}")),
-            }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(format!("not an IMAP folder identity: {err}")),
+        }))
         .protocol(Protocol::Imap)
         .operation(op)
         .try_build()
@@ -1566,10 +1451,9 @@ pub(super) fn folder_of(
 /// `Unsupported`, scoped to the folder: a `UIDNOTSTICKY` folder's UIDs do
 /// not persist across selections, so it cannot be tracked by UID.
 pub(super) fn not_sticky(folder: &MailboxName, op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(op),
-        Cause::Request(RequestCause::Unsupported { operation: op }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Unsupported {
+        operation: op,
+    }))
     .protocol(Protocol::Imap)
     .operation(op)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
@@ -1584,14 +1468,11 @@ pub(super) fn excluded_from_operand_error(
     operation: AccountOperation,
     folder: &MailboxName,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(
-                "message id could not be placed in an IMAP UID operand",
-            ),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only(
+            "message id could not be placed in an IMAP UID operand",
+        ),
+    }))
     .protocol(Protocol::Imap)
     .operation(operation)
     .scope(bifrost_types::ErrorScope::Cursor(super::folder_scope(
@@ -1612,12 +1493,9 @@ pub(super) fn excluded_from_operand_error(
 /// error carries it. The recovery class is `ClientBug` either way; the
 /// operation is what makes the telemetry attributable to a lane.
 pub(super) fn malformed(detail: &str, op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(detail.to_owned()),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only(detail.to_owned()),
+    }))
     .protocol(Protocol::Imap)
     .operation(op)
     .try_build()
@@ -1646,18 +1524,15 @@ pub(super) fn search_folders_conflict(
     b: &MailboxName,
     op: AccountOperation,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("folder"),
-            message: Some(DiagnosticText::support_only(format!(
-                "search filter spans two folders ({} and {}); \
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::InvalidArgument {
+        field: Some("folder"),
+        message: Some(DiagnosticText::support_only(format!(
+            "search filter spans two folders ({} and {}); \
                  IMAP SEARCH cannot span multiple mailboxes in one command",
-                a.as_str(),
-                b.as_str()
-            ))),
-        }),
-    )
+            a.as_str(),
+            b.as_str()
+        ))),
+    }))
     .protocol(Protocol::Imap)
     .operation(op)
     .try_build()
@@ -1687,13 +1562,10 @@ pub(super) fn cursor_scope_error(error: AccountError, scope: &CursorScope) -> Ac
 /// the command. Enterprise users expect a vanished message reported as absent;
 /// retain Acknowledged evidence consistently across hydration and raw reads.
 fn fetched_message_not_found(id: &bifrost_types::ObjectId, op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::NotFound(ResourceKind::Message),
-        Cause::Request(RequestCause::NotFound {
-            what: ResourceKind::Message,
-            id: Some(id.0.clone()),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::NotFound {
+        what: ResourceKind::Message,
+        id: Some(id.0.clone()),
+    }))
     .protocol(Protocol::Imap)
     .operation(op)
     .scope(ErrorScope::Message { id: id.clone() })
@@ -1784,53 +1656,40 @@ mod unsupported_constructor_tests {
 #[cfg(test)]
 pub(super) mod test_support {
     use super::*;
-    use bifrost_types::AccessErrorKind;
 
     pub(in crate::account) fn discovery_transport(op: AccountOperation) -> AccountError {
-        bifrost_types::AccountErrorBuilder::new(
-            bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
-            bifrost_types::Cause::Transport(bifrost_types::TransportCause::new(
-                bifrost_types::TransportKind::Network,
-                None,
-            )),
-        )
+        bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Transport(
+            bifrost_types::TransportCause::new(bifrost_types::TransportErrorKind::Network, None),
+        ))
         .operation(op)
         .try_build()
         .expect("valid account error classification")
     }
 
     pub(in crate::account) fn factory_transport() -> AccountError {
-        bifrost_types::AccountErrorBuilder::new(
-            bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
-            bifrost_types::Cause::Transport(bifrost_types::TransportCause::new(
-                bifrost_types::TransportKind::Network,
-                None,
-            )),
-        )
+        bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Transport(
+            bifrost_types::TransportCause::new(bifrost_types::TransportErrorKind::Network, None),
+        ))
         .operation(AccountOperation::Discover)
         .try_build()
         .expect("valid account error classification")
     }
 
     pub(in crate::account) fn factory_auth_lost() -> AccountError {
-        bifrost_types::AccountErrorBuilder::new(
-            bifrost_types::AccountErrorKind::Authentication(
-                bifrost_types::AuthErrorKind::ReauthorizationRequired,
-            ),
-            bifrost_types::Cause::Auth(bifrost_types::AuthCause::ReauthorizationRequired),
-        )
+        bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Auth(
+            bifrost_types::AuthCause::ReauthorizationRequired,
+        ))
         .operation(AccountOperation::Discover)
         .try_build()
         .expect("valid account error classification")
     }
 
     pub(in crate::account) fn smtp_unsupported() -> AccountError {
-        bifrost_types::AccountErrorBuilder::new(
-            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Send),
-            bifrost_types::Cause::Request(bifrost_types::RequestCause::Unsupported {
+        bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Request(
+            bifrost_types::RequestCause::Unsupported {
                 operation: AccountOperation::Send,
-            }),
-        )
+            },
+        ))
         .protocol(Protocol::Smtp)
         .operation(AccountOperation::Send)
         .try_build()
@@ -1838,41 +1697,33 @@ pub(super) mod test_support {
     }
 
     pub(in crate::account) fn unavailable_without_context() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Server(bifrost_types::ServerErrorKind::Unavailable),
-            Cause::Server(bifrost_types::ServerCause::Unavailable { retry_hint: None }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Server(
+            bifrost_types::ServerCause::Unavailable { retry_hint: None },
+        ))
         .try_build()
         .unwrap()
     }
 
     pub(in crate::account) fn expired_auth() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Authentication(AuthErrorKind::Expired),
-            Cause::Auth(AuthCause::Expired),
-        )
-        .protocol(Protocol::Imap)
-        .operation(AccountOperation::UpdateFlags)
-        .try_build()
-        .expect("auth error")
+        AccountErrorBuilder::new(PrimaryCause::Auth(AuthCause::Expired))
+            .protocol(Protocol::Imap)
+            .operation(AccountOperation::UpdateFlags)
+            .try_build()
+            .expect("auth error")
     }
 
     pub(in crate::account) fn incompatible_schema() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-            Cause::State(StateCause::SchemaIncompatible),
-        )
-        .protocol(Protocol::Imap)
-        .operation(AccountOperation::UpdateFlags)
-        .try_build()
-        .expect("schema error")
+        AccountErrorBuilder::new(PrimaryCause::State(StateCause::SchemaIncompatible))
+            .protocol(Protocol::Imap)
+            .operation(AccountOperation::UpdateFlags)
+            .try_build()
+            .expect("schema error")
     }
 
     pub(in crate::account) fn personal_permission_denied() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied { resource: None }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Access(AccessCause::PermissionDenied {
+            resource: None,
+        }))
         .protocol(Protocol::Imap)
         .operation(AccountOperation::UpdateFlags)
         .try_build()
@@ -1880,10 +1731,9 @@ pub(super) mod test_support {
     }
 
     pub(in crate::account) fn unavailable_update() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Server(bifrost_types::ServerErrorKind::Unavailable),
-            Cause::Server(bifrost_types::ServerCause::Unavailable { retry_hint: None }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Server(
+            bifrost_types::ServerCause::Unavailable { retry_hint: None },
+        ))
         .protocol(Protocol::Imap)
         .operation(AccountOperation::UpdateFlags)
         .try_build()
@@ -1891,10 +1741,9 @@ pub(super) mod test_support {
     }
 
     pub(in crate::account) fn unavailable_update_at(state: TransmissionState) -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::Unavailable {
+            retry_hint: None,
+        }))
         .protocol(Protocol::Imap)
         .operation(AccountOperation::UpdateFlags)
         .push_cause(Cause::Attempt(AttemptCause::new(state)))
@@ -1903,10 +1752,9 @@ pub(super) mod test_support {
     }
 
     pub(in crate::account) fn retryable_move() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::Unavailable {
+            retry_hint: None,
+        }))
         .operation(AccountOperation::BulkMove)
         .try_build()
         .unwrap()

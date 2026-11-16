@@ -1682,7 +1682,7 @@ mod push_subscription_tests {
     use super::*;
     use crate::error::{
         AccountErrorBuilder, AccountErrorKind, BatchItemId, BatchOutcome, BatchOutcomeBuilder,
-        Cause, RequestCause,
+        PrimaryCause, RequestCause,
     };
 
     #[test]
@@ -1718,10 +1718,9 @@ mod push_subscription_tests {
 
     fn outcomes_with_failure() -> BatchOutcome<CursorScope> {
         let operation = AccountOperation::PushSubscribe;
-        let error = AccountErrorBuilder::new(
-            AccountErrorKind::Unsupported(operation),
-            Cause::Request(RequestCause::Unsupported { operation }),
-        )
+        let error = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Unsupported {
+            operation,
+        }))
         .try_build()
         .expect("valid unsupported error");
         let item = BatchItemId("0".to_string());

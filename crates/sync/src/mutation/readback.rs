@@ -304,29 +304,27 @@ fn destroy_readback_saw_absence(error: &bifrost_types::AccountError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bifrost_types::{
-        AccountErrorBuilder, AccountErrorKind, Cause, ResourceKind, ServerCause, ServerErrorKind,
-    };
+    use bifrost_types::{AccountErrorBuilder, PrimaryCause, ResourceKind, ServerCause};
 
     #[test]
     fn destroy_readback_only_accepts_not_found_as_absence() {
-        let not_found = AccountErrorBuilder::new(
-            AccountErrorKind::NotFound(ResourceKind::Message),
-            Cause::Request(bifrost_types::RequestCause::NotFound {
+        let not_found = AccountErrorBuilder::new(PrimaryCause::Request(
+            bifrost_types::RequestCause::NotFound {
                 what: ResourceKind::Message,
                 id: None,
-            }),
-        )
+            },
+        ))
         .try_build()
         .expect("valid not-found classification");
         assert!(destroy_readback_saw_absence(&not_found));
 
-        let rate_limited = AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-        )
-        .try_build()
-        .expect("valid rate-limit classification");
+        let rate_limited =
+            AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+                throttle: Default::default(),
+                retry_hint: None,
+            }))
+            .try_build()
+            .expect("valid rate-limit classification");
         assert!(!destroy_readback_saw_absence(&rate_limited));
     }
 }

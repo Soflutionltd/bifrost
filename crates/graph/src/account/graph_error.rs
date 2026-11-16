@@ -12,11 +12,11 @@
 
 use bifrost_net::NetErrorContext;
 use bifrost_types::{
-    AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
-    ErrorScope, GraphSignal, InternalCause, InternalErrorKind, MailboxUnavailableKind, PrincipalId,
-    Protocol, ProtocolErrorKind, Provider, RequestCause, ResourceKind, RetryHint, ServerCause,
-    ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope, TransmissionState, WireCause,
+    AccessCause, AccountError, AccountErrorBuilder, AccountOperation, AttemptCause, AuthCause,
+    Cause, CursorScope, DiagnosticText, ErrorScope, GraphSignal, InternalCause, InternalErrorKind,
+    MailboxUnavailableKind, PrimaryCause, PrincipalId, Protocol, ProtocolErrorKind, Provider,
+    RequestCause, ResourceKind, RetryHint, ServerCause, StateCause, ThrottleScope,
+    TransmissionState, WireCause,
 };
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderName, RETRY_AFTER};
@@ -130,8 +130,7 @@ pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> A
         GraphError::Configuration { message } => finish(
             base_builder(
                 &ctx,
-                AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed {
+                PrimaryCause::Request(RequestCause::Malformed {
                     detail: DiagnosticText::support_only(message),
                 }),
             ),
@@ -151,11 +150,13 @@ pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> A
             let detail = DiagnosticText::support_only(format!("Graph response link {reason}"));
             let builder = base_builder(
                 &ctx,
-                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-                Cause::Wire(WireCause::MalformedResponse {
-                    protocol: ctx.protocol,
-                    detail: Some(detail.clone()),
-                }),
+                PrimaryCause::Protocol {
+                    kind: ProtocolErrorKind::ContractViolation,
+                    wire: WireCause::MalformedResponse {
+                        protocol: ctx.protocol,
+                        detail: Some(detail.clone()),
+                    },
+                },
             )
             .text(detail);
             finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
@@ -173,11 +174,13 @@ pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> A
             let detail = DiagnosticText::support_only(message);
             let builder = base_builder(
                 &ctx,
-                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-                Cause::Wire(WireCause::MalformedResponse {
-                    protocol: ctx.protocol,
-                    detail: Some(detail.clone()),
-                }),
+                PrimaryCause::Protocol {
+                    kind: ProtocolErrorKind::ContractViolation,
+                    wire: WireCause::MalformedResponse {
+                        protocol: ctx.protocol,
+                        detail: Some(detail.clone()),
+                    },
+                },
             )
             .text(detail);
             finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
@@ -197,8 +200,7 @@ fn internal(kind: InternalErrorKind, message: String, ctx: &GraphErrorContext) -
     finish(
         base_builder(
             ctx,
-            AccountErrorKind::Internal(kind),
-            Cause::Internal(InternalCause::new(kind, Some(detail.clone()))),
+            PrimaryCause::Internal(InternalCause::new(kind, Some(detail.clone()))),
         )
         .text(detail),
         ctx,
@@ -350,11 +352,13 @@ pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext
         EwsError::MalformedXml(detail) => {
             let builder = base_builder(
                 &ctx,
-                AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-                Cause::Wire(WireCause::MalformedResponse {
-                    protocol: ctx.protocol,
-                    detail: Some(detail.clone()),
-                }),
+                PrimaryCause::Protocol {
+                    kind: ProtocolErrorKind::ParseFailed,
+                    wire: WireCause::MalformedResponse {
+                        protocol: ctx.protocol,
+                        detail: Some(detail.clone()),
+                    },
+                },
             )
             .text(detail);
             let builder = push_attempt(builder, TransmissionState::Acknowledged);
@@ -369,8 +373,7 @@ pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext
         EwsError::Configuration(message) => finish(
             base_builder(
                 &ctx,
-                AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed {
+                PrimaryCause::Request(RequestCause::Malformed {
                     detail: DiagnosticText::support_only(message),
                 }),
             ),
@@ -392,87 +395,69 @@ fn soap_fault_to_account_error(
     // Cursor scopes deliberately do not imply Mailbox here: that would turn
     // folder-scoped 404s into object-not-found errors and change recovery.
     let resource = ctx.scope.as_ref().and_then(ErrorScope::resource);
-    let (kind, cause) = match code {
-        SoapFaultCode::Server => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        ),
-        SoapFaultCode::Client | SoapFaultCode::MustUnderstand | SoapFaultCode::VersionMismatch => (
-            AccountErrorKind::Server(ServerErrorKind::Error { status: Some(400) }),
-            Cause::Server(ServerCause::Error { status: Some(400) }),
-        ),
+    let cause = match code {
+        SoapFaultCode::Server => {
+            PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None })
+        }
+        SoapFaultCode::Client | SoapFaultCode::MustUnderstand | SoapFaultCode::VersionMismatch => {
+            PrimaryCause::Server(ServerCause::Error { status: Some(400) })
+        }
         // Microsoft EWS specific faults the convergence audit
         // identified as recoverable but previously collapsed to
         // ProviderContractViolation.
-        SoapFaultCode::ErrorAccessDenied => (
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied { resource }),
-        ),
-        SoapFaultCode::ErrorImpersonateUserDenied => (
-            AccountErrorKind::Authorization(AccessErrorKind::ConditionalAccessBlocked),
-            Cause::Access(AccessCause::ConditionalAccessBlocked),
-        ),
-        SoapFaultCode::ErrorServerBusy => (
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-        ),
-        SoapFaultCode::ErrorMailboxStoreUnavailable | SoapFaultCode::ErrorMailboxMoveInProgress => {
-            (
-                AccountErrorKind::Authorization(AccessErrorKind::MailboxUnavailable {
-                    kind: MailboxUnavailableKind::Transient,
-                }),
-                Cause::Access(AccessCause::MailboxUnavailable {
-                    kind: MailboxUnavailableKind::Transient,
-                }),
-            )
+        SoapFaultCode::ErrorAccessDenied => {
+            PrimaryCause::Access(AccessCause::PermissionDenied { resource })
         }
-        SoapFaultCode::ErrorNonExistentMailbox => (
-            AccountErrorKind::NotFound(ResourceKind::Mailbox),
-            Cause::Request(RequestCause::NotFound {
-                what: ResourceKind::Mailbox,
+        SoapFaultCode::ErrorImpersonateUserDenied => {
+            PrimaryCause::Access(AccessCause::ConditionalAccessBlocked)
+        }
+        SoapFaultCode::ErrorServerBusy => PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: None,
+        }),
+        SoapFaultCode::ErrorMailboxStoreUnavailable | SoapFaultCode::ErrorMailboxMoveInProgress => {
+            PrimaryCause::Access(AccessCause::MailboxUnavailable {
+                kind: MailboxUnavailableKind::Transient,
+            })
+        }
+        SoapFaultCode::ErrorNonExistentMailbox => PrimaryCause::Request(RequestCause::NotFound {
+            what: ResourceKind::Mailbox,
+            id: ctx
+                .scope
+                .as_ref()
+                .and_then(ErrorScope::object_id)
+                .map(str::to_owned),
+        }),
+        SoapFaultCode::ErrorItemNotFound => {
+            // Unscoped streaming and folder walks retain the historical item
+            // fallback; typed hydration identifies the actual resource.
+            let resource = resource.unwrap_or(ResourceKind::Message);
+            PrimaryCause::Request(RequestCause::NotFound {
+                what: resource,
                 id: ctx
                     .scope
                     .as_ref()
                     .and_then(ErrorScope::object_id)
                     .map(str::to_owned),
-            }),
-        ),
-        SoapFaultCode::ErrorItemNotFound => {
-            // Unscoped streaming and folder walks retain the historical item
-            // fallback; typed hydration identifies the actual resource.
-            let resource = resource.unwrap_or(ResourceKind::Message);
-            (
-                AccountErrorKind::NotFound(resource),
-                Cause::Request(RequestCause::NotFound {
-                    what: resource,
-                    id: ctx
-                        .scope
-                        .as_ref()
-                        .and_then(ErrorScope::object_id)
-                        .map(str::to_owned),
-                }),
-            )
+            })
         }
         // A streaming subscription is intentionally short lived. These
         // server codes mean the current stream must be discarded and the
         // outer worker must Subscribe again, not that the account contract
         // is terminally broken.
-        SoapFaultCode::ErrorStreamingSubscriptionInvalid => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        ),
-        SoapFaultCode::Unknown => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
+        SoapFaultCode::ErrorStreamingSubscriptionInvalid => {
+            PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None })
+        }
+        SoapFaultCode::Unknown => PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::ContractViolation,
+            wire: WireCause::MalformedResponse {
                 protocol: ctx.protocol,
                 detail: Some(detail.clone()),
-            }),
-        ),
+            },
+        },
     };
-    let class = bifrost_net::StatusClass::new(kind, cause);
-    let mut builder = base_builder(ctx, class.kind, class.cause).text(detail);
+    let mut builder = base_builder(ctx, cause.clone()).text(detail);
     builder = push_attempt(builder, TransmissionState::Acknowledged);
-    builder = http_error_policy(ctx).apply_throttle(builder, class.throttles);
     finish(builder, ctx)
 }
 
@@ -550,36 +535,24 @@ fn autodiscover_error(
 ) -> AccountError {
     let code = native_code;
     let is = |name: &str| classify_as.eq_ignore_ascii_case(name);
-    let (kind, cause) = if is("ServerBusy") {
-        (
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-        )
+    let cause = if is("ServerBusy") {
+        PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: None,
+        })
     } else if is("InternalServerError") {
-        (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        )
+        PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None })
     } else if is("InvalidUser") {
-        (
-            AccountErrorKind::NotFound(ResourceKind::Mailbox),
-            Cause::Request(RequestCause::NotFound {
-                what: ResourceKind::Mailbox,
-                id: None,
-            }),
-        )
+        PrimaryCause::Request(RequestCause::NotFound {
+            what: ResourceKind::Mailbox,
+            id: None,
+        })
     } else if is("InvalidRequest") || is("InvalidSetting") {
-        (
-            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(format!("{what} refused the request: {code}")),
-            }),
-        )
+        PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(format!("{what} refused the request: {code}")),
+        })
     } else {
-        (
-            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
-            Cause::Server(ServerCause::Error { status: None }),
-        )
+        PrimaryCause::Server(ServerCause::Error { status: None })
     };
     let shown = if code.is_empty() {
         "without a code"
@@ -590,14 +563,11 @@ fn autodiscover_error(
         Some(message) => format!("{what} error {shown}: {message}"),
         None => format!("{what} error {shown}"),
     };
-    let class = bifrost_net::StatusClass::new(kind, cause);
-    let mut builder =
-        base_builder(ctx, class.kind, class.cause).text(DiagnosticText::support_only(detail));
+    let mut builder = base_builder(ctx, cause.clone()).text(DiagnosticText::support_only(detail));
     if !code.is_empty() {
         builder = builder.native_code(code.to_string());
     }
     builder = push_attempt(builder, TransmissionState::Acknowledged);
-    builder = http_error_policy(ctx).apply_throttle(builder, class.throttles);
     finish(builder, ctx)
 }
 
@@ -615,11 +585,13 @@ pub(crate) fn provider_answer_violation(
     let detail = DiagnosticText::support_only(detail);
     let builder = base_builder(
         ctx,
-        AccountErrorKind::Protocol(kind),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: ctx.protocol,
-            detail: Some(detail.clone()),
-        }),
+        PrimaryCause::Protocol {
+            kind,
+            wire: WireCause::MalformedResponse {
+                protocol: ctx.protocol,
+                detail: Some(detail.clone()),
+            },
+        },
     )
     .text(detail);
     finish(push_attempt(builder, TransmissionState::Acknowledged), ctx)
@@ -647,11 +619,13 @@ fn json_parse_to_account_error(
     };
     let mut builder = base_builder(
         ctx,
-        AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: ctx.protocol,
-            detail: Some(detail.clone()),
-        }),
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::ParseFailed,
+            wire: WireCause::MalformedResponse {
+                protocol: ctx.protocol,
+                detail: Some(detail.clone()),
+            },
+        },
     )
     .text(detail);
     if let Some(body) = body
@@ -699,18 +673,17 @@ fn response_to_account_error(
     // envelope; that is provider contract violation territory unless
     // the status code itself carries enough information (5xx is enough,
     // regardless of whether an edge server supplied an HTML body).
-    let (kind, cause) = match signal.as_ref() {
+    let cause = match signal.as_ref() {
         Some(signal) => classify(ctx, code, signal, retry_hint),
         None => classify_no_envelope(ctx, code, retry_hint, &body),
     };
 
-    let class = bifrost_net::StatusClass::new(kind, cause.clone());
-    let mut builder = base_builder(ctx, class.kind, class.cause);
+    let mut builder = base_builder(ctx, cause.clone());
     // Attach the GraphSignal as an inner wire cause whenever the
     // primary cause is not itself a wire cause, so support tooling
     // can read the typed provider code regardless of which semantic
     // bucket the kind landed in.
-    if !matches!(cause, Cause::Wire(_))
+    if !matches!(cause, PrimaryCause::Protocol { .. })
         && let Some(signal) = signal.as_ref()
     {
         builder = builder.push_cause(Cause::Wire(WireCause::Graph(signal.clone())));
@@ -742,7 +715,6 @@ fn response_to_account_error(
     // The retry hint already lives structurally on `ServerCause`; no
     // builder side-channel is needed. `throttle_scope` annotation
     // applies only on rate-limit / quota paths. A plain 503 is unavailable.
-    builder = http_error_policy(ctx).apply_throttle(builder, class.throttles);
     finish(builder, ctx)
 }
 
@@ -755,55 +727,43 @@ fn classify(
     code: u16,
     signal: &GraphSignal,
     retry_hint: Option<RetryHint>,
-) -> (AccountErrorKind, Cause) {
+) -> PrimaryCause {
     match signal {
-        GraphSignal::InvalidAuthenticationToken => (
-            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-            Cause::Auth(AuthCause::ReauthorizationRequired),
-        ),
-        GraphSignal::AccessDenied | GraphSignal::Forbidden => (
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied {
+        GraphSignal::InvalidAuthenticationToken => {
+            PrimaryCause::Auth(AuthCause::ReauthorizationRequired)
+        }
+        GraphSignal::AccessDenied | GraphSignal::Forbidden => {
+            PrimaryCause::Access(AccessCause::PermissionDenied {
                 resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
-            }),
-        ),
-        GraphSignal::AccessRestricted | GraphSignal::ConditionalAccessBlocked => (
-            AccountErrorKind::Authorization(AccessErrorKind::ConditionalAccessBlocked),
-            Cause::Access(AccessCause::ConditionalAccessBlocked),
-        ),
-        GraphSignal::AdminConsentRequired => (
-            AccountErrorKind::Authorization(AccessErrorKind::AdminConsentRequired),
-            Cause::Access(AccessCause::AdminConsentRequired {
+            })
+        }
+        GraphSignal::AccessRestricted | GraphSignal::ConditionalAccessBlocked => {
+            PrimaryCause::Access(AccessCause::ConditionalAccessBlocked)
+        }
+        GraphSignal::AdminConsentRequired => {
+            PrimaryCause::Access(AccessCause::AdminConsentRequired {
                 needed: "admin-consent",
-            }),
-        ),
-        GraphSignal::MailboxNotEnabledForRestApi => (
-            AccountErrorKind::Authorization(AccessErrorKind::MailboxNotLicensed),
-            Cause::Access(AccessCause::MailboxNotLicensed),
-        ),
-        GraphSignal::MailboxStoreUnavailable => (
-            AccountErrorKind::Authorization(AccessErrorKind::MailboxUnavailable {
+            })
+        }
+        GraphSignal::MailboxNotEnabledForRestApi => {
+            PrimaryCause::Access(AccessCause::MailboxNotLicensed)
+        }
+        GraphSignal::MailboxStoreUnavailable => {
+            PrimaryCause::Access(AccessCause::MailboxUnavailable {
                 kind: MailboxUnavailableKind::Transient,
-            }),
-            Cause::Access(AccessCause::MailboxUnavailable {
-                kind: MailboxUnavailableKind::Transient,
-            }),
-        ),
+            })
+        }
         GraphSignal::ResyncRequired
         | GraphSignal::InvalidDeltaToken
         | GraphSignal::SyncStateNotFound => cursor_invalid_or_protocol(ctx),
-        GraphSignal::TooManyRequests => (
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint }),
-        ),
-        GraphSignal::GenericFileError => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint }),
-        ),
-        GraphSignal::PreconditionFailed => (
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
-        ),
+        GraphSignal::TooManyRequests => PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint,
+        }),
+        GraphSignal::GenericFileError => {
+            PrimaryCause::Server(ServerCause::Unavailable { retry_hint })
+        }
+        GraphSignal::PreconditionFailed => PrimaryCause::State(StateCause::ConcurrencyConflict),
         GraphSignal::Gone => classify_by_status(ctx, 410, retry_hint),
         GraphSignal::NotFound => classify_by_status(ctx, 404, retry_hint),
         GraphSignal::Unknown { .. } => classify_by_status(ctx, code, retry_hint),
@@ -814,19 +774,13 @@ fn classify(
     }
 }
 
-/// CursorInvalid producer. Requires the caller to thread an
-/// `ErrorScope::Cursor(_)` through the context: without it the
-/// builder rejects the error at construction time
-/// (`AccountErrorBuildError::CursorInvalidWithoutScope`). Producers
-/// that hit this path without a cursor scope have a bug; we
-/// down-route to `Protocol(ContractViolation)` so the audit surfaces
-/// the producer rather than crashing in `try_build`.
-fn cursor_invalid_or_protocol(ctx: &GraphErrorContext) -> (AccountErrorKind, Cause) {
-    if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) {
-        (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-        )
+/// Cursor expiry needs a cursor recovery target. Signals raised outside that
+/// context retain the existing protocol-contract classification and audit path.
+fn cursor_invalid_or_protocol(ctx: &GraphErrorContext) -> PrimaryCause {
+    if let Some(ErrorScope::Cursor(scope)) = &ctx.scope {
+        PrimaryCause::State(StateCause::CursorInvalid {
+            scope: scope.clone(),
+        })
     } else {
         // Should be unreachable in correctly-wired call sites. Keep
         // the producer surface honest: classify as a contract
@@ -837,15 +791,15 @@ fn cursor_invalid_or_protocol(ctx: &GraphErrorContext) -> (AccountErrorKind, Cau
             "Graph CursorInvalid signal raised without ErrorScope::Cursor (op={:?})",
             ctx.operation,
         );
-        (
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::ContractViolation,
+            wire: WireCause::MalformedResponse {
                 protocol: ctx.protocol,
                 detail: Some(DiagnosticText::support_only(
                     "Graph CursorInvalid signal raised outside cursor scope".to_string(),
                 )),
-            }),
-        )
+            },
+        }
     }
 }
 
@@ -853,14 +807,13 @@ fn classify_by_status(
     ctx: &GraphErrorContext,
     code: u16,
     retry_hint: Option<RetryHint>,
-) -> (AccountErrorKind, Cause) {
-    let class = bifrost_net::classify_status(
+) -> PrimaryCause {
+    bifrost_net::classify_status(
         code,
         ctx.scope.as_ref(),
         retry_hint,
         http_error_policy(ctx).status,
-    );
-    (class.kind, class.cause)
+    )
 }
 
 /// `signal == None`: the body did not decode as a Graph error
@@ -875,7 +828,7 @@ fn classify_no_envelope(
     code: u16,
     retry_hint: Option<RetryHint>,
     body: &bytes::Bytes,
-) -> (AccountErrorKind, Cause) {
+) -> PrimaryCause {
     // An Outlook user expects a temporary server failure to retry even if
     // a proxy replaces its Graph JSON with HTML. Keep status-based recovery
     // (including quota classification), with the body retained in diagnostics.
@@ -884,24 +837,20 @@ fn classify_no_envelope(
     } else {
         // Non-empty body that did not parse as a Graph error
         // envelope -> protocol contract violation.
-        (
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::ContractViolation,
+            wire: WireCause::MalformedResponse {
                 protocol: ctx.protocol,
                 detail: Some(DiagnosticText::support_only(format!(
                     "HTTP {code} with non-envelope body",
                 ))),
-            }),
-        )
+            },
+        }
     }
 }
 
-fn base_builder(
-    ctx: &GraphErrorContext,
-    kind: AccountErrorKind,
-    cause: Cause,
-) -> AccountErrorBuilder {
-    AccountErrorBuilder::new(kind, cause)
+fn base_builder(ctx: &GraphErrorContext, cause: PrimaryCause) -> AccountErrorBuilder {
+    AccountErrorBuilder::new(http_error_policy(ctx).apply_throttle(cause))
         .protocol(ctx.protocol)
         .operation(ctx.operation)
         .provider(Provider::Microsoft)
@@ -1090,12 +1039,9 @@ pub(crate) fn invalid_account_error(
     operation: AccountOperation,
     detail: impl Into<String>,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(detail.into()),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only(detail.into()),
+    }))
     .operation(operation)
     .provider(Provider::Microsoft)
     .protocol(Protocol::Graph)
@@ -1116,13 +1062,10 @@ pub(crate) fn invalid_argument_account_error(
     field: &'static str,
     detail: impl Into<String>,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some(field),
-            message: Some(DiagnosticText::support_only(detail.into())),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::InvalidArgument {
+        field: Some(field),
+        message: Some(DiagnosticText::support_only(detail.into())),
+    }))
     .operation(operation)
     .provider(Provider::Microsoft)
     .protocol(Protocol::Graph)
@@ -1141,12 +1084,9 @@ pub(crate) fn invalid_item_error(
     scope: ErrorScope,
     detail: impl Into<String>,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(detail.into()),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only(detail.into()),
+    }))
     .operation(operation)
     .provider(Provider::Microsoft)
     .protocol(Protocol::Graph)
@@ -1170,20 +1110,17 @@ pub(crate) fn stale_local_state_error(
     scope: ErrorScope,
     detail: impl Into<String>,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::ConcurrencyConflict,
-        Cause::State(StateCause::ConcurrencyConflict),
-    )
-    .push_cause(Cause::Attempt(bifrost_types::AttemptCause::new(
-        bifrost_types::TransmissionState::Unsent,
-    )))
-    .operation(operation)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
-    .scope(scope)
-    .text(DiagnosticText::support_only(detail.into()))
-    .try_build()
-    .expect("valid account error classification")
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::ConcurrencyConflict))
+        .push_cause(Cause::Attempt(bifrost_types::AttemptCause::new(
+            bifrost_types::TransmissionState::Unsent,
+        )))
+        .operation(operation)
+        .provider(Provider::Microsoft)
+        .protocol(Protocol::Graph)
+        .scope(scope)
+        .text(DiagnosticText::support_only(detail.into()))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// A public resource whose folder a COMPLETE discovery pass did not find.
@@ -1204,13 +1141,10 @@ pub(crate) fn unroutable_public_resource_error(
     id: &str,
     detail: impl Into<String>,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::NotFound(kind),
-        Cause::Request(RequestCause::NotFound {
-            what: kind,
-            id: Some(id.to_owned()),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::NotFound {
+        what: kind,
+        id: Some(id.to_owned()),
+    }))
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(operation)
     .provider(Provider::Microsoft)
@@ -1250,12 +1184,9 @@ pub(crate) fn id_translation_refused(
         Some(code) => format!("translateExchangeIds refused an id: {code}"),
         None => "translateExchangeIds refused an id without a code".to_string(),
     });
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: detail.clone(),
-        }),
-    )
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: detail.clone(),
+    }))
     .operation(operation)
     .provider(Provider::Microsoft)
     .protocol(Protocol::Graph)
@@ -1294,16 +1225,8 @@ pub(crate) fn cursor_error_to_account_error(
     ctx: GraphErrorContext,
 ) -> AccountError {
     use crate::account::cursor::CursorError;
-    // Every arm terminates through `finish`, which stamps `ctx.scope`.
-    // Skipping it (the old `try_build` per arm) was not merely a telemetry
-    // loss: `SyncState(ScopeRevoked)` derives `DisableScope(scope)` WITH a
-    // scope and `RestartAccount` without one, so a single stale
-    // shared-mailbox cursor escalated into an account-wide rediscovery -
-    // which cannot restore a mailbox that left the configuration, so the
-    // engine would take the whole account around that loop on every pass
-    // instead of quarantining one folder. The other arms want the scope for
-    // the ordinary reason: these errors are raised per cursor, and the
-    // support export has to name which.
+    // Scoped state causes own their recovery target. Finish also retains
+    // operation, provider and diagnostic scope on the other decode failures.
     // Keep decode reasons distinct even when they share a recovery policy.
     let decode_detail = error.to_string();
     let decode_builder = |fault: bifrost_types::CursorDecodeFault| {
@@ -1324,25 +1247,58 @@ pub(crate) fn cursor_error_to_account_error(
         }
         CursorError::Decode(_) => decode_builder(bifrost_types::CursorDecodeFault::Malformed),
         CursorError::ScopeMismatch => {
-            decode_builder(bifrost_types::CursorDecodeFault::ScopeMismatch)
+            decode_builder(bifrost_types::CursorDecodeFault::ScopeMismatch {
+                scope: ctx
+                    .scope
+                    .as_ref()
+                    .and_then(|s| {
+                        if let ErrorScope::Cursor(scope) = s {
+                            Some(scope.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("cursor error context"),
+            })
         }
         CursorError::CalendarWindowExpired | CursorError::InventoryInProgress => base_builder(
             &ctx,
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
+            PrimaryCause::State(StateCause::CursorInvalid {
+                scope: ctx
+                    .scope
+                    .as_ref()
+                    .and_then(|s| {
+                        if let ErrorScope::Cursor(scope) = s {
+                            Some(scope.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("cursor error context"),
+            }),
         )
         .text(DiagnosticText::support_only(error.to_string())),
         CursorError::Unsupported => base_builder(
             &ctx,
-            AccountErrorKind::Unsupported(ctx.operation),
-            Cause::Request(RequestCause::Unsupported {
+            PrimaryCause::Request(RequestCause::Unsupported {
                 operation: ctx.operation,
             }),
         ),
         CursorError::Configuration(msg) => base_builder(
             &ctx,
-            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
-            Cause::State(StateCause::ScopeRevoked),
+            PrimaryCause::State(StateCause::ScopeRevoked {
+                scope: ctx
+                    .scope
+                    .as_ref()
+                    .and_then(|s| {
+                        if let ErrorScope::Cursor(scope) = s {
+                            Some(scope.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("cursor error context"),
+            }),
         )
         .text(DiagnosticText::support_only(msg)),
         // A cursor this crate built would not serialize: the client's own
@@ -1351,8 +1307,7 @@ pub(crate) fn cursor_error_to_account_error(
             let detail = DiagnosticText::support_only(msg);
             base_builder(
                 &ctx,
-                AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-                Cause::Internal(InternalCause::new(
+                PrimaryCause::Internal(InternalCause::new(
                     InternalErrorKind::InvariantViolated,
                     Some(detail.clone()),
                 )),
@@ -1377,13 +1332,13 @@ pub(crate) fn protocol_violation(
     detail: impl Into<String>,
 ) -> AccountError {
     let detail = DiagnosticText::support_only(detail.into());
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(inner),
-        Cause::Wire(WireCause::MalformedResponse {
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: inner,
+        wire: WireCause::MalformedResponse {
             protocol: Protocol::Graph,
             detail: Some(detail.clone()),
-        }),
-    )
+        },
+    })
     .operation(operation)
     .provider(Provider::Microsoft)
     .protocol(Protocol::Graph)
@@ -1425,13 +1380,13 @@ pub(crate) fn batch_response_missing(
     subrequest_replayable: bool,
 ) -> AccountError {
     let detail = DiagnosticText::support_only(detail.into());
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::MalformedResponse {
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::PartialResponse,
+        wire: WireCause::MalformedResponse {
             protocol: Protocol::Graph,
             detail: Some(detail.clone()),
-        }),
-    )
+        },
+    })
     .operation(operation)
     .provider(Provider::Microsoft)
     .protocol(Protocol::Graph)

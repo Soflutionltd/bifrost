@@ -1521,6 +1521,13 @@ when message-level diagnostic detail is truncated.
 
 ## Error model
 
+Account translations carry one `PrimaryCause`; kind, scoped recovery and
+throttle metadata derive from it. Mailbox-scoped response codes carry a typed
+cursor scope. If selected state is lost without a known mailbox identity,
+classification requests account rediscovery via `CapabilityChanged` instead
+of fabricating a folder target. An enterprise user expects lost selected state
+to recover without quarantining another folder. See `reference/error-model.md`.
+
 `Error` is `pub(crate)` and `#[non_exhaustive]`. Its categories are `ServerStatus`,
 `Transport`, `Bye`, `LocalRefusal`, `Provider`, `Internal` and `ResultLimit`, plus
 OAuth, incomplete-MOVE and unsent-operation wrappers. Payload kinds own their

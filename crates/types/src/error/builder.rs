@@ -3,11 +3,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use super::account_error::{AccountError, AccountErrorParts};
-use super::cause::{Cause, CauseChain};
+use super::cause::{Cause, CauseChain, PrimaryCause};
 use super::diagnostic::{DiagnosticInfo, DiagnosticText, TelemetryToken};
-use super::kind::{AccountErrorKind, ServerErrorKind, SyncStateErrorKind, UnsupportedReason};
+use super::kind::{AccountErrorKind, UnsupportedReason};
 use super::message_key;
-use super::recovery::{self, ThrottleBudget, ThrottleScope};
+use super::recovery;
 use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
 
 #[derive(Clone, Copy)]
@@ -56,46 +56,16 @@ pub enum AccountErrorBuildError {
     EmptyChain,
     /// A local unsupported reason is meaningful only on Unsupported errors.
     UnsupportedReasonNotApplicable { kind: AccountErrorKind },
-    /// The outermost `Cause` does not match the declared
-    /// `AccountErrorKind`. Producers must classify both halves
-    /// consistently.
-    KindCauseMismatch {
-        kind: AccountErrorKind,
-        primary_cause: Cause,
-    },
     /// `Transport(_)` kind combined with an `Attempt(Acknowledged)`
     /// classification cause. Transport failures by definition mean no complete
     /// server response was received; an acknowledged transmission
     /// would belong on a `Server(_)` or `Protocol(_)` kind.
     TransportAcknowledged,
-    /// `SyncState(CursorInvalid)` without an `ErrorScope::Cursor`.
-    /// Producers must thread the cursor scope from the call site;
-    /// the engine cannot route a scope-less cursor restart.
-    CursorInvalidWithoutScope,
-    /// A `throttle_scope` attached to a kind that is not
-    /// `Server(RateLimited | QuotaExhausted)`. The kind and cause may
-    /// match each other perfectly; the fault is the throttle scope
-    /// alone, so this points the producer at it instead of
-    /// misdiagnosing a kind/cause mismatch.
-    ThrottleScopeNotApplicable {
-        kind: AccountErrorKind,
-        throttle_scope: ThrottleScope,
-    },
-    /// A `throttle_budget` stamped on a kind that is not
-    /// `Server(RateLimited | QuotaExhausted)`. Same fault shape as
-    /// `ThrottleScopeNotApplicable`: a budget names where a throttle hold
-    /// is recorded, so on anything but a throttle it is a producer bug.
-    ThrottleBudgetNotApplicable { kind: AccountErrorKind },
-    /// Local-hold provenance belongs only to rate-limit or quota refusals.
-    LocalHoldNotApplicable { kind: AccountErrorKind },
 }
 
 impl fmt::Display for AccountErrorBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LocalHoldNotApplicable { kind } => {
-                write!(f, "local hold is not applicable to {kind:?}")
-            }
             Self::PartialCommitAlreadyAttached
             | Self::PartialCommitEmpty
             | Self::PartialCommitApplication { .. }
@@ -105,32 +75,9 @@ impl fmt::Display for AccountErrorBuildError {
                 write!(f, "unsupported reason is not applicable to {kind:?}")
             }
             Self::EmptyChain => write!(f, "AccountError chain is empty"),
-            Self::KindCauseMismatch {
-                kind,
-                primary_cause,
-            } => write!(
-                f,
-                "AccountErrorKind {kind:?} does not match outermost cause {primary_cause:?}",
-            ),
             Self::TransportAcknowledged => write!(
                 f,
                 "transport failures cannot have acknowledged transmission state",
-            ),
-            Self::CursorInvalidWithoutScope => {
-                write!(f, "SyncState(CursorInvalid) requires an ErrorScope::Cursor",)
-            }
-            Self::ThrottleScopeNotApplicable {
-                kind,
-                throttle_scope,
-            } => write!(
-                f,
-                "throttle_scope {throttle_scope:?} is only meaningful on \
-                 Server(RateLimited | QuotaExhausted), not {kind:?}",
-            ),
-            Self::ThrottleBudgetNotApplicable { kind } => write!(
-                f,
-                "throttle_budget is only meaningful on \
-                 Server(RateLimited | QuotaExhausted), not {kind:?}",
             ),
         }
     }
@@ -141,8 +88,7 @@ impl std::error::Error for AccountErrorBuildError {}
 pub(crate) struct RebuildParts {
     pub original_error: Option<AccountError>,
     pub partial_commit: Option<Arc<PartialCommit>>,
-    pub kind: AccountErrorKind,
-    pub primary_cause: Cause,
+    pub primary_cause: PrimaryCause,
     pub chain_extras: Vec<Cause>,
     pub classification_cause_count: usize,
     pub scope: Option<ErrorScope>,
@@ -151,9 +97,6 @@ pub(crate) struct RebuildParts {
     pub protocol: Option<Protocol>,
     pub diagnostics: DiagnosticInfo,
     pub idempotency_override: Option<bool>,
-    pub throttle_scope: Option<ThrottleScope>,
-    pub throttle_budgets: Vec<ThrottleBudget>,
-    pub local_hold: bool,
     pub unsupported_reason: Option<UnsupportedReason>,
 }
 
@@ -162,8 +105,7 @@ pub struct AccountErrorBuilder {
     original_error: Option<AccountError>,
     partial_commit: Option<PartialCommitBuilder>,
     partial_commit_duplicate: bool,
-    kind: AccountErrorKind,
-    primary_cause: Cause,
+    primary_cause: PrimaryCause,
     chain_extras: Vec<Cause>,
     classification_cause_count: Option<usize>,
     scope: Option<ErrorScope>,
@@ -172,20 +114,16 @@ pub struct AccountErrorBuilder {
     protocol: Option<Protocol>,
     diagnostics: DiagnosticInfo,
     idempotency_override: Option<bool>,
-    throttle_scope: Option<ThrottleScope>,
-    throttle_budgets: Vec<ThrottleBudget>,
-    local_hold: bool,
     unsupported_reason: Option<UnsupportedReason>,
 }
 
 impl AccountErrorBuilder {
     #[must_use]
-    pub fn new(kind: AccountErrorKind, primary_cause: Cause) -> Self {
+    pub fn new(primary_cause: PrimaryCause) -> Self {
         Self {
             original_error: None,
             partial_commit: None,
             partial_commit_duplicate: false,
-            kind,
             primary_cause,
             chain_extras: Vec::new(),
             classification_cause_count: None,
@@ -195,9 +133,6 @@ impl AccountErrorBuilder {
             protocol: None,
             diagnostics: DiagnosticInfo::default(),
             idempotency_override: None,
-            throttle_scope: None,
-            throttle_budgets: Vec::new(),
-            local_hold: false,
             unsupported_reason: None,
         }
     }
@@ -216,7 +151,6 @@ impl AccountErrorBuilder {
             original_error: parts.original_error,
             partial_commit: parts.partial_commit.map(|r| r.builder()),
             partial_commit_duplicate: false,
-            kind: parts.kind,
             primary_cause: parts.primary_cause,
             chain_extras: parts.chain_extras,
             classification_cause_count: Some(parts.classification_cause_count),
@@ -226,9 +160,6 @@ impl AccountErrorBuilder {
             protocol: parts.protocol,
             diagnostics: parts.diagnostics,
             idempotency_override: parts.idempotency_override,
-            throttle_scope: parts.throttle_scope,
-            throttle_budgets: parts.throttle_budgets,
-            local_hold: parts.local_hold,
             unsupported_reason: parts.unsupported_reason,
         }
     }
@@ -251,6 +182,11 @@ impl AccountErrorBuilder {
 
     #[must_use]
     pub fn scope(mut self, scope: ErrorScope) -> Self {
+        if let ErrorScope::Cursor(target) = &scope
+            && let Some(primary) = self.primary_cause.cursor_scope_mut()
+        {
+            *primary = target.clone();
+        }
         self.scope = Some(scope);
         self
     }
@@ -292,7 +228,8 @@ impl AccountErrorBuilder {
     /// "server responded with an error this protocol does not carry a
     /// numeric status for" (IMAP `NO`/`BAD` without a response code).
     /// Builders must not synthesize sentinel values like `0`; pass `None`
-    /// instead.
+    /// instead. For ServerCause::Error, try_build projects this value from
+    /// the primary cause; this setter decorates the other error families.
     #[must_use]
     pub fn status(mut self, status: Option<u16>) -> Self {
         self.diagnostics.status = status;
@@ -356,45 +293,17 @@ impl AccountErrorBuilder {
         self
     }
 
-    /// Provider-documented throttle scope for rate-limit / quota
-    /// failures. Maps onto sharable [`ThrottleKey`](super::recovery::ThrottleKey)
-    /// entries the engine consults across work items. Use
-    /// `ThrottleScope::CurrentOperation` for per-call hints that
-    /// should not enter a shared bucket.
+    /// Decorate provider throttle evidence when the primary cause is rate-limit
+    /// or quota exhaustion. Other causes have no throttle payload to refine.
+    /// This cannot change the primary classification or redirect cursor recovery.
     #[must_use]
-    pub fn throttle_scope(mut self, scope: ThrottleScope) -> Self {
-        self.throttle_scope = Some(scope);
-        self
-    }
-
-    /// Mark a refusal by a gate whose owner already recorded the hold.
-    /// Consumers retain local pacing advice without recording a second shared
-    /// deadline. Only rate-limit and quota kinds admit this provenance; it
-    /// survives cloning and decoration and cannot be cleared by a later layer.
-    #[must_use]
-    pub fn local_hold(mut self) -> Self {
-        self.local_hold = true;
-        self
-    }
-
-    /// Name a provider rate budget the throttled request was held against.
-    /// Repeatable. When an error stamps any budget the engine records the
-    /// deadline on exactly the stamped budgets and does NOT lift the
-    /// `ThrottleScope` into a key as well - recording both would put the
-    /// hold back on the account key and pause every sibling mailbox the
-    /// budget exists to keep running.
-    /// Local gate refusals retain budgets as evidence without recording them
-    /// again; see [`Self::local_hold`].
-    ///
-    /// A budget must name what the response says to hold, not every budget
-    /// the request consumed. The producer that stamps it must also declare it
-    /// from `Account::throttle_keys` for the same work, or the hold is
-    /// recorded where no wait site looks. Like `throttle_scope`, it is only
-    /// meaningful on `Server(RateLimited | QuotaExhausted)`.
-    #[must_use]
-    pub fn throttle_budget(mut self, budget: ThrottleBudget) -> Self {
-        if !self.throttle_budgets.contains(&budget) {
-            self.throttle_budgets.push(budget);
+    pub fn with_throttle(mut self, refine: impl FnOnce(&mut super::cause::Throttle)) -> Self {
+        if let Some(throttle) = self.primary_cause.throttle_mut() {
+            let local_hold = throttle.local_hold;
+            refine(throttle);
+            // An outer decoration cannot claim ownership of a deadline the
+            // transport already installed. Preserve the original provenance.
+            throttle.local_hold |= local_hold;
         }
         self
     }
@@ -412,62 +321,30 @@ impl AccountErrorBuilder {
     /// translation boundaries call `.expect("valid account error
     /// classification")` because an invalid combination is a library
     /// bug, not recoverable runtime state.
-    pub fn try_build(self) -> Result<AccountError, AccountErrorBuildError> {
-        if self.unsupported_reason.is_some()
-            && !matches!(self.kind, AccountErrorKind::Unsupported(_))
+    pub fn try_build(mut self) -> Result<AccountError, AccountErrorBuildError> {
+        let kind = self.primary_cause.kind();
+        // Scope-directed failures own their routing identity. A cursor rebind
+        // updates this typed identity; unrelated diagnostic scope cannot erase it.
+        if let Some(scope) = self.primary_cause.cursor_scope() {
+            self.scope = Some(ErrorScope::Cursor(scope.clone()));
+        }
+        if let PrimaryCause::Server(super::cause::ServerCause::Error { status }) =
+            &self.primary_cause
         {
-            return Err(AccountErrorBuildError::UnsupportedReasonNotApplicable { kind: self.kind });
+            self.diagnostics.status = *status;
+        }
+        let throttle_scope = self
+            .primary_cause
+            .throttle()
+            .and_then(|throttle| throttle.scope);
+        if self.unsupported_reason.is_some() && !matches!(kind, AccountErrorKind::Unsupported(_)) {
+            return Err(AccountErrorBuildError::UnsupportedReasonNotApplicable { kind });
         }
         if self.partial_commit_duplicate {
             return Err(AccountErrorBuildError::PartialCommitAlreadyAttached);
         }
-        let throttled = matches!(
-            &self.kind,
-            AccountErrorKind::Server(
-                ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted
-            )
-        );
-        if self.local_hold && !throttled {
-            return Err(AccountErrorBuildError::LocalHoldNotApplicable { kind: self.kind });
-        }
-        if !throttled && !self.throttle_budgets.is_empty() {
-            return Err(AccountErrorBuildError::ThrottleBudgetNotApplicable { kind: self.kind });
-        }
-        if let Some(throttle_scope) = self.throttle_scope
-            && !throttled
-        {
-            // throttle_scope is meaningful only on rate-limit/quota
-            // failures; producers attaching it elsewhere is a bug.
-            // Caught here, and named for what it is: the kind and cause
-            // may match perfectly, so a KindCauseMismatch here would
-            // send the producer hunting the wrong invariant.
-            return Err(AccountErrorBuildError::ThrottleScopeNotApplicable {
-                kind: self.kind,
-                throttle_scope,
-            });
-        }
-
-        if !recovery::kind_matches_cause(&self.kind, &self.primary_cause) {
-            return Err(AccountErrorBuildError::KindCauseMismatch {
-                kind: self.kind,
-                primary_cause: self.primary_cause,
-            });
-        }
-
-        // CursorInvalid without an ErrorScope::Cursor cannot be routed
-        // by the engine. The convergence rewrite removed the silent
-        // fallback to `RestartAccount`; producers must thread the
-        // cursor scope from the call site.
-        if matches!(
-            self.kind,
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
-        ) && recovery::cursor_scope(self.scope.as_ref()).is_none()
-        {
-            return Err(AccountErrorBuildError::CursorInvalidWithoutScope);
-        }
-
         let mut causes = Vec::with_capacity(1 + self.chain_extras.len());
-        causes.push(self.primary_cause);
+        causes.push(self.primary_cause.clone().into());
         causes.extend(self.chain_extras);
         let chain = CauseChain::try_new(causes).ok_or(AccountErrorBuildError::EmptyChain)?;
 
@@ -488,7 +365,7 @@ impl AccountErrorBuilder {
 
         // Transport(_) cannot pair with an Acknowledged Attempt. The
         // wire-level evidence contradicts the kind.
-        if matches!(self.kind, AccountErrorKind::Transport(_))
+        if matches!(kind, AccountErrorKind::Transport(_))
             && classification_chain.iter().any(|cause| {
                 matches!(
                     cause,
@@ -502,34 +379,31 @@ impl AccountErrorBuilder {
         }
 
         let recovery = recovery::derive(
-            &self.kind,
+            &kind,
             self.scope.as_ref(),
             self.operation,
             &classification_chain,
-            self.throttle_scope,
+            throttle_scope,
             self.idempotency_override,
         );
         let leg_recovery = recovery.clone();
         let (partial_commit, recovery) = if let Some(record) = self.partial_commit {
             let attempt = super::partial::first_attempt(classification_chain.iter());
-            let (record, projected) = record.finish(&recovery, attempt, &self.kind)?;
+            let (record, projected) = record.finish(&recovery, attempt, &kind)?;
             (Some(Arc::new(record)), projected)
         } else {
             (None, recovery)
         };
-        let remediation = recovery::suggest(
-            &self.kind,
-            &recovery,
-            self.scope.as_ref(),
-            &classification_chain,
-        );
-        let message_key = message_key::derive(&self.kind);
+        let remediation =
+            recovery::suggest(&kind, &recovery, self.scope.as_ref(), &classification_chain);
+        let message_key = message_key::derive(&kind);
 
         Ok(AccountError::from_parts(AccountErrorParts {
             original_error: self.original_error,
+            primary_cause: self.primary_cause,
             partial_commit,
             leg_recovery,
-            kind: self.kind,
+            kind,
             recovery,
             remediation,
             scope: self.scope,
@@ -541,9 +415,6 @@ impl AccountErrorBuilder {
             classification_cause_count,
             message_key,
             idempotency_override: self.idempotency_override,
-            throttle_scope: self.throttle_scope,
-            throttle_budgets: self.throttle_budgets,
-            local_hold: self.local_hold,
             unsupported_reason: self.unsupported_reason,
         }))
     }
@@ -552,18 +423,19 @@ impl AccountErrorBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ThrottleBudget;
     use crate::error::{
-        AttemptCause, Cause, RequestCause, RequestErrorKind, TransmissionState, TransportCause,
-        TransportErrorKind, TransportKind,
+        AttemptCause, Cause, PrimaryCause, RequestCause, TransmissionState, TransportCause,
+        TransportErrorKind,
     };
 
     #[test]
     fn idempotency_override_is_monotone_across_decoration() {
         let failure = || {
-            AccountErrorBuilder::new(
-                AccountErrorKind::Transport(TransportErrorKind::Network),
-                Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-            )
+            AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+                TransportErrorKind::Network,
+                None,
+            )))
             .operation(AccountOperation::Send)
             .push_cause(Cause::Attempt(AttemptCause::new(
                 TransmissionState::InFlight,
@@ -601,29 +473,11 @@ mod tests {
     }
 
     #[test]
-    fn local_hold_provenance_requires_a_throttle_kind() {
-        let error = AccountErrorBuilder::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-        )
-        .local_hold()
-        .try_build()
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            AccountErrorBuildError::LocalHoldNotApplicable { .. }
-        ));
-    }
-
-    #[test]
     fn decoration_does_not_adopt_sibling_transmission_evidence() {
-        let original = AccountErrorBuilder::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause {
-                kind: TransportKind::Network,
-                message: None,
-            }),
-        )
+        let original = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause {
+            kind: TransportErrorKind::Network,
+            message: None,
+        }))
         .idempotency_override(false)
         .try_build()
         .expect("valid transport failure");
@@ -650,24 +504,25 @@ mod tests {
     fn decoration_does_not_adopt_sibling_retry_hints_or_smtp_identity() {
         use crate::error::{EnhancedStatusCode, RetryHint, ServerCause, WireCause};
 
-        for (kind, primary, extra) in [
+        for (primary, extra) in [
             (
-                ServerErrorKind::RateLimited,
-                ServerCause::RateLimited { retry_hint: None },
+                ServerCause::RateLimited {
+                    throttle: Default::default(),
+                    retry_hint: None,
+                },
                 Cause::Server(ServerCause::RateLimited {
+                    throttle: Default::default(),
                     retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(37))),
                 }),
             ),
             (
-                ServerErrorKind::Error { status: Some(554) },
                 ServerCause::Error { status: Some(554) },
                 Cause::Wire(WireCause::Smtp(EnhancedStatusCode::new(554, None, None))),
             ),
         ] {
-            let original =
-                AccountErrorBuilder::new(AccountErrorKind::Server(kind), Cause::Server(primary))
-                    .try_build()
-                    .expect("valid server failure");
+            let original = AccountErrorBuilder::new(PrimaryCause::Server(primary))
+                .try_build()
+                .expect("valid server failure");
             let decorated = original
                 .clone()
                 .into_builder()
@@ -685,12 +540,9 @@ mod tests {
 
     #[test]
     fn build_derives_message_key_and_recovery() {
-        let err = AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("bad"),
-            }),
-        )
+        let err = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("bad"),
+        }))
         .try_build()
         .expect("valid account error classification");
 
@@ -703,12 +555,9 @@ mod tests {
         // Starting from an EMPTY builder cannot detect this: the bug is that a
         // rejected replacement used to leave the earlier valid token in place,
         // so telemetry attributed the rebuilt error to the wrong request.
-        let err = AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("bad"),
-            }),
-        )
+        let err = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("bad"),
+        }))
         .request_id("req-1")
         .trace_id("trace-1")
         .native_code("code-1")
@@ -735,79 +584,20 @@ mod tests {
         assert_eq!(telemetry.native_code, None);
     }
 
-    #[test]
-    fn mismatched_kind_and_cause_rejected() {
-        let err = AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Transport(TransportCause {
-                kind: TransportKind::Network,
-                message: None,
-            }),
-        )
-        .try_build()
-        .expect_err("kind and cause disagree");
-
-        assert!(matches!(
-            err,
-            AccountErrorBuildError::KindCauseMismatch { .. }
-        ));
-    }
-
-    #[test]
-    fn throttle_scope_rejected_outside_rate_or_quota() {
-        let err = AccountErrorBuilder::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause {
-                kind: TransportKind::Network,
-                message: None,
-            }),
-        )
-        .throttle_scope(ThrottleScope::Account)
-        .try_build()
-        .expect_err("throttle_scope on transport is invalid");
-
-        // The dedicated variant, not KindCauseMismatch: the kind and
-        // cause here agree with each other, and the diagnosis must
-        // point at the throttle scope alone.
-        assert!(matches!(
-            err,
-            AccountErrorBuildError::ThrottleScopeNotApplicable {
-                throttle_scope: ThrottleScope::Account,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn throttle_budget_rejected_outside_rate_or_quota() {
-        let err = AccountErrorBuilder::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause {
-                kind: TransportKind::Network,
-                message: None,
-            }),
-        )
-        .throttle_budget(ThrottleBudget::new("b"))
-        .try_build()
-        .expect_err("throttle_budget on transport is invalid");
-        assert!(matches!(
-            err,
-            AccountErrorBuildError::ThrottleBudgetNotApplicable { .. }
-        ));
-    }
-
     /// A stamped budget is a builder input like `throttle_scope`, and must
     /// survive decoration through `into_builder`: a producer that rebuilds an
     /// error (to add evidence or an idempotency override) would otherwise
     /// silently move its hold back onto the account key.
     #[test]
     fn throttle_budget_survives_into_builder() {
-        let err = AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(crate::error::ServerCause::RateLimited { retry_hint: None }),
-        )
-        .throttle_budget(ThrottleBudget::new("b"))
-        .throttle_budget(ThrottleBudget::new("b"))
+        let err = AccountErrorBuilder::new(PrimaryCause::Server(
+            crate::error::ServerCause::RateLimited {
+                throttle: Default::default(),
+                retry_hint: None,
+            },
+        ))
+        .with_throttle(|throttle| throttle.add_budget(ThrottleBudget::new("b")))
+        .with_throttle(|throttle| throttle.add_budget(ThrottleBudget::new("b")))
         .try_build()
         .expect("valid");
         let rebuilt = err
@@ -820,13 +610,10 @@ mod tests {
 
     #[test]
     fn transport_acknowledged_rejected() {
-        let err = AccountErrorBuilder::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause {
-                kind: TransportKind::Network,
-                message: None,
-            }),
-        )
+        let err = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause {
+            kind: TransportErrorKind::Network,
+            message: None,
+        }))
         .push_cause(Cause::Attempt(AttemptCause::new(
             TransmissionState::Acknowledged,
         )))
@@ -834,19 +621,6 @@ mod tests {
         .expect_err("transport + acknowledged is invalid");
 
         assert_eq!(err, AccountErrorBuildError::TransportAcknowledged);
-    }
-
-    #[test]
-    fn cursor_invalid_without_scope_rejected() {
-        use super::super::cause::StateCause;
-        let err = AccountErrorBuilder::new(
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-        )
-        .try_build()
-        .expect_err("CursorInvalid requires a cursor scope");
-
-        assert_eq!(err, AccountErrorBuildError::CursorInvalidWithoutScope);
     }
 }
 
@@ -874,27 +648,17 @@ mod refusal_contract_tests {
             ),
         ];
         for (kind, cause, key) in cases {
-            let error = AccountErrorBuilder::new(
-                AccountErrorKind::Request(kind),
-                Cause::Request(cause.clone()),
-            )
-            .operation(AccountOperation::Send)
-            .try_build()
-            .expect("matching refusal");
+            let error = AccountErrorBuilder::new(PrimaryCause::Request(cause.clone()))
+                .operation(AccountOperation::Send)
+                .try_build()
+                .expect("matching refusal");
             assert_eq!(error.message_key(), key);
             assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused);
             assert_eq!(
                 error.suggested_remediation(),
                 Some(&RemediationAction::FixClientRequest)
             );
-            assert!(matches!(
-                AccountErrorBuilder::new(
-                    AccountErrorKind::Request(RequestErrorKind::Malformed),
-                    Cause::Request(cause)
-                )
-                .try_build(),
-                Err(AccountErrorBuildError::KindCauseMismatch { .. })
-            ));
+            assert_eq!(error.kind(), &AccountErrorKind::Request(kind));
         }
     }
 
@@ -938,5 +702,175 @@ mod refusal_contract_tests {
             error,
             Err(AccountErrorBuildError::UnsupportedReasonNotApplicable { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod primary_cause_tests {
+    use super::*;
+    use crate::{
+        AccessCause, AccessErrorKind, CursorScope, EngineDirective, FolderId,
+        MailboxUnavailableKind, PrimaryCause, ProtocolErrorKind, RecoveryClass, ServerCause,
+        ServerErrorKind, StateCause, Throttle, ThrottleBudget, ThrottleScope, WireCause,
+    };
+
+    #[test]
+    fn primary_cause_preserves_mailbox_permanence() {
+        for (permanence, retryable) in [
+            (MailboxUnavailableKind::Transient, true),
+            (MailboxUnavailableKind::Permanent, false),
+        ] {
+            let error =
+                AccountErrorBuilder::new(PrimaryCause::Access(AccessCause::MailboxUnavailable {
+                    kind: permanence,
+                }))
+                .try_build()
+                .unwrap();
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Authorization(AccessErrorKind::MailboxUnavailable {
+                    kind: permanence
+                })
+            );
+            assert_eq!(error.recovery().is_retryable(), retryable);
+        }
+    }
+
+    #[test]
+    fn primary_server_status_owns_classification_and_diagnostics() {
+        for (status, retryable) in [(Some(503), true), (Some(403), false), (None, false)] {
+            let error =
+                AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::Error { status }))
+                    .operation(AccountOperation::Hydrate)
+                    .status(Some(418))
+                    .push_cause(Cause::Server(ServerCause::Error { status: Some(503) }))
+                    .try_build()
+                    .unwrap();
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Server(ServerErrorKind::Error { status })
+            );
+            assert_eq!(error.telemetry_fields().status, status);
+            assert_eq!(error.recovery().is_retryable(), retryable);
+            let rebuilt = error
+                .clone()
+                .into_builder()
+                .status(Some(500))
+                .try_build()
+                .unwrap();
+            assert_eq!(rebuilt.kind(), error.kind());
+            assert_eq!(rebuilt.recovery(), error.recovery());
+            assert_eq!(rebuilt.telemetry_fields().status, status);
+        }
+    }
+
+    #[test]
+    fn primary_state_scope_survives_decoration_and_explicit_rebinding() {
+        let original = CursorScope::Folder(FolderId("original".into()));
+        let rebound = CursorScope::Folder(FolderId("rebound".into()));
+        for (state, directive) in [
+            (
+                StateCause::CursorInvalid {
+                    scope: original.clone(),
+                },
+                EngineDirective::RestartScope(original.clone()),
+            ),
+            (
+                StateCause::ScopeCapabilityLost {
+                    scope: original.clone(),
+                },
+                EngineDirective::DowngradeCapabilityForScope(original.clone()),
+            ),
+            (
+                StateCause::ScopeRevoked {
+                    scope: original.clone(),
+                },
+                EngineDirective::DisableScope(original.clone()),
+            ),
+        ] {
+            let error = AccountErrorBuilder::new(PrimaryCause::State(state))
+                .scope(ErrorScope::Account)
+                .push_cause(Cause::State(StateCause::CursorInvalid {
+                    scope: rebound.clone(),
+                }))
+                .try_build()
+                .unwrap();
+            assert_eq!(error.scope(), Some(&ErrorScope::Cursor(original.clone())));
+            assert_eq!(error.recovery(), &RecoveryClass::Engine(directive));
+            // Cover both the shared Arc and uniquely owned rebuild paths.
+            let shared = error.clone();
+            let mut rebuilt = error;
+            for _ in 0..2 {
+                rebuilt = rebuilt
+                    .into_builder()
+                    .scope(ErrorScope::Cursor(rebound.clone()))
+                    .try_build()
+                    .unwrap();
+                assert_eq!(rebuilt.scope(), Some(&ErrorScope::Cursor(rebound.clone())));
+                assert!(matches!(rebuilt.recovery(), RecoveryClass::Engine(d)
+                    if d.target_scope() == Some(rebound.clone())));
+                assert!(matches!(rebuilt.chain().outermost(), Cause::State(
+                    StateCause::CursorInvalid { scope } | StateCause::ScopeCapabilityLost { scope }
+                    | StateCause::ScopeRevoked { scope }) if scope == &rebound));
+            }
+            assert_eq!(shared.scope(), Some(&ErrorScope::Cursor(original.clone())));
+        }
+    }
+
+    #[test]
+    fn primary_throttle_provenance_cannot_be_erased_by_decoration() {
+        let error = AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+            retry_hint: Some(recovery::RetryHint::After(std::time::Duration::from_secs(
+                30,
+            ))),
+            throttle: Throttle {
+                scope: Some(ThrottleScope::Account),
+                budgets: vec![ThrottleBudget::new("mailbox")],
+                local_hold: true,
+            },
+        }))
+        .try_build()
+        .unwrap();
+        let original = error.clone();
+        let rebuilt = error
+            .into_builder()
+            .with_throttle(|throttle| throttle.local_hold = false)
+            .try_build()
+            .unwrap();
+        assert!(rebuilt.is_local_hold());
+        assert_eq!(rebuilt.throttle_budgets(), original.throttle_budgets());
+        assert_eq!(rebuilt.recovery(), original.recovery());
+        assert!(
+            rebuilt
+                .throttle_holds()
+                .into_iter()
+                .all(|(target, _)| matches!(target, crate::HoldTarget::CurrentOperation))
+        );
+    }
+
+    #[test]
+    fn primary_protocol_subkind_survives_rebuilding() {
+        for kind in [
+            ProtocolErrorKind::ParseFailed,
+            ProtocolErrorKind::PartialResponse,
+        ] {
+            let error = AccountErrorBuilder::new(PrimaryCause::Protocol {
+                kind,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Graph,
+                    detail: None,
+                },
+            })
+            .operation(AccountOperation::Hydrate)
+            .try_build()
+            .unwrap();
+            assert_eq!(error.kind(), &AccountErrorKind::Protocol(kind));
+            assert!(
+                matches!(error.chain().outermost(), Cause::Protocol { kind: stored, .. } if *stored == kind)
+            );
+            let rebuilt = error.clone().into_builder().try_build().unwrap();
+            assert_eq!(rebuilt.kind(), error.kind());
+            assert_eq!(rebuilt.recovery(), error.recovery());
+        }
     }
 }

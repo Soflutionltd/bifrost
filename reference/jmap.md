@@ -1505,7 +1505,7 @@ rules remain owned by `bifrost-types`; call sites pass observations and context
 rather than constructing kinds and causes themselves. Existing hermetic tests
 exercise these paths through their capability, paging, PIM and push callers.
 
-`sync/error.rs::into_account_error(error, ctx)` is the single translation boundary: it consumes `crate::Error` plus a `JmapErrorContext { operation, scope, .. }` and emits an `AccountError` via `AccountErrorBuilder`, routing `(AccountErrorKind, Cause)` plus operation, scope, and any `AttemptCause` through `bifrost-types::recovery::derive` (central `RecoveryClass`; no private `to_recovery` table).
+`sync/error.rs::into_account_error(error, ctx)` is the single translation boundary: it consumes `crate::Error` plus a `JmapErrorContext { operation, scope, .. }` and emits an `AccountError` via `AccountErrorBuilder`, routing a single `PrimaryCause` plus operation, scope, and any `AttemptCause` through `bifrost-types::recovery::derive` (central `RecoveryClass`; no private `to_recovery` table).
 
 The request contract is one of `Plain`, `StateRead(CursorScope)`,
 `AnchoredQuery(CursorScope)` or `Send`. Only `Send` adds evidence-less

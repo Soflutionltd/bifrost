@@ -165,7 +165,7 @@ pub(crate) fn resolve_throttle_key(
     let error = error
         .clone()
         .into_builder()
-        .throttle_scope(scope)
+        .with_throttle(|throttle| throttle.scope = Some(scope))
         .try_build()
         .unwrap();
     error

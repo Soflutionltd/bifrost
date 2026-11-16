@@ -42,22 +42,15 @@ pub enum HoldKind {
 }
 
 impl HoldKind {
-    /// Project the restricted hold classification into the shared error model.
-    #[must_use]
-    pub fn server_kind(self) -> bifrost_types::ServerErrorKind {
-        match self {
-            Self::RateLimited => bifrost_types::ServerErrorKind::RateLimited,
-            Self::QuotaExhausted => bifrost_types::ServerErrorKind::QuotaExhausted,
-        }
-    }
-
     #[must_use]
     pub fn server_cause(self, retry_hint: bifrost_types::RetryHint) -> bifrost_types::ServerCause {
         match self {
             Self::RateLimited => bifrost_types::ServerCause::RateLimited {
+                throttle: Default::default(),
                 retry_hint: Some(retry_hint),
             },
             Self::QuotaExhausted => bifrost_types::ServerCause::QuotaExhausted {
+                throttle: Default::default(),
                 retry_hint: Some(retry_hint),
             },
         }
@@ -241,7 +234,7 @@ mod tests {
                 },
                 Some(bifrost_types::ThrottleScope::Account),
             );
-            let Cause::Server(bifrost_types::ServerCause::RateLimited { retry_hint }) =
+            let Cause::Server(bifrost_types::ServerCause::RateLimited { retry_hint, .. }) =
                 error.chain().outermost()
             else {
                 panic!("rate cause")

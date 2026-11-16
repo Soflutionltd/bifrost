@@ -30,18 +30,19 @@
 use std::error::Error as StdError;
 
 #[cfg(test)]
+use bifrost_types::{AccountErrorKind, RequestErrorKind};
+#[cfg(test)]
 use std::time::Duration;
 
 use bifrost_net::{
     NetErrorContext, into_account_error_with_throttle_scope as net_into_account_error,
 };
 use bifrost_types::{
-    AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
-    ErrorScope, InternalCause, InternalErrorKind, JmapMethod, PartialCommitBuilder, Protocol,
-    ProtocolErrorKind, RequestCause, RequestErrorKind, ResourceKind, RetryHint, ServerCause,
-    ServerErrorKind, StateCause, SyncEvent, SyncStateErrorKind, ThrottleScope, TransmissionState,
-    TransportCause, TransportErrorKind, TransportKind, WireCause,
+    AccessCause, AccountError, AccountErrorBuilder, AccountOperation, AttemptCause, AuthCause,
+    Cause, CursorScope, DiagnosticText, ErrorScope, InternalCause, InternalErrorKind, JmapMethod,
+    PartialCommitBuilder, PrimaryCause, Protocol, ProtocolErrorKind, RequestCause, ResourceKind,
+    RetryHint, ServerCause, StateCause, SyncEvent, ThrottleScope, TransmissionState,
+    TransportCause, TransportErrorKind, WireCause,
 };
 #[cfg(test)]
 use bifrost_types::{BatchSuccess, ItemOutcome, MutationSuccess};
@@ -177,8 +178,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         crate::Error::Method(method) => convert_method(method, ctx),
         crate::Error::Set(set) => set_error_to_account_error(set, ctx, None),
         crate::Error::RequestEncode(err) => build(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            PrimaryCause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only(err.to_string()),
             }),
             &ctx,
@@ -186,8 +186,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         .try_build()
         .expect("valid account error classification"),
         crate::Error::RequestCallLimit { max } => build(
-            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
-            Cause::Request(RequestCause::PayloadTooLarge {
+            PrimaryCause::Request(RequestCause::PayloadTooLarge {
                 detail: DiagnosticText::support_only(format!(
                     "JMAP request exceeds maxCallsInRequest ({max})"
                 )),
@@ -197,8 +196,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         .try_build()
         .expect("valid account error classification"),
         crate::Error::RequestSizeLimit { max, size } => build(
-            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
-            Cause::Request(RequestCause::PayloadTooLarge {
+            PrimaryCause::Request(RequestCause::PayloadTooLarge {
                 detail: DiagnosticText::support_only(format!(
                     "JMAP request of {size} bytes exceeds maxSizeRequest ({max})"
                 )),
@@ -208,8 +206,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         .try_build()
         .expect("valid account error classification"),
         crate::Error::UploadSizeLimit { max, size } => build(
-            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
-            Cause::Request(RequestCause::PayloadTooLarge {
+            PrimaryCause::Request(RequestCause::PayloadTooLarge {
                 detail: DiagnosticText::support_only(format!(
                     "JMAP upload of {size} bytes exceeds maxSizeUpload ({max})"
                 )),
@@ -221,25 +218,29 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         crate::Error::EnvelopeDecode(err) => decode_error(err, None, &ctx),
         crate::Error::ResultDecode { call_id, source } => decode_error(source, Some(call_id), &ctx),
         crate::Error::MissingResponseField(field) => build(
-            AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(format!(
-                    "response omitted {field}"
-                ))),
-            }),
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::MissingField,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Jmap,
+                    detail: Some(DiagnosticText::support_only(format!(
+                        "response omitted {field}"
+                    ))),
+                },
+            },
             &ctx,
         )
         .try_build()
         .expect("valid account error classification"),
         crate::Error::CallNotFound(id) => build(
-            AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(format!(
-                    "call {id} not found in response"
-                ))),
-            }),
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::PartialResponse,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Jmap,
+                    detail: Some(DiagnosticText::support_only(format!(
+                        "call {id} not found in response"
+                    ))),
+                },
+            },
             &ctx,
         )
         // An omitted call is unanswered, so retry/reconciliation remains possible.
@@ -253,13 +254,15 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             expected,
             actual,
         } => build(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(format!(
-                    "call {call_id} returned {actual}, expected {expected}"
-                ))),
-            }),
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ContractViolation,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Jmap,
+                    detail: Some(DiagnosticText::support_only(format!(
+                        "call {call_id} returned {actual}, expected {expected}"
+                    ))),
+                },
+            },
             &ctx,
         )
         .try_build()
@@ -279,18 +282,19 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             reason,
         ),
         crate::Error::NotParsable(detail) => build(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(detail)),
-            }),
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ParseFailed,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Jmap,
+                    detail: Some(DiagnosticText::support_only(detail)),
+                },
+            },
             &ctx,
         )
         .try_build()
         .expect("valid account error classification"),
         crate::Error::InvalidUrl(detail) => build(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::InvalidArgument {
+            PrimaryCause::Request(RequestCause::InvalidArgument {
                 field: Some("url"),
                 message: Some(DiagnosticText::support_only(detail)),
             }),
@@ -304,13 +308,15 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         // so it is a terminal contract violation naming the property - not
         // the caller's `Request(Malformed)` it was once filed under.
         crate::Error::MalformedSessionUrl { property, detail } => build(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(format!(
-                    "session property {property} is not a usable URL: {detail}"
-                ))),
-            }),
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ContractViolation,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Jmap,
+                    detail: Some(DiagnosticText::support_only(format!(
+                        "session property {property} is not a usable URL: {detail}"
+                    ))),
+                },
+            },
             &ctx,
         )
         .try_build()
@@ -321,13 +327,15 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         // `CapabilityChanged -> RestartAccount` reopen loop an ABSENT
         // capability takes, and the URI rides in the diagnostic.
         crate::Error::MalformedCapability { capability } => build(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(format!(
-                    "JMAP capability object {capability} is present but not parseable"
-                ))),
-            }),
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ContractViolation,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Jmap,
+                    detail: Some(DiagnosticText::support_only(format!(
+                        "JMAP capability object {capability} is present but not parseable"
+                    ))),
+                },
+            },
             &ctx,
         )
         .try_build()
@@ -344,8 +352,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             account_id,
             capability,
         } => build(
-            AccountErrorKind::Unsupported(ctx.operation),
-            Cause::Request(RequestCause::Unsupported {
+            PrimaryCause::Request(RequestCause::Unsupported {
                 operation: ctx.operation,
             }),
             &ctx,
@@ -357,8 +364,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         .try_build()
         .expect("valid account error classification"),
         crate::Error::NoPrimaryAccount { capability } => build(
-            AccountErrorKind::Unsupported(ctx.operation),
-            Cause::Request(RequestCause::Unsupported {
+            PrimaryCause::Request(RequestCause::Unsupported {
                 operation: ctx.operation,
             }),
             &ctx,
@@ -381,8 +387,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         }
         #[cfg(feature = "websockets")]
         crate::Error::WebSocketNotConnected => build(
-            AccountErrorKind::Unsupported(ctx.operation),
-            Cause::Request(RequestCause::Unsupported {
+            PrimaryCause::Request(RequestCause::Unsupported {
                 operation: ctx.operation,
             }),
             &ctx,
@@ -392,9 +397,8 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         #[cfg(feature = "websockets")]
         crate::Error::WebSocketSetup(setup) => match setup {
             crate::WebSocketSetupError::Tls(message) => build(
-                AccountErrorKind::Transport(TransportErrorKind::Tls),
-                Cause::Transport(TransportCause::new(
-                    TransportKind::Tls,
+                PrimaryCause::Transport(TransportCause::new(
+                    TransportErrorKind::Tls,
                     Some(DiagnosticText::support_only(message)),
                 )),
                 &ctx,
@@ -403,8 +407,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             .try_build()
             .expect("valid account error classification"),
             crate::WebSocketSetupError::InvalidHeader(message) => build(
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::InvalidArgument {
+                PrimaryCause::Request(RequestCause::InvalidArgument {
                     field: Some("authorization"),
                     message: Some(DiagnosticText::support_only(message)),
                 }),
@@ -413,8 +416,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             .try_build()
             .expect("valid account error classification"),
             crate::WebSocketSetupError::Subprotocol(message) => build(
-                AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-                Cause::State(StateCause::CapabilityChanged { delta: None }),
+                PrimaryCause::State(StateCause::CapabilityChanged { delta: None }),
                 &ctx,
             )
             .text(DiagnosticText::support_only(message))
@@ -489,16 +491,13 @@ pub(crate) fn search_unknown_account(
     container_id: &str,
     account_id: &str,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("filter.in"),
-            message: Some(DiagnosticText::support_only(format!(
-                "container {container_id} names shared account {account_id}, \
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::InvalidArgument {
+        field: Some("filter.in"),
+        message: Some(DiagnosticText::support_only(format!(
+            "container {container_id} names shared account {account_id}, \
                  which this session cannot reach"
-            ))),
-        }),
-    )
+        ))),
+    }))
     .protocol(Protocol::Jmap)
     .operation(operation)
     .try_build()
@@ -521,16 +520,13 @@ pub(crate) fn search_cross_account_filter(
 ) -> AccountError {
     let first = super::foreign::owner_label(first_owner);
     let second = super::foreign::owner_label(second_owner);
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("filter.in"),
-            message: Some(DiagnosticText::support_only(format!(
-                "search filter names containers in accounts {first} and {second}; \
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::InvalidArgument {
+        field: Some("filter.in"),
+        message: Some(DiagnosticText::support_only(format!(
+            "search filter names containers in accounts {first} and {second}; \
                  one Email/query cannot span two accounts"
-            ))),
-        }),
-    )
+        ))),
+    }))
     .protocol(Protocol::Jmap)
     .operation(operation)
     .try_build()
@@ -571,18 +567,16 @@ pub(crate) fn search_cursor_account_mismatch(
 /// is stale, refreshing it means running the search again from the first
 /// page, and the retry then succeeds. The two neighbouring lanes are both
 /// wrong. `SyncState(CursorInvalid)` is reserved for an ENGINE cursor
-/// scope (the builder refuses it without an `ErrorScope::Cursor`,
-/// `CursorInvalidWithoutScope`), and a search page cursor never enters
+/// scope (its state cause requires a `CursorScope`), and a search page cursor never enters
 /// the cursor envelope, so there is no scope to restart. `Request(Malformed)`
 /// derives `ClientBug`, and a single delivered message advancing
 /// `queryState` is not the caller's bug and must not be reported as
 /// permanently unfixable.
 #[must_use]
 pub(crate) fn search_result_set_superseded(operation: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::ConcurrencyConflict,
-        Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::ConcurrencyConflict,
+    ))
     .protocol(Protocol::Jmap)
     .operation(operation)
     .text(DiagnosticText::support_only(
@@ -617,15 +611,12 @@ pub(crate) fn send_as_unknown_account(mailbox: &bifrost_types::PrincipalId) -> A
 /// per-scope on the accepted lane.
 #[must_use]
 pub(crate) fn no_mappable_push_scopes() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("push_subscribe.scopes"),
-            message: Some(DiagnosticText::support_only(
-                "no requested cursor scope maps to a JMAP push data type",
-            )),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::InvalidArgument {
+        field: Some("push_subscribe.scopes"),
+        message: Some(DiagnosticText::support_only(
+            "no requested cursor scope maps to a JMAP push data type",
+        )),
+    }))
     .protocol(Protocol::Jmap)
     .operation(AccountOperation::PushSubscribe)
     .try_build()
@@ -656,17 +647,14 @@ pub(crate) fn cross_account_destination(
 ) -> AccountError {
     let target_owner = super::foreign::owner_label(target_owner);
     let destination_owner = super::foreign::owner_label(destination_owner);
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("destination"),
-            message: Some(DiagnosticText::support_only(format!(
-                "mailbox {destination_id} belongs to account {destination_owner}, \
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::InvalidArgument {
+        field: Some("destination"),
+        message: Some(DiagnosticText::support_only(format!(
+            "mailbox {destination_id} belongs to account {destination_owner}, \
                  but object {target_id} belongs to account {target_owner}; \
                  one Email/set cannot span two accounts"
-            ))),
-        }),
-    )
+        ))),
+    }))
     .protocol(Protocol::Jmap)
     .operation(operation)
     .scope(ErrorScope::Message {
@@ -725,13 +713,13 @@ pub(crate) fn contract_violation(
     scope: Option<ErrorScope>,
     message: impl Into<String>,
 ) -> AccountError {
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-        Cause::Wire(WireCause::MalformedResponse {
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::ContractViolation,
+        wire: WireCause::MalformedResponse {
             protocol: Protocol::Jmap,
             detail: Some(DiagnosticText::support_only(message)),
-        }),
-    )
+        },
+    })
     .protocol(Protocol::Jmap)
     .operation(operation);
     if let Some(scope) = scope {
@@ -754,24 +742,21 @@ pub(crate) fn set_error_to_account_error(
     let context_scope = ctx.scope();
     let scope_for_resource = item_scope.as_ref().or(context_scope.as_ref());
     let error_type = set_error.error_type().clone();
-    let (kind, primary) = match error_type {
+    let primary = match error_type {
         SetErrorType::Forbidden
         | SetErrorType::ForbiddenFrom
         | SetErrorType::ForbiddenMailFrom
-        | SetErrorType::ForbiddenToSend => (
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied {
-                resource: scope_for_resource.and_then(ErrorScope::resource),
-            }),
-        ),
-        SetErrorType::OverQuota => (
-            AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
-        ),
-        SetErrorType::RateLimit => (
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-        ),
+        | SetErrorType::ForbiddenToSend => PrimaryCause::Access(AccessCause::PermissionDenied {
+            resource: scope_for_resource.and_then(ErrorScope::resource),
+        }),
+        SetErrorType::OverQuota => PrimaryCause::Server(ServerCause::QuotaExhausted {
+            throttle: Default::default(),
+            retry_hint: None,
+        }),
+        SetErrorType::RateLimit => PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: None,
+        }),
         SetErrorType::NotFound | SetErrorType::BlobNotFound => {
             let wire = if matches!(set_error.error_type(), &SetErrorType::BlobNotFound) {
                 JmapMethod::BlobNotFound
@@ -782,47 +767,31 @@ pub(crate) fn set_error_to_account_error(
                 let id = scope_for_resource
                     .and_then(ErrorScope::object_id)
                     .map(str::to_owned);
-                (
-                    AccountErrorKind::NotFound(resource),
-                    Cause::Request(RequestCause::NotFound { what: resource, id }),
-                )
+                PrimaryCause::Request(RequestCause::NotFound { what: resource, id })
             } else {
-                // No scope tells us what was missing. Classify as a
-                // typed protocol-shape error so the kind/cause pair
-                // matches the strict builder invariants. Without the
-                // resource scope the previous shape was
-                // `Server(Error { status: None }) + Cause::Wire(_)`,
-                // which doesn't pass `kind_matches_cause`.
-                (
-                    AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-                    Cause::Wire(WireCause::Jmap(wire)),
-                )
+                // Without a resource identity, the wire signal cannot name a
+                // missing target. Preserve it as an unknown protocol failure.
+                PrimaryCause::Protocol {
+                    kind: ProtocolErrorKind::Unknown,
+                    wire: WireCause::Jmap(wire),
+                }
             }
         }
-        SetErrorType::AlreadyExists => (
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
-        ),
+        SetErrorType::AlreadyExists => PrimaryCause::State(StateCause::ConcurrencyConflict),
         SetErrorType::TooLarge
         | SetErrorType::TooManyKeywords
         | SetErrorType::TooManyMailboxes
-        | SetErrorType::TooManyRecipients => (
-            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
-            Cause::Request(RequestCause::PayloadTooLarge {
-                detail: DiagnosticText::support_only(set_error.to_string()),
-            }),
-        ),
+        | SetErrorType::TooManyRecipients => PrimaryCause::Request(RequestCause::PayloadTooLarge {
+            detail: DiagnosticText::support_only(set_error.to_string()),
+        }),
         SetErrorType::InvalidPatch
         | SetErrorType::InvalidProperties
         | SetErrorType::InvalidEmail
         | SetErrorType::InvalidRecipients
         | SetErrorType::NoRecipients
-        | SetErrorType::InvalidScript => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(set_error.to_string()),
-            }),
-        ),
+        | SetErrorType::InvalidScript => PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(set_error.to_string()),
+        }),
         // Valid requests refused because of target state need a caller decision.
         // Repeating the write or blaming the provider would not help the user.
         SetErrorType::WillDestroy
@@ -830,19 +799,18 @@ pub(crate) fn set_error_to_account_error(
         | SetErrorType::ScriptIsActive
         | SetErrorType::CannotUnsend
         | SetErrorType::MailboxHasChild
-        | SetErrorType::MailboxHasEmail => (
-            AccountErrorKind::Request(RequestErrorKind::PreconditionFailed),
-            Cause::Request(RequestCause::PreconditionFailed {
+        | SetErrorType::MailboxHasEmail => {
+            PrimaryCause::Request(RequestCause::PreconditionFailed {
                 detail: DiagnosticText::support_only(set_error.to_string()),
-            }),
-        ),
-        SetErrorType::Other(code) => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Jmap(JmapMethod::Unknown { code })),
-        ),
+            })
+        }
+        SetErrorType::Other(code) => PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::Unknown,
+            wire: WireCause::Jmap(JmapMethod::Unknown { code }),
+        },
     };
 
-    let mut builder = build_with(&ctx, kind, primary)
+    let mut builder = build_with(&ctx, primary)
         // Set errors are returned in a successful JMAP response, which
         // already crossed the side-effect boundary.
         .push_cause(Cause::Attempt(AttemptCause::new(
@@ -859,7 +827,7 @@ pub(crate) fn set_error_to_account_error(
         builder = builder.text(DiagnosticText::support_only(description));
     }
     if matches!(set_error.error_type(), &SetErrorType::RateLimit) {
-        builder = builder.throttle_scope(ThrottleScope::Account);
+        builder = builder.with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Account));
     }
     if let Some(scope) = item_scope {
         builder = builder.scope(scope);
@@ -915,10 +883,9 @@ pub(crate) fn unregistered_foreign_scope(
     scope: CursorScope,
     operation: AccountOperation,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
-        Cause::State(StateCause::ScopeRevoked),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::ScopeRevoked {
+        scope: scope.clone(),
+    }))
     .protocol(Protocol::Jmap)
     .operation(operation)
     .scope(ErrorScope::Cursor(scope))
@@ -954,10 +921,9 @@ pub(crate) fn shared_scope_error(
 /// capability at all. This is a server-side capability change relative
 /// to whatever the session previously claimed: the engine must reopen.
 fn missing_core_capability() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged { delta: None }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::CapabilityChanged {
+        delta: None,
+    }))
     .protocol(Protocol::Jmap)
     .operation(AccountOperation::Discover)
     .text(DiagnosticText::support_only(
@@ -971,10 +937,9 @@ fn missing_core_capability() -> AccountError {
 /// derives routing, limits, and capabilities from the old session, so the
 /// only safe consumer action is to reopen against a freshly fetched session.
 pub(super) fn session_state_changed() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged { delta: None }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::CapabilityChanged {
+        delta: None,
+    }))
     .protocol(Protocol::Jmap)
     .operation(AccountOperation::ScopeLifecycle)
     .text(DiagnosticText::support_only(
@@ -992,15 +957,15 @@ pub(super) fn session_state_changed() -> AccountError {
 /// are `UnsignedInt`; an omitted `maxSizeUpload` takes the same error lane.
 /// It is not a capability change.
 fn unusable_core_limits() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-        Cause::Wire(WireCause::MalformedResponse {
+    AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::ContractViolation,
+        wire: WireCause::MalformedResponse {
             protocol: Protocol::Jmap,
             detail: Some(DiagnosticText::support_only(
                 "JMAP core capability omits required fields or advertises unusable limits",
             )),
-        }),
-    )
+        },
+    })
     .protocol(Protocol::Jmap)
     .operation(AccountOperation::Discover)
     .try_build()
@@ -1028,15 +993,15 @@ fn malformed_core_capability() -> AccountError {
 /// The URI is named in the diagnostic - "some capability is malformed" is
 /// not an actionable report when a session advertises a dozen.
 pub(super) fn malformed_required_capability(uri: &str) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-        Cause::Wire(WireCause::MalformedResponse {
+    AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::ContractViolation,
+        wire: WireCause::MalformedResponse {
             protocol: Protocol::Jmap,
             detail: Some(DiagnosticText::support_only(format!(
                 "JMAP capability object {uri} is present but not parseable"
             ))),
-        }),
-    )
+        },
+    })
     .protocol(Protocol::Jmap)
     .operation(AccountOperation::Discover)
     .try_build()
@@ -1071,15 +1036,15 @@ pub(super) fn finish_partial(error: AccountError, record: PartialCommitBuilder) 
 /// a share with unknown rights is far more useful than a share missing
 /// from the sidebar.
 pub(super) fn missing_shared_rights(container_id: &str, op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
-        Cause::Wire(WireCause::MalformedResponse {
+    AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::MissingField,
+        wire: WireCause::MalformedResponse {
             protocol: Protocol::Jmap,
             detail: Some(DiagnosticText::support_only(format!(
                 "shared Mailbox/get answered without myRights: {container_id}"
             ))),
-        }),
-    )
+        },
+    })
     .protocol(Protocol::Jmap)
     .operation(op)
     .try_build()
@@ -1087,14 +1052,11 @@ pub(super) fn missing_shared_rights(container_id: &str, op: AccountOperation) ->
 }
 
 pub(super) fn invalid_attachment_handle(op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(
-                "JMAP attachment handle has no source account; upload it again before sending",
-            ),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only(
+            "JMAP attachment handle has no source account; upload it again before sending",
+        ),
+    }))
     .protocol(Protocol::Jmap)
     .operation(op)
     .try_build()
@@ -1106,9 +1068,7 @@ pub(super) fn invalid_attachment_handle(op: AccountOperation) -> AccountError {
 /// `from` is absent; without either, JMAP defines no default identity to use.
 /// Maps to `Request(Malformed)`.
 pub(super) fn scheduled_requires_envelope() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
             detail: DiagnosticText::user_safe(
                 "Scheduled send requires a from address or selected identity and at least one recipient.",
             ),
@@ -1121,13 +1081,13 @@ pub(super) fn scheduled_requires_envelope() -> AccountError {
 }
 
 pub(super) fn reschedule_missing_field(detail: &'static str) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
-        Cause::Wire(WireCause::MalformedResponse {
+    AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::MissingField,
+        wire: WireCause::MalformedResponse {
             protocol: Protocol::Jmap,
             detail: Some(DiagnosticText::support_only(detail)),
-        }),
-    )
+        },
+    })
     .protocol(Protocol::Jmap)
     .operation(AccountOperation::RescheduleSend)
     .try_build()
@@ -1135,13 +1095,10 @@ pub(super) fn reschedule_missing_field(detail: &'static str) -> AccountError {
 }
 
 pub(super) fn reschedule_not_found(id: &str) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::NotFound(ResourceKind::Message),
-        Cause::Request(RequestCause::NotFound {
-            what: ResourceKind::Message,
-            id: Some(id.to_string()),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::NotFound {
+        what: ResourceKind::Message,
+        id: Some(id.to_string()),
+    }))
     .protocol(Protocol::Jmap)
     .operation(AccountOperation::RescheduleSend)
     .try_build()
@@ -1163,7 +1120,9 @@ pub(super) fn change_cursor_error(
         // A readable scope disagreement restarts only that scope. Keep
         // this exhaustive so new faults cannot inherit that policy.
         super::state::JmapCursorError::ScopeMismatch => {
-            bifrost_types::CursorDecodeFault::ScopeMismatch
+            bifrost_types::CursorDecodeFault::ScopeMismatch {
+                scope: scope.clone(),
+            }
         }
         super::state::JmapCursorError::UnsupportedScope
         | super::state::JmapCursorError::SchemaIncompatible => {
@@ -1200,13 +1159,10 @@ pub(super) fn invalid_argument(
     field: &'static str,
     message: String,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some(field),
-            message: Some(DiagnosticText::support_only(message)),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::InvalidArgument {
+        field: Some(field),
+        message: Some(DiagnosticText::support_only(message)),
+    }))
     .protocol(Protocol::Jmap)
     .operation(operation)
     .try_build()
@@ -1253,15 +1209,12 @@ pub(super) fn page_concurrency_conflict(
     operation: AccountOperation,
     message: String,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::ConcurrencyConflict,
-        Cause::State(StateCause::ConcurrencyConflict),
-    )
-    .protocol(Protocol::Jmap)
-    .operation(operation)
-    .text(DiagnosticText::support_only(message))
-    .try_build()
-    .expect("valid account error classification")
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::ConcurrencyConflict))
+        .protocol(Protocol::Jmap)
+        .operation(operation)
+        .text(DiagnosticText::support_only(message))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// A missing anchor on an anchored caller-owned walk is ordinary concurrent
@@ -1291,13 +1244,10 @@ pub(super) fn page_call_error(
 }
 
 pub(super) fn raw_message_not_found(id: &str) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::NotFound(ResourceKind::Message),
-        Cause::Request(RequestCause::NotFound {
-            what: ResourceKind::Message,
-            id: Some(id.to_owned()),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::NotFound {
+        what: ResourceKind::Message,
+        id: Some(id.to_owned()),
+    }))
     .operation(AccountOperation::OpenRawRfc822)
     .protocol(Protocol::Jmap)
     .try_build()
@@ -1305,12 +1255,9 @@ pub(super) fn raw_message_not_found(id: &str) -> AccountError {
 }
 
 pub(super) fn invalid_timestamp(operation: AccountOperation, message: String) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::user_safe(message),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::user_safe(message),
+    }))
     .protocol(Protocol::Jmap)
     .operation(operation)
     .try_build()
@@ -1323,12 +1270,10 @@ pub(crate) fn internal_invariant(
     operation: AccountOperation,
     message: impl Into<String>,
 ) -> AccountError {
-    let kind = AccountErrorKind::Internal(InternalErrorKind::InvariantViolated);
     let detail = DiagnosticText::support_only(message.into());
     let context = JmapErrorContext::new(operation);
     build(
-        kind,
-        Cause::Internal(InternalCause::new(
+        PrimaryCause::Internal(InternalCause::new(
             InternalErrorKind::InvariantViolated,
             Some(detail.clone()),
         )),
@@ -1339,22 +1284,14 @@ pub(crate) fn internal_invariant(
     .expect("valid internal invariant error")
 }
 
-fn build(kind: AccountErrorKind, primary: Cause, ctx: &JmapErrorContext) -> AccountErrorBuilder {
-    build_with(ctx, kind, primary)
+fn build(primary: PrimaryCause, ctx: &JmapErrorContext) -> AccountErrorBuilder {
+    build_with(ctx, primary)
 }
 
-fn build_with(
-    ctx: &JmapErrorContext,
-    kind: AccountErrorKind,
-    primary: Cause,
-) -> AccountErrorBuilder {
-    let mut builder = match kind {
-        AccountErrorKind::Unsupported(operation) => {
-            AccountError::unsupported(operation, Protocol::Jmap).into_builder()
-        }
-        _ => AccountErrorBuilder::new(kind, primary).protocol(Protocol::Jmap),
-    }
-    .operation(ctx.operation);
+fn build_with(ctx: &JmapErrorContext, primary: PrimaryCause) -> AccountErrorBuilder {
+    let mut builder = AccountErrorBuilder::new(primary)
+        .protocol(Protocol::Jmap)
+        .operation(ctx.operation);
     if let Some(scope) = ctx.scope() {
         builder = builder.scope(scope);
     }
@@ -1377,11 +1314,13 @@ fn decode_error(
         None => error.to_string(),
     };
     build(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Jmap,
-            detail: Some(DiagnosticText::support_only(detail)),
-        }),
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::ParseFailed,
+            wire: WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(detail)),
+            },
+        },
         ctx,
     )
     .push_cause(Cause::Attempt(AttemptCause::unreadable_success()))
@@ -1405,8 +1344,7 @@ fn convert_transport(
         };
         let detail = DiagnosticText::support_only(transport.message.clone());
         return build(
-            AccountErrorKind::Internal(kind),
-            Cause::Internal(InternalCause::new(kind, Some(detail.clone()))),
+            PrimaryCause::Internal(InternalCause::new(kind, Some(detail.clone()))),
             &ctx,
         )
         .text(detail)
@@ -1435,9 +1373,8 @@ fn convert_transport(
         // boundary, which knows the transport was already handed the
         // submission, so the failure is stamped `InFlight`.
         let builder = build(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause::new(
-                TransportKind::Network,
+            PrimaryCause::Transport(TransportCause::new(
+                TransportErrorKind::Network,
                 Some(DiagnosticText::support_only(transport.message)),
             )),
             &ctx,
@@ -1469,63 +1406,66 @@ fn convert_problem(
         .as_ref()
         .and_then(|t| retry_after_from_net(t.net.as_ref()));
 
-    let (kind, primary) = match (details.error(), details.limit(), status_u16) {
-        (ProblemType::JMAP(JMAPError::Limit), Some("maxConcurrentRequests"), _) => (
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint }),
-        ),
+    let primary = match (details.error(), details.limit(), status_u16) {
+        (ProblemType::JMAP(JMAPError::Limit), Some("maxConcurrentRequests"), _) => {
+            PrimaryCause::Server(ServerCause::RateLimited {
+                throttle: Default::default(),
+                retry_hint,
+            })
+        }
         // An enterprise user expects an oversized attachment or request to
         // identify the input limit, not retry the same payload indefinitely.
         (ProblemType::JMAP(JMAPError::Limit), Some(limit), _)
             if matches!(limit, "maxSizeRequest" | "maxCallsInRequest")
                 || limit.starts_with("maxObjectsIn") =>
         {
-            (
-                AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
-                Cause::Request(RequestCause::PayloadTooLarge {
-                    detail: DiagnosticText::support_only(format!("JMAP request exceeds {limit}")),
-                }),
-            )
+            PrimaryCause::Request(RequestCause::PayloadTooLarge {
+                detail: DiagnosticText::support_only(format!("JMAP request exceeds {limit}")),
+            })
         }
-        (ProblemType::JMAP(JMAPError::UnknownCapability), _, _) => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged { delta: None }),
-        ),
+        (ProblemType::JMAP(JMAPError::UnknownCapability), _, _) => {
+            PrimaryCause::State(StateCause::CapabilityChanged { delta: None })
+        }
         // The server claims our request was not JSON or not a valid
         // JMAP request envelope; the client side did send valid JSON
         // (any deserialization issue is caught locally before the
         // request leaves), so the server's claim is a protocol contract
         // violation, not a client bug. Per jmap-F2.
-        (ProblemType::JMAP(JMAPError::NotJSON | JMAPError::NotRequest), _, _) => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(details.to_string())),
-            }),
-        ),
+        (ProblemType::JMAP(JMAPError::NotJSON | JMAPError::NotRequest), _, _) => {
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ContractViolation,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Jmap,
+                    detail: Some(DiagnosticText::support_only(details.to_string())),
+                },
+            }
+        }
         // An absent or unfamiliar limit does not itself prove throttling.
         // Use HTTP evidence when present, just as for an unknown problem type.
         (ProblemType::JMAP(JMAPError::Limit) | ProblemType::Other(_), _, Some(status)) => {
-            let class = bifrost_net::classify_status(
+            bifrost_net::classify_status(
                 status,
                 ctx.scope().as_ref(),
                 retry_hint,
                 bifrost_net::StatusPolicy::default(),
-            );
-            (class.kind, class.cause)
+            )
         }
-        (error @ (ProblemType::JMAP(JMAPError::Limit) | ProblemType::Other(_)), _, None) => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(wire_for_problem(error)),
-        ),
+        (error @ (ProblemType::JMAP(JMAPError::Limit) | ProblemType::Other(_)), _, None) => {
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::Unknown,
+                wire: wire_for_problem(error),
+            }
+        }
     };
 
-    let class = bifrost_net::StatusClass::new(kind, primary);
-    let mut builder = build_with(&ctx, class.kind, class.cause)
-        .push_cause(Cause::Attempt(AttemptCause::new(
-            TransmissionState::Acknowledged,
-        )))
-        .push_cause(Cause::Wire(wire_for_problem(details.error())));
+    let mut builder = build_with(
+        &ctx,
+        bifrost_net::HttpErrorPolicy::from(Some(ThrottleScope::Account)).apply_throttle(primary),
+    )
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
+    .push_cause(Cause::Wire(wire_for_problem(details.error())));
     if let Some(status) = status_u16 {
         builder = builder.status(Some(status));
     }
@@ -1541,8 +1481,6 @@ fn convert_problem(
     if let Some(limit) = details.limit() {
         builder = builder.text(DiagnosticText::support_only(format!("limit: {limit}")));
     }
-    builder = bifrost_net::HttpErrorPolicy::from(Some(ThrottleScope::Account))
-        .apply_throttle(builder, class.throttles);
     builder
         .try_build()
         .expect("valid account error classification")
@@ -1595,107 +1533,106 @@ fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<RetryHint>
     bifrost_net::request::parse_retry_after_hint(headers.get(reqwest::header::RETRY_AFTER))
 }
 
-fn state_expiry_error(
-    wire: JmapMethod,
-    ctx: &JmapErrorContext,
-) -> (AccountErrorKind, Cause, JmapMethod) {
+fn state_expiry_error(wire: JmapMethod, ctx: &JmapErrorContext) -> (PrimaryCause, JmapMethod) {
     if !matches!(ctx.contract, RequestContract::StateRead(_)) {
         return (
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(
-                    "state-expiry method error was returned for a request without prior state"
-                        .to_string(),
-                )),
-            }),
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ContractViolation,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Jmap,
+                    detail: Some(DiagnosticText::support_only(
+                        "state-expiry method error was returned for a request without prior state"
+                            .to_string(),
+                    )),
+                },
+            },
             wire,
         );
     }
 
     (
-        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-        Cause::State(StateCause::CursorInvalid),
+        PrimaryCause::State(StateCause::CursorInvalid {
+            scope: ctx
+                .scope()
+                .and_then(|s| {
+                    if let ErrorScope::Cursor(scope) = s {
+                        Some(scope)
+                    } else {
+                        None
+                    }
+                })
+                .expect("stateful request has cursor scope"),
+        }),
         wire,
     )
 }
 
 fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext) -> AccountError {
     let method_type = method.error_type();
-    let (kind, primary, wire) = match method_type {
+    let (primary, wire) = match method_type {
         MethodErrorType::ServerUnavailable => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+            PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None }),
             JmapMethod::ServerUnavailable,
         ),
         MethodErrorType::ServerFail => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+            PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None }),
             JmapMethod::ServerFail,
         ),
         MethodErrorType::ServerPartialFail => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-            Cause::Wire(WireCause::Jmap(JmapMethod::ServerPartialFail)),
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::PartialResponse,
+                wire: WireCause::Jmap(JmapMethod::ServerPartialFail),
+            },
             JmapMethod::ServerPartialFail,
         ),
         MethodErrorType::UnknownMethod => (
-            AccountErrorKind::Unsupported(ctx.operation),
-            Cause::Request(RequestCause::Unsupported {
+            PrimaryCause::Request(RequestCause::Unsupported {
                 operation: ctx.operation,
             }),
             JmapMethod::UnknownMethod,
         ),
         MethodErrorType::InvalidArguments => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            PrimaryCause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only("invalidArguments".to_string()),
             }),
             JmapMethod::InvalidArguments,
         ),
         MethodErrorType::InvalidResultReference => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            PrimaryCause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only("invalidResultReference".to_string()),
             }),
             JmapMethod::InvalidResultReference,
         ),
         MethodErrorType::Forbidden => (
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied {
+            PrimaryCause::Access(AccessCause::PermissionDenied {
                 resource: ctx.scope().as_ref().and_then(ErrorScope::resource),
             }),
             JmapMethod::Forbidden,
         ),
         MethodErrorType::AccountNotFound => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged { delta: None }),
+            PrimaryCause::State(StateCause::CapabilityChanged { delta: None }),
             JmapMethod::AccountNotFound,
         ),
         MethodErrorType::FromAccountNotFound => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged { delta: None }),
+            PrimaryCause::State(StateCause::CapabilityChanged { delta: None }),
             JmapMethod::FromAccountNotFound,
         ),
         MethodErrorType::AccountNotSupportedByMethod => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged { delta: None }),
+            PrimaryCause::State(StateCause::CapabilityChanged { delta: None }),
             JmapMethod::AccountNotSupportedByMethod,
         ),
         MethodErrorType::FromAccountNotSupportedByMethod => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged { delta: None }),
+            PrimaryCause::State(StateCause::CapabilityChanged { delta: None }),
             JmapMethod::FromAccountNotSupportedByMethod,
         ),
         MethodErrorType::AccountReadOnly => (
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied {
+            PrimaryCause::Access(AccessCause::PermissionDenied {
                 resource: ctx.scope().as_ref().and_then(ErrorScope::resource),
             }),
             JmapMethod::AccountReadOnly,
         ),
         MethodErrorType::RequestTooLarge => (
-            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
-            Cause::Request(RequestCause::PayloadTooLarge {
+            PrimaryCause::Request(RequestCause::PayloadTooLarge {
                 detail: DiagnosticText::support_only("requestTooLarge".to_string()),
             }),
             JmapMethod::RequestTooLarge,
@@ -1704,39 +1641,47 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             state_expiry_error(JmapMethod::CannotCalculateChanges, &ctx)
         }
         MethodErrorType::StateMismatch => (
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
+            PrimaryCause::State(StateCause::ConcurrencyConflict),
             JmapMethod::StateMismatch,
         ),
         MethodErrorType::AlreadyExists => (
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
+            PrimaryCause::State(StateCause::ConcurrencyConflict),
             JmapMethod::AlreadyExists,
         ),
         MethodErrorType::AnchorNotFound
             if matches!(ctx.contract, RequestContract::AnchoredQuery(_)) =>
         {
             (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
+                PrimaryCause::State(StateCause::CursorInvalid {
+                    scope: ctx
+                        .scope()
+                        .and_then(|s| {
+                            if let ErrorScope::Cursor(scope) = s {
+                                Some(scope)
+                            } else {
+                                None
+                            }
+                        })
+                        .expect("stateful request has cursor scope"),
+                }),
                 JmapMethod::AnchorNotFound,
             )
         }
         MethodErrorType::AnchorNotFound => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::Jmap(JmapMethod::AnchorNotFound)),
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ContractViolation,
+                wire: WireCause::Jmap(JmapMethod::AnchorNotFound),
+            },
             JmapMethod::AnchorNotFound,
         ),
         MethodErrorType::UnsupportedSort => (
-            AccountErrorKind::Unsupported(ctx.operation),
-            Cause::Request(RequestCause::Unsupported {
+            PrimaryCause::Request(RequestCause::Unsupported {
                 operation: ctx.operation,
             }),
             JmapMethod::UnsupportedSort,
         ),
         MethodErrorType::UnsupportedFilter => (
-            AccountErrorKind::Unsupported(ctx.operation),
-            Cause::Request(RequestCause::Unsupported {
+            PrimaryCause::Request(RequestCause::Unsupported {
                 operation: ctx.operation,
             }),
             JmapMethod::UnsupportedFilter,
@@ -1745,16 +1690,18 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
         MethodErrorType::Other(code) => {
             let unknown = JmapMethod::Unknown { code: code.clone() };
             (
-                AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-                Cause::Wire(WireCause::Jmap(unknown.clone())),
+                PrimaryCause::Protocol {
+                    kind: ProtocolErrorKind::Unknown,
+                    wire: WireCause::Jmap(unknown.clone()),
+                },
                 unknown,
             )
         }
     };
 
-    let mut builder = build_with(&ctx, kind, primary).push_cause(Cause::Attempt(
-        AttemptCause::new(TransmissionState::Acknowledged),
-    ));
+    let mut builder = build_with(&ctx, primary).push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )));
     // Preserve the server's own explanation and named limit as
     // support-only diagnostics - the error-model contract prizes evidence
     // preservation, and these were previously dropped at the wire.
@@ -1787,8 +1734,7 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
 #[must_use]
 pub(crate) fn get_filter_not_found(id: &str, ctx: JmapErrorContext) -> AccountError {
     build(
-        AccountErrorKind::NotFound(ResourceKind::Filter),
-        Cause::Request(RequestCause::NotFound {
+        PrimaryCause::Request(RequestCause::NotFound {
             what: ResourceKind::Filter,
             id: Some(id.to_owned()),
         }),
@@ -1816,13 +1762,15 @@ pub(crate) fn get_filter_not_found(id: &str, ctx: JmapErrorContext) -> AccountEr
 #[must_use]
 fn get_id_unanswered(method: &str, id: &str, ctx: JmapErrorContext) -> AccountError {
     build(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Jmap,
-            detail: Some(DiagnosticText::support_only(format!(
-                "requested {method} id {id} appeared in neither `list` nor `notFound`"
-            ))),
-        }),
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::PartialResponse,
+            wire: WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(format!(
+                    "requested {method} id {id} appeared in neither `list` nor `notFound`"
+                ))),
+            },
+        },
         &ctx,
     )
     .push_cause(Cause::Attempt(AttemptCause::new(
@@ -1843,13 +1791,15 @@ pub(crate) fn missing_property(
     ctx: JmapErrorContext,
 ) -> AccountError {
     build(
-        AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Jmap,
-            detail: Some(DiagnosticText::support_only(format!(
-                "Email {id} response omitted {property}"
-            ))),
-        }),
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::MissingField,
+            wire: WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(format!(
+                    "Email {id} response omitted {property}"
+                ))),
+            },
+        },
         &ctx,
     )
     .try_build()
@@ -1889,13 +1839,15 @@ pub(crate) fn query_answer<T>(
 
 fn query_miss(id: &str, lane: &str, ctx: JmapErrorContext) -> AccountError {
     build(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Jmap,
-            detail: Some(DiagnosticText::support_only(format!(
-                "id {id} returned by /query was {lane} the follow-up /get"
-            ))),
-        }),
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::PartialResponse,
+            wire: WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(format!(
+                    "id {id} returned by /query was {lane} the follow-up /get"
+                ))),
+            },
+        },
         &ctx,
     )
     .push_cause(Cause::Attempt(AttemptCause::new(
@@ -1927,13 +1879,15 @@ pub(crate) fn set_id_unanswered(
     guarded: bool,
 ) -> AccountError {
     let builder = build(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Jmap,
-            detail: Some(DiagnosticText::support_only(format!(
-                "submitted {method} id {id} appeared in neither a success nor an error map"
-            ))),
-        }),
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::PartialResponse,
+            wire: WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(format!(
+                    "submitted {method} id {id} appeared in neither a success nor an error map"
+                ))),
+            },
+        },
         &ctx,
     )
     .push_cause(Cause::Attempt(AttemptCause::new(
@@ -1974,13 +1928,15 @@ pub(crate) fn created_id_unusable(
     method: &'static str,
 ) -> AccountError {
     build(
-        AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Jmap,
-            detail: Some(DiagnosticText::support_only(format!(
-                "JMAP {method} create result omitted a usable id"
-            ))),
-        }),
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::MissingField,
+            wire: WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(format!(
+                    "JMAP {method} create result omitted a usable id"
+                ))),
+            },
+        },
         &JmapErrorContext::new(operation),
     )
     .push_cause(Cause::Attempt(AttemptCause::new(
@@ -2004,8 +1960,7 @@ pub(crate) fn require_created_id(
 fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
     if let Some(resource) = ctx.scope().as_ref().and_then(ErrorScope::resource) {
         build(
-            AccountErrorKind::NotFound(resource),
-            Cause::Request(RequestCause::NotFound {
+            PrimaryCause::Request(RequestCause::NotFound {
                 what: resource,
                 id: Some(id),
             }),
@@ -2015,13 +1970,15 @@ fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
         .expect("valid account error classification")
     } else {
         build(
-            AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(format!(
-                    "id not found in response: {id}"
-                ))),
-            }),
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::MissingField,
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Jmap,
+                    detail: Some(DiagnosticText::support_only(format!(
+                        "id not found in response: {id}"
+                    ))),
+                },
+            },
             &ctx,
         )
         .try_build()
@@ -2037,11 +1994,13 @@ fn websocket_runtime_error(message: String, ctx: JmapErrorContext) -> AccountErr
     // `match` and routes through `Transport(Tls) + Unsent`. This
     // helper covers stream-level errors and post-handshake closes.
     build(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Jmap,
-            detail: Some(DiagnosticText::support_only(message)),
-        }),
+        PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::PartialResponse,
+            wire: WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(message)),
+            },
+        },
         &ctx,
     )
     .push_cause(Cause::Attempt(AttemptCause::new(
@@ -2070,9 +2029,8 @@ fn websocket_send_error(err: &tokio_websockets::Error, ctx: JmapErrorContext) ->
         TransmissionState::InFlight
     };
     build(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(
-            TransportKind::Network,
+        PrimaryCause::Transport(TransportCause::new(
+            TransportErrorKind::Network,
             Some(DiagnosticText::support_only(format!(
                 "WebSocket frame write failed: {err}"
             ))),
@@ -2096,23 +2054,21 @@ fn websocket_handshake_error(err: tokio_websockets::Error, ctx: JmapErrorContext
         .and_then(std::io::Error::get_ref)
         .and_then(|source| source.downcast_ref::<bifrost_net::proxy::TunnelError>());
 
-    let (kind, primary, status, detail) = match tunnel_error {
+    let (primary, status, detail) = match tunnel_error {
         Some(bifrost_net::proxy::TunnelError::ProxyAuthenticationRequired) => {
             // The shared taxonomy has no proxy-credential kind. This is the
             // closest existing credential classification and gives the
             // consumer an AuthLost/Reauthorize result. Keep the text explicit
             // that these credentials belong to the proxy, not the JMAP origin.
             (
-                AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-                Cause::Auth(AuthCause::ReauthorizationRequired),
+                PrimaryCause::Auth(AuthCause::ReauthorizationRequired),
                 Some(407),
                 format!("proxy authentication failed for WebSocket CONNECT: {message}"),
             )
         }
         Some(bifrost_net::proxy::TunnelError::ProxyTls { .. }) => (
-            AccountErrorKind::Transport(TransportErrorKind::Tls),
-            Cause::Transport(TransportCause::new(
-                TransportKind::Tls,
+            PrimaryCause::Transport(TransportCause::new(
+                TransportErrorKind::Tls,
                 Some(DiagnosticText::support_only(message.clone())),
             )),
             None,
@@ -2123,10 +2079,7 @@ fn websocket_handshake_error(err: tokio_websockets::Error, ctx: JmapErrorContext
             // existing server-error lane lets central recovery distinguish
             // permanent refusals from transient 5xx proxy failures.
             (
-                AccountErrorKind::Server(ServerErrorKind::Error {
-                    status: Some(*status),
-                }),
-                Cause::Server(ServerCause::Error {
+                PrimaryCause::Server(ServerCause::Error {
                     status: Some(*status),
                 }),
                 Some(*status),
@@ -2134,9 +2087,8 @@ fn websocket_handshake_error(err: tokio_websockets::Error, ctx: JmapErrorContext
             )
         }
         Some(_) | None => (
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause::new(
-                TransportKind::Network,
+            PrimaryCause::Transport(TransportCause::new(
+                TransportErrorKind::Network,
                 Some(DiagnosticText::support_only(message.clone())),
             )),
             None,
@@ -2144,7 +2096,7 @@ fn websocket_handshake_error(err: tokio_websockets::Error, ctx: JmapErrorContext
         ),
     };
 
-    build(kind, primary, &ctx)
+    build(primary, &ctx)
         .status(status)
         .text(DiagnosticText::support_only(detail))
         .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
@@ -2220,8 +2172,7 @@ mod tests {
                 problem.telemetry_fields().throttle_scope,
                 plain.telemetry_fields().throttle_scope
             );
-            assert!(problem.chain().iter().any(|cause| matches!(cause,
-                Cause::Wire(WireCause::Jmap(JmapMethod::Unknown { code })) if code == "about:blank")));
+            assert!(problem.chain().iter().any(|cause| matches!(cause.wire(), Some(WireCause::Jmap(JmapMethod::Unknown { code })) if code == "about:blank")));
         }
     }
 
@@ -2453,10 +2404,7 @@ mod tests {
         // the one thing only the problem-details path can produce: the
         // document's own type code in the cause chain.
         assert!(
-            err.chain().iter().any(|cause| matches!(
-                cause,
-                Cause::Wire(WireCause::Jmap(JmapMethod::Unknown { code })) if code == "about:blank"
-            )),
+            err.chain().iter().any(|cause| matches!(cause.wire(), Some(WireCause::Jmap(JmapMethod::Unknown { code })) if code == "about:blank")),
             "the problem document itself must have been read"
         );
     }
@@ -2505,7 +2453,7 @@ mod tests {
         let wire_seen = err
             .chain()
             .iter()
-            .any(|c| matches!(c, Cause::Wire(WireCause::Jmap(JmapMethod::StateMismatch))));
+            .any(|c| matches!(c.wire(), Some(WireCause::Jmap(JmapMethod::StateMismatch))));
         assert!(wire_seen, "wire cause missing");
     }
 
@@ -2533,10 +2481,10 @@ mod tests {
                     &RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(scope)),
                 );
                 assert_eq!(err.operation(), Some(operation));
-                assert!(err.chain().iter().any(|cause| matches!(
-                    cause,
-                    Cause::Wire(WireCause::Jmap(method)) if method == &wire,
-                )));
+                assert!(err.chain().iter().any(
+                    |cause| matches!(cause.wire(), Some(WireCause::Jmap(method)) if method == &wire,
+                    )
+                ));
             }
         }
     }
@@ -2558,7 +2506,7 @@ mod tests {
             assert!(
                 err.chain()
                     .iter()
-                    .any(|cause| matches!(cause, Cause::Wire(WireCause::Jmap(_)))),
+                    .any(|cause| matches!(cause.wire(), Some(WireCause::Jmap(_)))),
                 "{code}: the typed JMAP method cause must remain in the chain"
             );
         }
@@ -2715,8 +2663,8 @@ mod tests {
                 ));
                 assert!(
                     err.chain().iter().any(|cause| matches!(
-                        cause,
-                        Cause::Wire(WireCause::Jmap(JmapMethod::Limit))
+                        cause.wire(),
+                        Some(WireCause::Jmap(JmapMethod::Limit))
                     ))
                 );
                 assert_eq!(err.telemetry_fields().throttle_scope, None);
@@ -2867,11 +2815,8 @@ mod tests {
         );
         assert_eq!(err.recovery(), &RecoveryClass::ProviderContractViolation);
         assert!(
-            err.chain().iter().any(|cause| matches!(
-                cause,
-                Cause::Wire(WireCause::MalformedResponse { detail: Some(detail), .. })
-                    if detail.value.contains("uploadUrl")
-            )),
+            err.chain().iter().any(|cause| matches!(cause.wire(), Some(WireCause::MalformedResponse { detail: Some(detail), .. })
+                    if detail.value.contains("uploadUrl"))),
             "the diagnostic must name the session property"
         );
 
@@ -2971,11 +2916,8 @@ mod tests {
             error.kind(),
             &AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
         );
-        assert!(error.chain().iter().any(|cause| matches!(
-            cause,
-            Cause::Wire(WireCause::MalformedResponse { detail: Some(detail), .. })
-                if detail.as_str().contains("call-7")
-        )));
+        assert!(error.chain().iter().any(|cause| matches!(cause.wire(), Some(WireCause::MalformedResponse { detail: Some(detail), .. })
+                if detail.as_str().contains("call-7"))));
         let missing = into_account_error(
             crate::Error::MissingResponseField("Email/get.state"),
             JmapErrorContext::new(AccountOperation::SyncInventory),
@@ -3103,7 +3045,7 @@ mod tests {
         );
         let mut saw_real_code = false;
         for cause in err.chain().iter() {
-            if let Cause::Wire(WireCause::Jmap(JmapMethod::Unknown { code })) = cause {
+            if let Some(WireCause::Jmap(JmapMethod::Unknown { code })) = cause.wire() {
                 saw_real_code = true;
                 assert_eq!(code, "someNovelCode");
                 assert_ne!(code, "other", "must not synthesize the 'other' placeholder");
@@ -3420,8 +3362,8 @@ mod tests {
         let mut saw_wire = false;
         let mut saw_acknowledged = false;
         for cause in err.chain().iter() {
+            saw_wire |= matches!(cause.wire(), Some(WireCause::Jmap(_)));
             match cause {
-                Cause::Wire(WireCause::Jmap(_)) => saw_wire = true,
                 Cause::Attempt(attempt)
                     if attempt.transmission_state == TransmissionState::Acknowledged =>
                 {
@@ -3441,8 +3383,8 @@ mod tests {
     /// Total conformance sweep over the method-error code space. Every
     /// arm of `convert_method` ends in
     /// `try_build().expect("valid account error classification")`, so a
-    /// kind/cause pair that violates the builder's `kind_matches_cause`
-    /// or scope invariants panics in production rather than degrading.
+    /// contradictory transmission or effect evidence would panic in
+    /// production rather than degrading.
     /// This pins that no code panics, that each carries the protocol,
     /// the caller's operation, a typed wire cause, and acknowledged
     /// transmission evidence, and that a scoped call keeps its scope.
@@ -3537,10 +3479,8 @@ mod tests {
     }
 
     /// Total conformance sweep over the set-error code space, in both
-    /// scope shapes. The unscoped shape is the one that historically
-    /// produced a kind/cause pair the builder rejects (see the
-    /// `NotFound` comment in `set_error_to_account_error`), so both are
-    /// exercised.
+    /// scope shapes. Missing-resource signals without a resource identity
+    /// must preserve their wire evidence rather than invent a target.
     #[test]
     fn every_set_error_code_builds_a_well_formed_account_error() {
         for code in SET_ERROR_CODES {

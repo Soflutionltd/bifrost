@@ -115,12 +115,11 @@ fn change_cursor(bytes: &[u8]) -> ChangeCursor {
 }
 
 fn unrepresentable(key: &str) -> bifrost_types::InventoryObligation {
-    let error = bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-        bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
+    let error = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Request(
+        bifrost_types::RequestCause::Malformed {
             detail: bifrost_types::DiagnosticText::support_only("unrepresentable"),
-        }),
-    )
+        },
+    ))
     .try_build()
     .expect("valid account error classification");
     bifrost_types::InventoryObligation::Object {

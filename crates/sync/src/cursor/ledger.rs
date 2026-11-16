@@ -1745,10 +1745,9 @@ mod tests {
         ReplacementProgress, ReplacementRefusal,
     };
     use bifrost_types::{
-        AccountErrorBuilder, AccountErrorKind, Cause, CoverageCoordinate, CoverageDomain,
-        CursorScope, DiagnosticText, InventoryCoverageReport, InventoryObligation, ObjectId,
-        ObjectType, ObligationKey, RegionRecovery, RequestCause, RequestErrorKind,
-        SnapshotIdentity,
+        AccountErrorBuilder, CoverageCoordinate, CoverageDomain, CursorScope, DiagnosticText,
+        InventoryCoverageReport, InventoryObligation, ObjectId, ObjectType, ObligationKey,
+        PrimaryCause, RegionRecovery, RequestCause, SnapshotIdentity,
     };
 
     fn scope() -> CursorScope {
@@ -1756,12 +1755,9 @@ mod tests {
     }
 
     fn error() -> bifrost_types::AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("unrepresentable"),
-            }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("unrepresentable"),
+        }))
         .try_build()
         .expect("valid account error classification")
     }

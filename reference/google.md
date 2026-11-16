@@ -1650,6 +1650,11 @@ parent scope; valid handles anchor errors to the decoded parent message id.
 
 ## Error translation
 
+Classifiers return one `PrimaryCause`. Typed reason overrides and HTTP
+fallback both apply provider scope and project budget to its throttle payload
+before construction. History loss carries the account cursor scope in its
+state cause. See `reference/error-model.md`.
+
 `account/error.rs::into_account_error(error, ctx)` is the single
 boundary converting `crate::Error` (Net / ObservedNet / Response / JsonDecode /
 Base64 / Local) into an `AccountError`. `GmailErrorContext` carries
@@ -1681,7 +1686,8 @@ Mapping highlights:
 - HTTP fallback uses `bifrost_net::classify_status` for both envelopes with
   unknown reasons and plain transport failures. 408/502/503/504 and typed
   `backendError` -> `Server(Unavailable)`. 507 is quota exhausted with throttle
-  scope; 409/412 are conflicts and 400/413/422 are malformed requests. Other
+  scope; 409/412 are conflicts, 400/422 are malformed requests, and 413 is
+  `Request(PayloadTooLarge)`. Other
   5xx retain net's status-bearing `Server(Error)` classification. Users receive
   the same recovery when only the response body format changes. The declared
   history-endpoint 400/404/410 overrides and resource hints reach generic net

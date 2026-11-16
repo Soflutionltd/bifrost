@@ -33,8 +33,8 @@ the internal support export. Each `Cause` variant is itself `StdError`.
 
 `into_builder(self)` is the **decoration** path, not reclassification.
 It unwraps the Arc (clone-on-share), splits the chain into primary +
-extras, and returns a builder pre-loaded with the original `kind`,
-primary `Cause`, top-level fields, and diagnostics. The builder exposes
+extras, and returns a builder pre-loaded with the original
+primary `PrimaryCause`, top-level fields, and diagnostics. The builder exposes
 no kind-changing method. On this rebuilt builder, `push_cause` only appends
 secondary diagnostic evidence. The error retains the length of its original
 classification prefix across repeated rebuilds; derivation and transmission
@@ -44,16 +44,15 @@ Multi-step writes attach a partial-commit record to the unchanged leaf.
 Rebuilt builders allow one attachment and preserve an existing record;
 decoration never promotes historical evidence into the classification prefix.
 Net attempt-history/local-hold classifications retain their own evidence.
-Derived fields recompute on `try_build`. Builder overrides
-(`idempotency_override`, `throttle_scope`) are preserved across the
-round-trip, as is a `ServerCause` retry hint because it lives in the
-chain. Reclassifying to a
+Derived fields recompute on `try_build`. The idempotency override and the
+primary cause, including its throttle payload and retry hint, are preserved
+across the round-trip. Reclassifying to a
 different primary kind/cause requires a fresh `AccountErrorBuilder::new`, except
 for the types-owned foreign-scope revocation constructor, which prepends its
 state cause while preserving the original classification prefix boundary.
 
 `AccountError::unsupported(operation, protocol)` is the canonical local refusal
-constructor. It stamps kind, matching request cause, operation and protocol through
+constructor. It supplies the unsupported request cause, operation and protocol through
 `try_build`; `into_builder` adds provider, scope and diagnostics. Provider helpers
 retain their existing provider and scope choices. The required `Account::protocol`
 supplies the primary protocol for inherited default-method refusals. Implementors
@@ -85,44 +84,54 @@ diagnostics, not this live refusal metadata.
 
 ## AccountErrorBuilder funnel
 
-`builder.rs`. `AccountErrorBuilder::new(kind, primary_cause)` is the
-sole entry; setters are `#[must_use]` consuming-`self` (`operation`,
-`scope`, `provider`, `protocol`, `push_cause`, `request_id`,
-`trace_id`, `status`, `native_code`, `text`, `idempotency_override`,
-`throttle_scope`).
+`builder.rs`. `AccountErrorBuilder::new(primary_cause)` takes a
+`PrimaryCause`. Its exhaustive `kind()` projection is the sole owner of
+classification. Attempts and bare wire signals are secondary `Cause` evidence,
+so neither can classify a fresh error. Protocol failures carry
+`PrimaryCause::Protocol { kind: ProtocolErrorKind, wire: WireCause }`;
+`Cause::Protocol` retains both on the frozen chain. Other primary variants
+retain their existing chain vocabulary through `From<PrimaryCause> for Cause`.
+`Cause::wire()` projects wire evidence from both primary protocol failures and
+secondary wire layers; readers do not need to repeat that distinction.
 
-The terminator is **`try_build` -> `Result<AccountError,
-AccountErrorBuildError>`**, not an infallible `build`. The `Err` arm is
-a producer-bug surface, not recoverable runtime state: protocol-crate
-translation boundaries call
-`.expect("valid account error classification")`. `AccountErrorBuildError`
-(`#[non_exhaustive]`) enumerates the enforced invariants:
+Setters are `#[must_use]` consuming-self decorators: operation, scope, provider,
+protocol, secondary evidence, diagnostics, idempotency, unsupported reason,
+partial commitment and `with_throttle`. A throttle refinement receives a
+`&mut Throttle` only for rate-limit and quota causes; other causes have no
+payload to modify. Local-hold provenance cannot be cleared by decoration.
 
-- `EmptyChain` - every error carries at least one primary `Cause`.
-  `CauseChain::try_new` enforces this at the chain boundary. The current
-  public `new` requires a primary, so this remains a defensive invariant
-  for future construction paths.
-- `KindCauseMismatch { kind, primary_cause }` - the declared `kind`
-  and the outermost `Cause` disagree (`recovery::kind_matches_cause`).
-- `ThrottleScopeNotApplicable { kind, throttle_scope }` - a
-  `throttle_scope` attached to anything but
-  `Server(RateLimited | QuotaExhausted)`. Its own variant because the
-  kind and cause may match each other perfectly; the diagnosis must
-  point the producer at the throttle scope, not a mismatch that is
-  not there.
-- `ThrottleBudgetNotApplicable { kind }` - a `throttle_budget` stamped
-  on anything but `Server(RateLimited | QuotaExhausted)`, for the same
-  reason.
-- `LocalHoldNotApplicable { kind }` - local-hold provenance stamped on
-  anything but `Server(RateLimited | QuotaExhausted)`.
-- `TransportAcknowledged` - `Transport(_)` kind paired with any
-  `Attempt(Acknowledged)` classification cause. Transport failure means no
-  complete server response arrived; an acknowledged attempt belongs on a
-  `Server`/`Protocol` kind.
-- `CursorInvalidWithoutScope` - `SyncState(CursorInvalid)` without an
-  `ErrorScope::Cursor`. The engine cannot route a scope-less cursor
-  restart; the convergence rewrite removed the silent
-  `RestartAccount` fallback, so producers must thread the scope.
+`ServerCause::{RateLimited, QuotaExhausted}` each carry a `Throttle` containing
+optional scope, budget identities and local-hold provenance. These fields
+cannot occur on other primary failures. `StateCause::{CursorInvalid,
+ScopeRevoked, ScopeCapabilityLost}` each require a `CursorScope`. The cause
+owns the error's scope and recovery target. An explicit `.scope(Cursor(..))`
+rebind updates that typed target, preserving DAV's collection-to-account cursor
+routing; unrelated diagnostic scope cannot erase it. An enterprise user losing
+one delegated folder expects only that folder quarantined, and an expired
+collection token must restart the exact cursor advertised by the account.
+
+`ServerCause::Error { status }` owns the server-error status. Its kind and
+`DiagnosticInfo::status` are projections, recomputed on every build; a missing
+primary status never borrows another cause's status. Other error families
+retain independent diagnostic response status because an authentication or
+request refusal also needs its actual HTTP/SMTP status recorded.
+
+The terminator remains **`try_build` -> `Result<AccountError,
+AccountErrorBuildError>`**. The Err arm diagnoses producer bugs. Transmission,
+unsupported-reason and partial-commit evidence still have relational invariants
+that these cause payloads cannot encode. Remaining build errors are:
+
+- `EmptyChain`: the defensive chain boundary; every builder supplies a primary.
+- `UnsupportedReasonNotApplicable`: a local refusal reason on another family.
+- `TransportAcknowledged`: transport failure combined with an acknowledged
+  attempt in the classification prefix.
+- `PartialCommitAlreadyAttached`, `PartialCommitEmpty`,
+  `PartialCommitApplication`, `PartialCommitCompensation` and
+  `PartialCommitNested`: contradictory or invalid operation-effect evidence.
+
+Kind/cause agreement and throttle/cursor applicability checks are unnecessary:
+the primary cause determines the kind and carries the applicable typed data.
+The fallible terminator and translation-boundary expects remain intentional.
 
 On success `try_build` derives `recovery` (`recovery::derive`),
 `remediation` (`recovery::suggest`), and `message_key`
@@ -264,10 +273,10 @@ is the producer hint; the engine lifts the sharable scopes into a
 `CurrentOperation` is a per-call inline delay and never enters a key.
 
 A producer that knows which provider rate budget a throttled request was
-charged to names it instead: `AccountErrorBuilder::throttle_budget(ThrottleBudget)`
-(repeatable, read back through `AccountError::throttle_budgets()`), valid only on
-`Server(RateLimited | QuotaExhausted)` like `throttle_scope`
-(`ThrottleBudgetNotApplicable` otherwise). A `ThrottleBudget` is an opaque,
+charged to names it in the primary cause's `Throttle::budgets`
+(or adds it with `Throttle::add_budget`, which deduplicates). Read it back
+through `AccountError::throttle_budgets()`. Only rate-limit and quota causes
+carry this payload. A `ThrottleBudget` is an opaque,
 process-wide identity minted by the protocol crate; it does not embed an
 `AccountId`. When an error stamps budgets, the engine records the deadline on
 exactly `ThrottleKey::Budget(_)` for each and does NOT also lift the
@@ -355,13 +364,13 @@ operation is treated idempotent). The rules at altitude (read
   server that had just permanently refused it. Pinned by
   `an_smtp_5xx_is_a_permanent_refusal_not_a_retry`.
 - **SyncState** -> all `Engine(_)`: `CursorInvalid` -> `RestartScope`
-  (scope guaranteed by build-time check); `StrategyFailure` ->
+  (scope required by the cause); `StrategyFailure` ->
   `DowngradeStrategy`; `ScopeCapabilityLost` ->
-  `DowngradeCapabilityForScope` (or `RestartAccount` if no scope);
+  `DowngradeCapabilityForScope`;
   `SchemaIncompatible` -> `SchemaIncompatible`; `CapabilityChanged` ->
   `RestartAccount`; `OperatorOverrideNeeded` ->
   `OperatorOverrideRequired { reason }`; `ScopeRevoked` ->
-  `DisableScope` (or `RestartAccount` if no scope). CardDAV uses this for a
+  `DisableScope`. CardDAV uses this for a
   personal contact collection reclassified as a directory: no sync strategy is
   eligible, so it retires the original cursor scope rather than retrying or
   downgrading. The directory refusal's redirect evidence is preserved.
@@ -518,15 +527,15 @@ work changes that. Nothing in this workspace offers one.
 
 `bifrost-sync`'s ledger envelope is the one place that persists an error, and it
 persists a DIGEST: the exact classification (`AccountErrorKind`, `ErrorScope`,
-operation, provider, protocol) plus the whole `DiagnosticInfo`, rebuilt through
-`AccountErrorBuilder` with the canonical `Cause` its kind demands. Secondary
-cause payloads, `idempotency_override`, `throttle_scope` and the partial-commit
-record are lost. Ledger rows are coverage/repair evidence, never replayed;
-attaching a record to synthesized causes would validate invented evidence. That is
-sound there only because the field is evidence an operator reads and never an
-input to a decision; see `reference/sync.md` under "Ledger envelope". Any future
-caller wanting to persist an error owes the same argument, because a restored
-error's `recovery()` was derived from a synthesized cause chain and is not the
+operation, provider, protocol) plus the whole `DiagnosticInfo`, decoded into the
+plain `ErrorDigest` record. No `AccountError` is reconstructed, so no cause
+chain, `recovery()` or remediation is synthesized for it. The primary cause,
+secondary causes, throttle payload, `idempotency_override` and the
+partial-commit record are not persisted. Ledger rows are coverage/repair
+evidence an operator reads, never replayed and never an input to a decision;
+see `reference/sync.md` under "Ledger envelope". Any future caller wanting to
+persist an error owes the same argument, because an error rebuilt from a digest
+would carry recovery derived from an invented cause rather than the
 classification the producer made.
 
 ## Batch and stream outcomes
@@ -770,7 +779,7 @@ crates/types/src/error/
   partial.rs       // historical effects, compensation, derived operation plan
   recovery.rs      // RecoveryClass, derive/suggest, RetryHint,
                    // EngineDirective, Fatal, ThrottleKey/Scope
-  cause.rs         // Cause/CauseChain, Attempt/TransmissionState,
+  cause.rs         // PrimaryCause, Throttle, Cause/CauseChain, Attempt/TransmissionState,
                    // WireCause provider vocabularies, CauseSummary
   batch.rs         // BatchOutcome three-lane + builder/finalize,
                    // BatchItemId, validate_batch_input
@@ -931,8 +940,8 @@ An injected watch has no incarnation identity and retains unstamped routing.
 `cursor::CursorDecodeFault::builder` is the shared classification owner for
 protocol-tag mismatch, future/retired payload layout, malformed payload, scope
 mismatch and account identity mismatch. All but a readable scope mismatch use
-`SyncState(SchemaIncompatible)`; a scope mismatch uses `CursorInvalid` and must
-carry the cursor scope. Rebuilding unreadable durable state, including dependent
+`SyncState(SchemaIncompatible)`; a scope mismatch carries its required `CursorScope` in
+`CursorDecodeFault::ScopeMismatch { scope }` and builds `CursorInvalid`. Rebuilding unreadable durable state, including dependent
 backfill state, is preferable to silent gaps for an enterprise user. Account
 identity mismatch clears account state because none of its retained scopes can
 safely consume another account's token. These are local durable-state faults,
@@ -947,7 +956,7 @@ holds require a hint. Unresolved mailbox identities and operation-only advice
 remain `CurrentOperation`, which paces repair without widening shared holds.
 The engine supplies account identity and anchors hints on its monotonic clock.
 
-`AccountErrorBuilder::local_hold()` marks a gate refusal against a hold already
+`Throttle::local_hold` marks a gate refusal against a hold already
 recorded by its transport owner; `AccountError::is_local_hold()` exposes this
 per-leg provenance. Net sets it when translating `Error::LocalHold`; provider
 decoration and partial-commit records retain it. `throttle_holds()` projects

@@ -2,10 +2,14 @@
 
 DAV status errors and generic net failures use `bifrost_net::classify_status`
 with the same declared policy: a dialect resource hint and a 423 conflict
-override. Shared 409/412 conflicts refresh state, and 400/413/422 are malformed
-requests. An enterprise user gets the same recovery for the same refusal
+override. Shared 409/412 conflicts refresh state, 400/422 are malformed
+requests, and 413 is `Request(PayloadTooLarge)`. An enterprise user gets the same recovery for the same refusal
 regardless of which transport path preserved it. The policy applies account
 throttle scope once for 429/507; dispatch does not stamp it again.
+Classification returns one `PrimaryCause`; rate/quota payloads carry the
+throttle policy and cursor state causes carry their required `CursorScope`.
+Cursor rebinding updates that typed target, so collection-token expiry restarts
+the cursor advertised by the account. See `reference/error-model.md`.
 
 Every request declares its `ReplayPolicy` at the call site. Every event PUT
 (create, conditional update and unconditional update alike), scheduling
@@ -151,8 +155,8 @@ avoiding status retries for MOVE/filter fallback. Authentication recovery and
 transient-status retries stay in net; exhausted retry and rate-limit errors
 retain its complete history. Earlier possible commits on unreplayable requests
 still require reconciliation, using net's shared ledger rather than a private
-refusal list. Conditional 412 and locked 423 remain DAV conflicts; 400/413/422 are malformed requests and
-408/502/503/504 are unavailable. Cursor-invalid 410 is interpreted only by the
+refusal list. Conditional 412 and locked 423 remain DAV conflicts; 400/422 are malformed requests,
+413 is `Request(PayloadTooLarge)`, and 408/502/503/504 are unavailable. Cursor-invalid 410 is interpreted only by the
 sync-collection caller before the generic resource ladder.
 
 The local multi-leg error ranking is a DAV aggregation policy. Its inputs are

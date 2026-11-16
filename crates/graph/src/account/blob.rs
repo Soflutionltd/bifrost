@@ -1,13 +1,14 @@
+#[cfg(test)]
+use bifrost_types::AccountErrorKind;
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream, Batch,
-    BlobCapabilities, BlobEncoding, BlobHandle, BlobId, ByteRange, Cause, Checkpoint,
-    DiagnosticText, ErrorScope, ObjectId, PageBoundary, Protocol, ProtocolErrorKind, Provider,
-    SyncEvent, WireCause,
+    AccountError, AccountErrorBuilder, AccountOperation, AccountStream, Batch, BlobCapabilities,
+    BlobEncoding, BlobHandle, BlobId, ByteRange, Checkpoint, DiagnosticText, ErrorScope, ObjectId,
+    PageBoundary, PrimaryCause, Protocol, ProtocolErrorKind, Provider, SyncEvent, WireCause,
 };
 
 use super::GraphAccount;
@@ -310,14 +311,12 @@ fn open_blob_inner_stream(
                     if let Some(prev) = pending.take() {
                         yield SyncEvent::Batch(byte_chunk_batch(prev, PageBoundary::Page));
                     }
-                    let account_error = AccountErrorBuilder::new(
-                        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-                        Cause::Wire(WireCause::MalformedResponse {
+                    let account_error = AccountErrorBuilder::new(PrimaryCause::Protocol { kind: ProtocolErrorKind::PartialResponse, wire: WireCause::MalformedResponse {
                             protocol: Protocol::Graph,
                             detail: Some(DiagnosticText::support_only(format!(
                                 "Graph blob stream error: {error}"
                             ))),
-                        }),
+                        } },
                     )
                     .operation(op)
                     .provider(Provider::Microsoft)
@@ -372,14 +371,12 @@ pub(crate) fn open_raw_rfc822(
                     if let Some(prev) = pending.take() {
                         yield SyncEvent::Batch(byte_chunk_batch(prev, PageBoundary::Page));
                     }
-                    let account_error = AccountErrorBuilder::new(
-                        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-                        Cause::Wire(WireCause::MalformedResponse {
+                    let account_error = AccountErrorBuilder::new(PrimaryCause::Protocol { kind: ProtocolErrorKind::PartialResponse, wire: WireCause::MalformedResponse {
                             protocol: Protocol::Graph,
                             detail: Some(DiagnosticText::support_only(format!(
                                 "Graph raw message stream error: {error}"
                             ))),
-                        }),
+                        } },
                     )
                     .operation(op)
                     .provider(Provider::Microsoft)

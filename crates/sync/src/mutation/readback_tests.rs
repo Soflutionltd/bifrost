@@ -1,17 +1,16 @@
 use super::*;
 use bifrost_types::{
-    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountFuture, AccountId, AccountStream, AttachmentHandle, Batch, BlobHandle, ByteRange, Cause,
-    Change, ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
-    ContactSearchRequest, ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment,
-    CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange,
-    EventSearchRequest, FilterValidation, FlagOp, HostedAttachment, HydratedObject,
-    HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
-    Importance, InventoryEvent, ItemOutcome, MembershipScope, Message, MutationSuccess,
-    MutationTarget, ObjectId, Page, PageBoundary, Priority, Projection, QuotaInfo, RsvpStatus,
-    ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
-    VacationConfig,
+    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountFuture, AccountId,
+    AccountStream, AttachmentHandle, Batch, BlobHandle, ByteRange, Change, ChangeCursor,
+    CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
+    ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
+    DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
+    FlagOp, HostedAttachment, HydratedObject, HydratedObjectKind, HydrationProjection,
+    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEvent, ItemOutcome,
+    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page, PageBoundary,
+    PrimaryCause, Priority, Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest,
+    SendReceipt, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -550,10 +549,9 @@ async fn disagreeing_duplicate_observations_are_unresolved() {
 }
 #[tokio::test]
 async fn a_per_item_engine_failure_is_reported_not_absorbed() {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::SchemaIncompatible),
-        Cause::State(bifrost_types::StateCause::SchemaIncompatible),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::SchemaIncompatible,
+    ))
     .try_build()
     .unwrap();
     let report = observe_items(
@@ -598,15 +596,13 @@ async fn destroy_readback_requires_message_not_found() {
         cases
             .iter()
             .map(|(id, kind)| {
-                let error = AccountErrorBuilder::new(
-                    AccountErrorKind::NotFound(*kind),
-                    Cause::Request(RequestCause::NotFound {
+                let error =
+                    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::NotFound {
                         what: *kind,
                         id: None,
-                    }),
-                )
-                .try_build()
-                .expect("valid not-found classification");
+                    }))
+                    .try_build()
+                    .expect("valid not-found classification");
                 ItemOutcome::Failed(BatchFailure::new(BatchItemId((*id).into()), error))
             })
             .collect(),

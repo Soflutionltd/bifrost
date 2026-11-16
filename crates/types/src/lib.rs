@@ -145,13 +145,13 @@ pub use error::{
     EngineDirectiveIdentity, EngineNotice, EnhancedStatusCode, ErrorScope, Fatal, GmailSignal,
     GraphSignal, HINTLESS_HOLD_WAIT, HoldTarget, ImapResponseCode, InternalCause,
     InternalErrorKind, ItemOutcome, JmapMethod, MailboxUnavailableKind, MutationEffect,
-    MutationSuccess, OperatorOverrideReason, Protocol, ProtocolErrorKind, Provider,
+    MutationSuccess, OperatorOverrideReason, PrimaryCause, Protocol, ProtocolErrorKind, Provider,
     ReconcileAction, ReconcileAdvice, ReconcileGuidance, ReconcileReason, RecoveryClass,
     RemediationAction, RequestCause, RequestErrorKind, ResourceKind, RetryAdvice, RetryDisposition,
     RetryHint, RetryReason, ServerCause, ServerErrorKind, StateCause, StrategyDowngrade,
     SupportExportConsented, SupportExportInternal, SupportExportMinimal, SyncStateErrorKind,
-    TelemetryToken, TelemetryView, ThrottleBudget, ThrottleKey, ThrottleScope, ThrottleWork,
-    TransmissionState, TransportCause, TransportErrorKind, TransportKind, UnsupportedReason,
+    TelemetryToken, TelemetryView, Throttle, ThrottleBudget, ThrottleKey, ThrottleScope,
+    ThrottleWork, TransmissionState, TransportCause, TransportErrorKind, UnsupportedReason,
     Warning, WarningKind, WireCause, validate_batch_input,
 };
 

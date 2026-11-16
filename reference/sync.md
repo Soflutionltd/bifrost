@@ -3989,6 +3989,11 @@ it cannot claim `OperatorBlocked` without an observed operator barrier.
 
 ## Error / Terminated / Warning
 
+Engine-authored account errors use `AccountErrorBuilder::new(PrimaryCause)`.
+Scope-directed state causes contain their required `CursorScope`; throttle
+evidence lives in the primary rate or quota cause and survives decoration and
+partial-commit records. See `reference/error-model.md`.
+
 Engine-side `Error` (distinct from `bifrost-types::AccountError`):
 
 - `AccountNotAttached(AccountId)`

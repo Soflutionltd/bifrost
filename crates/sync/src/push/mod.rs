@@ -211,10 +211,7 @@ pub fn shared_sink() -> Arc<InvalidationSinkInner> {
 mod tests {
     use super::*;
     use crate::cancel::Boundary;
-    use bifrost_types::{
-        AccountError, AccountErrorBuilder, AccountErrorKind, Cause, CursorScope, StateCause,
-        SyncStateErrorKind,
-    };
+    use bifrost_types::{AccountError, AccountErrorBuilder, CursorScope, PrimaryCause, StateCause};
     fn setup() -> (
         InvalidationSinkInner,
         AccountId,
@@ -239,10 +236,9 @@ mod tests {
         (sink, account, target, boundary, reopen_rx, rx)
     }
     fn restart() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged { delta: None }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::State(StateCause::CapabilityChanged {
+            delta: None,
+        }))
         .try_build()
         .expect("restart")
     }
@@ -383,15 +379,13 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn sink_retry_termination_records_its_throttle_at_push_time() {
-        use bifrost_types::{RetryHint, ServerCause, ServerErrorKind, ThrottleScope};
+        use bifrost_types::{RetryHint, ServerCause, ThrottleScope};
         let (sink, account, target, _, _, mut rx) = setup();
-        let error = AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited {
-                retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(20))),
-            }),
-        )
-        .throttle_scope(ThrottleScope::Account)
+        let error = AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(20))),
+        }))
+        .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Account))
         .try_build()
         .expect("throttle");
         assert!(matches!(

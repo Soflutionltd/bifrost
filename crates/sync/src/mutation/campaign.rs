@@ -1624,11 +1624,8 @@ mod campaign_tests {
         assert!(candidates.is_empty());
         assert_eq!(outcomes[&id], MutationBucket::BlockedByEngine);
     }
-    fn origin_error(
-        kind: bifrost_types::AccountErrorKind,
-        cause: bifrost_types::Cause,
-    ) -> AccountError {
-        bifrost_types::AccountErrorBuilder::new(kind, cause)
+    fn origin_error(cause: bifrost_types::PrimaryCause) -> AccountError {
+        bifrost_types::AccountErrorBuilder::new(cause)
             .scope(bifrost_types::ErrorScope::Cursor(CursorScope::Account))
             .try_build()
             .unwrap()
@@ -1636,28 +1633,27 @@ mod campaign_tests {
     #[test]
     fn uncertain_origin_protects_dedupe_engine_and_terminal() {
         use bifrost_types::*;
-        let dedupe = AccountErrorBuilder::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-            Cause::Wire(WireCause::MalformedResponse {
+        let dedupe = AccountErrorBuilder::new(PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::PartialResponse,
+            wire: WireCause::MalformedResponse {
                 protocol: Protocol::Graph,
                 detail: None,
-            }),
-        )
+            },
+        })
         .operation(AccountOperation::BulkDestroy)
         .try_build()
         .unwrap();
-        let engine = origin_error(
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-        );
+        let engine = origin_error(PrimaryCause::State(StateCause::CursorInvalid {
+            scope: CursorScope::Account,
+        }));
         let terminal = AccountError::unsupported(AccountOperation::UpdateFlags, Protocol::Imap);
         for error in [&dedupe, &engine, &terminal] {
             assert_eq!(uncertain_origin(error), ReadbackOrigin::Protected);
         }
-        let transport = AccountErrorBuilder::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-        )
+        let transport = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+            TransportErrorKind::Network,
+            None,
+        )))
         .operation(AccountOperation::BulkDestroy)
         .push_cause(Cause::Attempt(AttemptCause::new(
             TransmissionState::InFlight,
@@ -1665,17 +1661,14 @@ mod campaign_tests {
         .try_build()
         .unwrap();
         assert_eq!(uncertain_origin(&transport), ReadbackOrigin::Reassertable);
-        let conflict = origin_error(
-            AccountErrorKind::ConcurrencyConflict,
-            Cause::State(StateCause::ConcurrencyConflict),
-        );
+        let conflict = origin_error(PrimaryCause::State(StateCause::ConcurrencyConflict));
         assert_eq!(uncertain_origin(&conflict), ReadbackOrigin::Reassertable);
         // An idempotent transport failure derives Retry(SameRequest): the
         // uncertainty lane replaced the blind retry with an observation.
-        let same_request = AccountErrorBuilder::new(
-            AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-        )
+        let same_request = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+            TransportErrorKind::Network,
+            None,
+        )))
         .operation(AccountOperation::UpdateFlags)
         .try_build()
         .unwrap();
@@ -1691,10 +1684,9 @@ mod campaign_tests {
     #[test]
     fn failed_engine_and_terminal_items_never_enter_read_back() {
         use bifrost_types::*;
-        let engine = origin_error(
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-        );
+        let engine = origin_error(PrimaryCause::State(StateCause::CursorInvalid {
+            scope: CursorScope::Account,
+        }));
         let terminal = AccountError::unsupported(AccountOperation::UpdateFlags, Protocol::Imap);
         for (error, expected) in [
             (engine, MutationBucket::BlockedByEngine),
@@ -1784,10 +1776,9 @@ mod campaign_tests {
         let id = AccountId("caller-conflict".into());
         let mut stub = crate::test_common::StubAccount::new(Vec::new());
         stub.versioned_flags_error = Some(
-            bifrost_types::AccountErrorBuilder::new(
-                bifrost_types::AccountErrorKind::ConcurrencyConflict,
-                bifrost_types::Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-            )
+            bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::State(
+                bifrost_types::StateCause::ConcurrencyConflict,
+            ))
             .protocol(bifrost_types::Protocol::Imap)
             .operation(bifrost_types::AccountOperation::UpdateFlags)
             .try_build()
@@ -1860,23 +1851,23 @@ mod campaign_tests {
 mod partial_commit_throttle_tests {
     use super::*;
     use bifrost_types::{
-        AccountErrorBuilder, AccountErrorKind, Application, Cause, CompensationOutcome, ErrorScope,
-        PartialCommitBuilder, PrimaryLeg, PrincipalId, RetryHint, ServerCause, ServerErrorKind,
-        StepEffect, StepReplay, StepTargets, ThrottleBudget, ThrottleKey, ThrottleScope,
+        AccountErrorBuilder, Application, CompensationOutcome, ErrorScope, PartialCommitBuilder,
+        PrimaryCause, PrimaryLeg, PrincipalId, RetryHint, ServerCause, StepEffect, StepReplay,
+        StepTargets, ThrottleBudget, ThrottleKey, ThrottleScope,
     };
     fn throttle(mailbox: &str, seconds: u64, budget: Option<&str>) -> AccountError {
-        let mut builder = AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited {
+        let mut builder =
+            AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+                throttle: Default::default(),
                 retry_hint: Some(RetryHint::After(Duration::from_secs(seconds))),
-            }),
-        )
-        .scope(ErrorScope::Owner {
-            id: PrincipalId(mailbox.into()),
-        })
-        .throttle_scope(ThrottleScope::Mailbox);
+            }))
+            .scope(ErrorScope::Owner {
+                id: PrincipalId(mailbox.into()),
+            })
+            .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Mailbox));
         if let Some(budget) = budget {
-            builder = builder.throttle_budget(ThrottleBudget::new(budget));
+            builder =
+                builder.with_throttle(|throttle| throttle.add_budget(ThrottleBudget::new(budget)));
         }
         builder.try_build().unwrap()
     }

@@ -55,7 +55,7 @@ pub enum InternalErrorKind {
     LimitExceeded,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
 #[non_exhaustive]
 pub enum TransportErrorKind {
     Network,

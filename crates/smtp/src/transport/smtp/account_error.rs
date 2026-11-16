@@ -16,14 +16,17 @@
 //! gone), which derives recovery centrally from the kind + cause chain +
 //! transmission state + idempotency.
 
+#[cfg(test)]
+use bifrost_types::AccessErrorKind;
 use bifrost_types::error::{
-    AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, DiagnosticText,
-    EnhancedStatusCode as TypesEnhancedStatusCode, InternalCause, InternalErrorKind,
-    MailboxUnavailableKind, Protocol, ProtocolErrorKind, RequestCause, RequestErrorKind,
-    ResourceKind, ServerCause, ServerErrorKind, ThrottleScope, TransmissionState, TransportCause,
-    TransportErrorKind, TransportKind, WireCause,
+    AccessCause, AccountError, AccountErrorBuilder, AccountOperation, AttemptCause, AuthCause,
+    Cause, DiagnosticText, EnhancedStatusCode as TypesEnhancedStatusCode, InternalCause,
+    InternalErrorKind, MailboxUnavailableKind, PrimaryCause, Protocol, ProtocolErrorKind,
+    RequestCause, ResourceKind, ServerCause, ThrottleScope, TransmissionState, TransportCause,
+    TransportErrorKind, WireCause,
 };
+#[cfg(test)]
+use bifrost_types::{AccountErrorKind, RequestErrorKind};
 
 use super::Dialect;
 use crate::error::Error as MessageError;
@@ -81,25 +84,26 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
     // must never turn caller input or peer protocol faults into policy blocks.
     match error.kind() {
         ErrorKind::Authentication => {
-            let (kind, cause) = auth_reauth();
+            let cause = auth_reauth();
             let detail = diagnostic.clone();
-            build_basic(&ctx, kind, cause, attempt_state, detail.as_deref(), None)
+            build_basic(&ctx, cause, attempt_state, detail.as_deref(), None)
         }
         ErrorKind::Parse => build_basic(
             &ctx,
-            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: ctx.protocol.into(),
-                detail: diagnostic.clone().map(DiagnosticText::support_only),
-            }),
+            PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ParseFailed,
+                wire: WireCause::MalformedResponse {
+                    protocol: ctx.protocol.into(),
+                    detail: diagnostic.clone().map(DiagnosticText::support_only),
+                },
+            },
             attempt_state,
             diagnostic.as_deref(),
             None,
         ),
         ErrorKind::InvalidInput => build_basic(
             &ctx,
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            PrimaryCause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only(
                     diagnostic.clone().unwrap_or_else(|| "invalid input".into()),
                 ),
@@ -110,12 +114,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
         ),
         ErrorKind::FeatureUnsupported => build_basic(
             &ctx,
-            // A relay that does not advertise the requested extension
-            // (e.g. FUTURERELEASE) is reported as an unsupported send,
-            // distinct from a malformed request so the IMAP boundary can
-            // surface a stable `Unsupported(Send)` kind.
-            AccountErrorKind::Unsupported(AccountOperation::Send),
-            Cause::Request(RequestCause::Unsupported {
+            PrimaryCause::Request(RequestCause::Unsupported {
                 operation: AccountOperation::Send,
             }),
             attempt_state,
@@ -124,10 +123,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
         ),
         ErrorKind::ParameterOverLimit => build_basic(
             &ctx,
-            // The value is out of the server-allowed window: a malformed
-            // request, not an unsupported feature.
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            PrimaryCause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only(
                     diagnostic
                         .clone()
@@ -144,8 +140,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
         // never the relay's (`reference/error-model.md`).
         ErrorKind::Internal => build_basic(
             &ctx,
-            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-            Cause::Internal(InternalCause::new(
+            PrimaryCause::Internal(InternalCause::new(
                 InternalErrorKind::InvariantViolated,
                 diagnostic.clone().map(DiagnosticText::support_only),
             )),
@@ -155,8 +150,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
         ),
         ErrorKind::LocalRuntime => build_basic(
             &ctx,
-            AccountErrorKind::Internal(InternalErrorKind::RuntimeFailure),
-            Cause::Internal(InternalCause::new(
+            PrimaryCause::Internal(InternalCause::new(
                 InternalErrorKind::RuntimeFailure,
                 diagnostic.clone().map(DiagnosticText::support_only),
             )),
@@ -168,8 +162,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             let detail = diagnostic.clone();
             build_basic(
                 &ctx,
-                AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
-                Cause::Access(AccessCause::PolicyBlocked),
+                PrimaryCause::Access(AccessCause::PolicyBlocked),
                 attempt_state,
                 detail.as_deref(),
                 None,
@@ -177,8 +170,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
         }
         ErrorKind::ServerUnavailable => build_basic(
             &ctx,
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+            PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None }),
             attempt_state,
             diagnostic.as_deref(),
             None,
@@ -186,28 +178,24 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
         ErrorKind::Connection | ErrorKind::Network => build_transport(
             &ctx,
             TransportErrorKind::Network,
-            TransportKind::Network,
             attempt_state,
             diagnostic.as_deref(),
         ),
         ErrorKind::Timeout => build_transport(
             &ctx,
             TransportErrorKind::Timeout,
-            TransportKind::Timeout,
             attempt_state,
             diagnostic.as_deref(),
         ),
         ErrorKind::Tls => build_transport(
             &ctx,
             TransportErrorKind::Tls,
-            TransportKind::Tls,
             attempt_state,
             diagnostic.as_deref(),
         ),
         ErrorKind::TransportShutdown => build_transport(
             &ctx,
             TransportErrorKind::Network,
-            TransportKind::Network,
             attempt_state,
             diagnostic.as_deref(),
         ),
@@ -269,19 +257,12 @@ fn name_mechanism(
 
 fn build_basic(
     ctx: &SmtpErrorContext,
-    kind: AccountErrorKind,
-    cause: Cause,
+    cause: PrimaryCause,
     attempt: Option<SmtpTransmissionState>,
     diagnostic: Option<&str>,
     extra: Option<Cause>,
 ) -> AccountError {
-    let mut builder = match kind {
-        // Classification tables return parts so they can retain wire evidence.
-        AccountErrorKind::Unsupported(operation) => {
-            AccountError::unsupported(operation, ctx.protocol.into()).into_builder()
-        }
-        _ => AccountErrorBuilder::new(kind, cause).protocol(ctx.protocol.into()),
-    };
+    let mut builder = AccountErrorBuilder::new(cause).protocol(ctx.protocol.into());
     builder = apply_context(builder, ctx);
     if let Some(state) = attempt {
         builder = builder.push_cause(Cause::Attempt(AttemptCause::new(to_types_state(state))));
@@ -298,7 +279,6 @@ fn build_basic(
 fn build_transport(
     ctx: &SmtpErrorContext,
     kind: TransportErrorKind,
-    cause_kind: TransportKind,
     attempt: Option<SmtpTransmissionState>,
     diagnostic: Option<&str>,
 ) -> AccountError {
@@ -306,13 +286,10 @@ fn build_transport(
     // terminal response arrived, the kind would be Server/Auth/etc., not
     // Transport. Drop the attempt cause defensively rather than panicking.
     let attempt = attempt.filter(|s| *s != SmtpTransmissionState::Acknowledged);
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Transport(kind),
-        Cause::Transport(TransportCause::new(
-            cause_kind,
-            diagnostic.map(|t| DiagnosticText::support_only(t.to_owned())),
-        )),
-    )
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+        kind,
+        diagnostic.map(|t| DiagnosticText::support_only(t.to_owned())),
+    )))
     .protocol(ctx.protocol.into());
     builder = apply_context(builder, ctx);
     if let Some(state) = attempt {
@@ -375,20 +352,17 @@ pub(crate) fn response_to_account_error(
         auth_mechanism(phase),
     );
 
-    let (kind, primary_cause) = classify_response(response, phase, ctx.protocol.into());
+    let mut primary_cause = classify_response(response, phase, ctx.protocol.into());
     // Decided from the same classification the builder is given, so the
     // throttle hint below cannot drift away from the kind it describes.
-    let rate_or_quota = kind_is_rate_or_quota(&kind);
-
-    let mut builder = match kind {
-        // Classification tables return parts so they can retain wire evidence.
-        AccountErrorKind::Unsupported(operation) => {
-            AccountError::unsupported(operation, ctx.protocol.into()).into_builder()
-        }
-        _ => AccountErrorBuilder::new(kind, primary_cause).protocol(ctx.protocol.into()),
+    if let Some(throttle) = primary_cause.throttle_mut() {
+        throttle.scope = Some(ThrottleScope::Account);
     }
-    .status(Some(status))
-    .native_code(native);
+
+    let mut builder = AccountErrorBuilder::new(primary_cause)
+        .protocol(ctx.protocol.into())
+        .status(Some(status))
+        .native_code(native);
     builder = apply_context(builder, ctx);
     builder = builder.push_cause(Cause::Wire(WireCause::Smtp(wire)));
     // Negative SMTP replies are by definition Acknowledged unless the caller
@@ -400,24 +374,14 @@ pub(crate) fn response_to_account_error(
     }
     // Wire 4xx rate-limit text gets a throttle-scope hint so recovery can
     // surface throttle scope. Default to ThrottleScope::Account.
-    if rate_or_quota {
-        builder = builder.throttle_scope(ThrottleScope::Account);
-    }
     finish(builder)
-}
-
-fn kind_is_rate_or_quota(kind: &AccountErrorKind) -> bool {
-    matches!(
-        kind,
-        AccountErrorKind::Server(ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted)
-    )
 }
 
 fn classify_response(
     response: &Response,
     phase: Option<SmtpCommandPhase>,
     protocol: Protocol,
-) -> (AccountErrorKind, Cause) {
+) -> PrimaryCause {
     let status = u16::from(response.code());
     let enhanced = response.enhanced_status_code();
     if let Some(code) = enhanced
@@ -442,7 +406,7 @@ fn classify_enhanced(
     response: &Response,
     phase: Option<SmtpCommandPhase>,
     protocol: Protocol,
-) -> Option<(AccountErrorKind, Cause)> {
+) -> Option<PrimaryCause> {
     let class = code.class;
     let is_recipient_lane = matches!(phase, Some(SmtpCommandPhase::RcptTo));
     let is_auth_lane = matches!(phase, Some(SmtpCommandPhase::Auth { .. }));
@@ -456,96 +420,74 @@ fn classify_enhanced(
     match (class, code.subject, code.detail) {
         // X.1 address status
         (_, 1, 0) => None,
-        (_, 1, 1 | 2 | 6) => Some((
-            AccountErrorKind::NotFound(ResourceKind::Mailbox),
-            Cause::Request(RequestCause::NotFound {
-                what: ResourceKind::Mailbox,
-                id: response.message().next().map(str::to_owned),
-            }),
-        )),
+        (_, 1, 1 | 2 | 6) => Some(PrimaryCause::Request(RequestCause::NotFound {
+            what: ResourceKind::Mailbox,
+            id: response.message().next().map(str::to_owned),
+        })),
         (_, 1, 3 | 4 | 7 | 8) => Some(malformed(response)),
         (_, 1, 5) => None,
         // X.2 mailbox status
         (_, 2, 0) => None,
-        (_, 2, 1) => Some((
-            AccountErrorKind::Authorization(AccessErrorKind::MailboxUnavailable {
-                kind: if class == 5 {
-                    MailboxUnavailableKind::Permanent
-                } else {
-                    MailboxUnavailableKind::Transient
-                },
-            }),
-            Cause::Access(AccessCause::MailboxUnavailable {
-                kind: if class == 5 {
-                    MailboxUnavailableKind::Permanent
-                } else {
-                    MailboxUnavailableKind::Transient
-                },
-            }),
-        )),
-        (_, 2, 2) => Some((
-            AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
-        )),
+        (_, 2, 1) => Some(PrimaryCause::Access(AccessCause::MailboxUnavailable {
+            kind: if class == 5 {
+                MailboxUnavailableKind::Permanent
+            } else {
+                MailboxUnavailableKind::Transient
+            },
+        })),
+        (_, 2, 2) => Some(PrimaryCause::Server(ServerCause::QuotaExhausted {
+            throttle: Default::default(),
+            retry_hint: None,
+        })),
         (_, 2, 3) => Some(malformed(response)),
         (_, 2, 4) => None,
         // X.3 mail system status
         (_, 3, 0) => None,
-        (_, 3, 1) => Some((
-            AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
-        )),
-        (_, 3, 2) => Some((
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        )),
+        (_, 3, 1) => Some(PrimaryCause::Server(ServerCause::QuotaExhausted {
+            throttle: Default::default(),
+            retry_hint: None,
+        })),
+        (_, 3, 2) => Some(PrimaryCause::Server(ServerCause::Unavailable {
+            retry_hint: None,
+        })),
         (_, 3, 3) => Some(unsupported_send()),
         (_, 3, 4) => Some(malformed(response)),
         (_, 3, 5) => Some(server_error(u16::from(response.code()))),
         // X.4 network and routing
         (_, 4, 0) => Some(if class == 4 {
-            (
-                AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-            )
+            PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None })
         } else {
             server_error(u16::from(response.code()))
         }),
-        (_, 4, 1..=3) => Some((
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        )),
-        (_, 4, 4) if class == 5 && is_recipient_lane => Some((
-            AccountErrorKind::NotFound(ResourceKind::Mailbox),
-            Cause::Request(RequestCause::NotFound {
+        (_, 4, 1..=3) => Some(PrimaryCause::Server(ServerCause::Unavailable {
+            retry_hint: None,
+        })),
+        (_, 4, 4) if class == 5 && is_recipient_lane => {
+            Some(PrimaryCause::Request(RequestCause::NotFound {
                 what: ResourceKind::Mailbox,
                 id: response.message().next().map(str::to_owned),
-            }),
-        )),
-        (_, 4, 4) => Some((
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        )),
-        (_, 4, 5) => Some((
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-        )),
+            }))
+        }
+        (_, 4, 4) => Some(PrimaryCause::Server(ServerCause::Unavailable {
+            retry_hint: None,
+        })),
+        (_, 4, 5) => Some(PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: None,
+        })),
         (_, 4, 6) => Some(server_error(u16::from(response.code()))),
         (_, 4, 7) => Some(if class == 4 {
-            (
-                AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-            )
+            PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None })
         } else {
             server_error(u16::from(response.code()))
         }),
         // X.5 delivery protocol status
         (_, 5, 0 | 1) => Some(contract_violation(response, protocol)),
         (_, 5, 2) => Some(malformed(response)),
-        (_, 5, 3) => Some((
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-        )),
+        (_, 5, 3) => Some(PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: None,
+        })),
         // RFC 4954 Section 6: `504 5.5.4` on the AUTH lane is "unrecognized
         // authentication type" - the server refused the MECHANISM, and
         // nothing about the request was malformed. The same X.5.4 subcode
@@ -556,13 +498,13 @@ fn classify_enhanced(
         (_, 5, 5) => Some(unsupported_send()),
         // X.6 content
         (_, 6, 0 | 1 | 2 | 3 | 5) => Some(malformed(response)),
-        (_, 6, 4) => Some((
-            AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-            Cause::Wire(WireCause::MalformedResponse {
+        (_, 6, 4) => Some(PrimaryCause::Protocol {
+            kind: ProtocolErrorKind::PartialResponse,
+            wire: WireCause::MalformedResponse {
                 protocol,
                 detail: Some(diag_detail(response)),
-            }),
-        )),
+            },
+        }),
         // X.7 security/policy
         //
         // RFC 4954 Section 6: `454 4.7.0` is "temporary authentication
@@ -581,39 +523,32 @@ fn classify_enhanced(
         (_, 7, 9) => Some(policy_blocked()),
         (_, 7, 10 | 11) => Some(policy_blocked()),
         (_, 7, 12) => Some(auth_reauth()),
-        (_, 7, 13) => Some((
-            AccountErrorKind::Authorization(AccessErrorKind::AccountDisabled),
-            Cause::Access(AccessCause::AccountDisabled),
-        )),
+        (_, 7, 13) => Some(PrimaryCause::Access(AccessCause::AccountDisabled)),
         (_, 7, 14 | 15) => Some(policy_blocked()),
         (_, 7, 16) => Some(malformed(response)),
         (_, 7, 17 | 18) => Some(permission_denied()),
-        (_, 7, 19) => Some((
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        )),
+        (_, 7, 19) => Some(PrimaryCause::Server(ServerCause::Unavailable {
+            retry_hint: None,
+        })),
         (_, 7, 20..=22) => Some(malformed(response)),
         (_, 7, 23..=26) => Some(policy_blocked()),
         (_, 7, 27) => Some(malformed(response)),
-        (_, 7, 28) => Some((
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-        )),
+        (_, 7, 28) => Some(PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: None,
+        })),
         (_, 7, 29) => Some(malformed(response)),
         (_, 7, 30) => Some(policy_blocked()),
         // X.7 fallback by class
         (4, 7, _) => {
             let throttled = reply_mentions(response, RATE_HINTS);
             Some(if throttled {
-                (
-                    AccountErrorKind::Server(ServerErrorKind::RateLimited),
-                    Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-                )
+                PrimaryCause::Server(ServerCause::RateLimited {
+                    throttle: Default::default(),
+                    retry_hint: None,
+                })
             } else {
-                (
-                    AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                    Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-                )
+                PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None })
             })
         }
         (5, 7, _) => Some(policy_blocked()),
@@ -638,7 +573,7 @@ fn classify_status(
     response: &Response,
     phase: Option<SmtpCommandPhase>,
     protocol: Protocol,
-) -> (AccountErrorKind, Cause) {
+) -> PrimaryCause {
     let is_recipient_lane = matches!(phase, Some(SmtpCommandPhase::RcptTo));
     let is_auth_lane = matches!(phase, Some(SmtpCommandPhase::Auth { .. }));
     match status {
@@ -647,23 +582,16 @@ fn classify_status(
         // 454 is "TLS not available", 502/504 are command-not-implemented.
         454 if is_auth_lane => auth_refresh_transient(),
         502 | 504 if is_auth_lane => auth_mechanism_refused(),
-        421 | 450 | 451 | 455 => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        ),
+        421 | 450 | 451 | 455 => {
+            PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None })
+        }
         432 => auth_refresh_transient(),
-        452 => (
-            AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
-        ),
-        454 => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        ),
-        400..=499 => (
-            AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-        ),
+        452 => PrimaryCause::Server(ServerCause::QuotaExhausted {
+            throttle: Default::default(),
+            retry_hint: None,
+        }),
+        454 => PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None }),
+        400..=499 => PrimaryCause::Server(ServerCause::Unavailable { retry_hint: None }),
         500 | 501 => malformed(response),
         502 | 504 => unsupported_send(),
         503 => contract_violation(response, protocol),
@@ -671,30 +599,24 @@ fn classify_status(
         534 | 538 => policy_blocked(),
         550 => {
             if is_recipient_lane {
-                (
-                    AccountErrorKind::NotFound(ResourceKind::Mailbox),
-                    Cause::Request(RequestCause::NotFound {
-                        what: ResourceKind::Mailbox,
-                        id: response.message().next().map(str::to_owned),
-                    }),
-                )
+                PrimaryCause::Request(RequestCause::NotFound {
+                    what: ResourceKind::Mailbox,
+                    id: response.message().next().map(str::to_owned),
+                })
             } else {
                 permission_denied()
             }
         }
-        551 => (
-            AccountErrorKind::NotFound(ResourceKind::Mailbox),
-            Cause::Request(RequestCause::NotFound {
-                what: ResourceKind::Mailbox,
-                id: response.message().next().map(str::to_owned),
-            }),
-        ),
+        551 => PrimaryCause::Request(RequestCause::NotFound {
+            what: ResourceKind::Mailbox,
+            id: response.message().next().map(str::to_owned),
+        }),
         552 => {
             if reply_mentions(response, QUOTA_HINTS) {
-                (
-                    AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                    Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
-                )
+                PrimaryCause::Server(ServerCause::QuotaExhausted {
+                    throttle: Default::default(),
+                    retry_hint: None,
+                })
             } else {
                 malformed(response)
             }
@@ -713,22 +635,16 @@ fn classify_status(
     }
 }
 
-fn malformed(response: &Response) -> (AccountErrorKind, Cause) {
-    (
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: diag_detail(response),
-        }),
-    )
+fn malformed(response: &Response) -> PrimaryCause {
+    PrimaryCause::Request(RequestCause::Malformed {
+        detail: diag_detail(response),
+    })
 }
 
-fn unsupported_send() -> (AccountErrorKind, Cause) {
-    (
-        AccountErrorKind::Unsupported(AccountOperation::Send),
-        Cause::Request(RequestCause::Unsupported {
-            operation: AccountOperation::Send,
-        }),
-    )
+fn unsupported_send() -> PrimaryCause {
+    PrimaryCause::Request(RequestCause::Unsupported {
+        operation: AccountOperation::Send,
+    })
 }
 
 /// The server refused the AUTH mechanism itself (RFC 4954 `504 5.5.4`
@@ -748,60 +664,40 @@ fn unsupported_send() -> (AccountErrorKind, Cause) {
 /// derives `AuthLost`, sending the user to re-enter credentials that were
 /// never presented and were never the problem - the server rejected the
 /// mechanism before any credential crossed the wire.
-fn auth_mechanism_refused() -> (AccountErrorKind, Cause) {
-    (
-        AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
-        Cause::Access(AccessCause::PolicyBlocked),
-    )
+fn auth_mechanism_refused() -> PrimaryCause {
+    PrimaryCause::Access(AccessCause::PolicyBlocked)
 }
 
-fn auth_reauth() -> (AccountErrorKind, Cause) {
-    (
-        AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-        Cause::Auth(AuthCause::ReauthorizationRequired),
-    )
+fn auth_reauth() -> PrimaryCause {
+    PrimaryCause::Auth(AuthCause::ReauthorizationRequired)
 }
 
-fn auth_refresh_transient() -> (AccountErrorKind, Cause) {
-    (
-        AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient),
-        Cause::Auth(AuthCause::RefreshTransient),
-    )
+fn auth_refresh_transient() -> PrimaryCause {
+    PrimaryCause::Auth(AuthCause::RefreshTransient)
 }
 
-fn policy_blocked() -> (AccountErrorKind, Cause) {
-    (
-        AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
-        Cause::Access(AccessCause::PolicyBlocked),
-    )
+fn policy_blocked() -> PrimaryCause {
+    PrimaryCause::Access(AccessCause::PolicyBlocked)
 }
 
-fn permission_denied() -> (AccountErrorKind, Cause) {
-    (
-        AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-        Cause::Access(AccessCause::PermissionDenied { resource: None }),
-    )
+fn permission_denied() -> PrimaryCause {
+    PrimaryCause::Access(AccessCause::PermissionDenied { resource: None })
 }
 
-fn contract_violation(response: &Response, protocol: Protocol) -> (AccountErrorKind, Cause) {
-    (
-        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-        Cause::Wire(WireCause::MalformedResponse {
+fn contract_violation(response: &Response, protocol: Protocol) -> PrimaryCause {
+    PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::ContractViolation,
+        wire: WireCause::MalformedResponse {
             protocol,
             detail: Some(diag_detail(response)),
-        }),
-    )
+        },
+    }
 }
 
-fn server_error(status: u16) -> (AccountErrorKind, Cause) {
-    (
-        AccountErrorKind::Server(ServerErrorKind::Error {
-            status: Some(status),
-        }),
-        Cause::Server(ServerCause::Error {
-            status: Some(status),
-        }),
-    )
+fn server_error(status: u16) -> PrimaryCause {
+    PrimaryCause::Server(ServerCause::Error {
+        status: Some(status),
+    })
 }
 
 /// Boundary translation: map a message-builder `crate::error::Error` into the
@@ -824,12 +720,11 @@ pub(crate) fn message_error_to_account_error(
     // Message Display owns these diagnostics; keep this deliberate future
     // translation boundary without duplicating every variant's wording.
     let detail = error.to_string();
-    let kind = AccountErrorKind::Request(RequestErrorKind::Malformed);
-    let cause = Cause::Request(RequestCause::Malformed {
+    let cause = PrimaryCause::Request(RequestCause::Malformed {
         detail: DiagnosticText::support_only(detail.clone()),
     });
 
-    let builder = AccountErrorBuilder::new(kind, cause)
+    let builder = AccountErrorBuilder::new(cause)
         .protocol(protocol)
         .operation(AccountOperation::Send)
         .idempotency_override(false)
@@ -1624,13 +1519,16 @@ mod tests {
             Detail::Zero,
             &["bad command sequence"],
         );
-        let (_, status_cause) = classify_response(&status_response, None, Protocol::Lmtp);
+        let status_cause = classify_response(&status_response, None, Protocol::Lmtp);
         assert!(matches!(
             status_cause,
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Lmtp,
+            PrimaryCause::Protocol {
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Lmtp,
+                    ..
+                },
                 ..
-            })
+            }
         ));
 
         let enhanced_response = response(
@@ -1639,13 +1537,16 @@ mod tests {
             Detail::Four,
             &["5.6.4 conversion required"],
         );
-        let (_, enhanced_cause) = classify_response(&enhanced_response, None, Protocol::Lmtp);
+        let enhanced_cause = classify_response(&enhanced_response, None, Protocol::Lmtp);
         assert!(matches!(
             enhanced_cause,
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Lmtp,
+            PrimaryCause::Protocol {
+                wire: WireCause::MalformedResponse {
+                    protocol: Protocol::Lmtp,
+                    ..
+                },
                 ..
-            })
+            }
         ));
     }
 }

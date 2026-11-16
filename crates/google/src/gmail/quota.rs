@@ -200,7 +200,7 @@ mod tests {
             &AccountErrorKind::Server(ServerErrorKind::QuotaExhausted)
         );
         assert!(
-            matches!(error.chain().outermost(), Cause::Server(ServerCause::QuotaExhausted { retry_hint: Some(RetryHint::At(at)) }) if *at == expected)
+            matches!(error.chain().outermost(), Cause::Server(ServerCause::QuotaExhausted { throttle: _,  retry_hint: Some(RetryHint::At(at)) }) if *at == expected)
         );
         let budget = ThrottleBudget::new("gmail-project|123");
         assert_eq!(error.throttle_budgets(), std::slice::from_ref(&budget));
@@ -245,7 +245,7 @@ mod tests {
         );
         let midnight = SystemTime::from("2026-10-20T07:00:00Z".parse::<Timestamp>().unwrap());
         assert!(
-            matches!(error.chain().outermost(), Cause::Server(ServerCause::QuotaExhausted { retry_hint: Some(RetryHint::At(at)) }) if *at == midnight)
+            matches!(error.chain().outermost(), Cause::Server(ServerCause::QuotaExhausted { throttle: _,  retry_hint: Some(RetryHint::At(at)) }) if *at == midnight)
         );
     }
 
@@ -275,7 +275,7 @@ mod tests {
             &[ThrottleBudget::new("gmail-project|123")]
         );
         assert!(
-            matches!(error.chain().outermost(), Cause::Server(ServerCause::RateLimited { retry_hint: Some(RetryHint::At(at)) }) if *at == wall() + Duration::from_secs(1))
+            matches!(error.chain().outermost(), Cause::Server(ServerCause::RateLimited { throttle: _,  retry_hint: Some(RetryHint::At(at)) }) if *at == wall() + Duration::from_secs(1))
         );
     }
 
@@ -304,7 +304,7 @@ mod tests {
             &AccountErrorKind::Server(ServerErrorKind::QuotaExhausted)
         );
         assert!(
-            matches!(refusal.chain().outermost(), Cause::Server(ServerCause::QuotaExhausted { retry_hint: Some(RetryHint::After(delay)) }) if *delay == Duration::from_secs(7200))
+            matches!(refusal.chain().outermost(), Cause::Server(ServerCause::QuotaExhausted { throttle: _,  retry_hint: Some(RetryHint::After(delay)) }) if *delay == Duration::from_secs(7200))
         );
         assert!(other.get::<serde_json::Value>("/profile").await.is_ok());
         assert_eq!(script.requests().len(), 2);
@@ -334,7 +334,7 @@ mod tests {
         );
         assert!(error.throttle_budgets().is_empty());
         assert!(
-            matches!(error.chain().outermost(), Cause::Server(ServerCause::QuotaExhausted { retry_hint: Some(RetryHint::At(at)) }) if *at == wall() + Duration::from_secs(60))
+            matches!(error.chain().outermost(), Cause::Server(ServerCause::QuotaExhausted { throttle: _,  retry_hint: Some(RetryHint::At(at)) }) if *at == wall() + Duration::from_secs(60))
         );
         let bifrost_types::RecoveryClass::Retry(advice) = error.recovery() else {
             panic!("retry")

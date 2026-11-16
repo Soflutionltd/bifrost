@@ -12,22 +12,21 @@ use std::sync::{Arc, Mutex};
 
 use bifrost_sync::{Error, SyncEngine};
 use bifrost_types::{
-    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountFactory, AccountFuture, AccountId, AccountStream, AddressBook, AddressBookId,
-    AttachmentHandle, BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Calendar,
-    CalendarEvent, Cause, Change, ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate,
-    ContactId, ContactPatch, ContactSearchRequest, ContainerId, ContainerKind, ConvenienceShape,
-    CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope, DraftHandle, DraftPatch,
-    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterDiagnostic,
-    FilterDiagnosticSeverity, FilterRuleShape, FilterScriptCreate, FilterScriptPatch,
-    FilterValidation, FlagOp, HostedAttachment, HydratedObject, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEvent, ItemOutcome,
-    MembershipScope, Message, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
-    MutationSuccess, MutationTarget, ObjectId, Page, PimMethodSupport, Priority, Projection,
-    PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
-    ScopeLifecycleEvent, ScriptLanguage, SearchRequest, SendReceipt, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
-    ThreadHydration, ThreadId, VacationConfig,
+    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountFactory, AccountFuture,
+    AccountId, AccountStream, AddressBook, AddressBookId, AttachmentHandle, BatchingPolicy,
+    BlobHandle, BlobRangeSupport, ByteRange, Calendar, CalendarEvent, Change, ChangeCursor,
+    CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
+    ContainerId, ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment,
+    CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
+    EventRange, EventSearchRequest, FilterDiagnostic, FilterDiagnosticSeverity, FilterRuleShape,
+    FilterScriptCreate, FilterScriptPatch, FilterValidation, FlagOp, HostedAttachment,
+    HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
+    Importance, InventoryEvent, ItemOutcome, MembershipScope, Message, MutationCapabilities,
+    MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page,
+    PimMethodSupport, PrimaryCause, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal,
+    RateLimitClass, RequestCause, RsvpStatus, ScopeLifecycleEvent, ScriptLanguage, SearchRequest,
+    SendReceipt, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
 use futures::stream;
@@ -35,10 +34,9 @@ use futures::stream;
 /// Convenience for stubs that just need to signal "this operation is
 /// not implemented in this test double."
 fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(op),
-        Cause::Request(RequestCause::Unsupported { operation: op }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Unsupported {
+        operation: op,
+    }))
     .operation(op)
     .try_build()
     .expect("valid account error classification")

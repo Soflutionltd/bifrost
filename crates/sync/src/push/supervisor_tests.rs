@@ -139,12 +139,9 @@ impl Fixture {
     }
 }
 fn restart() -> bifrost_types::AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::SyncState(
-            bifrost_types::SyncStateErrorKind::CapabilityChanged,
-        ),
-        bifrost_types::Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
-    )
+    bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::State(
+        bifrost_types::StateCause::CapabilityChanged { delta: None },
+    ))
     .try_build()
     .unwrap()
 }
@@ -152,15 +149,15 @@ fn terminal() -> bifrost_types::AccountError {
     crate::test_common::unsupported(bifrost_types::AccountOperation::PushStream)
 }
 fn throttle(seconds: u64) -> bifrost_types::AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),
-        bifrost_types::Cause::Server(bifrost_types::ServerCause::RateLimited {
+    bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Server(
+        bifrost_types::ServerCause::RateLimited {
+            throttle: Default::default(),
             retry_hint: Some(bifrost_types::RetryHint::After(Duration::from_secs(
                 seconds,
             ))),
-        }),
-    )
-    .throttle_scope(bifrost_types::ThrottleScope::Account)
+        },
+    ))
+    .with_throttle(|throttle| throttle.scope = Some(bifrost_types::ThrottleScope::Account))
     .try_build()
     .unwrap()
 }
@@ -324,7 +321,9 @@ async fn unit_failures_record_every_throttle_and_incomplete_waits_the_longest_hi
             S::Emit(E::UnitFailed(
                 throttle(20)
                     .into_builder()
-                    .throttle_scope(bifrost_types::ThrottleScope::CurrentOperation)
+                    .with_throttle(|throttle| {
+                        throttle.scope = Some(bifrost_types::ThrottleScope::CurrentOperation);
+                    })
                     .try_build()
                     .unwrap(),
             )),
@@ -567,12 +566,11 @@ async fn a_retiring_generation_cannot_mutate_the_replacement_lane() {
 #[tokio::test(start_paused = true)]
 async fn a_scope_repair_failed_during_a_pause_is_submitted_after_resume() {
     let scope = bifrost_types::CursorScope::Account;
-    let error = bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::SyncState(
-            bifrost_types::SyncStateErrorKind::CursorInvalid,
-        ),
-        bifrost_types::Cause::State(bifrost_types::StateCause::CursorInvalid),
-    )
+    let error = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::State(
+        bifrost_types::StateCause::CursorInvalid {
+            scope: scope.clone(),
+        },
+    ))
     .scope(bifrost_types::ErrorScope::Cursor(scope.clone()))
     .try_build()
     .unwrap();

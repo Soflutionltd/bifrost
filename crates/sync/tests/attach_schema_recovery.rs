@@ -35,19 +35,19 @@ use bifrost_sync::{
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountFactory, AccountFuture, AccountId, AccountStream, AttachmentHandle, Batch,
-    BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor,
-    CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
-    ContainerId, ContainerKind, Control, ConvenienceShape, CursorDescriptor, CursorEstablishment,
+    BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Change, ChangeCursor, CloudUploadMeta,
+    ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest, ContainerId,
+    ContainerKind, Control, ConvenienceShape, CursorDescriptor, CursorEstablishment,
     CursorFreshness, CursorScope, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId,
     EventPatch, EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
     IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
-    MutationTarget, ObjectId, OpaqueChangeState, Page, PageBoundary, PimMethodSupport, Priority,
-    Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause,
-    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
-    ThreadHydration, ThreadId, VacationConfig,
+    MutationTarget, ObjectId, OpaqueChangeState, Page, PageBoundary, PimMethodSupport,
+    PrimaryCause, Priority, Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal,
+    RateLimitClass, RequestCause, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{BackfillCheckpoint, Checkpoint};
@@ -57,10 +57,9 @@ use futures::stream;
 use std::sync::atomic::AtomicUsize as BoundaryCounter;
 
 fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(op),
-        Cause::Request(RequestCause::Unsupported { operation: op }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Unsupported {
+        operation: op,
+    }))
     .operation(op)
     .try_build()
     .expect("valid account error classification")
@@ -2606,13 +2605,12 @@ impl AccountFactory for ParkedReopenFactory {
 /// come back on its own after the 30s bound.
 #[tokio::test(start_paused = true)]
 async fn lifecycle_reader_unparks_after_the_bounded_reopen_wait() {
-    use bifrost_types::{StateCause, SyncStateErrorKind};
+    use bifrost_types::StateCause;
 
     let account_id = AccountId("bounded-lifecycle-park".to_owned());
-    let terminal = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged { delta: None }),
-    )
+    let terminal = AccountErrorBuilder::new(PrimaryCause::State(StateCause::CapabilityChanged {
+        delta: None,
+    }))
     .operation(bifrost_types::AccountOperation::SyncChanges)
     .try_build()
     .expect("valid account-reopen recovery error");
@@ -2721,7 +2719,7 @@ impl AccountFactory for ExhaustingFactory {
 /// the engine's +0..25% jitter.
 #[tokio::test(start_paused = true)]
 async fn three_failed_reopens_terminate_and_pause_the_account() {
-    use bifrost_types::{StateCause, SyncStateErrorKind};
+    use bifrost_types::StateCause;
     use tokio::sync::broadcast::error::RecvError;
 
     let account_id = AccountId("reopen-budget-exhausted".to_owned());
@@ -2750,10 +2748,9 @@ async fn three_failed_reopens_terminate_and_pause_the_account() {
 
     // Arm the trigger: an `Engine(RestartAccount)`-class lifecycle
     // termination, picked up on the reader's next reconnect.
-    let trigger = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged { delta: None }),
-    )
+    let trigger = AccountErrorBuilder::new(PrimaryCause::State(StateCause::CapabilityChanged {
+        delta: None,
+    }))
     .operation(bifrost_types::AccountOperation::SyncChanges)
     .try_build()
     .expect("valid account-reopen recovery error");
@@ -3106,12 +3103,9 @@ async fn a_deferred_inventory_that_raises_schema_incompatible_is_established_aft
         *count += 1;
         if *scope == trigger && *count == 1 {
             vec![bifrost_types::InventoryEvent::Terminated(
-                bifrost_types::AccountErrorBuilder::new(
-                    bifrost_types::AccountErrorKind::SyncState(
-                        bifrost_types::SyncStateErrorKind::SchemaIncompatible,
-                    ),
-                    bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
-                )
+                bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::State(
+                    bifrost_types::StateCause::SchemaIncompatible,
+                ))
                 .try_build()
                 .expect("schema error"),
             )]

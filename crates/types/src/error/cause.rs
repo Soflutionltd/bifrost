@@ -7,9 +7,12 @@ use crate::capabilities::CapabilityDelta;
 
 use super::batch::BatchItemId;
 use super::diagnostic::DiagnosticText;
-use super::kind::{InternalErrorKind, MailboxUnavailableKind, ResourceKind, TransportErrorKind};
-use super::recovery::{OperatorOverrideReason, RetryHint, StrategyDowngrade};
+use super::kind::*;
+use super::recovery::{
+    OperatorOverrideReason, RetryHint, StrategyDowngrade, ThrottleBudget, ThrottleScope,
+};
 use super::scope::{AccountOperation, Protocol};
+use crate::CursorScope;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CauseChain {
@@ -51,6 +54,182 @@ impl CauseChain {
     }
 }
 
+/// A failure that can classify an account error. Attempts and bare wire signals
+/// are secondary evidence, so neither can be supplied as a primary cause.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PrimaryCause {
+    Transport(TransportCause),
+    Auth(AuthCause),
+    Access(AccessCause),
+    Server(ServerCause),
+    State(StateCause),
+    Request(RequestCause),
+    Protocol {
+        kind: ProtocolErrorKind,
+        wire: WireCause,
+    },
+    Internal(InternalCause),
+}
+
+impl PrimaryCause {
+    /// The sole projection from a primary failure to its public taxonomy.
+    #[must_use]
+    pub fn kind(&self) -> AccountErrorKind {
+        match self {
+            Self::Transport(c) => AccountErrorKind::Transport(c.kind),
+            Self::Auth(c) => AccountErrorKind::Authentication(match c {
+                AuthCause::Expired => AuthErrorKind::Expired,
+                AuthCause::RefreshTransient => AuthErrorKind::RefreshTransient,
+                AuthCause::Revoked => AuthErrorKind::Revoked,
+                AuthCause::ReauthorizationRequired => AuthErrorKind::ReauthorizationRequired,
+            }),
+            Self::Access(c) => AccountErrorKind::Authorization(match c {
+                AccessCause::InsufficientScope { .. } => AccessErrorKind::InsufficientScope,
+                AccessCause::AdminConsentRequired { .. } => AccessErrorKind::AdminConsentRequired,
+                AccessCause::ConditionalAccessBlocked => AccessErrorKind::ConditionalAccessBlocked,
+                AccessCause::PolicyBlocked => AccessErrorKind::PolicyBlocked,
+                AccessCause::AccountDisabled => AccessErrorKind::AccountDisabled,
+                AccessCause::MailboxUnavailable { kind } => {
+                    AccessErrorKind::MailboxUnavailable { kind: *kind }
+                }
+                AccessCause::MailboxNotLicensed => AccessErrorKind::MailboxNotLicensed,
+                AccessCause::PermissionDenied { .. } => AccessErrorKind::PermissionDenied,
+            }),
+            Self::Server(c) => AccountErrorKind::Server(match c {
+                ServerCause::Unavailable { .. } => ServerErrorKind::Unavailable,
+                ServerCause::RateLimited { .. } => ServerErrorKind::RateLimited,
+                ServerCause::QuotaExhausted { .. } => ServerErrorKind::QuotaExhausted,
+                ServerCause::Error { status } => ServerErrorKind::Error { status: *status },
+            }),
+            Self::State(c) => match c {
+                StateCause::AccountClosed => AccountErrorKind::AccountClosed,
+                StateCause::ControlWaitEnded { .. } => AccountErrorKind::ControlWaitEnded,
+                StateCause::ConcurrencyConflict => AccountErrorKind::ConcurrencyConflict,
+                StateCause::CursorInvalid { .. } => {
+                    AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
+                }
+                StateCause::StrategyFailure { .. } => {
+                    AccountErrorKind::SyncState(SyncStateErrorKind::StrategyFailure)
+                }
+                StateCause::ScopeCapabilityLost { .. } => {
+                    AccountErrorKind::SyncState(SyncStateErrorKind::ScopeCapabilityLost)
+                }
+                StateCause::SchemaIncompatible => {
+                    AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+                }
+                StateCause::CapabilityChanged { .. } => {
+                    AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged)
+                }
+                StateCause::OperatorOverrideNeeded { .. } => {
+                    AccountErrorKind::SyncState(SyncStateErrorKind::OperatorOverrideNeeded)
+                }
+                StateCause::ScopeRevoked { .. } => {
+                    AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+                }
+            },
+            Self::Request(c) => match c {
+                RequestCause::NotFound { what, .. } => AccountErrorKind::NotFound(*what),
+                RequestCause::Unsupported { operation } => {
+                    AccountErrorKind::Unsupported(*operation)
+                }
+                RequestCause::Malformed { .. } | RequestCause::InvalidArgument { .. } => {
+                    AccountErrorKind::Request(RequestErrorKind::Malformed)
+                }
+                RequestCause::PayloadTooLarge { .. } => {
+                    AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge)
+                }
+                RequestCause::PreconditionFailed { .. } => {
+                    AccountErrorKind::Request(RequestErrorKind::PreconditionFailed)
+                }
+                RequestCause::BatchInputInvalid { .. } | RequestCause::BatchInputEmpty => {
+                    AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid)
+                }
+            },
+            Self::Protocol { kind, .. } => AccountErrorKind::Protocol(*kind),
+            Self::Internal(c) => AccountErrorKind::Internal(c.kind),
+        }
+    }
+
+    #[must_use]
+    pub fn throttle(&self) -> Option<&Throttle> {
+        match self {
+            Self::Server(
+                ServerCause::RateLimited { throttle, .. }
+                | ServerCause::QuotaExhausted { throttle, .. },
+            ) => Some(throttle),
+            _ => None,
+        }
+    }
+
+    /// Refine only a throttle cause. Provider policies can inspect this projection
+    /// rather than carry a parallel classification boolean.
+    pub fn throttle_mut(&mut self) -> Option<&mut Throttle> {
+        match self {
+            Self::Server(
+                ServerCause::RateLimited { throttle, .. }
+                | ServerCause::QuotaExhausted { throttle, .. },
+            ) => Some(throttle),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn cursor_scope_mut(&mut self) -> Option<&mut CursorScope> {
+        match self {
+            Self::State(
+                StateCause::CursorInvalid { scope }
+                | StateCause::ScopeRevoked { scope }
+                | StateCause::ScopeCapabilityLost { scope },
+            ) => Some(scope),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn cursor_scope(&self) -> Option<&CursorScope> {
+        match self {
+            Self::State(
+                StateCause::CursorInvalid { scope }
+                | StateCause::ScopeRevoked { scope }
+                | StateCause::ScopeCapabilityLost { scope },
+            ) => Some(scope),
+            _ => None,
+        }
+    }
+}
+
+impl From<PrimaryCause> for Cause {
+    fn from(cause: PrimaryCause) -> Self {
+        match cause {
+            PrimaryCause::Transport(c) => Self::Transport(c),
+            PrimaryCause::Auth(c) => Self::Auth(c),
+            PrimaryCause::Access(c) => Self::Access(c),
+            PrimaryCause::Server(c) => Self::Server(c),
+            PrimaryCause::State(c) => Self::State(c),
+            PrimaryCause::Request(c) => Self::Request(c),
+            PrimaryCause::Protocol { kind, wire } => Self::Protocol { kind, wire },
+            PrimaryCause::Internal(c) => Self::Internal(c),
+        }
+    }
+}
+
+/// Provider throttle identity and local gate provenance. This payload can only
+/// occur on rate-limit and quota causes; ordinary failures cannot carry a hold.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Throttle {
+    pub scope: Option<ThrottleScope>,
+    pub budgets: Vec<ThrottleBudget>,
+    pub local_hold: bool,
+}
+
+impl Throttle {
+    pub fn add_budget(&mut self, budget: ThrottleBudget) {
+        if !self.budgets.contains(&budget) {
+            self.budgets.push(budget);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Cause {
@@ -62,11 +241,25 @@ pub enum Cause {
     State(StateCause),
     Request(RequestCause),
     Wire(WireCause),
+    Protocol {
+        kind: ProtocolErrorKind,
+        wire: WireCause,
+    },
     /// A client-side failure; the cause behind `AccountErrorKind::Internal`.
     Internal(InternalCause),
 }
 
 impl Cause {
+    /// Provider wire evidence, whether it classifies a protocol failure or
+    /// accompanies a semantic failure as a secondary cause.
+    #[must_use]
+    pub fn wire(&self) -> Option<&WireCause> {
+        match self {
+            Self::Wire(wire) | Self::Protocol { wire, .. } => Some(wire),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub(crate) fn transmission_state(&self) -> Option<TransmissionState> {
         match self {
@@ -169,7 +362,7 @@ impl Cause {
                 },
                 ..CauseSummary::empty("request")
             },
-            Self::Wire(cause) => CauseSummary {
+            Self::Wire(cause) | Self::Protocol { wire: cause, .. } => CauseSummary {
                 kind: "wire",
                 detail: cause.detail(),
                 transmission_state: None,
@@ -196,7 +389,7 @@ impl fmt::Display for Cause {
             Self::Server(cause) => write!(f, "{cause}"),
             Self::State(cause) => write!(f, "{cause}"),
             Self::Request(cause) => write!(f, "{cause}"),
-            Self::Wire(cause) => write!(f, "{cause}"),
+            Self::Wire(cause) | Self::Protocol { wire: cause, .. } => write!(f, "{cause}"),
             Self::Internal(cause) => write!(f, "{cause}"),
         }
     }
@@ -234,23 +427,14 @@ impl StdError for InternalCause {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct TransportCause {
-    pub kind: TransportKind,
+    pub kind: TransportErrorKind,
     pub message: Option<DiagnosticText>,
 }
 
 impl TransportCause {
     #[must_use]
-    pub fn new(kind: TransportKind, message: Option<DiagnosticText>) -> Self {
+    pub fn new(kind: TransportErrorKind, message: Option<DiagnosticText>) -> Self {
         Self { kind, message }
-    }
-
-    #[must_use]
-    pub(crate) fn error_kind(&self) -> TransportErrorKind {
-        match self.kind {
-            TransportKind::Network => TransportErrorKind::Network,
-            TransportKind::Timeout => TransportErrorKind::Timeout,
-            TransportKind::Tls => TransportErrorKind::Tls,
-        }
     }
 }
 
@@ -264,14 +448,6 @@ impl fmt::Display for TransportCause {
 }
 
 impl StdError for TransportCause {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[non_exhaustive]
-pub enum TransportKind {
-    Network,
-    Timeout,
-    Tls,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -407,10 +583,20 @@ impl StdError for AccessCause {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ServerCause {
-    Unavailable { retry_hint: Option<RetryHint> },
-    RateLimited { retry_hint: Option<RetryHint> },
-    QuotaExhausted { retry_hint: Option<RetryHint> },
-    Error { status: Option<u16> },
+    Unavailable {
+        retry_hint: Option<RetryHint>,
+    },
+    RateLimited {
+        retry_hint: Option<RetryHint>,
+        throttle: Throttle,
+    },
+    QuotaExhausted {
+        retry_hint: Option<RetryHint>,
+        throttle: Throttle,
+    },
+    Error {
+        status: Option<u16>,
+    },
 }
 
 impl ServerCause {
@@ -418,8 +604,8 @@ impl ServerCause {
     pub(crate) fn retry_hint(&self) -> Option<RetryHint> {
         match self {
             Self::Unavailable { retry_hint }
-            | Self::RateLimited { retry_hint }
-            | Self::QuotaExhausted { retry_hint } => *retry_hint,
+            | Self::RateLimited { retry_hint, .. }
+            | Self::QuotaExhausted { retry_hint, .. } => *retry_hint,
             Self::Error { .. } => None,
         }
     }
@@ -452,11 +638,15 @@ pub enum StateCause {
     ControlWaitEnded {
         detail: DiagnosticText,
     },
-    CursorInvalid,
+    CursorInvalid {
+        scope: CursorScope,
+    },
     StrategyFailure {
         downgrade: StrategyDowngrade,
     },
-    ScopeCapabilityLost,
+    ScopeCapabilityLost {
+        scope: CursorScope,
+    },
     SchemaIncompatible,
     /// Capability shift evidence. The optional delta payload is for
     /// forensic exports only; producers that cannot compute a real
@@ -471,7 +661,9 @@ pub enum StateCause {
     ConcurrencyConflict,
     /// Access to one cursor scope was revoked mid-sync. Pairs with
     /// `SyncStateErrorKind::ScopeRevoked`.
-    ScopeRevoked,
+    ScopeRevoked {
+        scope: CursorScope,
+    },
 }
 
 impl StateCause {
@@ -480,13 +672,13 @@ impl StateCause {
             Self::ControlWaitEnded { detail } => Some(detail.as_str()),
             Self::OperatorOverrideNeeded { reason } => Some(reason.detail()),
             Self::AccountClosed
-            | Self::CursorInvalid
+            | Self::CursorInvalid { .. }
             | Self::StrategyFailure { .. }
-            | Self::ScopeCapabilityLost
+            | Self::ScopeCapabilityLost { .. }
             | Self::SchemaIncompatible
             | Self::CapabilityChanged { .. }
             | Self::ConcurrencyConflict
-            | Self::ScopeRevoked => None,
+            | Self::ScopeRevoked { .. } => None,
         }
     }
 }
@@ -520,7 +712,7 @@ pub enum RequestCause {
         operation: AccountOperation,
     },
     /// Deliberately has NO distinct `AccountErrorKind`:
-    /// `kind_matches_cause` maps it onto `Request(Malformed)`, and
+    /// `PrimaryCause::kind` maps it onto `Request(Malformed)`, and
     /// message-key / recovery treat the two identically. It exists as a
     /// richer cause payload (the offending field, a message) for
     /// diagnostics, not as a separate classification - do not expect a
@@ -1029,7 +1221,7 @@ pub struct CauseSummary<'a> {
     pub answer: Option<AnswerEvidence>,
     pub status: Option<u16>,
     pub native_code: Option<&'a str>,
-    pub transport_kind: Option<TransportKind>,
+    pub transport_kind: Option<TransportErrorKind>,
     pub resource: Option<ResourceKind>,
     pub needed: Option<&'a str>,
     pub downgrade: Option<StrategyDowngrade>,

@@ -60,13 +60,10 @@ async fn an_empty_lifecycle_stream_keeps_growing_its_backoff() {
 
 #[tokio::test(start_paused = true)]
 async fn a_lifecycle_restart_account_loop_is_paced_across_generations() {
-    use bifrost_types::{
-        AccountErrorBuilder, AccountErrorKind, Cause, StateCause, SyncStateErrorKind,
-    };
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged { delta: None }),
-    )
+    use bifrost_types::{AccountErrorBuilder, PrimaryCause, StateCause};
+    let error = AccountErrorBuilder::new(PrimaryCause::State(StateCause::CapabilityChanged {
+        delta: None,
+    }))
     .try_build()
     .expect("classified restart");
     let opens = Arc::new(std::sync::Mutex::new(Vec::new()));

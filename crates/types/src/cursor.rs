@@ -164,48 +164,44 @@ pub struct OpaqueChangeState {
 
 /// Why persisted cursor state cannot be resumed. The classification belongs
 /// here so every provider gives the engine the same recovery instruction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CursorDecodeFault {
     ProtocolMismatch,
     FutureVersion,
     RetiredVersion,
     Malformed,
-    ScopeMismatch,
+    ScopeMismatch {
+        scope: CursorScope,
+    },
     /// Token belongs to another account; no stored scope can safely consume it.
     IdentityMismatch,
 }
 
 impl CursorDecodeFault {
-    /// Build the shared classification; the caller supplies scope and diagnostics.
+    /// Build the shared classification. Scope mismatch carries its own cursor;
+    /// callers decorate other faults with diagnostic scope and detail.
     pub fn builder(
-        self,
+        &self,
         protocol: crate::Protocol,
         operation: crate::AccountOperation,
     ) -> crate::AccountErrorBuilder {
         // An enterprise user expects unreadable durable state to be rebuilt,
         // including dependent backfill state, rather than blamed on the server.
         // A readable token filed under another scope needs only that scope reset.
-        let (kind, cause) = match self {
-            Self::ScopeMismatch => (
-                crate::SyncStateErrorKind::CursorInvalid,
-                crate::StateCause::CursorInvalid,
-            ),
+        let cause = match self {
+            Self::ScopeMismatch { scope } => crate::StateCause::CursorInvalid {
+                scope: scope.clone(),
+            },
             Self::ProtocolMismatch
             | Self::FutureVersion
             | Self::RetiredVersion
             | Self::Malformed
-            | Self::IdentityMismatch => (
-                crate::SyncStateErrorKind::SchemaIncompatible,
-                crate::StateCause::SchemaIncompatible,
-            ),
+            | Self::IdentityMismatch => crate::StateCause::SchemaIncompatible,
         };
-        crate::AccountErrorBuilder::new(
-            crate::AccountErrorKind::SyncState(kind),
-            crate::Cause::State(cause),
-        )
-        .protocol(protocol)
-        .operation(operation)
+        crate::AccountErrorBuilder::new(crate::PrimaryCause::State(cause))
+            .protocol(protocol)
+            .operation(operation)
     }
 }
 
@@ -402,7 +398,9 @@ mod tests {
             CursorDecodeFault::FutureVersion,
             CursorDecodeFault::RetiredVersion,
             CursorDecodeFault::Malformed,
-            CursorDecodeFault::ScopeMismatch,
+            CursorDecodeFault::ScopeMismatch {
+                scope: CursorScope::Account,
+            },
             CursorDecodeFault::IdentityMismatch,
         ] {
             let error = fault
@@ -410,7 +408,7 @@ mod tests {
                 .scope(ErrorScope::Cursor(CursorScope::Account))
                 .try_build()
                 .expect("valid cursor classification");
-            let expected = if fault == CursorDecodeFault::ScopeMismatch {
+            let expected = if matches!(fault, CursorDecodeFault::ScopeMismatch { .. }) {
                 EngineDirective::RestartScope(CursorScope::Account)
             } else {
                 EngineDirective::SchemaIncompatible

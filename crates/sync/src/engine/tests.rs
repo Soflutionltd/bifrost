@@ -1644,12 +1644,11 @@ fn degraded_claim(key: &str) -> crate::cursor::CoverageClaim {
 }
 
 fn unrepresentable(key: &str) -> bifrost_types::InventoryObligation {
-    let error = bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-        bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
+    let error = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Request(
+        bifrost_types::RequestCause::Malformed {
             detail: bifrost_types::DiagnosticText::support_only("unrepresentable"),
-        }),
-    )
+        },
+    ))
     .try_build()
     .expect("valid account error classification");
     bifrost_types::InventoryObligation::Object {
@@ -2922,10 +2921,9 @@ fn rejected_push_scopes_are_not_treated_as_covered() {
     let mut builder = bifrost_types::BatchOutcomeBuilder::new();
     builder.push_succeeded(expected[0].clone(), accepted.clone());
     let operation = bifrost_types::AccountOperation::PushSubscribe;
-    let error = bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Unsupported(operation),
-        bifrost_types::Cause::Request(bifrost_types::RequestCause::Unsupported { operation }),
-    )
+    let error = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Request(
+        bifrost_types::RequestCause::Unsupported { operation },
+    ))
     .operation(operation)
     .scope(bifrost_types::ErrorScope::Cursor(rejected))
     .try_build()
@@ -3210,14 +3208,13 @@ fn readback_queue_is_every_still_pending_id() {
 fn scope_revoked_establishment_failure_is_contained_to_its_scope() {
     use super::scope_local_establish_failure;
     use bifrost_types::{
-        AccessCause, AccessErrorKind, AccountErrorBuilder, AccountErrorKind, AccountOperation,
-        Cause, ErrorScope, Protocol, StateCause, SyncStateErrorKind,
+        AccessCause, AccountErrorBuilder, AccountOperation, ErrorScope, PrimaryCause, Protocol,
+        StateCause,
     };
 
-    let revoked = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
-        Cause::State(StateCause::ScopeRevoked),
-    )
+    let revoked = AccountErrorBuilder::new(PrimaryCause::State(StateCause::ScopeRevoked {
+        scope: CursorScope::Folder(FolderId("Shared/alice/INBOX".into())),
+    }))
     .protocol(Protocol::Imap)
     .operation(AccountOperation::EstablishCursor)
     .scope(ErrorScope::Cursor(CursorScope::Folder(FolderId(
@@ -3230,10 +3227,9 @@ fn scope_revoked_establishment_failure_is_contained_to_its_scope() {
     // An account-wide fact still fails the attach: containment is
     // deliberately narrow, keyed on the protocol crate's own
     // `DisableScope` classification and nothing else.
-    let denied = AccountErrorBuilder::new(
-        AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-        Cause::Access(AccessCause::PermissionDenied { resource: None }),
-    )
+    let denied = AccountErrorBuilder::new(PrimaryCause::Access(AccessCause::PermissionDenied {
+        resource: None,
+    }))
     .protocol(Protocol::Imap)
     .operation(AccountOperation::EstablishCursor)
     .try_build()

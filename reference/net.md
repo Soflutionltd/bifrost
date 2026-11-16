@@ -1594,7 +1594,7 @@ shared parser for both transport waits and structured error evidence.
 
 `http_status::classify_status(code, scope, retry_hint, StatusPolicy)` owns the
 HTTP table for net, DAV, Graph, Google and JMAP problem details. It returns a
-`StatusClass { kind, cause, throttles }`. Typed provider body signals take
+`PrimaryCause`, whose `kind()` projection supplies the classification. Typed provider body signals take
 precedence; provider fallback policies declare only exceptions and resource
 hints. An enterprise user expects the same refusal to recover the same way
 whether it arrives as JSON, problem details or a proxy's plain body.
@@ -1618,9 +1618,9 @@ declares cursor-context 400 as cursor invalid. Google declares history-endpoint
 400/404/410 as cursor invalid and supplies its resource hint. Cursor overrides
 require a cursor scope. JMAP overrides only its typed problem types.
 
-`HttpErrorPolicy::apply_throttle` stamps the provider scope and optional budget
-once when `StatusClass::throttles` is true, including classifications refined
-by typed provider signals. DAV dispatch does not restamp net errors; Graph
+`HttpErrorPolicy::apply_throttle` refines the primary cause's typed `Throttle`
+payload with provider scope and an optional budget, including classifications
+refined by typed provider signals. There is no parallel throttle boolean. DAV dispatch does not restamp net errors; Graph
 passes its mailbox budget into net instead of rebuilding the returned error
 to add that budget. Non-throttle classifications carry neither annotation.
 

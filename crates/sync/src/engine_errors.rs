@@ -2,8 +2,8 @@
 
 use crate::recovery::{RecoveryPlan, plan_recovery};
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    EngineDirective, ErrorScope, StateCause, SyncStateErrorKind,
+    AccountError, AccountErrorBuilder, AccountOperation, CursorScope, EngineDirective, ErrorScope,
+    PrimaryCause, StateCause,
 };
 
 /// Build a sync-state cursor-invalid error scoped to a single cursor.
@@ -13,10 +13,9 @@ use bifrost_types::{
 /// `Engine(RestartScope(scope))`.
 #[must_use]
 pub(crate) fn restart_scope_error(scope: CursorScope, operation: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-        Cause::State(StateCause::CursorInvalid),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::CursorInvalid {
+        scope: scope.clone(),
+    }))
     .scope(ErrorScope::Cursor(scope))
     .operation(operation)
     .try_build()
@@ -37,12 +36,9 @@ pub(crate) fn establish_failure_error(
     scope: CursorScope,
     operation: AccountOperation,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::OperatorOverrideNeeded),
-        Cause::State(StateCause::OperatorOverrideNeeded {
-            reason: bifrost_types::OperatorOverrideReason::EstablishRetryBudgetExhausted,
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::OperatorOverrideNeeded {
+        reason: bifrost_types::OperatorOverrideReason::EstablishRetryBudgetExhausted,
+    }))
     .scope(ErrorScope::Cursor(scope))
     .operation(operation)
     .try_build()
@@ -65,15 +61,14 @@ pub(crate) fn inventory_resume_contract_failure(scope: CursorScope) -> AccountEr
 #[must_use]
 pub(crate) fn inventory_removal_scope_contract_failure(scope: &CursorScope) -> AccountError {
     let kind = bifrost_types::InternalErrorKind::AccountContract;
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Internal(kind),
-        bifrost_types::Cause::Internal(bifrost_types::InternalCause::new(
+    bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Internal(
+        bifrost_types::InternalCause::new(
             kind,
             Some(bifrost_types::DiagnosticText::support_only(
                 "inventory removals were emitted for an unsupported cursor scope",
             )),
-        )),
-    )
+        ),
+    ))
     .operation(AccountOperation::SyncInventory)
     .scope(bifrost_types::ErrorScope::Cursor(scope.clone()))
     .try_build()
@@ -111,13 +106,10 @@ pub(crate) fn recovery_exhaustion_error(
 /// engine's recovery dispatch can drive the schema-clear loop.
 #[must_use]
 pub(crate) fn cursor_decode_failure(operation: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-        Cause::State(StateCause::SchemaIncompatible),
-    )
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::SchemaIncompatible))
+        .operation(operation)
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Envelope provenance decides whether recovery may clear durable state.
@@ -217,13 +209,10 @@ fn contract_violation(
     scope: &CursorScope,
     detail: &'static str,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Internal(bifrost_types::InternalErrorKind::AccountContract),
-        Cause::Internal(bifrost_types::InternalCause::new(
-            bifrost_types::InternalErrorKind::AccountContract,
-            Some(bifrost_types::DiagnosticText::support_only(detail)),
-        )),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Internal(bifrost_types::InternalCause::new(
+        bifrost_types::InternalErrorKind::AccountContract,
+        Some(bifrost_types::DiagnosticText::support_only(detail)),
+    )))
     // The protocol the offending implementation speaks, for telemetry: it
     // used to ride inside the wire cause this replaced.
     .protocol(checkpoint_protocol(checkpoint))
@@ -245,12 +234,9 @@ fn checkpoint_protocol(checkpoint: Option<&bifrost_types::Checkpoint>) -> bifros
 /// The error a `pause` / `checkpoint_now` waiter returns when the account
 /// can no longer reach the boundary it asked for.
 pub(crate) fn control_wait_ended(detail: &'static str) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::ControlWaitEnded,
-        Cause::State(StateCause::ControlWaitEnded {
-            detail: bifrost_types::DiagnosticText::support_only(detail),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::ControlWaitEnded {
+        detail: bifrost_types::DiagnosticText::support_only(detail),
+    }))
     .try_build()
     .expect("valid account error classification")
 }
@@ -258,15 +244,14 @@ pub(crate) fn control_wait_ended(detail: &'static str) -> AccountError {
 /// Invalid answers stop this round; unanswered submitted writes remain uncertain.
 pub(crate) fn mutation_outcome_contract_failure() -> AccountError {
     let kind = bifrost_types::InternalErrorKind::AccountContract;
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Internal(kind),
-        bifrost_types::Cause::Internal(bifrost_types::InternalCause::new(
+    bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Internal(
+        bifrost_types::InternalCause::new(
             kind,
             Some(bifrost_types::DiagnosticText::support_only(
                 "mutation outcomes contain unknown, duplicate or missing targets",
             )),
-        )),
-    )
+        ),
+    ))
     .try_build()
     .expect("valid mutation outcome contract failure")
 }

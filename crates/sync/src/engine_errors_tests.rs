@@ -1,35 +1,29 @@
 use super::*;
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause, AuthCause,
-    AuthErrorKind, Cause, CursorScope, EngineDirective, ErrorScope, RecoveryClass, StateCause,
-    SyncStateErrorKind, TransmissionState, TransportCause, TransportErrorKind, TransportKind,
+    Cause, CursorScope, EngineDirective, ErrorScope, PrimaryCause, RecoveryClass, StateCause,
+    TransmissionState, TransportCause, TransportErrorKind,
 };
 
 fn build_terminal() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Authentication(AuthErrorKind::Expired),
-        Cause::Auth(AuthCause::Expired),
-    )
-    .operation(AccountOperation::SyncChanges)
-    .try_build()
-    .expect("valid")
+    AccountErrorBuilder::new(PrimaryCause::Auth(AuthCause::Expired))
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid")
 }
 
 fn build_engine() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-        Cause::State(StateCause::SchemaIncompatible),
-    )
-    .operation(AccountOperation::SyncChanges)
-    .try_build()
-    .expect("valid")
+    AccountErrorBuilder::new(PrimaryCause::State(StateCause::SchemaIncompatible))
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid")
 }
 
 fn build_reconcile() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+        TransportErrorKind::Network,
+        None,
+    )))
     .operation(AccountOperation::Send)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::InFlight,
@@ -39,10 +33,10 @@ fn build_reconcile() -> AccountError {
 }
 
 fn build_retry() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(TransportKind::Network, None)),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Transport(TransportCause::new(
+        TransportErrorKind::Network,
+        None,
+    )))
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(AccountOperation::SyncChanges)
     .try_build()

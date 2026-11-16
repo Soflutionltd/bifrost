@@ -11,7 +11,7 @@ use super::*;
 use crate::test_common as common;
 use bifrost_types::Control;
 use bifrost_types::{
-    AccountFuture, AttemptCause, Cause, ObjectType, ServerCause, ServerErrorKind, ThrottleBudget,
+    AccountFuture, AttemptCause, Cause, ObjectType, PrimaryCause, ServerCause, ThrottleBudget,
     ThrottleKey, ThrottleScope, TransmissionState,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,18 +21,16 @@ fn key() -> ThrottleKey {
     ThrottleKey::Budget(ThrottleBudget::new("repair-test"))
 }
 fn throttle(seconds: u64) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited {
-            retry_hint: Some(bifrost_types::RetryHint::After(Duration::from_secs(
-                seconds,
-            ))),
-        }),
-    )
+    bifrost_types::AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+        throttle: Default::default(),
+        retry_hint: Some(bifrost_types::RetryHint::After(Duration::from_secs(
+            seconds,
+        ))),
+    }))
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(bifrost_types::AccountOperation::EstablishCursor)
-    .throttle_scope(ThrottleScope::Account)
-    .throttle_budget(ThrottleBudget::new("repair-test"))
+    .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Account))
+    .with_throttle(|throttle| throttle.add_budget(ThrottleBudget::new("repair-test")))
     .try_build()
     .expect("valid throttle")
 }
@@ -694,18 +692,17 @@ async fn round1_restart_lock_hold_obeys_wait_allowance() {
 }
 
 fn teardown_throttle(seconds: u64, budget: Option<&str>) -> AccountError {
-    let builder = bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited {
+    let builder =
+        bifrost_types::AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
             retry_hint: Some(bifrost_types::RetryHint::After(Duration::from_secs(
                 seconds,
             ))),
-        }),
-    )
-    .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
-    .throttle_scope(ThrottleScope::CurrentOperation);
+        }))
+        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
+        .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::CurrentOperation));
     let builder = if let Some(budget) = budget {
-        builder.throttle_budget(ThrottleBudget::new(budget))
+        builder.with_throttle(|throttle| throttle.add_budget(ThrottleBudget::new(budget)))
     } else {
         builder
     };
@@ -1133,12 +1130,9 @@ impl AccountFactory for CountingFactory {
 }
 
 fn restart_account_error() -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::SyncState(
-            bifrost_types::SyncStateErrorKind::CapabilityChanged,
-        ),
-        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
-    )
+    bifrost_types::AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::CapabilityChanged { delta: None },
+    ))
     .try_build()
     .expect("restart error")
 }
@@ -1434,12 +1428,9 @@ async fn stale_requests_are_declined_after_their_account_was_replaced(
         Arc::new(common::StubAccount::new(vec![])),
     ])))
     .await;
-    let error = bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::SyncState(
-            bifrost_types::SyncStateErrorKind::CapabilityChanged,
-        ),
-        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
-    )
+    let error = bifrost_types::AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::CapabilityChanged { delta: None },
+    ))
     .try_build()
     .unwrap();
     for _ in 0..2 {

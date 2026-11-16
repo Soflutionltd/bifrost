@@ -20,12 +20,11 @@ use bifrost_sync::{
     ProofStatus, UnixSeconds,
 };
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AuthCause,
-    AuthErrorKind, Cause, ChangeCursor, Checkpoint, CoverageCoordinate, CoverageDomain,
-    CursorScope, DiagnosticText, ErrorScope, InventoryCoverageReport, InventoryObligation,
-    InventoryRepairTarget, ObjectId, ObjectType, ObligationKey, OpaqueChangeState, Protocol,
-    ProtocolKind, Provider, RegionRecovery, RepairAttemptId, RequestCause, RequestErrorKind,
-    SnapshotIdentity,
+    AccountError, AccountErrorBuilder, AccountOperation, AuthCause, ChangeCursor, Checkpoint,
+    CoverageCoordinate, CoverageDomain, CursorScope, DiagnosticText, ErrorScope,
+    InventoryCoverageReport, InventoryObligation, InventoryRepairTarget, ObjectId, ObjectType,
+    ObligationKey, OpaqueChangeState, PrimaryCause, Protocol, ProtocolKind, Provider,
+    RegionRecovery, RepairAttemptId, RequestCause, SnapshotIdentity,
 };
 
 fn scope() -> CursorScope {
@@ -40,12 +39,9 @@ fn key(name: &str) -> ObligationKey {
 /// kind: scope, operation, provider, protocol, telemetry tokens and both
 /// diagnostic visibility tiers all have to come back.
 fn decorated_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only("unrepresentable"),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only("unrepresentable"),
+    }))
     .scope(ErrorScope::Message {
         id: ObjectId("m-1".into()),
     })
@@ -65,13 +61,10 @@ fn decorated_error() -> AccountError {
 /// A second, structurally different error, so the two are told apart rather
 /// than both matching one lenient assertion.
 fn auth_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Authentication(AuthErrorKind::Revoked),
-        Cause::Auth(AuthCause::Revoked),
-    )
-    .operation(AccountOperation::Expunge)
-    .try_build()
-    .expect("valid account error classification")
+    AccountErrorBuilder::new(PrimaryCause::Auth(AuthCause::Revoked))
+        .operation(AccountOperation::Expunge)
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn object(name: &str) -> InventoryObligation {

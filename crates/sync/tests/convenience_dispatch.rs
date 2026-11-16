@@ -15,28 +15,27 @@ use std::sync::Mutex;
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountFuture, AccountOperation, AccountStream, AttachmentHandle, BatchingPolicy, BlobHandle,
-    BlobRangeSupport, ByteRange, Calendar, CalendarEvent, Cause, Change, ChangeCursor,
-    CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
-    ContainerId, ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment,
-    CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
-    EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
+    BlobRangeSupport, ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, CloudUploadMeta,
+    ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest, ContainerId,
+    ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness,
+    CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange,
+    EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
     HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
     Importance, InventoryEvent, InventoryPartition, ItemOutcome, Label, MembershipScope, Message,
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
-    MutationTarget, ObjectId, Page, PimMethodSupport, Priority, Projection, ProtocolKind,
-    Provenance, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
-    ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, StarredFlagShape, SubscriptionHandle, SyncEvent,
-    ThreadHydration, ThreadId, VacationConfig,
+    MutationTarget, ObjectId, Page, PimMethodSupport, PrimaryCause, Priority, Projection,
+    ProtocolKind, Provenance, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause,
+    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, StarredFlagShape, SubscriptionHandle,
+    SyncEvent, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 
 fn unsupported(op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(op),
-        Cause::Request(RequestCause::Unsupported { operation: op }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Unsupported {
+        operation: op,
+    }))
     .operation(op)
     .try_build()
     .expect("valid account error classification")

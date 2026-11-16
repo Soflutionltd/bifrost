@@ -953,6 +953,11 @@ are rejected.
 
 ## Error model
 
+The account boundary classifies into `PrimaryCause`, including the protocol
+subkind for wire failures. Rate and quota causes carry their account throttle
+payload. Transport causes and kinds share `TransportErrorKind`; no conversion
+between duplicate transport enums remains. See `reference/error-model.md`.
+
 Direct SMTP and LMTP sends deliberately return the wire-level `Error`; batch
 submission returns shared `AccountError` values at the batch and recipient
 boundaries. This is a product choice: a transport integrator needs full SMTP

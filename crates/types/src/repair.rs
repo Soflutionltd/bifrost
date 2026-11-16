@@ -237,19 +237,13 @@ pub enum InventoryRepairEvent {
 mod tests {
     use super::{InventoryRepairTarget, RepairAttemptId};
     use crate::coverage::{InventoryObligation, ObligationKey, RegionRecovery};
-    use crate::error::{
-        AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, RequestCause,
-        RequestErrorKind,
-    };
+    use crate::error::{AccountErrorBuilder, DiagnosticText, PrimaryCause, RequestCause};
     use crate::ids::ObjectId;
 
     fn error() -> crate::error::AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("unrepresentable"),
-            }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("unrepresentable"),
+        }))
         .try_build()
         .expect("valid account error classification")
     }

@@ -771,14 +771,11 @@ mod tests {
         bifrost_types::InventoryObligation::Region {
             key: bifrost_types::ObligationKey(key.as_bytes().to_vec()),
             failure_label: "truncated".into(),
-            error: bifrost_types::AccountErrorBuilder::new(
-                bifrost_types::AccountErrorKind::Request(
-                    bifrost_types::RequestErrorKind::Malformed,
-                ),
-                bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
+            error: bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Request(
+                bifrost_types::RequestCause::Malformed {
                     detail: bifrost_types::DiagnosticText::support_only("unrepresentable"),
-                }),
-            )
+                },
+            ))
             .try_build()
             .expect("valid account error classification"),
             recovery: bifrost_types::RegionRecovery::DurableReplay {
@@ -948,12 +945,11 @@ mod tests {
         let owner_obligation = bifrost_types::InventoryObligation::Region {
             key: bifrost_types::ObligationKey(b"owner".to_vec()),
             failure_label: "truncated".into(),
-            error: bifrost_types::AccountErrorBuilder::new(
-                AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-                bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
+            error: bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Request(
+                bifrost_types::RequestCause::Malformed {
                     detail: bifrost_types::DiagnosticText::support_only("unrepresentable"),
-                }),
-            )
+                },
+            ))
             .scope(bifrost_types::ErrorScope::Owner {
                 id: bifrost_types::PrincipalId("shared".into()),
             })
@@ -1093,13 +1089,12 @@ mod tests {
     #[test]
     fn nc2c_event_error_digest_retains_resource_and_scope() {
         use bifrost_types::{AccountOperation, ErrorScope, ResourceKind};
-        let error = bifrost_types::AccountErrorBuilder::new(
-            AccountErrorKind::NotFound(ResourceKind::Event),
-            bifrost_types::Cause::Request(bifrost_types::RequestCause::NotFound {
+        let error = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::Request(
+            bifrost_types::RequestCause::NotFound {
                 what: ResourceKind::Event,
                 id: Some("public-instance".into()),
-            }),
-        )
+            },
+        ))
         .operation(AccountOperation::EventGet)
         .scope(ErrorScope::Event {
             id: bifrost_types::EventId("public-instance".into()),

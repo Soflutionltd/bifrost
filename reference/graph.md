@@ -2487,6 +2487,11 @@ for `fileAttachment` (item/reference false); no pre-download digest.
 
 ## Error translation
 
+Classifiers return `PrimaryCause` only. Its kind is derived in bifrost-types;
+HTTP policy refines throttle payloads directly, so REST, SOAP and Autodiscover
+carry no separate kind/cause pair or throttle flag. Cursor-directed causes
+carry the cursor identity. See `reference/error-model.md`.
+
 `graph_error::into_account_error(error, ctx)` converts the crate-internal
 `GraphError` into an `AccountError` via `try_build`.
 
@@ -2512,8 +2517,8 @@ the envelope, and Graph's own 401 arm derives the same recovery class.
 
 HTTP fallback uses `bifrost_net::classify_status` with an explicit
 cursor-context 400 override. The same policy reaches non-envelope transport
-failures, so 412 consistently refreshes state and 413 is malformed regardless
-of body format. Typed Graph codes still take precedence. The policy carries
+failures, so 412 consistently refreshes state and 413 is
+`Request(PayloadTooLarge)` regardless of body format. Typed Graph codes still take precedence. The policy carries
 account throttle scope and the optional mailbox budget into net; the response,
 SOAP and Autodiscover paths apply the same throttle decoration at construction.
 No returned net error is rebuilt merely to stamp its budget.

@@ -20,8 +20,8 @@ pub use builder::{AccountErrorBuildError, AccountErrorBuilder};
 pub use cause::{
     AccessCause, AnswerEvidence, AttemptCause, AuthCause, BatchInputInvalidItem,
     BatchInputInvalidReason, Cause, CauseChain, EnhancedStatusCode, GmailSignal, GraphSignal,
-    ImapResponseCode, InternalCause, JmapMethod, RequestCause, ServerCause, StateCause,
-    TransmissionState, TransportCause, TransportKind, WireCause,
+    ImapResponseCode, InternalCause, JmapMethod, PrimaryCause, RequestCause, ServerCause,
+    StateCause, Throttle, TransmissionState, TransportCause, WireCause,
 };
 pub use diagnostic::{
     DetailVisibility, DiagnosticInfo, DiagnosticText, SupportExportConsented,

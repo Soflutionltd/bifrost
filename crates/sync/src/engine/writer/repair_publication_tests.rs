@@ -15,9 +15,9 @@ use crate::MultiplexerEvent;
 use crate::cursor::{DebtLedger, PendingCoverage};
 use crate::run_repair_pass;
 use bifrost_types::{
-    AccountErrorBuilder, AccountErrorKind, Cause, CoverageDomain, CursorScope, DiagnosticText,
-    FolderId, InventoryCoverageReport, InventoryEntry, InventoryObligation, InventoryRepairEvent,
-    InventoryRepairOutcome, ObjectId, ObligationKey, RequestCause, RequestErrorKind, SyncEvent,
+    AccountErrorBuilder, CoverageDomain, CursorScope, DiagnosticText, FolderId,
+    InventoryCoverageReport, InventoryEntry, InventoryObligation, InventoryRepairEvent,
+    InventoryRepairOutcome, ObjectId, ObligationKey, PrimaryCause, RequestCause, SyncEvent,
 };
 use tokio::sync::{broadcast, mpsc};
 
@@ -28,12 +28,9 @@ fn scope(name: &str) -> CursorScope {
 }
 
 fn obligation(key: &str) -> InventoryObligation {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only("unrepresentable"),
-        }),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only("unrepresentable"),
+    }))
     .try_build()
     .expect("valid account error classification");
     InventoryObligation::Object {

@@ -20,14 +20,18 @@
 //! it fresh rather than assuming that sweep covered it.
 
 use bifrost_types::{
-    AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
-    ErrorScope, GmailSignal, InternalCause, InternalErrorKind, ItemOutcome, MutationSuccess,
-    ObjectId, Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind, ResourceKind,
-    RetryHint, ServerCause, ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope,
+    AccessCause, AccountError, AccountErrorBuilder, AccountOperation, AttemptCause, AuthCause,
+    Cause, CursorScope, DiagnosticText, ErrorScope, GmailSignal, InternalCause, InternalErrorKind,
+    ItemOutcome, MutationSuccess, ObjectId, PrimaryCause, Protocol, ProtocolErrorKind, Provider,
+    RequestCause, ResourceKind, RetryHint, ServerCause, StateCause, ThrottleScope,
     TransmissionState, WireCause,
 };
-use bifrost_types::{BatchFailure, BatchItemId, BatchSuccess, TransportErrorKind};
+#[cfg(test)]
+use bifrost_types::{
+    AccessErrorKind, AccountErrorKind, AuthErrorKind, RequestErrorKind, ServerErrorKind,
+    SyncStateErrorKind,
+};
+use bifrost_types::{BatchFailure, BatchItemId, BatchSuccess};
 
 use crate::error::{
     Error, GmailCursorFailure, GmailErrorEnvelope, GmailLocalError, GmailResponseError,
@@ -401,15 +405,12 @@ pub(crate) fn mutation_error(
 /// land, which we cannot know, and dropping them would lose the write
 /// silently.
 pub(crate) fn shutdown_inflight_error(operation: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(bifrost_types::TransportCause::new(
-            bifrost_types::TransportKind::Network,
-            Some(DiagnosticText::support_only(
-                "google account closed while a mutation request was in flight",
-            )),
+    AccountErrorBuilder::new(PrimaryCause::Transport(bifrost_types::TransportCause::new(
+        bifrost_types::TransportErrorKind::Network,
+        Some(DiagnosticText::support_only(
+            "google account closed while a mutation request was in flight",
         )),
-    )
+    )))
     .provider(Provider::Gmail)
     .protocol(Protocol::Gmail)
     .operation(operation)
@@ -733,10 +734,11 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
                 .map(|hint| resp.headers.retry_at.map(RetryHint::At).unwrap_or(hint))
         });
 
-    let (kind, cause) = classify_response(status, &signal, ctx, retry_hint);
-    let class = bifrost_net::StatusClass::new(kind, cause);
+    let cause = classify_response(status, &signal, ctx, retry_hint);
+    let mut policy = http_error_policy(ctx);
+    policy.throttle_budget = project.map(|project| project.budget.clone());
 
-    let mut builder = AccountErrorBuilder::new(class.kind, class.cause)
+    let mut builder = AccountErrorBuilder::new(policy.apply_throttle(cause))
         .google_provider(ctx)
         .protocol(protocol_for(ctx))
         .operation(ctx.operation)
@@ -795,10 +797,6 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
         )));
     }
 
-    let mut policy = http_error_policy(ctx);
-    policy.throttle_budget = project.map(|project| project.budget.clone());
-    builder = policy.apply_throttle(builder, class.throttles);
-
     if let Some(idem) = ctx.idempotency_override {
         builder = builder.idempotency_override(idem);
     }
@@ -813,72 +811,58 @@ fn classify_response(
     signal: &GmailSignal,
     ctx: &GmailErrorContext,
     retry_hint: Option<RetryHint>,
-) -> (AccountErrorKind, Cause) {
+) -> PrimaryCause {
     // First, dispatch on Gmail reason (most precise).
     match signal {
         GmailSignal::InvalidQuery => {
-            return malformed_kind_cause(format!("HTTP {status} invalidQuery"));
+            return malformed_cause(format!("HTTP {status} invalidQuery"));
         }
         GmailSignal::InvalidCredentials | GmailSignal::AuthError => {
-            return (
-                AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-                Cause::Auth(AuthCause::ReauthorizationRequired),
-            );
+            return PrimaryCause::Auth(AuthCause::ReauthorizationRequired);
         }
         GmailSignal::Forbidden => {
-            return (
-                AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-                Cause::Access(AccessCause::PermissionDenied {
-                    resource: ctx.resource.and_then(GmailResource::to_resource_kind),
-                }),
-            );
+            return PrimaryCause::Access(AccessCause::PermissionDenied {
+                resource: ctx.resource.and_then(GmailResource::to_resource_kind),
+            });
         }
         GmailSignal::QuotaExceeded | GmailSignal::DailyLimitExceeded => {
-            return (
-                AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                Cause::Server(ServerCause::QuotaExhausted { retry_hint }),
-            );
+            return PrimaryCause::Server(ServerCause::QuotaExhausted {
+                throttle: Default::default(),
+                retry_hint,
+            });
         }
         GmailSignal::RateLimitExceeded | GmailSignal::UserRateLimitExceeded => {
-            return (
-                AccountErrorKind::Server(ServerErrorKind::RateLimited),
-                Cause::Server(ServerCause::RateLimited { retry_hint }),
-            );
+            return PrimaryCause::Server(ServerCause::RateLimited {
+                throttle: Default::default(),
+                retry_hint,
+            });
         }
         GmailSignal::BackendError => {
-            return (
-                AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_hint }),
-            );
+            return PrimaryCause::Server(ServerCause::Unavailable { retry_hint });
         }
         GmailSignal::FailedPrecondition
             if ctx
                 .endpoint
                 .is_some_and(crate::client::GmailEndpoint::is_history) =>
         {
-            return (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
-            );
+            return PrimaryCause::State(StateCause::CursorInvalid {
+                scope: CursorScope::Account,
+            });
         }
         // outside the history endpoint a `failedPrecondition`
         // signals an etag/version mismatch on the targeted resource,
         // not a malformed client request.
         GmailSignal::FailedPrecondition if ctx.surface != crate::quota::ApiSurface::Drive => {
-            return (
-                AccountErrorKind::ConcurrencyConflict,
-                Cause::State(StateCause::ConcurrencyConflict),
-            );
+            return PrimaryCause::State(StateCause::ConcurrencyConflict);
         }
         GmailSignal::HistoryNotFound
             if ctx
                 .endpoint
                 .is_some_and(crate::client::GmailEndpoint::is_history) =>
         {
-            return (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
-            );
+            return PrimaryCause::State(StateCause::CursorInvalid {
+                scope: CursorScope::Account,
+            });
         }
         // Only a history response proves cursor loss. Elsewhere preserve the
         // HTTP classification: users must not lose sync progress because an
@@ -889,17 +873,13 @@ fn classify_response(
                 .endpoint
                 .is_some_and(crate::client::GmailEndpoint::is_history) =>
         {
-            return (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
-            );
+            return PrimaryCause::State(StateCause::CursorInvalid {
+                scope: CursorScope::Account,
+            });
         }
-        GmailSignal::NotFound => return not_found_kind_cause(ctx),
+        GmailSignal::NotFound => return not_found_cause(ctx),
         GmailSignal::PreconditionFailed => {
-            return (
-                AccountErrorKind::ConcurrencyConflict,
-                Cause::State(StateCause::ConcurrencyConflict),
-            );
+            return PrimaryCause::State(StateCause::ConcurrencyConflict);
         }
         // A missing registration is retryable watch unavailability. Outlook
         // users expect polling to retain mail progress while push recovers;
@@ -907,10 +887,7 @@ fn classify_response(
         GmailSignal::PubSubSubscriptionDeleted | GmailSignal::PubSubSubscriptionExpired
             if ctx.surface == crate::quota::ApiSurface::Gmail =>
         {
-            return (
-                AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_hint }),
-            );
+            return PrimaryCause::Server(ServerCause::Unavailable { retry_hint });
         }
         GmailSignal::Unknown { code } => {
             // Specific stable Google reasons mapped explicitly per
@@ -918,35 +895,23 @@ fn classify_response(
             // and rely on `native_code` for downstream filters.
             match code.as_str() {
                 "invalidArgument" | "INVALID_ARGUMENT" => {
-                    return malformed_kind_cause(format!("HTTP {status} invalidArgument"));
+                    return malformed_cause(format!("HTTP {status} invalidArgument"));
                 }
                 "insufficientPermissions" | "ACCESS_TOKEN_SCOPE_INSUFFICIENT" => {
-                    return (
-                        AccountErrorKind::Authorization(AccessErrorKind::InsufficientScope),
-                        Cause::Access(AccessCause::InsufficientScope {
-                            needed: scope_for(ctx),
-                        }),
-                    );
+                    return PrimaryCause::Access(AccessCause::InsufficientScope {
+                        needed: scope_for(ctx),
+                    });
                 }
                 "domainPolicy" => {
-                    return (
-                        AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
-                        Cause::Access(AccessCause::PolicyBlocked),
-                    );
+                    return PrimaryCause::Access(AccessCause::PolicyBlocked);
                 }
                 "conditionNotMet" => {
-                    return (
-                        AccountErrorKind::ConcurrencyConflict,
-                        Cause::State(StateCause::ConcurrencyConflict),
-                    );
+                    return PrimaryCause::State(StateCause::ConcurrencyConflict);
                 }
                 "notAuthorizedToAccessThisResource" => {
-                    return (
-                        AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-                        Cause::Access(AccessCause::PermissionDenied {
-                            resource: ctx.resource.and_then(GmailResource::to_resource_kind),
-                        }),
-                    );
+                    return PrimaryCause::Access(AccessCause::PermissionDenied {
+                        resource: ctx.resource.and_then(GmailResource::to_resource_kind),
+                    });
                 }
                 _ => {}
             }
@@ -964,14 +929,13 @@ fn classify_by_status(
     status: u16,
     ctx: &GmailErrorContext,
     retry_hint: Option<RetryHint>,
-) -> (AccountErrorKind, Cause) {
-    let class = bifrost_net::classify_status(
+) -> PrimaryCause {
+    bifrost_net::classify_status(
         status,
         ctx.scope.as_ref(),
         retry_hint,
         http_error_policy(ctx).status,
-    );
-    (class.kind, class.cause)
+    )
 }
 
 /// pick the OAuth scope `needed` for an `InsufficientScope`
@@ -1052,19 +1016,14 @@ fn gmail_scope_for(op: AccountOperation) -> &'static str {
     }
 }
 
-fn malformed_kind_cause(detail: String) -> (AccountErrorKind, Cause) {
-    (
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(detail),
-        }),
-    )
+fn malformed_cause(detail: String) -> PrimaryCause {
+    PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only(detail),
+    })
 }
 
-fn not_found_kind_cause(ctx: &GmailErrorContext) -> (AccountErrorKind, Cause) {
-    let class =
-        bifrost_net::classify_status(404, ctx.scope.as_ref(), None, http_error_policy(ctx).status);
-    (class.kind, class.cause)
+fn not_found_cause(ctx: &GmailErrorContext) -> PrimaryCause {
+    bifrost_net::classify_status(404, ctx.scope.as_ref(), None, http_error_policy(ctx).status)
 }
 
 fn http_error_policy(ctx: &GmailErrorContext) -> bifrost_net::HttpErrorPolicy {
@@ -1099,13 +1058,13 @@ fn http_error_policy(ctx: &GmailErrorContext) -> bifrost_net::HttpErrorPolicy {
 }
 
 fn parse_failed(ctx: &GmailErrorContext, detail: String) -> AccountError {
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-        Cause::Wire(WireCause::MalformedResponse {
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: ProtocolErrorKind::ParseFailed,
+        wire: WireCause::MalformedResponse {
             protocol: protocol_for(ctx),
             detail: Some(DiagnosticText::support_only(detail.clone())),
-        }),
-    )
+        },
+    })
     .google_provider(ctx)
     .protocol(protocol_for(ctx))
     .operation(ctx.operation)
@@ -1122,12 +1081,9 @@ fn parse_failed(ctx: &GmailErrorContext, detail: String) -> AccountError {
 }
 
 fn malformed_request(ctx: &GmailErrorContext, detail: String) -> AccountError {
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(detail.clone()),
-        }),
-    )
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only(detail.clone()),
+    }))
     .google_provider(ctx)
     .protocol(protocol_for(ctx))
     .operation(ctx.operation)
@@ -1158,13 +1114,13 @@ fn provider_fault(
         ProviderFault::ContractViolation => ProtocolErrorKind::ContractViolation,
     };
     let detail = DiagnosticText::support_only(detail);
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(kind),
-        Cause::Wire(WireCause::MalformedResponse {
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind,
+        wire: WireCause::MalformedResponse {
             protocol: protocol_for(ctx),
             detail: Some(detail.clone()),
-        }),
-    )
+        },
+    })
     .push_cause(Cause::Attempt(AttemptCause::new(state)))
     .google_provider(ctx)
     .protocol(protocol_for(ctx))
@@ -1295,13 +1251,13 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
         // complete response carried it, so the evidence is `Acknowledged`.
         GmailLocalError::PageTokenRepeated { detail } => {
             let detail = DiagnosticText::support_only(detail);
-            let mut builder = AccountErrorBuilder::new(
-                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-                Cause::Wire(WireCause::MalformedResponse {
+            let mut builder = AccountErrorBuilder::new(PrimaryCause::Protocol {
+                kind: ProtocolErrorKind::ContractViolation,
+                wire: WireCause::MalformedResponse {
                     protocol: protocol_for(ctx),
                     detail: Some(detail.clone()),
-                }),
-            )
+                },
+            })
             .push_cause(Cause::Attempt(AttemptCause::new(
                 TransmissionState::Acknowledged,
             )))
@@ -1326,10 +1282,10 @@ fn internal(
     attempt: Option<TransmissionState>,
 ) -> AccountError {
     let detail = DiagnosticText::support_only(detail);
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Internal(kind),
-        Cause::Internal(InternalCause::new(kind, Some(detail.clone()))),
-    )
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::Internal(InternalCause::new(
+        kind,
+        Some(detail.clone()),
+    )))
     .google_provider(ctx)
     .protocol(protocol_for(ctx))
     .operation(ctx.operation)

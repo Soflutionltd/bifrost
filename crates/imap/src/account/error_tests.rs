@@ -256,8 +256,8 @@ fn auth_with_authentication_failed_maps_to_reauth() {
         AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired)
     ));
     assert!(account.chain().iter().any(|c| matches!(
-        c,
-        Cause::Wire(WireCause::Imap(ImapResponseCode::AuthenticationFailed))
+        c.wire(),
+        Some(WireCause::Imap(ImapResponseCode::AuthenticationFailed))
     )));
 }
 
@@ -380,8 +380,8 @@ fn shared_folder_permission_loss_derives_disable_scope() {
         Cause::Access(bifrost_types::AccessCause::PermissionDenied { .. })
     )));
     assert!(account.chain().iter().any(|cause| matches!(
-        cause,
-        Cause::Wire(WireCause::Imap(ImapResponseCode::NoPerm))
+        cause.wire(),
+        Some(WireCause::Imap(ImapResponseCode::NoPerm))
     )));
     assert!(account.chain().iter().any(|cause| matches!(cause,
         Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged)));
@@ -619,7 +619,7 @@ fn a_missing_mandatory_response_is_missing_field_with_the_same_recovery() {
         missing
             .chain()
             .iter()
-            .any(|cause| matches!(cause, Cause::Wire(WireCause::MalformedResponse { .. })))
+            .any(|cause| matches!(cause.wire(), Some(WireCause::MalformedResponse { .. })))
     );
     assert!(
         !Error::Provider(crate::error::ProviderFailure::Missing("x".into())).is_connection_fatal()
@@ -974,11 +974,8 @@ fn other_response_code_preserves_payload_in_wire_unknown() {
     );
     let account = into_account_error(err, ImapErrorContext::operation(AccountOperation::Discover));
     let has_unknown = account.chain().iter().any(|c| {
-        matches!(
-            c,
-            Cause::Wire(WireCause::Imap(ImapResponseCode::Unknown { code, value }))
-                if code == "X-CUSTOM" && value.as_ref().map(|v| v.value.as_str()) == Some("payload")
-        )
+        matches!(c.wire(), Some(WireCause::Imap(ImapResponseCode::Unknown { code, value }))
+                if code == "X-CUSTOM" && value.as_ref().map(|v| v.value.as_str()) == Some("payload"))
     });
     assert!(has_unknown);
     assert_eq!(account.telemetry_fields().native_code, Some("X-CUSTOM"));
@@ -995,9 +992,8 @@ fn uidvalidity_changed_derives_restart_scope() {
         account.recovery(),
         RecoveryClass::Engine(EngineDirective::RestartScope(CursorScope::Folder(_)))
     ));
-    // imap-N2: SyncState(CursorInvalid) must carry a cursor scope or
-    // builder rejects via `CursorInvalidWithoutScope`. This succeeds
-    // structurally because `uidvalidity_changed` threads it.
+    // The cursor-invalid cause owns the typed folder scope; its public scope
+    // projection must retain that same identity.
     assert!(matches!(account.scope(), Some(ErrorScope::Cursor(_))));
 }
 
@@ -1240,7 +1236,7 @@ fn payload_limits_are_refusals_with_native_evidence() {
             error
                 .chain()
                 .iter()
-                .any(|c| matches!(c, Cause::Wire(WireCause::Imap(c)) if c == &wire))
+                .any(|c| matches!(c.wire(), Some(WireCause::Imap(c)) if c == &wire))
         );
         assert!(error.chain().iter().any(|c| matches!(c, Cause::Attempt(a) if a.transmission_state == TransmissionState::Acknowledged)));
     }
@@ -1337,7 +1333,7 @@ fn stale_uidvalidity_requests_folder_reinventory_for_every_access() {
         );
         assert!(matches!(
             error.chain().outermost(),
-            Cause::State(StateCause::CursorInvalid)
+            Cause::State(StateCause::CursorInvalid { .. })
         ));
         assert_eq!(
             error.recovery(),

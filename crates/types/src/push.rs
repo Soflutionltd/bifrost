@@ -225,16 +225,13 @@ pub fn push_lane_contract_error(
     lane: PushLane,
     detail: &'static str,
 ) -> AccountError {
-    crate::AccountErrorBuilder::new(
-        crate::AccountErrorKind::Internal(crate::InternalErrorKind::AccountContract),
-        crate::Cause::Internal(crate::InternalCause::new(
-            crate::InternalErrorKind::AccountContract,
-            Some(crate::DiagnosticText::support_only(format!(
-                "push lane {}: {detail}",
-                lane.0
-            ))),
-        )),
-    )
+    crate::AccountErrorBuilder::new(crate::PrimaryCause::Internal(crate::InternalCause::new(
+        crate::InternalErrorKind::AccountContract,
+        Some(crate::DiagnosticText::support_only(format!(
+            "push lane {}: {detail}",
+            lane.0
+        ))),
+    )))
     .protocol(protocol)
     .operation(AccountOperation::PushStream)
     .try_build()

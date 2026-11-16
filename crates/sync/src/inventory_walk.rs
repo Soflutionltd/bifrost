@@ -338,9 +338,9 @@ pub(crate) async fn record_refused_debt(
 mod tests {
     use super::*;
     use bifrost_types::{
-        AccountErrorBuilder, AccountErrorKind, BackfillCheckpoint, BackfillProgress, Cause,
-        CoverageDomain, InventoryCoverageReport, InventoryObligation, ObjectType, ObligationKey,
-        RegionRecovery, RequestCause, RequestErrorKind,
+        AccountErrorBuilder, BackfillCheckpoint, BackfillProgress, CoverageDomain,
+        InventoryCoverageReport, InventoryObligation, ObjectType, ObligationKey, PrimaryCause,
+        RegionRecovery, RequestCause,
     };
 
     fn checkpoint(position: u64) -> Checkpoint {
@@ -359,12 +359,9 @@ mod tests {
     }
 
     fn barrier() -> InventoryCoverageReport {
-        let error = AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: bifrost_types::DiagnosticText::support_only("barrier"),
-            }),
-        )
+        let error = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: bifrost_types::DiagnosticText::support_only("barrier"),
+        }))
         .try_build()
         .expect("valid error");
         InventoryCoverageReport::degraded(

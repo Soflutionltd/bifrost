@@ -2,7 +2,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
 
-use super::cause::CauseChain;
+use super::cause::{CauseChain, PrimaryCause};
 use super::diagnostic::{
     DetailVisibility, DiagnosticInfo, SupportExportConsented, SupportExportInternal,
     SupportExportMinimal, TelemetryToken, TelemetryView, account_kind_discriminant,
@@ -43,6 +43,7 @@ struct AccountErrorInner {
     original_error: Option<AccountError>,
     partial_commit: Option<Arc<PartialCommit>>,
     leg_recovery: RecoveryClass,
+    primary_cause: PrimaryCause,
     kind: AccountErrorKind,
     recovery: RecoveryClass,
     remediation: Option<RemediationAction>,
@@ -55,9 +56,6 @@ struct AccountErrorInner {
     classification_cause_count: usize,
     message_key: &'static str,
     idempotency_override: Option<bool>,
-    throttle_scope: Option<ThrottleScope>,
-    throttle_budgets: Vec<ThrottleBudget>,
-    local_hold: bool,
     unsupported_reason: Option<UnsupportedReason>,
 }
 
@@ -67,10 +65,9 @@ impl AccountError {
     pub fn account_closed(operation: AccountOperation, protocol: Protocol) -> Self {
         // An Outlook user expects closing an account to stop its work, without
         // a retry, credential prompt, or claim that the feature is unsupported.
-        super::builder::AccountErrorBuilder::new(
-            AccountErrorKind::AccountClosed,
-            super::cause::Cause::State(super::cause::StateCause::AccountClosed),
-        )
+        super::builder::AccountErrorBuilder::new(super::cause::PrimaryCause::State(
+            super::cause::StateCause::AccountClosed,
+        ))
         .operation(operation)
         .protocol(protocol)
         .scope(ErrorScope::Account)
@@ -82,10 +79,9 @@ impl AccountError {
     /// Add scope, provider, or diagnostics through [`Self::into_builder`].
     #[must_use]
     pub fn unsupported(operation: AccountOperation, protocol: Protocol) -> Self {
-        super::builder::AccountErrorBuilder::new(
-            AccountErrorKind::Unsupported(operation),
-            super::cause::Cause::Request(super::cause::RequestCause::Unsupported { operation }),
-        )
+        super::builder::AccountErrorBuilder::new(super::cause::PrimaryCause::Request(
+            super::cause::RequestCause::Unsupported { operation },
+        ))
         .operation(operation)
         .protocol(protocol)
         .try_build()
@@ -101,15 +97,14 @@ impl AccountError {
     ) -> Self {
         // An Outlook user expects stale results to reload. This signal targets
         // only the page walk, never the account's durable sync checkpoints.
-        super::builder::AccountErrorBuilder::new(
-            AccountErrorKind::Request(super::kind::RequestErrorKind::Malformed),
-            super::cause::Cause::Request(super::cause::RequestCause::InvalidArgument {
+        super::builder::AccountErrorBuilder::new(super::cause::PrimaryCause::Request(
+            super::cause::RequestCause::InvalidArgument {
                 field: Some("page_cursor"),
                 message: Some(super::diagnostic::DiagnosticText::support_only(
                     detail.into(),
                 )),
-            }),
-        )
+            },
+        ))
         .operation(operation)
         .protocol(protocol)
         .try_build()
@@ -140,8 +135,9 @@ impl AccountError {
             super::builder::AccountErrorBuilder::from_rebuild(super::builder::RebuildParts {
                 original_error: Some(self.clone()),
                 partial_commit: self.inner.partial_commit.clone(),
-                kind: AccountErrorKind::SyncState(super::kind::SyncStateErrorKind::ScopeRevoked),
-                primary_cause: super::cause::Cause::State(super::cause::StateCause::ScopeRevoked),
+                primary_cause: PrimaryCause::State(super::cause::StateCause::ScopeRevoked {
+                    scope: scope.clone(),
+                }),
                 chain_extras: self.chain().iter().cloned().collect(),
                 classification_cause_count: self.inner.classification_cause_count + 1,
                 scope: Some(ErrorScope::Cursor(scope)),
@@ -150,9 +146,6 @@ impl AccountError {
                 protocol: self.inner.protocol,
                 diagnostics: self.inner.diagnostics.clone(),
                 idempotency_override: self.inner.idempotency_override,
-                throttle_scope: self.inner.throttle_scope,
-                throttle_budgets: self.inner.throttle_budgets.clone(),
-                local_hold: self.inner.local_hold,
                 unsupported_reason: None,
             });
         builder
@@ -170,6 +163,7 @@ impl AccountError {
                 original_error: parts.original_error,
                 partial_commit: parts.partial_commit,
                 leg_recovery: parts.leg_recovery,
+                primary_cause: parts.primary_cause,
                 kind: parts.kind,
                 recovery: parts.recovery,
                 remediation: parts.remediation,
@@ -182,23 +176,23 @@ impl AccountError {
                 classification_cause_count: parts.classification_cause_count,
                 message_key: parts.message_key,
                 idempotency_override: parts.idempotency_override,
-                throttle_scope: parts.throttle_scope,
-                throttle_budgets: parts.throttle_budgets,
-                local_hold: parts.local_hold,
                 unsupported_reason: parts.unsupported_reason,
             }),
         }
     }
 
     /// The provider rate budgets the failed request was held against, as
-    /// the producer stamped them (`AccountErrorBuilder::throttle_budget`).
+    /// the producer stamped them in the primary cause's `Throttle` payload.
     /// Empty unless the error is a throttle whose producer can name its
     /// budget; the engine then records the deadline on exactly these
     /// instead of lifting the `ThrottleScope`. A local gate refusal retains
     /// these identities as evidence but does not record another shared hold.
     #[must_use]
     pub fn throttle_budgets(&self) -> &[ThrottleBudget] {
-        &self.inner.throttle_budgets
+        self.inner
+            .primary_cause
+            .throttle()
+            .map_or(&[], |throttle| throttle.budgets.as_slice())
     }
 
     /// A transport gate refused this leg against an already recorded hold.
@@ -207,7 +201,10 @@ impl AccountError {
     /// sibling and cleanup failures keep their own ownership.
     #[must_use]
     pub fn is_local_hold(&self) -> bool {
-        self.inner.local_hold
+        self.inner
+            .primary_cause
+            .throttle()
+            .is_some_and(|throttle| throttle.local_hold)
     }
 
     /// Historical effects of this operation, when it crossed a partial commit.
@@ -431,8 +428,8 @@ impl AccountError {
     /// fields and chain.
     ///
     /// `into_builder` is for *decoration*, not reclassification: the
-    /// returned builder carries the original `kind` and primary
-    /// `Cause`, and exposes no kind-changing path. `push_cause` only
+    /// returned builder carries the original `PrimaryCause` and exposes no
+    /// kind-changing path. `push_cause` only
     /// appends secondary evidence to the chain. If a caller needs a
     /// different primary `kind` or a different outermost `Cause`, it
     /// must construct a fresh builder via `AccountErrorBuilder::new`.
@@ -440,17 +437,17 @@ impl AccountError {
     /// Derived fields (`recovery`, `remediation`, `message_key`) are
     /// recomputed on `try_build()` using only the original classification
     /// causes. Appended evidence does not participate. Builder overrides
-    /// (`idempotency_override`, `throttle_scope`) and retry hints set on
-    /// a `ServerCause` survive the round-trip.
+    /// (`idempotency_override`) and all primary throttle data and retry hints
+    /// survive the round-trip.
     #[must_use]
     pub fn into_builder(self) -> super::builder::AccountErrorBuilder {
         let inner = Arc::try_unwrap(self.inner).unwrap_or_else(|arc| (*arc).clone());
         let mut causes = inner.chain.into_vec();
-        let primary_cause = causes.remove(0);
+        causes.remove(0);
+        let primary_cause = inner.primary_cause;
         super::builder::AccountErrorBuilder::from_rebuild(super::builder::RebuildParts {
             original_error: inner.original_error,
             partial_commit: inner.partial_commit,
-            kind: inner.kind,
             primary_cause,
             chain_extras: causes,
             classification_cause_count: inner.classification_cause_count,
@@ -460,9 +457,6 @@ impl AccountError {
             protocol: inner.protocol,
             diagnostics: inner.diagnostics,
             idempotency_override: inner.idempotency_override,
-            throttle_scope: inner.throttle_scope,
-            throttle_budgets: inner.throttle_budgets,
-            local_hold: inner.local_hold,
             unsupported_reason: inner.unsupported_reason,
         })
     }
@@ -487,6 +481,7 @@ pub(crate) struct AccountErrorParts {
     pub original_error: Option<AccountError>,
     pub partial_commit: Option<Arc<PartialCommit>>,
     pub leg_recovery: RecoveryClass,
+    pub primary_cause: PrimaryCause,
     pub kind: AccountErrorKind,
     pub recovery: RecoveryClass,
     pub remediation: Option<RemediationAction>,
@@ -499,9 +494,6 @@ pub(crate) struct AccountErrorParts {
     pub classification_cause_count: usize,
     pub message_key: &'static str,
     pub idempotency_override: Option<bool>,
-    pub throttle_scope: Option<ThrottleScope>,
-    pub throttle_budgets: Vec<ThrottleBudget>,
-    pub local_hold: bool,
     pub unsupported_reason: Option<UnsupportedReason>,
 }
 
@@ -619,8 +611,7 @@ pub(crate) fn recovery_discriminant(recovery: &RecoveryClass) -> &'static str {
 mod tests {
     use super::*;
     use crate::error::{
-        AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, RequestCause,
-        RequestErrorKind,
+        AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, PrimaryCause, RequestCause,
     };
 
     #[test]
@@ -641,12 +632,9 @@ mod tests {
     }
 
     fn request_error() -> AccountError {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only("raw provider body"),
-            }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("raw provider body"),
+        }))
         .text(DiagnosticText::user_safe("Check the request."))
         .text(DiagnosticText::support_only("raw provider body"))
         .try_build()
@@ -764,23 +752,21 @@ mod tests {
         use std::time::Duration;
 
         use crate::error::{
-            AccountOperation, AttemptCause, Cause, ReconcileReason, RetryHint, ServerCause,
-            ServerErrorKind, ThrottleScope, TransmissionState,
+            AccountOperation, AttemptCause, Cause, PrimaryCause, ReconcileReason, RetryHint,
+            ServerCause, ThrottleScope, TransmissionState,
         };
 
         let hint = RetryHint::After(Duration::from_secs(30));
-        let original = AccountErrorBuilder::new(
-            AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited {
-                retry_hint: Some(hint),
-            }),
-        )
+        let original = AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+            throttle: Default::default(),
+            retry_hint: Some(hint),
+        }))
         .operation(AccountOperation::Send)
         .push_cause(Cause::Attempt(AttemptCause::new(
             TransmissionState::InFlight,
         )))
         .idempotency_override(false)
-        .throttle_scope(ThrottleScope::Account)
+        .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Account))
         .try_build()
         .expect("valid account error classification");
 
@@ -834,32 +820,31 @@ mod unsupported_constructor_tests {
 mod shared_constructor_tests {
     use super::*;
     use crate::{
-        AccessCause, AccessErrorKind, AccountErrorBuilder, AttemptCause, Cause, CursorScope,
-        DiagnosticText, EngineDirective, FolderId, RequestCause, RequestErrorKind,
-        TransmissionState,
+        AccessCause, AccountErrorBuilder, AttemptCause, Cause, CursorScope, DiagnosticText,
+        EngineDirective, FolderId, PrimaryCause, RequestCause, RequestErrorKind, TransmissionState,
     };
 
     #[test]
     fn foreign_revocation_preserves_original_source_and_support_evidence() {
         let scope = CursorScope::Folder(FolderId("shared".into()));
         let owner = crate::PrincipalId("delegate".into());
-        let original = AccountErrorBuilder::new(
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied { resource: None }),
-        )
-        .protocol(Protocol::Ews)
-        .provider(Provider::Microsoft)
-        .operation(AccountOperation::SyncChanges)
-        .status(Some(403))
-        .request_id("request")
-        .trace_id("trace")
-        .native_code("denied")
-        .text(DiagnosticText::support_only("original detail"))
-        .push_cause(Cause::Attempt(AttemptCause::new(
-            TransmissionState::Acknowledged,
-        )))
-        .try_build()
-        .unwrap();
+        let original =
+            AccountErrorBuilder::new(PrimaryCause::Access(AccessCause::PermissionDenied {
+                resource: None,
+            }))
+            .protocol(Protocol::Ews)
+            .provider(Provider::Microsoft)
+            .operation(AccountOperation::SyncChanges)
+            .status(Some(403))
+            .request_id("request")
+            .trace_id("trace")
+            .native_code("denied")
+            .text(DiagnosticText::support_only("original detail"))
+            .push_cause(Cause::Attempt(AttemptCause::new(
+                TransmissionState::Acknowledged,
+            )))
+            .try_build()
+            .unwrap();
         let revoked = original
             .clone()
             .revoke_foreign_scope(scope.clone(), Some(&owner))
@@ -897,18 +882,18 @@ mod shared_constructor_tests {
                 .support_text
                 .contains(&"original detail")
         );
-        let historical = AccountErrorBuilder::new(
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied { resource: None }),
-        )
-        .try_build()
-        .unwrap()
-        .into_builder()
-        .push_cause(Cause::Attempt(AttemptCause::new(
-            TransmissionState::InFlight,
-        )))
-        .try_build()
-        .unwrap();
+        let historical =
+            AccountErrorBuilder::new(PrimaryCause::Access(AccessCause::PermissionDenied {
+                resource: None,
+            }))
+            .try_build()
+            .unwrap()
+            .into_builder()
+            .push_cause(Cause::Attempt(AttemptCause::new(
+                TransmissionState::InFlight,
+            )))
+            .try_build()
+            .unwrap();
         let historical = historical.revoke_foreign_scope(CursorScope::Account, Some(&owner));
         assert_eq!(
             crate::Application::from_leaf(&historical),
@@ -934,16 +919,16 @@ mod shared_constructor_tests {
         // or to contact support about the user's own account. The original
         // denial's ContactProviderSupport must not leak through the chain.
         let owner = crate::PrincipalId("delegate".into());
-        let original = AccountErrorBuilder::new(
-            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-            Cause::Access(AccessCause::PermissionDenied { resource: None }),
-        )
-        .operation(AccountOperation::SyncChanges)
-        .push_cause(Cause::Attempt(AttemptCause::new(
-            TransmissionState::Acknowledged,
-        )))
-        .try_build()
-        .unwrap();
+        let original =
+            AccountErrorBuilder::new(PrimaryCause::Access(AccessCause::PermissionDenied {
+                resource: None,
+            }))
+            .operation(AccountOperation::SyncChanges)
+            .push_cause(Cause::Attempt(AttemptCause::new(
+                TransmissionState::Acknowledged,
+            )))
+            .try_build()
+            .unwrap();
         assert!(original.suggested_remediation().is_some());
         let revoked = original
             .revoke_foreign_scope(CursorScope::Folder(FolderId("shared".into())), Some(&owner));

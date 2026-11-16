@@ -288,6 +288,24 @@ Narrow edge cases, audits with no known defect, and design work.
   still overflow the stack downstream of the conversion, which makes the
   iterative conversion pointless on its own. Ablation confirmed the recursive
   conversion overflows a 50,000-deep chain in a debug test thread.
+- **Lateral findings from the review of the primary-cause builder rewrite.**
+  - Several producers mint a scope-directed state cause with a placeholder
+    `CursorScope` and rely on a later `.scope(ErrorScope::Cursor(_))` to rebind
+    it (Gmail's history arms use `CursorScope::Account`). Where the context
+    carries no cursor scope the placeholder now routes recovery silently; the
+    old builder rejected that shape. Correct for Gmail history today, but the
+    placeholder pattern hides a missing scope elsewhere.
+  - `AccountErrorBuilder::with_throttle` is a silent no-op on a non-throttle
+    cause, where the old `throttle_scope` setter failed the build. Callers that
+    reclassify a hold (`sync::throttle::resolve_throttle_key`) cannot tell that
+    nothing was stamped.
+  - `recovery::derive_sync_state` ends in `unreachable!` for a non-state
+    outermost cause. Sound while every `AccountError` comes from the builder,
+    but it is a panic in a published library path if a second construction
+    route appears.
+  - A `.status(..)` set on a `ServerCause::Error` error is now overwritten by
+    the cause's status in telemetry, so a site that classified `Error { None }`
+    but knew the HTTP status loses it from diagnostics.
 - **Lateral findings from the review of the November 2026 resolution batch.**
   - IMAP: an ESEARCH answer without the UID indicator to a UID SEARCH is now a
     hard protocol error; a lenient server that omits the indicator fails every

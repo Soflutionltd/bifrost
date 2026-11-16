@@ -330,12 +330,9 @@ async fn lanes_are_not_run_for_an_account_without_push() {
 
 #[tokio::test(start_paused = true)]
 async fn restart_account_failures_space_reattaches_by_the_carried_backoff() {
-    let restart = bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::SyncState(
-            bifrost_types::SyncStateErrorKind::CapabilityChanged,
-        ),
-        bifrost_types::Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
-    )
+    let restart = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::State(
+        bifrost_types::StateCause::CapabilityChanged { delta: None },
+    ))
     .try_build()
     .unwrap();
     let opens = Arc::new(Mutex::new(Vec::new()));

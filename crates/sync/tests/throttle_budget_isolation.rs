@@ -29,10 +29,9 @@ use std::time::Duration;
 
 use bifrost_sync::{EngineConfig, MultiplexerConfig, SyncEngine};
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountId,
-    AccountOperation, AttemptCause, Cause, Change, ChangeCursor, CursorScope, ObjectType,
-    ServerCause, ServerErrorKind, SyncEvent, ThrottleBudget, ThrottleKey, ThrottleScope,
-    TransmissionState,
+    AccountError, AccountErrorBuilder, AccountFactory, AccountId, AccountOperation, AttemptCause,
+    Cause, Change, ChangeCursor, CursorScope, ObjectType, PrimaryCause, ServerCause, SyncEvent,
+    ThrottleBudget, ThrottleKey, ThrottleScope, TransmissionState,
 };
 
 /// Fails once the others have polled; declares the held budget.
@@ -57,16 +56,14 @@ fn other() -> ThrottleBudget {
 /// `Account` throttle scope, as every Graph throttle does: the precedence
 /// rule is what must keep that scope out of the bucket.
 fn stamped_throttle() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited {
-            retry_hint: Some(bifrost_types::RetryHint::After(RETRY_AFTER)),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+        throttle: Default::default(),
+        retry_hint: Some(bifrost_types::RetryHint::After(RETRY_AFTER)),
+    }))
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(AccountOperation::SyncChanges)
-    .throttle_scope(ThrottleScope::Account)
-    .throttle_budget(held())
+    .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Account))
+    .with_throttle(|throttle| throttle.add_budget(held()))
     .try_build()
     .expect("valid account error")
 }

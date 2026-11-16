@@ -16,8 +16,8 @@ use bifrost_sync::multiplexer::{ScopeToken, ScopeTokens};
 use bifrost_sync::push::Reconciler;
 use bifrost_sync::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
 use bifrost_types::{
-    Account, AccountErrorBuilder, AccountErrorKind, AccountId, Cause, CursorScope, FolderId,
-    RetryHint, ServerCause, ServerErrorKind, SyncEvent,
+    Account, AccountErrorBuilder, AccountId, CursorScope, FolderId, PrimaryCause, RetryHint,
+    ServerCause, SyncEvent,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -32,14 +32,12 @@ fn scope(name: &str) -> CursorScope {
 
 /// A rate-limit failure carrying a very long provider hint.
 fn throttled() -> bifrost_types::AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited {
-            retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(
-                HINTED_DELAY_SECS,
-            ))),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+        throttle: Default::default(),
+        retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(
+            HINTED_DELAY_SECS,
+        ))),
+    }))
     .try_build()
     .expect("valid rate-limited server error")
 }
@@ -327,10 +325,9 @@ async fn a_paused_drive_keeps_its_scope_in_the_work_set() {
 
 #[tokio::test(start_paused = true)]
 async fn an_account_wide_directive_holds_the_remainder_until_the_generation_moves() {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CapabilityChanged),
-        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::CapabilityChanged { delta: None },
+    ))
     .try_build()
     .expect("restart");
     let mut harness = Harness::new(Some(error), false);
@@ -358,10 +355,9 @@ async fn an_account_wide_directive_holds_the_remainder_until_the_generation_move
 /// busy in a repair: shutdown alone must unpark the pending directive send.
 #[tokio::test(start_paused = true)]
 async fn shutdown_unparks_a_directive_send_against_a_full_reopen_channel() {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CapabilityChanged),
-        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::CapabilityChanged { delta: None },
+    ))
     .try_build()
     .expect("restart");
     let harness = Harness::new(Some(error.clone()), false);
@@ -398,10 +394,9 @@ async fn shutdown_unparks_a_directive_send_against_a_full_reopen_channel() {
 
 #[tokio::test(start_paused = true)]
 async fn an_account_wide_hold_clears_at_its_instant_without_a_generation_change() {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CapabilityChanged),
-        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::CapabilityChanged { delta: None },
+    ))
     .try_build()
     .expect("restart");
     let harness = Harness::new(Some(error), false);
@@ -419,10 +414,9 @@ async fn an_account_wide_hold_clears_at_its_instant_without_a_generation_change(
 
 #[tokio::test(start_paused = true)]
 async fn a_hold_is_not_cleared_by_an_already_published_generation() {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CapabilityChanged),
-        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::CapabilityChanged { delta: None },
+    ))
     .try_build()
     .expect("restart");
     let harness = Harness::new(Some(error), false);
@@ -447,10 +441,9 @@ async fn a_hold_is_not_cleared_by_an_already_published_generation() {
 /// the listener declined the now-stale directive.
 #[tokio::test(start_paused = true)]
 async fn a_reattach_during_the_failing_drive_releases_the_hold_at_once() {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CapabilityChanged),
-        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::CapabilityChanged { delta: None },
+    ))
     .try_build()
     .expect("restart");
     let mut harness = Harness::reattaching_during_first_drive(error);

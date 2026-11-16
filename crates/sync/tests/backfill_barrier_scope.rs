@@ -19,11 +19,11 @@ use std::time::Duration;
 
 use bifrost_sync::{CheckpointStore, InMemoryCheckpointStore, SyncEngine};
 use bifrost_types::{
-    AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountId, Cause, Checkpoint,
-    CoverageDomain, CursorScope, DiagnosticText, Fingerprint, InventoryBatch, InventoryCompletion,
-    InventoryCoverageReport, InventoryEntry, InventoryEvent, InventoryObligation,
-    InventoryPartition, InventoryPartitioning, ObjectId, ObligationKey, PageBoundary, PartitionEnd,
-    RegionRecovery, RequestCause, RequestErrorKind, ServerVersion, SyncEvent,
+    AccountErrorBuilder, AccountFactory, AccountId, Checkpoint, CoverageDomain, CursorScope,
+    DiagnosticText, Fingerprint, InventoryBatch, InventoryCompletion, InventoryCoverageReport,
+    InventoryEntry, InventoryEvent, InventoryObligation, InventoryPartition, InventoryPartitioning,
+    ObjectId, ObligationKey, PageBoundary, PartitionEnd, PrimaryCause, RegionRecovery,
+    RequestCause, ServerVersion, SyncEvent,
 };
 
 fn entry(id: &str) -> InventoryEntry {
@@ -50,12 +50,9 @@ fn entries(prefix: &str, count: usize) -> Vec<InventoryEntry> {
 }
 
 fn barrier_report(scope: &CursorScope) -> InventoryCoverageReport {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only("unidentifiable value"),
-        }),
-    )
+    let error = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only("unidentifiable value"),
+    }))
     .try_build()
     .expect("valid account error classification");
     InventoryCoverageReport::degraded(

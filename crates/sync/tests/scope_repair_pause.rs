@@ -27,9 +27,9 @@ use std::time::Duration;
 
 use bifrost_sync::{CheckpointStore, InMemoryCheckpointStore, SyncEngine};
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountId,
-    AccountOperation, Cause, Change, ChangeCursor, Control, CursorScope, ErrorScope, ObjectType,
-    StateCause, SyncEvent, SyncStateErrorKind,
+    AccountError, AccountErrorBuilder, AccountFactory, AccountId, AccountOperation, Change,
+    ChangeCursor, Control, CursorScope, ErrorScope, ObjectType, PrimaryCause, StateCause,
+    SyncEvent,
 };
 
 use common::{StubAccount, StubFactory};
@@ -45,19 +45,16 @@ const POLL_CADENCE_PASSED: Duration = Duration::from_secs(200);
 
 /// Derives `Engine(RestartScope(SCOPE))`.
 fn cursor_invalid() -> AccountError {
-    scoped_state_error(SyncStateErrorKind::CursorInvalid, StateCause::CursorInvalid)
+    scoped_state_error(StateCause::CursorInvalid { scope: SCOPE })
 }
 
 /// Derives `Engine(DowngradeCapabilityForScope(SCOPE))`.
 fn scope_capability_lost() -> AccountError {
-    scoped_state_error(
-        SyncStateErrorKind::ScopeCapabilityLost,
-        StateCause::ScopeCapabilityLost,
-    )
+    scoped_state_error(StateCause::ScopeCapabilityLost { scope: SCOPE })
 }
 
-fn scoped_state_error(kind: SyncStateErrorKind, cause: StateCause) -> AccountError {
-    AccountErrorBuilder::new(AccountErrorKind::SyncState(kind), Cause::State(cause))
+fn scoped_state_error(cause: StateCause) -> AccountError {
+    AccountErrorBuilder::new(PrimaryCause::State(cause))
         .operation(AccountOperation::SyncChanges)
         .scope(ErrorScope::Cursor(SCOPE))
         .try_build()

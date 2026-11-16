@@ -14,19 +14,19 @@ use bifrost_sync::{Error, IdempotencyVendor, SyncEngine, run_readback_guard};
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountFactory, AccountFuture, AccountId, AccountStream, AttachmentHandle, Batch,
-    BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor,
-    CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
-    ContainerId, ContainerKind, Control, ConvenienceShape, CursorDescriptor, CursorEstablishment,
+    BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Change, ChangeCursor, CloudUploadMeta,
+    ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest, ContainerId,
+    ContainerKind, Control, ConvenienceShape, CursorDescriptor, CursorEstablishment,
     CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
     EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
     HydratedObject, HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId,
     IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
-    MutationTarget, ObjectId, OpenedAccount, Page, PageBoundary, PimMethodSupport, Priority,
-    Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause,
-    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
-    ThreadHydration, ThreadId, VacationConfig,
+    MutationTarget, ObjectId, OpenedAccount, Page, PageBoundary, PimMethodSupport, PrimaryCause,
+    Priority, Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass,
+    RequestCause, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
+    SyncEvent, ThreadHydration, ThreadId, VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -37,10 +37,9 @@ use futures::stream::{self, StreamExt};
 /// not implemented in this test double." Maps to `Unsupported(op)` +
 /// `ClientBug` recovery so any unexpected call is obvious in output.
 fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(op),
-        Cause::Request(RequestCause::Unsupported { operation: op }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Unsupported {
+        operation: op,
+    }))
     .operation(op)
     .try_build()
     .expect("valid account error classification")
@@ -134,13 +133,10 @@ impl AccountFactory for CountingFactory {
 }
 
 fn retryable_transport() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
-        Cause::Transport(bifrost_types::TransportCause::new(
-            bifrost_types::TransportKind::Network,
-            None,
-        )),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Transport(bifrost_types::TransportCause::new(
+        bifrost_types::TransportErrorKind::Network,
+        None,
+    )))
     .try_build()
     .expect("valid retryable transport error")
 }
@@ -401,16 +397,14 @@ impl Account for FlagsAccount {
                         if (mode == COHORT_RETRY_ONCE || mode == COHORT_RETRY_BESIDE_UNCERTAIN)
                             && !previous.contains(&id)
                         {
-                            let mut builder = AccountErrorBuilder::new(
-                                AccountErrorKind::Server(
-                                    bifrost_types::ServerErrorKind::RateLimited,
-                                ),
-                                Cause::Server(bifrost_types::ServerCause::RateLimited {
+                            let mut builder = AccountErrorBuilder::new(PrimaryCause::Server(
+                                bifrost_types::ServerCause::RateLimited {
+                                    throttle: Default::default(),
                                     retry_hint: Some(bifrost_types::RetryHint::After(
                                         std::time::Duration::from_secs(30),
                                     )),
-                                }),
-                            );
+                                },
+                            ));
                             if let Some(bifrost_types::ThrottleKey::Budget(budget)) = campaign
                                 .target_keys
                                 .lock()
@@ -422,7 +416,8 @@ impl Account for FlagsAccount {
                                     })
                                 })
                             {
-                                builder = builder.throttle_budget(budget.clone());
+                                builder = builder
+                                    .with_throttle(|throttle| throttle.add_budget(budget.clone()));
                             }
                             return ItemOutcome::Failed(bifrost_types::BatchFailure::new(
                                 item,
@@ -473,18 +468,20 @@ impl Account for FlagsAccount {
             return Box::pin(
                 stream::once(async move {
                     let ids: Vec<ObjectId> = targets.collect().await;
-                    let mut builder = AccountErrorBuilder::new(
-                        AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),
-                        Cause::Server(bifrost_types::ServerCause::RateLimited {
+                    let mut builder = AccountErrorBuilder::new(PrimaryCause::Server(
+                        bifrost_types::ServerCause::RateLimited {
+                            throttle: Default::default(),
                             retry_hint: Some(bifrost_types::RetryHint::After(
                                 std::time::Duration::from_secs(HINTED_RETRY_SECS),
                             )),
-                        }),
-                    );
+                        },
+                    ));
                     if let Some(budget) = stamp {
                         builder = builder
-                            .throttle_scope(bifrost_types::ThrottleScope::Account)
-                            .throttle_budget(budget);
+                            .with_throttle(|throttle| {
+                                throttle.scope = Some(bifrost_types::ThrottleScope::Account);
+                            })
+                            .with_throttle(|throttle| throttle.add_budget(budget));
                     }
                     let error = builder
                         .try_build()
@@ -512,10 +509,11 @@ impl Account for FlagsAccount {
         {
             return Box::pin(stream::once(async move {
                 let ids: Vec<ObjectId> = targets.collect().await;
-                let blocked = AccountErrorBuilder::new(
-                    AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid),
-                    Cause::State(bifrost_types::StateCause::CursorInvalid),
-                )
+                let blocked = AccountErrorBuilder::new(PrimaryCause::State(
+                    bifrost_types::StateCause::CursorInvalid {
+                        scope: CursorScope::Account,
+                    },
+                ))
                 .scope(bifrost_types::ErrorScope::Cursor(CursorScope::Account))
                 .try_build()
                 .expect("valid engine-blocked error");
@@ -544,14 +542,9 @@ impl Account for FlagsAccount {
                     .map(|id| {
                         ItemOutcome::Failed(bifrost_types::BatchFailure::new(
                             bifrost_types::BatchItemId(id.0),
-                            AccountErrorBuilder::new(
-                                AccountErrorKind::SyncState(
-                                    bifrost_types::SyncStateErrorKind::CapabilityChanged,
-                                ),
-                                Cause::State(bifrost_types::StateCause::CapabilityChanged {
-                                    delta: None,
-                                }),
-                            )
+                            AccountErrorBuilder::new(PrimaryCause::State(
+                                bifrost_types::StateCause::CapabilityChanged { delta: None },
+                            ))
                             .try_build()
                             .expect("valid restart error"),
                         ))
@@ -577,21 +570,17 @@ impl Account for FlagsAccount {
                     .enumerate()
                     .map(|(n, id)| {
                         let error = if n == 0 {
-                            AccountErrorBuilder::new(
-                                AccountErrorKind::SyncState(
-                                    bifrost_types::SyncStateErrorKind::CapabilityChanged,
-                                ),
-                                Cause::State(bifrost_types::StateCause::CapabilityChanged {
-                                    delta: None,
-                                }),
-                            )
+                            AccountErrorBuilder::new(PrimaryCause::State(
+                                bifrost_types::StateCause::CapabilityChanged { delta: None },
+                            ))
                         } else {
-                            AccountErrorBuilder::new(
-                                AccountErrorKind::SyncState(
-                                    bifrost_types::SyncStateErrorKind::CursorInvalid,
-                                ),
-                                Cause::State(bifrost_types::StateCause::CursorInvalid),
-                            )
+                            AccountErrorBuilder::new(PrimaryCause::State(
+                                bifrost_types::StateCause::CursorInvalid {
+                                    scope: CursorScope::Folder(bifrost_types::FolderId(format!(
+                                        "folder-{n}"
+                                    ))),
+                                },
+                            ))
                             .scope(bifrost_types::ErrorScope::Cursor(
                                 CursorScope::Folder(bifrost_types::FolderId(format!("folder-{n}"))),
                             ))
@@ -617,10 +606,11 @@ impl Account for FlagsAccount {
             return Box::pin(stream::once(async move {
                 let mut ids: Vec<ObjectId> = targets.collect().await;
                 let first = ids.remove(0);
-                let error = AccountErrorBuilder::new(
-                    AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid),
-                    Cause::State(bifrost_types::StateCause::CursorInvalid),
-                )
+                let error = AccountErrorBuilder::new(PrimaryCause::State(
+                    bifrost_types::StateCause::CursorInvalid {
+                        scope: CursorScope::Account,
+                    },
+                ))
                 .scope(bifrost_types::ErrorScope::Cursor(CursorScope::Account))
                 .try_build()
                 .expect("valid engine-blocked error");
@@ -2997,69 +2987,69 @@ async fn reassert_engine(
     (engine, id)
 }
 fn conflict_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::ConcurrencyConflict,
-        Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::ConcurrencyConflict,
+    ))
     .try_build()
     .unwrap()
 }
 fn dedupe_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::PartialResponse),
-        Cause::Wire(bifrost_types::WireCause::MalformedResponse {
+    AccountErrorBuilder::new(PrimaryCause::Protocol {
+        kind: bifrost_types::ProtocolErrorKind::PartialResponse,
+        wire: bifrost_types::WireCause::MalformedResponse {
             protocol: bifrost_types::Protocol::Graph,
             detail: None,
-        }),
-    )
+        },
+    })
     .operation(bifrost_types::AccountOperation::BulkDestroy)
     .try_build()
     .unwrap()
 }
 fn engine_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid),
-        Cause::State(bifrost_types::StateCause::CursorInvalid),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::CursorInvalid {
+            scope: CursorScope::Account,
+        },
+    ))
     .scope(bifrost_types::ErrorScope::Cursor(CursorScope::Account))
     .try_build()
     .unwrap()
 }
 fn operator_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::OperatorOverrideNeeded),
-        Cause::State(bifrost_types::StateCause::OperatorOverrideNeeded {
+    AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::OperatorOverrideNeeded {
             reason: "test readback directive".into(),
-        }),
-    )
+        },
+    ))
     .try_build()
     .unwrap()
 }
 fn not_found_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message),
-        Cause::Request(RequestCause::NotFound {
-            what: bifrost_types::ResourceKind::Message,
-            id: None,
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::NotFound {
+        what: bifrost_types::ResourceKind::Message,
+        id: None,
+    }))
     .try_build()
     .unwrap()
 }
 fn held_error(budget: Option<&str>, seconds: u64) -> AccountError {
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),
-        Cause::Server(bifrost_types::ServerCause::RateLimited {
+    let mut builder = AccountErrorBuilder::new(PrimaryCause::Server(
+        bifrost_types::ServerCause::RateLimited {
+            throttle: Default::default(),
             retry_hint: Some(bifrost_types::RetryHint::After(
                 std::time::Duration::from_secs(seconds),
             )),
-        }),
-    )
+        },
+    ))
     .operation(bifrost_types::AccountOperation::UpdateFlags);
     if let Some(budget) = budget {
-        builder = builder.throttle_budget(bifrost_types::ThrottleBudget::new(budget));
+        builder = builder.with_throttle(|throttle| {
+            throttle.add_budget(bifrost_types::ThrottleBudget::new(budget));
+        });
     } else {
-        builder = builder.throttle_scope(bifrost_types::ThrottleScope::CurrentOperation);
+        builder = builder.with_throttle(|throttle| {
+            throttle.scope = Some(bifrost_types::ThrottleScope::CurrentOperation);
+        });
     }
     builder.try_build().unwrap()
 }
@@ -4053,18 +4043,18 @@ async fn an_engine_block_turns_a_ready_reassertion_into_blocked_by_engine() {
     );
 }
 fn restart_account_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CapabilityChanged),
-        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::CapabilityChanged { delta: None },
+    ))
     .try_build()
     .unwrap()
 }
 fn stale_folder_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid),
-        Cause::State(bifrost_types::StateCause::CursorInvalid),
-    )
+    AccountErrorBuilder::new(PrimaryCause::State(
+        bifrost_types::StateCause::CursorInvalid {
+            scope: CursorScope::Folder(bifrost_types::FolderId("stale".into())),
+        },
+    ))
     .scope(bifrost_types::ErrorScope::Cursor(CursorScope::Folder(
         bifrost_types::FolderId("stale".into()),
     )))
@@ -4330,7 +4320,7 @@ async fn a_terminal_partial_commit_keeps_its_observation() {
 async fn a_compensation_throttle_is_held_under_its_own_scope() {
     use bifrost_types::{
         Application, CompensationOutcome, PartialCommitBuilder, PrimaryLeg, RetryHint, ServerCause,
-        ServerErrorKind, StepEffect, StepReplay, StepTargets, ThrottleBudget, ThrottleKey,
+        StepEffect, StepReplay, StepTargets, ThrottleBudget, ThrottleKey,
     };
     let primary = retryable_transport();
     let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
@@ -4344,13 +4334,11 @@ async fn a_compensation_throttle_is_held_under_its_own_scope() {
         StepTargets::unknown(),
         StepReplay::Repeatable,
     );
-    let cleanup = AccountErrorBuilder::new(
-        AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited {
-            retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(37))),
-        }),
-    )
-    .throttle_budget(ThrottleBudget::new("cleanup"))
+    let cleanup = AccountErrorBuilder::new(PrimaryCause::Server(ServerCause::RateLimited {
+        throttle: Default::default(),
+        retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(37))),
+    }))
+    .with_throttle(|throttle| throttle.add_budget(ThrottleBudget::new("cleanup")))
     .try_build()
     .unwrap();
     record.compensation(

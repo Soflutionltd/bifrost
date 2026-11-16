@@ -21,8 +21,8 @@ pub fn classify_send_as_rejection(
     detail: crate::DiagnosticText,
 ) -> crate::AccountError {
     use crate::{
-        AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, RequestCause,
-        RequestErrorKind, UnsupportedReason,
+        AccountError, AccountErrorBuilder, AccountOperation, PrimaryCause, RequestCause,
+        UnsupportedReason,
     };
 
     if !available {
@@ -33,13 +33,10 @@ pub fn classify_send_as_rejection(
             .try_build()
             .expect("valid send-as refusal");
     }
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("send_as.mailbox"),
-            message: Some(detail),
-        }),
-    )
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::InvalidArgument {
+        field: Some("send_as.mailbox"),
+        message: Some(detail),
+    }))
     .operation(AccountOperation::Send)
     .protocol(protocol)
     .try_build()
@@ -291,22 +288,20 @@ pub fn validate_send_recipients(
     protocol: crate::Protocol,
 ) -> Result<(), crate::AccountError> {
     use crate::error::{
-        AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, DiagnosticText,
-        RequestCause, RequestErrorKind,
+        AccountErrorBuilder, AccountOperation, DiagnosticText, PrimaryCause, RequestCause,
     };
     // The builder is given a fixed, valid classification; try_build cannot fail.
     #[allow(clippy::unwrap_in_result)]
     if to.is_empty() && cc.is_empty() && bcc.is_empty() {
-        return Err(AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+        return Err(
+            AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::user_safe("send requires at least one recipient"),
-            }),
-        )
-        .operation(AccountOperation::Send)
-        .protocol(protocol)
-        .try_build()
-        .expect("valid account error classification"));
+            }))
+            .operation(AccountOperation::Send)
+            .protocol(protocol)
+            .try_build()
+            .expect("valid account error classification"),
+        );
     }
     Ok(())
 }
@@ -330,19 +325,13 @@ pub fn validate_scheduled(
     at: std::time::SystemTime,
     max_window: Option<std::time::Duration>,
 ) -> Result<(), crate::error::AccountError> {
-    use crate::error::{
-        AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, RequestCause,
-        RequestErrorKind,
-    };
+    use crate::error::{AccountErrorBuilder, DiagnosticText, PrimaryCause, RequestCause};
 
     let now = std::time::SystemTime::now();
     let malformed = |detail: &'static str| {
-        AccountErrorBuilder::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::user_safe(detail),
-            }),
-        )
+        AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::user_safe(detail),
+        }))
         .operation(crate::error::AccountOperation::Send)
         .try_build()
         .expect("valid account error classification")
