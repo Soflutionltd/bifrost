@@ -1252,6 +1252,17 @@ impl PendingCoverage {
     ///
     /// The scope comes from the checkpoint's stream; every caller passes a change
     /// or backfill checkpoint, so a scope-less stream is a caller bug and panics.
+    ///
+    /// Deliberately excludes `fenced_backfill`: that is a receipt bound, not a
+    /// producer generation. An unbounded discard runs after the orchestrator
+    /// stops the failed walk (or during teardown), awaits both retirement passes
+    /// around the row delete, then permits a retry to mint. A bounded discard
+    /// comes from a completion marker, the last publication of its walk, and
+    /// must leave an already running retry alone. Comparing either receipt bound
+    /// to the retry's scope-fence snapshot would refuse valid replacement pages
+    /// forever. Late receipts are checked against that bound by `claim_in`;
+    /// scope and account resets still revoke producers through this comparison.
+    /// Users get missing inventory replayed without interrupting live changes.
     pub(crate) fn register_if_fence(
         &self,
         checkpoint: Checkpoint,

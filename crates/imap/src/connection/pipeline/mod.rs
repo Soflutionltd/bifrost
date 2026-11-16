@@ -10,6 +10,9 @@
 //! findings in this module is an absence of reading. Noted so a later
 //! auditor knows where coverage stops.
 
+// Retained pending the separate decision on pipelined account transport.
+#![allow(dead_code)]
+
 use crate::types::{
     Flag, MailboxAttribute, MailboxName, NotifySetParams, SequenceSet, StoreOperation,
 };

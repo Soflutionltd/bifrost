@@ -33,7 +33,9 @@ pub(crate) struct WireReader {
     buf: BytesMut,
     consumed: usize,
     metering: WireMetering,
+    #[cfg(test)]
     compress_read: Option<(Reservation, usize)>,
+    #[cfg(test)]
     compress_boundary: bool,
     /// The offered grant a gated command committed on, spent by the very next
     /// write. See [`admit_first_write`](Self::admit_first_write).
@@ -54,7 +56,9 @@ impl WireReader {
             buf: BytesMut::with_capacity(8 * 1024),
             consumed: 0,
             metering: WireMetering::disabled(),
+            #[cfg(test)]
             compress_read: None,
+            #[cfg(test)]
             compress_boundary: false,
             first_write: None,
             #[cfg(test)]
@@ -72,7 +76,9 @@ impl WireReader {
             buf: BytesMut::with_capacity(8 * 1024),
             consumed: 0,
             metering: WireMetering::new(sink, bandwidth_budget),
+            #[cfg(test)]
             compress_read: None,
+            #[cfg(test)]
             compress_boundary: false,
             first_write: None,
             #[cfg(test)]
@@ -86,7 +92,9 @@ impl WireReader {
             buf: BytesMut::with_capacity(8 * 1024),
             consumed: 0,
             metering,
+            #[cfg(test)]
             compress_read: None,
+            #[cfg(test)]
             compress_boundary: false,
             first_write: None,
             #[cfg(test)]
@@ -102,6 +110,7 @@ impl WireReader {
         self.metering.peer_timeout = timeout.map(PeerBudget::new);
     }
 
+    #[cfg(test)]
     pub(super) fn set_peer_budget(&mut self, budget: Option<PeerBudget>) {
         self.metering.peer_timeout = budget;
     }
@@ -110,15 +119,18 @@ impl WireReader {
         self.metering.peer_timeout.clone()
     }
 
+    #[cfg(test)]
     pub(in crate::connection) fn begin_compress_boundary(&mut self) {
         self.compress_boundary = true;
     }
 
+    #[cfg(test)]
     pub(in crate::connection) fn finish_compress_boundary(&mut self, suffix: usize) {
         self.finish_compress_read(suffix);
         self.compress_boundary = false;
     }
 
+    #[cfg(test)]
     fn finish_compress_read(&mut self, suffix: usize) {
         if let Some((grant, read)) = self.compress_read.take() {
             let plaintext = read.saturating_sub(suffix);
@@ -140,6 +152,7 @@ impl WireReader {
     /// `utf8_mode` should be `WireMode::Utf8` when `UTF8=ACCEPT` (RFC 6855
     /// Section 3) has been enabled or `IMAP4rev2` is active (RFC 9051
     /// Section 7).
+    #[cfg(test)]
     pub(crate) async fn read_one(
         &mut self,
         utf8_mode: crate::types::wire::WireMode,
@@ -185,6 +198,7 @@ impl WireReader {
     /// Admission precedes peer I/O. A pending IDLE read pre-spends its slot
     /// without holding a lock or an exclusive turn on the account budget.
     async fn read_admitted(&mut self) -> Result<usize, Error> {
+        #[cfg(test)]
         self.finish_compress_read(0);
         let grant = self
             .metering
@@ -193,15 +207,16 @@ impl WireReader {
             .await;
         let read = self.stream.read_buf_limited(&mut self.buf, grant.granted());
         let n = peer_io(self.metering.peer_timeout.clone(), read).await?;
+        #[cfg(test)]
         if self.compress_boundary {
             // The last read can contain compressed bytes after the tagged OK.
             // Keep both counters pending until the upgrade identifies that
             // suffix, which will be counted after decompression by the new reader.
             self.compress_read = Some((grant, n));
-        } else {
-            grant.finish(n);
-            self.metering.record_in(n);
+            return Ok(n);
         }
+        grant.finish(n);
+        self.metering.record_in(n);
         Ok(n)
     }
 
@@ -364,6 +379,7 @@ impl WireReader {
     /// Used by COMPRESS (RFC 4978 Section3): after the tagged OK, any bytes
     /// already buffered are compressed data that must be preserved in
     /// the new `CompressedStream`'s raw read buffer.
+    #[cfg(test)]
     pub(super) fn take_buffer(&mut self) -> bytes::BytesMut {
         let remaining = self.buf.split_off(self.consumed);
         self.buf = BytesMut::new();

@@ -432,13 +432,26 @@ pub fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
 fn resolve_location(base: &reqwest::Url, location: &str) -> Result<reqwest::Url, Error> {
     base.join(location).map_err(|e| Error::MalformedRedirect {
         kind: MalformedRedirectKind::UnresolvableLocation,
-        message: format!("Location {location:?} could not be resolved against base: {e}"),
+        // Location can contain userinfo or provider tokens, even when malformed.
+        message: format!("Location could not be resolved against base: {e}"),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_location_diagnostics_omit_raw_credentials() {
+        let base = reqwest::Url::parse("https://dav.example.test/").unwrap();
+        let error = resolve_location(
+            &base,
+            "https://private-user:private-password@[invalid/?private-token",
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::MalformedRedirect { .. }));
+        assert!(!format!("{error:?}").contains("private-"));
+    }
 
     fn url(s: &str) -> reqwest::Url {
         s.parse().expect("test URL parses")

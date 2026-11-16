@@ -99,6 +99,7 @@ impl ImapConnection {
         self.execute_request(cmd, timeout).await
     }
 
+    #[cfg(test)]
     /// LIST with STATUS return option (RFC 5819 Section 2).
     ///
     /// Returns mailbox information paired with STATUS data for each mailbox.
@@ -150,18 +151,6 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<SelectedMailbox, Error> {
         self.select_or_examine(mailbox, false, options, timeout)
-            .await
-    }
-
-    /// EXAMINE a mailbox (read-only SELECT, RFC 3501 Section 6.3.2).
-    ///
-    /// For CONDSTORE or QRESYNC options, use [`examine_with`](Self::examine_with).
-    pub async fn examine(
-        &self,
-        mailbox: &(impl crate::types::MailboxInput + ?Sized),
-        timeout: Duration,
-    ) -> Result<SelectedMailbox, Error> {
-        self.examine_with(mailbox, &SelectOptions::default(), timeout)
             .await
     }
 
@@ -221,6 +210,7 @@ impl ImapConnection {
     /// Validate QRESYNC parameters before SELECT/EXAMINE (RFC 7162 Section 3.2.5.2).
     ///
     /// Checks live ENABLE state. Request construction owns operand validity.
+    #[cfg(test)]
     pub(super) fn validate_qresync_params(&self, params: &QresyncParams) -> Result<(), Error> {
         super::admission::SessionView {
             snapshot: &self.state_rx.borrow(),
@@ -258,6 +248,7 @@ impl ImapConnection {
         self.execute_request(cmd, timeout).await
     }
 
+    #[cfg(test)]
     /// CREATE a mailbox with special-use attributes (RFC 6154 Section 3).
     ///
     /// RFC 6154 Section 3 / Section 6 ABNF:
@@ -279,6 +270,7 @@ impl ImapConnection {
             .map(|_| ())
     }
 
+    #[cfg(test)]
     /// CREATE a mailbox with special-use attributes and return the server's
     /// `MAILBOXID` when present (RFC 6154 Section 3, RFC 8474 Section 4.1).
     pub async fn create_special_use_with_mailbox_id(
@@ -338,6 +330,7 @@ impl ImapConnection {
         self.execute_request(cmd, timeout).await
     }
 
+    #[cfg(test)]
     /// SUBSCRIBE to a mailbox (RFC 3501 Section 6.3.6).
     ///
     /// Adds the mailbox to the server's set of "active" or "subscribed" mailboxes
@@ -353,18 +346,7 @@ impl ImapConnection {
         self.execute_request(cmd, timeout).await
     }
 
-    /// UNSUBSCRIBE from a mailbox (RFC 3501 Section 6.3.7).
-    pub async fn unsubscribe(
-        &self,
-        mailbox: &(impl crate::types::MailboxInput + ?Sized),
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        let cmd = super::request::Unsubscribe {
-            mailbox: mailbox.mailbox_name()?,
-        };
-        self.execute_request(cmd, timeout).await
-    }
-
+    #[cfg(test)]
     /// LSUB  -  list subscribed mailboxes (RFC 3501 Section 6.3.9).
     ///
     /// Obsoleted by LIST-EXTENDED (RFC 5258) but still required for servers
@@ -385,6 +367,7 @@ impl ImapConnection {
         self.execute_request(cmd, timeout).await
     }
 
+    #[cfg(test)]
     /// CLOSE the selected mailbox (RFC 3501 Section 6.4.2).
     ///
     /// Permanently removes all messages with the `\Deleted` flag and returns

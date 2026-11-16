@@ -1056,3 +1056,12 @@ Discovery credential scenarios and wire assertions live in dav-core's
 clients supply their real discovery and collection-listing calls, preserving
 coverage of dialect property parsing, origin admission and effective-URL href
 resolution without a reverse dependency from dav-core.
+
+## URL refusal diagnostics
+
+Shared DAV admission and destination refusals describe only the parsed HTTP(S)
+origin, or a fixed invalid-URL marker. Inventory member and directory-target
+messages follow the same rule. Enterprise support needs the target origin;
+userinfo passwords and provider tokens in paths, queries or fragments must not
+enter diagnostic text, even at support-only visibility. Malformed redirect
+Location errors in net likewise omit the raw Location value.

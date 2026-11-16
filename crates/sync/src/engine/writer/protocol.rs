@@ -18,10 +18,6 @@ pub(crate) struct AckRequest {
     ///
     /// `None` only for engine-internal acks that carry no coverage claim.
     pub publication: Option<crate::cursor::AckToken>,
-    /// Diagnostic provenance flag: `true` labels an engine-generated ack,
-    /// and `false` labels a consumer ack in tracing. This flag does not
-    /// change acknowledgement validation or persistence.
-    pub auto: bool,
     /// Completion channel for consumer-driven acks. `ack`
     /// waits on this so it returns only after the checkpoint store
     /// has accepted or rejected the write.
@@ -34,7 +30,6 @@ impl std::fmt::Debug for AckRequest {
             .field("scope", &self.scope)
             .field("checkpoint", &self.checkpoint)
             .field("publication", &self.publication)
-            .field("auto", &self.auto)
             .field("complete", &self.complete.is_some())
             .finish()
     }

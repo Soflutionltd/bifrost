@@ -232,7 +232,7 @@ impl SyncEngine {
         control.bind_control_events(account_control_tx.clone());
 
         let (ack_tx, ack_rx) = mpsc::channel::<WriterRequest>(256);
-        let writer = WriterHandle::new(ack_tx.clone());
+        let writer = WriterHandle::new(ack_tx);
         cleanup.writer = Some(tokio::spawn(ack_writer(
             account_id.clone(),
             Arc::clone(&self.checkpoints),
@@ -589,7 +589,6 @@ impl SyncEngine {
                 sink: Arc::clone(&self.sink),
                 budget: self.scheduler.budget(),
                 backfill_registry: Arc::clone(&self.backfill_registry),
-                throttles: Arc::clone(&self.throttles),
                 bandwidth_meter: self.bandwidth_meter.clone(),
             })),
         });

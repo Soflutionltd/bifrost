@@ -759,7 +759,6 @@ pub struct MetadataResult {
 /// is used when the threading algorithm infers a parent that does not
 /// correspond to an existing message.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ThreadNode<I = super::Uid> {
     addressing: std::marker::PhantomData<I>,
     /// UID (or sequence number) of this message, or `None` if this is a
@@ -776,6 +775,83 @@ impl<I> ThreadNode<I> {
             children,
             addressing: std::marker::PhantomData,
         }
+    }
+}
+
+// A valid flat THREAD response can describe a chain of arbitrary depth.
+// Keep every structural operation on a heap worklist, just like parsing and
+// teardown, so inspecting a server response cannot exhaust the call stack.
+impl<I> Clone for ThreadNode<I> {
+    fn clone(&self) -> Self {
+        let mut pending = vec![(self, self.children.iter(), Vec::new())];
+        loop {
+            let (node, mut remaining, children) = pending.pop().expect("root frame exists");
+            if let Some(child) = remaining.next() {
+                pending.push((node, remaining, children));
+                pending.push((child, child.children.iter(), Vec::new()));
+            } else {
+                let completed = Self::new(node.id, children);
+                if let Some(parent) = pending.last_mut() {
+                    parent.2.push(completed);
+                } else {
+                    return completed;
+                }
+            }
+        }
+    }
+}
+
+impl<I> PartialEq for ThreadNode<I> {
+    fn eq(&self, other: &Self) -> bool {
+        let mut pending = vec![(self, other)];
+        while let Some((left, right)) = pending.pop() {
+            if left.id != right.id || left.children.len() != right.children.len() {
+                return false;
+            }
+            pending.extend(left.children.iter().zip(&right.children));
+        }
+        true
+    }
+}
+
+impl<I> Eq for ThreadNode<I> {}
+
+impl<I> std::hash::Hash for ThreadNode<I> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut pending = vec![self];
+        while let Some(node) = pending.pop() {
+            std::hash::Hash::hash(&node.id, state);
+            // Lengths delimit subtrees, distinguishing identical preorder ids
+            // arranged into different branch structures.
+            std::hash::Hash::hash(&node.children.len(), state);
+            pending.extend(node.children.iter().rev());
+        }
+    }
+}
+
+impl<I> std::fmt::Debug for ThreadNode<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        enum Part<'a, I> {
+            Node(&'a ThreadNode<I>),
+            Text(&'static str),
+        }
+        let mut pending = vec![Part::Node(self)];
+        while let Some(part) = pending.pop() {
+            match part {
+                Part::Text(text) => f.write_str(text)?,
+                Part::Node(node) => {
+                    write!(f, "ThreadNode {{ id: {:?}, children: [", node.id)?;
+                    pending.push(Part::Text("] }"));
+                    for (index, child) in node.children.iter().enumerate().rev() {
+                        pending.push(Part::Node(child));
+                        if index != 0 {
+                            pending.push(Part::Text(", "));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -919,3 +995,80 @@ impl From<&ResponseCode> for bifrost_types::ImapResponseCode {
 #[cfg(test)]
 #[path = "response_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod thread_node_operations_tests {
+    use super::ThreadNode;
+    use std::hash::{Hash, Hasher};
+
+    fn chain() -> ThreadNode<u32> {
+        let mut root = ThreadNode::new(Some(50_000), Vec::new());
+        for id in (1..50_000).rev() {
+            root = ThreadNode::new(Some(id), vec![root]);
+        }
+        root
+    }
+
+    #[test]
+    fn deep_thread_clone() {
+        let root = chain();
+        let copy = root.clone();
+        let mut cursor = &copy;
+        for id in 1..=50_000 {
+            assert_eq!(cursor.id, Some(id));
+            if id != 50_000 {
+                assert_eq!(cursor.children.len(), 1);
+                cursor = &cursor.children[0];
+            }
+        }
+        assert!(cursor.children.is_empty());
+    }
+
+    #[test]
+    fn deep_thread_equality() {
+        let root = chain();
+        let mut other = chain();
+        assert!(root == other);
+        let mut leaf = &mut other;
+        while !leaf.children.is_empty() {
+            leaf = &mut leaf.children[0];
+        }
+        leaf.id = None;
+        assert!(root != other);
+    }
+
+    #[test]
+    fn deep_thread_hash() {
+        let root = chain();
+        let mut actual = std::collections::hash_map::DefaultHasher::new();
+        root.hash(&mut actual);
+        let mut expected = std::collections::hash_map::DefaultHasher::new();
+        for id in 1..=50_000_u32 {
+            Some(id).hash(&mut expected);
+            usize::from(id != 50_000).hash(&mut expected);
+        }
+        assert_eq!(actual.finish(), expected.finish());
+    }
+
+    #[test]
+    fn deep_thread_debug() {
+        let output = format!("{:?}", chain());
+        assert_eq!(output.matches("ThreadNode {").count(), 50_000);
+        assert!(output.starts_with("ThreadNode { id: Some(1), children: ["));
+        assert!(output.contains("ThreadNode { id: Some(50000), children: [] }"));
+        assert!(output.ends_with("] }"));
+    }
+
+    #[test]
+    fn thread_operations_preserve_branch_structure() {
+        let leaf = || ThreadNode::<u32>::new(Some(2), Vec::new());
+        let root = ThreadNode::new(None, vec![leaf(), leaf()]);
+        assert_eq!(root, root.clone());
+        assert_eq!(
+            format!("{root:?}"),
+            "ThreadNode { id: None, children: [ThreadNode { id: Some(2), children: [] }, ThreadNode { id: Some(2), children: [] }] }"
+        );
+        let chain = ThreadNode::new(None, vec![ThreadNode::new(Some(2), vec![leaf()])]);
+        assert_ne!(root, chain);
+    }
+}

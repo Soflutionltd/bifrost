@@ -205,6 +205,13 @@ pub(crate) async fn update(
                 .expect("valid account error classification"),
         );
     }
+    // Users expect caller versions to require the advertised atomic update
+    // door as well as a native If-Match guard, before any content read or write.
+    account.capabilities.mutation.concurrency.gate_version(
+        AccountOperation::ContactUpdate,
+        patch.expected_version.as_ref(),
+        bifrost_types::Protocol::Graph,
+    )?;
     let etag = if let Some(version) = &patch.expected_version {
         Some(
             version
@@ -1430,6 +1437,46 @@ mod tests {
         assert_eq!(top_for_limit(Some(10), 250), 10);
         assert_eq!(top_for_limit(Some(9999), 250), 250);
         assert_eq!(top_for_limit(None, 999), 250);
+    }
+
+    #[tokio::test]
+    async fn caller_contact_update_version_requires_advertised_guard() {
+        for concurrency in [
+            bifrost_types::MutationConcurrency::StateBased,
+            bifrost_types::MutationConcurrency::ExpectedVersion(
+                bifrost_types::VersionedDoors::EVENT_UPDATE,
+            ),
+        ] {
+            let client = crate::client::GraphClient::new("token");
+            let mut account = GraphAccount::new_for_tests(
+                client.clone(),
+                super::super::PushMode::GraphSubscriptions,
+            );
+            account.capabilities.mutation.concurrency = concurrency;
+            client.script_rest([crate::client::ScriptedRestResponse::empty(
+                reqwest::StatusCode::NO_CONTENT,
+            )]);
+            let error = update(
+                account,
+                ContactId("one".into()),
+                ContactPatch {
+                    expected_version: Some(bifrost_types::ServerVersion::etag(
+                        bifrost_types::Protocol::Graph,
+                        bifrost_types::ObjectType::Contact,
+                        "W/\"stale\"",
+                    )),
+                    display_name: Some(Some("changed".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::ContactUpdate)
+            );
+            assert!(client.take_rest_requests().is_empty());
+        }
     }
 
     #[tokio::test]

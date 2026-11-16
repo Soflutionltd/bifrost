@@ -423,16 +423,12 @@ fn imap4rev2_active(capabilities: &[Capability], enabled: &[Capability]) -> bool
     }
 }
 
-/// Shared oracle for tests of every view over [`supports`] (the profile, the
-/// encoder options and the connection snapshot).
-///
-/// `expected_usable` combines advertised support and the QRESYNC implication
-/// with the production rev2 baseline decision. The exhaustive Capability match
-/// belongs to `rev2_baseline_includes`, so a new variant requires a production
-/// decision even when no capability-matrix test runs.
+/// Shared input fixtures and production adapter for capability-view tests.
+/// Production's exhaustive baseline match owns every capability decision;
+/// tests of other views must not maintain a second support formula.
 #[cfg(test)]
 pub(crate) mod capability_matrix {
-    use super::{Capability, imap4rev2_active, rev2_baseline_includes};
+    use super::{Capability, SessionCapabilities};
 
     /// One sample of every [`Capability`] variant (parameterised variants get a
     /// representative payload).
@@ -492,25 +488,14 @@ pub(crate) mod capability_matrix {
         ]
     }
 
-    /// The expected answer for `capability` given the pair, from first
-    /// principles: advertised, or QRESYNC for CONDSTORE, or baseline under
-    /// active rev2.
+    /// Ask the production session owner directly. Keep this adapter shared by
+    /// profile, encoder and connection tests so their fixtures carry no oracle.
     pub(crate) fn expected_usable(
         capabilities: &[Capability],
         enabled: &[String],
         capability: &Capability,
     ) -> bool {
-        capabilities.contains(capability)
-            || (matches!(capability, Capability::Condstore)
-                && capabilities.contains(&Capability::QResync))
-            || (rev2_baseline_includes(capability)
-                && imap4rev2_active(
-                    capabilities,
-                    &enabled
-                        .iter()
-                        .map(|s| Capability::from_imap_str(s))
-                        .collect::<Vec<_>>(),
-                ))
+        SessionCapabilities::new(capabilities.to_vec(), enabled.to_vec()).supports(capability)
     }
 
     /// Connection states that exercise every branch of the rev2-ACTIVE rule.

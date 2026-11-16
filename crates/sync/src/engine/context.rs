@@ -256,7 +256,6 @@ pub(super) struct SlotRegistrations {
     pub sink: Arc<InvalidationSinkInner>,
     pub budget: BudgetGate,
     pub backfill_registry: Arc<BackfillRegistry>,
-    pub throttles: Arc<crate::throttle::ThrottleBucket>,
     pub bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
 }
 
@@ -265,7 +264,6 @@ impl Drop for SlotRegistrations {
         self.sink.unregister(&self.account_id);
         self.budget.forget(&self.account_id);
         self.backfill_registry.forget_account(&self.account_id);
-        self.throttles.forget_account(&self.account_id);
         if let Some(meter) = &self.bandwidth_meter {
             meter.forget_account(&self.account_id);
         }

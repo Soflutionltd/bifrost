@@ -206,17 +206,19 @@ fn parse_envelope(bytes: &[u8]) -> Result<CursorEnvelope, Error> {
     let scope_end = scope_start
         .checked_add(scope_len)
         .ok_or_else(|| Error::Malformed("cursor envelope: scope length overflow".into()))?;
-    if bytes.len() < scope_end + 4 {
+    let payload_start = scope_end
+        .checked_add(4)
+        .ok_or_else(|| Error::Malformed("cursor envelope: scope length overflow".into()))?;
+    if bytes.len() < payload_start {
         return Err(Error::Malformed("cursor envelope: truncated scope".into()));
     }
-    let payload_len_bytes = &bytes[scope_end..scope_end + 4];
+    let payload_len_bytes = &bytes[scope_end..payload_start];
     let payload_len = u32::from_le_bytes([
         payload_len_bytes[0],
         payload_len_bytes[1],
         payload_len_bytes[2],
         payload_len_bytes[3],
     ]) as usize;
-    let payload_start = scope_end + 4;
     let payload_end = payload_start
         .checked_add(payload_len)
         .ok_or_else(|| Error::Malformed("cursor envelope: payload length overflow".into()))?;
@@ -288,41 +290,49 @@ pub fn decode_scope(bytes: &[u8]) -> Result<CursorScope, Error> {
     }
     let tag = bytes[0];
     let rest = &bytes[1..];
-    match tag {
-        SCOPE_ACCOUNT => Ok(CursorScope::Account),
+    let (scope, consumed) = match tag {
+        SCOPE_ACCOUNT => (CursorScope::Account, 0),
         SCOPE_TYPE => {
-            if rest.is_empty() {
-                return Err(Error::Malformed(
-                    "cursor envelope: type scope missing object type".into(),
-                ));
-            }
-            Ok(CursorScope::Type(decode_obj_type(rest[0])?))
+            let ty = rest.first().ok_or_else(|| {
+                Error::Malformed("cursor envelope: type scope missing object type".into())
+            })?;
+            (CursorScope::Type(decode_obj_type(*ty)?), 1)
         }
         SCOPE_QUERY => {
-            let (s, _) = read_string(rest)?;
-            Ok(CursorScope::Query(crate::QueryId(s)))
+            let (s, consumed) = read_string(rest)?;
+            (CursorScope::Query(crate::QueryId(s)), consumed)
         }
         SCOPE_FOLDER => {
-            let (s, _) = read_string(rest)?;
-            Ok(CursorScope::Folder(crate::FolderId(s)))
+            let (s, consumed) = read_string(rest)?;
+            (CursorScope::Folder(crate::FolderId(s)), consumed)
         }
         SCOPE_FOLDER_TYPE => {
             let (folder, consumed) = read_string(rest)?;
-            if rest.len() < consumed + 1 {
-                return Err(Error::Malformed(
-                    "cursor envelope: folder-type scope missing object type".into(),
-                ));
-            }
-            let ty = decode_obj_type(rest[consumed])?;
-            Ok(CursorScope::FolderType {
-                folder: crate::FolderId(folder),
-                ty,
-            })
+            let ty = rest.get(consumed).ok_or_else(|| {
+                Error::Malformed("cursor envelope: folder-type scope missing object type".into())
+            })?;
+            (
+                CursorScope::FolderType {
+                    folder: crate::FolderId(folder),
+                    ty: decode_obj_type(*ty)?,
+                },
+                consumed + 1,
+            )
         }
-        other => Err(Error::Malformed(format!(
-            "cursor envelope: unknown scope tag {other}"
-        ))),
+        other => {
+            return Err(Error::Malformed(format!(
+                "cursor envelope: unknown scope tag {other}"
+            )));
+        }
+    };
+    // Scope fields have no padding: a stored checkpoint must not silently
+    // resume from only a recognized prefix of a corrupted field.
+    if consumed != rest.len() {
+        return Err(Error::Malformed(
+            "cursor envelope: trailing scope bytes".into(),
+        ));
     }
+    Ok(scope)
 }
 
 fn encode_obj_type(ty: ObjectType) -> u8 {
@@ -421,12 +431,18 @@ fn decode_change_payload(
         ));
     }
     let has_progress = bytes[cursor_bytes_end];
-    let advanced_through = if has_progress == 0 {
-        None
+    let tail = &bytes[cursor_bytes_end + 1..];
+    let (advanced_through, consumed) = if has_progress == 0 {
+        (None, 0)
     } else {
-        let (p, _) = read_bytes(&bytes[cursor_bytes_end + 1..])?;
-        Some(OpaqueProgressBytes(p))
+        let (p, consumed) = read_bytes(tail)?;
+        (Some(OpaqueProgressBytes(p)), consumed)
     };
+    if consumed != tail.len() {
+        return Err(Error::Malformed(
+            "cursor envelope: trailing change payload bytes".into(),
+        ));
+    }
     Ok(migrate_change_cursor(
         envelope_version,
         ChangeCursor {
@@ -535,25 +551,35 @@ fn decode_backfill_payload(
         after_progress[7],
     ]);
     let has_estimate = after_progress[8];
-    let items_estimated = if has_estimate == 0 {
-        None
+    let (items_estimated, consumed) = if has_estimate == 0 {
+        (None, 9)
     } else {
         if after_progress.len() < 17 {
             return Err(Error::Malformed(
                 "cursor envelope: truncated backfill estimate".into(),
             ));
         }
-        Some(u64::from_le_bytes([
-            after_progress[9],
-            after_progress[10],
-            after_progress[11],
-            after_progress[12],
-            after_progress[13],
-            after_progress[14],
-            after_progress[15],
-            after_progress[16],
-        ]))
+        (
+            Some(u64::from_le_bytes([
+                after_progress[9],
+                after_progress[10],
+                after_progress[11],
+                after_progress[12],
+                after_progress[13],
+                after_progress[14],
+                after_progress[15],
+                after_progress[16],
+            ])),
+            17,
+        )
     };
+    // Counters end the payload; opaque partition and progress bytes remain
+    // untouched, but bytes outside those declared fields are corruption.
+    if consumed != after_progress.len() {
+        return Err(Error::Malformed(
+            "cursor envelope: trailing backfill payload bytes".into(),
+        ));
+    }
     Ok(BackfillCheckpoint {
         scope,
         partition: Partition(partition_bytes),

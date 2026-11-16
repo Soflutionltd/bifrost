@@ -59,6 +59,8 @@ use crate::error::Error;
 use bifrost_types::{CursorScope, EngineDirective, FolderId, MembershipScope, ObjectType};
 
 /// Harness for driving the account writer directly.
+/// Keep the raw endpoint here: tests submit private protocol requests and
+/// inspect ordering and refusals that producer-facing WriterHandle hides.
 fn writer_harness_observed() -> (
     bifrost_types::AccountId,
     Arc<crate::cursor::InMemoryCheckpointStore>,
@@ -221,7 +223,6 @@ async fn a_discarded_backfill_attempt_cannot_be_rebuilt_by_a_late_ack() {
         scope: scope.clone(),
         checkpoint,
         publication: Some(publication),
-        auto: false,
         complete: Some(done),
     }))
     .await
@@ -292,7 +293,6 @@ async fn a_discard_fences_the_backfill_lane_and_leaves_live_acks_alone() {
         scope: scope.clone(),
         checkpoint: live_checkpoint,
         publication: Some(live_publication),
-        auto: false,
         complete: Some(done),
     }))
     .await
@@ -316,7 +316,6 @@ async fn a_discard_fences_the_backfill_lane_and_leaves_live_acks_alone() {
         scope: scope.clone(),
         checkpoint: page,
         publication: Some(page_publication),
-        auto: false,
         complete: Some(done),
     }))
     .await
@@ -818,7 +817,6 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
         scope: scope.clone(),
         checkpoint: marker,
         publication: Some(marker_publication),
-        auto: false,
         complete: Some(done),
     }))
     .await
@@ -846,7 +844,6 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
         scope,
         checkpoint: retry_page,
         publication: Some(retry_publication),
-        auto: false,
         complete: Some(done),
     }))
     .await
@@ -1134,7 +1131,6 @@ async fn a_rejected_acknowledgement_frees_no_capacity() {
         scope: CursorScope::Account,
         checkpoint: x,
         publication: Some(y_id),
-        auto: false,
         complete: Some(done),
     }))
     .await
@@ -1203,7 +1199,6 @@ async fn a_failed_store_write_still_frees_the_bound() {
         scope: CursorScope::Account,
         checkpoint: first,
         publication: Some(first_id),
-        auto: false,
         complete: Some(done),
     }))
     .await
@@ -1695,7 +1690,6 @@ async fn ack(
         scope: email_scope(),
         checkpoint,
         publication,
-        auto: false,
         complete: Some(done),
     }))
     .await
@@ -2609,7 +2603,6 @@ async fn an_aborted_reattach_spares_a_cursor_an_ack_has_claimed() {
         scope: cursor("acked").scope,
         checkpoint: Checkpoint::Change(cursor("acked")),
         publication: None,
-        auto: false,
         complete: Some(done),
     }))
     .await
@@ -3635,6 +3628,7 @@ async fn the_detach_race_cleanup_bumps_the_push_topology_after_its_delete() {
         caps,
         push_label: "first".to_owned(),
         push_log: Arc::clone(&log),
+        push_lane_specs: StubAccount::registration_lanes(),
         ..StubAccount::new(scopes.clone())
     });
     let subscribe_gate = Arc::new(tokio::sync::Notify::new());
@@ -3719,7 +3713,6 @@ async fn mismatched_ack_scopes_preserve_provisional_ownership_and_checkpoint_row
             scope: provisional_cursor.scope.clone(),
             checkpoint: checkpoint.clone(),
             publication: Some(publication),
-            auto: false,
             complete: Some(done),
         }))
         .await

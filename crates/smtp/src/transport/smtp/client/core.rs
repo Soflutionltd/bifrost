@@ -355,6 +355,8 @@ impl Projection for BatchProgress {
     const RECIPIENTS: RecipientPolicy = RecipientPolicy::PerRecipient;
     const BATCH: bool = true;
     fn group_failure(&mut self, wire: TransactionProgress, error: PhasedError) -> Self::Output {
+        // finish only returns Err for an Err result at MAIL FROM; Ok(())
+        // cannot enter that branch regardless of wire contents.
         let progress = self.finish(wire, Ok(())).expect("no failure to project");
         Err((error.into_error(), progress))
     }
@@ -363,6 +365,8 @@ impl Projection for BatchProgress {
         wire: TransactionProgress,
         result: Result<(), PhasedError>,
     ) -> Self::Output {
+        // The private driver returns at Step::Finish, whose projection is the
+        // sole consumer of this value. No server input can project it twice.
         let mut progress = self.0.take().expect("project a transaction only once");
         let body_started = wire.body_started();
         for (index, status) in wire.recipients.into_iter().enumerate() {
@@ -524,6 +528,9 @@ impl<P: Projection> Transaction<P> {
             epilogue: None,
         }
     }
+    // configured installs progress; only terminal projection takes it. Both
+    // adapters immediately return on Finish and cannot step this machine again.
+    // This also justifies the finish-only-once assertions at terminal exits.
     fn progress(&mut self) -> &mut TransactionProgress {
         self.progress
             .as_mut()

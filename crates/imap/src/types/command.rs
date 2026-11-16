@@ -28,6 +28,10 @@ pub(crate) enum Command {
     /// LOGOUT command (RFC 3501 Section 6.1.3).
     Logout,
     /// UNAUTHENTICATE command (RFC 8437 Section 2).
+    // The command vocabulary stays complete for the encoder, admission and
+    // effect tables; the account layer does not issue this command, only
+    // tests construct it.
+    #[cfg_attr(not(test), allow(dead_code))]
     Unauthenticate,
     /// ENABLE command (RFC 5161 Section 3).
     ///
@@ -134,6 +138,8 @@ pub(crate) enum Command {
         multi: bool,
     },
     /// CLOSE command (RFC 3501 Section 6.4.2).
+    // Kept for the complete command vocabulary; only tests construct it.
+    #[cfg_attr(not(test), allow(dead_code))]
     Close,
     /// UNSELECT command (RFC 3691 Section 3).
     ///
@@ -326,6 +332,8 @@ pub(crate) enum Command {
 
     // --- COMPRESS (RFC 4978) ---
     /// COMPRESS command (RFC 4978 Section 4).
+    // Kept for the complete command vocabulary; only tests construct it.
+    #[cfg_attr(not(test), allow(dead_code))]
     Compress,
 
     // --- QUOTA (RFC 2087) ---

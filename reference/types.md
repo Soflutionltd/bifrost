@@ -934,8 +934,11 @@ with its epoch, while page totals and page sizes remain counts.
 Its exhaustive match forces every new partition variant to choose a durable
 encoding instead of colliding on an external consumer's fallback key. Existing
 `full`, `time:F:T`, `uid:E:F:T` and `page:F:T` bytes are unchanged; omitted time
-bounds encode as empty fields. The engine separately owns completion keys and
-the decoder for older or unknown stored keys.
+bounds encode as empty fields. `wire::partition::InventoryKey` owns inventory
+key encoding and decoding; `durable_key` maps each partition into that codec.
+In bifrost-sync, `backfill/marker.rs::BackfillKey` delegates inventory grammar to
+this codec and owns completion keys and their legacy proof rules. Both codecs
+preserve unknown stored keys as opaque bytes.
 
 `SnapshotIdentity` retains value `Eq` for durable-record round trips and
 record deduplication. It is not a coverage proof. Only `same_snapshot_as`

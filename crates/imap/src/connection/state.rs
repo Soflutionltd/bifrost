@@ -141,10 +141,12 @@ impl ProtocolState {
     }
 
     /// Successfully `ENABLE`d extensions (RFC 5161 Section3.2).
+    #[cfg(test)]
     pub(crate) fn enabled(&self) -> &[Capability] {
         self.enabled.as_slice()
     }
 
+    #[cfg(test)]
     /// Whether any mailbox has been selected in this session (RFC 5161
     /// Section 3.1). See the field.
     pub(crate) fn mailbox_selected(&self) -> bool {

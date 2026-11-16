@@ -139,6 +139,8 @@ impl Session {
         self.epilogue = Some(epilogue);
         Step::Run(op)
     }
+    // The private adapters return at the first Step::Finish. info is installed
+    // at construction and only taken here, so input cannot exhaust it early.
     fn finish(&mut self) -> Step<SessionResult> {
         Step::Finish(Ok((
             self.info.take().expect("session finishes once"),
@@ -172,6 +174,7 @@ impl Session {
         credentials: Credentials,
         certificate: Option<Vec<u8>>,
     ) -> Result<Step<SessionResult>, Error> {
+        // Only finish takes info, and the driver never steps a finished session.
         let info = self.info.as_ref().expect("server info lives until finish");
         if let Some(mechanism) = oauth_mechanism(&mechanisms, info, &credentials) {
             let Credentials::OAuth2 { identity, .. } = &credentials else {
@@ -204,7 +207,8 @@ impl Session {
         let (exchange, command, stage) = if let Some(rung) = selection.scram {
             let (username, password) = credentials.password_parts()?;
             let exchange = ScramExchange::new(
-                scram_hash(mechanism).expect("SCRAM rung"),
+                scram_hash(mechanism)
+                    .ok_or_else(|| error::internal("SCRAM selection requires a SCRAM mechanism"))?,
                 rung.binding,
                 username,
                 password.into(),
@@ -252,6 +256,7 @@ impl Session {
                     Ok(Step::Run(Op::ReadSingle))
                 }
                 Entry::StartTls(tls) => {
+                    // info remains owned until the driver returns at Finish.
                     if !self
                         .info
                         .as_ref()

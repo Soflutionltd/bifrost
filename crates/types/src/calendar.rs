@@ -112,7 +112,9 @@ pub enum AttendeeRole {
 
 /// Parsed calendar time, independent of any enclosing event flag.
 ///
-/// Dates are all-day values. Their ends are exclusive: a single day on
+/// Dates are all-day values. Missing or malformed observations can retain
+/// all-day mode through `converted` without inventing a date. Date ends are
+/// exclusive: a single day on
 /// 2026-06-02 starts on that date and ends on 2026-06-03. Local date-times
 /// remain floating unless accompanied by a timezone. Named zones are retained
 /// without requiring an IANA lookup, including provider-specific TZIDs.
@@ -121,6 +123,7 @@ pub struct EventTime {
     value: String,
     timezone: Option<String>,
     kind: EventTimeKind,
+    all_day: bool,
     local: Option<jiff::civil::DateTime>,
 }
 
@@ -199,6 +202,7 @@ impl EventTime {
             value,
             timezone,
             kind,
+            all_day: matches!(kind, EventTimeKind::Date(_)),
             local,
         }
     }
@@ -221,7 +225,7 @@ impl EventTime {
 
     #[must_use]
     pub fn is_all_day(&self) -> bool {
-        matches!(self.kind, EventTimeKind::Date(_))
+        self.all_day
     }
 
     #[must_use]
@@ -286,11 +290,15 @@ impl EventTime {
 
     /// Convert a stored bound for an explicit all-day/timed patch instruction.
     /// Dates become midnight with their retained timezone annotation, or
-    /// floating midnight when no timezone was supplied.
+    /// floating midnight when no timezone was supplied. Missing or malformed
+    /// observations retain their spelling and kind while recording the mode: an
+    /// all-day meeting must remain an all-day row even without a usable start.
     #[must_use]
     pub fn converted(&self, all_day: bool) -> Self {
         let Some(local) = self.local_datetime() else {
-            return self.clone();
+            let mut converted = self.clone();
+            converted.all_day = all_day;
+            return converted;
         };
         let converted = if all_day {
             Self::from(local.date())
@@ -309,6 +317,7 @@ impl From<jiff::civil::Date> for EventTime {
             value: date.to_string(),
             timezone: None,
             kind: EventTimeKind::Date(date),
+            all_day: true,
             local: Some(date.to_datetime(jiff::civil::Time::MIN)),
         }
     }
@@ -320,6 +329,7 @@ impl From<jiff::civil::DateTime> for EventTime {
             value: local.to_string(),
             timezone: None,
             kind: EventTimeKind::Floating(local),
+            all_day: false,
             local: Some(local),
         }
     }
@@ -331,6 +341,7 @@ impl From<jiff::Timestamp> for EventTime {
             value: instant.to_string(),
             timezone: None,
             kind: EventTimeKind::Offset(instant),
+            all_day: false,
             local: Some(jiff::tz::Offset::UTC.to_datetime(instant)),
         }
     }
@@ -523,7 +534,7 @@ pub struct CalendarEvent {
 }
 
 impl CalendarEvent {
-    /// Whether the start is a date-only all-day value.
+    /// Whether the start carries the all-day mode.
     #[must_use]
     pub fn is_all_day(&self) -> bool {
         self.start.is_all_day()
@@ -624,7 +635,7 @@ pub struct EventCreate {
 }
 
 impl EventCreate {
-    /// Whether the start is a date-only all-day value.
+    /// Whether the start carries the all-day mode.
     #[must_use]
     pub fn is_all_day(&self) -> bool {
         self.start.is_all_day()
@@ -684,6 +695,23 @@ impl EventSearchRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_event_time_retains_all_day_mode_without_inventing_a_date() {
+        for value in ["", "  ", "invalid"] {
+            let original = EventTime::from_observed(value, Some("Europe/Oslo".into()));
+            let all_day = original.converted(true);
+            assert!(all_day.is_all_day());
+            assert_eq!(all_day.kind(), original.kind());
+            assert_eq!(all_day.value(), value);
+            assert_eq!(all_day.timezone(), original.timezone());
+            assert!(all_day.validate().is_err());
+            assert_eq!(all_day.local_datetime(), None);
+            assert_eq!(all_day.instant(), None);
+            assert!(all_day.clone().with_timezone(None).is_all_day());
+            assert_eq!(all_day.converted(false), original);
+        }
+    }
 
     #[test]
     fn event_time_classifies_once_and_retains_unknown_observations() {

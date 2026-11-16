@@ -34,7 +34,9 @@ use tokio::time::Instant;
 /// One bucket per `SyncEngine`, shared by every attached account.
 /// `Budget` keys cross account boundaries by design: a key names a
 /// provider budget, and every account whose work is charged to it pauses
-/// on it. `Mailbox` and `Account` keys are per-account.
+/// on it. `Mailbox` and `Account` keys are per-account. Detach does not
+/// erase deadlines: a new attachment of the same account still honors the
+/// provider hold until it expires.
 ///
 /// A budget reaches an account by DECLARATION: a wait site asks
 /// `Account::throttle_keys` what its work consumes and looks each returned
@@ -88,11 +90,9 @@ impl ThrottleBucket {
             .or_insert(wait_until);
     }
 
-    /// Record a deadline observed by `account`. Every key the engine
-    /// records either embeds its account (`Account`, `Mailbox`) or is
-    /// declared by the accounts that consume it (`Budget`), so the
-    /// observing account needs no enrollment and this is `record`.
-    pub fn record_for(&self, _account: &AccountId, key: ThrottleKey, wait_until: Instant) {
+    /// Record an observed deadline. The key supplies its account identity
+    /// or names a shared budget; no observing-account enrollment is needed.
+    pub fn record_for(&self, key: ThrottleKey, wait_until: Instant) {
         self.record(key, wait_until);
     }
 
@@ -121,13 +121,6 @@ impl ThrottleBucket {
             waits.retain(|_, until| *until > now);
         }
     }
-
-    /// Called at detach. The bucket holds no per-account state beyond
-    /// deadlines, so there is nothing to forget: deadlines under the
-    /// account's own key are left to expire on their own - they are
-    /// per-account facts a reattach of the same account may still want to
-    /// honor.
-    pub fn forget_account(&self, _account: &AccountId) {}
 }
 
 /// Resolve the `ThrottleKey` a `ThrottleScope` maps to, given the

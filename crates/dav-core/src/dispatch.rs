@@ -393,7 +393,10 @@ impl DavDispatch {
         if !self.is_trusted_url(url) {
             return Err(local_error(
                 operation,
-                format!("refusing to send DAV credentials to untrusted URL: {url}"),
+                format!(
+                    "refusing to send DAV credentials to untrusted URL: {}",
+                    crate::url::diagnostic_origin(url)
+                ),
                 self.protocol,
             ));
         }
@@ -504,7 +507,7 @@ impl DavDispatch {
                 operation,
                 format!(
                     "refusing to send DAV credentials to untrusted URL: {}",
-                    request.url()
+                    crate::url::diagnostic_origin(request.url())
                 ),
                 self.protocol,
             ));
@@ -836,7 +839,10 @@ impl DavDispatch {
         if !self.is_trusted_url(to) {
             return Err(local_error(
                 operation,
-                format!("refusing to name an untrusted DAV move destination: {to}"),
+                format!(
+                    "refusing to name an untrusted DAV move destination: {}",
+                    crate::url::diagnostic_origin(to)
+                ),
                 self.protocol,
             ));
         }
@@ -910,7 +916,8 @@ impl HopPolicy for DavHopPolicy {
     fn admit(&self, _prior: Option<&Url>, next: &Url) -> Result<HopCredential, NetError> {
         if self.dispatch.trusted_origins.admit_url(next).is_err() {
             return Err(self.local(format!(
-                "refusing to send DAV credentials to untrusted URL: {next}"
+                "refusing to send DAV credentials to untrusted URL: {}",
+                crate::url::diagnostic_origin(next.as_str())
             )));
         }
         match &self.dispatch.credentials {
@@ -942,7 +949,8 @@ impl HopPolicy for DavHopPolicy {
         if let Some(rebased) = rebased {
             if !self.dispatch.is_trusted_url(&rebased) {
                 return Err(self.local(format!(
-                    "refusing to name an untrusted DAV move destination after a redirect: {rebased}"
+                    "refusing to name an untrusted DAV move destination after a redirect: {}",
+                    crate::url::diagnostic_origin(&rebased)
                 )));
             }
             let value =
@@ -973,7 +981,7 @@ impl HopPolicy for DavHopPolicy {
             if !trusted {
                 return Err(self.local(format!(
                     "refusing to name an untrusted DAV {method} destination: {}",
-                    String::from_utf8_lossy(destination.as_bytes())
+                    crate::url::diagnostic_origin(destination.to_str().unwrap_or_default())
                 )));
             }
         }
@@ -1082,6 +1090,81 @@ mod tests {
     };
 
     const BASE: &str = "https://dav.example.test";
+
+    #[tokio::test]
+    async fn refused_url_diagnostics_never_contain_credentials_or_tokens() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            for raw in [
+                "https://private-user:private-password@dav.example.test/cal?private-token#private-fragment",
+                "https://private-user:private-password@[invalid/",
+            ] {
+                let script = dav_script_empty();
+                let dispatch = DavDispatch::with_account_net(
+                    scripted_dav_net(&script),
+                    BASE,
+                    DavCredentials::Basic {
+                        username: "account-user".to_string(),
+                        password: "account-password".to_string(),
+                    },
+                    protocol,
+                );
+                let operation = AccountOperation::Discover;
+                let errors = [
+                    dispatch.auth_headers(raw, operation).await.unwrap_err(),
+                    dispatch
+                        .send_raw_request(DavRequest::new(Method::GET, raw), operation)
+                        .await
+                        .unwrap_err(),
+                    dispatch
+                        .move_resource(BASE, raw, operation)
+                        .await
+                        .unwrap_err(),
+                    dispatch
+                        .send_raw_request(
+                            DavRequest::new(crate::MOVE.clone(), BASE).header(DESTINATION, raw),
+                            operation,
+                        )
+                        .await
+                        .unwrap_err(),
+                ];
+                for error in errors {
+                    let diagnostic = format!("{error:?}");
+                    assert!(diagnostic.contains("refusing"), "{diagnostic}");
+                    assert!(!diagnostic.contains("private-"), "{diagnostic}");
+                }
+                assert!(script.requests().is_empty());
+            }
+            let script = dav_script([dav_redirect(
+                StatusCode::TEMPORARY_REDIRECT,
+                "https://private-user:private-password@dav.example.test/next?private-token",
+            )]);
+            let dispatch = DavDispatch::with_account_net(
+                scripted_dav_net(&script),
+                BASE,
+                DavCredentials::Basic {
+                    username: "account-user".to_string(),
+                    password: "account-password".to_string(),
+                },
+                protocol,
+            );
+            let error = dispatch
+                .send_raw_request(
+                    DavRequest::new(Method::GET, BASE),
+                    AccountOperation::Discover,
+                )
+                .await
+                .unwrap_err();
+            // Inspect the local refusal, separately from retained server headers.
+            assert!(
+                error
+                    .diagnostics()
+                    .text
+                    .iter()
+                    .all(|text| !text.as_str().contains("private-"))
+            );
+            assert_eq!(script.requests().len(), 1);
+        }
+    }
 
     struct DispatchReachedGuard(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
 

@@ -67,6 +67,8 @@ impl<E: SmtpExecutor> Pool<E> {
             // Sender lifetime covers the entire worker future, including a
             // future aborted before its first poll. No values are ever sent.
             let (worker_lifetime, worker_completion) = tokio::sync::watch::channel(());
+            // Both OnceLocks are fresh and each has exactly one set call in
+            // this constructor. The worker never sets either cell.
             pool_
                 .worker_completion
                 .set(worker_completion)
@@ -454,6 +456,9 @@ impl ParkedConnection {
 }
 
 impl<E: Executor> PooledConnection<E> {
+    // wrap installs the owned connection; only Drop takes it. Safe callers
+    // cannot dereference during or after Drop, so the lifecycle expects below
+    // cannot be broken by server input or cancellation.
     fn wrap(conn: AsyncSmtpConnection, pool: Arc<Pool<E>>, permit: OwnedSemaphorePermit) -> Self {
         Self {
             conn: Some(conn),
@@ -484,6 +489,7 @@ impl<E: Executor> Drop for PooledConnection<E> {
             .take()
             .expect("AsyncSmtpConnection hasn't been taken yet");
         let pool = Arc::clone(&self.pool);
+        // wrap also installs the permit, and Drop is its only taker.
         let permit = self
             .permit
             .take()

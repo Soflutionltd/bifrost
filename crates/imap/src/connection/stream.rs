@@ -1,4 +1,5 @@
 use bytes::{BufMut, BytesMut};
+#[cfg(test)]
 use flate2::{Compress, Decompress, FlushCompress, FlushDecompress, Status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -97,6 +98,7 @@ pub(super) type TrackedTcp = Tracked<TcpStream>;
 /// connections. The `Tls` variant is large due to TLS session state, same
 /// rationale as `ImapStream` for not boxing.
 #[allow(clippy::large_enum_variant)]
+#[cfg(test)]
 pub(super) enum InnerStream {
     Plain(TrackedTcp),
     Tls(TlsStream<TrackedTcp>),
@@ -107,6 +109,7 @@ pub(super) enum InnerStream {
     Memory(Tracked<tokio::io::DuplexStream>),
 }
 
+#[cfg(test)]
 impl InnerStream {
     /// Octets the socket beneath this stream has accepted. See [`Tracked`].
     fn written(&self) -> u64 {
@@ -151,6 +154,7 @@ impl InnerStream {
 /// Wraps an `InnerStream` with raw deflate compression/decompression.
 /// Per RFC 4978 Section 3, uses raw deflate (RFC 1951): not gzip, not zlib,
 /// with `SyncFlush` after each write to ensure the peer can decode immediately.
+#[cfg(test)]
 pub(super) struct CompressedStream {
     /// The underlying TCP or TLS stream.
     pub(super) inner: InnerStream,
@@ -168,12 +172,16 @@ pub(super) struct CompressedStream {
 }
 
 /// Initial size of the raw-read buffer for compressed streams.
+#[cfg(test)]
 const COMPRESSED_RAW_BUF_SIZE: usize = 8192;
 /// Size of the scratch buffer used during inflate.
+#[cfg(test)]
 const INFLATE_BUF_SIZE: usize = 16384;
 /// Size of the output buffer used during deflate.
+#[cfg(test)]
 const DEFLATE_BUF_SIZE: usize = 16384;
 
+#[cfg(test)]
 impl CompressedStream {
     /// Create a new compressed stream wrapping the given inner stream.
     ///
@@ -335,6 +343,7 @@ impl CompressedStream {
     }
 }
 
+#[cfg(test)]
 fn ensure_deflate_progress(consumed: usize, produced: usize) -> std::io::Result<()> {
     if consumed == 0 && produced == 0 {
         return Err(std::io::Error::new(
@@ -355,6 +364,7 @@ pub(super) enum ImapStream {
     Plain(TrackedTcp),
     Tls(TlsStream<TrackedTcp>),
     /// Compressed stream per RFC 4978 (COMPRESS=DEFLATE).
+    #[cfg(test)]
     Compressed(CompressedStream),
     /// Sentinel used during in-progress stream upgrades (STARTTLS,
     /// COMPRESS). All I/O operations return an error immediately.
@@ -384,16 +394,12 @@ impl ImapStream {
         match self {
             Self::Plain(s) => s.written(),
             Self::Tls(s) => s.get_ref().get_ref().get_ref().written(),
+            #[cfg(test)]
             Self::Compressed(s) => s.inner.written(),
             Self::Poisoned => u64::MAX,
             #[cfg(test)]
             Self::Memory(s) => s.written(),
         }
-    }
-
-    #[cfg(test)]
-    pub(super) async fn read_buf(&mut self, buf: &mut BytesMut) -> std::io::Result<usize> {
-        self.read_buf_limited(buf, 8192).await
     }
 
     pub(super) async fn read_buf_limited(
@@ -406,6 +412,7 @@ impl ImapStream {
         match self {
             Self::Plain(s) => s.read_buf(&mut bounded).await,
             Self::Tls(s) => s.read_buf(&mut bounded).await,
+            #[cfg(test)]
             Self::Compressed(s) => s.read_buf_limited(buf, limit).await,
             Self::Poisoned => Err(std::io::Error::other("stream poisoned during upgrade")),
             #[cfg(test)]
@@ -419,6 +426,7 @@ impl ImapStream {
             Self::Tls(s) => s.write(data).await,
             // COMPRESS drains the bounded plaintext offer, including its sync
             // flush, before reporting success. Errors retain the whole grant.
+            #[cfg(test)]
             Self::Compressed(s) => {
                 s.write_all(data).await?;
                 Ok(data.len())
@@ -434,6 +442,7 @@ impl ImapStream {
         match self {
             Self::Plain(s) => s.write_all(data).await,
             Self::Tls(s) => s.write_all(data).await,
+            #[cfg(test)]
             Self::Compressed(s) => s.write_all(data).await,
             Self::Poisoned => Err(std::io::Error::other("stream poisoned during upgrade")),
             #[cfg(test)]
@@ -445,6 +454,7 @@ impl ImapStream {
         match self {
             Self::Plain(s) => s.flush().await,
             Self::Tls(s) => s.flush().await,
+            #[cfg(test)]
             Self::Compressed(s) => s.flush().await,
             Self::Poisoned => Err(std::io::Error::other("stream poisoned during upgrade")),
             #[cfg(test)]
@@ -469,6 +479,7 @@ impl ImapStream {
             Self::Plain(tcp) => SockRef::from(tcp.get_ref()).set_tcp_keepalive(&sock_ka),
             Self::Tls(tls) => SockRef::from(tls.get_ref().get_ref().get_ref().get_ref())
                 .set_tcp_keepalive(&sock_ka),
+            #[cfg(test)]
             Self::Compressed(c) => match &c.inner {
                 InnerStream::Plain(tcp) => SockRef::from(tcp.get_ref()).set_tcp_keepalive(&sock_ka),
                 InnerStream::Tls(tls) => SockRef::from(tls.get_ref().get_ref().get_ref().get_ref())
@@ -525,6 +536,7 @@ impl ImapStream {
     pub(super) fn peer_certificate_der(&self) -> Option<Vec<u8>> {
         let tls = match self {
             Self::Tls(s) => Some(s),
+            #[cfg(test)]
             Self::Compressed(c) => match &c.inner {
                 InnerStream::Tls(s) => Some(s),
                 InnerStream::Plain(_) => None,
@@ -552,7 +564,9 @@ impl ImapStream {
     pub(super) fn into_tcp(self) -> Option<TrackedTcp> {
         match self {
             Self::Plain(s) => Some(s),
-            Self::Tls(_) | Self::Compressed(_) | Self::Poisoned => Option::None,
+            Self::Tls(_) | Self::Poisoned => Option::None,
+            #[cfg(test)]
+            Self::Compressed(_) => Option::None,
             #[cfg(test)]
             // Memory streams cannot upgrade to TLS: STARTTLS tests must
             // use the real transport.

@@ -205,12 +205,10 @@ fn wait_for_account_reads_only_the_account_key() {
     let now = Instant::now();
     let a = AccountId("acc-1".into());
     bucket.record_for(
-        &a,
         ThrottleKey::Account(a.clone()),
         now + Duration::from_secs(3),
     );
     bucket.record_for(
-        &a,
         ThrottleKey::Budget(bifrost_types::ThrottleBudget::new("test|mailbox:x")),
         now + Duration::from_secs(8),
     );
@@ -229,7 +227,6 @@ fn wait_for_account_excludes_mailbox_keys() {
     let now = Instant::now();
     let a = AccountId("acc-1".into());
     bucket.record_for(
-        &a,
         ThrottleKey::Owner {
             account: a.clone(),
             owner: PrincipalId("shared@example.com".into()),
@@ -368,15 +365,10 @@ fn a_hintless_mailbox_throttle_holds_its_mailbox_for_the_fallback() {
 /// another account recorded under a key it declares.
 #[test]
 fn a_declared_key_reaches_an_account_that_was_never_enrolled() {
-    let recorder = AccountId("recorder".into());
     let bystander = AccountId("bystander".into());
     let key = ThrottleKey::Budget(bifrost_types::ThrottleBudget::new("test|mailbox:x"));
     let bucket = ThrottleBucket::new();
-    bucket.record_for(
-        &recorder,
-        key.clone(),
-        Instant::now() + Duration::from_secs(30),
-    );
+    bucket.record_for(key.clone(), Instant::now() + Duration::from_secs(30));
 
     assert_eq!(account_throttle_wait(&bucket, &bystander), None);
     assert!(throttle_wait(&bucket, &bystander, &[key]).is_some());

@@ -1449,7 +1449,7 @@ the consumer-acked `BackfillCheckpoint` in the `CheckpointStore`. On
 completion the orchestrator broadcasts a durable completion marker - a
 synthetic empty `Batch` whose `BackfillCheckpoint` sits on the
 `completion_partition` sentinel key (`partitioner::completion_partition`,
-distinct from every `page:F:T` / `uid:F:T` / `time:F:T` key). It rides
+distinct from every `page:F:T` / `uid:E:F:T` / `time:F:T` key). It rides
 the same consumer-ack path as the page batches (`emit_backfill_complete`
 -> broadcast -> consumer persist+ack -> ack writer `put_backfill`), and
 because it is ordered behind every page it only lands durably after the
@@ -2119,7 +2119,10 @@ advertised partitioning and an explicit current timestamp. Completion marker
 construction and guarded publication live in `backfill/marker.rs`. Incarnation
 scheduling and its registry projection live in `backfill/scan.rs`. The engine
 orchestrator owns the async loop, admission and wiring. The existing typed
-`partitioner::BackfillKey` remains the shared key codec for resume and the writer.
+`backfill::marker::BackfillKey` is the shared engine key codec for resume and
+the writer, re-exported by `partitioner`. It delegates inventory key grammar to
+`bifrost_types::wire::partition::InventoryKey` and owns completion marker keys
+and their legacy proof rules.
 
 Partition SEQUENCING is not the orchestrator's; `ScopeWalkDriver` in
 `backfill/scope_walk.rs` owns it, so a barrier stops the enclosing scope walk
@@ -2860,9 +2863,10 @@ before recovery handoff and cadence sleeps.
 
 `admit` returns `Error::Admission(AdmissionFailure::LaneFull { .. })` when its lane is at capacity - the incoming
 request is refused rather than displacing an older waiter. Repeating work paths
-treat that as transient: the poll loop backs off one cadence step and re-enters
-rather than retiring the scope, and the push sweep skips that scope only, which
-is the same blast radius rule the sweep uses for a failed drive.
+use `engine/drive_start.rs::DriveStart` to retry that refusal internally after
+`ADMISSION_RETRY` (one second), releasing activity while waiting and observing
+shutdown and boundary changes. This engine pressure consumes no provider retry
+budget and does not use poll cadence or skip the push scope.
 
 `Scheduler`, `BudgetGate`, and their configuration are publicly re-exported now
 that the engine uses them, and `SyncEngine::scheduler()` hands out the live
@@ -3910,10 +3914,11 @@ sled / sqlite default; storage is consumer-owned.
 engine-owned comparison helper. Proven completion wins before count ordering.
 Other rows retain the greatest `items_done`, then greatest parsed page upper
 bound, then lexicographically greatest bytes. This preserves existing partial
-resume positions. `backfill::partitioner::BackfillKey` provides a typed codec for
-full, time, UID, page, versioned completion and legacy completion keys, retaining
-unknown bytes as opaque keys. Existing `complete`, `complete:v2` and `page:F:T`
-rows remain readable; legacy empty-plan markers retain their one-time recheck.
+resume positions. `backfill::marker::BackfillKey` (re-exported by `partitioner`)
+owns versioned and legacy completion keys and their proof rules. It delegates full, time, UID
+and page key encoding and decoding to
+`bifrost_types::wire::partition::InventoryKey`, retaining unknown bytes as
+opaque keys. Existing `complete`, `complete:v2` and `page:F:T` rows remain readable; legacy empty-plan markers retain their one-time recheck.
 `InventoryPartition::durable_key` in `bifrost-types` owns generation of partition
 keys with an exhaustive match; the engine has no shared unknown-variant key.
 Consumer stores must apply `cursor::store::backfill_checkpoint_compacts` within
@@ -4795,6 +4800,9 @@ The count describes non-deferred outcomes submitted to the writer, not a claim
 that every recovered publication has already been acknowledged or every stale
 proof accepted. An operator must not see a failed repair attempt as progress.
 
+`engine::maintenance::MaintenanceGate` holds a read-only `BoundaryView`: it
+observes control requests without authority to overwrite a concurrent pause,
+checkpoint request or Stop.
 Maintenance admission releases its scheduler permit before waiting on the
 control boundary after activity registration refuses. It also watches shutdown
 and its own boundary while waiting, so a separate Stop cannot strand that wait.

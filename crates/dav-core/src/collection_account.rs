@@ -148,7 +148,10 @@ impl<D: Dialect> DavCollectionAccount<D> {
                         &reqwest::header::HeaderMap::new(),
                         operation,
                         status,
-                        format!("inventory member refused: {}", failure.href),
+                        format!(
+                            "inventory member refused: {}",
+                            crate::url::diagnostic_origin(&failure.href)
+                        ),
                         D::DAV,
                     ),
                     None => {
@@ -390,7 +393,8 @@ impl<D: Dialect> DavCollectionAccount<D> {
         }
         if let Some(ErrorScope::DirectoryGateway { url }) = error.scope() {
             builder = builder.text(DiagnosticText::support_only(format!(
-                "personal sync scope targets a directory: {url}"
+                "personal sync scope targets a directory: {}",
+                crate::url::diagnostic_origin(url)
             )));
         }
         for cause in error.chain().iter().cloned() {

@@ -1,7 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 use super::dispatch::filter_store_flags;
 use super::*;
-use crate::types::set::UidSet;
 
 const DEFAULT_FETCH_STREAM_CAPACITY: usize = 64;
 
@@ -32,6 +31,7 @@ impl ImapConnection {
         .await
     }
 
+    #[cfg(test)]
     /// UID FETCH with CHANGEDSINCE modifier (RFC 7162 Section 3.1.4).
     ///
     /// Returns only messages whose mod-sequence is greater than `mod_seq`.
@@ -81,6 +81,7 @@ impl ImapConnection {
         Ok((rx, fut))
     }
 
+    #[cfg(test)]
     /// UID FETCH with CHANGEDSINCE and VANISHED modifiers (RFC 7162 Section 3.2.6).
     ///
     /// Issues `UID FETCH <set> (<items>) (CHANGEDSINCE <mod_seq> VANISHED)`.
@@ -117,45 +118,6 @@ impl ImapConnection {
             vanished: true,
         };
         self.execute_request(cmd, timeout).await
-    }
-
-    /// UID FETCH with CHANGEDSINCE and VANISHED as a bounded stream.
-    ///
-    /// This has the same wire semantics as [`uid_fetch_vanished`], but
-    /// backpressures before reading more responses so a large
-    /// `VANISHED (EARLIER)` set is not buffered behind the caller.
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn uid_fetch_vanished_stream<'a>(
-        &'a self,
-        sequence_set: &'a SequenceSet,
-        items: &'a [FetchAttr],
-        mod_seq: crate::types::ModSeq,
-        timeout: Duration,
-    ) -> Result<
-        (
-            tokio::sync::mpsc::Receiver<Result<dispatch::FetchStreamItem, Error>>,
-            impl std::future::Future<Output = Result<(), Error>> + Send + 'a,
-        ),
-        Error,
-    > {
-        let parsed_set = UidSet::from_expression(sequence_set);
-        let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_FETCH_STREAM_CAPACITY);
-        let cmd = Command::UidFetch {
-            sequence_set: sequence_set.clone(),
-            items: items.to_vec().into(),
-            changed_since: Some(mod_seq),
-            vanished: true,
-        };
-        self.admit_command(&cmd)?;
-        let fut = async move {
-            self.submit_streaming(
-                cmd,
-                dispatch::BoundedStreamingFetchVanishedConsumer::new(tx, parsed_set),
-                Some(tokio::time::Instant::now() + timeout),
-            )
-            .await
-        };
-        Ok((rx, fut))
     }
 
     /// UID FETCH streaming (RFC 3501 Section 6.4.5).
@@ -239,31 +201,6 @@ impl ImapConnection {
         Ok((rx, fut))
     }
 
-    /// UID FETCH streaming (RFC 3501 Section 6.4.5).
-    ///
-    /// Pushes each [`FetchResponse`] through the provided unbounded channel as
-    /// it arrives from the server, rather than buffering the entire result set
-    /// in memory. The channel is closed when the tagged OK is received.
-    ///
-    /// If the receiver is dropped, the driver still drains the command to the
-    /// tagged completion so the IMAP stream remains synchronized.
-    ///
-    /// Prefer this over [`uid_fetch`](Self::uid_fetch) when the result set
-    /// may be large enough to cause memory pressure.
-    pub async fn uid_fetch_streaming(
-        &self,
-        sequence_set: &SequenceSet,
-        items: &[FetchAttr],
-        tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        let (rx, fetch_fut) = self.uid_fetch_stream(sequence_set, items, timeout)?;
-        let drain_fut = super::ergonomics::drain_fetch_stream(rx, |item| Ok(tx.send(item).is_ok()));
-        let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain_fut);
-        drain_result?;
-        fetch_result
-    }
-
     /// Shared implementation for streaming FETCH and UID FETCH
     /// (RFC 3501 Section 6.4.5).
     ///
@@ -304,6 +241,7 @@ impl ImapConnection {
             .await
     }
 
+    #[cfg(test)]
     /// UID SEARCH with RETURN options (RFC 4731 Section 3.2).
     ///
     /// Returns the full [`EsearchResponse`] with MIN, MAX, COUNT, and ALL fields.

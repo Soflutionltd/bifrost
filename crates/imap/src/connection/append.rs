@@ -6,6 +6,7 @@ impl ImapConnection {
     // Append
     // -----------------------------------------------------------------------
 
+    #[cfg(test)]
     /// APPEND a message to a mailbox (RFC 3501 Section 6.3.11).
     ///
     /// The handle only carries the request to the driver as a
@@ -67,6 +68,7 @@ impl ImapConnection {
         .await
     }
 
+    #[cfg(test)]
     /// MULTIAPPEND  -  append multiple messages in a single APPEND command (RFC 3502).
     ///
     /// Sends all messages as consecutive literals in one APPEND command.

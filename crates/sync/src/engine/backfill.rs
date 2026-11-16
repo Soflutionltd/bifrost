@@ -7,7 +7,8 @@ use crate::backfill::plan::{ScopeResume, backfill_plan_for};
 use crate::backfill::scan::{BackfillScan, ParkedWalk};
 
 /// The backfill-specific half of the orchestrator's wiring; everything
-/// slot-wide rides in the [`SlotContext`].
+/// slot-wide rides in the [`SlotContext`]. Publication always uses the slot
+/// delivery endpoint, so this wiring needs no broadcast sender or enable flag.
 pub(super) struct BackfillWiring {
     pub live: Arc<LiveSupersedes>,
     pub registry: Arc<BackfillRegistry>,

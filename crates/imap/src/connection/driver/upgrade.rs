@@ -6,8 +6,12 @@ use crate::types::response::Capability;
 
 use super::super::dispatch::TaggedOkConsumer;
 use super::super::request::{self, Request};
-use super::super::{CompressedStream, ImapStream, InnerStream, SessionState};
-use super::{ConsumerErased, DriverConsumer, UpgradePayload, event_sink};
+#[cfg(test)]
+use super::super::{CompressedStream, InnerStream};
+use super::super::{ImapStream, SessionState};
+#[cfg(test)]
+use super::UpgradePayload;
+use super::{ConsumerErased, DriverConsumer, event_sink};
 
 /// Execute a stream upgrade atomically.
 ///
@@ -15,6 +19,7 @@ use super::{ConsumerErased, DriverConsumer, UpgradePayload, event_sink};
 /// The driver runs the protocol command internally (using a
 /// `TaggedOkConsumer`), then atomically swaps the stream using the
 /// `Poisoned` sentinel (I9, I10).
+#[cfg(test)]
 pub(super) async fn run_upgrade(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
@@ -231,6 +236,7 @@ fn retire_after_failed_refresh(
 /// 4. Wrap the old stream in a `CompressedStream`.
 /// 5. Install a fresh `WireReader` on the compressed stream,
 ///    preserving any buffered compressed bytes.
+#[cfg(test)]
 async fn run_compress_upgrade(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,

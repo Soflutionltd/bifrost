@@ -10,45 +10,6 @@ impl ImapConnection {
     // Connection lifecycle
     // -----------------------------------------------------------------------
 
-    /// Connect to an IMAP server.
-    ///
-    /// Performs the TCP connection (with optional TLS), reads the server greeting,
-    /// and parses initial capabilities per RFC 3501 Section 6.1.1.
-    pub async fn connect(
-        host: &str,
-        port: u16,
-        tls_mode: TlsMode,
-        timeout: Duration,
-    ) -> Result<Self, Error> {
-        let tls_connector = build_default_tls_connector()?;
-        Self::connect_with_tls_connector(host, port, tls_mode, tls_connector, timeout).await
-    }
-
-    /// Connect with a custom TLS connector (RFC 3501 Section 6.1.1 /
-    /// RFC 9051 Section 6.1.1).
-    ///
-    /// Establishes TCP/TLS, then spawns the driver to read the greeting and
-    /// negotiate initial capabilities before returning the ready handle.
-    pub async fn connect_with_tls_connector(
-        host: &str,
-        port: u16,
-        tls_mode: TlsMode,
-        tls_connector: native_tls::TlsConnector,
-        timeout: Duration,
-    ) -> Result<Self, Error> {
-        Self::connect_with_tls_connector_metered(
-            host,
-            port,
-            tls_mode,
-            tls_connector,
-            timeout,
-            None,
-            None,
-            &super::LeaseHandoff::none(),
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn connect_with_tls_connector_metered(
         host: &str,
@@ -153,6 +114,7 @@ impl ImapConnection {
             state_rx,
             events_rx: tokio::sync::Mutex::new(events_rx),
             driver_handle: driver_task,
+            #[cfg(test)]
             host: host.to_owned(),
             tls_active,
             abandoned: std::sync::atomic::AtomicBool::new(false),
@@ -279,19 +241,7 @@ impl ImapConnection {
         }
     }
 
-    /// Upgrade to TLS via STARTTLS (RFC 3501 Section 6.2.1).
-    ///
-    /// Valid on an unencrypted, not-authenticated connection when the server
-    /// advertises STARTTLS. `TlsMode::None` creates that reachable state;
-    /// `TlsMode::StartTls` performs the upgrade during connection setup.
-    ///
-    /// The upgrade is atomic via the `Poisoned` sentinel pattern (I9, I10)
-    ///  -  handled entirely by the driver task.
-    pub async fn starttls(&self, timeout: Duration) -> Result<(), Error> {
-        self.starttls_with_connector(build_default_tls_connector()?, timeout)
-            .await
-    }
-
+    #[cfg(test)]
     /// STARTTLS with a custom TLS connector (RFC 3501 Section 6.2.1 /
     /// RFC 9051 Section 6.2.1).
     ///

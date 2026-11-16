@@ -913,8 +913,6 @@ recovery open is a fresh connection, which is safe whatever this one reached.
 
 `select_for_sync()` takes the same `SelectOptions` (`types/request.rs`) as direct SELECT/EXAMINE, with `SelectAccess` choosing EXAMINE, and returns a `SyncSelectResult` carrying the QRESYNC outcome and the VANISHED ranges parsed off the SELECT response.
 
-`SyncFetchRequest` / `SyncFetchResult` wrap UID FETCH; `FetchChanges::{All, Since, SinceWithVanished}` makes VANISHED without CHANGEDSINCE unrepresentable, and `sync_fetch()` surfaces both VANISHED ranges and per-UID FETCH responses.
-
 Inventory and the three change strategies deliberately do NOT refuse a
 UIDNOTSTICKY folder (only the poller does). Refusing would hide that folder's
 mail from the user entirely, which removes a capability and needs an owner
@@ -2181,8 +2179,8 @@ only changes reads attach cached QRESYNC state.
 known-UID payload contains finite validated sets; sequence-match data can only
 be attached after known UIDs. Validation happens at request construction rather
 than by reparsing generated command operands in admission and encoding. Live
-ENABLE state remains an admission check. `FetchChanges` carries All, Since, or
-SinceWithVanished, so VANISHED cannot lack its modification sequence.
+ENABLE state remains an admission check. VANISHED fetch
+operands are carried by the `UidFetchWithVanished` request.
 
 `ModSeq::new` admits only 1 through `ModSeq::MAX` (the RFC 7162 63-bit ceiling).
 `ModSeqValzer` owns the same ceiling with zero admitted for UNCHANGEDSINCE.
@@ -2407,6 +2405,11 @@ is `ThreadNode<u32>` until its consumer supplies the command's addressing.
 Legacy SEARCH observations are named `numbers`, not `uids`: the response has no
 wire indicator. Raw-to-addressed THREAD conversion uses an explicit stack, since
 a linear chain can be much deeper than the parser's parenthesis nesting cap.
+The parser constructs linear reply chains bottom-up, moving branch groups
+without cloning them; nested parenthesized groups still recurse under a depth
+cap. Account thread search flattens trees with an explicit stack in preorder,
+omitting dummy parents. `ThreadNode::drop` drains descendants through a heap
+worklist, so teardown also avoids one call frame per reply.
 ESEARCH supplies its own `EsearchNumbers::Uids` or `Seqs`, with
 typed nonzero MIN/MAX identities and wire ALL ranges in that addressing. A
 SEARCH consumer refuses a selected ESEARCH whose addressing disagrees with its

@@ -3301,7 +3301,11 @@ can inspect the failed grant without mistaking the missing share for an empty
 mailbox. Outlook service configuration refusals retain
 `OperatorOverrideReason::OutlookConfiguration` and support-only detail.
 
-Contact and event conditional deletes pass caller-version admission through
-`MutationConcurrency::gate_version` before reads or writes. The advertised
+Contact and event updates and conditional deletes pass caller-version admission
+through `MutationConcurrency::gate_version` before reads or writes. The advertised
 atomic door and the native If-Match guard must both hold; users expect a
-versioned delete never to silently become an unconditional delete.
+versioned write never to silently become an unconditional write.
+Update admission precedes contact validator reads and event recurrence-content
+reads. A StateBased declaration or an ExpectedVersion declaration omitting the
+specific update door refuses a caller version before I/O. Unversioned updates
+retain their existing immediate-read guards.

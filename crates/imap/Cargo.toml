@@ -31,7 +31,6 @@ bifrost-sasl = { path = "../sasl" }
 bifrost-smtp = { path = "../smtp", features = ["tokio"] }
 bytes = { workspace = true }
 jiff = { workspace = true }
-flate2 = "1"
 futures = { workspace = true }
 getrandom = { workspace = true }
 native-tls = { workspace = true }
@@ -45,6 +44,7 @@ tracing = { workspace = true, features = ["std"] }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+flate2 = "1"
 bifrost-smtp = { path = "../smtp", features = ["test-support"] }
 bifrost-net = { path = "../net", features = ["test-support"] }
 pretty_assertions = "1.2"

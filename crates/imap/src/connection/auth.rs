@@ -425,42 +425,6 @@ impl ImapConnection {
             .await
     }
 
-    /// Authenticate with SASL SCRAM-SHA-1 (RFC 5802).
-    pub async fn authenticate_scram_sha1(
-        &self,
-        user: &str,
-        pass: &str,
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        self.authenticate_scram_with_binding(
-            user,
-            pass,
-            bifrost_sasl::ScramHash::Sha1,
-            bifrost_sasl::ChannelBinding::None,
-            None,
-            tokio::time::Instant::now() + timeout,
-        )
-        .await
-    }
-
-    /// Authenticate with SASL SCRAM-SHA-256 (RFC 7677).
-    pub async fn authenticate_scram_sha256(
-        &self,
-        user: &str,
-        pass: &str,
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        self.authenticate_scram_with_binding(
-            user,
-            pass,
-            bifrost_sasl::ScramHash::Sha256,
-            bifrost_sasl::ChannelBinding::None,
-            None,
-            tokio::time::Instant::now() + timeout,
-        )
-        .await
-    }
-
     /// Run a SCRAM exchange under a chosen channel-binding dimension.
     ///
     /// `binding` selects the wire mechanism token and GS2 header. For
@@ -581,6 +545,7 @@ impl ImapConnection {
         .map(drop)
     }
 
+    #[cfg(test)]
     /// UNAUTHENTICATE  -  reset to unauthenticated state (RFC 8437 Section 2).
     ///
     /// Resets the IMAP session to Not Authenticated without closing the
@@ -787,6 +752,7 @@ impl ImapConnection {
     /// swaps the stream using the `Poisoned` sentinel (I9, I10). An upgrade
     /// withdrawn before its claim was never written, and the stream is
     /// untouched.
+    #[cfg(test)]
     pub(super) async fn submit_upgrade(
         &self,
         payload: driver::UpgradePayload,

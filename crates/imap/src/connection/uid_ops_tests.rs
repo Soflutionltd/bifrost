@@ -325,12 +325,6 @@ async fn sort_requires_the_sort_capability() {
     // SORT is not part of the IMAP4rev2 baseline.
     let conn = selected(vec![Capability::Imap4Rev2]);
     assert!(matches!(
-        conn.sort("DATE", "UTF-8", "ALL", T).await,
-        Err(Error::LocalRefusal(
-            crate::error::LocalRefusal::MissingCapability(_)
-        ))
-    ));
-    assert!(matches!(
         conn.uid_sort("DATE", "UTF-8", "ALL", T).await,
         Err(Error::LocalRefusal(
             crate::error::LocalRefusal::MissingCapability(_)

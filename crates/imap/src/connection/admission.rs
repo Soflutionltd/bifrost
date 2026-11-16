@@ -392,6 +392,7 @@ impl SessionView<'_> {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(super) fn require_searchres(&self) -> Result<(), Error> {
         let snap = self.snapshot;
         // RFC 9051 Appendix E: IMAP4rev2 folds SEARCHRES into the base protocol.

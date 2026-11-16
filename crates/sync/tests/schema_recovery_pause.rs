@@ -56,6 +56,9 @@ fn failing_on_demand() -> (StubAccount, Arc<AtomicUsize>) {
     let fire = Arc::new(AtomicUsize::new(0));
     let hook_fire = Arc::clone(&fire);
     let mut account = StubAccount::new(vec![EMAIL, EVENTS]);
+    // `subscribe_push` refuses an account with no effective push lanes.
+    account.caps.push = bifrost_types::PushCapability::Webhook;
+    account.push_lane_specs = StubAccount::registration_lanes();
     account.changes_hook = Some(Arc::new(move |_cursor: &ChangeCursor| {
         let fires = hook_fire
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -448,6 +451,9 @@ async fn a_folder_deleted_while_its_repair_is_queued_leaves_no_live_cursor() {
     let id = AccountId("created-deleted-queued".to_owned());
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let mut account = StubAccount::new(vec![CursorScope::Folder(FolderId("inbox".to_owned()))]);
+    // `subscribe_push` refuses an account with no effective push lanes.
+    account.caps.push = bifrost_types::PushCapability::Webhook;
+    account.push_lane_specs = StubAccount::registration_lanes();
     account.lifecycle_rx = std::sync::Mutex::new(Some(rx));
     let polls = Arc::new(AtomicUsize::new(0));
     let hook_polls = Arc::clone(&polls);

@@ -111,6 +111,17 @@ pub fn well_known_url(base_url: &str, service: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+/// Describe a diagnostic target without credentials or resource tokens.
+/// Enterprise support needs the destination origin, never a password or a
+/// provider token. Unparseable input is omitted rather than guessed at.
+pub(crate) fn diagnostic_origin(raw: &str) -> String {
+    reqwest::Url::parse(raw)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .and_then(|url| bifrost_net::Origin::from_url(&url))
+        .map_or_else(|| "<invalid URL>".to_string(), |origin| origin.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parent_collection_url, well_known_url};

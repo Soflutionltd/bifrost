@@ -1304,6 +1304,15 @@ impl SyncEngine {
             return Err(Error::AccountNotAttached(account_id.clone()));
         }
         let account = slot.current.load_full();
+        // Match reattach's recreation gate. A user must not receive a live
+        // subscription handle that the next incarnation silently drops because
+        // the account has no effective push coverage; polling remains active.
+        if bifrost_types::effective_push_lanes(account.as_ref().as_ref()).is_empty() {
+            return Err(Error::Account(AccountError::unsupported(
+                bifrost_types::AccountOperation::PushSubscribe,
+                account.protocol(),
+            )));
+        }
         let result = {
             let _topology = TopologyBump(&slot.push_topology_tx);
             account.push_subscribe(scopes).await?

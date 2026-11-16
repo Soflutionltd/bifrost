@@ -23,6 +23,7 @@ impl DriverExit {
         })
     }
 
+    #[cfg(test)]
     fn exited() -> Arc<Self> {
         Arc::new(Self {
             state: std::sync::Mutex::new(ExitState::Exited),
@@ -150,6 +151,7 @@ impl DriverTask {
     }
 
     /// For fakes with no driver: starts exited, so retained values drop at once.
+    #[cfg(test)]
     pub(crate) fn absent() -> Self {
         Self {
             handle: tokio::sync::Mutex::new(None),

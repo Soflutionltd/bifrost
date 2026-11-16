@@ -158,92 +158,19 @@ impl SelectOptions {
     }
 }
 
-/// Delta modes for UID FETCH.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-#[allow(
-    dead_code,
-    reason = "Raw sync FETCH supports all CONDSTORE and QRESYNC modifiers"
-)]
-pub enum FetchChanges {
-    All,
-    Since(ModSeq),
-    SinceWithVanished(ModSeq),
-}
-
-/// Common fetch shape for mailbox synchronization.
-// protocol-specific: direct IMAP sync helpers carry UID FETCH operands.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncFetchRequest {
-    /// UID set to fetch.
-    pub uids: UidSetExpr,
-    /// Attributes to request.
-    pub attrs: Vec<FetchAttr>,
-    /// Delta mode, with VANISHED structurally requiring CHANGEDSINCE.
-    pub changes: FetchChanges,
-}
-
-#[allow(
-    dead_code,
-    reason = "Raw sync FETCH builders extend beyond the account-selected projections"
-)]
-impl SyncFetchRequest {
-    /// Fetch flags and UID for all messages.
-    pub fn flags() -> Self {
-        Self {
-            uids: UidSetExpr::all(),
-            attrs: vec![FetchAttr::Uid, FetchAttr::Flags, FetchAttr::ModSeq],
-            changes: FetchChanges::All,
-        }
-    }
-
-    /// Fetch envelope-sized metadata for all messages.
-    pub fn envelope() -> Self {
-        Self {
-            uids: UidSetExpr::all(),
-            attrs: vec![
-                FetchAttr::Uid,
-                FetchAttr::Flags,
-                FetchAttr::Envelope,
-                FetchAttr::InternalDate,
-                FetchAttr::Rfc822Size,
-                FetchAttr::ModSeq,
-            ],
-            changes: FetchChanges::All,
-        }
-    }
-
-    /// Fetch full RFC 5322 message bytes for the given UID set without
-    /// setting `\Seen`.
-    pub fn full_messages(uids: UidSetExpr) -> Self {
-        Self {
-            uids,
-            attrs: vec![
-                FetchAttr::Uid,
-                FetchAttr::Flags,
-                FetchAttr::Rfc822Size,
-                FetchAttr::BodySection {
-                    peek: true,
-                    section: None,
-                    partial: None,
-                },
-            ],
-            changes: FetchChanges::All,
-        }
-    }
-
-    /// Add CHANGEDSINCE to the request.
-    pub fn changed_since(mut self, mod_seq: ModSeq) -> Self {
-        self.changes = FetchChanges::Since(mod_seq);
-        self
-    }
-
-    /// Request VANISHED data for a QRESYNC delta fetch.
-    pub fn include_vanished(mut self, mod_seq: ModSeq) -> Self {
-        self.changes = FetchChanges::SinceWithVanished(mod_seq);
-        self
-    }
+/// The FETCH attributes for full RFC 5322 message bytes, read without
+/// setting `\Seen`.
+pub(crate) fn full_message_attrs() -> Vec<FetchAttr> {
+    vec![
+        FetchAttr::Uid,
+        FetchAttr::Flags,
+        FetchAttr::Rfc822Size,
+        FetchAttr::BodySection {
+            peek: true,
+            section: None,
+            partial: None,
+        },
+    ]
 }
 
 #[cfg(test)]

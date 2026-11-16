@@ -222,3 +222,115 @@ fn cursor_envelopes_reject_bytes_after_the_declared_payload() {
         }
     }
 }
+
+fn cursor_scopes() -> Vec<CursorScope> {
+    vec![
+        CursorScope::Account,
+        CursorScope::Type(crate::ObjectType::Email),
+        CursorScope::Query(crate::QueryId("query".into())),
+        CursorScope::Folder(crate::FolderId("folder".into())),
+        CursorScope::FolderType {
+            folder: crate::FolderId("folder".into()),
+            ty: crate::ObjectType::CalendarEvent,
+        },
+    ]
+}
+
+#[test]
+fn cursor_scopes_reject_bytes_inside_the_declared_scope() {
+    for scope in cursor_scopes() {
+        let mut encoded = cursor::encode_scope(&scope);
+        assert_eq!(cursor::decode_scope(&encoded).unwrap(), scope);
+        encoded.push(0);
+        assert!(matches!(
+            cursor::decode_scope(&encoded),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+}
+
+fn cursor_checkpoints() -> Vec<crate::Checkpoint> {
+    let mut checkpoints = Vec::new();
+    for scope in cursor_scopes() {
+        for marker in [
+            None,
+            Some(crate::OpaqueProgressBytes(vec![])),
+            Some(crate::OpaqueProgressBytes(vec![0, 255])),
+        ] {
+            checkpoints.push(crate::Checkpoint::Change(crate::ChangeCursor {
+                scope: scope.clone(),
+                server_state: crate::OpaqueChangeState {
+                    protocol: crate::ProtocolKind::Jmap,
+                    envelope_version: crate::PayloadVersion::new(7),
+                    bytes: vec![0, 255],
+                },
+                advanced_through: marker.clone(),
+                envelope_version: crate::TraitEnvelopeVersion::new(cursor::ENGINE_VERSION),
+            }));
+            for estimate in [None, Some(0), Some(u64::MAX)] {
+                checkpoints.push(crate::Checkpoint::Backfill(crate::BackfillCheckpoint {
+                    scope: scope.clone(),
+                    partition: crate::Partition(vec![0, 255]),
+                    progress_marker: marker.clone(),
+                    progress: crate::BackfillProgress {
+                        items_done: u64::MAX,
+                        items_estimated: estimate,
+                    },
+                    envelope_version: crate::TraitEnvelopeVersion::new(cursor::ENGINE_VERSION),
+                }));
+            }
+        }
+    }
+    checkpoints
+}
+
+#[test]
+fn cursor_envelopes_reject_bytes_inside_the_declared_scope() {
+    for checkpoint in cursor_checkpoints() {
+        let encoded = cursor::encode_envelope(&checkpoint);
+        // Current encoder output must remain readable, including empty opaque
+        // progress bytes, which differ from an absent progress marker.
+        assert_eq!(cursor::decode_envelope(&encoded).unwrap(), checkpoint);
+        let scope_len = u32::from_le_bytes(encoded[9..13].try_into().unwrap());
+        let scope_end = 13 + usize::try_from(scope_len).unwrap();
+        let mut padded_scope = encoded.clone();
+        padded_scope.insert(scope_end, 0);
+        padded_scope[9..13].copy_from_slice(&(scope_len + 1).to_le_bytes());
+        assert!(matches!(
+            cursor::decode_envelope(&padded_scope),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+}
+
+#[test]
+fn cursor_envelopes_reject_bytes_inside_the_declared_payload() {
+    for checkpoint in cursor_checkpoints() {
+        let encoded = cursor::encode_envelope(&checkpoint);
+        assert_eq!(cursor::decode_envelope(&encoded).unwrap(), checkpoint);
+        let scope_len = u32::from_le_bytes(encoded[9..13].try_into().unwrap());
+        let scope_end = 13 + usize::try_from(scope_len).unwrap();
+        let payload_len = u32::from_le_bytes(encoded[scope_end..scope_end + 4].try_into().unwrap());
+        let mut padded_payload = encoded;
+        padded_payload.push(0);
+        padded_payload[scope_end..scope_end + 4].copy_from_slice(&(payload_len + 1).to_le_bytes());
+        assert!(matches!(
+            cursor::decode_envelope(&padded_payload),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+}
+
+#[test]
+fn cursor_payload_header_offset_cannot_overflow() {
+    let mut bytes = vec![0xB5, 0, 0, 0];
+    bytes.extend_from_slice(&cursor::ENGINE_VERSION.to_le_bytes());
+    bytes.push(0);
+    // On 32-bit targets scope_end is usize::MAX - 2: the scope addition
+    // succeeds, but the following four-byte payload length header overflows.
+    bytes.extend_from_slice(&(u32::MAX - 15).to_le_bytes());
+    assert!(matches!(
+        cursor::decode_envelope(&bytes),
+        Err(DecodeError::Malformed(_))
+    ));
+}

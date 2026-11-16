@@ -258,9 +258,9 @@ impl SyncEngine {
                 break;
             }
             let aborting = campaign.aborting();
-            let mut boundary = slot.boundary.sender().subscribe();
+            let mut boundary = slot.boundary.subscribe();
             let mut generation = slot.account_generation_tx.subscribe();
-            if aborting && !matches!(*boundary.borrow_and_update(), BoundaryRequest::Run) {
+            if aborting && !matches!(boundary.peek(), BoundaryRequest::Run) {
                 break;
             }
             if !aborting && !slot.control.wait_until_running(&slot.shutdown).await {

@@ -6,6 +6,11 @@
 //! Connection and authentication are defined in RFC 3501 Sections 6.1-6.2 /
 //! RFC 9051 Sections 6.1-6.2.
 
+// This is the account transport. Unused production connection surface is a bug.
+// Test-only command adapters preserve hermetic protocol transcripts without
+// retaining a second production API beside the account.
+#![warn(dead_code)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,15 +20,17 @@ use tracing::{debug, warn};
 
 use crate::error::Error;
 use crate::types::{
-    AclEntry, AppendMessage, Capability, Command, CopyResult, EsearchResponse, ExpungeResult,
-    FetchAttr, FetchResponse, Flag, ListRightsResponse, MailboxAttribute, MailboxInfo, MailboxName,
-    MetadataResult, MoveResult, NamespaceResponse, NotifySetParams, QresyncParams, QuotaResource,
+    AppendMessage, Capability, Command, CopyResult, ExpungeResult, FetchAttr, FetchResponse, Flag,
+    MailboxInfo, MailboxName, MoveResult, NamespaceResponse, NotifySetParams,
     QuotaRootResponse, ResponseCode, SelectOptions, SelectedMailbox, SequenceSet, StatusItem,
-    StatusResult, StoreOperation, StoreResult, ThreadNode, UidRange,
+    StatusResult, StoreOperation, StoreResult, ThreadNode,
 };
 
 #[cfg(test)]
-use crate::types::{Response, UntaggedResponse, UntaggedStatus};
+use crate::types::{
+    AclEntry, EsearchResponse, ListRightsResponse, MailboxAttribute, MetadataResult, QresyncParams,
+    QuotaResource, Response, UidRange, UntaggedResponse, UntaggedStatus,
+};
 
 pub(crate) const LOGOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -43,6 +50,8 @@ pub(super) mod pipeline;
 mod reply;
 mod request;
 mod search_validation;
+// Sequence-number command adapters are only needed by protocol transcripts.
+#[cfg(test)]
 mod seq_ops;
 mod sort_thread;
 pub(super) mod state;
@@ -52,7 +61,7 @@ pub(crate) mod typed_event;
 mod uid_ops;
 pub(super) mod wire;
 
-// pub: ImapConfig is re-exported at the crate root for direct connections.
+// ImapConfig is re-exported for account construction.
 pub(crate) use crate::types::{SearchResult, SessionState};
 pub use config::ImapConfig;
 pub(crate) use config::{TcpKeepalive, TlsMode};
@@ -63,7 +72,9 @@ use dispatch::{
 use driver::task::InFlightGuard;
 pub(crate) use driver::task::{DriverTask, LeaseHandoff};
 pub(crate) use idle::IdleEvent;
-use stream::{CompressedStream, ImapStream, InnerStream};
+use stream::ImapStream;
+#[cfg(test)]
+use stream::{CompressedStream, InnerStream};
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -107,6 +118,7 @@ pub(crate) struct ImapConnection {
     ///
     /// Needed to construct the `ServerName` for TLS SNI and certificate
     /// verification when the caller invokes `starttls()`.
+    #[cfg(test)]
     host: String,
     /// Whether the current transport is encrypted.
     tls_active: Arc<std::sync::atomic::AtomicBool>,
@@ -204,6 +216,7 @@ impl ImapConnection {
     /// This is the primary way to observe asynchronous server data
     /// (ALERTs, EXISTS/EXPUNGE, NOTIFY events, BYE, etc.) outside of an
     /// active command or IDLE session.
+    #[cfg(test)]
     pub async fn drain_events(&self) -> Vec<typed_event::TypedEvent> {
         let mut rx = self.events_rx.lock().await;
         let mut out = Vec::new();

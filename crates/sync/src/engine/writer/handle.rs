@@ -37,7 +37,6 @@ impl WriterHandle {
                 scope,
                 checkpoint,
                 publication: Some(token),
-                auto: false,
                 complete: Some(done),
             })
         })

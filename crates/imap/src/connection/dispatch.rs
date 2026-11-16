@@ -31,8 +31,7 @@ pub(crate) use auth::{AuthenticateSaslConsumer, AuthenticateScramConsumer, Login
 #[cfg(test)]
 pub(crate) use fetch::StreamingFetchConsumer;
 pub(crate) use fetch::{
-    BoundedStreamingFetchConsumer, BoundedStreamingFetchVanishedConsumer, FetchConsumer,
-    FetchStreamItem, FetchVanishedConsumer, StoreConsumer,
+    BoundedStreamingFetchConsumer, FetchConsumer, FetchVanishedConsumer, StoreConsumer,
 };
 pub(crate) use list::{
     ListConsumer, ListExtendedConsumer, ListStatusConsumer, LsubConsumer, StatusConsumer,
@@ -467,6 +466,7 @@ fn resolve_appenduid(
 /// an error on a non-idempotent APPEND invites a retry that duplicates them -
 /// but the code cannot say which UID went to which message, so it is
 /// discarded, exactly as if the server had no UIDPLUS.
+#[cfg(test)]
 fn appenduid_pairs(
     code: Option<ResponseCode>,
     submitted: usize,
@@ -590,6 +590,7 @@ impl Consumer for AppendConsumer {
 /// exactly as many UIDs as messages were submitted (`appenduid_pairs`).
 /// Retains an untagged `* OK [APPENDUID ...]` whole, exactly as
 /// [`AppendConsumer`] does.
+#[cfg(test)]
 pub(crate) struct MultiAppendConsumer {
     buffered: Vec<UntaggedResponse>,
     /// Index in `buffered` of the first untagged `OK [APPENDUID ...]`.
@@ -599,6 +600,7 @@ pub(crate) struct MultiAppendConsumer {
     submitted: usize,
 }
 
+#[cfg(test)]
 impl MultiAppendConsumer {
     /// A consumer for a MULTIAPPEND of `submitted` messages.
     pub(crate) fn new(submitted: usize) -> Self {
@@ -610,6 +612,7 @@ impl MultiAppendConsumer {
     }
 }
 
+#[cfg(test)]
 impl Consumer for MultiAppendConsumer {
     type Output = Vec<crate::types::AppendUid>;
 

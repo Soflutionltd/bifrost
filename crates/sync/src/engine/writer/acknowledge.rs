@@ -75,7 +75,6 @@ impl Writer {
                     account = ?account_id,
                     scope = ?req.scope,
                     error = %err,
-                    auto = req.auto,
                     "ack: checkpoint persist failed"
                 );
                 // The batch is no longer in flight - the consumer took
@@ -102,7 +101,6 @@ impl Writer {
                     account = ?account_id,
                     scope = ?req.scope,
                     error = %err,
-                    auto = req.auto,
                     "ack: acknowledgement refused before any durable write"
                 );
                 // NOTHING is retired here, and the distinction from a store

@@ -130,6 +130,8 @@ fn unrepresentable(key: &str) -> bifrost_types::InventoryObligation {
     }
 }
 
+// These writer protocol tests deliberately retain the raw endpoint to submit
+// requests and inspect persistence failures independently of WriterHandle.
 fn start_flaky_writer(
     store: Arc<FlakyLedgerStore>,
 ) -> (mpsc::Sender<WriterRequest>, tokio::task::JoinHandle<()>) {
@@ -298,7 +300,6 @@ async fn provisional_ack_abort_case(case: &str) {
                 generation: crate::cursor::WalkGeneration::for_test(0),
             })
         }),
-        auto: false,
         complete: Some(done),
     }))
     .await
@@ -485,7 +486,6 @@ async fn unread_ledger_refuses_writes_then_recovers_without_erasing_debt() {
         scope: email_scope(),
         checkpoint: Checkpoint::Change(change_cursor(b"acked")),
         publication: None,
-        auto: false,
         complete: Some(done),
     }))
     .await
@@ -630,7 +630,6 @@ async fn failed_ack_proof_does_not_leak_into_an_unrelated_write() {
         scope: email_scope(),
         checkpoint,
         publication: Some(publication),
-        auto: false,
         complete: None,
     };
     let shared = Arc::clone(&store);

@@ -411,8 +411,13 @@ impl AccountFactory for RotatingFactory {
         let lifecycle_calls = Arc::clone(&self.lifecycle_calls);
         Box::pin(async move {
             let mut account_caps = caps();
+            // `subscribe_push` refuses an account with no effective push
+            // lanes, and a lane-less capability is `None`, so the first
+            // incarnation must advertise a real push capability to be
+            // subscribable. It stays distinct from the replacement's so the
+            // capability-snapshot-refresh assertion still observes a change.
             account_caps.push = if generation == 0 {
-                PushCapability::None
+                PushCapability::Webhook
             } else {
                 PushCapability::InProcess
             };

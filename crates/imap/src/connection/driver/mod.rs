@@ -46,7 +46,9 @@ use idle::run_idle;
 #[cfg(test)]
 use pipeline::group_into_sub_batches;
 use pipeline::{PipelineEnd, run_pipeline};
-use upgrade::{logout_best_effort, required_capability_refresh, run_upgrade};
+#[cfg(test)]
+use upgrade::run_upgrade;
+use upgrade::{logout_best_effort, required_capability_refresh};
 use wire_send::{SendOutcome, commit_before_first_write, send_wire_command};
 
 /// Per-command result type for pipelined batch execution.
@@ -80,6 +82,7 @@ pub(super) enum DriverCommand {
     /// Stream upgrade  -  the driver sends the protocol command, awaits
     /// the tagged OK, then atomically swaps the stream using the
     /// `Poisoned` sentinel (I9, I10). No consumer needed.
+    #[cfg(test)]
     Upgrade {
         reply: Reply<UpgradePayload, Result<Box<dyn std::any::Any + Send>, Error>>,
     },
@@ -109,7 +112,7 @@ pub(super) enum DriverCommand {
     Idle {
         reply: Reply<oneshot::Receiver<()>, Result<IdleTermination, Error>>,
         /// Handle-admission proof; see `admit_live`.
-        admitted: super::admission::HandleAdmitted,
+        _admitted: super::admission::HandleAdmitted,
     },
 }
 
@@ -128,6 +131,7 @@ pub(super) enum IdleTermination {
 /// `Poisoned` sentinel pattern (I9, I10). The driver sends the protocol
 /// command (STARTTLS / COMPRESS), awaits the tagged OK, then swaps the
 /// stream without any `.await` between the buffer check and the swap.
+#[cfg(test)]
 pub(super) enum UpgradePayload {
     /// STARTTLS upgrade (RFC 3501 Section 6.2.1 / RFC 9051 Section 6.2.1).
     ///
@@ -492,6 +496,7 @@ pub(super) async fn driver_task(
                             result,
                         );
                     }
+                    #[cfg(test)]
                     DriverCommand::Upgrade { reply } => {
                         let Some((payload, reply)) = reply.claim() else {
                             trace!("driver: caller withdrew the upgrade before it reached the head of the queue");
@@ -585,7 +590,7 @@ pub(super) async fn driver_task(
                         // No protocol state changed  -  skip snapshot publish.
                         continue;
                     }
-                    DriverCommand::Idle { reply, admitted: _ } => {
+                    DriverCommand::Idle { reply, _admitted: _ } => {
                         let Some((done_rx, reply)) = reply.claim() else {
                             trace!("driver: caller withdrew IDLE before it reached the head of the queue");
                             continue;

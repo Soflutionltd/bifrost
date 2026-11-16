@@ -750,10 +750,9 @@ that omits the requested id from both `list` and `notFound` maps to retryable
 Inbound calendar durations count each week as seven days, for timed and
 all-day events alike. Shared `EventTime` values carry parsed date, local-time
 and instant kinds; the returned event and create payload derive `is_all_day()`
-from the typed start. If a provider omits `start`, the shared time is
-`Unspecified` and cannot retain an independent `showWithoutTime: true` flag;
-preserving that flag requires extending the shared `EventTime` model. Projection
-keeps the missing time rather than inventing a date or hiding the event.
+from the typed start. If a provider omits `start`, the shared time remains
+`Unspecified` while retaining `showWithoutTime`, so an all-day event still
+appears as all-day without inventing a date or hiding the event.
 Writers and range filters consume that parsed state,
 including shared compatible-bound and exclusive-date-end validation. Reminder
 offsets and absolute triggers likewise use shared parsed timing types, with

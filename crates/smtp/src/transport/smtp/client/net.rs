@@ -235,7 +235,7 @@ impl NetworkStream {
                 self.state = ConnectionState::Broken;
 
                 let Some(InnerNetworkStream::Tcp(tcp_stream)) = self.inner.take() else {
-                    unreachable!()
+                    return Err(error::internal("TCP stream missing during TLS upgrade"));
                 };
 
                 self.inner = Some(Self::upgrade_tls_impl(tcp_stream, tls_parameters)?);

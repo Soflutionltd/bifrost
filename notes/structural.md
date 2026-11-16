@@ -196,18 +196,6 @@ Proposal: one configurable double per lane (changes, inventory, push, mutation,
 lifecycle) composed into a stub, and test files named after the contract they
 pin (`supervisor_*`, `delivery_*`, `campaign_*`, `establish_*`).
 
-## STR-036 - Vestigial engine surface
-
-**Reported by:** sync-engine (published; removal needs the owner).
-
-- `AckRequest::auto` is always `false`; nothing produces `true`, and the doc
-  says it "remains for trace readability".
-- `ThrottleBucket::record_for` ignores its account argument.
-- `ThrottleBucket::forget_account` is a no-op that detach still calls.
-- `BackfillWiring::changes_tx: Option<broadcast::Sender>` is only used as
-  `is_some()`, a bool meaning "broadcast at all"; publication goes through
-  `delivery`.
-
 ## STR-042 - `PendingCoverage` is five subsystems behind one lock and one public surface
 
 **Reported by:** sync-lanes.
@@ -269,15 +257,6 @@ instant behind four locks, and is the implicit owner of folder roles; making
 roles, ownership and the shared-error mapping explicit registry
 responsibilities (BUG-028, BUG-046) gives those decisions a home.
 
-## STR-064 - IMAP test layout mirrors the pre-split monolith
-
-**Reported by:** imap-protocol, imap-connection.
-
-Residue. The connection, scripted-account, decoder and encoder test monoliths
-are split per behaviour or grammar, and the review-named modules are renamed.
-What remains: the `capability_matrix` oracle in `types/profile.rs` is a test
-copy of production capability logic and should go once production is
-exhaustive.
 ## STR-071 - The IMAP pipeline has no production caller yet shapes the driver's hardest invariants
 
 **Reported by:** imap-connection (crate-private, but removal is an owner decision; flagged, not recommended).
@@ -295,23 +274,6 @@ line-audited" note. It bypasses every handle gate (BUG-029) and waits unbounded
 (`connection/request.rs`, BUG-029) so it stops being a gate bypass; (b) remove it and simplify
 `wait_for_continuation` to one mode, dropping `PipelineRouting`,
 `untagged_routing_key` and the router.
-
-## STR-072 - A library-grade IMAP connection surface nobody outside the crate can reach
-
-**Reported by:** imap-connection (owner decision).
-
-The connection layer is written as a direct API: `pub fn` methods, a typed
-`Pipeline` with tuple unfolding, `ergonomics.rs` whose every method says "Direct
-API counterpart to Account ...", `IdleEvent` with exhaustive RFC documentation,
-`drain_event_impacts`. None is reachable from outside `bifrost-imap`
-(`ImapConnection` is `pub(crate)`), and `lib.rs` carries a crate-wide
-`#![allow(dead_code)]` "because the dead surface is spread across most of the
-connection module tree". Either promote a deliberate direct-IMAP public API (then
-gates, typed ids and bounded waits matter for real callers), or shape the layer
-as the account's transport and let the compiler find the dead surface by removing
-the allow from `connection/` alone (the crate-wide count was measured at 105;
-a connection-only removal gives the exact list). The current middle state pays
-the complexity of a public API without its users.
 
 ## STR-078 - Credentials and TLS mode, three copies each
 

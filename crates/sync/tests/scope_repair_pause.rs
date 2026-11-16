@@ -67,6 +67,9 @@ fn failing_on_demand(error: fn() -> AccountError) -> (StubAccount, Arc<AtomicUsi
     let fire = Arc::new(AtomicUsize::new(0));
     let hook_fire = Arc::clone(&fire);
     let mut account = StubAccount::new(vec![SCOPE]);
+    // `subscribe_push` refuses an account with no effective push lanes.
+    account.caps.push = bifrost_types::PushCapability::Webhook;
+    account.push_lane_specs = StubAccount::registration_lanes();
     account.changes_hook = Some(Arc::new(move |_cursor: &ChangeCursor| {
         let fires = hook_fire
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))

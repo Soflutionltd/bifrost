@@ -352,6 +352,13 @@ pub(crate) async fn update(
     }
     let (event_calendar_id, native_event_id) = split_event_id(&event.0, operation)?;
     reject_calendar_move(&patch, &event_calendar_id)?;
+    // Users expect caller versions to require the advertised atomic update
+    // door as well as a native If-Match guard, before any content read or write.
+    account.capabilities.mutation.concurrency.gate_version(
+        AccountOperation::EventUpdate,
+        patch.expected_version.as_ref(),
+        bifrost_types::Protocol::Graph,
+    )?;
     let etag = patch
         .expected_version
         .as_ref()
@@ -1369,6 +1376,50 @@ mod tests {
                 &bifrost_types::AccountErrorKind::Request(
                     bifrost_types::RequestErrorKind::Malformed,
                 )
+            );
+            assert!(client.take_rest_requests().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_event_update_version_requires_advertised_guard() {
+        for concurrency in [
+            bifrost_types::MutationConcurrency::StateBased,
+            bifrost_types::MutationConcurrency::ExpectedVersion(
+                bifrost_types::VersionedDoors::CONTACT_UPDATE,
+            ),
+        ] {
+            let client = crate::client::GraphClient::new("token");
+            let mut account = GraphAccount::new_for_tests(
+                client.clone(),
+                super::super::PushMode::GraphSubscriptions,
+            );
+            account.capabilities.mutation.concurrency = concurrency;
+            client.script_rest([
+                crate::client::ScriptedRestResponse::json(
+                    reqwest::StatusCode::OK,
+                    serde_json::json!({"id": "one", "changeKey": "fresh"}),
+                ),
+                crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+            ]);
+            let error = update(
+                account,
+                EventId("calendar::one".into()),
+                EventPatch {
+                    expected_version: Some(bifrost_types::ServerVersion::etag(
+                        bifrost_types::Protocol::Graph,
+                        bifrost_types::ObjectType::CalendarEvent,
+                        "W/\"stale\"",
+                    )),
+                    title: Some(Some("changed".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
             );
             assert!(client.take_rest_requests().is_empty());
         }

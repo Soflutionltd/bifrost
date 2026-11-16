@@ -1,6 +1,6 @@
 //! Higher-level mailbox sync request and result types.
 
-use super::{FetchResponse, SelectedMailbox};
+use super::SelectedMailbox;
 
 /// Result of selecting a mailbox for synchronization.
 // protocol-specific: direct IMAP sync helpers expose SELECT extension usage.
@@ -34,15 +34,4 @@ pub enum QresyncOutcome {
     /// is illegal (RFC 5161 Section 3.1), and connections are brought to
     /// QRESYNC when they are minted instead.
     NotEnabledOnConnection,
-}
-
-/// Result of a sync fetch.
-// protocol-specific: direct IMAP sync helpers expose FETCH plus VANISHED data.
-#[non_exhaustive]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SyncFetchResult {
-    /// Fetched messages.
-    pub fetches: Vec<FetchResponse>,
-    /// Vanished UID ranges returned by QRESYNC.
-    pub vanished: Vec<super::UidRange>,
 }

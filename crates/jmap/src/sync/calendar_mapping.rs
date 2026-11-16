@@ -91,20 +91,22 @@ pub(super) fn event_from_jmap(
             ))
         })?;
     let timezone = event.time_zone().as_value().map(ToString::to_string);
-    // With no start, EventTime is Unspecified and cannot retain showWithoutTime:
-    // its all-day sense requires a parsed date. Preserve the missing observation
-    // rather than inventing a date or hiding a damaged meeting from the user.
-    // Retaining that independent flag requires extending the shared EventTime model.
+    // Keep the provider's all-day mode even without a start: the user should
+    // still see an all-day row, without a fabricated date.
     let start = EventTime::from_observed(
         shared_time_from_jmap(raw_start, is_all_day),
         timezone.clone(),
-    );
+    )
+    .converted(is_all_day);
     // An absent `duration` is RFC 8984's `PT0S`, a real zero-length end; only
     // an event with no `start` to measure from has no end at all.
-    let end = Some(EventTime::from_observed(
-        shared_time_from_jmap(&raw_end, is_all_day),
-        timezone.clone(),
-    ))
+    let end = Some(
+        EventTime::from_observed(
+            shared_time_from_jmap(&raw_end, is_all_day),
+            timezone.clone(),
+        )
+        .converted(is_all_day),
+    )
     .filter(|end| !end.value().is_empty());
     let (rdate, mut exdate) = recurrence_dates_from_overrides(event.recurrence_overrides())
         .map_err(|message| unsupported(operation, message))?;
@@ -266,6 +268,7 @@ pub(super) fn event_context_from_patch(
                 shared_time_from_jmap(event.start().unwrap_or_default(), is_all_day),
                 event.time_zone().as_value().map(ToString::to_string),
             )
+            .converted(is_all_day)
         })
     });
     let owner_participants = current

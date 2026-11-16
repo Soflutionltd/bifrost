@@ -7,14 +7,8 @@
 //! [`ImapPoller`] beside the account. The raw IMAP connection, parser, and
 //! wire types are crate-internal implementation detail.
 
-// The Account impl drives a subset of the IMAP4rev2 + extensions surface
-// implemented under `connection/` and `types/`. The remaining commands,
-// response shapes, and pipeline helpers stay built so the protocol layer
-// is complete; a future trimming pass can decide what to remove vs wire
-// up. The annotation is at the crate root because the dead surface is
-// spread across most of the connection module tree. The types and codec
-// modules override it with warn(dead_code); retained protocol builders carry
-// local exceptions explaining the commands they support.
+// Non-connection protocol and Sieve internals retain their existing allowance.
+// The account transport, types and codec override it with warn(dead_code).
 #![allow(dead_code)]
 // The crate-private `Error` now carries typed failure evidence
 // (`LocalFailure`, `CapabilityFailure`) beside its message, so it is a large

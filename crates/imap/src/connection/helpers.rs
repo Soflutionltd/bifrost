@@ -21,6 +21,7 @@ impl ImapConnection {
     /// Returns a clone of the capability list as last observed by the
     /// driver task. Updated automatically when the server advertises
     /// new capabilities (e.g., post-STARTTLS, post-LOGIN).
+    #[cfg(test)]
     pub fn capabilities(&self) -> Vec<Capability> {
         self.state_rx.borrow().capabilities.clone()
     }
@@ -49,6 +50,7 @@ impl ImapConnection {
     /// advertised, a client MUST issue `ENABLE IMAP4rev2` before assuming
     /// rev2 behavior. If the server advertises only `IMAP4rev2` (no rev1),
     /// rev2 is implicitly active.
+    #[cfg(test)]
     pub(super) fn is_rev2(&self) -> bool {
         let snap = self.state_rx.borrow();
         super::auth::is_rev2_from_snapshot(&snap)
@@ -97,6 +99,7 @@ impl ImapConnection {
     ///
     /// QRESYNC implies CONDSTORE (RFC 7162 Section 3.2.3), so either
     /// capability satisfies the requirement.
+    #[cfg(test)]
     pub(super) fn require_condstore(&self) -> Result<(), Error> {
         super::admission::SessionView {
             snapshot: &self.state_rx.borrow(),
@@ -105,6 +108,7 @@ impl ImapConnection {
         .require_condstore()
     }
 
+    #[cfg(test)]
     /// Verify that the server advertises the SEARCHRES capability (RFC 5182 Section 2).
     pub(super) fn require_searchres(&self) -> Result<(), Error> {
         super::admission::SessionView {
@@ -128,6 +132,7 @@ impl ImapConnection {
 
     /// `true` when the server advertises support for the named quota resource
     /// via `QUOTA=RES-<name>` (RFC 9208 Section 3.1.1).
+    #[cfg(test)]
     pub(super) fn has_quota_resource(&self, resource: &str) -> bool {
         super::admission::SessionView {
             snapshot: &self.state_rx.borrow(),
@@ -151,6 +156,7 @@ impl ImapConnection {
     /// before sending a LIST command with selection options, multiple
     /// patterns, or return options (RFC 5258 Section 3 /
     /// RFC 9051 Section 6.3.9 / Appendix C).
+    #[cfg(test)]
     pub(super) fn validate_list_extended_request(
         &self,
         patterns: &[&str],
@@ -198,6 +204,7 @@ impl ImapConnection {
     /// Additional items are gated by their respective extensions:
     /// `HIGHESTMODSEQ` (RFC 7162 Section 3.1.7), `APPENDLIMIT`
     /// (RFC 7889 Section 3), and `MAILBOXID` (RFC 8474 Section 5.1).
+    #[cfg(test)]
     pub(super) fn validate_requested_status_items(&self, items: &str) -> Result<(), Error> {
         super::admission::SessionView {
             snapshot: &self.state_rx.borrow(),
@@ -206,6 +213,7 @@ impl ImapConnection {
         .validate_requested_status_items(&items.into())
     }
 
+    #[cfg(test)]
     /// Validate requested FETCH data items against negotiated extensions
     /// before sending the command.
     ///
@@ -229,6 +237,7 @@ impl ImapConnection {
         .validate_fetch_items(&crate::types::fetch::FetchItems::Attributes(items.to_vec()))
     }
 
+    #[cfg(test)]
     /// Parse a STATUS data item list into individual item atoms.
     ///
     /// Accepts either a raw space-separated list (`"MESSAGES UNSEEN"`) or a
@@ -237,17 +246,6 @@ impl ImapConnection {
     /// rejected per RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11.
     pub(super) fn status_item_tokens(items: &str) -> Result<Vec<&str>, Error> {
         crate::types::command_options::status_item_tokens(items)
-    }
-
-    /// Whether `UTF8=ACCEPT` has been enabled (RFC 6855 Section 3).
-    ///
-    /// Derived from the connection state snapshot. Does NOT include
-    /// `IMAP4rev2`  -  use `utf8_mode()` for the combined check.
-    pub(super) fn utf8_enabled(&self) -> bool {
-        self.state_rx
-            .borrow()
-            .enabled
-            .contains(&crate::types::Capability::Utf8Accept)
     }
 
     // -----------------------------------------------------------------------
@@ -262,6 +260,7 @@ impl ImapConnection {
     ///
     /// Valid in any state (RFC 3501 Section 6.1.2). Returns an error only
     /// if the connection is closed (e.g. after LOGOUT).
+    #[cfg(test)]
     pub async fn noop(&self, timeout: Duration) -> Result<(), Error> {
         self.execute_request(super::request::Noop {}, timeout).await
     }
@@ -270,24 +269,11 @@ impl ImapConnection {
     // CHECK (RFC 3501 Section 6.4.1)
     // -----------------------------------------------------------------------
 
-    /// CHECK  -  request a checkpoint of the currently selected mailbox
-    /// (RFC 3501 Section 6.4.1).
-    ///
-    /// Implementation-defined server action; typically flushes internal
-    /// state to persistent storage.
-    ///
-    /// **`IMAP4rev1` only.** RFC 9051 removed the CHECK command from
-    /// `IMAP4rev2`. On a pure rev2 connection, use [`noop`](Self::noop)
-    /// instead  -  this method returns [`crate::error::LocalRefusal::MissingCapability`].
-    pub async fn check(&self, timeout: Duration) -> Result<(), Error> {
-        self.execute_request(super::request::Check {}, timeout)
-            .await
-    }
-
     // -----------------------------------------------------------------------
     // CAPABILITY (RFC 3501 Section 6.1.1 / RFC 9051 Section 6.1.1)
     // -----------------------------------------------------------------------
 
+    #[cfg(test)]
     /// CAPABILITY  -  force a capability round-trip (RFC 3501 Section 6.1.1 /
     /// RFC 9051 Section 6.1.1).
     ///

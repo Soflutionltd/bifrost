@@ -45,10 +45,11 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
-- **DAV raw-URL refusals put caller-supplied userinfo, password included, into
-  diagnostics.** `crates/dav-core/src/dispatch.rs` interpolates the URL
-  userinfo into a support-only `local_error`. Reported by a fixer in passing,
-  unverified.
+- **DAV wire types can expose secrets through `Debug`.** Derived `Debug` on
+  `DavHref`, `DavRequest`, `DavResponse` and `DavBody` prints URLs, headers or
+  bodies; retained server response evidence can also carry echoed secrets.
+  Reported in passing, unverified. (URL diagnostics are already redacted to
+  the origin.)
 
 ## 2. Blocked on a live probe
 
@@ -285,10 +286,21 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
-- **IMAP `ThreadNode` still derives recursive `Clone`, `Debug`, equality and
-  hashing.** Flattening, drop and parser construction are iterative now, but
-  those derives still recurse on a deep reply chain. `reference/imap.md` does
-  not yet describe the iterative THREAD handling.
+- **Reference and comment handoffs from the November 2026 resolution loop.**
+  Doc-only, each checked against code when written:
+  - `reference/sync.md` still lists throttle cleanup as a detach registration
+    duty (`ThrottleBucket::forget_account` is gone; deadlines expire on their
+    own), and does not say initial `subscribe_push` refuses an account with no
+    effective push lanes as `Unsupported(PushSubscribe)`.
+  - `reference/types.md`: `EventTime::converted` records all-day mode on
+    Unspecified and Invalid observations without fabricating a date.
+  - `reference/imap.md`: `ThreadNode` clone, debug, equality and hashing use
+    explicit worklists; the `connection/` tree is under `warn(dead_code)` with
+    test-only command adapters and compression, and the pipeline is the
+    retained exception.
+  - `crates/imap/src/types/profile_tests.rs` still calls its fixture a
+    first-principles oracle; `connection/wire.rs` documents a nonexistent
+    `ImapConnection::new_wire_reader`.
 - **Lateral findings from the review of the primary-cause builder rewrite.**
   - Several producers mint a scope-directed state cause with a placeholder
     `CursorScope` and rely on a later `.scope(ErrorScope::Cursor(_))` to rebind
@@ -310,10 +322,7 @@ Narrow edge cases, audits with no known defect, and design work.
   - DAV: the dispatcher tests now call `send_raw_request` directly, so a crate
     verb that bypassed the dispatcher would go unnoticed.
   - sync: engine-wide `AccountId`-keyed throttles can receive late holds from a
-    retired slot, which a reattach of the same id inherits. `engine/bulk.rs`
-    still takes a raw boundary sender only to subscribe, and
-    `reference/sync.md` does not say `MaintenanceGate` holds a read-only
-    boundary view. A retained slot `Arc` keeps its
+    retired slot, which a reattach of the same id inherits. A retained slot `Arc` keeps its
     watch and broadcast channels open past detach. The integration test
     `an_orphan_restored_after_detachs_take_is_not_inherited_by_the_next_attach`
     no longer bites on removing the shutdown check in
@@ -325,34 +334,18 @@ Narrow edge cases, audits with no known defect, and design work.
   - SASL: `strip_frame_delim` in `crates/sasl/src/oauth.rs` still
     rewrites for callers that bypass `SaslClient`.
   - JMAP: a capability dropped mid-session yields terminal `Unsupported` where
-    `CapabilityChanged` may fit (ruling). An all-day event with no start loses
-    its all-day flag: `EventTime` in `crates/types/src/calendar.rs` derives
-    all-day only from a parsed date, so the fix is a types change (the limit is
-    documented in `jmap/src/sync/calendar_mapping.rs` and `reference/jmap.md`).
+    `CapabilityChanged` may fit (ruling).
   - SMTP: a rejected batch DATA reports per-recipient RCPT rejections. Batch
     sends have no BDAT entry point (ruling). An LMTP final 421 marks the
-    remaining recipients uncertain without reading their finals. Three
-    `unreachable!` sites remain in `net.rs` and `async_net.rs`, plus lifecycle
-    `expect` assertions.
+    remaining recipients uncertain without reading their finals. The blocking
+    pool still panics when the OS refuses to create a worker thread, and
+    mutex-poison assertions remain.
   - sync: the operator-override warning moved from `user_safe` to
     `support_only` (ruling). `plan_recovery` lost its unhandled-classification
     detail. `ThrottleScope::Mailbox` (defined in
     `crates/types/src/error/recovery.rs`) also covers owners and folders; a
-    rename such as `ScopedResource` is proposed. Several
-    engine sites still hold raw `WriterRequest` senders instead of
-    `WriterHandle`. `AckOutcome` is not `#[must_use]`: adding it is clean in
+    rename such as `ScopedResource` is proposed. `AckOutcome` is not `#[must_use]`: adding it is clean in
     production but about fifty test call sites discard the value.
-  - `reference/sync.md`: the scheduler section describes overflow as poll
-    cadence and push skipping, but `engine/drive_start.rs` retries internally
-    with `ADMISSION_RETRY`. It and `reference/types.md` should also name
-    `backfill/marker.rs` and `wire::partition` as the partition key owners.
-  - `reference/net.md` could say `Server` is the fallback cause for unlisted
-    4xx statuses.
-  - Cursor wire: the inner scope and payload decoders accept unconsumed bytes
-    within declared fields, and `parse_envelope` computes `scope_end + 4`
-    unchecked, which can overflow on 32-bit targets.
-  - Graph contact and event updates validate caller ETags without calling
-    `gate_version`.
   - Graph: `public_folder` change events carry `Owner` memberships that only
     `Account` cursors cover.
   - Calendars: CalDAV and JMAP normalize floating times to UTC.
@@ -373,12 +366,6 @@ Narrow edge cases, audits with no known defect, and design work.
   second is a server answering a different object than asked, which reads as a
   contract violation rather than a vanished message. Needs a call on whether to
   split them.
-- **Reattach and first subscribe disagree on accounts with no push lanes.**
-  Reattach now carries a desired subscription only when
-  `effective_push_lanes` of the replacement is non-empty
-  (`crates/sync/src/engine/reattach.rs`), dropping it otherwise; verify the
-  initial `push_subscribe` path applies the same decision, or a consumer can
-  hold a subscription on one incarnation that the next silently drops.
 
 - **IMAP `draft_send` and `draft_discard` do not check that the handle is a
   draft.** Both decode any `imap2` object id (`crates/imap/src/account/pim.rs`)
@@ -505,11 +492,6 @@ Narrow edge cases, audits with no known defect, and design work.
     answers to rule on: name it as a consumer assertion path, or refuse a
     `None`-publication backfill acknowledgement (always, by the reasoning
     `completion_refusal` already records, or once an account fence is raised).
-  - Conditional registration ignores `fenced_backfill`: `register_if_fence`
-    compares `scope_fence`, which reads `fenced` (and `fenced_account`), not
-    `fenced_backfill`, so a backfill discard revokes an in-flight backfill
-    producer only at acknowledgement, not at registration. Probably harmless
-    (the discard runs before the retry mints).
   - Backfill discard requests survive an account reset: detach drains
     `take_backfill_discards()` and sends `DiscardBackfillProgress` per scope; a
     discard recorded before an account reset deletes the post-reset walk's rows

@@ -1616,8 +1616,9 @@ request cause, 413 to `Request(PayloadTooLarge)` with a payload-too-large cause,
 `NotFound` when context names a resource (otherwise a status-bearing server
 error), 409/412 to a state conflict, and 410 to cursor invalid only on a cursor
 scope. 408/502/503/504 are unavailable, 429 is rate limited, and 507 is quota
-exhausted. Other statuses, including 500 and unknown 5xx, retain net's
-`Server(Error { status })` classification; shared recovery still retries HTTP
+exhausted. Other statuses, including unlisted 4xx, 500 and unknown 5xx, use
+`PrimaryCause::Server(ServerCause::Error { status: Some(code) })`, retaining
+net's `Server(Error { status })` classification; shared recovery still retries HTTP
 5xx server errors. Failed preconditions refresh state. An enterprise user with
 an oversized attachment expects a terminal size refusal (`ProviderRefused`), so
 413 neither reports a client bug nor throttles the account. Neither decision

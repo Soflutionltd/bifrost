@@ -168,6 +168,13 @@ enum InnerAsyncNetworkStream {
     None,
 }
 
+// Admission only accepts inbound and outbound requests. Keep its selector exhaustive
+// even if the shared, non-exhaustive bandwidth vocabulary gains variants.
+enum AdmissionDirection {
+    Inbound,
+    Outbound,
+}
+
 impl AsyncNetworkStream {
     fn new(inner: InnerAsyncNetworkStream) -> Self {
         if let InnerAsyncNetworkStream::None = inner {
@@ -196,23 +203,30 @@ impl AsyncNetworkStream {
 
     /// Admission completes before the caller arms a peer I/O timer.
     pub(super) async fn admit_outbound(&mut self, len: usize) {
-        std::future::poll_fn(|cx| self.poll_admission(cx, BandwidthDirection::Outbound, len)).await;
+        std::future::poll_fn(|cx| self.poll_admission(cx, AdmissionDirection::Outbound, len)).await;
     }
 
     pub(super) async fn admit_inbound(&mut self, len: usize) {
-        std::future::poll_fn(|cx| self.poll_admission(cx, BandwidthDirection::Inbound, len)).await;
+        std::future::poll_fn(|cx| self.poll_admission(cx, AdmissionDirection::Inbound, len)).await;
     }
 
     fn poll_admission(
         &mut self,
         cx: &mut Context<'_>,
-        direction: BandwidthDirection,
+        direction: AdmissionDirection,
         len: usize,
     ) -> Poll<()> {
-        let (grant, pending) = match direction {
-            BandwidthDirection::Inbound => (&mut self.in_grant, &mut self.in_admission),
-            BandwidthDirection::Outbound => (&mut self.out_grant, &mut self.out_admission),
-            _ => unreachable!("unknown bandwidth direction"),
+        let (direction, grant, pending) = match direction {
+            AdmissionDirection::Inbound => (
+                BandwidthDirection::Inbound,
+                &mut self.in_grant,
+                &mut self.in_admission,
+            ),
+            AdmissionDirection::Outbound => (
+                BandwidthDirection::Outbound,
+                &mut self.out_grant,
+                &mut self.out_admission,
+            ),
         };
         if grant.is_some() {
             return Poll::Ready(());
@@ -371,7 +385,7 @@ impl AsyncNetworkStream {
                 // get owned TcpStream
                 let tcp_stream = mem::replace(&mut self.inner, InnerAsyncNetworkStream::None);
                 let InnerAsyncNetworkStream::TokioTcp(tcp_stream) = tcp_stream else {
-                    unreachable!()
+                    return Err(error::internal("TCP stream missing during TLS upgrade"));
                 };
 
                 self.inner = Self::upgrade_tls_stream(tcp_stream, tls_parameters, deadline).await?;
@@ -451,7 +465,9 @@ impl AsyncRead for AsyncNetworkStream {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        std::task::ready!(this.poll_admission(cx, BandwidthDirection::Inbound, buf.remaining()));
+        // Ready admission installs in_grant. Polling the peer borrows only
+        // inner, so no input or cancellation can remove it before take below.
+        std::task::ready!(this.poll_admission(cx, AdmissionDirection::Inbound, buf.remaining()));
         let size = this
             .in_grant
             .as_ref()
@@ -495,7 +511,9 @@ impl AsyncWrite for AsyncNetworkStream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        std::task::ready!(this.poll_admission(cx, BandwidthDirection::Outbound, buf.len()));
+        // Ready admission installs out_grant, including on a retry. Only this
+        // method consumes it, after polling inner; Pending retains the grant.
+        std::task::ready!(this.poll_admission(cx, AdmissionDirection::Outbound, buf.len()));
         // A retry keeps its pending length, but never past the buffer it is
         // handed: `AsyncWrite` lets a caller re-poll with a shorter buffer,
         // and slicing past it would panic. A TLS session that refuses the

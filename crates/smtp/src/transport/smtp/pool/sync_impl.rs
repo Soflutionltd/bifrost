@@ -155,6 +155,9 @@ impl Pool {
                         }
                     }
                 })
+                // Thread creation can fail under OS resource pressure; this is
+                // not a local ownership invariant. Propagating it requires a
+                // fallible pool construction policy at the transport builder.
                 .expect("couldn't spawn the Pool thread");
         }
 
@@ -221,6 +224,8 @@ impl Pool {
                     // The transport was shut down
                     return Err(error::transport_shutdown());
                 }
+                // The None case returned above while this same mutex guard
+                // stayed held; shutdown cannot change it between the checks.
                 if let Some(conn) = connections.as_mut().expect("pool is open").pop() {
                     (Some(conn), false)
                 } else if self.try_reserve() {
@@ -405,6 +410,9 @@ impl ParkedConnection {
 }
 
 impl PooledConnection {
+    // wrap installs the owned connection; only Drop takes it. Safe callers
+    // cannot dereference during or after Drop, so the lifecycle expects below
+    // cannot be broken by server input or cancellation.
     fn wrap(conn: SmtpConnection, pool: Arc<Pool>) -> Self {
         Self {
             conn: Some(conn),

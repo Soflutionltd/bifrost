@@ -52,15 +52,17 @@ pub(crate) use notify::NotifyEvent;
 pub(crate) use notify::{MailboxFilter, NotifyEventGroup, NotifySetParams};
 pub(crate) use profile::ServerProfile;
 pub(crate) use response::{
-    AclEntry, Capability, CopyResult, EsearchResponse, ExpungeResult, ListRightsResponse,
-    ListStatusEntry, MetadataResult, MoveResult, NamespaceResponse, QuotaResource,
+    Capability, CopyResult, ExpungeResult, ListStatusEntry, MoveResult, NamespaceResponse,
     QuotaRootResponse, Response, ResponseCode, SeqBound, ThreadNode, UidRange, UntaggedResponse,
 };
 #[cfg(test)]
-pub(crate) use response::{MetadataEntry, UntaggedStatus};
+pub(crate) use response::{
+    AclEntry, EsearchResponse, ListRightsResponse, MetadataEntry, MetadataResult, QuotaResource,
+    UntaggedStatus,
+};
 pub(crate) use search::{SearchCriteria, SearchResult};
 pub(crate) use secret::SecretString;
-pub(crate) use sync::{QresyncOutcome, SyncFetchResult, SyncSelectResult};
+pub(crate) use sync::{QresyncOutcome, SyncSelectResult};
 pub(crate) use validated::{
     MailboxArgument, MailboxInput, MailboxName, SequenceSet, ValidationError,
 };
@@ -68,9 +70,7 @@ pub(crate) use validated::{
 // Re-export command types for internal use only.
 pub(crate) use command::{Command, CommandKind};
 
-pub(crate) use request::{
-    FetchChanges, QresyncParams, SelectAccess, SelectOptions, SyncFetchRequest,
-};
+pub(crate) use request::{QresyncParams, SelectAccess, SelectOptions};
 
 pub(crate) mod command_options;
 

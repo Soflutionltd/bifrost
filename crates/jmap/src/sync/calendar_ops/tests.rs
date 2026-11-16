@@ -1451,6 +1451,27 @@ fn a_server_event_without_start_projects_an_empty_start_and_no_end() {
     assert_eq!(event.end, None);
 }
 
+/// The all-day assertion fails when projection derives the mode only from a date.
+#[test]
+fn a_server_event_without_start_retains_its_all_day_mode() {
+    for all_day in [true, false] {
+        let raw: JmapCalendarEvent = serde_json::from_value(json!({
+            "id": "e1",
+            "calendarIds": {"c1": true},
+            "showWithoutTime": all_day,
+            "duration": "PT1H"
+        }))
+        .expect("event parses");
+        let event = event_from_jmap(raw, AccountOperation::EventGet).expect("projects");
+        assert_eq!(event.is_all_day(), all_day);
+        assert!(event.start.is_unspecified());
+        assert_eq!(event.start.value(), "");
+        assert_eq!(event.start.local_datetime(), None);
+        assert!(event.start.validate().is_err());
+        assert_eq!(event.end, None);
+    }
+}
+
 /// Fails if `validate_start` is removed from `write_event_create`:
 /// `start: ""` would be sent to the server.
 #[test]

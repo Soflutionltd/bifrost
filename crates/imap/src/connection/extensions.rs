@@ -6,6 +6,7 @@ impl ImapConnection {
     // COMPRESS (RFC 4978)
     // -----------------------------------------------------------------------
 
+    #[cfg(test)]
     /// COMPRESS DEFLATE  -  negotiate and activate compression (RFC 4978 Section 4).
     ///
     /// Sends the `COMPRESS DEFLATE` command. If the server accepts, wraps the
@@ -83,6 +84,7 @@ impl ImapConnection {
         Ok(())
     }
 
+    #[cfg(test)]
     /// NOTIFY NONE  -  cancel all event subscriptions (RFC 5465 Section 3).
     ///
     /// Reverts to baseline IMAP behavior where the server only sends
@@ -109,24 +111,6 @@ impl ImapConnection {
     // -----------------------------------------------------------------------
     // ENABLE (RFC 5161 Section 3 / RFC 9051 Section 6.3.1)
     // -----------------------------------------------------------------------
-
-    /// ENABLE UTF8=ACCEPT  -  negotiate UTF-8 support (RFC 6855 Section 3).
-    ///
-    /// Convenience wrapper around [`enable`](Self::enable) that sends
-    /// `ENABLE UTF8=ACCEPT` and returns `true` if the server confirmed
-    /// the extension, `false` if the server did not include it in its
-    /// `ENABLED` response.
-    ///
-    /// Must be issued in authenticated state before SELECT/EXAMINE
-    /// (RFC 5161 Section 2).
-    pub async fn enable_utf8(&self, timeout: Duration) -> Result<bool, Error> {
-        let enabled = self.enable(&["UTF8=ACCEPT"], timeout).await?;
-        let enabled: crate::types::profile::EnabledSet = enabled
-            .iter()
-            .map(|extension| Capability::from_imap_str(extension))
-            .collect();
-        Ok(enabled.contains(&Capability::Utf8Accept))
-    }
 
     /// ENABLE  -  request the server to activate one or more IMAP extensions
     /// (RFC 5161 Section 3 / RFC 9051 Section 6.3.1).
@@ -223,6 +207,7 @@ impl ImapConnection {
     // GETMETADATA / SETMETADATA (RFC 5464)
     // -----------------------------------------------------------------------
 
+    #[cfg(test)]
     /// GETMETADATA  -  retrieve mailbox or server metadata
     /// (RFC 5464 Section 4.2).
     ///
@@ -255,6 +240,7 @@ impl ImapConnection {
         self.execute_request(cmd, timeout).await
     }
 
+    #[cfg(test)]
     /// SETMETADATA  -  set or delete mailbox/server metadata entries
     /// (RFC 5464 Section 4.3).
     ///
@@ -284,6 +270,7 @@ impl ImapConnection {
     // QUOTA (RFC 2087 / RFC 9208)
     // -----------------------------------------------------------------------
 
+    #[cfg(test)]
     /// GETQUOTA  -  query quota resources for a quota root
     /// (RFC 2087 Section 4.2 / RFC 9208 Section 4.2).
     ///
@@ -322,6 +309,7 @@ impl ImapConnection {
         self.execute_request(cmd, timeout).await
     }
 
+    #[cfg(test)]
     /// SETQUOTA  -  set resource limits on a quota root
     /// (RFC 2087 Section 4.1 / RFC 9208 Section 4.1).
     ///
@@ -350,50 +338,7 @@ impl ImapConnection {
     // ACL (RFC 4314)
     // -----------------------------------------------------------------------
 
-    /// SETACL  -  set access control list entries for a mailbox
-    /// (RFC 4314 Section 3.1).
-    ///
-    /// Sets the rights for `identifier` on `mailbox`. The `rights` string
-    /// uses the format defined in RFC 4314 Section 2 (e.g., `"+lrswipkxte"`
-    /// to add rights, `"-d"` to remove, or a bare string to replace).
-    ///
-    /// Requires the `ACL` capability (RFC 4314 Section 1).
-    pub async fn set_acl(
-        &self,
-        mailbox: &(impl crate::types::MailboxInput + ?Sized),
-        identifier: &str,
-        rights: &str,
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        let mailbox_name = mailbox.mailbox_name()?;
-        let cmd = super::request::SetAcl {
-            mailbox: mailbox_name,
-            identifier: identifier.to_owned(),
-            rights: rights.to_owned(),
-        };
-        self.execute_request(cmd, timeout).await
-    }
-
-    /// DELETEACL  -  remove an access control list entry for a mailbox
-    /// (RFC 4314 Section 3.2).
-    ///
-    /// Removes all rights for `identifier` on `mailbox`.
-    ///
-    /// Requires the `ACL` capability (RFC 4314 Section 1).
-    pub async fn delete_acl(
-        &self,
-        mailbox: &(impl crate::types::MailboxInput + ?Sized),
-        identifier: &str,
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        let mailbox_name = mailbox.mailbox_name()?;
-        let cmd = super::request::DeleteAcl {
-            mailbox: mailbox_name,
-            identifier: identifier.to_owned(),
-        };
-        self.execute_request(cmd, timeout).await
-    }
-
+    #[cfg(test)]
     /// GETACL  -  retrieve the access control list for a mailbox
     /// (RFC 4314 Section 3.3).
     ///
@@ -413,6 +358,7 @@ impl ImapConnection {
         self.execute_request(cmd, timeout).await
     }
 
+    #[cfg(test)]
     /// LISTRIGHTS  -  query the set of rights grantable to an identifier
     /// on a mailbox (RFC 4314 Section 3.4).
     ///

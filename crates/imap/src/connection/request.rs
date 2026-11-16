@@ -67,6 +67,7 @@ request! {
     dispatch::TaggedOkConsumer::default()
 }
 
+#[cfg(test)]
 request! {
     Close {  } =>
     Command::Close,
@@ -109,6 +110,7 @@ request! {
     dispatch::TaggedOkConsumer::default()
 }
 
+#[cfg(test)]
 request! {
     Unauthenticate {  } =>
     Command::Unauthenticate,
@@ -416,6 +418,7 @@ request! {
     dispatch::AppendConsumer,
     dispatch::AppendConsumer::default()
 }
+#[cfg(test)]
 request! {
     AppendMany { mailbox: crate::types::MailboxArgument, messages: Vec<crate::types::AppendMessage> } =>
     Command::Append { mailbox, messages, multi: true },

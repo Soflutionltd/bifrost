@@ -14,6 +14,7 @@ use super::*;
 /// closed receiver stays pending while a permit is outstanding. Awaiting full
 /// drainage would therefore outlive the command timeout whenever the server
 /// stalls mid-response, hanging the joined future forever.
+#[cfg(test)]
 pub(super) async fn drain_fetch_stream<F>(
     mut rx: tokio::sync::mpsc::Receiver<Result<FetchResponse, Error>>,
     mut on_item: F,
@@ -48,8 +49,7 @@ impl ImapConnection {
     /// when minted (`account::pool::enable_qresync`); the result's
     /// `qresync` says what happened here.
     ///
-    /// Direct API counterpart to Account cursor establishment and changes:
-    /// callers keep native IMAP types and own cursor persistence.
+    /// The account owns cursor persistence; this helper assembles wire options.
     pub async fn select_for_sync(
         &self,
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
@@ -89,44 +89,10 @@ impl ImapConnection {
         })
     }
 
-    /// Execute a sync-oriented UID FETCH.
-    ///
-    /// Direct API counterpart to Account change streams: callers provide
-    /// native UID sets and receive protocol FETCH data.
-    pub async fn sync_fetch(
-        &self,
-        request: &crate::types::SyncFetchRequest,
-        timeout: Duration,
-    ) -> Result<crate::types::SyncFetchResult, Error> {
-        let sequence_set = request.uids.as_sequence_set();
-        if let crate::types::FetchChanges::SinceWithVanished(mod_seq) = request.changes {
-            let (fetches, vanished) = self
-                .uid_fetch_vanished(sequence_set, &request.attrs, mod_seq, timeout)
-                .await?;
-            Ok(crate::types::SyncFetchResult { fetches, vanished })
-        } else if let crate::types::FetchChanges::Since(mod_seq) = request.changes {
-            let fetches = self
-                .uid_fetch_changed_since(sequence_set, &request.attrs, mod_seq, timeout)
-                .await?;
-            Ok(crate::types::SyncFetchResult {
-                fetches,
-                vanished: Vec::new(),
-            })
-        } else {
-            let fetches = self
-                .uid_fetch(sequence_set, &request.attrs, timeout)
-                .await?;
-            Ok(crate::types::SyncFetchResult {
-                fetches,
-                vanished: Vec::new(),
-            })
-        }
-    }
-
+    #[cfg(test)]
     /// Stream a UID FETCH into a callback without exposing channel ceremony.
     ///
-    /// Direct API counterpart to Account hydration: callers consume native
-    /// FETCH responses instead of shared HydratedObject batches.
+    /// Test adapter for bounded FETCH consumer cancellation transcripts.
     pub async fn uid_fetch_each<F>(
         &self,
         uids: &crate::types::UidSetExpr,
@@ -162,7 +128,7 @@ impl ImapConnection {
     /// Both paths frame and parse a whole response before delivery. The
     /// budget is not a ceiling on syntax, parser allocations or peak memory.
     ///
-    /// Direct API counterpart to Account get/blob streams for buffered callers.
+    /// Used by account hydration for budgeted buffered responses.
     pub async fn uid_fetch_limited(
         &self,
         uids: &crate::types::UidSetExpr,
@@ -187,15 +153,15 @@ impl ImapConnection {
     /// [`uid_fetch_each`](Self::uid_fetch_each) for unbounded or large
     /// result sets.
     ///
-    /// Direct API counterpart to Account full-message hydration.
+    /// Used by account draft and full-message hydration.
     pub async fn uid_fetch_full_messages(
         &self,
         uids: &crate::types::UidSetExpr,
         max_estimated_bytes: usize,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        let request = crate::types::SyncFetchRequest::full_messages(uids.clone());
-        self.uid_fetch_limited(uids, &request.attrs, max_estimated_bytes, timeout)
+        let attrs = crate::types::request::full_message_attrs();
+        self.uid_fetch_limited(uids, &attrs, max_estimated_bytes, timeout)
             .await
     }
 }

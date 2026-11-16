@@ -345,6 +345,30 @@ post-TLS reply.
   `abort_is_bounded_by_the_teardown_cap_when_no_operation_timeout_is_set`
   (`timeout(None)`, which the first cannot reach).
 
+## Internal errors and local assertions
+
+TLS stream extraction failures in both network adapters return `Internal`
+with the stream left `Broken`. A SCRAM selection paired with a non-SCRAM
+mechanism likewise returns `Internal` through the session's normal abort path.
+These failures must preserve ordinary error handling for an enterprise send
+queue rather than unwind through its send operation. Async bandwidth admission
+uses a private exhaustive inbound/outbound selector; extending the shared
+bandwidth vocabulary cannot introduce a panic fallback in this adapter.
+
+The retained ownership assertions enforce local invariants. Session server
+info and transaction progress are installed at construction and taken only at
+terminal projection; both private drivers return immediately on `Step::Finish`.
+Batch group-failure projection passes `Ok(())`, which cannot enter its
+error-result branch. Pooled wrappers install a connection (and an async permit)
+that only `Drop` takes; safe callers cannot dereference the wrapper during or
+after that drop. The async worker's two `OnceLock` cells each have one setter in
+the constructor. Ready bandwidth admission installs a grant, and polling the
+peer only borrows the inner stream, leaving that grant available for completion.
+No server input or cancelled future can violate these ownership assertions.
+This does not cover mutex poisoning or the blocking pool worker thread spawn:
+the latter still panics on OS thread creation failure because pool construction
+is currently infallible.
+
 ## Connection state and cancel-safety
 
 Sync and async streams carry an explicit state: `Ok` / `Broken` / `Closed`. Writes, flushes, reads, and TLS upgrades set `Broken` before the await; only success restores `Ok`. Dropped futures leave state `Broken`; the pool drops the connection.

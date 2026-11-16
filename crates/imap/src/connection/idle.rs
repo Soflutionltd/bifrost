@@ -118,7 +118,10 @@ impl ImapConnection {
         }
         let (done_tx, done_rx) = oneshot::channel();
         let (reply, mut pending) = reply_channel(done_rx, &self.abandoned);
-        permit.send(DriverCommand::Idle { reply, admitted });
+        permit.send(DriverCommand::Idle {
+            reply,
+            _admitted: admitted,
+        });
         // Submitted, but not yet the driver's: only its commit, just before
         // the IDLE line's first byte, transfers the exchange. Until then every
         // departure
