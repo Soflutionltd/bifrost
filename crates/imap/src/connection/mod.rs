@@ -21,9 +21,9 @@ use tracing::{debug, warn};
 use crate::error::Error;
 use crate::types::{
     AppendMessage, Capability, Command, CopyResult, ExpungeResult, FetchAttr, FetchResponse, Flag,
-    MailboxInfo, MailboxName, MoveResult, NamespaceResponse, NotifySetParams,
-    QuotaRootResponse, ResponseCode, SelectOptions, SelectedMailbox, SequenceSet, StatusItem,
-    StatusResult, StoreOperation, StoreResult, ThreadNode,
+    MailboxInfo, MailboxName, MoveResult, NamespaceResponse, NotifySetParams, QuotaRootResponse,
+    ResponseCode, SelectOptions, SelectedMailbox, SequenceSet, StatusItem, StatusResult,
+    StoreOperation, StoreResult, ThreadNode,
 };
 
 #[cfg(test)]

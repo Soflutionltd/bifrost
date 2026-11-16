@@ -1,10 +1,9 @@
 //! Single wire-reader primitive (RFC 3501 Section2.2.2).
 //!
-//! Private to `crate::connection`. `WireReader::new` and the internal
-//! fields are unreachable outside this module. The ONLY construction
-//! site outside this file is `ImapConnection::new_wire_reader`, which
-//! itself is only called by the connection constructor and the stream
-//! upgrade handler.
+//! The reader owns the stream and parse buffer. Connection bootstrap constructs
+//! it through `WireReader::new_metered` in `connection::lifecycle`; driver-owned
+//! stream upgrades consume the old reader and rebuild it around the new stream.
+//! Hermetic connection fixtures use the test-only `WireReader::new` adapter.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

@@ -84,16 +84,11 @@ pub(super) fn admit(command: &Command, session: &SessionView<'_>) -> Result<(), 
     // Criteria contribute requirements through the same literal-aware walk
     // for both snapshots and live state, including inside a pipeline.
     match command {
-        Command::Search { criteria }
-        | Command::UidSearch { criteria }
+        Command::Search { criteria, .. }
         | Command::SearchReturn { criteria, .. }
-        | Command::UidSearchReturn { criteria, .. }
-        | Command::SearchSave { criteria }
-        | Command::UidSearchSave { criteria }
+        | Command::SearchSave { criteria, .. }
         | Command::Sort { criteria, .. }
-        | Command::UidSort { criteria, .. }
-        | Command::Thread { criteria, .. }
-        | Command::UidThread { criteria, .. } => {
+        | Command::Thread { criteria, .. } => {
             criteria.validate_raw(opts.literal_mode)?;
             for capability in criteria.required_capabilities() {
                 if !session.supports(&capability) {
@@ -659,15 +654,10 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
             | Command::Move { .. }
             | Command::UidMove { .. }
             | Command::Search { .. }
-            | Command::UidSearch { .. }
             | Command::SearchReturn { .. }
-            | Command::UidSearchReturn { .. }
             | Command::SearchSave { .. }
-            | Command::UidSearchSave { .. }
             | Command::Sort { .. }
-            | Command::UidSort { .. }
             | Command::Thread { .. }
-            | Command::UidThread { .. }
             | Command::GetMetadata { .. }
             | Command::SetMetadata { .. }
             | Command::GetQuotaRoot { .. }
@@ -752,17 +742,17 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
             }
         }
         Command::Unauthenticate => session.require(Capability::Unauthenticate)?,
-        Command::SearchReturn { .. } | Command::UidSearchReturn { .. } => {
+        Command::SearchReturn { .. } => {
             session.require(Capability::Esearch)?;
             if ImapConnection::search_return_requests_save(command) {
                 session.require(Capability::SearchRes)?;
             }
         }
-        Command::SearchSave { .. } | Command::UidSearchSave { .. } => {
+        Command::SearchSave { .. } => {
             session.require(Capability::SearchRes)?;
         }
-        Command::Sort { .. } | Command::UidSort { .. } => session.require(Capability::Sort)?,
-        Command::Thread { algorithm, .. } | Command::UidThread { algorithm, .. } => {
+        Command::Sort { .. } => session.require(Capability::Sort)?,
+        Command::Thread { algorithm, .. } => {
             session.require(Capability::from_imap_str(&format!("THREAD={algorithm}")))?;
         }
         Command::Status { items, .. } => session.validate_requested_status_items(items)?,

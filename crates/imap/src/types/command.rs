@@ -12,6 +12,23 @@ use super::mailbox::MailboxAttribute;
 use super::secret::SecretString;
 use super::validated::{MailboxName, SequenceSet};
 
+/// Addressing of SEARCH-family command results. The response consumer retains
+/// the corresponding typed identifier; encoding only chooses the UID prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Addressing {
+    Sequences,
+    Uids,
+}
+
+impl Addressing {
+    pub(crate) const fn command(self, sequence: &'static str, uid: &'static str) -> &'static str {
+        match self {
+            Self::Sequences => sequence,
+            Self::Uids => uid,
+        }
+    }
+}
+
 /// An IMAP command to be encoded and sent to the server.
 #[derive(Debug, Clone)]
 pub(crate) enum Command {
@@ -156,12 +173,18 @@ pub(crate) enum Command {
     /// CHECK command (RFC 3501 Section 6.4.1).
     Check,
 
-    // The command forms retain distinct operand types. In particular, the
-    // VANISHED modifier exists only on UID FETCH; collapsing the forms would
-    // make a sequence FETCH with VANISHED representable and need another gate.
+    // SEARCH, SORT and THREAD share operands and carry result addressing.
+    // FETCH, STORE, COPY and MOVE instead retain distinct typed sets. A common
+    // addressed-set enum would move their matches into another layer without
+    // removing the encoder's need to unpack those sets. FETCH also restricts
+    // VANISHED to its UID form. Keep those type guarantees rather than replace
+    // them with runtime admission solely to shorten this command vocabulary.
     // --- Message operations (RFC 3501 Section 6.4) ---
     /// SEARCH command (RFC 3501 Section 6.4.4).
-    Search { criteria: super::SearchCriteria },
+    Search {
+        addressing: Addressing,
+        criteria: super::SearchCriteria,
+    },
     /// SEARCH RETURN (opts) command (RFC 4731 Section 3.2).
     ///
     /// RFC 4731 Section 3.2 / Section 4 ABNF:
@@ -169,13 +192,17 @@ pub(crate) enum Command {
     /// `"SEARCH" [SP "RETURN" SP "(" [search-return-opt *(SP search-return-opt)] ")"]
     ///  SP search-criteria`
     SearchReturn {
+        addressing: Addressing,
         criteria: super::SearchCriteria,
         return_opts: Vec<super::command_options::SearchReturn>,
     },
     /// SEARCH RETURN (SAVE) command (RFC 5182 Section 2).
     ///
     /// Saves the search results server-side as `$` for use in subsequent commands.
-    SearchSave { criteria: super::SearchCriteria },
+    SearchSave {
+        addressing: Addressing,
+        criteria: super::SearchCriteria,
+    },
     /// FETCH command (RFC 3501 Section 6.4.5, RFC 7162 Section 3.1.4.1 for CHANGEDSINCE).
     Fetch {
         sequence_set: SequenceSet<super::Seq>,
@@ -200,22 +227,6 @@ pub(crate) enum Command {
         sequence_set: SequenceSet<super::Seq>,
         mailbox: MailboxName,
     },
-    /// UID SEARCH command (RFC 3501 Section 6.4.4).
-    UidSearch { criteria: super::SearchCriteria },
-    /// UID SEARCH RETURN (opts) command (RFC 4731 Section 3.2).
-    ///
-    /// RFC 4731 Section 3.2 / Section 4 ABNF:
-    /// `search-return-opt = "MIN" / "MAX" / "ALL" / "COUNT"`
-    /// `"UID" SP "SEARCH" [SP "RETURN" SP "(" [search-return-opt *(SP search-return-opt)] ")"]
-    ///  SP search-criteria`
-    UidSearchReturn {
-        criteria: super::SearchCriteria,
-        return_opts: Vec<super::command_options::SearchReturn>,
-    },
-    /// UID SEARCH RETURN (SAVE) command (RFC 5182 Section 2).
-    ///
-    /// Saves the search results server-side as `$` for use in subsequent commands.
-    UidSearchSave { criteria: super::SearchCriteria },
     /// UID FETCH command (RFC 3501 Section 6.4.5, RFC 7162 Section 3.1.4.1 for CHANGEDSINCE,
     /// RFC 7162 Section 3.2.6 for VANISHED).
     UidFetch {
@@ -290,12 +301,7 @@ pub(crate) enum Command {
     // --- THREAD (RFC 5256) ---
     /// THREAD command (RFC 5256 Section 3).
     Thread {
-        algorithm: String,
-        charset: String,
-        criteria: super::SearchCriteria,
-    },
-    /// UID THREAD command (RFC 5256 Section 3).
-    UidThread {
+        addressing: Addressing,
         algorithm: String,
         charset: String,
         criteria: super::SearchCriteria,
@@ -304,14 +310,7 @@ pub(crate) enum Command {
     // --- SORT (RFC 5256) ---
     /// SORT command (RFC 5256 Section 2).
     Sort {
-        /// Sort criteria: one or more sort keys per RFC 5256 Section 2
-        /// `sort-criteria = "(" sort-key *(SP sort-key) ")"`.
-        sort_criteria: String,
-        charset: String,
-        criteria: super::SearchCriteria,
-    },
-    /// UID SORT command (RFC 5256 Section 2).
-    UidSort {
+        addressing: Addressing,
         /// Sort criteria: one or more sort keys per RFC 5256 Section 2
         /// `sort-criteria = "(" sort-key *(SP sort-key) ")"`.
         sort_criteria: String,
@@ -706,9 +705,9 @@ impl Command {
             Self::Close => CommandKind::Close,
             Self::Unselect => CommandKind::Unselect,
             Self::Expunge | Self::UidExpunge { .. } => CommandKind::Expunge,
-            Self::Search { .. } | Self::UidSearch { .. } => CommandKind::Search,
-            Self::SearchReturn { .. } | Self::UidSearchReturn { .. } => CommandKind::SearchReturn,
-            Self::SearchSave { .. } | Self::UidSearchSave { .. } => CommandKind::SearchSave,
+            Self::Search { .. } => CommandKind::Search,
+            Self::SearchReturn { .. } => CommandKind::SearchReturn,
+            Self::SearchSave { .. } => CommandKind::SearchSave,
             Self::Fetch { .. } => CommandKind::Fetch,
             Self::UidFetch { .. } => CommandKind::UidFetch,
             Self::Store { .. } | Self::UidStore { .. } => CommandKind::Store,
@@ -722,8 +721,8 @@ impl Command {
             Self::Id(_) => CommandKind::Id,
             Self::GetMetadata { .. } => CommandKind::GetMetadata,
             Self::SetMetadata { .. } => CommandKind::SetMetadata,
-            Self::Thread { .. } | Self::UidThread { .. } => CommandKind::Thread,
-            Self::Sort { .. } | Self::UidSort { .. } => CommandKind::Sort,
+            Self::Thread { .. } => CommandKind::Thread,
+            Self::Sort { .. } => CommandKind::Sort,
             Self::NotifySet(_) => CommandKind::NotifySet,
             Self::NotifyNone => CommandKind::NotifyNone,
             Self::Compress => CommandKind::Compress,

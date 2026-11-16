@@ -1,9 +1,11 @@
 use super::*;
+use crate::types::Addressing;
 
 #[test]
 fn encode_uid_search() {
     let mut buf = BytesMut::new();
-    let cmd = Command::UidSearch {
+    let cmd = Command::Search {
+        addressing: Addressing::Uids,
         criteria: "ALL".into(),
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
@@ -14,6 +16,7 @@ fn encode_uid_search() {
 fn encode_search() {
     let mut buf = BytesMut::new();
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: "UNSEEN".into(),
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
@@ -27,6 +30,7 @@ fn encode_search() {
 fn encode_search_allows_literal_criteria() {
     let mut buf = BytesMut::new();
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: "BODY {12}\r\nhello MODSEQ".into(),
     };
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
@@ -41,6 +45,7 @@ fn encode_search_allows_literal_criteria() {
 fn encode_search_save() {
     let mut buf = BytesMut::new();
     let cmd = Command::SearchSave {
+        addressing: Addressing::Sequences,
         criteria: "UNSEEN".into(),
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
@@ -50,7 +55,8 @@ fn encode_search_save() {
 #[test]
 fn encode_uid_search_save() {
     let mut buf = BytesMut::new();
-    let cmd = Command::UidSearchSave {
+    let cmd = Command::SearchSave {
+        addressing: Addressing::Uids,
         criteria: "ALL".into(),
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
@@ -61,6 +67,7 @@ fn encode_uid_search_save() {
 fn encode_search_return_min_max_count() {
     let mut buf = BytesMut::new();
     let cmd = Command::SearchReturn {
+        addressing: Addressing::Sequences,
         criteria: "UNSEEN".into(),
         return_opts: vec!["MIN".into(), "MAX".into(), "COUNT".into()],
     };
@@ -71,7 +78,8 @@ fn encode_search_return_min_max_count() {
 #[test]
 fn encode_uid_search_return_all() {
     let mut buf = BytesMut::new();
-    let cmd = Command::UidSearchReturn {
+    let cmd = Command::SearchReturn {
+        addressing: Addressing::Uids,
         criteria: "ALL".into(),
         return_opts: vec!["ALL".into(), "COUNT".into()],
     };
@@ -83,6 +91,7 @@ fn encode_uid_search_return_all() {
 fn encode_search_return_empty_opts() {
     let mut buf = BytesMut::new();
     let cmd = Command::SearchReturn {
+        addressing: Addressing::Sequences,
         criteria: "FLAGGED".into(),
         return_opts: vec![],
     };
@@ -97,6 +106,7 @@ fn encode_search_return_empty_opts() {
 fn encode_search_return_trims_outer_option_whitespace() {
     let mut buf = BytesMut::new();
     let cmd = Command::SearchReturn {
+        addressing: Addressing::Sequences,
         criteria: "UNSEEN".into(),
         return_opts: vec![" MIN ".into(), "\tCOUNT\t".into()],
     };
@@ -113,6 +123,7 @@ fn encode_search_return_trims_outer_option_whitespace() {
 fn encode_search_return_rejects_embedded_whitespace_in_option() {
     let mut buf = BytesMut::new();
     let cmd = Command::SearchReturn {
+        addressing: Addressing::Sequences,
         criteria: "UNSEEN".into(),
         return_opts: vec!["MIN COUNT".into()],
     };
@@ -132,6 +143,7 @@ fn encode_search_return_rejects_embedded_whitespace_in_option() {
 fn encode_thread_command() {
     let mut buf = BytesMut::new();
     let cmd = Command::Thread {
+        addressing: Addressing::Sequences,
         algorithm: "REFERENCES".into(),
         charset: "UTF-8".into(),
         criteria: "ALL".into(),
@@ -146,6 +158,7 @@ fn encode_thread_command() {
 fn encode_thread_allows_literal_criteria() {
     let mut buf = BytesMut::new();
     let cmd = Command::Thread {
+        addressing: Addressing::Sequences,
         algorithm: "REFERENCES".into(),
         charset: "UTF-8".into(),
         criteria: "BODY {12}\r\nhello MODSEQ".into(),
@@ -164,7 +177,8 @@ fn encode_thread_allows_literal_criteria() {
 #[test]
 fn encode_uid_thread_command() {
     let mut buf = BytesMut::new();
-    let cmd = Command::UidThread {
+    let cmd = Command::Thread {
+        addressing: Addressing::Uids,
         algorithm: "ORDEREDSUBJECT".into(),
         charset: "US-ASCII".into(),
         criteria: "SINCE 1-Jan-2025".into(),
@@ -182,6 +196,7 @@ fn encode_uid_thread_command() {
 fn encode_sort_command() {
     let mut buf = BytesMut::new();
     let cmd = Command::Sort {
+        addressing: Addressing::Sequences,
         sort_criteria: "DATE".into(),
         charset: "UTF-8".into(),
         criteria: "ALL".into(),
@@ -193,7 +208,8 @@ fn encode_sort_command() {
 #[test]
 fn encode_uid_sort_command() {
     let mut buf = BytesMut::new();
-    let cmd = Command::UidSort {
+    let cmd = Command::Sort {
+        addressing: Addressing::Uids,
         sort_criteria: "SUBJECT".into(),
         charset: "US-ASCII".into(),
         criteria: "SINCE 1-Jan-2025".into(),
@@ -211,6 +227,7 @@ fn encode_uid_sort_command() {
 fn encode_thread_allows_quoted_charset() {
     let mut buf = BytesMut::new();
     let cmd = Command::Thread {
+        addressing: Addressing::Sequences,
         algorithm: "REFERENCES".into(),
         charset: "\"UTF-8\"".into(),
         criteria: "ALL".into(),
@@ -226,6 +243,7 @@ fn encode_thread_allows_quoted_charset() {
 fn encode_sort_allows_quoted_charset() {
     let mut buf = BytesMut::new();
     let cmd = Command::Sort {
+        addressing: Addressing::Sequences,
         sort_criteria: "DATE".into(),
         charset: "\"UTF-8\"".into(),
         criteria: "ALL".into(),
@@ -239,6 +257,7 @@ fn encode_sort_allows_quoted_charset() {
 fn sort_command_uses_sort_criteria_field() {
     let mut buf = BytesMut::new();
     let cmd = Command::Sort {
+        addressing: Addressing::Sequences,
         sort_criteria: "DATE".into(),
         charset: "UTF-8".into(),
         criteria: "ALL".into(),
@@ -259,6 +278,7 @@ fn encode_thread_rejects_invalid_algorithm() {
     // An algorithm containing spaces is not a valid atom and must be rejected.
     let mut buf = BytesMut::new();
     let cmd = Command::Thread {
+        addressing: Addressing::Sequences,
         algorithm: "ORDEREDSUBJECT INVALID".into(),
         charset: "UTF-8".into(),
         criteria: "ALL".into(),
@@ -276,6 +296,7 @@ fn encode_sort_rejects_invalid_charset() {
     // atom-specials, so an unquoted charset containing them must be rejected.
     let mut buf = BytesMut::new();
     let cmd = Command::Sort {
+        addressing: Addressing::Sequences,
         sort_criteria: "DATE".into(),
         charset: "UTF(8)".into(),
         criteria: "ALL".into(),
@@ -300,6 +321,7 @@ fn encode_sort_rejects_invalid_charset() {
 fn audit_finding8_sort_command_encodes_correctly() {
     let mut buf = BytesMut::new();
     let cmd = Command::Sort {
+        addressing: Addressing::Sequences,
         sort_criteria: "DATE".into(),
         charset: "UTF-8".into(),
         criteria: "ALL".into(),
@@ -316,7 +338,8 @@ fn audit_finding8_sort_command_encodes_correctly() {
 #[test]
 fn audit_finding8_uid_sort_command_encodes_correctly() {
     let mut buf = BytesMut::new();
-    let cmd = Command::UidSort {
+    let cmd = Command::Sort {
+        addressing: Addressing::Uids,
         sort_criteria: "REVERSE DATE".into(),
         charset: "UTF-8".into(),
         criteria: "SINCE 1-Jan-2024".into(),
@@ -434,6 +457,7 @@ fn criteria_non_synchronizing_literal_without_an_extension_is_refused() {
 #[test]
 fn crlf_injection_search_criteria_rejected() {
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: "ALL\r\nA002 DELETE INBOX".into(),
     };
     let mut buf = BytesMut::new();
@@ -452,7 +476,8 @@ fn crlf_injection_search_criteria_rejected() {
 /// UID SEARCH criteria containing CRLF must be rejected.
 #[test]
 fn crlf_injection_uid_search_criteria_rejected() {
-    let cmd = Command::UidSearch {
+    let cmd = Command::Search {
+        addressing: Addressing::Uids,
         criteria: "ALL\r\nA002 DELETE INBOX".into(),
     };
     let mut buf = BytesMut::new();
@@ -467,6 +492,7 @@ fn crlf_injection_uid_search_criteria_rejected() {
 #[test]
 fn crlf_injection_search_return_opts_rejected() {
     let cmd = Command::SearchReturn {
+        addressing: Addressing::Sequences,
         criteria: "ALL".into(),
         return_opts: vec!["MIN\r\nA002 DELETE INBOX".into()],
     };
@@ -482,6 +508,7 @@ fn crlf_injection_search_return_opts_rejected() {
 #[test]
 fn crlf_injection_thread_criteria_rejected() {
     let cmd = Command::Thread {
+        addressing: Addressing::Sequences,
         algorithm: "REFERENCES".into(),
         charset: "UTF-8".into(),
         criteria: "ALL\r\nA002 DELETE INBOX".into(),
@@ -498,6 +525,7 @@ fn crlf_injection_thread_criteria_rejected() {
 #[test]
 fn crlf_injection_sort_criteria_rejected() {
     let cmd = Command::Sort {
+        addressing: Addressing::Sequences,
         sort_criteria: "DATE".into(),
         charset: "UTF-8".into(),
         criteria: "ALL\r\nA002 DELETE INBOX".into(),
@@ -514,6 +542,7 @@ fn crlf_injection_sort_criteria_rejected() {
 #[test]
 fn crlf_injection_normal_search_succeeds() {
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: "ALL".into(),
     };
     let mut buf = BytesMut::new();
@@ -532,6 +561,7 @@ fn crlf_injection_normal_search_succeeds() {
 #[test]
 fn search_rejects_non_synchronizing_literal_without_extension() {
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: "TEXT {3+}\r\nfoo".into(),
     };
     let mut buf = BytesMut::new();
@@ -556,6 +586,7 @@ fn search_rejects_non_synchronizing_literal_without_extension() {
 #[test]
 fn search_allows_non_synchronizing_literal_with_literal_plus() {
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: "TEXT {3+}\r\nfoo".into(),
     };
     let mut buf = BytesMut::new();
@@ -576,6 +607,7 @@ fn search_allows_non_synchronizing_literal_with_literal_plus() {
 #[test]
 fn search_rejects_empty_criteria() {
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: String::new().into(),
     };
     let mut buf = BytesMut::new();
@@ -591,6 +623,7 @@ fn search_rejects_empty_criteria() {
 #[test]
 fn thread_rejects_empty_criteria() {
     let cmd = Command::Thread {
+        addressing: Addressing::Sequences,
         algorithm: "REFERENCES".into(),
         charset: "UTF-8".into(),
         criteria: "   ".into(),
@@ -608,6 +641,7 @@ fn thread_rejects_empty_criteria() {
 #[test]
 fn sort_rejects_empty_criteria() {
     let cmd = Command::Sort {
+        addressing: Addressing::Sequences,
         sort_criteria: "DATE".into(),
         charset: "UTF-8".into(),
         criteria: String::new().into(),
@@ -627,6 +661,7 @@ fn sort_rejects_empty_criteria() {
 fn thread_rejects_oversized_non_synchronizing_literal_in_literal_minus_mode() {
     let oversized = "a".repeat(4097);
     let cmd = Command::Thread {
+        addressing: Addressing::Sequences,
         algorithm: "REFERENCES".into(),
         charset: "UTF-8".into(),
         criteria: format!("TEXT {{4097+}}\r\n{oversized}").into(),
@@ -656,6 +691,7 @@ fn thread_rejects_oversized_non_synchronizing_literal_in_literal_minus_mode() {
 #[test]
 fn encode_search_rejects_charset_when_utf8_enabled() {
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: "CHARSET UTF-8 ALL".into(),
     };
     let result = encode_command("A001", &cmd, &opts(LiteralMode::Synchronizing, true));
@@ -672,7 +708,10 @@ fn typed_search_string_uses_live_mode_and_structural_literals() {
     let criteria = crate::types::SearchCriteria::new()
         .subject("caf\u{e9}")
         .unwrap();
-    let cmd = Command::Search { criteria };
+    let cmd = Command::Search {
+        addressing: Addressing::Sequences,
+        criteria,
+    };
     let ascii = encode_command("A001", &cmd, &default_opts()).unwrap();
     assert_eq!(
         ascii.to_vec(),
@@ -687,7 +726,10 @@ fn typed_search_control_and_marker_bytes_remain_operand_data() {
     let criteria = crate::types::SearchCriteria::new()
         .body("x\r\n{3}\r\nabc")
         .unwrap();
-    let cmd = Command::Search { criteria };
+    let cmd = Command::Search {
+        addressing: Addressing::Sequences,
+        criteria,
+    };
     let wire = encode_command("A001", &cmd, &default_opts()).unwrap();
     assert_eq!(
         wire.to_vec(),
@@ -704,13 +746,30 @@ fn typed_search_capability_requirements_follow_keys_and_raw_declarations() {
         .body("MODSEQ OLDER $")
         .unwrap();
     let criteria = crate::types::SearchCriteria::new().not(&body);
-    assert!(admit_and_encode("A001", &Command::Search { criteria }, &options).is_ok());
+    assert!(
+        admit_and_encode(
+            "A001",
+            &Command::Search {
+                addressing: Addressing::Sequences,
+                criteria
+            },
+            &options
+        )
+        .is_ok()
+    );
     let criteria = crate::types::SearchCriteria::new().or(
         &body,
         &crate::types::SearchCriteria::new().mod_seq(4).unwrap(),
     );
     assert!(matches!(
-        admit_and_encode("A001", &Command::Search { criteria }, &options),
+        admit_and_encode(
+            "A001",
+            &Command::Search {
+                addressing: Addressing::Sequences,
+                criteria
+            },
+            &options
+        ),
         Err(crate::Error::LocalRefusal(
             crate::error::LocalRefusal::MissingCapability(_)
         ))
@@ -718,7 +777,14 @@ fn typed_search_capability_requirements_follow_keys_and_raw_declarations() {
     let criteria =
         crate::types::SearchCriteria::raw("X-LOCAL value".to_owned(), vec![Capability::Within]);
     assert!(matches!(
-        admit_and_encode("A001", &Command::Search { criteria }, &options),
+        admit_and_encode(
+            "A001",
+            &Command::Search {
+                addressing: Addressing::Sequences,
+                criteria
+            },
+            &options
+        ),
         Err(crate::Error::LocalRefusal(
             crate::error::LocalRefusal::MissingCapability(_)
         ))

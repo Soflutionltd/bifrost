@@ -212,10 +212,150 @@ pub struct SessionRecord {
     pub gates: Vec<tokio::time::Instant>,
 }
 
+pub type FiltersListHook =
+    Arc<dyn Fn() -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> + Send + Sync>;
+
+pub type FilterCreateHook = Arc<
+    dyn Fn(ServerFilterCreate) -> AccountFuture<Result<ServerFilterId, AccountError>> + Send + Sync,
+>;
+
+pub type FilterUpdateHook = Arc<
+    dyn Fn(ServerFilterId, ServerFilterPatch) -> AccountFuture<Result<(), AccountError>>
+        + Send
+        + Sync,
+>;
+
+pub type FilterDeleteHook =
+    Arc<dyn Fn(ServerFilterId) -> AccountFuture<Result<(), AccountError>> + Send + Sync>;
+
+pub type FilterValidateHook = Arc<
+    dyn Fn(ServerFilterCreate) -> AccountFuture<Result<FilterValidation, AccountError>>
+        + Send
+        + Sync,
+>;
+
+pub type IdentitiesListHook =
+    Arc<dyn Fn() -> AccountFuture<Result<Vec<Identity>, AccountError>> + Send + Sync>;
+
+pub type IdentityUpdateHook =
+    Arc<dyn Fn(IdentityId, IdentityPatch) -> AccountFuture<Result<(), AccountError>> + Send + Sync>;
+
+pub type VacationGetHook =
+    Arc<dyn Fn() -> AccountFuture<Result<Option<VacationConfig>, AccountError>> + Send + Sync>;
+
+pub type VacationSetHook =
+    Arc<dyn Fn(VacationConfig) -> AccountFuture<Result<(), AccountError>> + Send + Sync>;
+
+pub type QuotaGetHook =
+    Arc<dyn Fn() -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> + Send + Sync>;
+
+pub type ChangesStreamHook =
+    Arc<dyn Fn(ChangeCursor) -> AccountStream<SyncEvent<Change>> + Send + Sync>;
+
+pub type ScopeLifecycleStreamHook =
+    Arc<dyn Fn() -> AccountStream<ScopeLifecycleEvent> + Send + Sync>;
+
+pub type CloseHook = Arc<dyn Fn() -> AccountFuture<Result<(), AccountError>> + Send + Sync>;
+
+pub type PushSubscribeHook = Arc<
+    dyn Fn(&[CursorScope]) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>>
+        + Send
+        + Sync,
+>;
+
+pub type PushUnsubscribeHook =
+    Arc<dyn Fn(SubscriptionHandle) -> AccountFuture<Result<(), AccountError>> + Send + Sync>;
+
+pub type ContactsListHook = Arc<
+    dyn Fn(
+            Option<AddressBookId>,
+            Option<bifrost_types::PageCursor>,
+        ) -> AccountFuture<Result<Page<ContactCard>, AccountError>>
+        + Send
+        + Sync,
+>;
+
+pub type GetStreamHook = Arc<
+    dyn Fn(
+            AccountStream<ObjectId>,
+            Projection,
+        ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>
+        + Send
+        + Sync,
+>;
+
+pub type FlagTargetHook = Arc<
+    dyn Fn(&ObjectId, &bifrost_types::FlagSet, &FlagOp) -> bifrost_types::FlagTargetState
+        + Send
+        + Sync,
+>;
+
+/// Independent provider lanes composed into the shared account double.
+/// Hooks return streams directly so infinite transcripts and construction-time
+/// observations keep the same semantics as a purpose-built account.
+#[derive(Default)]
+pub struct AccountLanes {
+    pub settings: SettingsLane,
+    pub filters: FilterLane,
+    pub changes: ChangesLane,
+    pub lifecycle: LifecycleLane,
+    pub push: PushRegistrationLane,
+    pub pages: PageLane,
+    pub mutation: MutationLane,
+}
+
+#[derive(Default)]
+pub struct ChangesLane {
+    pub changes_stream: Option<ChangesStreamHook>,
+}
+
+#[derive(Default)]
+pub struct LifecycleLane {
+    pub scope_lifecycle_stream: Option<ScopeLifecycleStreamHook>,
+    pub close: Option<CloseHook>,
+}
+
+#[derive(Default)]
+pub struct PushRegistrationLane {
+    pub push_subscribe: Option<PushSubscribeHook>,
+    pub push_unsubscribe: Option<PushUnsubscribeHook>,
+}
+
+#[derive(Default)]
+pub struct PageLane {
+    pub contacts_list: Option<ContactsListHook>,
+}
+
+#[derive(Default)]
+pub struct MutationLane {
+    pub get_stream: Option<GetStreamHook>,
+    pub flag_target: Option<FlagTargetHook>,
+}
+
+#[derive(Default)]
+pub struct FilterLane {
+    pub filters_list: Option<FiltersListHook>,
+    pub filter_create: Option<FilterCreateHook>,
+    pub filter_update: Option<FilterUpdateHook>,
+    pub filter_delete: Option<FilterDeleteHook>,
+    pub filter_validate: Option<FilterValidateHook>,
+}
+
+#[derive(Default)]
+pub struct SettingsLane {
+    pub identities_list: Option<IdentitiesListHook>,
+    pub identity_update: Option<IdentityUpdateHook>,
+    pub vacation_get: Option<VacationGetHook>,
+    pub vacation_set: Option<VacationSetHook>,
+    pub quota_get: Option<QuotaGetHook>,
+}
+
 /// Configurable `Account` double. Construct with [`StubAccount::new`], then
 /// set hooks for the surfaces the test drives; everything else answers
 /// `Unsupported` or an empty stream.
 pub struct StubAccount {
+    pub protocol: bifrost_types::Protocol,
+    pub lanes: AccountLanes,
     /// Returned by `push_lanes`; a lane not in it gets the S11 failure.
     pub push_lane_specs: Vec<bifrost_types::PushLaneSpec>,
     /// One script per `push_stream` call on a declared lane; an empty queue
@@ -511,6 +651,8 @@ impl StubAccount {
     #[must_use]
     pub fn new(scopes: Vec<CursorScope>) -> Self {
         Self {
+            protocol: bifrost_types::Protocol::Jmap,
+            lanes: AccountLanes::default(),
             push_lane_specs: Vec::new(),
             push_sessions: Mutex::new(Default::default()),
             push_session_log: Arc::new(Mutex::new(Vec::new())),
@@ -607,8 +749,20 @@ impl AccountFactory for StubFactory {
 }
 
 impl Account for StubAccount {
+    fn flag_target(
+        &self,
+        target: &ObjectId,
+        observed: &bifrost_types::FlagSet,
+        op: &FlagOp,
+    ) -> bifrost_types::FlagTargetState {
+        if let Some(hook) = &self.lanes.mutation.flag_target {
+            return hook(target, observed, op);
+        }
+        bifrost_types::flag_target_state(observed, op)
+    }
+
     fn protocol(&self) -> bifrost_types::Protocol {
-        bifrost_types::Protocol::Jmap
+        self.protocol
     }
 
     fn capabilities(&self) -> &AccountCapabilities {
@@ -698,6 +852,9 @@ impl Account for StubAccount {
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
+        if let Some(hook) = &self.lanes.lifecycle.scope_lifecycle_stream {
+            return hook();
+        }
         self.lifecycle_opens
             .lock()
             .expect("lifecycle opens lock")
@@ -809,6 +966,9 @@ impl Account for StubAccount {
         _ids: AccountStream<ObjectId>,
         _projection: Projection,
     ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
+        if let Some(hook) = &self.lanes.mutation.get_stream {
+            return hook(_ids, _projection);
+        }
         Box::pin(stream::empty())
     }
 
@@ -826,6 +986,9 @@ impl Account for StubAccount {
     }
 
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
+        if let Some(hook) = &self.lanes.changes.changes_stream {
+            return hook(cursor);
+        }
         let items = match &self.changes_hook {
             Some(hook) => hook(&cursor),
             None => Vec::new(),
@@ -843,6 +1006,9 @@ impl Account for StubAccount {
         &self,
         scopes: &[CursorScope],
     ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
+        if let Some(hook) = &self.lanes.push.push_subscribe {
+            return hook(scopes);
+        }
         // The first subscription on an account is named by its label, so a
         // single-subscription test reads `call("old", "old")`. Further ones
         // get `label-2`, `label-3`, ...: a test holding several subscriptions
@@ -885,6 +1051,9 @@ impl Account for StubAccount {
         &self,
         handle: SubscriptionHandle,
     ) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(hook) = &self.lanes.push.push_unsubscribe {
+            return hook(handle);
+        }
         self.push_log
             .unsubscribed
             .lock()
@@ -1071,6 +1240,9 @@ impl Account for StubAccount {
     }
 
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(hook) = &self.lanes.lifecycle.close {
+            return hook();
+        }
         self.closed
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let gate = self.close_gate.clone();
@@ -1297,6 +1469,9 @@ impl Account for StubAccount {
     }
 
     fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
+        if let Some(hook) = &self.lanes.settings.identities_list {
+            return hook();
+        }
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::IdentitiesList)) })
     }
 
@@ -1305,22 +1480,37 @@ impl Account for StubAccount {
         _identity: IdentityId,
         _patch: IdentityPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(hook) = &self.lanes.settings.identity_update {
+            return hook(_identity, _patch);
+        }
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::IdentityUpdate)) })
     }
 
     fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
+        if let Some(hook) = &self.lanes.settings.vacation_get {
+            return hook();
+        }
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::VacationGet)) })
     }
 
     fn vacation_set(&self, _config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(hook) = &self.lanes.settings.vacation_set {
+            return hook(_config);
+        }
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::VacationSet)) })
     }
 
     fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
+        if let Some(hook) = &self.lanes.settings.quota_get {
+            return hook();
+        }
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::QuotaGet)) })
     }
 
     fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
+        if let Some(hook) = &self.lanes.filters.filters_list {
+            return hook();
+        }
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FiltersList)) })
     }
 
@@ -1328,6 +1518,9 @@ impl Account for StubAccount {
         &self,
         _filter: ServerFilterCreate,
     ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+        if let Some(hook) = &self.lanes.filters.filter_create {
+            return hook(_filter);
+        }
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FilterCreate)) })
     }
 
@@ -1336,10 +1529,16 @@ impl Account for StubAccount {
         _filter: ServerFilterId,
         _patch: ServerFilterPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(hook) = &self.lanes.filters.filter_update {
+            return hook(_filter, _patch);
+        }
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FilterUpdate)) })
     }
 
     fn filter_delete(&self, _filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(hook) = &self.lanes.filters.filter_delete {
+            return hook(_filter);
+        }
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FilterDelete)) })
     }
 
@@ -1347,6 +1546,9 @@ impl Account for StubAccount {
         &self,
         _filter: ServerFilterCreate,
     ) -> AccountFuture<Result<FilterValidation, AccountError>> {
+        if let Some(hook) = &self.lanes.filters.filter_validate {
+            return hook(_filter);
+        }
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FilterValidate)) })
     }
 
@@ -1363,6 +1565,9 @@ impl Account for StubAccount {
         _address_book: Option<AddressBookId>,
         _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
+        if let Some(hook) = &self.lanes.pages.contacts_list {
+            return hook(_address_book, _page_cursor);
+        }
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactsList)) })
     }
 

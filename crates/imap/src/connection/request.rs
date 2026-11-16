@@ -4,6 +4,7 @@
 //! SASL requests retain their caller-owned channels and negotiation state.
 
 use super::dispatch;
+use crate::types::Addressing;
 use crate::types::{Command, Flag, MailboxAttribute, MailboxName, SecretString, SequenceSet};
 
 pub(super) trait Request {
@@ -239,7 +240,7 @@ request! {
 
 request! {
     SearchSave { criteria: crate::types::SearchCriteria } =>
-    Command::SearchSave { criteria },
+    Command::SearchSave { addressing: Addressing::Sequences, criteria },
     dispatch::SearchSaveConsumer,
     dispatch::SearchSaveConsumer::new()
 }
@@ -267,63 +268,63 @@ request! {
 
 request! {
     Search { criteria: crate::types::SearchCriteria } =>
-    Command::Search { criteria },
+    Command::Search { addressing: Addressing::Sequences, criteria },
     dispatch::SearchConsumer<crate::types::Seq>,
     dispatch::SearchConsumer::<crate::types::Seq>::new()
 }
 
 request! {
     UidSearch { criteria: crate::types::SearchCriteria } =>
-    Command::UidSearch { criteria },
+    Command::Search { addressing: Addressing::Uids, criteria },
     dispatch::SearchConsumer<crate::types::Uid>,
     dispatch::SearchConsumer::<crate::types::Uid>::new()
 }
 
 request! {
     SearchReturn { criteria: crate::types::SearchCriteria, return_opts: Vec<crate::types::command_options::SearchReturn> } =>
-    Command::SearchReturn { criteria, return_opts },
+    Command::SearchReturn { addressing: Addressing::Sequences, criteria, return_opts },
     dispatch::EsearchConsumer,
     dispatch::EsearchConsumer::new()
 }
 
 request! {
     UidSearchReturn { criteria: crate::types::SearchCriteria, return_opts: Vec<crate::types::command_options::SearchReturn> } =>
-    Command::UidSearchReturn { criteria, return_opts },
+    Command::SearchReturn { addressing: Addressing::Uids, criteria, return_opts },
     dispatch::EsearchConsumer,
     dispatch::EsearchConsumer::new()
 }
 
 request! {
     UidSearchSave { criteria: crate::types::SearchCriteria } =>
-    Command::UidSearchSave { criteria },
+    Command::SearchSave { addressing: Addressing::Uids, criteria },
     dispatch::SearchSaveConsumer,
     dispatch::SearchSaveConsumer::new()
 }
 
 request! {
     Thread { algorithm: String, charset: String, criteria: crate::types::SearchCriteria } =>
-    Command::Thread { algorithm, charset, criteria },
+    Command::Thread { addressing: Addressing::Sequences, algorithm, charset, criteria },
     dispatch::ThreadConsumer<crate::types::Seq>,
     dispatch::ThreadConsumer::<crate::types::Seq>::default()
 }
 
 request! {
     UidThread { algorithm: String, charset: String, criteria: crate::types::SearchCriteria } =>
-    Command::UidThread { algorithm, charset, criteria },
+    Command::Thread { addressing: Addressing::Uids, algorithm, charset, criteria },
     dispatch::ThreadConsumer<crate::types::Uid>,
     dispatch::ThreadConsumer::<crate::types::Uid>::default()
 }
 
 request! {
     Sort { sort_criteria: String, charset: String, criteria: crate::types::SearchCriteria } =>
-    Command::Sort { sort_criteria, charset, criteria },
+    Command::Sort { addressing: Addressing::Sequences, sort_criteria, charset, criteria },
     dispatch::SortConsumer<crate::types::Seq>,
     dispatch::SortConsumer::<crate::types::Seq>::default()
 }
 
 request! {
     UidSort { sort_criteria: String, charset: String, criteria: crate::types::SearchCriteria } =>
-    Command::UidSort { sort_criteria, charset, criteria },
+    Command::Sort { addressing: Addressing::Uids, sort_criteria, charset, criteria },
     dispatch::SortConsumer<crate::types::Uid>,
     dispatch::SortConsumer::<crate::types::Uid>::default()
 }

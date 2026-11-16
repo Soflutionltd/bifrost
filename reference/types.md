@@ -750,9 +750,13 @@ zones are not ordered by their wall clocks.
 answer from the typed start. Neither payload stores a sibling flag.
 `EventPatch::is_all_day` remains an explicit conversion instruction for stored
 bounds, including a patch that supplies no new times. It is not an alternative
-type tag. `EventTime::converted` produces a date for an all-day conversion and
-midnight in its retained timezone (floating when absent) for a date converted
-to timed. Providers retain their
+type tag. For valid bounds, `EventTime::converted` produces a date for an
+all-day conversion and midnight in its retained timezone (floating when absent)
+for a date converted to timed. For Unspecified and Invalid observations, it
+records the requested all-day mode while retaining the original spelling,
+timezone and kind, without fabricating a date. A damaged all-day meeting can
+therefore remain an all-day row without a usable start; its bound still fails
+write validation. Providers retain their
 conversion limitations, such as Google's requirement for both bounds.
 
 `ReminderTrigger::Relative` carries a parsed `ReminderOffset`; its `span()`

@@ -12,19 +12,16 @@ use super::{
     super::{AsyncSmtpConnection, Error},
     PoolConfig, idle_connection_expired, pool_worker_interval,
 };
-use crate::{
-    Executor,
-    executor::{SmtpExecutor, SpawnHandle},
-    transport::smtp::{async_transport::AsyncSmtpClient, error},
-};
+use crate::transport::smtp::{async_transport::AsyncSmtpClient, error};
+use crate::{Executor, TokioExecutor, executor::SpawnHandle};
 
-pub(crate) struct Pool<E: Executor> {
+pub(crate) struct Pool {
     config: PoolConfig,
     connections: Mutex<Option<Vec<ParkedConnection>>>,
     admission: Arc<Semaphore>,
     available: Notify,
-    client: AsyncSmtpClient<E>,
-    handle: OnceLock<E::Handle>,
+    client: AsyncSmtpClient,
+    handle: OnceLock<tokio::task::JoinHandle<()>>,
     worker_completion: OnceLock<tokio::sync::watch::Receiver<()>>,
     shutdown_completion: OnceLock<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
 }
@@ -35,16 +32,14 @@ struct ParkedConnection {
     permit: OwnedSemaphorePermit,
 }
 
-pub(crate) struct PooledConnection<E: Executor> {
+pub(crate) struct PooledConnection {
     conn: Option<AsyncSmtpConnection>,
-    pool: Arc<Pool<E>>,
+    pool: Arc<Pool>,
     permit: Option<OwnedSemaphorePermit>,
 }
 
-impl<E: SmtpExecutor> Pool<E> {
-    // Pool creation can dial replacement idle connections, so it needs the
-    // private SMTP executor extension. Recycling only spawns cleanup work.
-    pub(crate) fn new(config: PoolConfig, client: AsyncSmtpClient<E>) -> Arc<Self> {
+impl Pool {
+    pub(crate) fn new(config: PoolConfig, client: AsyncSmtpClient) -> Arc<Self> {
         let max_size = config.max_size;
         let pool = Arc::new(Self {
             config,
@@ -73,7 +68,7 @@ impl<E: SmtpExecutor> Pool<E> {
                 .worker_completion
                 .set(worker_completion)
                 .expect("worker not started");
-            let handle = E::spawn(async move {
+            let handle = TokioExecutor::spawn(async move {
                 let _worker_lifetime = worker_lifetime;
                 loop {
                     #[cfg(feature = "tracing")]
@@ -166,7 +161,7 @@ impl<E: SmtpExecutor> Pool<E> {
                         }
                     }
 
-                    E::sleep(pool_worker_interval(idle_timeout)).await;
+                    TokioExecutor::sleep(pool_worker_interval(idle_timeout)).await;
                 }
             });
             pool_
@@ -193,7 +188,7 @@ impl<E: SmtpExecutor> Pool<E> {
                     .take();
                 let pool = Arc::clone(self);
                 let (done, mut completed) = tokio::sync::watch::channel(false);
-                E::spawn(async move {
+                TokioExecutor::spawn(async move {
                     pool.shutdown_inner(connections).await;
                     let _ = done.send(true);
                 });
@@ -220,14 +215,14 @@ impl<E: SmtpExecutor> Pool<E> {
         if let Some(handle) = self.handle.get() {
             handle.shutdown().await;
             if let Some(completed) = self.worker_completion.get() {
-                // Executor shutdown requests cancellation; sender drop proves
+                // Task abort requests cancellation; sender drop proves
                 // the worker has actually released its connections and dials.
                 let _ = completed.clone().changed().await;
             }
         }
     }
 
-    pub(crate) async fn connection(self: &Arc<Self>) -> Result<PooledConnection<E>, Error> {
+    pub(crate) async fn connection(self: &Arc<Self>) -> Result<PooledConnection, Error> {
         if self.config.max_size == 0 {
             return Err(error::invalid_input(
                 "pool max_size must be greater than zero",
@@ -327,7 +322,7 @@ impl<E: SmtpExecutor> Pool<E> {
     }
 }
 
-impl<E: Executor> Pool<E> {
+impl Pool {
     /// Park an already-established connection so a test can exercise checkout
     /// and recycle without dialing anything.
     #[cfg(test)]
@@ -358,7 +353,7 @@ impl<E: Executor> Pool<E> {
     fn discard(mut conn: AsyncSmtpConnection, permit: OwnedSemaphorePermit) {
         // Drop cannot await. Keep ownership, including admission, in the task
         // until bounded stream shutdown finishes, just as checkout does.
-        E::spawn(async move {
+        TokioExecutor::spawn(async move {
             conn.abort().await;
             drop(permit);
         });
@@ -392,7 +387,7 @@ impl<E: Executor> Pool<E> {
     }
 }
 
-impl<E: Executor> Debug for Pool<E> {
+impl Debug for Pool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Pool")
             .field("config", &self.config)
@@ -422,7 +417,7 @@ impl<E: Executor> Debug for Pool<E> {
     }
 }
 
-impl<E: Executor> Drop for Pool<E> {
+impl Drop for Pool {
     fn drop(&mut self) {
         #[cfg(feature = "tracing")]
         tracing::debug!("dropping Pool");
@@ -455,11 +450,11 @@ impl ParkedConnection {
     }
 }
 
-impl<E: Executor> PooledConnection<E> {
+impl PooledConnection {
     // wrap installs the owned connection; only Drop takes it. Safe callers
     // cannot dereference during or after Drop, so the lifecycle expects below
     // cannot be broken by server input or cancellation.
-    fn wrap(conn: AsyncSmtpConnection, pool: Arc<Pool<E>>, permit: OwnedSemaphorePermit) -> Self {
+    fn wrap(conn: AsyncSmtpConnection, pool: Arc<Pool>, permit: OwnedSemaphorePermit) -> Self {
         Self {
             conn: Some(conn),
             pool,
@@ -468,7 +463,7 @@ impl<E: Executor> PooledConnection<E> {
     }
 }
 
-impl<E: Executor> Deref for PooledConnection<E> {
+impl Deref for PooledConnection {
     type Target = AsyncSmtpConnection;
 
     fn deref(&self) -> &Self::Target {
@@ -476,13 +471,13 @@ impl<E: Executor> Deref for PooledConnection<E> {
     }
 }
 
-impl<E: Executor> DerefMut for PooledConnection<E> {
+impl DerefMut for PooledConnection {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.conn.as_mut().expect("conn hasn't been dropped yet")
     }
 }
 
-impl<E: Executor> Drop for PooledConnection<E> {
+impl Drop for PooledConnection {
     fn drop(&mut self) {
         let conn = self
             .conn
@@ -521,7 +516,6 @@ mod tests {
     async fn discarded_connection_keeps_admission_until_shutdown_finishes() {
         for closed in [false, true] {
             use super::Pool;
-            use crate::TokioExecutor;
 
             let hello = ClientId::Domain("client.example".to_owned());
             let transcript = Transcript::new("220 smtp.example\r\n")
@@ -549,9 +543,9 @@ mod tests {
             let admission = Arc::new(tokio::sync::Semaphore::new(1));
             let permit = Arc::clone(&admission).try_acquire_owned().unwrap();
             let pool = Pool::new(
-            super::super::PoolConfig::new(),
-            crate::transport::smtp::async_transport::AsyncSmtpClient::<TokioExecutor>::for_pool_test(),
-        );
+                super::super::PoolConfig::new(),
+                crate::transport::smtp::async_transport::AsyncSmtpClient::for_pool_test(),
+            );
             // A checked-out connection can return after shutdown took the idle set.
             if closed {
                 pool.connections.lock().unwrap().take();

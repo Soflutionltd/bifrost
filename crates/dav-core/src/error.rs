@@ -337,9 +337,13 @@ fn status_error_for(
         .operation(operation)
         .status(Some(status.as_u16()));
     let mut builder = builder;
-    let body = body.trim();
+    // A refusal body can echo Authorization, cookies or submitted content.
+    // Support consent is not credential consent: retain size, never raw text.
     if !body.is_empty() {
-        builder = builder.text(DiagnosticText::support_only(body.to_string()));
+        builder = builder.text(DiagnosticText::support_only(format!(
+            "DAV response body omitted ({} bytes)",
+            body.len()
+        )));
     }
     builder
         .try_build()
@@ -507,6 +511,30 @@ pub fn should_fallback_discovery(error: &AccountError, protocol: DavProtocol) ->
 mod tests {
     use super::*;
     use bifrost_types::RecoveryClass;
+
+    #[test]
+    fn status_diagnostics_do_not_retain_echoed_secrets() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            let error = status_error(
+                &reqwest::header::HeaderMap::new(),
+                AccountOperation::EventGet,
+                StatusCode::FORBIDDEN,
+                "Authorization: Bearer echoed-secret; Cookie: session-secret".to_string(),
+                protocol,
+            );
+            assert_eq!(error.diagnostics().status, Some(403));
+            assert_eq!(error.diagnostics().text.len(), 1);
+            assert!(error.diagnostics().text[0].as_str().contains("bytes"));
+            assert!(!format!("{error:?}").contains("secret"));
+            assert!(
+                error
+                    .diagnostics()
+                    .text
+                    .iter()
+                    .all(|text| !text.as_str().contains("secret"))
+            );
+        }
+    }
 
     #[test]
     fn status_headers_preserve_retry_timing_and_account_throttle_scope() {

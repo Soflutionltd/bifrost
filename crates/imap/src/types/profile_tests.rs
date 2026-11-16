@@ -77,10 +77,11 @@ fn the_dual_mode_rule_truth_table() {
     }
 }
 
-/// Capability-by-capability, state-by-state matrix for the single authority,
-/// against the first-principles oracle. Covers every `Capability` variant in
-/// every rev2-ACTIVE state, both unadvertised and advertised, and checks that
-/// `ServerProfile::supports` (a view over the authority) gives the same answer.
+/// Capability-by-capability, state-by-state wiring matrix. The fixture asks
+/// the production `SessionCapabilities` owner for the expected answer; it is
+/// not an independent oracle for the capability policy. Covers every
+/// `Capability` variant, advertised and unadvertised, across the fixture's
+/// negotiation states, checking `supports` and `ServerProfile::supports`.
 #[test]
 fn supports_matrix_over_every_capability_and_state() {
     use capability_matrix::{connection_states, every_capability, expected_usable};

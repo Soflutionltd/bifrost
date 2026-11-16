@@ -219,13 +219,13 @@ impl From<Dialect> for bifrost_types::error::Protocol {
 }
 
 #[cfg(feature = "tokio")]
-// pub: async SMTP and LMTP transports are the tokio user-facing API.
-pub use self::async_transport::{
-    AsyncLmtpTransport, AsyncLmtpTransportBuilder, AsyncSmtpTransport, AsyncSmtpTransportBuilder,
-};
-#[cfg(feature = "tokio")]
 pub(crate) use self::client::AsyncSmtpConnection;
 pub(crate) use self::client::SmtpConnection;
+#[cfg(feature = "tokio")]
+// pub: async SMTP and LMTP transports are the tokio user-facing API.
+pub use self::surface::{
+    AsyncLmtpTransport, AsyncLmtpTransportBuilder, AsyncSmtpTransport, AsyncSmtpTransportBuilder,
+};
 // pub: callers configure SMTP TLS roots and client identities explicitly.
 pub use self::client::{Certificate, Identity};
 // pub: callers choose SMTP TLS mode, SNI, and native-tls parameters.
@@ -236,7 +236,7 @@ pub use self::pool::PoolConfig;
 pub use self::{
     error::{Error, ErrorKind},
     extension::SendOptions,
-    transport::{LmtpTransport, LmtpTransportBuilder, SmtpTransport, SmtpTransportBuilder},
+    surface::{LmtpTransport, LmtpTransportBuilder, SmtpTransport, SmtpTransportBuilder},
 };
 use crate::transport::smtp::{
     authentication::{Credentials, DEFAULT_MECHANISMS, Mechanism},
@@ -271,7 +271,14 @@ pub mod response;
 pub(crate) mod test_support;
 #[cfg(feature = "test-support")]
 pub use test_support::{ScriptedConnector, Transcript};
+#[cfg(feature = "tokio")]
+mod dial;
+mod surface;
 mod transport;
+// pub: callers may name the dialect/runtime product directly.
+#[cfg(feature = "tokio")]
+pub use surface::Tokio;
+pub use surface::{Blocking, Builder, Lmtp, Smtp, Transport};
 pub(super) mod util;
 
 // Registered port numbers:

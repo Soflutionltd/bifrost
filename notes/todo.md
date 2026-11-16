@@ -45,11 +45,17 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
-- **DAV wire types can expose secrets through `Debug`.** Derived `Debug` on
-  `DavHref`, `DavRequest`, `DavResponse` and `DavBody` prints URLs, headers or
-  bodies; retained server response evidence can also carry echoed secrets.
-  Reported in passing, unverified. (URL diagnostics are already redacted to
-  the origin.)
+- **Remaining paths by which a secret can reach `Debug` or diagnostics.**
+  Reported in passing, unverified. DAV wire types and URL diagnostics are
+  already redacted.
+  - CalDAV and CardDAV config `Debug` prints the raw `base_url`, and the
+    factory `Debug` includes the config.
+  - `crates/net/src/error.rs`: `FinalResponse` derives `Debug` over headers
+    and body.
+  - `crates/net/src/account_error.rs`: `response_diagnostics` keeps raw body
+    text and selected header values, which DAV transport errors can receive.
+  - `crates/dav-core/src/dispatch.rs`: token-source error text enters
+    diagnostics without credential sanitization.
 
 ## 2. Blocked on a live probe
 
@@ -286,21 +292,16 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
-- **Reference and comment handoffs from the November 2026 resolution loop.**
-  Doc-only, each checked against code when written:
-  - `reference/sync.md` still lists throttle cleanup as a detach registration
-    duty (`ThrottleBucket::forget_account` is gone; deadlines expire on their
-    own), and does not say initial `subscribe_push` refuses an account with no
-    effective push lanes as `Unsupported(PushSubscribe)`.
-  - `reference/types.md`: `EventTime::converted` records all-day mode on
-    Unspecified and Invalid observations without fabricating a date.
-  - `reference/imap.md`: `ThreadNode` clone, debug, equality and hashing use
-    explicit worklists; the `connection/` tree is under `warn(dead_code)` with
-    test-only command adapters and compression, and the pipeline is the
-    retained exception.
-  - `crates/imap/src/types/profile_tests.rs` still calls its fixture a
-    first-principles oracle; `connection/wire.rs` documents a nonexistent
-    `ImapConnection::new_wire_reader`.
+- **Doc handoffs from the November 2026 resolution loop.** `reference/sync.md`'s
+  throttle overview and lookup discussion name a `ThrottleKey::Mailbox`
+  variant that does not exist (the enum has `Owner`, `Folder`, `Account` and
+  `Budget`). The SMTP transport unification into
+  `crates/smtp/src/transport/smtp/surface.rs` dropped the long rustdoc the old
+  `SmtpTransport` and `AsyncSmtpTransport` carried (pool behaviour, relay
+  guidance); restore it on the aliases or the generic types.
+- **SMTP scripted dialing disagrees on Unix sockets.** The blocking scripted
+  dialer can ignore a configured Unix socket while the async one rejects the
+  combination. Reported in passing, unverified.
 - **Lateral findings from the review of the primary-cause builder rewrite.**
   - Several producers mint a scope-directed state cause with a placeholder
     `CursorScope` and rely on a later `.scope(ErrorScope::Cursor(_))` to rebind

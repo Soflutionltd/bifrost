@@ -116,10 +116,10 @@ pub mod transport;
 use std::error::Error as StdError;
 
 #[cfg(feature = "tokio")]
-// pub: async transport executors are chosen by users of the tokio API.
+// pub: callers can use the sealed Tokio task and timer services.
 pub use self::executor::Executor;
 #[cfg(feature = "tokio")]
-// pub: default tokio executor for async SMTP and LMTP transports.
+// pub: Tokio task and timer service provider.
 pub use self::executor::TokioExecutor;
 #[cfg(feature = "tokio")]
 #[doc(inline)]

@@ -269,7 +269,7 @@ The whole teardown runs under the same `lifecycle_inflight` guard
 `attach` takes, claimed together with the slot removal under one lock
 acquisition. The slot leaves `engine.accounts` at the top while the
 registry cleanup (invalidation sink, budget gate, backfill registry,
-throttle memberships, bandwidth meter) happens at the very bottom,
+bandwidth meter) happens at the very bottom,
 after up to four `detach_timeout` budgets of worker awaits, writer drain, the
 reopen-lock wait and `Account::close()`.
 Without the guard an attach landing in that window saw no slot, no
@@ -280,7 +280,12 @@ itself attached while silently dropping every out-of-process push
 racing attach now gets `AccountAlreadyAttached`, which is literally
 true: the incarnation is attached and draining. A racing detach, and an
 attach still in flight, both yield `AccountNotAttached`. Pinned by
-`tests/attach_schema_recovery.rs::attach_cannot_land_inside_an_in_flight_detach`.
+`tests/attachment_lifecycle.rs::attach_cannot_land_inside_an_in_flight_detach`.
+
+Throttle deadlines are engine-owned and survive detach until expiry. They
+describe provider holds on stable account identities or shared budgets, so
+detaching and reattaching must not let a user bypass a provider wait. Expired
+entries are pruned opportunistically during throttle lookup.
 
 Once detach claims the reservation and removes the slot, it synchronously
 raises the teardown signals (`DetachingAccount::begin`: inert departure sweep,
@@ -2263,6 +2268,12 @@ are retired; a later call retries only the failed handles. This composes
 with Graph's retained server ids after a failed DELETE.
 `SyncEngine::subscribe_push` is the engine-side entry that returns the
 per-scope result and records its handle only when at least one scope succeeded.
+Before calling the provider, it refuses an account with no effective push lanes
+as `Unsupported(PushSubscribe)`, stamped with the account's protocol. Effective
+lanes are empty when `PushCapability::None` disables push or `push_lanes()`
+declares no lanes. Polling remains active: a user must not receive a live
+subscription handle that replacement would silently discard for lack of push
+coverage.
 Reopen likewise recreates and records only accepted scopes. Both entries
 serialize on the slot's reopen lock:
 reattach snapshots the registry, tears old handles down, and installs
@@ -4119,7 +4130,7 @@ to the per-account `AccountControl` broadcast via
 `SyncEngine::account_control_stream` and flip back via
 `SyncEngine::resume_account`. The account-wide shape is pinned
 end-to-end by
-`tests/attach_schema_recovery.rs::three_failed_reopens_terminate_and_pause_the_account`,
+`tests/supervisor_restart_budget.rs::three_failed_reopens_terminate_and_pause_the_account`,
 which runs under paused time so the recorded per-attempt open instants
 exercise the bounded reopen schedule under the shared jitter envelope.
 

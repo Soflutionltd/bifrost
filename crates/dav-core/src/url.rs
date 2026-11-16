@@ -4,10 +4,19 @@
 ///
 /// XML-relative hrefs must be resolved before construction. Persisted ids retain
 /// their spelling; the credential policy still has to admit the parsed origin.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct DavHref {
     spelling: String,
     url: reqwest::Url,
+}
+
+// Support needs the origin, not userinfo or tokens embedded in resource URLs.
+impl std::fmt::Debug for DavHref {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DavHref")
+            .field("origin", &diagnostic_origin(self.as_str()))
+            .finish_non_exhaustive()
+    }
 }
 
 impl DavHref {

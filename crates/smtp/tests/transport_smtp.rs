@@ -23,7 +23,7 @@ mod sync {
 #[cfg(test)]
 #[cfg(feature = "tokio")]
 mod tokio {
-    use bifrost_smtp::{AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor};
+    use bifrost_smtp::{AsyncSmtpTransport, AsyncTransport, Message};
 
     #[tokio::test]
     #[ignore = "requires a local SMTP server on 127.0.0.1:2525"]
@@ -36,10 +36,9 @@ mod tokio {
             .body(String::from("Be happy!"))
             .unwrap();
 
-        let sender: AsyncSmtpTransport<TokioExecutor> =
-            AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
-                .port(2525)
-                .build();
+        let sender: AsyncSmtpTransport = AsyncSmtpTransport::builder_dangerous("127.0.0.1")
+            .port(2525)
+            .build();
         sender.send(&email).await.unwrap();
     }
 }

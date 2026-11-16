@@ -12,61 +12,20 @@ use std::sync::{Arc, Mutex};
 
 use bifrost_sync::{Error, SyncEngine};
 use bifrost_types::{
-    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountFactory, AccountFuture,
-    AccountId, AccountStream, AddressBook, AddressBookId, AttachmentHandle, BatchingPolicy,
-    BlobHandle, BlobRangeSupport, ByteRange, Calendar, CalendarEvent, Change, ChangeCursor,
-    CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
-    ContainerId, ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment,
-    CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
-    EventRange, EventSearchRequest, FilterDiagnostic, FilterDiagnosticSeverity, FilterRuleShape,
-    FilterScriptCreate, FilterScriptPatch, FilterValidation, FlagOp, HostedAttachment,
-    HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
-    Importance, InventoryEvent, ItemOutcome, MembershipScope, Message, MutationCapabilities,
-    MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page,
-    PimMethodSupport, PrimaryCause, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal,
-    RateLimitClass, RequestCause, RsvpStatus, ScopeLifecycleEvent, ScriptLanguage, SearchRequest,
-    SendReceipt, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
-    SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
+    Account, AccountCapabilities, AccountError, AccountFactory, AccountFuture, AccountId,
+    FilterDiagnostic, FilterDiagnosticSeverity, FilterRuleShape, FilterScriptCreate,
+    FilterScriptPatch, FilterValidation, ScriptLanguage, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch,
 };
-use bytes::Bytes;
-use futures::stream;
 
-/// Convenience for stubs that just need to signal "this operation is
-/// not implemented in this test double."
-fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Unsupported {
-        operation: op,
-    }))
-    .operation(op)
-    .try_build()
-    .expect("valid account error classification")
-}
+mod common;
+
+use common::unsupported;
 
 fn caps() -> AccountCapabilities {
     AccountCapabilities {
-        cursor_freshness: CursorFreshness::ServerIssued,
-        blob_range: BlobRangeSupport::No,
-        blob_digest_pre_download: false,
-        push: PushCapability::None,
-        mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::ExpectedVersion(bifrost_types::VersionedDoors::NONE),
-            replay_safety: MutationReplaySafety::None,
-            reassertion: bifrost_types::MutationReassertion::NONE,
-        },
-        batching_policy: BatchingPolicy {
-            max_items: 100,
-            max_wait: std::time::Duration::from_millis(50),
-            flush_on_input_close: true,
-        },
-        rate_limit_class: RateLimitClass::Generous,
-        quota_signal: QuotaSignal::None,
-        requires_uidvalidity_recheck: false,
-        historyid_expires_after: None,
-        delta_token_expires_after: None,
-        pim_methods: PimMethodSupport::default(),
         filter_rule_shape: FilterRuleShape::Scripts,
-        conveniences: ConvenienceShape::default(),
-        discovers_foreign_namespaces_on_rediscovery: false,
+        ..common::caps()
     }
 }
 
@@ -82,8 +41,8 @@ struct Recorded {
 
 /// Account double: records the arguments each filter primitive is
 /// called with (or, when `fail` is set, returns an `AccountError` so the
-/// engine's `?` folding can be exercised). Every non-filter method is
-/// stubbed - discovery streams are empty so `attach` establishes zero
+/// engine's `?` folding can be exercised). The shared stub discovers zero
+/// scopes, so `attach` establishes zero
 /// scopes and completes without touching any of them.
 struct FilterAccount {
     caps: AccountCapabilities,
@@ -105,7 +64,8 @@ impl AccountFactory for FilterFactory {
             caps: caps(),
             rec: Arc::clone(&self.rec),
             fail: self.fail,
-        };
+        }
+        .into_stub();
         Box::pin(async move {
             Ok(bifrost_types::OpenedAccount::complete(
                 Arc::new(account) as Arc<dyn Account>
@@ -125,593 +85,91 @@ fn sample_script_create(body: &str) -> ServerFilterCreate {
     })
 }
 
-impl Account for FilterAccount {
-    fn protocol(&self) -> bifrost_types::Protocol {
-        bifrost_types::Protocol::Unknown
-    }
-
-    fn capabilities(&self) -> &AccountCapabilities {
-        &self.caps
-    }
-
-    fn set_priority(&self, _priority: Priority) {}
-
-    fn set_bandwidth_cap(&self, _bps: Option<bifrost_types::BandwidthCap>) {}
-
-    fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
-        unreachable!("describe_cursor not exercised by filter passthrough tests")
-    }
-
-    fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>> {
-        Box::pin(stream::empty())
-    }
-
-    fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>> {
-        Box::pin(stream::empty())
-    }
-
-    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
-        Box::pin(stream::empty())
-    }
-
-    fn establish_initial_cursor(
-        &self,
-        _scope: CursorScope,
-    ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::EstablishCursor,
-            ))
-        })
-    }
-
-    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<InventoryEvent> {
-        Box::pin(stream::empty())
-    }
-
-    fn get_stream(
-        &self,
-        _ids: AccountStream<ObjectId>,
-        _projection: Projection,
-    ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
-        Box::pin(stream::empty::<SyncEvent<ItemOutcome<HydratedObject>>>())
-    }
-
-    fn changes_stream(&self, _cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
-        Box::pin(stream::empty())
-    }
-
-    fn push_subscribe(
-        &self,
-        _scopes: &[CursorScope],
-    ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::PushSubscribe)) })
-    }
-
-    fn push_unsubscribe(
-        &self,
-        _handle: SubscriptionHandle,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::PushUnsubscribe,
-            ))
-        })
-    }
-
-    fn push_stream(
-        &self,
-        lane: bifrost_types::PushLane,
-        _stop: bifrost_types::SessionStop,
-        _gate: bifrost_types::PushGate,
-    ) -> AccountStream<bifrost_types::PushSessionEvent> {
-        Box::pin(futures::stream::iter([
-            bifrost_types::PushSessionEvent::Failed(bifrost_types::push_lane_contract_error(
-                self.protocol(),
-                lane,
-                "not a lane of this account",
-            )),
-        ]))
-    }
-
-    fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {
-        Box::pin(stream::empty())
-    }
-
-    fn open_blob_range(
-        &self,
-        _handle: BlobHandle,
-        _range: ByteRange,
-    ) -> AccountStream<SyncEvent<Bytes>> {
-        Box::pin(stream::empty())
-    }
-
-    fn open_raw_rfc822(&self, _message: ObjectId) -> AccountStream<SyncEvent<Bytes>> {
-        Box::pin(stream::empty())
-    }
-
-    fn bulk_set_flags(
-        &self,
-        _targets: AccountStream<ObjectId>,
-        _op: FlagOp,
-        _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        Box::pin(stream::empty())
-    }
-
-    fn bulk_move(
-        &self,
-        _targets: AccountStream<ObjectId>,
-        _destination: MembershipScope,
-        _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        Box::pin(stream::empty())
-    }
-
-    fn bulk_destroy(
-        &self,
-        _targets: AccountStream<ObjectId>,
-        _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        Box::pin(stream::empty())
-    }
-
-    fn close(&self) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn add_to_container(
-        &self,
-        _target: MutationTarget,
-        _container: ContainerId,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::AddToContainer)) })
-    }
-
-    fn remove_from_container(
-        &self,
-        _target: MutationTarget,
-        _container: ContainerId,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::RemoveFromContainer,
-            ))
-        })
-    }
-
-    fn set_keyword(
-        &self,
-        _target: MutationTarget,
-        _keyword: bifrost_types::Flag,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetKeyword)) })
-    }
-
-    fn set_label_membership(
-        &self,
-        _target: MutationTarget,
-        _label: ContainerId,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::SetLabelMembership,
-            ))
-        })
-    }
-
-    fn set_category(
-        &self,
-        _target: MutationTarget,
-        _category: String,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetCategory)) })
-    }
-
-    fn set_extended_property(
-        &self,
-        _target: MutationTarget,
-        _property_id: String,
-        _value: Option<String>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::SetExtendedProperty,
-            ))
-        })
-    }
-
-    fn set_is_read(
-        &self,
-        _target: MutationTarget,
-        _is_read: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetIsRead)) })
-    }
-
-    fn set_importance(
-        &self,
-        _target: MutationTarget,
-        _level: Importance,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetImportance)) })
-    }
-
-    fn send_message(
-        &self,
-        _request: SendRequest,
-    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Send)) })
-    }
-
-    fn attachment_upload(
-        &self,
-        _bytes: AccountStream<Result<Bytes, AccountError>>,
-        _mime: String,
-    ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::AttachmentUpload,
-            ))
-        })
-    }
-
-    fn host_attachment(
-        &self,
-        _bytes: Bytes,
-        _meta: CloudUploadMeta,
-    ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::HostAttachment)) })
-    }
-
-    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftCreate)) })
-    }
-
-    fn draft_update(
-        &self,
-        _draft: DraftHandle,
-        _patch: DraftPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftUpdate)) })
-    }
-
-    fn draft_discard(&self, _draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftDiscard)) })
-    }
-
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftSend)) })
-    }
-
-    fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::CancelScheduledSend,
-            ))
-        })
-    }
-
-    fn reschedule_send(
-        &self,
-        _handle: ObjectId,
-        _scheduled: std::time::SystemTime,
-    ) -> AccountFuture<Result<ObjectId, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::RescheduleSend)) })
-    }
-
-    fn search(
-        &self,
-        _request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Search)) })
-    }
-
-    fn search_messages(
-        &self,
-        _request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SearchMessages)) })
-    }
-
-    fn containers_list(&self) -> AccountFuture<Result<bifrost_types::ContainerList, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainersList)) })
-    }
-
-    fn container_create(
-        &self,
-        _kind: ContainerKind,
-        _name: String,
-        _parent: Option<ContainerId>,
-        _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::ContainerCreate,
-            ))
-        })
-    }
-
-    fn container_rename(
-        &self,
-        _container: ContainerId,
-        _name: String,
-        _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::ContainerRename,
-            ))
-        })
-    }
-
-    fn container_move(
-        &self,
-        _container: ContainerId,
-        _new_parent: Option<ContainerId>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainerMove)) })
-    }
-
-    fn container_delete(&self, _container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::ContainerDelete,
-            ))
-        })
-    }
-
-    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::IdentitiesList)) })
-    }
-
-    fn identity_update(
-        &self,
-        _identity: IdentityId,
-        _patch: IdentityPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::IdentityUpdate)) })
-    }
-
-    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::VacationGet)) })
-    }
-
-    fn vacation_set(&self, _config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::VacationSet)) })
-    }
-
-    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::QuotaGet)) })
-    }
-
-    fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
-        let fail = self.fail;
-        let rec = Arc::clone(&self.rec);
-        Box::pin(async move {
-            if fail {
-                return Err(unsupported(bifrost_types::AccountOperation::FiltersList));
-            }
-            rec.lock().expect("recorder lock").list_called = true;
-            Ok(vec![ServerFilter::Script(bifrost_types::FilterScript {
-                id: ServerFilterId("listed-script".to_owned()),
-                name: Some("listed".to_owned()),
-                language: ScriptLanguage::Sieve,
-                body: "keep;".to_owned(),
-                is_active: true,
-            })])
-        })
-    }
-
-    fn filter_create(
-        &self,
-        filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
-        let fail = self.fail;
-        let rec = Arc::clone(&self.rec);
-        Box::pin(async move {
-            if fail {
-                return Err(unsupported(bifrost_types::AccountOperation::FilterCreate));
-            }
-            rec.lock().expect("recorder lock").created = Some(filter);
-            Ok(ServerFilterId("created-id".to_owned()))
-        })
-    }
-
-    fn filter_update(
-        &self,
-        filter: ServerFilterId,
-        patch: ServerFilterPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        let fail = self.fail;
-        let rec = Arc::clone(&self.rec);
-        Box::pin(async move {
-            if fail {
-                return Err(unsupported(bifrost_types::AccountOperation::FilterUpdate));
-            }
-            rec.lock().expect("recorder lock").updated = Some((filter, patch));
-            Ok(())
-        })
-    }
-
-    fn filter_delete(&self, filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
-        let fail = self.fail;
-        let rec = Arc::clone(&self.rec);
-        Box::pin(async move {
-            if fail {
-                return Err(unsupported(bifrost_types::AccountOperation::FilterDelete));
-            }
-            rec.lock().expect("recorder lock").deleted = Some(filter);
-            Ok(())
-        })
-    }
-
-    fn filter_validate(
-        &self,
-        filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<FilterValidation, AccountError>> {
-        let fail = self.fail;
-        let rec = Arc::clone(&self.rec);
-        Box::pin(async move {
-            if fail {
-                return Err(unsupported(bifrost_types::AccountOperation::FilterValidate));
-            }
-            rec.lock().expect("recorder lock").validated = Some(filter);
-            Ok(FilterValidation {
-                diagnostics: vec![FilterDiagnostic {
-                    severity: FilterDiagnosticSeverity::Warning,
-                    message: "accepted with warning".to_owned(),
-                    line: Some(1),
-                    column: None,
-                }],
+impl FilterAccount {
+    fn into_stub(self) -> common::StubAccount {
+        let mut stub = common::StubAccount::new(Vec::new());
+        stub.protocol = bifrost_types::Protocol::Unknown;
+        stub.caps = self.caps.clone();
+        let config = Arc::new(self);
+        let config_for_hook = Arc::clone(&config);
+        stub.lanes.filters.filters_list = Some(Arc::new(move || {
+            let config = &config_for_hook;
+            let fail = config.fail;
+            let rec = Arc::clone(&config.rec);
+            Box::pin(async move {
+                if fail {
+                    return Err(unsupported(bifrost_types::AccountOperation::FiltersList));
+                }
+                rec.lock().expect("recorder lock").list_called = true;
+                Ok(vec![ServerFilter::Script(bifrost_types::FilterScript {
+                    id: ServerFilterId("listed-script".to_owned()),
+                    name: Some("listed".to_owned()),
+                    language: ScriptLanguage::Sieve,
+                    body: "keep;".to_owned(),
+                    is_active: true,
+                })])
             })
-        })
-    }
-
-    fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::AddressBooksList,
-            ))
-        })
-    }
-
-    fn contacts_list(
-        &self,
-        _address_book: Option<AddressBookId>,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactsList)) })
-    }
-
-    fn contact_get(&self, _contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactGet)) })
-    }
-
-    fn contact_create(
-        &self,
-        _contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactCreate)) })
-    }
-
-    fn contact_update(
-        &self,
-        _contact: ContactId,
-        _patch: ContactPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactUpdate)) })
-    }
-
-    fn contact_delete(&self, _contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactDelete)) })
-    }
-
-    fn contact_search(
-        &self,
-        _request: ContactSearchRequest,
-    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactSearch)) })
-    }
-
-    fn directory_search(
-        &self,
-        _query: String,
-        _limit: Option<u32>,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<bifrost_types::DirectoryCard>, AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::DirectorySearch,
-            ))
-        })
-    }
-
-    fn directory_groups_list(
-        &self,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroup>, AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::DirectoryGroupsList,
-            ))
-        })
-    }
-
-    fn directory_group_expand(
-        &self,
-        _group: bifrost_types::DirectoryGroupId,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroupMember>, AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::DirectoryGroupExpand,
-            ))
-        })
-    }
-
-    fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::CalendarsList)) })
-    }
-
-    fn events_in_range(
-        &self,
-        _range: EventRange,
-    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventsInRange)) })
-    }
-
-    fn event_get(&self, _event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventGet)) })
-    }
-
-    fn event_create(&self, _event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventCreate)) })
-    }
-
-    fn event_update(
-        &self,
-        _event: EventId,
-        _patch: EventPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventUpdate)) })
-    }
-
-    fn event_delete(&self, _event: EventId) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventDelete)) })
-    }
-
-    fn event_rsvp(
-        &self,
-        _event: EventId,
-        _status: RsvpStatus,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventRsvp)) })
-    }
-
-    fn event_search(
-        &self,
-        _request: EventSearchRequest,
-    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventSearch)) })
-    }
-
-    fn thread_hydrate(
-        &self,
-        _thread: ThreadId,
-    ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::HydrateThread)) })
-    }
-
-    fn message_hydrate(
-        &self,
-        _message: ObjectId,
-        _projection: HydrationProjection,
-    ) -> AccountFuture<Result<Message, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::HydrateMessage)) })
+        }));
+        let config_for_hook = Arc::clone(&config);
+        stub.lanes.filters.filter_create = Some(Arc::new(move |filter| {
+            let config = &config_for_hook;
+            let fail = config.fail;
+            let rec = Arc::clone(&config.rec);
+            Box::pin(async move {
+                if fail {
+                    return Err(unsupported(bifrost_types::AccountOperation::FilterCreate));
+                }
+                rec.lock().expect("recorder lock").created = Some(filter);
+                Ok(ServerFilterId("created-id".to_owned()))
+            })
+        }));
+        let config_for_hook = Arc::clone(&config);
+        stub.lanes.filters.filter_update = Some(Arc::new(move |filter, patch| {
+            let config = &config_for_hook;
+            let fail = config.fail;
+            let rec = Arc::clone(&config.rec);
+            Box::pin(async move {
+                if fail {
+                    return Err(unsupported(bifrost_types::AccountOperation::FilterUpdate));
+                }
+                rec.lock().expect("recorder lock").updated = Some((filter, patch));
+                Ok(())
+            })
+        }));
+        let config_for_hook = Arc::clone(&config);
+        stub.lanes.filters.filter_delete = Some(Arc::new(move |filter| {
+            let config = &config_for_hook;
+            let fail = config.fail;
+            let rec = Arc::clone(&config.rec);
+            Box::pin(async move {
+                if fail {
+                    return Err(unsupported(bifrost_types::AccountOperation::FilterDelete));
+                }
+                rec.lock().expect("recorder lock").deleted = Some(filter);
+                Ok(())
+            })
+        }));
+        let config_for_hook = Arc::clone(&config);
+        stub.lanes.filters.filter_validate = Some(Arc::new(move |filter| {
+            let config = &config_for_hook;
+            let fail = config.fail;
+            let rec = Arc::clone(&config.rec);
+            Box::pin(async move {
+                if fail {
+                    return Err(unsupported(bifrost_types::AccountOperation::FilterValidate));
+                }
+                rec.lock().expect("recorder lock").validated = Some(filter);
+                Ok(FilterValidation {
+                    diagnostics: vec![FilterDiagnostic {
+                        severity: FilterDiagnosticSeverity::Warning,
+                        message: "accepted with warning".to_owned(),
+                        line: Some(1),
+                        column: None,
+                    }],
+                })
+            })
+        }));
+        stub
     }
 }
 

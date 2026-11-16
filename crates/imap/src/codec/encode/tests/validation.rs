@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::Addressing;
 
 /// `validate_no_crlf` accepts clean input.
 #[test]
@@ -64,6 +65,7 @@ fn an_encoder_capability_refusal_names_the_command_and_the_capability() {
 #[test]
 fn an_encoder_validation_refusal_arrives_as_invalid_input() {
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: String::new().into(),
     };
     let mut buf = BytesMut::new();
@@ -82,6 +84,7 @@ fn an_encoder_validation_refusal_arrives_as_invalid_input() {
 #[test]
 fn crlf_injection_bare_cr_rejected() {
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: "ALL\rA002 DELETE INBOX".into(),
     };
     let mut buf = BytesMut::new();
@@ -96,6 +99,7 @@ fn crlf_injection_bare_cr_rejected() {
 #[test]
 fn crlf_injection_bare_lf_rejected() {
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: "ALL\nA002 DELETE INBOX".into(),
     };
     let mut buf = BytesMut::new();

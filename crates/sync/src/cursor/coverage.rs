@@ -3503,3 +3503,6 @@ mod tests {
         assert!(matches!(pending.claim(id), ClaimLookup::Unknown));
     }
 }
+
+#[cfg(test)]
+mod capacity_tests;

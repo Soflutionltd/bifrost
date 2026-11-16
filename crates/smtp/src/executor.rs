@@ -1,25 +1,10 @@
 use std::fmt::Debug;
-use std::path::Path;
 use std::time::Duration;
-
-#[cfg(feature = "tokio")]
-use crate::transport::smtp::AsyncSmtpConnection;
-#[cfg(feature = "tokio")]
-use crate::transport::smtp::Dialect;
-#[cfg(feature = "tokio")]
-use crate::transport::smtp::Error;
-#[cfg(feature = "tokio")]
-use crate::transport::smtp::Tls;
-use crate::transport::smtp::WireMetering;
-#[cfg(feature = "tokio")]
-use crate::transport::smtp::extension::ClientId;
 
 /// Async executor abstraction trait
 ///
-/// Used by [`AsyncSmtpTransport`] so tests and transports can share one
-/// Tokio-backed abstraction.
-///
-/// [`AsyncSmtpTransport`]: crate::AsyncSmtpTransport
+/// Sealed Tokio task and timer services. Transport dialing is owned by the
+/// SMTP connection adapter.
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub trait Executor: Debug + Send + Sync + 'static + private::Sealed {
     #[allow(private_bounds)]
@@ -41,37 +26,9 @@ pub(crate) trait SpawnHandle: Debug + Send + Sync + 'static + private::Sealed {
     fn shutdown(&self) -> impl Future<Output = ()> + Send + '_;
 }
 
-pub(crate) struct ConnectionOptions {
-    pub(crate) protocol: Dialect,
-    pub(crate) metering: WireMetering,
-    #[cfg(feature = "test-support")]
-    pub(crate) connector: Option<crate::transport::smtp::test_support::ScriptedConnector>,
-}
-
-pub(crate) trait SmtpExecutor: Executor {
-    // Keep SMTP dialing out of the public `Executor` trait. Public async
-    // transport constructors intentionally use this private sealed bound, so
-    // those call sites carry `#[allow(private_bounds)]`.
-    //
-    // Connection options carry protocol policy and the optional scripted dial
-    // alongside metering, keeping the dial signature stable across features.
-    #[allow(clippy::too_many_arguments)]
-    fn connect<'a>(
-        hostname: &'a str,
-        port: u16,
-        unix_socket: Option<&'a Path>,
-        timeout: Option<Duration>,
-        hello_name: &'a ClientId,
-        tls: &'a Tls,
-        connection: ConnectionOptions,
-    ) -> impl Future<Output = Result<AsyncSmtpConnection, Error>> + Send + 'a;
-}
-
 /// Async [`Executor`] using Tokio.
 ///
-/// Used by [`AsyncSmtpTransport`] for async runtime services.
-///
-/// [`AsyncSmtpTransport`]: crate::AsyncSmtpTransport
+/// Provides Tokio task and timer services.
 #[allow(missing_copy_implementations)]
 #[non_exhaustive]
 #[cfg(feature = "tokio")]
@@ -94,71 +51,6 @@ impl Executor for TokioExecutor {
 
     fn sleep(duration: Duration) -> Self::Sleep {
         tokio::time::sleep(duration)
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl SmtpExecutor for TokioExecutor {
-    #[allow(clippy::too_many_arguments)]
-    async fn connect(
-        hostname: &str,
-        port: u16,
-        unix_socket: Option<&Path>,
-        timeout: Option<Duration>,
-        hello_name: &ClientId,
-        tls: &Tls,
-        connection: ConnectionOptions,
-    ) -> Result<AsyncSmtpConnection, Error> {
-        let ConnectionOptions {
-            protocol,
-            metering,
-            #[cfg(feature = "test-support")]
-            connector,
-        } = connection;
-        #[cfg(feature = "test-support")]
-        if connector.is_some() && (!matches!(tls, Tls::None) || unix_socket.is_some()) {
-            return Err(crate::transport::smtp::error::invalid_input(
-                "scripted connectors require plaintext TCP configuration",
-            ));
-        }
-        let plan = crate::transport::smtp::DialPlan::new(tls, unix_socket)?;
-        if let Some(path) = unix_socket {
-            #[cfg(unix)]
-            {
-                return AsyncSmtpConnection::connect_unix_with_protocol(
-                    path, timeout, hello_name, protocol, metering,
-                )
-                .await;
-            }
-            #[cfg(not(unix))]
-            {
-                // Keep the binding used when Unix socket support is cfg-gated out.
-                let _ = path;
-                return Err(crate::transport::smtp::error::invalid_input(
-                    "Unix-domain LMTP sockets are only supported on Unix platforms",
-                ));
-            }
-        }
-
-        #[allow(unused_mut)]
-        let mut conn = AsyncSmtpConnection::connect_with_protocol(
-            (hostname, port),
-            timeout,
-            hello_name,
-            plan.implicit_tls.cloned(),
-            None,
-            protocol,
-            metering,
-            #[cfg(feature = "test-support")]
-            connector,
-        )
-        .await?;
-
-        if let Some(parameters) = plan.starttls(conn.can_starttls()) {
-            conn.starttls(parameters.clone(), hello_name).await?;
-        }
-
-        Ok(conn)
     }
 }
 

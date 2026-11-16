@@ -870,7 +870,7 @@ extension therefore minted a phantom address book. Both sides now guard, pinned
 by `addressbook_element_outside_resourcetype_does_not_mark_a_collection`.
 
 `not_found_error` still decorates the classified 404 with an `ErrorScope`
-naming the contact and keeps the response text. CalDAV's no-VEVENT case builds
+naming the contact and keeps redacted response body-size evidence. CalDAV's no-VEVENT case builds
 its own missing-event cause. Shared PUT and unconditional DELETE return response
 ETags, so CardDAV retains the validator while CalDAV's delete wrapper discards
 it. Conditional deletes retain caller preconditions and missing-target errors.
@@ -1065,3 +1065,21 @@ messages follow the same rule. Enterprise support needs the target origin;
 userinfo passwords and provider tokens in paths, queries or fragments must not
 enter diagnostic text, even at support-only visibility. Malformed redirect
 Location errors in net likewise omit the raw Location value.
+
+
+## DAV wire diagnostics
+
+Shared `DavHref` Debug shows only `diagnostic_origin`, including when nested
+in requests, responses or bodies. Wire Debug retains methods, statuses, header
+names, body byte counts and replay policy; all header values and body contents
+are omitted. This covers Authorization, Proxy-Authorization, Cookie, Set-Cookie
+and credentials echoed in arbitrary extension headers or payloads. Invalid
+request URLs also show only the invalid-URL marker. Native href access and
+Display retain their original spelling for protocol use.
+
+DAV status classification retains body byte counts rather than raw refusal
+text, including for scoped missing-contact errors. Enterprise support needs
+status and response evidence without disclosing credentials echoed by a server;
+support consent alone does not make arbitrary response text safe. This policy
+covers DAV's own status classification. Net transport failures still retain
+net's response diagnostics and require the separate net redaction policy.

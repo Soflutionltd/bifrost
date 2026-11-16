@@ -13,6 +13,11 @@ use bytes::Bytes;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
 pub struct FetchResponse {
+    // Keep raw observations here: attribute parsing constructs a default value
+    // before the outer response parser supplies the nonzero sequence number.
+    // Seq would require a separate partial-response representation or a made-up
+    // identity during assembly. UID stays numeric with that observation shape;
+    // consumers establish addressed identities at their typed boundary.
     /// Message sequence number (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
     pub seq: u32,
     /// `UID` value (RFC 3501 Section 2.3.1.1).

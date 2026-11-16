@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+use crate::types::Addressing;
 use crate::types::StoreOperation;
 
 // --- Authentication commands ---
@@ -315,10 +316,14 @@ fn command_check() {
 #[test]
 fn command_search() {
     let cmd = Command::Search {
+        addressing: Addressing::Sequences,
         criteria: "UNSEEN FROM alice".into(),
     };
     match &cmd {
-        Command::Search { criteria } => {
+        Command::Search {
+            addressing: Addressing::Sequences,
+            criteria,
+        } => {
             assert_eq!(criteria, "UNSEEN FROM alice");
         }
         _ => panic!("expected Search"),
@@ -328,19 +333,28 @@ fn command_search() {
 #[test]
 fn command_search_save() {
     let cmd = Command::SearchSave {
+        addressing: Addressing::Sequences,
         criteria: "ALL".into(),
     };
-    assert!(matches!(cmd, Command::SearchSave { .. }));
+    assert!(matches!(
+        cmd,
+        Command::SearchSave {
+            addressing: Addressing::Sequences,
+            ..
+        }
+    ));
 }
 
 #[test]
 fn command_search_return() {
     let cmd = Command::SearchReturn {
+        addressing: Addressing::Sequences,
         criteria: "UNSEEN".into(),
         return_opts: vec!["MIN".into(), "MAX".into(), "COUNT".into()],
     };
     match &cmd {
         Command::SearchReturn {
+            addressing: Addressing::Sequences,
             criteria,
             return_opts,
         } => {
@@ -354,19 +368,21 @@ fn command_search_return() {
 
 #[test]
 fn command_uid_search_return() {
-    let cmd = Command::UidSearchReturn {
+    let cmd = Command::SearchReturn {
+        addressing: Addressing::Uids,
         criteria: "ALL".into(),
         return_opts: vec!["ALL".into(), "COUNT".into()],
     };
     match &cmd {
-        Command::UidSearchReturn {
+        Command::SearchReturn {
+            addressing: Addressing::Uids,
             criteria,
             return_opts,
         } => {
             assert_eq!(criteria, "ALL");
             assert_eq!(return_opts.len(), 2);
         }
-        _ => panic!("expected UidSearchReturn"),
+        _ => panic!("expected UID-addressed SearchReturn"),
     }
 }
 
@@ -459,18 +475,32 @@ fn command_copy() {
 
 #[test]
 fn command_uid_search() {
-    let cmd = Command::UidSearch {
+    let cmd = Command::Search {
+        addressing: Addressing::Uids,
         criteria: "ALL".into(),
     };
-    assert!(matches!(cmd, Command::UidSearch { .. }));
+    assert!(matches!(
+        cmd,
+        Command::Search {
+            addressing: Addressing::Uids,
+            ..
+        }
+    ));
 }
 
 #[test]
 fn command_uid_search_save() {
-    let cmd = Command::UidSearchSave {
+    let cmd = Command::SearchSave {
+        addressing: Addressing::Uids,
         criteria: "FLAGGED".into(),
     };
-    assert!(matches!(cmd, Command::UidSearchSave { .. }));
+    assert!(matches!(
+        cmd,
+        Command::SearchSave {
+            addressing: Addressing::Uids,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -629,12 +659,14 @@ fn command_set_metadata() {
 #[test]
 fn command_thread() {
     let cmd = Command::Thread {
+        addressing: Addressing::Sequences,
         algorithm: "REFERENCES".into(),
         charset: "UTF-8".into(),
         criteria: "ALL".into(),
     };
     match &cmd {
         Command::Thread {
+            addressing: Addressing::Sequences,
             algorithm,
             charset,
             criteria,
@@ -649,12 +681,19 @@ fn command_thread() {
 
 #[test]
 fn command_uid_thread() {
-    let cmd = Command::UidThread {
+    let cmd = Command::Thread {
+        addressing: Addressing::Uids,
         algorithm: "ORDEREDSUBJECT".into(),
         charset: "US-ASCII".into(),
         criteria: "SINCE 1-Jan-2024".into(),
     };
-    assert!(matches!(cmd, Command::UidThread { .. }));
+    assert!(matches!(
+        cmd,
+        Command::Thread {
+            addressing: Addressing::Uids,
+            ..
+        }
+    ));
 }
 
 // --- COMPRESS command ---

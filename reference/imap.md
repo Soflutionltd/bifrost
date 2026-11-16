@@ -2388,10 +2388,14 @@ retain their existing endpoint classification. No error category reparses text.
 
 `SequenceSet<I>` preserves UID or sequence addressing even when borrowed from
 `UidSetExpr` or `SeqSetExpr`. Connection methods, pipelines, command operands
-and finite QRESYNC knowledge retain that unit. FETCH, STORE, COPY and MOVE keep
+and finite QRESYNC knowledge retain that unit. SEARCH, SEARCH RETURN, SEARCH SAVE,
+SORT and THREAD each have one command variant carrying `Addressing`, selecting
+sequence or UID result semantics and wire spelling. Their consumers still retain
+typed result identifiers. FETCH, STORE, COPY and MOVE keep
 their separate command forms: their operand types differ, and only UID FETCH
-can represent the VANISHED modifier. Collapsing those forms would require a new
-runtime admission rule for an invalid sequence FETCH with VANISHED.
+can represent the VANISHED modifier. A bare addressing flag would lose that
+restriction; an addressed target retaining it would relocate the typed-set
+matches into another layer. The separate forms retain those guarantees directly.
 
 `CommandKind::UidFetch` alone supplies FETCH's historical VANISHED owner.
 Sequence FETCH cannot solicit it. Both FETCH forms still share a pipeline
@@ -2405,6 +2409,8 @@ is `ThreadNode<u32>` until its consumer supplies the command's addressing.
 Legacy SEARCH observations are named `numbers`, not `uids`: the response has no
 wire indicator. Raw-to-addressed THREAD conversion uses an explicit stack, since
 a linear chain can be much deeper than the parser's parenthesis nesting cap.
+Clone, debug formatting, equality and hashing also use explicit heap worklists,
+so inspecting or copying a deep server reply cannot exhaust the call stack.
 The parser constructs linear reply chains bottom-up, moving branch groups
 without cloning them; nested parenthesized groups still recurse under a depth
 cap. Account thread search flattens trees with an explicit stack in preorder,
@@ -2415,8 +2421,12 @@ typed nonzero MIN/MAX identities and wire ALL ranges in that addressing. A
 SEARCH consumer refuses a selected ESEARCH whose addressing disagrees with its
 command. Enterprise users must never act on sequence numbers mistaken for UIDs.
 Raw FETCH/EXPUNGE observations and contextual MODIFIED ranges remain wire values;
-they preserve existing decoder tolerance instead of admitting invalid nonzero
-identities or inventing addressing the server did not send.
+FETCH assembly starts with an unaddressed default before its outer parser
+supplies the sequence number, so a nonzero wrapper would require a separate
+partial-response type. FETCH UID and EXPUNGE sequence numbers are checked as
+nonzero by the decoder; removal folding retains the raw EXPUNGE observation
+without introducing a second validation boundary. Contextual MODIFIED ranges
+cannot acquire addressing that the response did not send.
 
 `CopyUid` is the common response-code and COPY/MOVE-result payload. Its range
 lists retain the server's positional correspondence rather than becoming
@@ -2441,8 +2451,11 @@ wire identity. Existing account ids and persisted envelopes retain their bytes.
 
 ## Protocol lints and test ownership
 
-`types/` and `codec/` enable `warn(dead_code)` below the crate-wide allowance
-for the retained raw connection surface. Protocol builders that support commands
+`types/`, `codec/` and `connection/` enable `warn(dead_code)` below the
+crate-wide allowance. Connection command adapters used only by hermetic
+transcripts and compression support compile only for tests. The pipeline is
+an explicit retained `allow(dead_code)` exception pending the separate decision
+on pipelined account transport. Protocol builders that support commands
 beyond the account strategy have local exceptions with their reasons. The
 backing-free FETCH parser adapter and address-marker inspection helpers compile
 only for tests. Unused backing-free untagged parser adapters, address constructors

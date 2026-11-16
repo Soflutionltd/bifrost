@@ -3,6 +3,7 @@
 use crate::connection::test_support::detached;
 use crate::connection::{ImapConnection, SessionState};
 use crate::error::Error;
+use crate::types::Addressing;
 use crate::types::{Capability, Command, FetchAttr};
 
 fn conn(caps: Vec<Capability>) -> ImapConnection {
@@ -192,12 +193,14 @@ fn has_quota_resource_matches_case_insensitively() {
 #[test]
 fn search_return_save_detected_on_both_forms() {
     let cmd = Command::SearchReturn {
+        addressing: Addressing::Sequences,
         criteria: "ALL".to_owned().into(),
         return_opts: vec![" save ".into()],
     };
     assert!(ImapConnection::search_return_requests_save(&cmd));
 
-    let uid_cmd = Command::UidSearchReturn {
+    let uid_cmd = Command::SearchReturn {
+        addressing: Addressing::Uids,
         criteria: "ALL".to_owned().into(),
         return_opts: vec!["MIN".into(), "SAVE".into()],
     };
@@ -207,6 +210,7 @@ fn search_return_save_detected_on_both_forms() {
 #[test]
 fn search_return_save_absent_and_on_other_commands() {
     let cmd = Command::SearchReturn {
+        addressing: Addressing::Sequences,
         criteria: "ALL".to_owned().into(),
         return_opts: vec!["COUNT".into()],
     };

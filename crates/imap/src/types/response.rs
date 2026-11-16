@@ -598,6 +598,9 @@ pub struct ExpungeResult {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Removal {
     /// `* n EXPUNGE`: the message at sequence number `n` was removed.
+    // Preserve the raw EXPUNGE observation carried by UntaggedResponse, just
+    // as FETCH retains its wire sequence number. Conversion here alone would
+    // add a second validation boundary while the parser already checks nz-number.
     Seq(u32),
     /// `* VANISHED [(EARLIER)] uid-set`. `earlier` marks a historical report
     /// of UIDs already gone, which does not change the message count.

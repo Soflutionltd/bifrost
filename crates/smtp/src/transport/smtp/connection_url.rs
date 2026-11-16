@@ -2,67 +2,12 @@ use std::borrow::Cow;
 
 use url::Url;
 
-#[cfg(feature = "tokio")]
-use super::AsyncSmtpTransportBuilder;
-use super::{Error, SmtpTransportBuilder, authentication::Credentials, error, extension::ClientId};
-use super::{PortTls, default_port};
-use super::{Tls, TlsParameters};
+use super::surface::{Builder, Smtp};
+use super::{Error, authentication::Credentials, error, extension::ClientId};
+use super::{PortTls, Tls, TlsParameters, default_port};
 
-pub(crate) trait TransportBuilder {
-    fn new<T: Into<String>>(server: T) -> Self;
-    fn tls(self, tls: super::Tls) -> Self;
-    fn port(self, port: u16) -> Self;
-    fn credentials(self, credentials: Credentials) -> Self;
-    fn hello_name(self, name: ClientId) -> Self;
-}
-
-impl TransportBuilder for SmtpTransportBuilder {
-    fn new<T: Into<String>>(server: T) -> Self {
-        Self::new(server)
-    }
-
-    fn tls(self, tls: super::Tls) -> Self {
-        self.tls(tls)
-    }
-
-    fn port(self, port: u16) -> Self {
-        self.port(port)
-    }
-
-    fn credentials(self, credentials: Credentials) -> Self {
-        self.credentials(credentials)
-    }
-
-    fn hello_name(self, name: ClientId) -> Self {
-        self.hello_name(name)
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl TransportBuilder for AsyncSmtpTransportBuilder {
-    fn new<T: Into<String>>(server: T) -> Self {
-        Self::new(server)
-    }
-
-    fn tls(self, tls: super::Tls) -> Self {
-        self.tls(tls)
-    }
-
-    fn port(self, port: u16) -> Self {
-        self.port(port)
-    }
-
-    fn credentials(self, credentials: Credentials) -> Self {
-        self.credentials(credentials)
-    }
-
-    fn hello_name(self, name: ClientId) -> Self {
-        self.hello_name(name)
-    }
-}
-
-/// Create a new `SmtpTransportBuilder` or `AsyncSmtpTransportBuilder` from a connection URL
-pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> Result<B, Error> {
+/// Parse SMTP configuration for either runtime.
+pub(crate) fn from_connection_url<R>(connection_url: &str) -> Result<Builder<Smtp, R>, Error> {
     // These are local configuration faults. Retrying them like network outages
     // would leave an enterprise user's send queue stuck until manual repair.
     let connection_url = Url::parse(connection_url).map_err(error::invalid_input)?;
@@ -78,7 +23,7 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
         .filter(|host| !host.is_empty())
         .ok_or_else(|| error::invalid_input("smtp host undefined"))?;
 
-    let mut builder = B::new(host);
+    let mut builder = Builder::new(host);
 
     match (connection_url.scheme(), tls.as_deref()) {
         ("smtp", None) => {

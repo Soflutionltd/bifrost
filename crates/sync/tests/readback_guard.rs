@@ -1,7 +1,7 @@
 //! Read-back guard and campaign read-back tests.
 //!
 //! `FlagsAccount` returns predetermined flag sets per id and drives the
-//! published guards and the scripted cohort campaigns. `JudgingAccount`
+//! published guards and the scripted cohort campaigns. The shared stub
 //! overrides `Account::flag_target`. `ReassertAccount` scripts every
 //! mutation round and read-back observation to pin desired-state
 //! reassertion after a valid unsatisfied observation.
@@ -13,37 +13,29 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use bifrost_sync::{Error, IdempotencyVendor, SyncEngine, run_readback_guard};
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountFactory, AccountFuture, AccountId, AccountStream, AttachmentHandle, Batch,
-    BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Change, ChangeCursor, CloudUploadMeta,
-    ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest, ContainerId,
-    ContainerKind, Control, ConvenienceShape, CursorDescriptor, CursorEstablishment,
-    CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
-    EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
-    HydratedObject, HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
-    MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
-    MutationTarget, ObjectId, OpenedAccount, Page, PageBoundary, PimMethodSupport, PrimaryCause,
-    Priority, Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass,
-    RequestCause, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
-    SyncEvent, ThreadHydration, ThreadId, VacationConfig,
+    AccountFactory, AccountFuture, Application, CompensationOutcome, Control,
+    PartialCommitBuilder, PrimaryLeg, RequestCause, RetryHint, ServerCause, StepEffect,
+    StepReplay, StepTargets, ThrottleBudget, ThrottleKey,
+    AccountId, AccountStream, AttachmentHandle, Batch, BlobHandle, ByteRange, Change, ChangeCursor,
+    CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
+    ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
+    DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
+    FlagOp, HostedAttachment, HydratedObject, HydratedObjectKind, HydrationProjection,
+    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEvent, ItemOutcome,
+    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, OpenedAccount, Page,
+    PageBoundary, PrimaryCause, Priority, Projection, ProtocolKind, QuotaInfo, RsvpStatus,
+    ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
+    VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 
-/// Convenience for stubs that just need to signal "this operation is
-/// not implemented in this test double." Maps to `Unsupported(op)` +
-/// `ClientBug` recovery so any unexpected call is obvious in output.
-fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Unsupported {
-        operation: op,
-    }))
-    .operation(op)
-    .try_build()
-    .expect("valid account error classification")
-}
+mod common;
+
+use common::{caps, unsupported};
 
 /// Synthetic Account that returns predetermined flags for each id on
 /// `get_stream(Projection::FlagsOnly)`. All other methods are
@@ -139,34 +131,6 @@ fn retryable_transport() -> AccountError {
     )))
     .try_build()
     .expect("valid retryable transport error")
-}
-
-fn caps() -> AccountCapabilities {
-    AccountCapabilities {
-        cursor_freshness: CursorFreshness::ServerIssued,
-        blob_range: BlobRangeSupport::No,
-        blob_digest_pre_download: false,
-        push: PushCapability::None,
-        mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::ExpectedVersion(bifrost_types::VersionedDoors::NONE),
-            replay_safety: MutationReplaySafety::None,
-            reassertion: bifrost_types::MutationReassertion::NONE,
-        },
-        batching_policy: BatchingPolicy {
-            max_items: 100,
-            max_wait: std::time::Duration::from_millis(50),
-            flush_on_input_close: true,
-        },
-        rate_limit_class: RateLimitClass::Generous,
-        quota_signal: QuotaSignal::None,
-        requires_uidvalidity_recheck: false,
-        historyid_expires_after: None,
-        delta_token_expires_after: None,
-        pim_methods: PimMethodSupport::default(),
-        filter_rule_shape: FilterRuleShape::None,
-        conveniences: ConvenienceShape::default(),
-        discovers_foreign_namespaces_on_rediscovery: false,
-    }
 }
 
 impl Account for FlagsAccount {
@@ -2223,461 +2187,20 @@ fn key_parts(key: &IdempotencyKey) -> (&bifrost_types::RunId, u64, &bifrost_type
     (&key.run_id, key.sequence, &key.protocol_salt)
 }
 
-struct JudgingAccount {
-    inner: FlagsAccount,
-}
-impl JudgingAccount {
-    fn hydrate(
-        &self,
-        ids: AccountStream<ObjectId>,
-        projection: Projection,
-    ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
-        self.inner.get_stream(ids, projection)
-    }
-    fn judge(
-        &self,
-        _target: &ObjectId,
-        _observed: &bifrost_types::FlagSet,
-        _op: &FlagOp,
-    ) -> bifrost_types::FlagTargetState {
-        bifrost_types::FlagTargetState::Satisfied
-    }
-}
-impl Account for JudgingAccount {
-    fn protocol(&self) -> bifrost_types::Protocol {
-        self.inner.protocol()
-    }
-
-    fn capabilities(&self) -> &AccountCapabilities {
-        &self.inner.caps
-    }
-    fn set_priority(&self, _priority: Priority) {
-        self.inner.set_priority(_priority);
-    }
-    fn set_bandwidth_cap(&self, _bps: Option<bifrost_types::BandwidthCap>) {
-        self.inner.set_bandwidth_cap(_bps);
-    }
-    fn throttle_keys(
-        &self,
-        _account: &AccountId,
-        work: bifrost_types::ThrottleWork<'_>,
-    ) -> Vec<bifrost_types::ThrottleKey> {
-        self.inner.throttle_keys(_account, work)
-    }
-    fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
-        self.inner.describe_cursor(_cursor)
-    }
-    fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>> {
-        self.inner.discover_cursor_scopes()
-    }
-    fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>> {
-        self.inner.discover_memberships()
-    }
-    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
-        self.inner.scope_lifecycle_stream()
-    }
-    fn establish_initial_cursor(
-        &self,
-        _scope: CursorScope,
-    ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
-        self.inner.establish_initial_cursor(_scope)
-    }
-    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<InventoryEvent> {
-        self.inner.inventory_stream(_scope)
-    }
-    fn get_stream(
-        &self,
-        ids: AccountStream<ObjectId>,
-        projection: Projection,
-    ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
-        self.hydrate(ids, projection)
-    }
-    fn changes_stream(&self, _cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
-        self.inner.changes_stream(_cursor)
-    }
-    fn push_subscribe(
-        &self,
-        _scopes: &[CursorScope],
-    ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
-        self.inner.push_subscribe(_scopes)
-    }
-    fn push_unsubscribe(
-        &self,
-        _handle: SubscriptionHandle,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.push_unsubscribe(_handle)
-    }
-    fn push_stream(
-        &self,
-        lane: bifrost_types::PushLane,
-        _stop: bifrost_types::SessionStop,
-        _gate: bifrost_types::PushGate,
-    ) -> AccountStream<bifrost_types::PushSessionEvent> {
-        Box::pin(futures::stream::iter([
-            bifrost_types::PushSessionEvent::Failed(bifrost_types::push_lane_contract_error(
-                self.protocol(),
-                lane,
-                "not a lane of this account",
-            )),
-        ]))
-    }
-    fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {
-        self.inner.open_blob(_handle)
-    }
-    fn open_blob_range(
-        &self,
-        _handle: BlobHandle,
-        _range: ByteRange,
-    ) -> AccountStream<SyncEvent<Bytes>> {
-        self.inner.open_blob_range(_handle, _range)
-    }
-    fn open_raw_rfc822(&self, _message: ObjectId) -> AccountStream<SyncEvent<Bytes>> {
-        self.inner.open_raw_rfc822(_message)
-    }
-    fn bulk_set_flags(
-        &self,
-        targets: AccountStream<ObjectId>,
-        _op: FlagOp,
-        key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        self.inner.bulk_set_flags(targets, _op, key)
-    }
-    fn bulk_move(
-        &self,
-        _targets: AccountStream<ObjectId>,
-        destination: MembershipScope,
-        _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        self.inner.bulk_move(_targets, destination, _key)
-    }
-    fn bulk_destroy(
-        &self,
-        _targets: AccountStream<ObjectId>,
-        _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        self.inner.bulk_destroy(_targets, _key)
-    }
-    fn close(&self) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.close()
-    }
-    fn add_to_container(
-        &self,
-        _target: MutationTarget,
-        _container: ContainerId,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.add_to_container(_target, _container)
-    }
-    fn remove_from_container(
-        &self,
-        _target: MutationTarget,
-        _container: ContainerId,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.remove_from_container(_target, _container)
-    }
-    fn set_keyword(
-        &self,
-        _target: MutationTarget,
-        _keyword: bifrost_types::Flag,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.set_keyword(_target, _keyword, _value)
-    }
-    fn set_label_membership(
-        &self,
-        _target: MutationTarget,
-        _label: ContainerId,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.set_label_membership(_target, _label, _value)
-    }
-    fn set_category(
-        &self,
-        _target: MutationTarget,
-        _category: String,
-        _value: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.set_category(_target, _category, _value)
-    }
-    fn set_extended_property(
-        &self,
-        _target: MutationTarget,
-        _property_id: String,
-        _value: Option<String>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner
-            .set_extended_property(_target, _property_id, _value)
-    }
-    fn set_is_read(
-        &self,
-        _target: MutationTarget,
-        _is_read: bool,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.set_is_read(_target, _is_read)
-    }
-    fn set_importance(
-        &self,
-        _target: MutationTarget,
-        _level: Importance,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.set_importance(_target, _level)
-    }
-    fn send_message(
-        &self,
-        _request: SendRequest,
-    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
-        self.inner.send_message(_request)
-    }
-    fn attachment_upload(
-        &self,
-        _bytes: AccountStream<Result<Bytes, AccountError>>,
-        _mime: String,
-    ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-        self.inner.attachment_upload(_bytes, _mime)
-    }
-    fn host_attachment(
-        &self,
-        _bytes: Bytes,
-        _meta: CloudUploadMeta,
-    ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
-        self.inner.host_attachment(_bytes, _meta)
-    }
-    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
-        self.inner.draft_create(_patch)
-    }
-    fn draft_update(
-        &self,
-        _draft: DraftHandle,
-        _patch: DraftPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.draft_update(_draft, _patch)
-    }
-    fn draft_discard(&self, _draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.draft_discard(_draft)
-    }
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
-        self.inner.draft_send(_draft)
-    }
-    fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.cancel_scheduled_send(_handle)
-    }
-    fn reschedule_send(
-        &self,
-        _handle: ObjectId,
-        _scheduled: std::time::SystemTime,
-    ) -> AccountFuture<Result<ObjectId, AccountError>> {
-        self.inner.reschedule_send(_handle, _scheduled)
-    }
-    fn search(
-        &self,
-        _request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
-        self.inner.search(_request)
-    }
-    fn search_messages(
-        &self,
-        _request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
-        self.inner.search_messages(_request)
-    }
-    fn containers_list(&self) -> AccountFuture<Result<bifrost_types::ContainerList, AccountError>> {
-        self.inner.containers_list()
-    }
-    fn container_create(
-        &self,
-        _kind: ContainerKind,
-        _name: String,
-        _parent: Option<ContainerId>,
-        _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
-        self.inner.container_create(_kind, _name, _parent, _style)
-    }
-    fn container_rename(
-        &self,
-        _container: ContainerId,
-        _name: String,
-        _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.container_rename(_container, _name, _style)
-    }
-    fn container_move(
-        &self,
-        _container: ContainerId,
-        _new_parent: Option<ContainerId>,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.container_move(_container, _new_parent)
-    }
-    fn container_delete(&self, _container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.container_delete(_container)
-    }
-    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
-        self.inner.identities_list()
-    }
-    fn identity_update(
-        &self,
-        _identity: IdentityId,
-        _patch: IdentityPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.identity_update(_identity, _patch)
-    }
-    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
-        self.inner.vacation_get()
-    }
-    fn vacation_set(&self, _config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.vacation_set(_config)
-    }
-    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
-        self.inner.quota_get()
-    }
-    fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
-        self.inner.filters_list()
-    }
-    fn filter_create(
-        &self,
-        _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
-        self.inner.filter_create(_filter)
-    }
-    fn filter_update(
-        &self,
-        _filter: ServerFilterId,
-        _patch: ServerFilterPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.filter_update(_filter, _patch)
-    }
-    fn filter_delete(&self, _filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.filter_delete(_filter)
-    }
-    fn filter_validate(
-        &self,
-        _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<FilterValidation, AccountError>> {
-        self.inner.filter_validate(_filter)
-    }
-    fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
-        self.inner.address_books_list()
-    }
-    fn contacts_list(
-        &self,
-        _address_book: Option<AddressBookId>,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        self.inner.contacts_list(_address_book, _page_cursor)
-    }
-    fn contact_get(&self, _contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
-        self.inner.contact_get(_contact)
-    }
-    fn contact_create(
-        &self,
-        _contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
-        self.inner.contact_create(_contact)
-    }
-    fn contact_update(
-        &self,
-        _contact: ContactId,
-        _patch: ContactPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.contact_update(_contact, _patch)
-    }
-    fn contact_delete(&self, _contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.contact_delete(_contact)
-    }
-    fn contact_search(
-        &self,
-        _request: ContactSearchRequest,
-    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        self.inner.contact_search(_request)
-    }
-    fn directory_search(
-        &self,
-        _query: String,
-        _limit: Option<u32>,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<bifrost_types::DirectoryCard>, AccountError>> {
-        self.inner.directory_search(_query, _limit, _page_cursor)
-    }
-    fn directory_groups_list(
-        &self,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroup>, AccountError>> {
-        self.inner.directory_groups_list(_page_cursor)
-    }
-    fn directory_group_expand(
-        &self,
-        _group: bifrost_types::DirectoryGroupId,
-        _page_cursor: Option<bifrost_types::PageCursor>,
-    ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroupMember>, AccountError>> {
-        self.inner.directory_group_expand(_group, _page_cursor)
-    }
-    fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
-        self.inner.calendars_list()
-    }
-    fn events_in_range(
-        &self,
-        _range: EventRange,
-    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
-        self.inner.events_in_range(_range)
-    }
-    fn event_get(&self, _event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
-        self.inner.event_get(_event)
-    }
-    fn event_create(&self, _event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
-        self.inner.event_create(_event)
-    }
-    fn event_update(
-        &self,
-        _event: EventId,
-        _patch: EventPatch,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.event_update(_event, _patch)
-    }
-    fn event_delete(&self, _event: EventId) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.event_delete(_event)
-    }
-    fn event_rsvp(
-        &self,
-        _event: EventId,
-        _status: RsvpStatus,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        self.inner.event_rsvp(_event, _status)
-    }
-    fn event_search(
-        &self,
-        _request: EventSearchRequest,
-    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
-        self.inner.event_search(_request)
-    }
-    fn thread_hydrate(
-        &self,
-        _thread: ThreadId,
-    ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
-        self.inner.thread_hydrate(_thread)
-    }
-    fn message_hydrate(
-        &self,
-        _message: ObjectId,
-        _projection: HydrationProjection,
-    ) -> AccountFuture<Result<Message, AccountError>> {
-        self.inner.message_hydrate(_message, _projection)
-    }
-    fn flag_target(
-        &self,
-        target: &ObjectId,
-        observed: &bifrost_types::FlagSet,
-        op: &FlagOp,
-    ) -> bifrost_types::FlagTargetState {
-        self.judge(target, observed, op)
-    }
-}
 #[tokio::test]
 async fn readback_guard_judges_through_the_account() {
-    let account = JudgingAccount {
-        inner: FlagsAccount {
-            caps: caps(),
-            flag_table: Default::default(),
-            campaign: None,
-        },
-    };
+    let flags = Arc::new(FlagsAccount {
+        caps: caps(),
+        flag_table: Default::default(),
+        campaign: None,
+    });
+    let mut account = common::StubAccount::new(Vec::new());
+    account.lanes.mutation.get_stream = Some(Arc::new(move |ids, projection| {
+        flags.get_stream(ids, projection)
+    }));
+    account.lanes.mutation.flag_target = Some(Arc::new(|_, _, _| {
+        bifrost_types::FlagTargetState::Satisfied
+    }));
     let result = run_readback_guard(
         &account,
         vec![ObjectId("a".into())],
@@ -4233,7 +3756,6 @@ async fn an_uncertain_operation_local_retry_hint_delays_the_read_back() {
 }
 
 fn partial_error(leaf: AccountError, replay: bifrost_types::StepReplay) -> AccountError {
-    use bifrost_types::{Application, PartialCommitBuilder, PrimaryLeg, StepEffect, StepTargets};
     let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
         StepEffect::Updated,
         StepTargets::unknown(),
@@ -4318,10 +3840,6 @@ async fn a_terminal_partial_commit_keeps_its_observation() {
 
 #[tokio::test(start_paused = true)]
 async fn a_compensation_throttle_is_held_under_its_own_scope() {
-    use bifrost_types::{
-        Application, CompensationOutcome, PartialCommitBuilder, PrimaryLeg, RetryHint, ServerCause,
-        StepEffect, StepReplay, StepTargets, ThrottleBudget, ThrottleKey,
-    };
     let primary = retryable_transport();
     let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
         StepEffect::Updated,

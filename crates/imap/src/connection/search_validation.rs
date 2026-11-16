@@ -1,5 +1,7 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
+#[cfg(test)]
+use crate::types::Addressing;
 
 impl ImapConnection {
     // Tests exercise the same admission policy as live and queued commands.
@@ -8,6 +10,7 @@ impl ImapConnection {
         let snap = self.state_rx.borrow();
         super::admit_for_encoding(
             &Command::Search {
+                addressing: Addressing::Sequences,
                 criteria: criteria.into(),
             },
             &crate::codec::encode::EncodeOptions {

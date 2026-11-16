@@ -1,3 +1,4 @@
+use crate::types::Addressing;
 use bytes::BytesMut;
 
 use super::*;
@@ -323,7 +324,8 @@ fn append_wire(
 fn uid_search(criteria: &str, opts: &EncodeOptions) -> Result<WireCommand, crate::Error> {
     admit_and_encode(
         "A001",
-        &Command::UidSearch {
+        &Command::Search {
+            addressing: Addressing::Uids,
             criteria: criteria.into(),
         },
         opts,

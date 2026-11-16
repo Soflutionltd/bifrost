@@ -1,6 +1,6 @@
 //! Account-oriented SMTP submission in shared address and error vocabulary.
 use crate::transport::smtp::{SendOptions, SubmissionStatus, submission_status};
-use crate::{Address as SmtpAddress, AsyncSmtpTransport, TokioExecutor};
+use crate::{Address as SmtpAddress, AsyncSmtpTransport};
 use bifrost_net::TokenSource;
 use bifrost_types::error::{AccountError, BatchItem, BatchItemId};
 use bifrost_types::mime::SubmissionEnvelope;
@@ -65,11 +65,10 @@ impl SubmissionConfig {
     /// Construct submission defaults while retaining access to every transport option.
     pub fn new(host: &str, tls: SubmissionTls) -> Result<Self, crate::transport::smtp::Error> {
         let transport = match tls {
-            SubmissionTls::Implicit => AsyncSmtpTransport::<TokioExecutor>::relay(host)?,
-            SubmissionTls::StartTls => AsyncSmtpTransport::<TokioExecutor>::starttls_relay(host)?,
+            SubmissionTls::Implicit => AsyncSmtpTransport::relay(host)?,
+            SubmissionTls::StartTls => AsyncSmtpTransport::starttls_relay(host)?,
             SubmissionTls::Plaintext => {
-                AsyncSmtpTransport::<TokioExecutor>::builder_dangerous(host)
-                    .dangerous_allow_insecure_auth(true)
+                AsyncSmtpTransport::builder_dangerous(host).dangerous_allow_insecure_auth(true)
             }
         }
         .port(tls.default_port());
@@ -102,7 +101,7 @@ pub struct SubmissionReceipt {
 /// SMTP submission facade. Any accepted recipient commits the send; failed and
 /// uncertain recipients are returned individually so users do not resend to all.
 pub struct Submission {
-    transport: AsyncSmtpTransport<TokioExecutor>,
+    transport: AsyncSmtpTransport,
 }
 
 impl From<SubmissionConfig> for Submission {

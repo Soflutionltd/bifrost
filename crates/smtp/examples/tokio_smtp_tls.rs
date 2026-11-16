@@ -1,6 +1,4 @@
-use bifrost_smtp::{
-    AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor, message::header::ContentType,
-};
+use bifrost_smtp::{AsyncSmtpTransport, AsyncTransport, Message, message::header::ContentType};
 
 #[tokio::main]
 async fn main() {
@@ -16,11 +14,10 @@ async fn main() {
         .unwrap();
 
     // Open a TLS-wrapped connection to a remote SMTP submission server.
-    let mailer: AsyncSmtpTransport<TokioExecutor> =
-        AsyncSmtpTransport::<TokioExecutor>::relay("smtp.example.com")
-            .unwrap()
-            .password("user@example.com", "smtp_password")
-            .build();
+    let mailer: AsyncSmtpTransport = AsyncSmtpTransport::relay("smtp.example.com")
+        .unwrap()
+        .password("user@example.com", "smtp_password")
+        .build();
 
     // Send the email
     match mailer.send(&email).await {

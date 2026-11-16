@@ -71,6 +71,43 @@ Sync and async, SMTP and LMTP:
 
 `Transport::Ok` is `Response` for SMTP, `Vec<Response>` for LMTP (one per envelope recipient, original order preserved).
 
+`transport::smtp::Builder<D, R>` owns `SmtpInfo` and pool configuration once.
+`Transport<D, R>` owns the runtime's pool. The dialect markers are `Smtp` and
+`Lmtp`; the runtime markers are `Blocking` and, with `tokio`, `Tokio`.
+The four existing transport names and four builder names are type aliases of
+this product. Async transports have no executor type argument, and `build()`
+requires no executor selection:
+
+```rust,ignore
+let transport = AsyncSmtpTransport::relay("smtp.example.com")?
+    .password("username", "password")
+    .build();
+```
+
+Every builder setter has one implementation in `surface.rs`. Selecting `port`
+or `tls` clears an earlier Unix socket route; selecting `unix_socket` clears
+TLS. This rule is identical for blocking and Tokio LMTP. An explicit TCP
+configuration must not silently retain an old local-delivery destination.
+Only LMTP exposes Unix socket configuration; only SMTP exposes relay and URL
+constructors. The URL parser consumes the shared builder directly.
+
+The transport method body is written once in `transport_methods!`, including
+batch validation before checkout and recipient resolution afterward. Expansion
+selects the dialect's connection operation and the runtime's calling convention:
+blocking returns a result directly, while Tokio awaits its pooled connection.
+A future-only connection trait would force blocking callers to poll a future;
+syntactic runtime substitution keeps the two native I/O contracts without
+copying their sequencing. Direct SMTP still returns one `Response`, and direct
+LMTP returns ordered per-recipient responses. VRFY, EXPN, NOOP, DATA, BDAT,
+batch sends, shutdown, pooling and the message trait's DKIM handling remain
+available through the aliases. The `tokio` feature remains optional.
+
+Tokio pools and clients are concrete rather than generic over the sealed
+executor. `Executor` and `TokioExecutor` retain their task/timer service surface;
+they no longer configure a transport or own dialing. `dial::connect_async`
+takes `&SmtpInfo`, applies the TLS/socket plan, and performs async dialing.
+There is no separate connection-options record.
+
 Async transports support Tokio. TLS and plaintext URL parsing via `from_url` use the Tokio backend.
 
 `BoxedTransport<Ok, Error>` and `BoxedAsyncTransport<Ok, Error>` erase the concrete type. `Box<T>` and `Arc<T>` get blanket `Transport` / `AsyncTransport` forwarding.
@@ -1220,7 +1257,9 @@ crates/smtp/src/
 │       ├── client/      - core (transaction), session, reply, connection and
 │       │                  async_connection (the two I/O adapters), net,
 │       │                  async_net, metering, tls
-│       ├── transport.rs / async_transport.rs - public sync + async transports
+│       ├── surface.rs     - shared builder, transport product, aliases and methods
+│       ├── transport.rs / async_transport.rs - connection factories and tests
+│       ├── dial.rs        - Tokio TLS/socket dial sequence
 │       ├── commands.rs  - EHLO, MAIL, RCPT, DATA, BDAT, AUTH, NOOP, RSET, VRFY, EXPN, STARTTLS, LHLO
 │       ├── extension.rs - ServerInfo, SendOptions, MAIL/RCPT parameters
 │       ├── response.rs  - parser, enhanced status codes
@@ -1253,7 +1292,7 @@ requiring a partial-commit record above those lanes.
 ## Dial policy and parameter identity
 
 `DialPlan` in the SMTP transport module owns the TLS/socket policy used by both
-blocking connection setup and Tokio's executor: implicit TLS parameters,
+blocking connection setup and the Tokio dialer: implicit TLS parameters,
 required versus advertised-only STARTTLS, and refusal of TLS on Unix sockets.
 The adapters perform I/O and keep their existing timeout semantics. Invalid
 local combinations remain `InvalidInput` errors.

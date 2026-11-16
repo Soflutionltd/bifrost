@@ -840,7 +840,7 @@ impl ScriptedConnector {
 mod connector_tests {
     use super::*;
     use crate::transport::smtp::extension::ClientId;
-    use crate::{AsyncLmtpTransport, AsyncSmtpTransport, TokioExecutor};
+    use crate::{AsyncLmtpTransport, AsyncSmtpTransport};
 
     #[test]
     fn blocking_scripted_connector_drives_smtp_and_lmtp_without_sockets() {
@@ -917,25 +917,25 @@ mod connector_tests {
                     .expect("EHLO client\r\n", "250 peer\r\n")
                     .expect("NOOP\r\n", "250 ok\r\n")
             });
-            let smtp = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("invalid")
+            let smtp = AsyncSmtpTransport::builder_dangerous("invalid")
                 .hello_name(ClientId::Domain("client".into()))
                 .scripted_connector(connector.clone())
-                .build::<TokioExecutor>();
+                .build();
             assert!(smtp.test_connection().await.unwrap());
-            let smtp = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("invalid")
+            let smtp = AsyncSmtpTransport::builder_dangerous("invalid")
                 .hello_name(ClientId::Domain("client".into()))
                 .scripted_connector(connector)
-                .build::<TokioExecutor>();
+                .build();
             assert!(smtp.test_connection().await.unwrap());
         }
-        let lmtp = AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("invalid")
+        let lmtp = AsyncLmtpTransport::builder_dangerous("invalid")
             .hello_name(ClientId::Domain("client".into()))
             .scripted_connector(ScriptedConnector::new(|| {
                 Transcript::new("220 peer\r\n")
                     .expect("LHLO client\r\n", "250 peer\r\n")
                     .expect("NOOP\r\n", "250 ok\r\n")
             }))
-            .build::<TokioExecutor>();
+            .build();
         assert!(lmtp.test_connection().await.unwrap());
     }
 
@@ -944,12 +944,12 @@ mod connector_tests {
         for starttls in [false, true] {
             let connector = ScriptedConnector::new(|| panic!("TLS must reject before dial"));
             let smtp = if starttls {
-                AsyncSmtpTransport::<TokioExecutor>::starttls_relay("example.com").unwrap()
+                AsyncSmtpTransport::starttls_relay("example.com").unwrap()
             } else {
-                AsyncSmtpTransport::<TokioExecutor>::relay("example.com").unwrap()
+                AsyncSmtpTransport::relay("example.com").unwrap()
             }
             .scripted_connector(connector.clone())
-            .build::<TokioExecutor>();
+            .build();
             assert!(smtp.test_connection().await.is_err());
             let parameters =
                 crate::transport::smtp::client::TlsParameters::new("example.com".into()).unwrap();
@@ -958,10 +958,10 @@ mod connector_tests {
             } else {
                 crate::transport::smtp::client::Tls::Wrapper(parameters)
             };
-            let lmtp = AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("invalid")
+            let lmtp = AsyncLmtpTransport::builder_dangerous("invalid")
                 .tls(tls)
                 .scripted_connector(connector)
-                .build::<TokioExecutor>();
+                .build();
             assert!(lmtp.test_connection().await.is_err());
         }
     }

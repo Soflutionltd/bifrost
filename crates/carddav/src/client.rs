@@ -579,12 +579,8 @@ pub(crate) fn contact_scope(id: impl Into<String>) -> ErrorScope {
 
 /// Scope the server's own not-found answer to the contact it names.
 ///
-/// DECORATES the classified 404 rather than minting a fresh one. The fresh
-/// `status_error(.., 404, String::new())` this used to build threw away the
-/// response body the server sent with the 404 - the one diagnostic an operator
-/// has for why a contact vanished - while keeping everything else. Decorating
-/// keeps the kind, the status, the acknowledged attempt and the body text, and
-/// adds only the scope.
+/// Decorates the classified 404, keeping its kind, status, acknowledged
+/// attempt and redacted body-size evidence, and adds only the contact scope.
 pub(crate) fn not_found_error(error: AccountError, id: impl Into<String>) -> AccountError {
     error
         .into_builder()
@@ -1471,19 +1467,13 @@ mod tests {
         );
     }
 
-    /// A missing contact keeps what the server said about it.
-    ///
-    /// `fetch_contact_resource` scopes the 404 to the contact. It used to do so
-    /// by REPLACING the classified error with a fresh 404 minted from an empty
-    /// body, so the server's response text - the only diagnostic an operator
-    /// has - was dropped. Against that code the text assertion fails. The kind,
-    /// scope and acknowledged attempt are pinned beside it so the decoration
-    /// cannot lose what the replacement kept.
+    /// Scoping a missing contact retains safe response evidence without
+    /// exporting arbitrary server text that could echo credentials.
     #[tokio::test]
-    async fn a_missing_contact_keeps_the_servers_response_text() {
+    async fn a_missing_contact_keeps_redacted_response_evidence() {
         use bifrost_types::account::Account as _;
 
-        const EXPLANATION: &str = "contact was moved to the archive book";
+        const EXPLANATION: &str = "Authorization: Bearer echoed-secret";
         let url = "https://dav.example.test/books/ada/personal/one.vcf";
         let script = dav_script([DavResponse {
             status: StatusCode::NOT_FOUND,
@@ -1523,8 +1513,15 @@ mod tests {
                 .support_consented()
                 .support_text
                 .iter()
-                .any(|text| text.contains(EXPLANATION)),
-            "the server's response text survives: {error:?}"
+                .any(|text| text.contains("DAV response body omitted")),
+            "safe response evidence survives: {error:?}"
+        );
+        assert!(
+            error
+                .support_consented()
+                .support_text
+                .iter()
+                .all(|text| !text.contains(EXPLANATION))
         );
         assert!(
             error.chain().iter().any(|cause| matches!(

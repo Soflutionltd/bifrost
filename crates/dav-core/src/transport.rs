@@ -17,7 +17,7 @@ use crate::error::DavProtocol;
 /// Wall-clock ceiling on a single DAV request.
 pub const DAV_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DavResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
@@ -35,7 +35,7 @@ pub struct DavResponse {
 
 /// A DAV response body paired with the effective URI that produced it, so href
 /// resolution has the base RFC 4918 requires.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DavBody {
     pub text: String,
     pub url: crate::DavHref,
@@ -46,7 +46,7 @@ pub struct DavBody {
 /// Wrappers assemble this record without reading credentials. The dispatcher
 /// forwards its owned bytes and replay declaration to net once; net rebuilds
 /// each retry and redirect hop and consults DAV's credential and target policy.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DavRequest {
     pub(crate) method: Method,
     pub(crate) url: Result<crate::DavHref, String>,
@@ -65,6 +65,53 @@ pub struct DavRequest {
     /// for - an unconditional PUT where an `If-Match` was intended, say - which
     /// is a far worse failure than a local `Request(Malformed)`.
     pub(crate) invalid_header: Option<String>,
+}
+
+// Servers can echo credentials in arbitrary headers and bodies. Keep header
+// names and byte counts for support, but never guess which values are safe.
+struct DebugHeaders<'a>(&'a HeaderMap);
+
+impl std::fmt::Debug for DebugHeaders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut map = f.debug_map();
+        for name in self.0.keys() {
+            map.entry(name, &"<redacted>");
+        }
+        map.finish()
+    }
+}
+
+impl std::fmt::Debug for DavResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DavResponse")
+            .field("status", &self.status)
+            .field("headers", &DebugHeaders(&self.headers))
+            .field("body_bytes", &self.body.len())
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for DavBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DavBody")
+            .field("text_bytes", &self.text.len())
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for DavRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DavRequest")
+            .field("method", &self.method)
+            .field("url", &crate::url::diagnostic_origin(self.url()))
+            .field("headers", &DebugHeaders(&self.headers))
+            .field("body_bytes", &self.body.as_ref().map(bytes::Bytes::len))
+            .field("replay", &self.replay)
+            .field("invalid_header", &self.invalid_header)
+            .finish()
+    }
 }
 
 impl DavRequest {
@@ -215,6 +262,74 @@ pub fn url_origin(value: &str) -> Option<bifrost_net::Origin> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_debug_omits_credentials_and_echoed_content() {
+        let url =
+            "https://user-secret:password-secret@dav.test/path-secret?query-secret#fragment-secret";
+        let mut headers = HeaderMap::new();
+        for name in [
+            "Authorization",
+            "Proxy-Authorization",
+            "Cookie",
+            "Set-Cookie",
+            "Location",
+            "Destination",
+            "X-Echo",
+        ] {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static("header-secret"),
+            );
+        }
+        headers.append(
+            "set-cookie",
+            HeaderValue::from_static("second-cookie-secret"),
+        );
+        let request = DavRequest::new(Method::PUT, url)
+            .headers(headers.clone())
+            .body("body-secret");
+        let response = DavResponse {
+            status: StatusCode::FORBIDDEN,
+            headers,
+            body: "body-secret".to_string(),
+            url: crate::DavHref::parse(url).unwrap(),
+        };
+        let body = DavBody {
+            text: "body-secret".to_string(),
+            url: response.url.clone(),
+        };
+        let invalid = DavRequest::new(Method::GET, "invalid-url-secret");
+        for debug in [
+            format!("{:?}", response.url),
+            format!("{:#?}", response.url),
+            format!("{request:?}"),
+            format!("{request:#?}"),
+            format!("{response:?}"),
+            format!("{response:#?}"),
+            format!("{body:?}"),
+            format!("{body:#?}"),
+            format!("{invalid:?}"),
+            format!("{invalid:#?}"),
+        ] {
+            assert!(!debug.contains("secret"), "credential leaked: {debug}");
+        }
+        let debug = format!("{request:?}");
+        assert!(debug.contains("PUT"));
+        assert!(debug.contains("https://dav.test:443"));
+        assert!(debug.contains("authorization"));
+        assert!(debug.contains("proxy-authorization"));
+        assert!(debug.contains("cookie"));
+        assert!(debug.contains("set-cookie"));
+        assert!(debug.contains("body_bytes: Some(11)"));
+        assert!(format!("{response:?}").contains("403"));
+        assert!(format!("{body:?}").contains("text_bytes: 11"));
+        // Formatting must not mutate the values needed for dispatch or parsing.
+        assert_eq!(request.headers["authorization"], "header-secret");
+        assert_eq!(response.body, "body-secret");
+        assert_eq!(body.text, "body-secret");
+        assert_eq!(response.url.as_str(), url);
+    }
 
     #[test]
     fn url_origin_normalizes_case_and_default_port() {

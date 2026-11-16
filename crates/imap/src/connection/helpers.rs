@@ -122,8 +122,7 @@ impl ImapConnection {
     /// result option from the SEARCHRES extension (RFC 5182 Section 2).
     pub(super) fn search_return_requests_save(cmd: &Command) -> bool {
         match cmd {
-            Command::SearchReturn { return_opts, .. }
-            | Command::UidSearchReturn { return_opts, .. } => return_opts
+            Command::SearchReturn { return_opts, .. } => return_opts
                 .iter()
                 .any(|opt| matches!(opt, crate::types::command_options::SearchReturn::Save)),
             _ => false,

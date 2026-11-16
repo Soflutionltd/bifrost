@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use crate::types::Addressing;
 use std::time::Duration;
 
 use crate::connection::test_support::detached;
@@ -378,11 +379,13 @@ fn sort_and_thread_inherit_the_search_criteria_gates() {
     // capability snapshot that is current when they reach the wire.
     for command in [
         Command::Sort {
+            addressing: Addressing::Sequences,
             sort_criteria: "DATE".to_owned(),
             charset: "UTF-8".to_owned(),
             criteria: "MODSEQ 5".to_owned().into(),
         },
         Command::Thread {
+            addressing: Addressing::Sequences,
             algorithm: "ORDEREDSUBJECT".to_owned(),
             charset: "UTF-8".to_owned(),
             criteria: "MODSEQ 5".to_owned().into(),

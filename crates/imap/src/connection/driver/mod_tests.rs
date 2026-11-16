@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+use crate::types::Addressing;
 use crate::types::validated::{MailboxName, SequenceSet};
 
 /// Dummy consumer for testing sub-batch grouping. Implements
@@ -181,9 +182,11 @@ fn group_searchres_pipeline_respects_save_ordering() {
     // second.
     let commands = vec![
         Command::SearchSave {
+            addressing: Addressing::Sequences,
             criteria: "SEEN".into(),
         },
         Command::SearchSave {
+            addressing: Addressing::Sequences,
             criteria: "FLAGGED".into(),
         },
         Command::Fetch {
@@ -236,10 +239,12 @@ fn group_splits_distinct_kinds_that_share_an_untagged_response() {
             },
         ),
         (
-            Command::UidSearch {
+            Command::Search {
+                addressing: Addressing::Uids,
                 criteria: "ALL".into(),
             },
-            Command::UidSearchReturn {
+            Command::SearchReturn {
+                addressing: Addressing::Uids,
                 criteria: "ALL".into(),
                 return_opts: vec!["ALL".into()],
             },

@@ -174,17 +174,45 @@ pub(crate) fn encode_command(
             let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_status(&mut w, tag, &wire, items, utf8)?;
         }
-        Command::Search { criteria } => {
-            encode_search(&mut w, tag, "SEARCH", criteria, None, utf8)?;
+        Command::Search {
+            addressing,
+            criteria,
+        } => {
+            encode_search(
+                &mut w,
+                tag,
+                addressing.command("SEARCH", "UID SEARCH"),
+                criteria,
+                None,
+                utf8,
+            )?;
         }
         Command::SearchReturn {
+            addressing,
             criteria,
             return_opts,
         } => {
-            encode_search(&mut w, tag, "SEARCH", criteria, Some(return_opts), utf8)?;
+            encode_search(
+                &mut w,
+                tag,
+                addressing.command("SEARCH", "UID SEARCH"),
+                criteria,
+                Some(return_opts),
+                utf8,
+            )?;
         }
-        Command::SearchSave { criteria } => {
-            encode_search(&mut w, tag, "SEARCH RETURN (SAVE)", criteria, None, utf8)?;
+        Command::SearchSave {
+            addressing,
+            criteria,
+        } => {
+            encode_search(
+                &mut w,
+                tag,
+                addressing.command("SEARCH RETURN (SAVE)", "UID SEARCH RETURN (SAVE)"),
+                criteria,
+                None,
+                utf8,
+            )?;
         }
         Command::Fetch {
             sequence_set,
@@ -240,25 +268,6 @@ pub(crate) fn encode_command(
                 "MOVE",
                 sequence_set.as_str(),
                 &wire,
-                utf8,
-            )?;
-        }
-        Command::UidSearch { criteria } => {
-            encode_search(&mut w, tag, "UID SEARCH", criteria, None, utf8)?;
-        }
-        Command::UidSearchReturn {
-            criteria,
-            return_opts,
-        } => {
-            encode_search(&mut w, tag, "UID SEARCH", criteria, Some(return_opts), utf8)?;
-        }
-        Command::UidSearchSave { criteria } => {
-            encode_search(
-                &mut w,
-                tag,
-                "UID SEARCH RETURN (SAVE)",
-                criteria,
-                None,
                 utf8,
             )?;
         }
@@ -380,13 +389,7 @@ pub(crate) fn encode_command(
             encode_setmetadata(&mut w, tag, &wire, entries, utf8)?;
         }
         Command::Thread {
-            algorithm,
-            charset,
-            criteria,
-        } => {
-            encode_thread_or_sort_cmd(&mut w, tag, "THREAD", algorithm, charset, criteria, false)?;
-        }
-        Command::UidThread {
+            addressing,
             algorithm,
             charset,
             criteria,
@@ -394,7 +397,7 @@ pub(crate) fn encode_command(
             encode_thread_or_sort_cmd(
                 &mut w,
                 tag,
-                "UID THREAD",
+                addressing.command("THREAD", "UID THREAD"),
                 algorithm,
                 charset,
                 criteria,
@@ -402,13 +405,7 @@ pub(crate) fn encode_command(
             )?;
         }
         Command::Sort {
-            sort_criteria,
-            charset,
-            criteria,
-        } => {
-            encode_thread_or_sort_cmd(&mut w, tag, "SORT", sort_criteria, charset, criteria, true)?;
-        }
-        Command::UidSort {
+            addressing,
             sort_criteria,
             charset,
             criteria,
@@ -416,7 +413,7 @@ pub(crate) fn encode_command(
             encode_thread_or_sort_cmd(
                 &mut w,
                 tag,
-                "UID SORT",
+                addressing.command("SORT", "UID SORT"),
                 sort_criteria,
                 charset,
                 criteria,

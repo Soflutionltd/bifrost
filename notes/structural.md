@@ -172,30 +172,6 @@ No account reads `run_id`, `sequence` or `protocol_salt`; the salt's string
 payloads are always empty. Its only function is engine bookkeeping, which need
 not cross the account boundary.
 
-## STR-034 - The sync test layout mirrors history, not the design
-
-**Reported by:** sync-engine.
-
-- `engine/lane.rs` is about 110 lines of gate and 1,100 lines of tests, mostly
-  exercising `PendingCoverage` capacity, supersession and watermarks; the
-  capacity moved into `cursor/coverage.rs` and the tests did not follow.
-- `tests/attach_schema_recovery.rs` (about 3,150 lines) is a grab-bag:
-  page-loss warnings, detach push teardown, reattach topology, lifecycle reader
-  parking, account restart exhaustion, partial-batch boundary, publication-id
-  invariant, deferred schema reset. It redefines `unsupported`, `caps` and
-  `cursor_for` from `tests/common/mod.rs` and has its own `HealAccount`.
-- Nine hand-written `impl Account` doubles in `crates/sync`
-  (`common::StubAccount`, `HealAccount`, `FlagsAccount`, `JudgingAccount` and
-  `ReassertAccount` in `readback_guard.rs` alone, plus the passthrough ones)
-  copy default-method behaviour rather than share it.
-- `tests/common/mod.rs`'s `StubAccount` has about 50 hook fields, and is
-  included into the crate as `crate::test_common` via `#[path]` as well as being
-  the integration double.
-
-Proposal: one configurable double per lane (changes, inventory, push, mutation,
-lifecycle) composed into a stub, and test files named after the contract they
-pin (`supervisor_*`, `delivery_*`, `campaign_*`, `establish_*`).
-
 ## STR-042 - `PendingCoverage` is five subsystems behind one lock and one public surface
 
 **Reported by:** sync-lanes.
@@ -231,20 +207,6 @@ InventoryPartition` has two redundant middle layers, and collapsing it to
 and the durable cost of the unexercised machinery (the selection rule every
 store implements, the time-key compaction contract) is paid now by every backend
 for producers that do not exist yet.
-
-## STR-050 - UID versus sequence number is not in the IMAP response types
-
-**Reported by:** imap-protocol, imap-connection.
-
-Search, sort and thread results are typed by addressing, ESEARCH's UID
-indicator is checked against the command, the command sets are typed
-(`SequenceSet<Seq>` versus `SequenceSet` of UIDs), `AppendUid` and `ModSeq`
-landed, and `CommandKind` tells UID FETCH from FETCH. What remains: the
-UID/sequence `Command` twins (`Search`/`UidSearch`, `Fetch`/`UidFetch`, ...)
-are still separate variants doubling every match in `kind`, `mailbox_target`
-and the encoder; one variant with an addressed target would halve them. The
-wire-level `FetchResponse { seq: u32, uid: Option<u32> }` and
-`Removal::Seq(u32)` are still bare numbers.
 
 ## STR-062 - Protocol-value behaviour lives in IMAP `account/`, and account identity lives in `types/`
 
@@ -411,30 +373,5 @@ split, and the shared message-error strings landed. One residue needs a
 bifrost-net API first: `client/metering.rs`'s blocking admission loop belongs
 beside `BandwidthBudget` in bifrost-net as a blocking budget API, which does not
 exist yet. (The rest of `authentication.rs` moving to bifrost-sasl is STR-135.)
-
-## STR-141 - The SMTP 2x2 product at the public surface, and a Lettre-vestige executor that owns dialing
-
-**Reported by:** smtp-sasl (both need owner rulings).
-
-`SmtpTransport`, `LmtpTransport`, `AsyncSmtpTransport<E>`, `AsyncLmtpTransport<E>`
-and four builders each repeat `hello_name`, `credentials`, `password`, `oauth2`,
-`oauth2_source`, `authentication`, `dangerous_allow_insecure_auth`, `timeout`,
-`bandwidth_metering`, `port`, `tls`, `pool_config`, `build`; each transport repeats
-`test_connection`, `verify`, `expand`, `send_raw_with_options`, `send_raw_bdat*`,
-`send_raw_batch_with_options` with the same body (validate, map, checkout, send,
-resolve). `connection_url.rs` already introduced a private `TransportBuilder` trait to
-paper over two of the four builders, and the setters drift in small ways (the async
-LMTP builder's `tls` clears `unix_socket` and is redundantly `#[cfg(feature =
-"tokio")]` inside an always-tokio file). Proposal: one `Builder<D: Dialect, R:
-Runtime>` over `SmtpInfo` and one `Transport<D, R>` whose methods are written once
-over a runtime-abstract connection (feasible now that the sans-IO session machine has landed), with the current
-names surviving as type aliases (structs becoming aliases needs the owner).
-Separately, `Executor` is sealed with exactly one implementor (`TokioExecutor`),
-every async transport is generic over `E` with `#[allow(private_bounds)]` on most
-methods, and `SmtpExecutor::connect` holds the TLS-mode dial sequence (CON-058);
-dialing policy is not a property of the runtime. Moving `connect` out is internal;
-dropping the `E` parameter needs the owner. `ConnectionOptions` exists "keeping the
-dial signature stable across features" - a symptom of the parameter list living in
-the wrong place.
 
 

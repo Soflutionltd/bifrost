@@ -51,14 +51,14 @@ pub(crate) use mailbox::{
 pub(crate) use notify::NotifyEvent;
 pub(crate) use notify::{MailboxFilter, NotifyEventGroup, NotifySetParams};
 pub(crate) use profile::ServerProfile;
-pub(crate) use response::{
-    Capability, CopyResult, ExpungeResult, ListStatusEntry, MoveResult, NamespaceResponse,
-    QuotaRootResponse, Response, ResponseCode, SeqBound, ThreadNode, UidRange, UntaggedResponse,
-};
 #[cfg(test)]
 pub(crate) use response::{
     AclEntry, EsearchResponse, ListRightsResponse, MetadataEntry, MetadataResult, QuotaResource,
     UntaggedStatus,
+};
+pub(crate) use response::{
+    Capability, CopyResult, ExpungeResult, ListStatusEntry, MoveResult, NamespaceResponse,
+    QuotaRootResponse, Response, ResponseCode, SeqBound, ThreadNode, UidRange, UntaggedResponse,
 };
 pub(crate) use search::{SearchCriteria, SearchResult};
 pub(crate) use secret::SecretString;
@@ -68,7 +68,7 @@ pub(crate) use validated::{
 };
 
 // Re-export command types for internal use only.
-pub(crate) use command::{Command, CommandKind};
+pub(crate) use command::{Addressing, Command, CommandKind};
 
 pub(crate) use request::{QresyncParams, SelectAccess, SelectOptions};
 
