@@ -102,11 +102,8 @@ pub(crate) struct GmailErrorContext {
 }
 
 impl GmailErrorContext {
-    pub(crate) fn identity(&self) -> bifrost_types::error::builder::AccountErrorContext {
-        bifrost_types::error::builder::AccountErrorContext::new(
-            provider_for(self),
-            protocol_for(self),
-        )
+    pub(crate) fn identity(&self) -> bifrost_types::AccountErrorContext {
+        bifrost_types::AccountErrorContext::new(provider_for(self), protocol_for(self))
     }
 
     pub(crate) fn base(operation: AccountOperation) -> Self {

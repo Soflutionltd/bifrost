@@ -140,6 +140,10 @@ pub struct AccountErrorBuilder {
 
 impl AccountErrorBuilder {
     /// Apply the identity owned by the failing API or transport boundary.
+    ///
+    /// Always replaces the protocol. A `Some` provider replaces the existing
+    /// provider; `None` preserves it, so a provider-neutral transport boundary
+    /// does not discard known account provider identity.
     #[must_use]
     pub fn context(self, context: AccountErrorContext) -> Self {
         let builder = self.protocol(context.protocol);

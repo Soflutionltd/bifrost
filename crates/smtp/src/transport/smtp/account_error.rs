@@ -62,8 +62,8 @@ pub(crate) struct SmtpErrorContext {
 }
 
 impl SmtpErrorContext {
-    fn identity(&self) -> bifrost_types::error::builder::AccountErrorContext {
-        bifrost_types::error::builder::AccountErrorContext::new(None, self.protocol.into())
+    fn identity(&self) -> bifrost_types::AccountErrorContext {
+        bifrost_types::AccountErrorContext::new(None, self.protocol.into())
     }
 
     pub(crate) fn send(protocol: Dialect) -> Self {

@@ -576,6 +576,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn smtp_5xx_submission_restamp_stays_provider_refused() {
+        use bifrost_types::{AccountOperation, Protocol, RecoveryClass};
+
+        let (submission, envelope) = two_recipient_submission(|script| {
+            script
+                .expect("RCPT TO:<a@example.com>\r\n", "250 recipient\r\n")
+                .expect("RCPT TO:<b@example.com>\r\n", "250 recipient\r\n")
+                .expect("DATA\r\n", "354 send\r\n")
+                .expect("Subject: test\r\n\r\nbody\r\n", "")
+                .expect(".\r\n", "554 transaction failed\r\n")
+        });
+        let error = submission
+            .send_rfc5322(&envelope, b"Subject: test\r\n\r\nbody\r\n", None)
+            .await
+            .expect_err("the relay permanently refused the message");
+        assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused);
+        for operation in [AccountOperation::Send, AccountOperation::DraftSend] {
+            let error = crate::account::error::restamp(error.clone(), operation);
+            // An enterprise user expects a permanent relay refusal to stop the
+            // send queue, even though IMAP owns the enclosing operation.
+            assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused);
+            assert_eq!(error.protocol(), Some(Protocol::Smtp));
+            assert_eq!(error.operation(), Some(operation));
+        }
+    }
+
+    #[tokio::test]
     async fn a_partial_send_reports_the_refused_recipient_on_success() {
         let (submission, envelope) = two_recipient_submission(|script| {
             script

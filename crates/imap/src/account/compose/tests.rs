@@ -25,7 +25,7 @@ fn send_as_rejected_unsupported() {
 fn scheduled_send_restamp_preserves_unsupported_kind() {
     // The smtp boundary already produces `Unsupported(Send)` for an
     // unsupporting relay (brick 4.6a). The IMAP send path re-stamps
-    // only the operation/protocol via `restamp`; it must not change
+    // only the operation via `restamp`; it must not change
     // the kind. Pin that the kind survives unchanged.
     let smtp_derived = crate::account::error::test_support::smtp_unsupported();
 

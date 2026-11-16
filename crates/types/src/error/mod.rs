@@ -16,7 +16,7 @@ pub use batch::{
     BatchFailure, BatchInvariantError, BatchItem, BatchItemId, BatchItemOutcome, BatchOutcome,
     BatchOutcomeBuilder, BatchSuccess, BatchUncertain, SubmissionIndex, validate_batch_input,
 };
-pub use builder::{AccountErrorBuildError, AccountErrorBuilder};
+pub use builder::{AccountErrorBuildError, AccountErrorBuilder, AccountErrorContext};
 pub use cause::{
     AccessCause, AnswerEvidence, AttemptCause, AuthCause, BatchInputInvalidItem,
     BatchInputInvalidReason, Cause, CauseChain, EnhancedStatusCode, GmailSignal, GraphSignal,

@@ -29,8 +29,8 @@ pub enum DavProtocol {
 }
 
 impl DavProtocol {
-    fn identity(self) -> bifrost_types::error::builder::AccountErrorContext {
-        bifrost_types::error::builder::AccountErrorContext::new(None, self.protocol())
+    fn identity(self) -> bifrost_types::AccountErrorContext {
+        bifrost_types::AccountErrorContext::new(None, self.protocol())
     }
 
     #[must_use]

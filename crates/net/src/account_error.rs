@@ -37,8 +37,8 @@ pub struct NetErrorContext {
 impl NetErrorContext {
     /// The failing leg's identity, shared with provider-owned translations.
     #[must_use]
-    pub fn identity(&self) -> bifrost_types::error::builder::AccountErrorContext {
-        bifrost_types::error::builder::AccountErrorContext::new(self.provider, self.protocol)
+    pub fn identity(&self) -> bifrost_types::AccountErrorContext {
+        bifrost_types::AccountErrorContext::new(self.provider, self.protocol)
     }
 }
 

@@ -2273,6 +2273,9 @@ conversion, HOLDUNTIL and recipient receipt projection to
 field, login credential inheritance, account budget/meter, default From and
 save-to-Sent policy. Its scripted submission connector still reaches the same
 SMTP builder. Local envelope validation errors now identify SMTP as their protocol.
+Submission error restamping changes only the enclosing Send or DraftSend
+operation, preserving the failing SMTP/LMTP protocol. An enterprise user expects
+a relay 5xx refusal to remain ProviderRefused and stop automatic retries.
 
 SELECT option assembly propagates cached QRESYNC operand validation failures as
 internal IMAP errors to the operation's classification boundary rather than

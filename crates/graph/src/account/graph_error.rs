@@ -43,11 +43,8 @@ pub(crate) struct GraphErrorContext {
 }
 
 impl GraphErrorContext {
-    pub(crate) fn identity(&self) -> bifrost_types::error::builder::AccountErrorContext {
-        bifrost_types::error::builder::AccountErrorContext::new(
-            Some(Provider::Microsoft),
-            self.protocol,
-        )
+    pub(crate) fn identity(&self) -> bifrost_types::AccountErrorContext {
+        bifrost_types::AccountErrorContext::new(Some(Provider::Microsoft), self.protocol)
     }
 
     #[must_use]

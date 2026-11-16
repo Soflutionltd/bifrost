@@ -65,8 +65,12 @@ consuming account stamps the protocol at the boundary.
 Protocol and provider remain properties of the failing leg, rather than a
 blanket account stamp. Composed accounts can fail through DAV, SMTP, EWS or
 Google auxiliary APIs while their primary protocol stays IMAP, Graph or Gmail.
-`AccountErrorContext` in `error::builder` owns provider and protocol identity
-for a translation boundary; builders apply it through `.context(..)`. Provider
+`AccountErrorContext`, re-exported from `error` and the crate root alongside
+`AccountErrorBuilder`, owns provider and protocol identity
+for a translation boundary; builders apply it through `.context(..)`. Context
+always replaces protocol. A `Some` provider replaces the existing provider;
+`None` preserves it because a provider-neutral transport boundary supplies no
+replacement for known account provider identity. Provider
 contexts choose the actual failing API once: Gmail, Calendar, People and Drive;
 Graph REST or EWS; SMTP or LMTP; IMAP, JMAP and DAV keep their own identities.
 Provider-neutral rendering errors acquire identity only at the account boundary.

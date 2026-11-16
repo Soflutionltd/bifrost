@@ -129,7 +129,7 @@ where
         // relay's EHLO at send time is authoritative: an unsupporting
         // relay surfaces an `Unsupported(Send)` AccountError from the
         // smtp boundary (kind set there, not here). Re-stamp only the
-        // operation/protocol; `restamp` cannot change the kind.
+        // operation; `restamp` cannot change the kind.
         let not_accepted = submission
             .send_rfc5322(&rendered.envelope, &rendered.raw, request.scheduled)
             .await

@@ -45,13 +45,6 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
-- **SMTP 5xx permanence now rests on the `protocol` field alone.** Recovery
-  reads the error's protocol, so a future `.context(..)` or `.protocol(..)`
-  that restamps an SMTP-derived error (an IMAP-composed send, for example)
-  would turn a permanent refusal into a retry. Nothing restamps today; a test
-  pinning that IMAP-restamped send errors stay `ProviderRefused` would guard
-  it. `AccountErrorContext` is also reachable only by its full module path, and
-  `context` with `provider: None` keeps an existing provider undocumented.
 - **`BatchOutcome::iter()` yields builder push order, not submission order.**
   The docs now say so; whether consumers need submission order is open.
 - **`UnsupportedReason::LabelKind` has no producer.** Its only producers were

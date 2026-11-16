@@ -50,8 +50,8 @@ use bifrost_types::{BatchSuccess, ItemOutcome, MutationSuccess};
 use crate::core::error::{JMAPError, MethodErrorType, ProblemDetails, ProblemType};
 use crate::core::set::{SetError, SetErrorType};
 
-const ERROR_CONTEXT: bifrost_types::error::builder::AccountErrorContext =
-    bifrost_types::error::builder::AccountErrorContext::new(None, Protocol::Jmap);
+const ERROR_CONTEXT: bifrost_types::AccountErrorContext =
+    bifrost_types::AccountErrorContext::new(None, Protocol::Jmap);
 
 // State-bearing contracts own their recovery scope. A caller cannot describe
 // an anchored or state-based request without saying which cursor to restart.

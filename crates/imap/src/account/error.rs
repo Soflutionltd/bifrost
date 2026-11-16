@@ -59,12 +59,12 @@ pub(crate) struct ImapErrorContext {
     pub(crate) extra_text: Vec<DiagnosticText>,
 }
 
-const ERROR_CONTEXT: bifrost_types::error::builder::AccountErrorContext =
-    bifrost_types::error::builder::AccountErrorContext::new(None, Protocol::Imap);
+const ERROR_CONTEXT: bifrost_types::AccountErrorContext =
+    bifrost_types::AccountErrorContext::new(None, Protocol::Imap);
 
 impl ImapErrorContext {
-    fn identity(&self) -> bifrost_types::error::builder::AccountErrorContext {
-        bifrost_types::error::builder::AccountErrorContext::new(self.provider, Protocol::Imap)
+    fn identity(&self) -> bifrost_types::AccountErrorContext {
+        bifrost_types::AccountErrorContext::new(self.provider, Protocol::Imap)
     }
 
     pub(crate) fn operation(operation: AccountOperation) -> Self {
@@ -1411,6 +1411,8 @@ pub(super) fn pim_malformed(op: AccountOperation, detail: impl Into<String>) -> 
 ///
 /// `into_builder` preserves idempotency and throttle overrides. Restamping
 /// changes the operation without discarding the submission boundary's evidence.
+/// Keep its SMTP/LMTP protocol: an enterprise user expects a permanent relay
+/// refusal to stop the send queue rather than become an IMAP retry.
 pub(super) fn restamp(err: AccountError, op: AccountOperation) -> AccountError {
     err.into_builder()
         .operation(op)
