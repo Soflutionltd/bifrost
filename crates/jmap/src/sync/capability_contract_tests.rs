@@ -99,7 +99,7 @@ fn account_with(submission_available: bool, foreign_submission_id: Option<&str>)
     let session: Session = serde_json::from_str(SESSION).expect("session fixture parses");
     let transport = ReqwestTransport::new(
         reqwest::header::HeaderMap::new(),
-        Authorization::Basic(String::new()),
+        Authorization::Basic(Default::default()),
         bifrost_types::AccountId("jmap-capability-contract".to_string()),
         std::time::Duration::from_secs(5),
         false,

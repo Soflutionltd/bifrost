@@ -340,7 +340,7 @@ fn a_hintless_mailbox_throttle_holds_its_mailbox_for_the_fallback() {
     record(
         &bucket,
         &build(
-            ThrottleScope::Mailbox,
+            ThrottleScope::ScopedResource,
             Some(ErrorScope::Cursor(CursorScope::Folder(
                 bifrost_types::FolderId("INBOX".into()),
             ))),
@@ -388,7 +388,7 @@ fn resolve_throttle_key_reads_identities_from_the_error() {
         id: "shared@example.com".into(),
     }));
     assert_eq!(
-        resolve_throttle_key(ThrottleScope::Mailbox, &account, &mailbox_err),
+        resolve_throttle_key(ThrottleScope::ScopedResource, &account, &mailbox_err),
         Some(ThrottleKey::Folder {
             account: account.clone(),
             folder: bifrost_types::FolderId("shared@example.com".into()),
@@ -407,9 +407,11 @@ fn throttle_owner_and_container_ids_never_share_a_bucket() {
         ty: bifrost_types::ObjectType::Email,
     })));
     let mailbox = throttled_error(Some(ErrorScope::Mailbox { id: "same".into() }));
-    let owner_key = resolve_throttle_key(ThrottleScope::Mailbox, &account, &owner).unwrap();
-    let folder_key = resolve_throttle_key(ThrottleScope::Mailbox, &account, &folder).unwrap();
-    let mailbox_key = resolve_throttle_key(ThrottleScope::Mailbox, &account, &mailbox).unwrap();
+    let owner_key = resolve_throttle_key(ThrottleScope::ScopedResource, &account, &owner).unwrap();
+    let folder_key =
+        resolve_throttle_key(ThrottleScope::ScopedResource, &account, &folder).unwrap();
+    let mailbox_key =
+        resolve_throttle_key(ThrottleScope::ScopedResource, &account, &mailbox).unwrap();
     assert_eq!(
         owner_key,
         ThrottleKey::Owner {
@@ -435,7 +437,7 @@ fn throttle_owner_and_container_ids_never_share_a_bucket() {
 /// construct: IMAP's `with_mailbox` is annotated production-dead, and every
 /// real folder producer goes through `with_folder_scope`, yielding
 /// `Cursor(Folder(_))`. IMAP's `mailbox_throttle` is the only production
-/// emitter of `ThrottleScope::Mailbox` anywhere in the workspace and it
+/// emitter of `ThrottleScope::ScopedResource` anywhere in the workspace and it
 /// fires for both shapes, so a reader accepting only the synthetic one
 /// degraded on every real per-folder throttle and on none of the tested
 /// ones - the bucket entry was simply never recorded.
@@ -446,7 +448,7 @@ fn a_folder_scoped_throttle_keys_the_folder_bucket() {
         bifrost_types::FolderId("INBOX/shared".into()),
     ))));
     assert_eq!(
-        resolve_throttle_key(ThrottleScope::Mailbox, &account, &folder_err),
+        resolve_throttle_key(ThrottleScope::ScopedResource, &account, &folder_err),
         Some(ThrottleKey::Folder {
             account,
             folder: bifrost_types::FolderId("INBOX/shared".into()),
@@ -461,7 +463,7 @@ fn a_mailbox_throttle_naming_no_mailbox_never_widens_to_the_account() {
     let account = AccountId("a".into());
     let bare = throttled_error(None);
     assert_eq!(
-        resolve_throttle_key(ThrottleScope::Mailbox, &account, &bare),
+        resolve_throttle_key(ThrottleScope::ScopedResource, &account, &bare),
         None
     );
     // `throttled_error` carries no provider timing, and an account-wide

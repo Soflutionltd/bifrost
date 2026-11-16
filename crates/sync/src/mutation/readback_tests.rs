@@ -5,11 +5,11 @@ use bifrost_types::{
     CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
     ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
     DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
-    FlagOp, HostedAttachment, HydratedObject, HydratedObjectKind, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEvent, ItemOutcome,
-    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page, PageBoundary,
-    PrimaryCause, Priority, Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest,
-    SendReceipt, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    FlagOp, HostedAttachment, HydratedObject, HydratedObjectKind, HydrationProjection, Identity,
+    IdentityId, IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
+    MutationSuccess, MutationTarget, ObjectId, Page, PageBoundary, PrimaryCause, Priority,
+    Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
     SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
@@ -127,7 +127,6 @@ impl Account for ScriptAccount {
         &self,
         targets: AccountStream<ObjectId>,
         _op: FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         unreachable!("unexpected account door")
     }
@@ -135,14 +134,12 @@ impl Account for ScriptAccount {
         &self,
         _targets: AccountStream<ObjectId>,
         destination: MembershipScope,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         unreachable!("unexpected account door")
     }
     fn bulk_destroy(
         &self,
         _targets: AccountStream<ObjectId>,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         unreachable!("unexpected account door")
     }

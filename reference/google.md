@@ -468,7 +468,7 @@ awaits session cleanup rather than dropping the multi-request future.
   only. Gmail `batchModify` has no conditional history-ID primitive; versioned
   bulk mail refuses supplied tokens before I/O.
 - `mutation.replay_safety: MutationReplaySafety::None`. No client-mintable
-  dedup token; the shared `IdempotencyKey` is held engine-side.
+  dedup token; the engine's cohort key never reaches the account.
 - `mutation.reassertion: { set_flags: true, destroy: true }`. Gmail ids are
   immutable and `batchModify` / `batchDelete` converge when reapplied; the flag
   judge is described under "Flag observation and reassertion capability".
@@ -1599,8 +1599,8 @@ label merely because its id differs only in case.
   `Fingerprint.flags_hash` field of an `InventoryEntry`.
 
 Gmail accepts no client-mintable idempotency header on these endpoints, so the
-mutation impls take the shared `IdempotencyKey` and hold it engine-side rather
-than wiring it onto the request.
+mutation impls send none; cohort correlation stays inside `bifrost-sync` and
+never reaches the account.
 
 ## Blobs
 

@@ -1970,3 +1970,5 @@ ManageSieve. Service selection preserves plaintext relay 25 versus submission
 587, IMAP 993/143, LMTP 24 and ManageSieve 4190. A configured port always wins.
 This vocabulary does not replace SMTP's connector parameters or opportunistic
 upgrade policy.
+
+Ordinary Error Display omits arbitrary constructor messages and foreign sources, except local Network/Tls text. Generic account translation likewise omits foreign sources and encoding, header, URL and redirect prose; typed categories and transmission evidence remain.

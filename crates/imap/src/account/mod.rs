@@ -15,11 +15,11 @@ use bifrost_types::{
     ContainerKind, ContainerList, CursorDescriptor, CursorEstablishment, CursorScope,
     DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
     EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
-    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
-    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus,
-    SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
-    ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
+    HostedAttachment, HydratedObject, HydrationProjection, Identity, IdentityId, IdentityPatch,
+    Importance, InventoryEvent, ItemOutcome, MembershipScope, Message, MutationSuccess,
+    MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus, SearchRequest,
+    SendReceipt, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use futures::stream::Stream;
@@ -614,18 +614,16 @@ impl Account for ImapAccount {
         &self,
         targets: AccountStream<bifrost_types::ObjectId>,
         op: bifrost_types::FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutate::bulk_set_flags(self.clone(), targets, op, key)
+        mutate::bulk_set_flags(self.clone(), targets, op)
     }
 
     fn bulk_set_flags_if_version(
         self: std::sync::Arc<Self>,
         targets: AccountStream<bifrost_types::MailMutationTarget>,
         op: bifrost_types::FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutate::bulk_set_flags_if_version(self.as_ref().clone(), targets, op, key)
+        mutate::bulk_set_flags_if_version(self.as_ref().clone(), targets, op)
     }
 
     // Account: maps shared membership moves to UID MOVE; direct users call uid_move_messages().
@@ -633,18 +631,16 @@ impl Account for ImapAccount {
         &self,
         targets: AccountStream<bifrost_types::ObjectId>,
         destination: MembershipScope,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutate::bulk_move(self.clone(), targets, destination, key)
+        mutate::bulk_move(self.clone(), targets, destination)
     }
 
     // Account: maps shared destroy batches to STORE Deleted plus UID EXPUNGE.
     fn bulk_destroy(
         &self,
         targets: AccountStream<bifrost_types::ObjectId>,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutate::bulk_destroy(self.clone(), targets, key)
+        mutate::bulk_destroy(self.clone(), targets)
     }
 
     fn add_to_container(

@@ -205,8 +205,7 @@ pub struct MutationCapabilities {
 
 /// How the protocol crate's bulk methods batch their input stream.
 ///
-/// Per-protocol defaults: JMAP `{ 500, 100ms }`, Gmail
-/// `{ 1000, 200ms }`, Graph `{ 20, 100ms }`, IMAP `{ 5000, 50ms }`.
+/// Each provider declares its own defaults in its capability snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchingPolicy {
     pub max_items: usize,
@@ -214,8 +213,8 @@ pub struct BatchingPolicy {
     pub flush_on_input_close: bool,
 }
 
-/// Coarse rate-limit posture. Used by `bifrost-net` and the engine to
-/// pick a default request-rate budget for the account.
+/// Coarse rate-limit posture retained in capability-change diagnostics.
+/// Neither `bifrost-net` nor the engine derives request budgets from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RateLimitClass {
@@ -230,7 +229,8 @@ pub enum RateLimitClass {
     PerConnection,
 }
 
-/// Quota-shape signal the engine reacts to.
+/// Declared quota shape retained in capability-change diagnostics.
+/// Engine recovery follows observed errors rather than this declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum QuotaSignal {
@@ -548,6 +548,11 @@ impl Default for ConvenienceShape {
 }
 
 /// Snapshot of an account's behavior read at open-time.
+///
+/// Cursor freshness, pre-download digest availability, rate-limit and quota
+/// posture, UIDVALIDITY recheck policy and token-expiry hints are read by
+/// `CapabilityDelta::between` for reattach change notifications. They do not
+/// drive engine scheduling, retry budgets or cursor validation.
 #[derive(Debug, Clone)]
 pub struct AccountCapabilities {
     pub cursor_freshness: CursorFreshness,

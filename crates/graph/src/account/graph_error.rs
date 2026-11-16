@@ -347,7 +347,8 @@ pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext
             response_to_account_error(response, &ctx)
         }
         EwsError::SoapFault { code, detail } => soap_fault_to_account_error(code, detail, &ctx),
-        EwsError::MalformedXml(detail) => {
+        EwsError::MalformedXml(_) => {
+            let detail = DiagnosticText::support_only("malformed EWS XML response");
             let builder = base_builder(
                 &ctx,
                 PrimaryCause::Protocol {
@@ -382,14 +383,15 @@ pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext
 
 fn soap_fault_to_account_error(
     code: SoapFaultCode,
-    detail: DiagnosticText,
+    _detail: DiagnosticText,
     ctx: &GraphErrorContext,
 ) -> AccountError {
+    let detail = DiagnosticText::support_only(format!("EWS SOAP fault: {code:?}"));
     // SOAP 1.1 fault codes map onto the same recovery taxonomy as
     // HTTP statuses: `Server` ~ 5xx (unavailable), `Client` ~ 4xx
     // (refused). Microsoft EWS embeds finer-grained codes in the
-    // `<detail>` payload, but that is support-only diagnostics; we
-    // do not branch UX on the string.
+    // `<detail>` payload. Keep it private: arbitrary SOAP prose may echo
+    // credentials, and typed fault codes alone choose recovery.
     // Cursor scopes deliberately do not imply Mailbox here: that would turn
     // folder-scoped 404s into object-not-found errors and change recovery.
     let resource = ctx.scope.as_ref().and_then(ErrorScope::resource);
@@ -603,18 +605,14 @@ pub(crate) fn provider_answer_violation(
 /// parsers and the OneDrive upload-session 202 read raise it too, each with a
 /// message naming its source. The label therefore claims only what every
 /// producer shares - the provider's response could not be read - and leaves
-/// the format and source to the producer's message, rather than calling an
-/// XML document a JSON parse failure.
+/// the format unspecified. Producer parser prose may quote credentials and
+/// remains private.
 fn json_parse_to_account_error(
-    message: &str,
+    _message: &str,
     body: Option<bytes::Bytes>,
     ctx: &GraphErrorContext,
 ) -> AccountError {
-    let detail = if message.trim().is_empty() {
-        DiagnosticText::support_only("provider response did not parse".to_string())
-    } else {
-        DiagnosticText::support_only(format!("provider response did not parse: {message}"))
-    };
+    let detail = DiagnosticText::support_only("provider response did not parse");
     let mut builder = base_builder(
         ctx,
         PrimaryCause::Protocol {

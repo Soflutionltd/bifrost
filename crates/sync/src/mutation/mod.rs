@@ -25,7 +25,7 @@ pub(crate) mod campaign;
 pub mod idempotency;
 pub mod readback;
 
-pub use idempotency::{IdempotencyVendor, MutationCampaignId};
+pub use idempotency::{IdempotencyKey, IdempotencyVendor, MutationCampaignId, ProtocolSalt};
 pub use readback::{
     ReadbackOutcome, run_destroy_readback_guard, run_move_readback_guard, run_readback_guard,
 };
@@ -47,6 +47,10 @@ pub use readback::{
 /// the contract.
 #[derive(Debug, Default, Clone)]
 pub struct MutationCounters {
+    /// Engine-local identities allocated for the campaign, in allocation order.
+    /// Retries and reassertions reuse a cohort identity; rerouting unsent work
+    /// may allocate another. These keys never cross the Account boundary.
+    pub cohort_keys: Vec<IdempotencyKey>,
     /// Append-only observations, not unique effects. Repeated attempts may
     /// report the same effect; requested-state satisfaction never clears these.
     pub partial_commit_observations: Vec<PartialCommitObservation>,

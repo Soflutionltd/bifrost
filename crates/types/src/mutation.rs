@@ -7,7 +7,7 @@
 use bytes::Bytes;
 
 use crate::blob::BlobHandle;
-use crate::ids::{ObjectId, RunId};
+use crate::ids::ObjectId;
 
 /// Server observation used in fingerprints and conditional mutations.
 ///
@@ -376,63 +376,6 @@ pub struct HydratedObject {
     /// Blob handles for attached parts, when the projection requested
     /// them or when they are cheap to expose.
     pub blobs: Vec<BlobHandle>,
-}
-
-/// Idempotency surface for safe retry of bulk mutations.
-///
-/// Distinct from `MutationConcurrency::StateBased`: that is
-/// optimistic concurrency on the wire, this is engine bookkeeping
-/// for "did we already submit this exact batch?" Built-in providers do not
-/// emit `ProtocolSalt` onto the wire; they rely on the engine's read-back guard.
-#[derive(Debug, Clone)]
-pub struct IdempotencyKey {
-    pub run_id: RunId,
-    pub sequence: u64,
-    pub protocol_salt: ProtocolSalt,
-}
-
-/// Protocol-tagged salt used by the engine's idempotency bookkeeping.
-///
-/// Carried alongside `RunId` and `sequence` for protocol-specific correlation.
-/// The engine preserves the salt across retries without interpreting it;
-/// built-in providers never send it on the wire. Custom factories may supply
-/// nonempty payloads as consumer bookkeeping identity, not cursor provenance.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ProtocolSalt {
-    /// JMAP has no documented wire replay token; `ifInState` is the
-    /// orthogonal concurrency primitive.
-    Jmap(String),
-    /// Gmail has no documented wire replay token; `X-Goog-Request-Id`
-    /// is not a dedup primitive on the messages endpoints.
-    Gmail(String),
-    /// Microsoft Graph has no documented wire replay token;
-    /// `client-request-id` is debugging correlation only.
-    Graph(String),
-    /// IMAP carries no replay token; the engine relies on read-back of
-    /// uncertain writes and declared desired-state reassertion.
-    Imap,
-    /// CardDAV carries no replay token; consumers use etags where
-    /// available and the engine keeps idempotency local.
-    CardDav,
-    /// CalDAV carries no replay token, on the same terms as CardDAV.
-    CalDav,
-}
-
-impl From<crate::ProtocolKind> for ProtocolSalt {
-    /// Default bookkeeping salt. Custom factories can still supply payloads.
-    fn from(protocol: crate::ProtocolKind) -> Self {
-        // Keep this exhaustive inside the vocabulary's owner. An external
-        // wildcard used to silently assign new protocols the IMAP identity.
-        match protocol {
-            crate::ProtocolKind::Jmap => Self::Jmap(String::new()),
-            crate::ProtocolKind::Imap => Self::Imap,
-            crate::ProtocolKind::Gmail => Self::Gmail(String::new()),
-            crate::ProtocolKind::CardDav => Self::CardDav,
-            crate::ProtocolKind::CalDav => Self::CalDav,
-            crate::ProtocolKind::Graph => Self::Graph(String::new()),
-        }
-    }
 }
 
 /// Bulk flag mutation. Carries both the operation and the flag set

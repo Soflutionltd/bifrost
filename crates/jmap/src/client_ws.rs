@@ -1765,7 +1765,7 @@ mod tests {
         .expect("session fixture parses");
         let transport = crate::transport_reqwest::ReqwestTransport::new(
             reqwest::header::HeaderMap::new(),
-            crate::client::Authorization::Basic(String::new()),
+            crate::client::Authorization::Basic(Default::default()),
             bifrost_net::AccountId("jmap-ws-size".to_string()),
             std::time::Duration::from_secs(5),
             false,
@@ -1817,7 +1817,7 @@ mod tests {
         .expect("session fixture parses");
         let transport = crate::transport_reqwest::ReqwestTransport::new(
             reqwest::header::HeaderMap::new(),
-            crate::client::Authorization::Basic(String::new()),
+            crate::client::Authorization::Basic(Default::default()),
             bifrost_net::AccountId("jmap-ws-url".to_string()),
             std::time::Duration::from_secs(5),
             false,

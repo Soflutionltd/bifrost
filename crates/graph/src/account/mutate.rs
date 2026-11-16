@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use bifrost_types::{
     AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchUncertain, Checkpoint,
-    ErrorScope, FlagOp, IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, ObjectId,
-    PageBoundary, ProtocolErrorKind, SyncEvent,
+    ErrorScope, FlagOp, ItemOutcome, MembershipScope, MutationSuccess, ObjectId, PageBoundary,
+    ProtocolErrorKind, SyncEvent,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -32,7 +32,6 @@ pub(crate) fn bulk_set_flags_stream(
     account: GraphAccount,
     targets: AccountStream<ObjectId>,
     op: FlagOp,
-    _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     if let Err(error) = op.validate_for_account(bifrost_types::Protocol::Graph) {
         return Box::pin(futures::stream::once(async move {
@@ -46,7 +45,6 @@ pub(crate) fn bulk_move_stream(
     account: GraphAccount,
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
-    _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     bulk_mutation_stream(account, targets, MutationKind::Move(destination))
 }
@@ -54,7 +52,6 @@ pub(crate) fn bulk_move_stream(
 pub(crate) fn bulk_destroy_stream(
     account: GraphAccount,
     targets: AccountStream<ObjectId>,
-    _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     bulk_mutation_stream(account, targets, MutationKind::Destroy)
 }
@@ -63,7 +60,6 @@ pub(crate) fn bulk_set_flags_if_version_stream(
     account: GraphAccount,
     targets: AccountStream<bifrost_types::MailMutationTarget>,
     op: FlagOp,
-    _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     Box::pin(async_stream::stream! {
         // Graph JSON batching carries headers on each subrequest, so one
@@ -1231,7 +1227,6 @@ mod tests {
                 ObjectId("m2".into()),
             ])),
             FlagOp::Add(FlagSet::from(["\\seen".into()])),
-            idempotency_key(),
         )
         .collect::<Vec<_>>()
         .await;
@@ -1271,7 +1266,6 @@ mod tests {
         let events = bulk_destroy_stream(
             account.clone(),
             Box::pin(futures::stream::iter([public.clone()])),
-            idempotency_key(),
         )
         .collect::<Vec<_>>()
         .await;
@@ -1305,7 +1299,6 @@ mod tests {
             account.clone(),
             Box::pin(futures::stream::iter([ObjectId("m1".into())])),
             MembershipScope::Folder(FolderId("AAMkPF=".to_string())),
-            idempotency_key(),
         )
         .collect::<Vec<_>>()
         .await;
@@ -1357,7 +1350,6 @@ mod tests {
                 },
             ])),
             FlagOp::Add(FlagSet::from(["\\seen".into()])),
-            idempotency_key(),
         )
         .collect::<Vec<_>>()
         .await;
@@ -1442,7 +1434,6 @@ mod tests {
                 },
             ])),
             FlagOp::Add(FlagSet::from(["\\seen".into()])),
-            idempotency_key(),
         )
         .collect::<Vec<_>>()
         .await;
@@ -1520,7 +1511,6 @@ mod tests {
                 },
             ])),
             FlagOp::Add(FlagSet::from(["\\seen".into()])),
-            idempotency_key(),
         )
         .collect::<Vec<_>>()
         .await;
@@ -1582,12 +1572,10 @@ mod tests {
                 std::sync::Arc::clone(&account),
                 target(),
                 MembershipScope::Mailbox(bifrost_types::MailboxId("archive".into())),
-                idempotency_key(),
             ),
             bifrost_types::Account::bulk_destroy_if_version(
                 std::sync::Arc::clone(&account),
                 target(),
-                idempotency_key(),
             ),
         ];
         for (stream, operation) in streams
@@ -2713,14 +2701,6 @@ mod tests {
         assert!(!requires_etag(&MutationKind::Destroy));
     }
 
-    fn idempotency_key() -> IdempotencyKey {
-        IdempotencyKey {
-            run_id: bifrost_types::RunId("run-1".to_string()),
-            sequence: 0,
-            protocol_salt: bifrost_types::ProtocolSalt::Graph("salt".to_string()),
-        }
-    }
-
     /// The mutation lane's terminus is the end of the stream, not a
     /// `PageBoundary::Final` tag. `bifrost-sync`'s mutation consumer loops
     /// on `stream.next()` and matches only `Batch` / `Terminated`; it never
@@ -2741,7 +2721,7 @@ mod tests {
             )]);
         let targets: AccountStream<ObjectId> =
             Box::pin(futures::stream::iter([ObjectId("AAMk1".to_string())]));
-        let mut stream = bulk_destroy_stream(account, targets, idempotency_key());
+        let mut stream = bulk_destroy_stream(account, targets);
 
         let mut boundaries = Vec::new();
         let mut saw_done = false;
@@ -2836,9 +2816,7 @@ mod tests {
                 ObjectId("later".to_string()),
             ];
             let targets = Box::pin(futures::stream::iter(ids.clone()));
-            let events: Vec<_> = bulk_destroy_stream(account, targets, idempotency_key())
-                .collect()
-                .await;
+            let events: Vec<_> = bulk_destroy_stream(account, targets).collect().await;
             let mut outcomes = Vec::new();
             let mut done = 0;
             for event in events {
@@ -2985,7 +2963,7 @@ mod tests {
         // `Batch` (which the engine would read as "0 of N applied").
         let account = shared_account();
         let targets: AccountStream<ObjectId> = Box::pin(futures::stream::empty());
-        let mut stream = bulk_destroy_stream(account, targets, idempotency_key());
+        let mut stream = bulk_destroy_stream(account, targets);
         assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
         assert!(stream.next().await.is_none());
     }

@@ -319,7 +319,7 @@ pub enum RetryReason {
     RefreshTransient,
 }
 
-/// Provider-documented scope at which a throttle applies. `Mailbox` and
+/// Provider-documented scope at which a throttle applies. `ScopedResource` and
 /// `Account` map onto sharable [`ThrottleKey`] entries the engine consults
 /// across work items. `CurrentOperation` is a per-call hint: the caller
 /// delays the single work item inline without entering any shared bucket.
@@ -334,7 +334,8 @@ pub enum RetryReason {
 #[non_exhaustive]
 pub enum ThrottleScope {
     CurrentOperation,
-    Mailbox,
+    /// The owner, folder or mailbox identified by the error scope.
+    ScopedResource,
     Account,
 }
 

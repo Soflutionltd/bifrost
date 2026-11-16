@@ -16,8 +16,8 @@ use std::time::Instant;
 
 use bifrost_types::{
     AccountError, AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess,
-    BatchUncertain, ContainerId, FlagOp, IdempotencyKey, ItemOutcome, LabelId, MembershipScope,
-    MutationEffect, MutationSuccess, ObjectId, PageBoundary, SyncEvent, Warning, WarningKind,
+    BatchUncertain, ContainerId, FlagOp, ItemOutcome, LabelId, MembershipScope, MutationEffect,
+    MutationSuccess, ObjectId, PageBoundary, SyncEvent, Warning, WarningKind,
 };
 use futures::{StreamExt, stream};
 use serde::Serialize;
@@ -51,9 +51,8 @@ pub(crate) fn bulk_set_flags(
     cache: ScopeCache,
     targets: AccountStream<ObjectId>,
     op: FlagOp,
-    key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    bulk_set_flags_cancellable(client, cache, targets, op, key, CancellationToken::new())
+    bulk_set_flags_cancellable(client, cache, targets, op, CancellationToken::new())
 }
 
 pub(crate) fn bulk_set_flags_cancellable(
@@ -61,20 +60,12 @@ pub(crate) fn bulk_set_flags_cancellable(
     cache: ScopeCache,
     targets: AccountStream<ObjectId>,
     op: FlagOp,
-    key: IdempotencyKey,
     shutdown: CancellationToken,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     if let Err(error) = op.validate_for_account(bifrost_types::Protocol::Gmail) {
         return Box::pin(stream::once(async move { SyncEvent::Terminated(error) }));
     }
-    mutation_stream(
-        client,
-        cache,
-        targets,
-        MutationKind::SetFlags(op),
-        key,
-        shutdown,
-    )
+    mutation_stream(client, cache, targets, MutationKind::SetFlags(op), shutdown)
 }
 
 #[cfg(test)]
@@ -84,7 +75,6 @@ pub(crate) fn bulk_move(
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
     source: Option<MembershipScope>,
-    key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     bulk_move_cancellable(
         client,
@@ -92,7 +82,6 @@ pub(crate) fn bulk_move(
         targets,
         destination,
         source,
-        key,
         CancellationToken::new(),
     )
 }
@@ -103,7 +92,6 @@ pub(crate) fn bulk_move_cancellable(
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
     source: Option<MembershipScope>,
-    key: IdempotencyKey,
     shutdown: CancellationToken,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(
@@ -114,7 +102,6 @@ pub(crate) fn bulk_move_cancellable(
             destination,
             source,
         },
-        key,
         shutdown,
     )
 }
@@ -124,19 +111,17 @@ pub(crate) fn bulk_destroy(
     client: Arc<GmailClient>,
     cache: ScopeCache,
     targets: AccountStream<ObjectId>,
-    key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    bulk_destroy_cancellable(client, cache, targets, key, CancellationToken::new())
+    bulk_destroy_cancellable(client, cache, targets, CancellationToken::new())
 }
 
 pub(crate) fn bulk_destroy_cancellable(
     client: Arc<GmailClient>,
     cache: ScopeCache,
     targets: AccountStream<ObjectId>,
-    key: IdempotencyKey,
     shutdown: CancellationToken,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    mutation_stream(client, cache, targets, MutationKind::Destroy, key, shutdown)
+    mutation_stream(client, cache, targets, MutationKind::Destroy, shutdown)
 }
 
 fn mutation_stream(
@@ -144,7 +129,6 @@ fn mutation_stream(
     cache: ScopeCache,
     targets: AccountStream<ObjectId>,
     kind: MutationKind,
-    key: IdempotencyKey,
     shutdown: CancellationToken,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     // One batch here is one `batchModify` / `batchDelete` call plus any
@@ -159,7 +143,6 @@ fn mutation_stream(
         cache,
         targets,
         kind,
-        key,
         patch: None,
         pending_target: None,
         phase: MutationPhase::Reading,
@@ -299,13 +282,7 @@ fn mutation_stream(
         let operation_future = async {
             match &state.kind {
                 MutationKind::Destroy => {
-                    apply_destroy(
-                        &state.client,
-                        &ids,
-                        &state.key,
-                        Arc::clone(&progress_for_operation),
-                    )
-                    .await
+                    apply_destroy(&state.client, &ids, Arc::clone(&progress_for_operation)).await
                 }
                 MutationKind::SetFlags(_) | MutationKind::Move { .. } => {
                     let patch = state
@@ -316,7 +293,6 @@ fn mutation_stream(
                         &state.client,
                         &ids,
                         patch,
-                        &state.key,
                         operation,
                         Arc::clone(&progress_for_operation),
                     )
@@ -462,7 +438,6 @@ struct MutationState {
     cache: ScopeCache,
     targets: AccountStream<ObjectId>,
     kind: MutationKind,
-    key: IdempotencyKey,
     patch: Option<Result<LabelPatch, MoveRefusal>>,
     pending_target: Option<ObjectId>,
     phase: MutationPhase,
@@ -687,7 +662,6 @@ async fn apply_label_patch_tracked(
     client: &GmailClient,
     ids: &[ObjectId],
     patch: Result<LabelPatch, MoveRefusal>,
-    key: &IdempotencyKey,
     operation: AccountOperation,
     progress: Arc<Mutex<MutationProgress>>,
 ) -> MutationApply {
@@ -751,7 +725,6 @@ async fn apply_label_patch_tracked(
             client,
             &live_ids,
             &body,
-            key,
             LabelPatchBodyContext {
                 operation,
                 unsupported: &patch.unsupported_flags,
@@ -848,7 +821,6 @@ async fn apply_label_patch_body(
     client: &GmailClient,
     ids: &[ObjectId],
     template: &BatchModifyRequest,
-    key: &IdempotencyKey,
     context: LabelPatchBodyContext<'_>,
 ) -> Result<Vec<ObjectId>, AccountError> {
     let LabelPatchBodyContext {
@@ -880,7 +852,6 @@ async fn apply_label_patch_body(
             client,
             "/messages/batchModify",
             &body,
-            key,
             bifrost_net::ReplayPolicy::Idempotent,
         )
         .await
@@ -1010,7 +981,6 @@ fn unsupported_flags_warning(unsupported: &[String]) -> Warning {
 async fn apply_destroy(
     client: &GmailClient,
     ids: &[ObjectId],
-    key: &IdempotencyKey,
     progress: Arc<Mutex<MutationProgress>>,
 ) -> MutationApply {
     let body = BatchDeleteRequest {
@@ -1024,7 +994,6 @@ async fn apply_destroy(
         client,
         "/messages/batchDelete",
         &body,
-        key,
         bifrost_net::ReplayPolicy::Never,
     )
     .await
@@ -1071,7 +1040,6 @@ async fn apply_destroy(
                 client,
                 ids,
                 Ok(fallback),
-                key,
                 AccountOperation::BulkDestroy,
                 Arc::clone(&progress),
             )
@@ -1182,11 +1150,11 @@ async fn post_empty_json<B: Serialize>(
     client: &GmailClient,
     path: &str,
     body: &B,
-    _key: &IdempotencyKey,
     replay: bifrost_net::ReplayPolicy,
 ) -> crate::Result<()> {
     // Gmail messages endpoints accept no documented client-mintable
-    // replay token, so the Account idempotency key stays engine-side.
+    // replay token. Correlation stays in the engine; uncertain writes
+    // are reconciled through read-back.
     client.post_no_content(path, body, replay).await
 }
 
@@ -1197,7 +1165,7 @@ mod tests {
     use bifrost_net::auth::StaticTokenSource;
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
     use bifrost_net::{NetConfig, test_support};
-    use bifrost_types::{FolderId, ProtocolSalt, RunId};
+    use bifrost_types::FolderId;
     use bytes::Bytes;
     use reqwest::StatusCode;
     use std::time::Instant;
@@ -1254,7 +1222,6 @@ mod tests {
                 ObjectId("m1".to_string()),
                 ObjectId("m2".to_string()),
             ])),
-            test_key(99),
             shutdown.clone(),
         );
         let started = tokio::time::Instant::now();
@@ -1328,7 +1295,6 @@ mod tests {
             )),
             label("INBOX"),
             None,
-            test_key(100),
             shutdown.clone(),
         );
         let collected = tokio::spawn(async move {
@@ -1397,7 +1363,6 @@ mod tests {
             Box::pin(stream::iter(
                 ["trashed", "pending"].map(|id| ObjectId(id.to_string())),
             )),
-            test_key(101),
             shutdown.clone(),
         );
         let collected = tokio::spawn(collect_events(events));
@@ -1447,7 +1412,6 @@ mod tests {
             client,
             fresh_cache(Vec::new()),
             Box::pin(stream::iter([ObjectId("m1".to_string())])),
-            test_key(99),
             shutdown,
         );
         assert!(events.next().await.is_none());
@@ -1476,14 +1440,6 @@ mod tests {
                 fetched_at: Some(Instant::now()),
             },
         ))
-    }
-
-    fn test_key(sequence: u64) -> IdempotencyKey {
-        IdempotencyKey {
-            run_id: RunId("run".to_string()),
-            sequence,
-            protocol_salt: ProtocolSalt::Gmail("test".to_string()),
-        }
     }
 
     fn set(items: &[&str]) -> bifrost_types::FlagSet {
@@ -1522,7 +1478,6 @@ mod tests {
             targets,
             label("INBOX"),
             None,
-            test_key(10),
         ))
         .await;
 
@@ -1572,7 +1527,6 @@ mod tests {
             client.as_ref(),
             &ids,
             &template,
-            &test_key(17),
             LabelPatchBodyContext {
                 operation: AccountOperation::BulkMove,
                 unsupported: &[],
@@ -1625,7 +1579,6 @@ mod tests {
             )),
             label("INBOX"),
             None,
-            test_key(16),
         ))
         .await;
 
@@ -1728,7 +1681,6 @@ mod tests {
             fresh_cache(labels),
             Box::pin(stream::iter([ObjectId("m1".to_string())])),
             FlagOp::Set(set(&["\\Seen"])),
-            test_key(31),
         ))
         .await;
 
@@ -1796,7 +1748,6 @@ mod tests {
                 ["live-1", "absent", "live-2"].map(|id| ObjectId(id.to_string())),
             )),
             FlagOp::Set(set(&["\\Seen"])),
-            test_key(32),
         ))
         .await;
 
@@ -1850,7 +1801,6 @@ mod tests {
             fresh_cache(labels),
             Box::pin(stream::iter([ObjectId("m1".to_string())])),
             FlagOp::Set(set(&["\\Seen"])),
-            test_key(33),
         ))
         .await;
 
@@ -1883,7 +1833,6 @@ mod tests {
             fresh_cache(labels),
             Box::pin(stream::iter([ObjectId("m1".to_string())])),
             FlagOp::Set(flags),
-            test_key(11),
         ))
         .await;
 
@@ -1935,7 +1884,6 @@ mod tests {
             fresh_cache(Vec::new()),
             Box::pin(stream::iter([ObjectId("m1".to_string())])),
             FlagOp::Add(set(&["\\Draft"])),
-            test_key(14),
         ))
         .await;
 
@@ -1989,7 +1937,6 @@ mod tests {
             targets,
             label("INBOX"),
             None,
-            test_key(15),
         ))
         .await;
 
@@ -2025,7 +1972,6 @@ mod tests {
             fresh_cache(Vec::new()),
             Box::pin(stream::iter([ObjectId("m1".to_string())])),
             FlagOp::Add(flags),
-            test_key(12),
         ))
         .await;
 
@@ -2059,7 +2005,6 @@ mod tests {
             fresh_cache(Vec::new()),
             Box::pin(stream::iter([ObjectId("m1".to_string())])),
             FlagOp::Add(set(&["$gmail-label:Label_42:Old: Name"])),
-            test_key(120),
         ))
         .await;
 
@@ -2093,7 +2038,6 @@ mod tests {
             client,
             fresh_cache(Vec::new()),
             Box::pin(stream::iter([ObjectId("m1".to_string())])),
-            test_key(13),
         ))
         .await;
 
@@ -2284,11 +2228,6 @@ mod tests {
             targets,
             MembershipScope::Folder(FolderId("INBOX".to_string())),
             None,
-            IdempotencyKey {
-                run_id: RunId("run".to_string()),
-                sequence: 1,
-                protocol_salt: ProtocolSalt::Gmail("test".to_string()),
-            },
         );
 
         let first = events.next().await.expect("mutation batch");
@@ -2315,11 +2254,6 @@ mod tests {
             targets,
             MembershipScope::Folder(FolderId("INBOX".to_string())),
             None,
-            IdempotencyKey {
-                run_id: RunId("run".to_string()),
-                sequence: 2,
-                protocol_salt: ProtocolSalt::Gmail("test".to_string()),
-            },
         );
 
         let Some(SyncEvent::Batch(first)) = events.next().await else {

@@ -18,9 +18,9 @@ use bifrost_types::{
     CursorEstablishment, CursorFreshness, CursorScope, DirectoryCard, DirectoryGroup,
     DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate, EventId,
     EventPatch, EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp,
-    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEntry, InventoryEvent, ItemOutcome, MembershipScope,
-    Message, MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
+    HostedAttachment, HydratedObject, HydrationProjection, Identity, IdentityId, IdentityPatch,
+    Importance, InventoryEntry, InventoryEvent, ItemOutcome, MembershipScope, Message,
+    MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
     MutationTarget, ObjectId, Page, PageBoundary, PimMethodSupport, Priority, Projection,
     PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RsvpStatus, ScopeLifecycleEvent,
     SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
@@ -299,7 +299,6 @@ impl Account for StubAccount {
         &self,
         _targets: AccountStream<ObjectId>,
         _op: FlagOp,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }
@@ -308,7 +307,6 @@ impl Account for StubAccount {
         &self,
         _targets: AccountStream<ObjectId>,
         _destination: MembershipScope,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }
@@ -316,7 +314,6 @@ impl Account for StubAccount {
     fn bulk_destroy(
         &self,
         _targets: AccountStream<ObjectId>,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }

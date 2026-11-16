@@ -185,31 +185,23 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
         Error::Network {
             message,
             transmission_state,
-            source,
+            source: _,
         } => transport_or_partial(
             &ctx,
             TransportErrorKind::Network,
             message,
             transmission_state,
-            source.as_ref().map(ToString::to_string),
         ),
         Error::Timeout { transmission_state } => transport_or_partial(
             &ctx,
             TransportErrorKind::Timeout,
             "request timed out".to_owned(),
             transmission_state,
-            None,
         ),
         Error::Tls {
             message,
             transmission_state,
-        } => transport_or_partial(
-            &ctx,
-            TransportErrorKind::Tls,
-            message,
-            transmission_state,
-            None,
-        ),
+        } => transport_or_partial(&ctx, TransportErrorKind::Tls, message, transmission_state),
         Error::Status {
             code,
             body,
@@ -290,31 +282,30 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
             "request_cost",
             format!("request cost {cost} exceeds bucket burst {burst}"),
         ),
-        Error::EncodeBody { message, source } => invalid_argument_with_source(
-            &ctx,
-            "body",
-            message,
-            source.as_ref().map(ToString::to_string),
-        ),
-        Error::InvalidHeader { message, source } => invalid_argument_with_source(
-            &ctx,
-            "header",
-            message,
-            source.as_ref().map(ToString::to_string),
-        ),
-        Error::InvalidRequest { field, detail } => invalid_argument(&ctx, field, detail),
+        Error::EncodeBody { .. } => {
+            invalid_argument(&ctx, "body", "request body encoding failed".to_owned())
+        }
+        Error::InvalidHeader { .. } => {
+            invalid_argument(&ctx, "header", "invalid request header".to_owned())
+        }
+        Error::InvalidRequest { field, .. } => {
+            invalid_argument(&ctx, field, "invalid request".to_owned())
+        }
         Error::RefreshFailed {
             retry_after,
             source,
         } => refresh_failed(&ctx, retry_after, source.as_ref()),
-        Error::RangeNotHonored { kind, message } => match kind {
-            RangeFailureKind::LocalInvalid => invalid_argument(&ctx, "range", message),
-            RangeFailureKind::ResponseNotPartial
-            | RangeFailureKind::MissingContentRange
-            | RangeFailureKind::ContentRangeMismatch => {
-                contract_violation(&ctx, message, TransmissionState::Acknowledged)
+        Error::RangeNotHonored { kind, .. } => {
+            let message = format!("range not honored: {kind:?}");
+            match kind {
+                RangeFailureKind::LocalInvalid => invalid_argument(&ctx, "range", message),
+                RangeFailureKind::ResponseNotPartial
+                | RangeFailureKind::MissingContentRange
+                | RangeFailureKind::ContentRangeMismatch => {
+                    contract_violation(&ctx, message, TransmissionState::Acknowledged)
+                }
             }
-        },
+        }
         Error::UnexpectedResponse { response } => {
             let builder = base_builder(
                 &ctx,
@@ -330,11 +321,13 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
                 response_diagnostics(builder, response.status, &response.headers, &response.body);
             finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
         }
-        Error::RedirectRejected { message } => {
+        Error::RedirectRejected { .. } => {
+            let message = "redirect rejected".to_owned();
             let builder = invalid_argument_builder(&ctx, "redirect_policy", message);
             finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
         }
-        Error::MalformedRedirect { message, .. } => {
+        Error::MalformedRedirect { kind, .. } => {
+            let message = format!("malformed redirect: {kind:?}");
             contract_violation(&ctx, message, TransmissionState::Acknowledged)
         }
         // Not `auth_lost`. The 401 came back on a hop that carried no
@@ -346,14 +339,14 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
         // request onto an origin it then demands auth for is the
         // contract fault.
         Error::UnauthenticatedRedirectHop {
-            message,
+            message: _,
             final_response,
         } => {
             let builder = base_builder(
                 &ctx,
                 PrimaryCause::Protocol {
                     kind: ProtocolErrorKind::ContractViolation,
-                    wire: malformed_response_cause(&ctx, message),
+                    wire: malformed_response_cause(&ctx, "unauthenticated redirect hop".to_owned()),
                 },
             );
             let builder = response_diagnostics(
@@ -385,16 +378,9 @@ fn transport_or_partial(
     transport_kind: TransportErrorKind,
     message: String,
     transmission_state: TransmissionState,
-    source_message: Option<String>,
 ) -> AccountError {
     if transmission_state == TransmissionState::Acknowledged {
-        let detail = match source_message {
-            Some(source) if !source.trim().is_empty() => {
-                format!("{message}; source: {source}")
-            }
-            _ => message,
-        };
-        return partial_response(ctx, detail, transmission_state);
+        return partial_response(ctx, message, transmission_state);
     }
 
     let diagnostic = maybe_support_text(message.clone());
@@ -404,9 +390,6 @@ fn transport_or_partial(
     );
     if let Some(text) = diagnostic {
         builder = builder.text(text);
-    }
-    if let Some(source) = maybe_support_text_from_option(source_message) {
-        builder = builder.text(source);
     }
     finish(push_attempt(builder, transmission_state), ctx)
 }
@@ -513,19 +496,6 @@ fn status_error(
 
 fn invalid_argument(ctx: &NetErrorContext, field: &'static str, detail: String) -> AccountError {
     let builder = invalid_argument_builder(ctx, field, detail);
-    finish(builder, ctx)
-}
-
-fn invalid_argument_with_source(
-    ctx: &NetErrorContext,
-    field: &'static str,
-    detail: String,
-    source: Option<String>,
-) -> AccountError {
-    let mut builder = invalid_argument_builder(ctx, field, detail);
-    if let Some(text) = maybe_support_text_from_option(source) {
-        builder = builder.text(text);
-    }
     finish(builder, ctx)
 }
 
@@ -658,10 +628,6 @@ fn maybe_support_text(value: String) -> Option<DiagnosticText> {
     } else {
         Some(DiagnosticText::support_only(value))
     }
-}
-
-fn maybe_support_text_from_option(value: Option<String>) -> Option<DiagnosticText> {
-    value.and_then(maybe_support_text)
 }
 
 /// Response headers that carry a provider request id, in priority order.
@@ -993,11 +959,59 @@ mod explicit_throttle_scope_tests {
                 headers: HeaderMap::new(),
             },
             ctx,
-            Some(ThrottleScope::Mailbox),
+            Some(ThrottleScope::ScopedResource),
         );
         assert_eq!(
             scoped.telemetry_fields().throttle_scope,
-            Some(ThrottleScope::Mailbox)
+            Some(ThrottleScope::ScopedResource)
         );
+    }
+}
+
+#[cfg(test)]
+mod safe_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn account_exports_withhold_constructor_and_source_prose() {
+        let marker = "password=echoed-credential";
+        for error in [
+            Error::EncodeBody {
+                message: marker.into(),
+                source: Some(Box::new(std::io::Error::other(marker))),
+            },
+            Error::InvalidHeader {
+                message: marker.into(),
+                source: None,
+            },
+            Error::InvalidRequest {
+                field: "url",
+                detail: marker.into(),
+            },
+            Error::Network {
+                message: "connection reset".into(),
+                transmission_state: TransmissionState::Unsent,
+                source: Some(Box::new(std::io::Error::other(marker))),
+            },
+        ] {
+            let error = into_account_error_with_throttle_scope(
+                error,
+                NetErrorContext {
+                    provider: None,
+                    protocol: Protocol::Jmap,
+                    operation: bifrost_types::AccountOperation::SyncChanges,
+                    scope: None,
+                },
+                None,
+            );
+            assert!(!format!("{error:?}").contains(marker));
+            assert!(
+                !error
+                    .support_consented()
+                    .support_text
+                    .iter()
+                    .any(|s| s.contains(marker))
+            );
+        }
     }
 }

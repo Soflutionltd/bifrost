@@ -19,9 +19,9 @@ use bifrost_types::{
     ContactCreate, ContactId, ContactPatch, ContactSearchRequest, ContainerId, ContainerKind,
     CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch, EventCreate,
     EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
-    HostedAttachment, HydratedObject, HydratedObjectKind, HydrationProjection, IdempotencyKey,
-    Identity, IdentityId, IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope,
-    Message, MutationSuccess, MutationTarget, ObjectId, OpenedAccount, Page, PageBoundary,
+    HostedAttachment, HydratedObject, HydratedObjectKind, HydrationProjection, Identity,
+    IdentityId, IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
+    MutationSuccess, MutationTarget, ObjectId, OpenedAccount, Page, PageBoundary,
     PartialCommitBuilder, PrimaryCause, PrimaryLeg, Priority, Projection, ProtocolKind, QuotaInfo,
     RequestCause, RetryHint, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt,
     SendRequest, ServerCause, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
@@ -53,7 +53,7 @@ const COHORT_RETRY_ONCE: usize = 2;
 const COHORT_ERROR_IN_SECOND: usize = 3;
 const COHORT_UNCERTAIN: usize = 4;
 const COHORT_RETRY_BESIDE_UNCERTAIN: usize = 5;
-type CohortCall = (Vec<ObjectId>, IdempotencyKey, tokio::time::Instant);
+type CohortCall = (Vec<ObjectId>, tokio::time::Instant);
 
 #[derive(Default)]
 struct CampaignState {
@@ -90,7 +90,6 @@ struct CampaignState {
     readbacks: AtomicUsize,
     readback_started: tokio::sync::Notify,
     release_readback: tokio::sync::Notify,
-    keys: std::sync::Mutex<Vec<IdempotencyKey>>,
     /// How many targets each successive submission actually carried, so a
     /// test can observe the width of a resubmission rather than only its
     /// count.
@@ -319,12 +318,10 @@ impl Account for FlagsAccount {
         &self,
         targets: AccountStream<ObjectId>,
         _op: FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         let Some(campaign) = &self.campaign else {
             return Box::pin(stream::empty());
         };
-        campaign.keys.lock().expect("keys lock").push(key.clone());
         if campaign.cohort_mode.load(Ordering::SeqCst) != 0 {
             let campaign = Arc::clone(campaign);
             return Box::pin(stream::once(async move {
@@ -334,9 +331,9 @@ impl Account for FlagsAccount {
                     let mut calls = campaign.calls.lock().expect("calls");
                     let previous: std::collections::HashSet<_> = calls
                         .iter()
-                        .flat_map(|(ids, _, _)| ids.iter().cloned())
+                        .flat_map(|(ids, _)| ids.iter().cloned())
                         .collect();
-                    calls.push((ids.clone(), key, tokio::time::Instant::now()));
+                    calls.push((ids.clone(), tokio::time::Instant::now()));
                     previous
                 };
                 campaign.submitted.notify_one();
@@ -640,7 +637,6 @@ impl Account for FlagsAccount {
         &self,
         _targets: AccountStream<ObjectId>,
         destination: MembershipScope,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         let item = ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
             bifrost_types::BatchItemId(format!("{destination:?}")),
@@ -658,7 +654,6 @@ impl Account for FlagsAccount {
     fn bulk_destroy(
         &self,
         _targets: AccountStream<ObjectId>,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }
@@ -1166,12 +1161,7 @@ async fn bulk_move_from_defaults_to_bulk_move() {
     let destination = MembershipScope::Label(bifrost_types::LabelId("Label_42".into()));
     let source = MembershipScope::Label(bifrost_types::LabelId("Label_7".into()));
     let events: Vec<_> = acc
-        .bulk_move_from(
-            Box::pin(stream::empty()),
-            destination.clone(),
-            Some(source),
-            key(),
-        )
+        .bulk_move_from(Box::pin(stream::empty()), destination.clone(), Some(source))
         .collect()
         .await;
     let ids = events
@@ -1187,14 +1177,6 @@ async fn bulk_move_from_defaults_to_bulk_move() {
         })
         .collect::<Vec<_>>();
     assert_eq!(ids, vec![format!("{destination:?}")]);
-}
-
-fn key() -> IdempotencyKey {
-    IdempotencyKey {
-        run_id: bifrost_types::RunId("test-run".into()),
-        sequence: 0,
-        protocol_salt: bifrost_types::ProtocolSalt::Gmail("test-salt".into()),
-    }
 }
 
 /// Cross-check: a guard run against an arc'd Account behaves the same.
@@ -1232,7 +1214,7 @@ fn campaign_account(state: Arc<CampaignState>) -> Arc<FlagsAccount> {
 fn vendor() -> IdempotencyVendor {
     IdempotencyVendor::with_run_id(
         bifrost_types::RunId("boundary-test".into()),
-        Box::new(|_| bifrost_types::ProtocolSalt::Imap),
+        Box::new(|_| bifrost_sync::mutation::idempotency::ProtocolSalt::Imap),
     )
 }
 
@@ -1274,13 +1256,7 @@ async fn paused_campaign_resumes_once_without_losing_retry_accounting() {
     assert_eq!(counters.applied, 1);
     assert_eq!(counters.pending_retry, 0);
     assert_eq!(state.submissions.load(Ordering::SeqCst), 2);
-    {
-        let keys = state.keys.lock().expect("keys lock");
-        assert_eq!(keys.len(), 2);
-        assert_eq!(keys[0].run_id, keys[1].run_id);
-        assert_eq!(keys[0].sequence, keys[1].sequence);
-        assert_eq!(keys[0].protocol_salt, keys[1].protocol_salt);
-    }
+    assert_eq!(counters.cohort_keys.len(), 1);
     engine.detach(&account_id).await.expect("detach");
 }
 
@@ -1990,7 +1966,7 @@ async fn cohort_free_mailbox_finishes_while_sibling_is_held() {
         assert!(
             calls
                 .iter()
-                .any(|(ids, _, at)| ids == &[ObjectId("b".into())] && *at == started),
+                .any(|(ids, at)| ids == &[ObjectId("b".into())] && *at == started),
             "free mailbox must finish before held mailbox becomes ready: {calls:?}"
         );
         assert_eq!(calls.len(), 2, "held cohort must still be waiting");
@@ -2036,7 +2012,7 @@ async fn cohort_deduplicates_targets_into_one_submission() {
         .lock()
         .expect("calls")
         .iter()
-        .flat_map(|(ids, _, _)| ids.clone())
+        .flat_map(|(ids, _)| ids.clone())
         .collect();
     assert_eq!(submitted, vec![ObjectId("a".into()), ObjectId("b".into())]);
     assert_eq!(counters.applied, 2);
@@ -2044,33 +2020,31 @@ async fn cohort_deduplicates_targets_into_one_submission() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn cohort_frozen_keys_are_vended_once_per_cohort() {
+async fn cohort_retries_keep_their_original_targets() {
     let state = cohort_state(COHORT_RETRY_ONCE);
     let (engine, account) = cohort_engine(&state, 10).await;
-    cohort_run(&engine, &account, &["a", "b"])
+    let counters = cohort_run(&engine, &account, &["a", "b"])
         .await
         .expect("campaign");
+    assert_eq!(counters.cohort_keys.len(), 2);
+    assert_ne!(
+        counters.cohort_keys[0].sequence,
+        counters.cohort_keys[1].sequence
+    );
     {
         let calls = state.calls.lock().expect("calls");
         assert_eq!(calls.len(), 4);
         assert_eq!(calls[0].0, calls[2].0);
         assert_eq!(calls[1].0, calls[3].0);
-        assert_eq!(key_parts(&calls[0].1), key_parts(&calls[2].1));
-        assert_eq!(key_parts(&calls[1].1), key_parts(&calls[3].1));
-        assert_ne!(
-            key_parts(&calls[0].1),
-            key_parts(&calls[1].1),
-            "cohorts must each vend their own key"
-        );
     }
     engine.detach(&account).await.expect("detach");
 }
 
 /// Equal singleton declarations form one cohort even when the account returns
 /// the keys in a different order or repeats keys. Both objects retry together
-/// under the single key allocated for their shared execution identity.
+/// under their shared execution identity.
 #[tokio::test(start_paused = true)]
-async fn cohort_equal_declarations_share_submission_and_frozen_key() {
+async fn cohort_equal_declarations_share_submission_and_retry() {
     let state = cohort_state(COHORT_RETRY_ONCE);
     let first = bifrost_types::ThrottleKey::Budget(bifrost_types::ThrottleBudget::new(
         "cohort|shared-first",
@@ -2103,13 +2077,8 @@ async fn cohort_equal_declarations_share_submission_and_frozen_key() {
             "distinct targets must share the initial submission"
         );
         assert_eq!(calls[1].0, targets, "both targets retry in the same cohort");
-        assert_eq!(
-            key_parts(&calls[0].1),
-            key_parts(&calls[1].1),
-            "the shared cohort key must remain frozen"
-        );
-        assert_eq!(state.keys.lock().expect("keys").len(), 2);
     }
+    assert_eq!(counters.cohort_keys.len(), 1);
     assert_eq!(counters.applied, 2);
     assert_eq!(counters.pending_retry, 0);
     engine.detach(&account).await.expect("detach");
@@ -2129,7 +2098,7 @@ async fn cohort_retry_allowance_is_shared_campaign_wide() {
             4,
             "three singleton initial submissions and ONE retry total"
         );
-        assert!(calls.iter().all(|(ids, _, _)| ids.len() == 1));
+        assert!(calls.iter().all(|(ids, _)| ids.len() == 1));
     }
     assert_eq!(counters.applied, 1);
     assert_eq!(counters.failed_terminal, 0);
@@ -2181,10 +2150,6 @@ async fn cohort_counters_derive_from_per_object_observations() {
         0
     );
     engine.detach(&account).await.expect("detach");
-}
-
-fn key_parts(key: &IdempotencyKey) -> (&bifrost_types::RunId, u64, &bifrost_types::ProtocolSalt) {
-    (&key.run_id, key.sequence, &key.protocol_salt)
 }
 
 #[tokio::test]
@@ -2253,7 +2218,6 @@ struct RoundScript {
 }
 struct DoorCall {
     targets: Vec<bifrost_types::MailMutationTarget>,
-    key: IdempotencyKey,
     versioned: bool,
 }
 #[derive(Default)]
@@ -2371,18 +2335,15 @@ impl ReassertAccount {
     fn submit(
         &self,
         ids: AccountStream<ObjectId>,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         self.submit_targets(
             Box::pin(ids.map(bifrost_types::MailMutationTarget::from)),
-            key,
             false,
         )
     }
     fn submit_targets(
         &self,
         targets: AccountStream<bifrost_types::MailMutationTarget>,
-        key: IdempotencyKey,
         versioned: bool,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         let state = Arc::clone(&self.state);
@@ -2394,7 +2355,6 @@ impl ReassertAccount {
                     assert!(log.len() < 8, "campaign exceeded the bounded test script");
                     log.push(DoorCall {
                         targets: targets.clone(),
-                        key,
                         versioned,
                     });
                 }
@@ -2682,24 +2642,21 @@ impl Account for ReassertAccount {
         &self,
         targets: AccountStream<ObjectId>,
         _op: FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        self.submit(targets, key)
+        self.submit(targets)
     }
     fn bulk_move(
         &self,
         _targets: AccountStream<ObjectId>,
         _destination: MembershipScope,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        self.submit(_targets, _key)
+        self.submit(_targets)
     }
     fn bulk_destroy(
         &self,
         _targets: AccountStream<ObjectId>,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        self.submit(_targets, _key)
+        self.submit(_targets)
     }
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
         self.inner.close()
@@ -3008,14 +2965,13 @@ impl Account for ReassertAccount {
         self: Arc<Self>,
         targets: AccountStream<bifrost_types::MailMutationTarget>,
         _op: FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        self.submit_targets(targets, key, true)
+        self.submit_targets(targets, true)
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_eligible_mismatch_is_resubmitted_under_its_frozen_key() {
+async fn an_eligible_mismatch_resubmits_the_same_targets() {
     let state = reassert_state(
         &["a"],
         vec![
@@ -3027,7 +2983,18 @@ async fn an_eligible_mismatch_is_resubmitted_under_its_frozen_key() {
     let counters = cohort_run(&engine, &id, &["a"]).await.unwrap();
     let doors = state.doors.lock().unwrap();
     assert_eq!(doors.len(), 2);
-    assert_eq!(key_parts(&doors[0].key), key_parts(&doors[1].key));
+    assert_eq!(
+        doors[0]
+            .targets
+            .iter()
+            .map(|target| (&target.id, &target.expected_version))
+            .collect::<Vec<_>>(),
+        doors[1]
+            .targets
+            .iter()
+            .map(|target| (&target.id, &target.expected_version))
+            .collect::<Vec<_>>(),
+    );
     assert_eq!(counters.applied, 1);
     assert_eq!(state.reads.lock().unwrap().len(), 1);
 }
@@ -3488,7 +3455,21 @@ async fn pause_parks_a_ready_reassertion_without_spending_an_attempt() {
     let counters = task.await.unwrap();
     let doors = state.doors.lock().unwrap();
     assert_eq!(doors.len(), 2);
-    assert_eq!(key_parts(&doors[0].key), key_parts(&doors[1].key));
+    // Only "a" is still unresolved (a2 failed its read-back), so the parked
+    // reassertion resubmits exactly that target, unchanged.
+    let first_a: Vec<_> = doors[0]
+        .targets
+        .iter()
+        .filter(|target| target.id == ObjectId("a".into()))
+        .map(|target| (&target.id, &target.expected_version))
+        .collect();
+    let second: Vec<_> = doors[1]
+        .targets
+        .iter()
+        .map(|target| (&target.id, &target.expected_version))
+        .collect();
+    assert_eq!(first_a.len(), 1);
+    assert_eq!(first_a, second);
     assert_eq!(counters.applied, 1);
 }
 #[tokio::test(start_paused = true)]

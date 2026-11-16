@@ -56,7 +56,7 @@ use crate::filter::{
 };
 use crate::hydration::{HydrationProjection, Importance, Message, ThreadHydration};
 use crate::ids::{AccountId, ObjectId, SubscriptionHandle, ThreadId};
-use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, Projection};
+use crate::mutation::{FlagOp, HydratedObject, Projection};
 use crate::page::{Page, SkippedScope};
 use crate::repair::{InventoryRepairEvent, InventoryRepairOutcome, InventoryRepairRequest};
 use crate::search::SearchRequest;
@@ -623,7 +623,6 @@ pub trait Account: Send + Sync {
         &self,
         targets: AccountStream<ObjectId>,
         op: FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>;
 
     /// Bulk move. Targets are moved into `destination`.
@@ -638,7 +637,6 @@ pub trait Account: Send + Sync {
         &self,
         targets: AccountStream<ObjectId>,
         destination: MembershipScope,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>;
 
     /// Bulk move out of a known `source` container.
@@ -668,10 +666,9 @@ pub trait Account: Send + Sync {
         targets: AccountStream<ObjectId>,
         destination: MembershipScope,
         source: Option<MembershipScope>,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         let _ = source;
-        self.bulk_move(targets, destination, key)
+        self.bulk_move(targets, destination)
     }
 
     /// Bulk destroy.
@@ -680,7 +677,6 @@ pub trait Account: Send + Sync {
     fn bulk_destroy(
         &self,
         targets: AccountStream<ObjectId>,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>;
 
     /// Per-target caller-version form of [`Self::bulk_set_flags`].
@@ -691,7 +687,6 @@ pub trait Account: Send + Sync {
         self: Arc<Self>,
         targets: AccountStream<crate::MailMutationTarget>,
         op: FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>
     where
         Self: 'static,
@@ -703,11 +698,7 @@ pub trait Account: Send + Sync {
                     AccountError::unsupported(AccountOperation::UpdateFlags, self.protocol()),
                 );
             }
-            self.bulk_set_flags(
-                Box::pin(futures::stream::iter([target.id])),
-                op.clone(),
-                key.clone(),
-            )
+            self.bulk_set_flags(Box::pin(futures::stream::iter([target.id])), op.clone())
         })
     }
 
@@ -719,7 +710,6 @@ pub trait Account: Send + Sync {
         self: Arc<Self>,
         targets: AccountStream<crate::MailMutationTarget>,
         destination: MembershipScope,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>
     where
         Self: 'static,
@@ -734,7 +724,6 @@ pub trait Account: Send + Sync {
             self.bulk_move(
                 Box::pin(futures::stream::iter([target.id])),
                 destination.clone(),
-                key.clone(),
             )
         })
     }
@@ -748,7 +737,6 @@ pub trait Account: Send + Sync {
         targets: AccountStream<crate::MailMutationTarget>,
         destination: MembershipScope,
         source: Option<MembershipScope>,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>
     where
         Self: 'static,
@@ -764,7 +752,6 @@ pub trait Account: Send + Sync {
                 Box::pin(futures::stream::iter([target.id])),
                 destination.clone(),
                 source.clone(),
-                key.clone(),
             )
         })
     }
@@ -776,7 +763,6 @@ pub trait Account: Send + Sync {
     fn bulk_destroy_if_version(
         self: Arc<Self>,
         targets: AccountStream<crate::MailMutationTarget>,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>
     where
         Self: 'static,
@@ -788,7 +774,7 @@ pub trait Account: Send + Sync {
                     AccountError::unsupported(AccountOperation::BulkDestroy, self.protocol()),
                 );
             }
-            self.bulk_destroy(Box::pin(futures::stream::iter([target.id])), key.clone())
+            self.bulk_destroy(Box::pin(futures::stream::iter([target.id])))
         })
     }
 

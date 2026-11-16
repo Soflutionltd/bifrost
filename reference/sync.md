@@ -2646,7 +2646,7 @@ observation-only. Replay-token semantics and error derivation are unchanged.
 
 `SyncEngine::bulk_move` and `SyncEngine::bulk_move_from` use the move
 arm, which submits through
-`Account::bulk_move_from(targets, destination, source, key)` and
+`Account::bulk_move_from(targets, destination, source)` and
 `bulk_move` is exactly `source: None`. `source` exists for request
 count, not semantics: the folder-model providers vacate the source as
 part of the move itself, so the trait's default impl forwards to
@@ -2658,7 +2658,8 @@ move landed, and does not separately re-verify absence from `source`.
 Moves never reassert: source membership cannot authorize another COPY after
 partial completion.
 
-`IdempotencyKey` is `{ run_id, sequence, protocol_salt }`. `run_id`
+`bifrost_sync::mutation::IdempotencyKey` is
+`{ run_id, sequence, protocol_salt }` and stays inside the engine. `run_id`
 is consumer-minted and consumer-persisted across process restarts
 so retries from a previous process correlate. `IdempotencyVendor` does not
 persist it; the consumer supplies the durable value.
@@ -2668,10 +2669,18 @@ it does not override error identity or cursor provenance. `Account::protocol()`
 names the primary account protocol and is not a replacement for that policy on
 a composed account. `IdempotencyVendor` retains its custom salt factory and
 nonempty payload support. The default factory delegates to the exhaustive
-`ProtocolSalt::from(ProtocolKind)` conversion in `bifrost-types`, so adding a
-cursor protocol cannot silently assign it the IMAP salt. Built-in providers do
-not consume the salt payload, but consumer implementations still receive it in
-the `IdempotencyKey` passed to their bulk methods.
+`ProtocolSalt::from(ProtocolKind)` conversion in `bifrost-sync`, so adding a
+cursor protocol cannot silently assign it the IMAP salt. `ProtocolSalt` lives
+beside the key under `mutation::idempotency`; both are re-exported by
+`mutation`. No Account bulk method receives a key. Consumers retain access to
+allocated cohort identities through `MutationCounters::cohort_keys`, including
+custom salt payloads, in allocation order. Retries and reassertions reuse a
+cohort identity; rerouting unsent targets may allocate a new one. These keys
+provide bookkeeping correlation, never wire deduplication or replay authority.
+`MutationConcurrency::StateBased` instead describes optimistic concurrency
+enforced by the provider on the wire. Uncertain writes still require read-back
+and the declared reassertion policy: an enterprise user expects reconciliation
+before another potentially duplicate write.
 
 Before every wire action, including read-back, the scheduler waits through
 `SyncControl::wait_until_running` and registers an activity guard.
@@ -4164,7 +4173,7 @@ reason. The reason rides on the warning's free-form fields; the
 
 `crate::throttle::ThrottleBucket` is engine-wide (one per
 `SyncEngine`, shared by every slot): deadlines keyed by
-`ThrottleKey::{Mailbox, Account, Budget}`. `Budget` is the only key that
+`ThrottleKey::{Owner, Folder, Account, Budget}`. `Budget` is the only key that
 crosses accounts. `ThrottleScope::CurrentOperation` is a per-call hint and
 never enters the bucket.
 
@@ -4183,7 +4192,7 @@ that every observed HTTP throttle pauses all work sharing an engine budget.
 
 Keys reach the work they hold two ways. A key LIFTED from a
 `ThrottleScope` (see below) is the account's own `Account` key or one of its
-`Mailbox` keys. A key DECLARED by `Account::throttle_keys` for
+`Owner` or `Folder` keys. A key DECLARED by `Account::throttle_keys` for
 the work about to be driven is looked up literally by
 `recovery::throttle_wait`, so an account that has
 never failed still sees the first deadline a sibling recorded under it.

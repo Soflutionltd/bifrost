@@ -3,7 +3,7 @@ use std::fmt::Display;
 use serde::Deserialize;
 
 // types: protocol-specific RFC 7807 body kept so JMAP error mapping can inspect type and limit.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[non_exhaustive]
 pub(crate) struct ProblemDetails {
     #[serde(rename = "type")]
@@ -32,7 +32,7 @@ pub(crate) enum JMAPError {
     Limit,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub(crate) enum ProblemType {
@@ -45,13 +45,13 @@ fn default_problem_type() -> ProblemType {
     ProblemType::Other("about:blank".to_string())
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct MethodError {
     #[serde(rename = "type")]
     p_type: MethodErrorType,
     /// RFC 8620 s3.6.2: the server's own explanation of the failure.
-    /// Preserved for support diagnostics rather than dropped at the wire.
+    /// Retained for protocol interpretation, never diagnostic export.
     #[serde(default)]
     description: Option<String>,
     /// The per-error `limit` name some errors carry (`requestTooLarge`,
@@ -60,7 +60,7 @@ pub(crate) struct MethodError {
     limit: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) enum MethodErrorType {
     ServerUnavailable,
@@ -209,7 +209,7 @@ impl Display for MethodError {
             MethodErrorType::UnsupportedSort => write!(f, "Unsupported sort"),
             MethodErrorType::UnsupportedFilter => write!(f, "Unsupported filter"),
             MethodErrorType::TooManyChanges => write!(f, "Too many changes"),
-            MethodErrorType::Other(code) => write!(f, "Other ({code})"),
+            MethodErrorType::Other(_) => write!(f, "Other"),
         }
     }
 }
@@ -223,22 +223,66 @@ impl Display for ProblemDetails {
                 JMAPError::NotRequest => write!(f, "Not request")?,
                 JMAPError::Limit => write!(f, "Limit")?,
             },
-            ProblemType::Other(err) => f.write_str(err.as_str())?,
+            ProblemType::Other(_) => f.write_str("Other problem")?,
         }
 
         if let Some(status) = self.status {
             write!(f, " (status {status})")?;
         }
 
-        if let Some(title) = &self.title {
-            write!(f, ": {title}")?;
-        }
-
-        if let Some(detail) = &self.detail {
-            write!(f, ". Details: {detail}")?;
-        }
-
         Ok(())
+    }
+}
+
+// Wire descriptions and unknown identifiers can echo credentials. Keep raw
+// accessors for classification while formatting only structural evidence.
+impl std::fmt::Debug for ProblemDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProblemDetails")
+            .field("type", &self.p_type)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Debug for ProblemType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::JMAP(kind) => std::fmt::Debug::fmt(kind, f),
+            Self::Other(_) => f.write_str("Other"),
+        }
+    }
+}
+impl std::fmt::Debug for MethodError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::fmt::Debug for MethodErrorType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Unknown wire identifiers remain private.
+        f.write_str(match self {
+            Self::ServerUnavailable => "ServerUnavailable",
+            Self::ServerFail => "ServerFail",
+            Self::ServerPartialFail => "ServerPartialFail",
+            Self::UnknownMethod => "UnknownMethod",
+            Self::InvalidArguments => "InvalidArguments",
+            Self::InvalidResultReference => "InvalidResultReference",
+            Self::Forbidden => "Forbidden",
+            Self::AccountNotFound => "AccountNotFound",
+            Self::AccountNotSupportedByMethod => "AccountNotSupportedByMethod",
+            Self::AccountReadOnly => "AccountReadOnly",
+            Self::RequestTooLarge => "RequestTooLarge",
+            Self::CannotCalculateChanges => "CannotCalculateChanges",
+            Self::StateMismatch => "StateMismatch",
+            Self::AlreadyExists => "AlreadyExists",
+            Self::FromAccountNotFound => "FromAccountNotFound",
+            Self::FromAccountNotSupportedByMethod => "FromAccountNotSupportedByMethod",
+            Self::AnchorNotFound => "AnchorNotFound",
+            Self::UnsupportedSort => "UnsupportedSort",
+            Self::UnsupportedFilter => "UnsupportedFilter",
+            Self::TooManyChanges => "TooManyChanges",
+            Self::Other(_) => "Other",
+        })
     }
 }
 
@@ -265,5 +309,30 @@ mod tests {
             problem.detail(),
             Some("The account is over its request limit")
         );
+    }
+}
+
+#[cfg(test)]
+mod safe_format_tests {
+    use super::*;
+
+    #[test]
+    fn problem_and_method_formatting_withhold_raw_fields() {
+        let marker = "password=echoed-credential";
+        let problem = ProblemDetails::new(
+            ProblemType::Other(marker.into()),
+            Some(400),
+            Some(marker.into()),
+            Some(marker.into()),
+            Some(marker.into()),
+            Some(marker.into()),
+        );
+        assert!(!format!("{problem:?} {problem}").contains(marker));
+        let method = MethodError {
+            p_type: MethodErrorType::Other(marker.into()),
+            description: Some(marker.into()),
+            limit: Some(marker.into()),
+        };
+        assert!(!format!("{method:?} {method} {:?}", method.error_type()).contains(marker));
     }
 }

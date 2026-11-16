@@ -624,11 +624,6 @@ async fn caller_modseq_rejects_stale_flags_while_absent_keeps_cached_guard() {
             respond(&mut server, &format!("{} {status}\r\n", tag_of(&store))).await;
             server
         });
-        let key = bifrost_types::IdempotencyKey {
-            run_id: bifrost_types::RunId("caller-version".into()),
-            sequence: 0,
-            protocol_salt: bifrost_types::ProtocolSalt::Imap,
-        };
         let events = Arc::new(account)
             .bulk_set_flags_if_version(
                 Box::pin(futures::stream::iter([MailMutationTarget {
@@ -640,7 +635,6 @@ async fn caller_modseq_rejects_stale_flags_while_absent_keeps_cached_guard() {
                     expected_version: expected.map(ServerVersion::ModSeq),
                 }])),
                 FlagOp::Add(bifrost_types::FlagSet::from(["$flagged".into()])),
-                key,
             )
             .collect::<Vec<_>>()
             .await;
@@ -682,11 +676,6 @@ async fn caller_modseq_without_condstore_is_refused_before_the_wire() {
             tag_of(&select))).await;
         server
     });
-    let key = bifrost_types::IdempotencyKey {
-        run_id: bifrost_types::RunId("caller-version".into()),
-        sequence: 0,
-        protocol_salt: bifrost_types::ProtocolSalt::Imap,
-    };
     let events = Arc::new(account)
         .bulk_set_flags_if_version(
             Box::pin(futures::stream::iter([MailMutationTarget {
@@ -698,7 +687,6 @@ async fn caller_modseq_without_condstore_is_refused_before_the_wire() {
                 expected_version: Some(ServerVersion::ModSeq(100)),
             }])),
             FlagOp::Add(bifrost_types::FlagSet::from(["$flagged".into()])),
-            key,
         )
         .collect::<Vec<_>>()
         .await;

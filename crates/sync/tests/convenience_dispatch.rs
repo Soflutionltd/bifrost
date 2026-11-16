@@ -20,8 +20,8 @@ use bifrost_types::{
     ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness,
     CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange,
     EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
-    HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
-    Importance, InventoryEvent, InventoryPartition, ItemOutcome, Label, MembershipScope, Message,
+    HydratedObject, HydrationProjection, Identity, IdentityId, IdentityPatch, Importance,
+    InventoryEvent, InventoryPartition, ItemOutcome, Label, MembershipScope, Message,
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
     MutationTarget, ObjectId, Page, PimMethodSupport, PrimaryCause, Priority, Projection,
     ProtocolKind, Provenance, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause,
@@ -212,7 +212,6 @@ impl Account for RecorderAccount {
         &self,
         _targets: AccountStream<ObjectId>,
         _op: FlagOp,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }
@@ -221,7 +220,6 @@ impl Account for RecorderAccount {
         &self,
         _targets: AccountStream<ObjectId>,
         _destination: MembershipScope,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }
@@ -229,7 +227,6 @@ impl Account for RecorderAccount {
     fn bulk_destroy(
         &self,
         _targets: AccountStream<ObjectId>,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }

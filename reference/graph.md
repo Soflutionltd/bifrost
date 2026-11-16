@@ -2160,7 +2160,7 @@ thread expansion. `ContainerRights` on a public
 folder still project the server's EWS `EffectiveRights`: they state what the
 principal is permitted, not what this client implements.
 `bulk_move` requires `MembershipScope::Folder` (else fatal pre-request).
-`IdempotencyKey` is accepted but not sent (`MutationReplaySafety::None`).
+No idempotency key reaches the account or the wire (`MutationReplaySafety::None`).
 
 ### The mutation lane's terminus is the end of the stream
 
@@ -3319,3 +3319,5 @@ bifrost-net's shared shape checks before export. Hand-written response and
 innerError Debug omit raw evidence. Enterprise users need escalation ids without
 exposing credentials that an error response may echo. Classification still uses
 the original status and typed signals.
+
+EWS SOAP faults export their typed fault category, and malformed XML and provider JSON decoding export fixed labels. Raw fault details and parser prose remain available internally without entering account diagnostics.

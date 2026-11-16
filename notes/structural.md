@@ -136,30 +136,6 @@ own module (an extension trait with a blanket impl, or free functions over `&dyn
 Account`), dispatched uniformly through `ConvenienceShape` (add a `LabelShape`),
 providers owning their sentinel strings.
 
-## STR-017 - Write-only capability fields
-
-**Reported by:** types (removal needs owner; wire-or-retire).
-
-No reader outside producers and their tests: `cursor_freshness`,
-`blob_digest_pre_download`, `rate_limit_class`, `quota_signal`,
-`requires_uidvalidity_recheck`, `historyid_expires_after`,
-`delta_token_expires_after` (the last two `None` in every provider).
-`RateLimitClass`'s doc says "Used by `bifrost-net` and the engine"; neither
-reads it. `BatchingPolicy` is read only by Graph, of its own value, and its
-doc's per-protocol defaults are stale (IMAP declares 1024 items, not 5000;
-Gmail's wait is 75 ms, not 200 ms). They may be consumed by ratatoskr, so the
-question is wire-or-retire. The protocol-named fields are the wrong shape for a
-protocol-neutral snapshot either way. The imap-account hunter confirms IMAP sets
-`requires_uidvalidity_recheck = true` and nothing reads it.
-
-## STR-018 - `IdempotencyKey` is threaded through every bulk method and read by no account
-
-**Reported by:** types (wire-or-retire, needs owner).
-
-No account reads `run_id`, `sequence` or `protocol_salt`; the salt's string
-payloads are always empty. Its only function is engine bookkeeping, which need
-not cross the account boundary.
-
 ## STR-042 - `PendingCoverage` is five subsystems behind one lock and one public surface
 
 **Reported by:** sync-lanes.

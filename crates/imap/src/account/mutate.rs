@@ -16,8 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use bifrost_types::{
     AccountError, AccountErrorKind, AccountOperation, AccountStream, BatchFailure, BatchItemId,
-    FlagOp, IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol,
-    SyncEvent,
+    FlagOp, ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol, SyncEvent,
 };
 use futures::StreamExt;
 
@@ -26,15 +25,13 @@ use crate::types::{Flag, MailboxName, ResponseCode, StoreOperation};
 use super::targets::{TargetBatch, Verdict};
 use super::{DecodedObjectId, ImapAccount, UidSet, batch, boxed_receiver_stream, decode_object_id};
 
-// The Account surface supplies an idempotency key to each bulk operation, but
 // IMAP has no request token that a server can use to deduplicate these
-// commands. Keep the key intentionally unused; uncertain outcomes are
-// reconciled through the per-UID result lanes and read-back.
+// commands. Uncertain outcomes are reconciled through the per-UID result
+// lanes and the engine's read-back guard.
 pub(crate) fn bulk_set_flags(
     account: ImapAccount,
     targets: AccountStream<bifrost_types::ObjectId>,
     op: FlagOp,
-    _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     if let Err(error) = op.validate_for_account(Protocol::Imap) {
         return Box::pin(futures::stream::once(async move {
@@ -48,7 +45,6 @@ pub(crate) fn bulk_move(
     account: ImapAccount,
     targets: AccountStream<bifrost_types::ObjectId>,
     destination: MembershipScope,
-    _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(account, targets, MutationKind::Move(destination))
 }
@@ -56,7 +52,6 @@ pub(crate) fn bulk_move(
 pub(crate) fn bulk_destroy(
     account: ImapAccount,
     targets: AccountStream<bifrost_types::ObjectId>,
-    _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(account, targets, MutationKind::Destroy)
 }
@@ -65,7 +60,6 @@ pub(crate) fn bulk_set_flags_if_version(
     account: ImapAccount,
     targets: AccountStream<bifrost_types::MailMutationTarget>,
     op: FlagOp,
-    key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     bifrost_types::mutation::versioned_mail_stream(targets, move |target| {
         if let Err(error) = account.capabilities.mutation.concurrency.gate_version(
@@ -80,7 +74,6 @@ pub(crate) fn bulk_set_flags_if_version(
                 account.clone(),
                 Box::pin(futures::stream::iter([target.id])),
                 op.clone(),
-                key.clone(),
             );
         };
         let kind = match version {

@@ -34,7 +34,7 @@ use tokio::time::Instant;
 /// One bucket per `SyncEngine`, shared by every attached account.
 /// `Budget` keys cross account boundaries by design: a key names a
 /// provider budget, and every account whose work is charged to it pauses
-/// on it. `Mailbox` and `Account` keys are per-account. Detach does not
+/// on it. `Owner`, `Folder` and `Account` keys are per-account. Detach does not
 /// erase deadlines: a new attachment of the same account still honors the
 /// provider hold until it expires.
 ///
@@ -105,7 +105,7 @@ impl ThrottleBucket {
     }
 
     /// Longest remaining wait that applies to `account` as a whole at
-    /// `now`: the account's own `Account` key. `Mailbox` and `Budget` keys
+    /// `now`: the account's own `Account` key. `Owner`, `Folder` and `Budget` keys
     /// are deliberately excluded - they hold one mailbox's work, never the
     /// whole account, and reach the work they hold through the keys the
     /// account declares for it ([`throttle_wait`]).
@@ -129,7 +129,7 @@ impl ThrottleBucket {
 /// producer's throttle.
 ///
 /// - `CurrentOperation` never enters the bucket (per-call hint).
-/// - `Mailbox` uses an Owner scope as a principal key and a native Mailbox
+/// - `ScopedResource` uses an Owner scope as a principal key and a native Mailbox
 ///   or Folder/FolderType cursor scope as a canonical folder key. A missing
 ///   identity remains local to the current operation.
 /// - `Account` uses the account key.

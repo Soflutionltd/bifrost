@@ -1466,7 +1466,7 @@ mod tests {
     #[test]
     fn generic_throttle_honors_context_scope() {
         let mut ctx = GmailErrorContext::inventory();
-        ctx.throttle_scope = Some(ThrottleScope::Mailbox);
+        ctx.throttle_scope = Some(ThrottleScope::ScopedResource);
         let error = translate_net_error(
             bifrost_net::Error::Status {
                 code: reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -1477,7 +1477,7 @@ mod tests {
         );
         assert_eq!(
             error.telemetry_fields().throttle_scope,
-            Some(ThrottleScope::Mailbox)
+            Some(ThrottleScope::ScopedResource)
         );
     }
 

@@ -802,7 +802,7 @@ fn response_code_limit_in_mailbox_scope_throttles_mailbox() {
         AccountErrorKind::Server(ServerErrorKind::RateLimited)
     ));
     if let RecoveryClass::Retry(advice) = account.recovery() {
-        assert_eq!(advice.throttle_scope, Some(ThrottleScope::Mailbox));
+        assert_eq!(advice.throttle_scope, Some(ThrottleScope::ScopedResource));
     } else {
         panic!("expected Retry");
     }
@@ -821,7 +821,7 @@ fn response_code_limit_in_folder_scope_throttles_mailbox() {
     let account = into_account_error(err, ctx);
 
     if let RecoveryClass::Retry(advice) = account.recovery() {
-        assert_eq!(advice.throttle_scope, Some(ThrottleScope::Mailbox));
+        assert_eq!(advice.throttle_scope, Some(ThrottleScope::ScopedResource));
     } else {
         panic!("expected Retry");
     }

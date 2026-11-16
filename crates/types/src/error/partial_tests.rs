@@ -8,7 +8,7 @@ fn throttle() -> AccountError {
         retry_hint: Some(RetryHint::After(Duration::from_secs(37))),
     }))
     .operation(AccountOperation::EventUpdate)
-    .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Mailbox))
+    .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::ScopedResource))
     .with_throttle(|throttle| throttle.add_budget(ThrottleBudget::new("budget")))
     .try_build()
     .unwrap()
@@ -57,7 +57,7 @@ fn partial_commit_blocking_prefix_protects_a_throttled_leg() {
         a.retry_hint,
         Some(RetryHint::After(Duration::from_secs(37)))
     );
-    assert_eq!(a.throttle_scope, Some(ThrottleScope::Mailbox));
+    assert_eq!(a.throttle_scope, Some(ThrottleScope::ScopedResource));
 }
 #[test]
 fn partial_commit_repeatable_prefix_keeps_leg_retry() {

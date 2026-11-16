@@ -908,10 +908,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use bifrost_types::{
-        ContainerId, FlagOp, IdempotencyKey, MembershipScope, MutationTarget, ObjectId,
-        ProtocolSalt, RunId,
-    };
+    use bifrost_types::{ContainerId, FlagOp, MembershipScope, MutationTarget, ObjectId};
     use bytes::Bytes;
     use futures::StreamExt;
     use serde_json::{Value, json};
@@ -1341,14 +1338,6 @@ mod tests {
                 .map(|(account, state)| ((*account).to_string(), Some((*state).into())))
                 .collect(),
         )
-    }
-
-    fn idempotency_key() -> IdempotencyKey {
-        IdempotencyKey {
-            run_id: RunId("test-run".to_string()),
-            sequence: 1,
-            protocol_salt: ProtocolSalt::Jmap("test".to_string()),
-        }
     }
 
     /// One reply answering both batched open probes.
@@ -2465,7 +2454,6 @@ mod tests {
                 )),
                 targets,
                 op.clone(),
-                idempotency_key(),
             );
             let events: Vec<_> = stream.collect().await;
 
@@ -2522,7 +2510,6 @@ mod tests {
             )),
             targets,
             FlagOp::Add(bifrost_types::FlagSet::from(["$seen".to_string()])),
-            idempotency_key(),
         );
 
         match stream.next().await {
@@ -2658,7 +2645,6 @@ mod tests {
             )),
             targets,
             MembershipScope::Mailbox(bifrost_types::MailboxId("inbox".to_string())),
-            idempotency_key(),
         );
 
         match stream.next().await {
@@ -2744,7 +2730,6 @@ mod tests {
             )),
             targets,
             MembershipScope::Mailbox(bifrost_types::MailboxId(destination.0)),
-            idempotency_key(),
         );
 
         match stream.next().await {
@@ -2838,7 +2823,6 @@ mod tests {
             )),
             targets,
             FlagOp::Add(bifrost_types::FlagSet::from(["$seen".to_string()])),
-            idempotency_key(),
         );
         while let Some(event) = stream.next().await {
             assert!(

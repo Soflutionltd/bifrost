@@ -391,7 +391,6 @@ impl SyncEngine {
                 drop(admission);
                 continue;
             };
-            let key = campaign.key(index);
             let guarded = remaining
                 .iter()
                 .any(|id| campaign.expected_version(id).is_some());
@@ -408,7 +407,7 @@ impl SyncEngine {
                 let account = Arc::clone(account.as_ref());
                 match campaign.operation() {
                     BulkPipelineOp::SetFlags(flags) => {
-                        account.bulk_set_flags_if_version(target_stream, flags.clone(), key.clone())
+                        account.bulk_set_flags_if_version(target_stream, flags.clone())
                     }
                     BulkPipelineOp::Move {
                         destination,
@@ -417,29 +416,21 @@ impl SyncEngine {
                         target_stream,
                         destination.clone(),
                         source.clone(),
-                        key.clone(),
                     ),
-                    BulkPipelineOp::Destroy => {
-                        account.bulk_destroy_if_version(target_stream, key.clone())
-                    }
+                    BulkPipelineOp::Destroy => account.bulk_destroy_if_version(target_stream),
                 }
             } else {
                 let target_stream: AccountStream<bifrost_types::ObjectId> =
                     Box::pin(futures::stream::iter(remaining.clone()));
                 match campaign.operation() {
                     BulkPipelineOp::SetFlags(flag_op) => {
-                        account.bulk_set_flags(target_stream, flag_op.clone(), key.clone())
+                        account.bulk_set_flags(target_stream, flag_op.clone())
                     }
                     BulkPipelineOp::Move {
                         destination,
                         source,
-                    } => account.bulk_move_from(
-                        target_stream,
-                        destination.clone(),
-                        source.clone(),
-                        key.clone(),
-                    ),
-                    BulkPipelineOp::Destroy => account.bulk_destroy(target_stream, key.clone()),
+                    } => account.bulk_move_from(target_stream, destination.clone(), source.clone()),
+                    BulkPipelineOp::Destroy => account.bulk_destroy(target_stream),
                 }
             };
             // Accounting stays in the campaign; the driver owns stream lifetime.
@@ -558,7 +549,7 @@ mod tests {
         engine.accounts.get(&id).expect("slot").shutdown.cancel();
         let vendor = crate::mutation::IdempotencyVendor::with_run_id(
             bifrost_types::RunId("campaign-test".into()),
-            Box::new(|_| bifrost_types::ProtocolSalt::Imap),
+            Box::new(|_| crate::mutation::idempotency::ProtocolSalt::Imap),
         );
         let outcome = engine
             .bulk_destroy(

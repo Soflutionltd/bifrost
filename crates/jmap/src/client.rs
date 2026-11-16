@@ -35,13 +35,13 @@ pub(crate) enum Credentials {
     // pair. Keep the representation at the HTTP header boundary: decoding it
     // into stream-protocol credentials adds no authentication capability and
     // would require retaining or regenerating the encoded value anyway.
-    Basic(String),
+    Basic(bifrost_net::credentials::Secret),
     Bearer(Arc<dyn TokenSource>),
 }
 
 #[derive(Clone)]
 pub(crate) enum Authorization {
-    Basic(String),
+    Basic(bifrost_net::credentials::Secret),
     Bearer(bifrost_net::CoordinatedTokenSource),
 }
 
@@ -68,7 +68,7 @@ impl Authorization {
     /// pipeline injects the bearer through `AccountNet` instead.
     pub(crate) async fn header_value(&self) -> Result<String, bifrost_net::Error> {
         match self {
-            Self::Basic(value) => Ok(format!("Basic {value}")),
+            Self::Basic(value) => Ok(format!("Basic {}", value.as_str())),
             Self::Bearer(source) => {
                 let token = source.current().await?;
                 Ok(format!("Bearer {}", token.as_str()))
@@ -1837,7 +1837,7 @@ impl<T: HttpTransport> Client<T> {
 impl Credentials {
     pub(crate) fn basic(username: &str, password: &str) -> Self {
         use base64::{Engine, engine::general_purpose::STANDARD};
-        Credentials::Basic(STANDARD.encode(format!("{username}:{password}")))
+        Credentials::Basic(STANDARD.encode(format!("{username}:{password}")).into())
     }
 
     pub(crate) fn bearer(token: impl Into<String>) -> Self {

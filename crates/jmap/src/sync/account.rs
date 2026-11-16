@@ -12,10 +12,10 @@ use bifrost_types::{
     CursorEstablishment, CursorScope, DirectoryCard, DirectoryGroup, DirectoryGroupId,
     DirectoryGroupMember, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId, EventPatch,
     EventRange, EventSearchRequest, FilterValidation, HostedAttachment, HydratedObject,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
-    InventoryEvent, InventoryPartition, InventoryPartitioning, ItemOutcome, Label, MembershipScope,
-    Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo,
-    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendAs, SendReceipt, SendRequest, ServerFilter,
+    HydrationProjection, Identity, IdentityId, IdentityPatch, Importance, InventoryEvent,
+    InventoryPartition, InventoryPartitioning, ItemOutcome, Label, MembershipScope, Message,
+    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus,
+    ScopeLifecycleEvent, SearchRequest, SendAs, SendReceipt, SendRequest, ServerFilter,
     ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
     SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
 };
@@ -654,16 +654,14 @@ impl Account for JmapAccount {
         &self,
         targets: AccountStream<ObjectId>,
         op: bifrost_types::FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutation::set_flags(Arc::clone(&self.registry), targets, op, key)
+        mutation::set_flags(Arc::clone(&self.registry), targets, op)
     }
 
     fn bulk_set_flags_if_version(
         self: Arc<Self>,
         targets: AccountStream<bifrost_types::MailMutationTarget>,
         op: bifrost_types::FlagOp,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::versioned_stream(
             Arc::clone(&self.registry),
@@ -676,7 +674,6 @@ impl Account for JmapAccount {
         self: Arc<Self>,
         targets: AccountStream<bifrost_types::MailMutationTarget>,
         destination: MembershipScope,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         let MembershipScope::Mailbox(mailbox) = destination else {
             return bifrost_types::mutation::versioned_mail_stream(targets, |target| {
@@ -696,7 +693,6 @@ impl Account for JmapAccount {
     fn bulk_destroy_if_version(
         self: Arc<Self>,
         targets: AccountStream<bifrost_types::MailMutationTarget>,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::versioned_stream(
             Arc::clone(&self.registry),
@@ -710,26 +706,23 @@ impl Account for JmapAccount {
         targets: AccountStream<bifrost_types::MailMutationTarget>,
         destination: MembershipScope,
         _source: Option<MembershipScope>,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        self.bulk_move_if_version(targets, destination, key)
+        self.bulk_move_if_version(targets, destination)
     }
 
     fn bulk_move(
         &self,
         targets: AccountStream<ObjectId>,
         destination: MembershipScope,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutation::move_to(Arc::clone(&self.registry), targets, destination, key)
+        mutation::move_to(Arc::clone(&self.registry), targets, destination)
     }
 
     fn bulk_destroy(
         &self,
         targets: AccountStream<ObjectId>,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutation::destroy(Arc::clone(&self.registry), targets, key)
+        mutation::destroy(Arc::clone(&self.registry), targets)
     }
 
     fn add_to_container(

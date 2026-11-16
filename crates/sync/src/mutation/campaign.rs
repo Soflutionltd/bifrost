@@ -145,7 +145,8 @@ impl Campaign {
     ) -> Option<&bifrost_types::ServerVersion> {
         self.expected_versions.get(id)
     }
-    pub(crate) fn key(&self, index: usize) -> bifrost_types::IdempotencyKey {
+    #[cfg(test)]
+    pub(crate) fn key(&self, index: usize) -> crate::mutation::idempotency::IdempotencyKey {
         self.cohorts[index].key.clone()
     }
     pub(crate) fn is_readback(&self, index: usize) -> bool {
@@ -855,6 +856,7 @@ impl Campaign {
         totals.effects = self.effects.into_iter().collect();
         totals.partial_commit_observations = self.partial_commit_observations;
         totals.dedupe_by_client_id = self.dedupe_count;
+        totals.cohort_keys = self.cohorts.into_iter().map(|cohort| cohort.key).collect();
         totals
     }
 }
@@ -950,7 +952,7 @@ impl MutationCohort {
 
 struct MutationCohort {
     identity: std::collections::BTreeSet<usize>,
-    key: bifrost_types::IdempotencyKey,
+    key: crate::mutation::idempotency::IdempotencyKey,
     targets: Vec<bifrost_types::ObjectId>,
     remaining: Vec<bifrost_types::ObjectId>,
     phase: CohortPhase,
@@ -1422,15 +1424,16 @@ fn retry_available(attempts: u64, max_retries: u32) -> bool {
 mod campaign_tests {
     use super::*;
     use crate::engine::SyncEngine;
+    use crate::mutation::idempotency::{IdempotencyKey, ProtocolSalt};
     use bifrost_types::{
         Batch, BatchItemId, BatchSuccess, MutationEffect, ObjectId, PageBoundary, SyncEvent,
     };
 
     #[test]
     fn declaration_matches_requires_every_unsent_target_on_the_replacement() {
-        use bifrost_types::{ProtocolKind, ProtocolSalt, RunId, ThrottleBudget, ThrottleKey};
+        use bifrost_types::{ProtocolKind, RunId, ThrottleBudget, ThrottleKey};
 
-        fn identity(key: &bifrost_types::IdempotencyKey) -> (&RunId, u64, &ProtocolSalt) {
+        fn identity(key: &IdempotencyKey) -> (&RunId, u64, &ProtocolSalt) {
             (&key.run_id, key.sequence, &key.protocol_salt)
         }
 
@@ -1506,6 +1509,97 @@ mod campaign_tests {
     }
 
     #[tokio::test]
+    async fn cohort_keys_stay_local_and_frozen_through_retry_and_reassertion() {
+        use crate::mutation::readback::ObjectReadback;
+        use bifrost_types::{
+            MutationReassertion, ProtocolKind, RunId, ThrottleBudget, ThrottleKey,
+        };
+
+        let mut account = crate::test_common::StubAccount::new(Vec::new());
+        account.object_keys = Some(Arc::new(|ids| {
+            ids.iter()
+                .map(|id| ThrottleKey::Budget(ThrottleBudget::new(id.0.clone())))
+                .collect()
+        }));
+        let vendor = super::super::IdempotencyVendor::with_run_id(
+            RunId("frozen-cohorts".into()),
+            Box::new(|_| ProtocolSalt::Graph("custom-payload".into())),
+        );
+        let targets = vec![ObjectId("a".into()), ObjectId("b".into())];
+        let mut campaign = Campaign::new(
+            targets.clone().into(),
+            BulkPipelineOp::Destroy,
+            &account,
+            &AccountId("frozen-cohorts".into()),
+            &vendor,
+            ProtocolKind::Graph,
+            &crate::types::EngineConfig::default(),
+        );
+        assert_eq!(campaign.cohorts.len(), 2);
+        let keys: Vec<_> = (0..2).map(|index| campaign.key(index)).collect();
+        assert_ne!(keys[0].sequence, keys[1].sequence);
+        let reassertion = MutationReassertion {
+            set_flags: false,
+            destroy: true,
+        };
+        for (index, id) in targets.iter().enumerate() {
+            let mut remaining = vec![id.clone()];
+            assert!(
+                campaign
+                    .begin_submission(index, &mut remaining, &reassertion)
+                    .is_some()
+            );
+            // A known retryable refusal keeps the cohort identity.
+            campaign.submit(
+                index,
+                &remaining,
+                remaining.clone(),
+                tokio::time::Instant::now(),
+                None,
+                false,
+            );
+            assert_eq!(campaign.key(index).sequence, keys[index].sequence);
+            assert!(
+                campaign
+                    .begin_submission(index, &mut remaining, &reassertion)
+                    .is_some()
+            );
+            // An omitted result requires read-back; a valid mismatch authorizes
+            // desired-state reassertion, still under the original identity.
+            campaign.submit(
+                index,
+                &remaining,
+                Vec::new(),
+                tokio::time::Instant::now(),
+                None,
+                false,
+            );
+            let report = HashMap::from([(id.clone(), ObjectReadback::Unsatisfied)]);
+            campaign.read_back(index, remaining.clone(), Some(&report), &reassertion);
+            assert!(matches!(
+                campaign.outcomes.get(id),
+                Some(MutationBucket::ReadyReassert),
+            ));
+            assert!(
+                campaign
+                    .begin_submission(index, &mut remaining, &reassertion)
+                    .is_some()
+            );
+            let retained = campaign.key(index);
+            assert_eq!(retained.run_id, keys[index].run_id);
+            assert_eq!(retained.sequence, keys[index].sequence);
+            assert_eq!(retained.protocol_salt, keys[index].protocol_salt);
+        }
+        let counters = campaign.finalize();
+        assert_eq!(counters.cohort_keys.len(), 2);
+        for (actual, expected) in counters.cohort_keys.iter().zip(keys) {
+            assert_eq!(actual.run_id, expected.run_id);
+            assert_eq!(actual.sequence, expected.sequence);
+            assert_eq!(actual.protocol_salt, expected.protocol_salt);
+        }
+    }
+
+    #[tokio::test]
     async fn campaign_rejects_unknown_duplicate_and_missing_answers() {
         for (answers, applied) in [
             (vec!["unrequested"], 0),
@@ -1542,7 +1636,7 @@ mod campaign_tests {
                 .expect("attach");
             let vendor = crate::mutation::IdempotencyVendor::with_run_id(
                 bifrost_types::RunId("contract".into()),
-                Box::new(|_| bifrost_types::ProtocolSalt::Imap),
+                Box::new(|_| crate::mutation::idempotency::ProtocolSalt::Imap),
             );
             let counters = engine
                 .bulk_set_flags(
@@ -1595,7 +1689,7 @@ mod campaign_tests {
             .expect("attach");
         let vendor = crate::mutation::IdempotencyVendor::with_run_id(
             bifrost_types::RunId("duplicate".into()),
-            Box::new(|_| bifrost_types::ProtocolSalt::Imap),
+            Box::new(|_| crate::mutation::idempotency::ProtocolSalt::Imap),
         );
         let counters = engine
             .bulk_set_flags(
@@ -1796,7 +1890,7 @@ mod campaign_tests {
             .expect("attach");
         let vendor = crate::mutation::IdempotencyVendor::with_run_id(
             bifrost_types::RunId("caller-version".into()),
-            Box::new(|_| bifrost_types::ProtocolSalt::Imap),
+            Box::new(|_| crate::mutation::idempotency::ProtocolSalt::Imap),
         );
         let counters = engine
             .bulk_set_flags_if_version(
@@ -1864,7 +1958,7 @@ mod partial_commit_throttle_tests {
             .scope(ErrorScope::Owner {
                 id: PrincipalId(mailbox.into()),
             })
-            .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Mailbox));
+            .with_throttle(|throttle| throttle.scope = Some(ThrottleScope::ScopedResource));
         if let Some(budget) = budget {
             builder =
                 builder.with_throttle(|throttle| throttle.add_budget(ThrottleBudget::new(budget)));

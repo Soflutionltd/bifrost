@@ -14,9 +14,10 @@ The identity vocabularies describe different domains. `ProtocolKind` is the
 set of protocols that mint opaque change cursors; `Protocol` also names
 submission and auxiliary APIs and has `Unknown` for unavailable identity.
 `From<ProtocolKind> for Protocol` owns their exhaustive conversion here.
-`ProtocolSalt::from(ProtocolKind)` owns default mutation bookkeeping salts,
-also exhaustively. Custom salt factories retain their payload-bearing variants;
-empty payloads are a default, not a restriction on consumers.
+Engine-local `bifrost_sync::mutation::ProtocolSalt::from(ProtocolKind)` owns
+default mutation bookkeeping salts exhaustively in `bifrost-sync`. The key and
+salt do not cross the Account boundary; custom salt payloads remain available
+in the engine's `MutationCounters::cohort_keys`.
 
 `Provider` names a vendor or vendor API, including the expression language of
 `FilterCondition::ProviderExpression`. A vendor expression is not cursor
@@ -169,6 +170,19 @@ fields include:
 Consumers should inspect capabilities before presenting an operation.
 An implementation must still return a structured error if an advertised
 operation fails or support changes at runtime.
+
+`cursor_freshness`, `blob_digest_pre_download`, `rate_limit_class`,
+`quota_signal`, `requires_uidvalidity_recheck`, `historyid_expires_after`
+and `delta_token_expires_after` are read by `CapabilityDelta::between`.
+Committed engine reattach publishes their changes through
+`AccountControl::CapabilitiesChanged`. These fields remain diagnostic snapshot
+metadata; they do not drive engine scheduling, retry budgets or cursor
+validation. In particular, neither bifrost-net nor the engine derives a
+request-rate budget from `RateLimitClass`.
+
+Each provider declares its own `BatchingPolicy` defaults in its capability
+snapshot. The shared type specifies no per-provider numeric defaults. Graph
+reads its declared `max_items` when batching hydration and mutations.
 
 `PimMethodSupport` remains the published snapshot. Its declaration generates
 both its existing fields and `gate(operation, protocol)`, which returns the
@@ -621,8 +635,9 @@ crates/types/src/
 `ServerVersion` for each target. The `Account` methods
 `bulk_set_flags_if_version`, `bulk_move_if_version`,
 `bulk_move_from_if_version` and `bulk_destroy_if_version` take `self: Arc<Self>`
-and a stream of these targets, plus the same operation arguments and
-`IdempotencyKey` as their unversioned counterparts. Existing methods remain.
+and a stream of these targets, plus the same operation arguments as their
+unversioned counterparts. Account bulk methods do not take an idempotency key;
+cohort correlation belongs to `bifrost-sync`. Existing methods remain.
 The versioned methods submit targets independently with bounded memory and
 backpressure; callers that do not need preconditions can retain bulk batching
 through the existing methods. Each pulled target gets its own outcome, local

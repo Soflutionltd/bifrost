@@ -13,7 +13,7 @@ Crates present:
 - `crates/carddav/` → `bifrost-carddav` - CardDAV account crate for contacts.
 - `crates/caldav/` → `bifrost-caldav` - CalDAV account crate for calendars.
 - `crates/smtp/` → `bifrost-smtp` - SMTP and LMTP client. Lettre-derived. Native-tls only.
-- `crates/sasl/` → `bifrost-sasl` - published shared SASL clients and policy layer (SCRAM, CRAM-MD5 and OAuth).
+- `crates/sasl/` → `bifrost-sasl` - published shared SASL clients, zeroizing `Secret` credential storage and policy layer (SCRAM, CRAM-MD5 and OAuth).
 
 All crates are pre-1.0, API stabilization phase.
 

@@ -116,7 +116,7 @@ pub enum Error {
 
     /// Local refusal before a wire attempt. Prior outcomes are retained in
     /// order; an empty list is the only case with no dispatched attempt.
-    #[error("request refused by local hold {key}")]
+    #[error("request refused by local hold")]
     LocalHold {
         key: String,
         held: crate::Held,
@@ -258,7 +258,7 @@ pub enum Error {
     /// error is captured at the builder call site and surfaced on the
     /// subsequent `send` so the fluent API does not have to return a
     /// `Result` on every chained setter.
-    #[error("request body encoding failed: {message}")]
+    #[error("request body encoding failed")]
     EncodeBody {
         /// Human-readable description of the encoding failure.
         message: String,
@@ -271,7 +271,7 @@ pub enum Error {
     /// lazily from `send` like `EncodeBody` so the fluent builder API
     /// remains chainable while malformed headers do not disappear
     /// silently.
-    #[error("invalid request header: {message}")]
+    #[error("invalid request header")]
     InvalidHeader {
         /// Human-readable description of the header failure.
         message: String,
@@ -282,7 +282,7 @@ pub enum Error {
 
     /// Local request construction failed before the request crossed
     /// the wire boundary.
-    #[error("invalid request {field}: {detail}")]
+    #[error("invalid request {field}")]
     InvalidRequest {
         /// Stable producer field name.
         field: &'static str,
@@ -297,7 +297,7 @@ pub enum Error {
     /// refresher would otherwise have to flatten a `Network` or
     /// `Timeout` failure into `AuthLost` and lose the transient-vs-
     /// permanent distinction.
-    #[error("OAuth refresh failed: {source}")]
+    #[error("OAuth refresh failed")]
     RefreshFailed {
         /// Provider-supplied retry hint parsed by the auth layer,
         /// when the token endpoint returned a `Retry-After` hint.
@@ -313,7 +313,7 @@ pub enum Error {
     /// `206 Partial Content` with a `Content-Range` that disagrees with
     /// the request). Returned before any body bytes are yielded so the
     /// caller does not assemble a misaligned blob.
-    #[error("range not honored: {message}")]
+    #[error("range not honored")]
     RangeNotHonored {
         /// Whether the failure is local input or response evidence.
         kind: RangeFailureKind,
@@ -325,7 +325,7 @@ pub enum Error {
     /// `RedirectPolicy::cross_origin` admission policy. Returned by the
     /// `bifrost-net` redirect loop before any further request is
     /// issued.
-    #[error("redirect rejected: {message}")]
+    #[error("redirect rejected")]
     RedirectRejected {
         /// Description of why the redirect was rejected.
         message: String,
@@ -344,7 +344,7 @@ pub enum Error {
     /// a re-authorization prompt for a working account, so the
     /// self-stripped provenance is carried here instead and classifies
     /// as a provider contract violation.
-    #[error("unauthenticated redirect hop: {message}")]
+    #[error("unauthenticated redirect hop")]
     UnauthenticatedRedirectHop {
         /// Description of the chain and the hop that answered 401.
         message: String,
@@ -353,7 +353,7 @@ pub enum Error {
     },
 
     /// Server returned a malformed redirect response.
-    #[error("malformed redirect: {message}")]
+    #[error("malformed redirect")]
     MalformedRedirect {
         /// Malformed redirect category.
         kind: MalformedRedirectKind,
@@ -707,5 +707,38 @@ mod tests {
                 },
             ]
         ));
+    }
+}
+
+#[cfg(test)]
+mod safe_display_tests {
+    use super::*;
+
+    #[test]
+    fn foreign_constructor_prose_stays_out_of_display() {
+        let marker = "password=echoed-credential";
+        for error in [
+            Error::EncodeBody {
+                message: marker.into(),
+                source: None,
+            },
+            Error::InvalidHeader {
+                message: marker.into(),
+                source: None,
+            },
+            Error::InvalidRequest {
+                field: "url",
+                detail: marker.into(),
+            },
+            Error::RedirectRejected {
+                message: marker.into(),
+            },
+            Error::MalformedRedirect {
+                kind: MalformedRedirectKind::UnresolvableLocation,
+                message: marker.into(),
+            },
+        ] {
+            assert!(!format!("{error} {error:?}").contains(marker));
+        }
     }
 }

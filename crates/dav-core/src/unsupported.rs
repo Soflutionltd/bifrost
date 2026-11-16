@@ -51,7 +51,6 @@ macro_rules! dav_unsupported_account_methods {
         &self,
         _targets: AccountStream<ObjectId>,
         op: FlagOp,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         match op.validate_for_account(<$dialect as $crate::collection::Dialect>::DAV.protocol()) {
             Ok(()) => $crate::collection_account::DavCollectionAccount::<$dialect>::unsupported_stream(AccountOperation::UpdateFlags),
@@ -65,7 +64,6 @@ macro_rules! dav_unsupported_account_methods {
         &self,
         _targets: AccountStream<ObjectId>,
         _destination: MembershipScope,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         $crate::collection_account::DavCollectionAccount::<$dialect>::unsupported_stream(AccountOperation::BulkMove)
     }
@@ -73,7 +71,6 @@ macro_rules! dav_unsupported_account_methods {
     fn bulk_destroy(
         &self,
         _targets: AccountStream<ObjectId>,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         $crate::collection_account::DavCollectionAccount::<$dialect>::unsupported_stream(AccountOperation::BulkDestroy)
     }

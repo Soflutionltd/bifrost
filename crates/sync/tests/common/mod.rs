@@ -28,9 +28,9 @@ use bifrost_types::{
     ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope,
     DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
     FilterRuleShape, FilterValidation, FlagOp, HostedAttachment, HydratedObject,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
-    InventoryEvent, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
-    Message, MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
+    HydrationProjection, Identity, IdentityId, IdentityPatch, Importance, InventoryEvent,
+    InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope, Message,
+    MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
     MutationTarget, ObjectId, OpaqueChangeState, Page, PrimaryCause, Priority, Projection,
     ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RsvpStatus,
     ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate,
@@ -1181,7 +1181,6 @@ impl Account for StubAccount {
         &self,
         _targets: AccountStream<ObjectId>,
         _op: FlagOp,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::iter(
             self.bulk_flags_script
@@ -1196,7 +1195,6 @@ impl Account for StubAccount {
         self: Arc<Self>,
         targets: AccountStream<bifrost_types::MailMutationTarget>,
         op: FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         bifrost_types::mutation::versioned_mail_stream(targets, move |target| {
             self.versioned_flags_seen
@@ -1214,11 +1212,7 @@ impl Account for StubAccount {
                     }),
                 );
             }
-            self.bulk_set_flags(
-                Box::pin(futures::stream::iter([target.id])),
-                op.clone(),
-                key.clone(),
-            )
+            self.bulk_set_flags(Box::pin(futures::stream::iter([target.id])), op.clone())
         })
     }
 
@@ -1226,7 +1220,6 @@ impl Account for StubAccount {
         &self,
         _targets: AccountStream<ObjectId>,
         _destination: MembershipScope,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }
@@ -1234,7 +1227,6 @@ impl Account for StubAccount {
     fn bulk_destroy(
         &self,
         _targets: AccountStream<ObjectId>,
-        _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }

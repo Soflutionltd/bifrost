@@ -1074,8 +1074,7 @@ fn json_parse_failure_is_protocol_parse_failed() {
 /// OneDrive 202 range read's failures. The diagnostic used to call every
 /// one of them a "Graph response JSON parse failed", so a support export
 /// for a truncated Autodiscover XML answer named the wrong format and
-/// the wrong service. The producer's message names its source; the
-/// label must not contradict it.
+/// the wrong service. A format-neutral label also keeps parser prose private.
 #[test]
 fn a_non_json_parse_failure_is_not_labelled_a_json_parse() {
     for message in [
@@ -1091,7 +1090,7 @@ fn a_non_json_parse_failure_is_not_labelled_a_json_parse() {
         );
         let debug = format!("{err:?}");
         assert!(!debug.contains("JSON"), "{debug}");
-        assert!(debug.contains(message), "{debug}");
+        assert!(!debug.contains(message), "{debug}");
         assert_eq!(
             err.kind(),
             &AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
@@ -1431,4 +1430,29 @@ fn primary_mailbox_permission_loss_stays_terminal() {
     ));
     assert!(err.recovery().is_terminal());
     assert!(matches!(err.recovery(), RecoveryClass::NoPermission { .. }));
+}
+
+#[test]
+fn ews_fault_and_xml_exports_withhold_provider_prose() {
+    let marker = "password=echoed-credential";
+    for error in [
+        EwsError::SoapFault {
+            code: SoapFaultCode::ErrorServerBusy,
+            detail: DiagnosticText::support_only(marker),
+        },
+        EwsError::MalformedXml(DiagnosticText::support_only(marker)),
+    ] {
+        let error = ews_error_to_account_error(
+            error,
+            GraphErrorContext::ews(AccountOperation::SyncChanges),
+        );
+        assert!(!format!("{error:?}").contains(marker));
+        assert!(
+            !error
+                .support_consented()
+                .support_text
+                .iter()
+                .any(|s| s.contains(marker))
+        );
+    }
 }

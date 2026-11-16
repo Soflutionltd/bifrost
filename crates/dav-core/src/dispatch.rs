@@ -1081,11 +1081,11 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
-    use bifrost_net::TokenSource;
     use crate::test_support::{
         DavTranscript, dav_dropped_after_send, dav_redirect, dav_script, dav_script_empty,
         scripted_dav_net, scripted_dav_net_capped, transcripts,
     };
+    use bifrost_net::TokenSource;
 
     const BASE: &str = "https://dav.example.test";
 

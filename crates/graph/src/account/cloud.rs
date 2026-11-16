@@ -1086,11 +1086,11 @@ mod tests {
     }
 
     /// The final chunk's 200/201 must carry the drive item. One that does not
-    /// decode is the provider's parse failure, and since `GraphError::Json`'s
-    /// label names no format, its message must say which body failed: it
-    /// used to carry serde's bare text, naming neither OneDrive nor JSON.
+    /// decode is the provider's parse failure. The producer message names the
+    /// source but is kept private by the credential-safe boundary, so the
+    /// account error exposes only the fixed label and the body length.
     #[tokio::test]
-    async fn an_undecodable_drive_item_names_its_source() {
+    async fn an_undecodable_drive_item_is_a_redacted_parse_failure() {
         let (error, puts) = refusal_of_first_answer(
             b"01234",
             ScriptedRestResponse::text(reqwest::StatusCode::CREATED, "<html>ok</html>"),
@@ -1103,10 +1103,12 @@ mod tests {
                 bifrost_types::ProtocolErrorKind::ParseFailed
             )
         );
-        assert!(
-            format!("{error:?}").contains("OneDrive upload drive item JSON body"),
-            "{error:?}"
-        );
+        // Producer parser prose may quote credentials, so the boundary keeps
+        // it private; the error carries only the fixed label and body size.
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains("OneDrive upload drive item JSON body"));
+        assert!(!rendered.contains("<html>"), "{rendered}");
+        assert!(rendered.contains("captured response body bytes: 15"), "{rendered}");
     }
 
     /// A 202 that parses but names an impossible offset is the provider's

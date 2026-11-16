@@ -280,9 +280,9 @@ Both advice structs are explicitly `#[non_exhaustive]`.
 `ReconcileGuidance` is an ordinary constructible public struct, so the nested
 shape is not accidentally sealed.
 
-`ThrottleScope::{CurrentOperation, Mailbox, Account}`
+`ThrottleScope::{CurrentOperation, ScopedResource, Account}`
 is the producer hint; the engine lifts the sharable scopes into a
-`ThrottleKey::{Mailbox, Account}` bucket.
+`ThrottleKey::{Owner, Folder, Account, Budget}` bucket.
 `CurrentOperation` is a per-call inline delay and never enters a key.
 
 A producer that knows which provider rate budget a throttled request was
@@ -1005,3 +1005,5 @@ existing provider wait to be honored once without stalling unrelated work.
 `compose::validate_send_recipients` and `SendRequest::validate_recipients`
 require a protocol identity for their local empty-send refusal. Neutral MIME
 callers use `Unknown` and account boundaries supply their own identity.
+
+Provider decode diagnostics export structural positions and categories or fixed labels, never parser prose or SOAP/XML descriptions. Custom JMAP transports retain classification and transmission evidence without exporting their message. Known JMAP limit names are exported only through an exact allowlist.

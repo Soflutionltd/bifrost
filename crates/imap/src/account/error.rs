@@ -94,7 +94,7 @@ impl ImapErrorContext {
     /// `with_folder_scope` (`ErrorScope::Cursor(Folder(_))`). Tests still
     /// use it, so the scope READERS must keep accepting `Mailbox { id }` -
     /// see `id_from_scope` / `mailbox_throttle`, where assuming otherwise
-    /// made `ThrottleScope::Mailbox` unreachable in production while its
+    /// made `ThrottleScope::ScopedResource` unreachable in production while its
     /// test kept passing.
     #[allow(dead_code)]
     #[must_use]
@@ -950,7 +950,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
     };
     let mailbox_throttle = || match ctx.scope.as_ref() {
         Some(ErrorScope::Mailbox { .. } | ErrorScope::Cursor(CursorScope::Folder(_))) => {
-            ThrottleScope::Mailbox
+            ThrottleScope::ScopedResource
         }
         _ => ThrottleScope::Account,
     };

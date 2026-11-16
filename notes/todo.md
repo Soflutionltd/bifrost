@@ -45,24 +45,11 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
-- **Remaining free-form text in diagnostics.** bifrost-net, the DAV crates and
-  the Google, Graph and JMAP HTTP error mappers export only structural evidence
-  and shape-checked ids. Reported in passing, unverified:
-  - net's ordinary transport `Display` and account diagnostics still accept
-    free-form messages and sources.
-  - Graph EWS SOAP and XML and JSON-parse mappings in
-    `crates/graph/src/account/graph_error.rs` export free-form detail.
-  - JMAP decode and custom-transport mappings in `sync/error.rs` export
-    free-form strings, and `core/error.rs` problem types derive `Debug` over
-    raw descriptions.
-  - JMAP's reusable pre-encoded Basic credential is a plain `String`, not a
-    zeroizing secret.
-  - JMAP `convert_problem` no longer exports a limit name even when it matched
-    the known set (`maxSizeRequest`, `maxCallsInRequest`, `maxObjectsIn*`);
-    those values are pinned by the match, so exporting them is safe.
-  - `AGENTS.md` still describes bifrost-sasl as private in at least one place,
-    although bifrost-net now re-exports its `Secret` as a credential field
-    type.
+- **Remaining provider prose in diagnostics.** Reported in passing,
+  unverified. Graph Autodiscover and id-translation mappings and JMAP
+  WebSocket runtime and handshake mappings still export provider prose. The
+  public `JmapCredentials::Basic.password` field is a plain `String` (the
+  reusable encoded credential is already a zeroizing `Secret`).
 
 ## 2. Blocked on a live probe
 
@@ -299,9 +286,11 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
-- **`reference/sync.md` names a `ThrottleKey::Mailbox` variant that does not
-  exist** in its throttle overview and lookup discussion (the enum has
-  `Owner`, `Folder`, `Account` and `Budget`).
+- **JMAP local transport failures lost their reason in diagnostics.**
+  `convert_transport` in `crates/jmap/src/sync/error.rs` exports a fixed
+  "local JMAP transport failure" for `InvariantViolated` and `LimitExceeded`,
+  though those messages are bifrost-authored, not foreign. Decide whether
+  support needs the local reason back.
 - **Lateral findings from the review of the primary-cause builder rewrite.**
   - Several producers mint a scope-directed state cause with a placeholder
     `CursorScope` and rely on a later `.scope(ErrorScope::Cursor(_))` to rebind
@@ -343,9 +332,7 @@ Narrow edge cases, audits with no known defect, and design work.
     mutex-poison assertions remain.
   - sync: the operator-override warning moved from `user_safe` to
     `support_only` (ruling). `plan_recovery` lost its unhandled-classification
-    detail. `ThrottleScope::Mailbox` (defined in
-    `crates/types/src/error/recovery.rs`) also covers owners and folders; a
-    rename such as `ScopedResource` is proposed. `AckOutcome` is not `#[must_use]`: adding it is clean in
+    detail. `AckOutcome` is not `#[must_use]`: adding it is clean in
     production but about fifty test call sites discard the value.
   - Graph: `public_folder` change events carry `Owner` memberships that only
     `Account` cursors cover.

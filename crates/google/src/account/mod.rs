@@ -31,12 +31,12 @@ use bifrost_types::{
     ContainerList, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DirectoryCard,
     DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate,
     EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
-    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
-    MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, OpenedAccount, Page, Priority,
-    Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt,
-    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
-    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
+    HostedAttachment, HydratedObject, HydrationProjection, Identity, IdentityId, IdentityPatch,
+    Importance, InventoryEvent, ItemOutcome, MembershipScope, Message, MutationSuccess,
+    MutationTarget, ObjectId, OpaqueChangeState, OpenedAccount, Page, Priority, Projection,
+    QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -615,14 +615,12 @@ impl Account for GoogleAccount {
         &self,
         targets: AccountStream<ObjectId>,
         op: FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::bulk_set_flags_cancellable(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
             targets,
             op,
-            key,
             self.shutdown.clone(),
         )
     }
@@ -631,7 +629,6 @@ impl Account for GoogleAccount {
         &self,
         targets: AccountStream<ObjectId>,
         destination: MembershipScope,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::bulk_move_cancellable(
             Arc::clone(&self.client),
@@ -639,7 +636,6 @@ impl Account for GoogleAccount {
             targets,
             destination,
             None,
-            key,
             self.shutdown.clone(),
         )
     }
@@ -653,7 +649,6 @@ impl Account for GoogleAccount {
         targets: AccountStream<ObjectId>,
         destination: MembershipScope,
         source: Option<MembershipScope>,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::bulk_move_cancellable(
             Arc::clone(&self.client),
@@ -661,7 +656,6 @@ impl Account for GoogleAccount {
             targets,
             destination,
             source,
-            key,
             self.shutdown.clone(),
         )
     }
@@ -669,13 +663,11 @@ impl Account for GoogleAccount {
     fn bulk_destroy(
         &self,
         targets: AccountStream<ObjectId>,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::bulk_destroy_cancellable(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
             targets,
-            key,
             self.shutdown.clone(),
         )
     }

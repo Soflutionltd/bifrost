@@ -49,12 +49,11 @@ use bifrost_types::{
     ContactSearchRequest, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
     DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
     EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
-    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Importance,
-    InventoryEvent, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
-    ObjectId, OpenedAccount, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent,
-    SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
-    ServerFilterPatch, SkippedScope, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
-    ThreadId, VacationConfig,
+    HostedAttachment, HydratedObject, HydrationProjection, Importance, InventoryEvent, ItemOutcome,
+    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, OpenedAccount, Page,
+    Priority, Projection, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SkippedScope,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -775,35 +774,31 @@ impl Account for GraphAccount {
         &self,
         targets: AccountStream<ObjectId>,
         op: bifrost_types::FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutate::bulk_set_flags_stream(self.clone(), targets, op, key)
+        mutate::bulk_set_flags_stream(self.clone(), targets, op)
     }
 
     fn bulk_set_flags_if_version(
         self: Arc<Self>,
         targets: AccountStream<bifrost_types::MailMutationTarget>,
         op: bifrost_types::FlagOp,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutate::bulk_set_flags_if_version_stream(self.as_ref().clone(), targets, op, key)
+        mutate::bulk_set_flags_if_version_stream(self.as_ref().clone(), targets, op)
     }
 
     fn bulk_move(
         &self,
         targets: AccountStream<ObjectId>,
         destination: MembershipScope,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutate::bulk_move_stream(self.clone(), targets, destination, key)
+        mutate::bulk_move_stream(self.clone(), targets, destination)
     }
 
     fn bulk_destroy(
         &self,
         targets: AccountStream<ObjectId>,
-        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutate::bulk_destroy_stream(self.clone(), targets, key)
+        mutate::bulk_destroy_stream(self.clone(), targets)
     }
 
     fn add_to_container(

@@ -177,9 +177,9 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         crate::Error::Problem { details, transport } => convert_problem(*details, transport, ctx),
         crate::Error::Method(method) => convert_method(method, ctx),
         crate::Error::Set(set) => set_error_to_account_error(set, ctx, None),
-        crate::Error::RequestEncode(err) => build(
+        crate::Error::RequestEncode(_) => build(
             PrimaryCause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(err.to_string()),
+                detail: DiagnosticText::support_only("JMAP request encoding failed"),
             }),
             &ctx,
         )
@@ -281,22 +281,22 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             bifrost_types::UnsupportedReason::FlagOperation,
             reason,
         ),
-        crate::Error::NotParsable(detail) => build(
+        crate::Error::NotParsable(_) => build(
             PrimaryCause::Protocol {
                 kind: ProtocolErrorKind::ParseFailed,
                 wire: WireCause::MalformedResponse {
                     protocol: Protocol::Jmap,
-                    detail: Some(DiagnosticText::support_only(detail)),
+                    detail: Some(DiagnosticText::support_only("unparseable JMAP response")),
                 },
             },
             &ctx,
         )
         .try_build()
         .expect("valid account error classification"),
-        crate::Error::InvalidUrl(detail) => build(
+        crate::Error::InvalidUrl(_) => build(
             PrimaryCause::Request(RequestCause::InvalidArgument {
                 field: Some("url"),
-                message: Some(DiagnosticText::support_only(detail)),
+                message: Some(DiagnosticText::support_only("invalid JMAP URL")),
             }),
             &ctx,
         )
@@ -307,13 +307,16 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         // described itself wrongly, and a reopen re-reads the same session,
         // so it is a terminal contract violation naming the property - not
         // the caller's `Request(Malformed)` it was once filed under.
-        crate::Error::MalformedSessionUrl { property, detail } => build(
+        crate::Error::MalformedSessionUrl {
+            property,
+            detail: _,
+        } => build(
             PrimaryCause::Protocol {
                 kind: ProtocolErrorKind::ContractViolation,
                 wire: WireCause::MalformedResponse {
                     protocol: Protocol::Jmap,
                     detail: Some(DiagnosticText::support_only(format!(
-                        "session property {property} is not a usable URL: {detail}"
+                        "session property {property} is not a usable URL"
                     ))),
                 },
             },
@@ -406,10 +409,10 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
             .try_build()
             .expect("valid account error classification"),
-            crate::WebSocketSetupError::InvalidHeader(message) => build(
+            crate::WebSocketSetupError::InvalidHeader(_) => build(
                 PrimaryCause::Request(RequestCause::InvalidArgument {
                     field: Some("authorization"),
-                    message: Some(DiagnosticText::support_only(message)),
+                    message: Some(DiagnosticText::support_only("invalid authorization header")),
                 }),
                 &ctx,
             )
@@ -1307,10 +1310,19 @@ fn decode_error(
     call_id: Option<String>,
     ctx: &JmapErrorContext,
 ) -> AccountError {
-    let detail = match call_id {
-        Some(id) => format!("call {id}: {error}"),
-        None => error.to_string(),
-    };
+    // Decoder prose can quote rejected values, including credentials.
+    let mut detail = format!(
+        "JMAP JSON decode failed at line {}, column {} ({:?})",
+        error.line(),
+        error.column(),
+        error.classify()
+    );
+    if let Some(id) = call_id
+        .as_deref()
+        .and_then(bifrost_net::account_error::correlation_id)
+    {
+        detail.push_str(&format!("; call {id}"));
+    }
     build(
         PrimaryCause::Protocol {
             kind: ProtocolErrorKind::ParseFailed,
@@ -1340,7 +1352,7 @@ fn convert_transport(
             }
             crate::core::transport::LocalFailure::LimitExceeded => InternalErrorKind::LimitExceeded,
         };
-        let detail = DiagnosticText::support_only(transport.message.clone());
+        let detail = DiagnosticText::support_only("local JMAP transport failure");
         return build(
             PrimaryCause::Internal(InternalCause::new(kind, Some(detail.clone()))),
             &ctx,
@@ -1373,7 +1385,9 @@ fn convert_transport(
         let builder = build(
             PrimaryCause::Transport(TransportCause::new(
                 TransportErrorKind::Network,
-                Some(DiagnosticText::support_only(transport.message)),
+                Some(DiagnosticText::support_only(
+                    "custom JMAP transport failure",
+                )),
             )),
             &ctx,
         );
@@ -1478,6 +1492,17 @@ fn convert_problem(
         .and_then(bifrost_net::account_error::correlation_id)
     {
         builder = builder.request_id(request_id);
+    }
+    if let Some(
+        limit @ ("maxSizeRequest"
+        | "maxCallsInRequest"
+        | "maxObjectsInGet"
+        | "maxObjectsInSet"
+        | "maxConcurrentRequests"
+        | "maxConcurrentUpload"),
+    ) = details.limit()
+    {
+        builder = builder.text(DiagnosticText::support_only(format!("JMAP limit: {limit}")));
     }
     // Problem title/detail and arbitrary limit names are server prose.
     // Support consent must not expose credentials echoed by a server.
@@ -2743,6 +2768,12 @@ mod tests {
                 JmapErrorContext::new(AccountOperation::Send),
             );
             assert_eq!(err.kind(), &expected, "{limit}");
+            assert!(
+                err.support_consented()
+                    .support_text
+                    .iter()
+                    .any(|s| s.contains(limit))
+            );
         }
     }
 
@@ -3848,5 +3879,30 @@ mod refusal_contract_tests {
             error.kind(),
             &AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge)
         );
+    }
+}
+
+#[cfg(test)]
+mod safe_decode_tests {
+    use super::*;
+
+    #[test]
+    fn decode_and_custom_transport_exports_withhold_foreign_prose() {
+        let marker = "password=echoed-credential";
+        let decode = serde_json::from_value::<u64>(serde_json::json!(marker)).unwrap_err();
+        let ctx = || JmapErrorContext::new(AccountOperation::SyncChanges);
+        for error in [
+            decode_error(decode, Some(marker.into()), &ctx()),
+            convert_transport(crate::core::transport::TransportError::new(marker), ctx()),
+        ] {
+            assert!(!format!("{error:?}").contains(marker));
+            assert!(
+                !error
+                    .support_consented()
+                    .support_text
+                    .iter()
+                    .any(|s| s.contains(marker))
+            );
+        }
     }
 }

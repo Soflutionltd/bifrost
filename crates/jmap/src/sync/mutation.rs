@@ -4,8 +4,7 @@ use std::time::Instant;
 
 use bifrost_types::{
     AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, ErrorScope, FlagOp,
-    IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, ObjectId, PageBoundary,
-    SyncEvent,
+    ItemOutcome, MembershipScope, MutationSuccess, ObjectId, PageBoundary, SyncEvent,
 };
 use futures::StreamExt;
 
@@ -21,7 +20,6 @@ pub(crate) fn set_flags<T: HttpTransport>(
     foreign_mail: Arc<crate::sync::registry::Registry<T>>,
     targets: AccountStream<ObjectId>,
     op: FlagOp,
-    _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     if let Err(error) = op.validate_for_account(bifrost_types::Protocol::Jmap) {
         return Box::pin(futures::stream::once(async move {
@@ -50,7 +48,6 @@ pub(crate) fn move_to<T: HttpTransport>(
     foreign_mail: Arc<crate::sync::registry::Registry<T>>,
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
-    _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     let kind = match destination {
         MembershipScope::Mailbox(mailbox) => MutationKind::Move(MailboxId::new(mailbox.0)),
@@ -71,7 +68,6 @@ pub(crate) fn move_to<T: HttpTransport>(
 pub(crate) fn destroy<T: HttpTransport>(
     foreign_mail: Arc<crate::sync::registry::Registry<T>>,
     targets: AccountStream<ObjectId>,
-    _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(foreign_mail, targets, MutationKind::Destroy)
 }

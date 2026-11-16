@@ -297,7 +297,7 @@ impl AccountError {
             // stalling sibling folders, including when timing is omitted.
             let target = match scope {
                 Some(ThrottleScope::Account) if hint.is_some() => HoldTarget::Account,
-                Some(ThrottleScope::Mailbox) => match error.scope() {
+                Some(ThrottleScope::ScopedResource) => match error.scope() {
                     Some(ErrorScope::Owner { id }) => HoldTarget::Owner(id.clone()),
                     Some(ErrorScope::Mailbox { id }) => {
                         HoldTarget::Folder(crate::FolderId::from(id))
