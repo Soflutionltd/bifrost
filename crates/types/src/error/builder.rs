@@ -86,11 +86,16 @@ pub enum AccountErrorBuildError {
     /// `ThrottleScopeNotApplicable`: a budget names where a throttle hold
     /// is recorded, so on anything but a throttle it is a producer bug.
     ThrottleBudgetNotApplicable { kind: AccountErrorKind },
+    /// Local-hold provenance belongs only to rate-limit or quota refusals.
+    LocalHoldNotApplicable { kind: AccountErrorKind },
 }
 
 impl fmt::Display for AccountErrorBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LocalHoldNotApplicable { kind } => {
+                write!(f, "local hold is not applicable to {kind:?}")
+            }
             Self::PartialCommitAlreadyAttached
             | Self::PartialCommitEmpty
             | Self::PartialCommitApplication { .. }
@@ -148,6 +153,7 @@ pub(crate) struct RebuildParts {
     pub idempotency_override: Option<bool>,
     pub throttle_scope: Option<ThrottleScope>,
     pub throttle_budgets: Vec<ThrottleBudget>,
+    pub local_hold: bool,
     pub unsupported_reason: Option<UnsupportedReason>,
 }
 
@@ -168,6 +174,7 @@ pub struct AccountErrorBuilder {
     idempotency_override: Option<bool>,
     throttle_scope: Option<ThrottleScope>,
     throttle_budgets: Vec<ThrottleBudget>,
+    local_hold: bool,
     unsupported_reason: Option<UnsupportedReason>,
 }
 
@@ -190,6 +197,7 @@ impl AccountErrorBuilder {
             idempotency_override: None,
             throttle_scope: None,
             throttle_budgets: Vec::new(),
+            local_hold: false,
             unsupported_reason: None,
         }
     }
@@ -220,6 +228,7 @@ impl AccountErrorBuilder {
             idempotency_override: parts.idempotency_override,
             throttle_scope: parts.throttle_scope,
             throttle_budgets: parts.throttle_budgets,
+            local_hold: parts.local_hold,
             unsupported_reason: parts.unsupported_reason,
         }
     }
@@ -335,9 +344,15 @@ impl AccountErrorBuilder {
     /// authoritative source for the common case; callers that find
     /// themselves reaching for this method should first check whether
     /// their operation is mis-classified.
+    ///
+    /// Overrides compose monotonically: `false` wins over `true`, including
+    /// across `AccountError::into_builder`. A guard can establish replay
+    /// safety only before contrary evidence narrows it. Enterprise users
+    /// must not get a duplicate write because a later decoration erased
+    /// the transport's possible-commit evidence.
     #[must_use]
     pub fn idempotency_override(mut self, idempotent: bool) -> Self {
-        self.idempotency_override = Some(idempotent);
+        self.idempotency_override = Some(self.idempotency_override.unwrap_or(true) && idempotent);
         self
     }
 
@@ -352,12 +367,24 @@ impl AccountErrorBuilder {
         self
     }
 
+    /// Mark a refusal by a gate whose owner already recorded the hold.
+    /// Consumers retain local pacing advice without recording a second shared
+    /// deadline. Only rate-limit and quota kinds admit this provenance; it
+    /// survives cloning and decoration and cannot be cleared by a later layer.
+    #[must_use]
+    pub fn local_hold(mut self) -> Self {
+        self.local_hold = true;
+        self
+    }
+
     /// Name a provider rate budget the throttled request was held against.
     /// Repeatable. When an error stamps any budget the engine records the
     /// deadline on exactly the stamped budgets and does NOT lift the
     /// `ThrottleScope` into a key as well - recording both would put the
     /// hold back on the account key and pause every sibling mailbox the
     /// budget exists to keep running.
+    /// Local gate refusals retain budgets as evidence without recording them
+    /// again; see [`Self::local_hold`].
     ///
     /// A budget must name what the response says to hold, not every budget
     /// the request consumed. The producer that stamps it must also declare it
@@ -400,6 +427,9 @@ impl AccountErrorBuilder {
                 ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted
             )
         );
+        if self.local_hold && !throttled {
+            return Err(AccountErrorBuildError::LocalHoldNotApplicable { kind: self.kind });
+        }
         if !throttled && !self.throttle_budgets.is_empty() {
             return Err(AccountErrorBuildError::ThrottleBudgetNotApplicable { kind: self.kind });
         }
@@ -513,6 +543,7 @@ impl AccountErrorBuilder {
             idempotency_override: self.idempotency_override,
             throttle_scope: self.throttle_scope,
             throttle_budgets: self.throttle_budgets,
+            local_hold: self.local_hold,
             unsupported_reason: self.unsupported_reason,
         }))
     }
@@ -525,6 +556,64 @@ mod tests {
         AttemptCause, Cause, RequestCause, RequestErrorKind, TransmissionState, TransportCause,
         TransportErrorKind, TransportKind,
     };
+
+    #[test]
+    fn idempotency_override_is_monotone_across_decoration() {
+        let failure = || {
+            AccountErrorBuilder::new(
+                AccountErrorKind::Transport(TransportErrorKind::Network),
+                Cause::Transport(TransportCause::new(TransportKind::Network, None)),
+            )
+            .operation(AccountOperation::Send)
+            .push_cause(Cause::Attempt(AttemptCause::new(
+                TransmissionState::InFlight,
+            )))
+        };
+        let narrowed = failure().idempotency_override(false).try_build().unwrap();
+        let widened = failure().idempotency_override(true).try_build().unwrap();
+        assert!(matches!(
+            widened.recovery(),
+            recovery::RecoveryClass::Retry(_)
+        ));
+        assert!(matches!(
+            narrowed.recovery(),
+            recovery::RecoveryClass::Reconcile(_)
+        ));
+        for overrides in [[false, true], [true, false], [false, false]] {
+            let error = failure()
+                .idempotency_override(overrides[0])
+                .idempotency_override(overrides[1])
+                .try_build()
+                .unwrap();
+            assert_eq!(error.recovery(), narrowed.recovery());
+        }
+        // Clone forces the shared-Arc rebuild path; the second pass covers
+        // rebuilding an owned error. Neither can erase a previous narrowing.
+        let mut error = narrowed.clone();
+        for _ in 0..2 {
+            error = error
+                .into_builder()
+                .idempotency_override(true)
+                .try_build()
+                .unwrap();
+            assert_eq!(error.recovery(), narrowed.recovery());
+        }
+    }
+
+    #[test]
+    fn local_hold_provenance_requires_a_throttle_kind() {
+        let error = AccountErrorBuilder::new(
+            AccountErrorKind::Transport(TransportErrorKind::Network),
+            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
+        )
+        .local_hold()
+        .try_build()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AccountErrorBuildError::LocalHoldNotApplicable { .. }
+        ));
+    }
 
     #[test]
     fn decoration_does_not_adopt_sibling_transmission_evidence() {

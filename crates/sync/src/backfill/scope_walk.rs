@@ -44,11 +44,11 @@ impl WalkTotal {
         self.0 = self.0.saturating_add(outcome.seen);
     }
 
-    /// Completion retains the existing marker encoding: one past the observed
-    /// count, with the observed count as its estimate.
+    /// Completion reports observed work. The durable key, not an inflated
+    /// count, makes a completed walk outrank every partial checkpoint.
     pub(crate) fn completion_progress(self) -> bifrost_types::BackfillProgress {
         bifrost_types::BackfillProgress {
-            items_done: self.0.saturating_add(1),
+            items_done: self.0,
             items_estimated: Some(self.0),
         }
     }
@@ -201,6 +201,15 @@ impl ScopeWalkDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_counts_report_observed_work_without_an_ordering_bonus() {
+        for count in [0, 1, 10, u64::MAX] {
+            let progress = WalkTotal(count).completion_progress();
+            assert_eq!(progress.items_done, count);
+            assert_eq!(progress.items_estimated, Some(count));
+        }
+    }
 
     fn clean(seen: u64) -> BackfillPartitionOutcome {
         BackfillPartitionOutcome {

@@ -174,6 +174,10 @@ fn caps() -> AccountCapabilities {
 }
 
 impl Account for FlagsAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::Imap
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.caps
     }
@@ -2250,6 +2254,10 @@ impl JudgingAccount {
     }
 }
 impl Account for JudgingAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        self.inner.protocol()
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.inner.caps
     }
@@ -3060,6 +3068,10 @@ fn call_ids(call: &DoorCall) -> Vec<&str> {
 }
 
 impl Account for ReassertAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        self.inner.protocol()
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.inner.caps
     }

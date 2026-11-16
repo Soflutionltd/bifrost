@@ -560,11 +560,53 @@ fn partial_commit_directive_does_not_lift_never() {
         Cause::State(StateCause::CapabilityChanged { delta: None }),
     );
     let error = attach(leaf, StepReplay::Blocking, StepEffect::Moved);
-    assert!(matches!(error.recovery(), RecoveryClass::Engine(_)));
+    // A committed Blocking step keeps the reconcile at the head: performing
+    // the directive and replaying would repeat the move.
+    assert!(actions(&error).contains(&ReconcileAction::ObserveOnly));
+    assert!(matches!(error.leg_recovery(), RecoveryClass::Engine(_)));
+    assert_eq!(error.partial_commit().unwrap().plan().directives.len(), 1);
     assert_eq!(
         error.partial_commit().unwrap().plan().replay,
         ReplaySafety::Never
     );
+}
+#[test]
+fn partial_commit_gating_leg_keeps_directive_off_the_headline() {
+    let leaf = classified(
+        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+        Cause::State(StateCause::CapabilityChanged { delta: None }),
+    );
+    let sibling = AccountErrorBuilder::new(
+        AccountErrorKind::Transport(TransportErrorKind::Network),
+        Cause::Transport(TransportCause {
+            kind: TransportKind::Network,
+            message: None,
+        }),
+    )
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::InFlight,
+    )))
+    .try_build()
+    .unwrap();
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
+    record.failed_sibling(
+        Some(StepEffect::Updated),
+        StepTargets::unknown(),
+        StepReplay::Blocking,
+        Application::Uncertain,
+        sibling,
+    );
+    let error = leaf
+        .into_builder()
+        .partial_commit(record)
+        .try_build()
+        .unwrap();
+    assert_eq!(
+        error.partial_commit().unwrap().plan().replay,
+        ReplaySafety::AfterObservation
+    );
+    assert_eq!(actions(&error), [ReconcileAction::CheckTarget]);
+    assert!(matches!(error.leg_recovery(), RecoveryClass::Engine(_)));
 }
 #[test]
 fn partial_commit_terminal_sibling_bars_reassertion() {

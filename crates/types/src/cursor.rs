@@ -113,6 +113,10 @@ pub enum ObjectType {
 
 /// Which protocol minted an opaque cursor. Tagged so a JMAP cursor
 /// cannot be silently handed to the Graph impl on dispatch.
+///
+/// This is narrower than `Protocol`: submission and auxiliary APIs do not
+/// mint change cursors. Convert with `Protocol::from` for error metadata;
+/// storage tags belong to each versioned codec, not to that conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ProtocolKind {
@@ -122,6 +126,21 @@ pub enum ProtocolKind {
     CardDav,
     CalDav,
     Graph,
+}
+
+impl From<ProtocolKind> for crate::Protocol {
+    fn from(protocol: ProtocolKind) -> Self {
+        // Both vocabularies live here so a new cursor protocol must choose
+        // its error identity instead of falling through an external wildcard.
+        match protocol {
+            ProtocolKind::Jmap => Self::Jmap,
+            ProtocolKind::Imap => Self::Imap,
+            ProtocolKind::Gmail => Self::Gmail,
+            ProtocolKind::CardDav => Self::CardDav,
+            ProtocolKind::CalDav => Self::CalDav,
+            ProtocolKind::Graph => Self::Graph,
+        }
+    }
 }
 
 /// Concrete opaque cursor state. `protocol` and `envelope_version`
@@ -360,6 +379,20 @@ impl ProtocolKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_protocols_keep_their_error_identity() {
+        for (cursor_protocol, error_protocol) in [
+            (ProtocolKind::Jmap, crate::Protocol::Jmap),
+            (ProtocolKind::Imap, crate::Protocol::Imap),
+            (ProtocolKind::Gmail, crate::Protocol::Gmail),
+            (ProtocolKind::CardDav, crate::Protocol::CardDav),
+            (ProtocolKind::CalDav, crate::Protocol::CalDav),
+            (ProtocolKind::Graph, crate::Protocol::Graph),
+        ] {
+            assert_eq!(crate::Protocol::from(cursor_protocol), error_protocol);
+        }
+    }
 
     #[test]
     fn persisted_cursor_faults_have_one_recovery_policy() {

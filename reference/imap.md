@@ -741,11 +741,11 @@ empty-but-successful `open_raw_rfc822` stream.
 
 Every locally-malformed `AccountError` the account layer mints carries the
 operation of the call that produced it. `envelope::malformed` (id decode) and
-`error::pim_malformed` (mailbox-name validation, UIDVALIDITY drift, operand
+`error::pim_malformed` (mailbox-name validation, operand
 refusal, search-criteria assembly, page-cursor parsing) both take an
 `AccountOperation`, and the private helpers between them and their public
 entry points thread it down rather than guessing: `decode_object_id`,
-`decode_thread_id`, `decoded_targets`, `pim_operand`, `valid_uids`,
+`decode_thread_id`, `decoded_targets`, `pim_operand`,
 `folder_from_container`, `search_plan` and its criteria combinators,
 `SearchPager::new`, `child_name`, `renamed_sibling`,
 `parse_draft_for_submission`. The recovery class is `ClientBug` on all of
@@ -1083,11 +1083,12 @@ race cannot be closed by this client.
   copied. An empty resolved conversation hydrates empty and mutations are
   no-ops; a conversation with no member in the removal folder is already
   satisfied. An epoch change between resolution and the write is refused by
-  the PIM-wide `Request(Malformed)` stale-epoch rule. Search-generated
+  the shared `SyncState(CursorInvalid)` stale-epoch rule, requesting folder
+  re-inventory before retrying with fresh identities. Search-generated
   `imapthread1`/`imapthread2` handles retain their explicit UID snapshot
   semantics and remain the fallback when neither key exists.
 - Search messages: UID SEARCH across selectable folders, `SearchFilter::In` restricting the selected mailbox. Thread search is advertised only with `THREAD=REFERENCES`, returning synthetic thread ids containing folder, UIDVALIDITY, and member UIDs.
-- Search paging (`search::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. An undecodable cursor and a cursor outside the `SearchFilter::In` restriction are `Request(Malformed)` with cause `InvalidArgument { field: Some("page_cursor") }`, the shared signal (JMAP uses it too) to restart from page one. A changed UIDVALIDITY on the cursor's folder stays `ConcurrencyConflict` (repeat the walk), scoped to that folder's cursor: the cursor was valid when issued and the server replaced the mailbox under it, and `Malformed` would derive ClientBug and report a server-side epoch change as an application defect. An Outlook user whose mailbox was rebuilt expects the search to simply run again; a consumer restarts paging on either error. Stale message ids and part handles instead return terminal `Request(PreconditionFailed)`: the user must refresh the target, and replaying an old UID in a new epoch is unsafe. A zero limit is `Request(Malformed)` without that cursor marker. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
+- Search paging (`search::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. An undecodable cursor and a cursor outside the `SearchFilter::In` restriction are `Request(Malformed)` with cause `InvalidArgument { field: Some("page_cursor") }`, the shared signal (JMAP uses it too) to restart from page one. A changed UIDVALIDITY on the cursor's folder uses the shared `SyncState(CursorInvalid)` classification and `Engine(RestartScope(Folder))` recovery: re-inventory that folder and repeat the search from page one. An enterprise Outlook user expects a rebuilt folder to refresh and the action to retry against fresh identities. Stale message ids and part handles use the same recovery; an old UID must never be replayed against the new generation. A zero limit is `Request(Malformed)` without that cursor marker. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
 - Containers: LIST-backed enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE (checks `STATUS MESSAGES`, refuses non-empty mailboxes).
 - Quota: `GETQUOTAROOT`, mapped from STORAGE units to bytes when QUOTA is advertised. The account probes the Inbox role when it exists; otherwise it chooses the first selectable folder by display name, wire octets, and encoding mode. Hydration: one-shot message FETCH and synthetic thread hydration.
 - Draft create/discard: APPEND to Drafts with `\Draft` when a delimiter-aware Drafts role and UIDPLUS or active IMAP4rev2 are present (create returns the APPENDUID-derived id); discard is advertised on every server and removes through the shared removal path above. Draft bodies use the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles rejected as `AttachmentUpload`), preserving the `Bcc:` header in the saved draft.
@@ -1235,7 +1236,7 @@ for requested UIDs; later mutable fields win and immutable data fills gaps.
 
 Output ordering is therefore input-window order, then folder display-name order with wire identity breaking ties within a window; FETCH response order within a folder remains server-driven. This is weaker than the previous guarantee, which drained the whole input before visiting folders lexically, so ids for one folder could previously never be split across batches. bifrost-sync tolerates the weaker contract because it keys results by `ObjectId` rather than by arrival position, and `BatchOutcome` carries its own submission-order index (`reference/error-model.md`); nothing downstream may start depending on cross-window ordering. Every requested id is still answered exactly once. Command response bodies retain their separate byte budgets.
 
-- Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(Request(PreconditionFailed))` and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails. The per-folder error path in turn only downgrades ids that still lack a published outcome (`run_folder_get` prunes the caller's unresolved set as it publishes), so a FETCH failure after the stale batch cannot put one id in two lanes.
+- Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(SyncState(CursorInvalid))` with `Engine(RestartScope(Folder))` recovery and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails. The per-folder error path in turn only downgrades ids that still lack a published outcome (`run_folder_get` prunes the caller's unresolved set as it publishes), so a FETCH failure after the stale batch cannot put one id in two lanes.
 - Wire selection and conversion kind are chosen together by one projection
   plan. Unknown projections fail each item as Unsupported before any folder
   checkout; MIME projections whose
@@ -1578,13 +1579,28 @@ acknowledgement remain on server refusals; the preflight APPENDLIMIT guard is
 unsent. These cover cardinality as well as byte size.
 
 Non-empty mailbox deletion and ManageSieve ACTIVE are
-`Request(PreconditionFailed)`. All stale-epoch message accesses share the same
-classification: mutation, hydration, PIM reads, raw reads and part handles.
-An enterprise Outlook user expects a meaningful refusal and a refreshed target,
-not a bug report or a retry of an obsolete UID. These preconditions are terminal
-`ProviderRefused`; they do not reset durable folder cursors. Search page state
-still uses its separate repeat-the-search conflict, and sync cursors still
-restart their folder on UIDVALIDITY change.
+`Request(PreconditionFailed)` with terminal `ProviderRefused` recovery.
+
+A stale UIDVALIDITY instead uses `SyncState(CursorInvalid)` with
+`ErrorScope::Cursor(Folder)` and derives `Engine(RestartScope(Folder))`.
+`error::uidvalidity_changed_error` owns this choice for mutation, hydration,
+PIM reads, raw reads, part handles, search continuation and sync cursors;
+each retains its calling operation. An enterprise Outlook user expects the
+folder to refresh and the action to retry against the new generation.
+The engine's restart handler clears the folder cursor and re-establishes
+inventory. It is unsafe to replay the old UID, which may name another message
+in the new generation: consumers retry with refreshed identities, and search
+callers restart paging. Bulk mutation campaigns forward the directive and count
+the target as blocked by the engine rather than terminal. Direct engine PIM and
+hydration passthroughs return the advice to their caller; they do not dispatch
+recovery or automatically replay the call. When a composed PIM call fails on a
+stale leg after a sibling committed (a thread copy spanning two generations),
+the operation recovery stays a reconcile with `ObserveOnly`, because the shared
+partial-commit projection never lets a directive head an operation whose
+committed effect would repeat on replay: an enterprise user expects no
+duplicate copy. The folder restart remains visible on the stale leg's
+`leg_recovery()` and in `partial_commit().plan().directives`. Stale targets remain known Failed items,
+not Uncertain, and valid targets in the same window may still complete.
 
 Local FETCH retained-result, literal and SEARCH expansion budgets use
 `Internal(LimitExceeded)`. These are implementation safety limits, not malformed
@@ -1889,8 +1905,9 @@ Every error keeps the calling PIM operation for recovery classification.
 
 The Result adapter retains committed per-window effects and the failing stage
 in crate-local `FolderProgress`. Windows use `mutation_batch_size` (at least
-one). A stale-epoch target receives the shared `Request(PreconditionFailed)` answer;
-valid targets in the same window can still commit. The first failure becomes
+one). A stale-epoch target receives the shared `SyncState(CursorInvalid)` answer
+with `Engine(RestartScope(Folder))` recovery; valid targets in the same window
+can still commit. The first failure becomes
 the single Result error, with any additional failures retained as sibling legs
 when a partial-commit record is needed. An Outlook user expects an applied
 change to remain visible when another member conflicts: the adapter retains

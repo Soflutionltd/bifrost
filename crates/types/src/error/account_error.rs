@@ -57,6 +57,7 @@ struct AccountErrorInner {
     idempotency_override: Option<bool>,
     throttle_scope: Option<ThrottleScope>,
     throttle_budgets: Vec<ThrottleBudget>,
+    local_hold: bool,
     unsupported_reason: Option<UnsupportedReason>,
 }
 
@@ -151,6 +152,7 @@ impl AccountError {
                 idempotency_override: self.inner.idempotency_override,
                 throttle_scope: self.inner.throttle_scope,
                 throttle_budgets: self.inner.throttle_budgets.clone(),
+                local_hold: self.inner.local_hold,
                 unsupported_reason: None,
             });
         builder
@@ -182,6 +184,7 @@ impl AccountError {
                 idempotency_override: parts.idempotency_override,
                 throttle_scope: parts.throttle_scope,
                 throttle_budgets: parts.throttle_budgets,
+                local_hold: parts.local_hold,
                 unsupported_reason: parts.unsupported_reason,
             }),
         }
@@ -191,10 +194,20 @@ impl AccountError {
     /// the producer stamped them (`AccountErrorBuilder::throttle_budget`).
     /// Empty unless the error is a throttle whose producer can name its
     /// budget; the engine then records the deadline on exactly these
-    /// instead of lifting the `ThrottleScope`.
+    /// instead of lifting the `ThrottleScope`. A local gate refusal retains
+    /// these identities as evidence but does not record another shared hold.
     #[must_use]
     pub fn throttle_budgets(&self) -> &[ThrottleBudget] {
         &self.inner.throttle_budgets
+    }
+
+    /// A transport gate refused this leg against an already recorded hold.
+    /// Recovery and budget evidence remain intact, but observing this error
+    /// must not install another shared hold. This is per-leg provenance;
+    /// sibling and cleanup failures keep their own ownership.
+    #[must_use]
+    pub fn is_local_hold(&self) -> bool {
+        self.inner.local_hold
     }
 
     /// Historical effects of this operation, when it crossed a partial commit.
@@ -246,6 +259,8 @@ impl AccountError {
     }
 
     /// Holds across primary, sibling and cleanup failures, with budget precedence.
+    /// Local gate refusals pace only the observer; their owner already holds
+    /// the shared deadline.
     #[must_use]
     pub fn throttle_holds(&self) -> Vec<(HoldTarget, super::RetryHint)> {
         let mut holds = Vec::new();
@@ -264,6 +279,13 @@ impl AccountError {
                 _ => continue,
             };
             let fallback = super::RetryHint::After(HINTLESS_HOLD_WAIT);
+            if error.is_local_hold() {
+                // An Outlook user expects the existing provider wait to be
+                // honored once. Re-observing a local gate must not create or
+                // extend an engine hold, even when a budget was stamped.
+                holds.push((HoldTarget::CurrentOperation, hint.unwrap_or(fallback)));
+                continue;
+            }
             if !error.throttle_budgets().is_empty() {
                 holds.extend(
                     error
@@ -440,6 +462,7 @@ impl AccountError {
             idempotency_override: inner.idempotency_override,
             throttle_scope: inner.throttle_scope,
             throttle_budgets: inner.throttle_budgets,
+            local_hold: inner.local_hold,
             unsupported_reason: inner.unsupported_reason,
         })
     }
@@ -478,6 +501,7 @@ pub(crate) struct AccountErrorParts {
     pub idempotency_override: Option<bool>,
     pub throttle_scope: Option<ThrottleScope>,
     pub throttle_budgets: Vec<ThrottleBudget>,
+    pub local_hold: bool,
     pub unsupported_reason: Option<UnsupportedReason>,
 }
 

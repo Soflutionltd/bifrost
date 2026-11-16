@@ -77,6 +77,16 @@ pub(crate) fn bulk_set_flags_if_version_stream(
             let mut rejected = Vec::new();
             for target in chunk {
                 let version = op.validate_for_account(bifrost_types::Protocol::Graph).and_then(|()| {
+                    account.capabilities.mutation.concurrency.gate_version(
+                        AccountOperation::UpdateFlags,
+                        target.expected_version.as_ref(),
+                        bifrost_types::Protocol::Graph,
+                    ).map_err(|error| {
+                        error.into_builder()
+                            .provider(bifrost_types::Provider::Microsoft)
+                            .try_build()
+                            .expect("valid Graph version refusal")
+                    })?;
                     target.expected_version.as_ref().map(|version| {
                         version.expected_etag(
                             bifrost_types::Protocol::Graph, AccountOperation::UpdateFlags, false,
@@ -1310,6 +1320,88 @@ mod tests {
             &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::BulkMove)
         );
         assert!(account.mailboxes.primary().take_rest_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unadvertised_version_door_refuses_only_guarded_targets() {
+        let mut account = shared_account();
+        account.capabilities.mutation.concurrency =
+            bifrost_types::MutationConcurrency::ExpectedVersion(
+                bifrost_types::VersionedDoors::NONE,
+            );
+        account.etag_index.write().await.insert(
+            "m2".into(),
+            GraphETag::from_odata_annotation("W/\"observed\""),
+        );
+        account
+            .mailboxes
+            .primary()
+            .script_rest([crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({"responses": [{"id": "0", "status": 200, "body": {"id": "m2"}}]}),
+            )]);
+        let events = bulk_set_flags_if_version_stream(
+            account.clone(),
+            Box::pin(futures::stream::iter([
+                bifrost_types::MailMutationTarget {
+                    id: ObjectId("m1".into()),
+                    expected_version: Some(bifrost_types::ServerVersion::ETag(
+                        "W/\"caller\"".into(),
+                    )),
+                },
+                bifrost_types::MailMutationTarget {
+                    id: ObjectId("m2".into()),
+                    expected_version: None,
+                },
+            ])),
+            FlagOp::Add(FlagSet::from(["\\seen".into()])),
+            idempotency_key(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let [
+            SyncEvent::Batch(refused),
+            SyncEvent::Batch(applied),
+            SyncEvent::Done(None),
+        ] = events.as_slice()
+        else {
+            panic!("{events:?}");
+        };
+        let [ItemOutcome::Failed(failure)] = refused.items.as_slice() else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(failure.item.0, "m1");
+        assert_eq!(
+            failure.error.provider(),
+            Some(bifrost_types::Provider::Microsoft)
+        );
+        assert_eq!(
+            failure.error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::UpdateFlags)
+        );
+        let [ItemOutcome::Succeeded(success)] = applied.items.as_slice() else {
+            panic!("{applied:?}");
+        };
+        assert_eq!(success.item.0, "m2");
+        let requests = account.mailboxes.primary().take_rest_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the unguarded sibling reaches transport"
+        );
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["requests"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            requests[0].body.as_ref().unwrap()["requests"][0]["url"]
+                .as_str()
+                .unwrap()
+                .contains("m2")
+        );
     }
 
     #[tokio::test]

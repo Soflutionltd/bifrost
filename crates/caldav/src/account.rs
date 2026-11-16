@@ -403,8 +403,7 @@ impl Account for CalDavAccount {
     ) -> AccountStream<InventoryEvent> {
         match partition {
             InventoryPartition::Full => self.inventory_stream(scope),
-            _ => bifrost_types::account::unsupported_inventory_stream_with_protocol(
-                scope,
+            _ => bifrost_types::account::unsupported_inventory_stream(
                 AccountOperation::SyncInventory,
                 self.protocol(),
             ),

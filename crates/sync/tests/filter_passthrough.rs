@@ -128,6 +128,10 @@ fn sample_script_create(body: &str) -> ServerFilterCreate {
 }
 
 impl Account for FilterAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::Unknown
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.caps
     }

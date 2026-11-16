@@ -116,6 +116,38 @@ impl VersionedDoors {
 }
 
 impl MutationConcurrency {
+    /// Refuse a supplied caller version unless this operation advertises an
+    /// atomic guard. No version leaves the ordinary operation unchanged.
+    ///
+    /// Admission does not implement a guard: providers must still validate
+    /// the token kind and enforce it on the wire. Trait defaults that cannot
+    /// enforce versions must continue to refuse even an advertised door.
+    pub fn gate_version(
+        self,
+        operation: crate::AccountOperation,
+        expected_version: Option<&crate::ServerVersion>,
+        protocol: crate::Protocol,
+    ) -> Result<(), crate::AccountError> {
+        use crate::AccountOperation;
+        let door = match operation {
+            AccountOperation::UpdateFlags => VersionedDoors::MAIL_SET_FLAGS,
+            AccountOperation::BulkMove => VersionedDoors::MAIL_MOVE,
+            AccountOperation::BulkDestroy => VersionedDoors::MAIL_DESTROY,
+            AccountOperation::ContactUpdate => VersionedDoors::CONTACT_UPDATE,
+            AccountOperation::EventUpdate => VersionedDoors::EVENT_UPDATE,
+            AccountOperation::ContactDelete => VersionedDoors::CONTACT_DELETE,
+            AccountOperation::EventDelete => VersionedDoors::EVENT_DELETE,
+            AccountOperation::EventRsvp => VersionedDoors::EVENT_RSVP,
+            _ => VersionedDoors::NONE,
+        };
+        if expected_version.is_none() || (!door.is_empty() && self.versioned_doors().contains(door))
+        {
+            Ok(())
+        } else {
+            Err(crate::AccountError::unsupported(operation, protocol))
+        }
+    }
+
     /// Legacy state guards do not promise any caller-version door.
     #[must_use]
     pub const fn versioned_doors(self) -> VersionedDoors {
@@ -214,9 +246,49 @@ pub enum QuotaSignal {
     None,
 }
 
+// Keep the published snapshot fields and operation-to-flag gates in one
+// declaration. Send-as and directory enumeration have no operation mapping:
+// an Outlook user can send as a delegate even without a personal send path.
+macro_rules! pim_method_support {
+    ($(#[$attr:meta])* pub struct $name:ident {
+        $($(#[$field_attr:meta])* pub $field:ident: bool => [$($operation:ident),*],)*
+    }) => {
+        $(#[$attr])*
+        pub struct $name {
+            $($(#[$field_attr])* pub $field: bool,)*
+        }
+
+        impl $name {
+            /// Admit an advertised PIM operation or return its canonical refusal.
+            ///
+            /// `Send` checks the ordinary sending path only. Send-as, scheduled
+            /// request fields and empty-query directory enumeration have separate
+            /// prerequisites; callers must check them at their request boundary.
+            /// Operations without a PIM method flag are refused by this helper.
+            /// A successful gate does not replace provider validation or I/O.
+            pub fn gate(
+                &self,
+                operation: crate::AccountOperation,
+                protocol: crate::Protocol,
+            ) -> Result<(), crate::AccountError> {
+                let supported = match operation {
+                    $($(crate::AccountOperation::$operation => self.$field,)*)*
+                    _ => false,
+                };
+                if supported {
+                    Ok(())
+                } else {
+                    Err(crate::AccountError::unsupported(operation, protocol))
+                }
+            }
+        }
+    };
+}
+
+pim_method_support! {
 /// Per-method dispatch advertisement for the PIM trait surface.
 ///
-/// Each field corresponds to a primitive or convenience on `Account`.
+/// Each field describes a primitive, convenience or request path on `Account`.
 /// `true` means the implementation handles the method instead of
 /// always returning `Err(Error::Unsupported)`. It does not promise a
 /// lossless provider model, native server-side filtering, or support
@@ -227,10 +299,12 @@ pub enum QuotaSignal {
 /// unsupported. New flags are added with `false` defaults so growing
 /// the trait surface stays additive.
 ///
-/// Structural weakness, known and accepted: this is a hand-maintained MIRROR
-/// of the trait surface with no mechanical link to it, and consumers must
-/// consult it AND handle `Unsupported` regardless. The mirror is also
-/// incomplete - `send_raw_message`, `repair_inventory`, `bulk_move_from` and
+/// The declaration below generates the fields and their canonical local
+/// refusal gates together. Provider implementations and their negotiated
+/// prerequisites still need contract tests: a gate cannot prove that a
+/// provider implements a method. Consumers must consult the snapshot AND
+/// handle `Unsupported` regardless. The snapshot is also incomplete -
+/// `send_raw_message`, `repair_inventory`, `bulk_move_from` and
 /// `open_blob_range` have documented gating with no flag here, or a flag on a
 /// different struct.
 ///
@@ -250,22 +324,22 @@ pub enum QuotaSignal {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PimMethodSupport {
     /// Read Outlook master category definitions.
-    pub category_definitions: bool,
+    pub category_definitions: bool => [CategoryDefinitionsList],
     /// Read Exchange-native message reaction properties.
-    pub message_reactions: bool,
+    pub message_reactions: bool => [MessageReactionsRead],
     // Mail mutation primitives.
-    pub add_to_container: bool,
-    pub remove_from_container: bool,
-    pub set_keyword: bool,
-    pub set_label_membership: bool,
-    pub set_category: bool,
-    pub set_extended_property: bool,
+    pub add_to_container: bool => [AddToContainer],
+    pub remove_from_container: bool => [RemoveFromContainer],
+    pub set_keyword: bool => [SetKeyword],
+    pub set_label_membership: bool => [SetLabelMembership],
+    pub set_category: bool => [SetCategory],
+    pub set_extended_property: bool => [SetExtendedProperty],
     /// Native message-importance overwrite (`set_importance`). Graph
     /// `PATCH { importance }`, JMAP/IMAP `$important` keyword. `false`
     /// on Gmail (no importance field) and the DAV crates -> the
     /// primitive returns `Unsupported(SetImportance)`.
-    pub set_importance: bool,
-    pub set_is_read: bool,
+    pub set_importance: bool => [SetImportance],
+    pub set_is_read: bool => [SetIsRead],
     // Mail composition primitives.
     /// Ordinary sending from the account's own identity: `send_message` with
     /// `SendRequest::send_as` left `None`. `false` -> such a request returns
@@ -277,8 +351,8 @@ pub struct PimMethodSupport {
     /// answer - which may be yes while this is `false`. A JMAP session whose
     /// primary account lacks Submission while a seeded foreign account has it
     /// is exactly that: ordinary sends are refused, routed sends work.
-    pub send_message: bool,
-    pub attachment_upload: bool,
+    pub send_message: bool => [Send],
+    pub attachment_upload: bool => [AttachmentUpload],
     /// Native large-attachment hosting + share-link generation (Google
     /// Drive, Microsoft OneDrive). Gates `host_attachment`. `true` only on
     /// the Gmail and Graph accounts; `false` -> `host_attachment` returns
@@ -286,17 +360,17 @@ pub struct PimMethodSupport {
     /// flag is the bifrost replacement for ratatoskr's consumer-side
     /// `supports_cloud_upload(provider) = matches!(Graph | Gmail)` (closes
     /// the A8 provider-identity leak A-1).
-    pub host_attachment: bool,
-    pub draft_create: bool,
-    pub draft_update: bool,
-    pub draft_discard: bool,
-    pub draft_send: bool,
+    pub host_attachment: bool => [HostAttachment],
+    pub draft_create: bool => [DraftCreate],
+    pub draft_update: bool => [DraftUpdate],
+    pub draft_discard: bool => [DraftDiscard],
+    pub draft_send: bool => [DraftSend],
     /// Native server-side scheduled send (JMAP `maxDelayedSend > 0`,
     /// Graph `PidTagDeferredSendTime`, IMAP relay FUTURERELEASE). Gates
     /// `SendRequest::scheduled`, `cancel_scheduled_send`, and
     /// `reschedule_send`. `false` -> a scheduled request is rejected
     /// `Unsupported(Send)` and the two primitives return `Unsupported`.
-    pub scheduled_send: bool,
+    pub scheduled_send: bool => [CancelScheduledSend, RescheduleSend],
     /// Native send-as / send-on-behalf-of routing for a shared or
     /// delegate mailbox (Microsoft Graph: route the draft-create-and-send
     /// through the shared mailbox's `/users/{id}` client and stamp the
@@ -319,25 +393,25 @@ pub struct PimMethodSupport {
     ///
     /// Independent of `send_message`, which covers only the ordinary path:
     /// this flag can be `true` while that one is `false`.
-    pub send_as: bool,
+    pub send_as: bool => [],
     // Search primitives.
-    pub search: bool,
-    pub search_messages: bool,
+    pub search: bool => [Search],
+    pub search_messages: bool => [SearchMessages],
     // Container CRUD primitives.
-    pub containers_list: bool,
-    pub container_create: bool,
-    pub container_rename: bool,
-    pub container_move: bool,
-    pub container_delete: bool,
+    pub containers_list: bool => [ContainersList],
+    pub container_create: bool => [ContainerCreate],
+    pub container_rename: bool => [ContainerRename],
+    pub container_move: bool => [ContainerMove],
+    pub container_delete: bool => [ContainerDelete],
     // Settings primitives.
-    pub identities_list: bool,
-    pub identity_update: bool,
-    pub vacation_get: bool,
-    pub vacation_set: bool,
-    pub quota_get: bool,
+    pub identities_list: bool => [IdentitiesList],
+    pub identity_update: bool => [IdentityUpdate],
+    pub vacation_get: bool => [VacationGet],
+    pub vacation_set: bool => [VacationSet],
+    pub quota_get: bool => [QuotaGet],
     // Hydration primitives.
-    pub thread_hydrate: bool,
-    pub message_hydrate: bool,
+    pub thread_hydrate: bool => [HydrateThread],
+    pub message_hydrate: bool => [HydrateMessage],
     /// Native server-assembled whole-message RFC822 read
     /// (`open_raw_rfc822`). IMAP `BODY.PEEK[]`, Gmail `format=raw`,
     /// JMAP whole-message `blobId` + `download`, Graph
@@ -345,29 +419,29 @@ pub struct PimMethodSupport {
     /// source" / body store / attachment-dedup paths. `false` -> the
     /// method terminates `Unsupported(OpenRawRfc822)` (the two DAV
     /// crates).
-    pub open_raw_rfc822: bool,
+    pub open_raw_rfc822: bool => [OpenRawRfc822],
     // Server-side filter primitives.
-    pub filters_list: bool,
-    pub filter_create: bool,
-    pub filter_update: bool,
-    pub filter_delete: bool,
-    pub filter_validate: bool,
+    pub filters_list: bool => [FiltersList],
+    pub filter_create: bool => [FilterCreate],
+    pub filter_update: bool => [FilterUpdate],
+    pub filter_delete: bool => [FilterDelete],
+    pub filter_validate: bool => [FilterValidate],
     // Contact primitives and conveniences.
-    pub address_books_list: bool,
-    pub contacts_list: bool,
-    pub contact_get: bool,
-    pub contact_create: bool,
-    pub contact_update: bool,
-    pub contact_delete: bool,
-    pub contact_search: bool,
-    pub contact_autocomplete: bool,
+    pub address_books_list: bool => [AddressBooksList],
+    pub contacts_list: bool => [ContactsList],
+    pub contact_get: bool => [ContactGet],
+    pub contact_create: bool => [ContactCreate],
+    pub contact_update: bool => [ContactUpdate],
+    pub contact_delete: bool => [ContactDelete],
+    pub contact_search: bool => [ContactSearch],
+    pub contact_autocomplete: bool => [ContactAutocomplete],
     /// Provider-side directory lookup with a non-empty query. Independent of
     /// enumeration support. CardDAV requires an admitted directory gateway.
-    pub directory_search: bool,
+    pub directory_search: bool => [DirectorySearch],
     /// Empty-query directory enumeration, via `directory_search`.
     /// A provider without this flag returns classified Unsupported for an
     /// empty query, even when non-empty lookups are supported.
-    pub directory_enumerate: bool,
+    pub directory_enumerate: bool => [],
     /// Mail-enabled directory-group listing (`directory_groups_list`):
     /// the org-directory groups the authenticated mailbox belongs to
     /// (Microsoft Graph `/me/memberOf` filtered to mail-enabled). `true`
@@ -376,24 +450,25 @@ pub struct PimMethodSupport {
     /// directory-group read consent still fails at call time with a
     /// `NoPermission` error - consent is per-tenant runtime state a
     /// static flag cannot know.
-    pub directory_groups_list: bool,
+    pub directory_groups_list: bool => [DirectoryGroupsList],
     /// Transitive directory-group member expansion
     /// (`directory_group_expand`): resolve a `DirectoryGroupId` to its
     /// user members, nested groups flattened provider-side (Microsoft
     /// Graph `/groups/{id}/transitiveMembers`). `true` only on Graph;
     /// `false` -> `Unsupported(DirectoryGroupExpand)`. Same per-tenant
     /// consent caveat as `directory_groups_list`.
-    pub directory_group_expand: bool,
+    pub directory_group_expand: bool => [DirectoryGroupExpand],
     // Calendar primitives and conveniences.
-    pub calendars_list: bool,
-    pub events_in_range: bool,
-    pub event_get: bool,
-    pub event_create: bool,
-    pub event_update: bool,
-    pub event_delete: bool,
-    pub event_rsvp: bool,
-    pub event_search: bool,
-    pub event_autocomplete: bool,
+    pub calendars_list: bool => [CalendarsList],
+    pub events_in_range: bool => [EventsInRange],
+    pub event_get: bool => [EventGet],
+    pub event_create: bool => [EventCreate],
+    pub event_update: bool => [EventUpdate],
+    pub event_delete: bool => [EventDelete],
+    pub event_rsvp: bool => [EventRsvp],
+    pub event_search: bool => [EventSearch],
+    pub event_autocomplete: bool => [EventAutocomplete],
+}
 }
 
 /// Mapping from each provider's flag namespace onto the canonical
@@ -683,5 +758,115 @@ impl CapabilityDelta {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::{AccountErrorKind, AccountOperation, Protocol, ServerVersion};
+
+    #[test]
+    fn pim_gate_reads_the_specific_flag_and_preserves_refusal_identity() {
+        let caps = PimMethodSupport {
+            search: true,
+            ..PimMethodSupport::default()
+        };
+        assert!(caps.gate(AccountOperation::Search, Protocol::Imap).is_ok());
+        let error = caps
+            .gate(AccountOperation::SearchMessages, Protocol::Imap)
+            .expect_err("thread search does not enable message search");
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::SearchMessages)
+        );
+        assert_eq!(error.operation(), Some(AccountOperation::SearchMessages));
+        assert_eq!(error.protocol(), Some(Protocol::Imap));
+        assert!(error.recovery().is_terminal());
+    }
+
+    #[test]
+    fn pim_gate_keeps_request_fields_separate_from_method_support() {
+        let caps = PimMethodSupport {
+            send_as: true,
+            scheduled_send: true,
+            directory_enumerate: true,
+            ..PimMethodSupport::default()
+        };
+        for operation in [
+            AccountOperation::CancelScheduledSend,
+            AccountOperation::RescheduleSend,
+        ] {
+            assert!(caps.gate(operation, Protocol::Jmap).is_ok());
+        }
+        for operation in [
+            AccountOperation::Send,
+            AccountOperation::DirectorySearch,
+            AccountOperation::Close,
+        ] {
+            assert!(caps.gate(operation, Protocol::Jmap).is_err());
+        }
+    }
+
+    #[test]
+    fn version_gate_requires_the_operations_own_door_only_for_supplied_versions() {
+        let version = ServerVersion::ETag("caller-owned".into());
+        let operations = [
+            (
+                AccountOperation::UpdateFlags,
+                VersionedDoors::MAIL_SET_FLAGS,
+            ),
+            (AccountOperation::BulkMove, VersionedDoors::MAIL_MOVE),
+            (AccountOperation::BulkDestroy, VersionedDoors::MAIL_DESTROY),
+            (
+                AccountOperation::ContactUpdate,
+                VersionedDoors::CONTACT_UPDATE,
+            ),
+            (AccountOperation::EventUpdate, VersionedDoors::EVENT_UPDATE),
+            (
+                AccountOperation::ContactDelete,
+                VersionedDoors::CONTACT_DELETE,
+            ),
+            (AccountOperation::EventDelete, VersionedDoors::EVENT_DELETE),
+            (AccountOperation::EventRsvp, VersionedDoors::EVENT_RSVP),
+        ];
+        for (enabled, door) in operations {
+            let concurrency = MutationConcurrency::ExpectedVersion(door);
+            for (operation, _) in operations {
+                assert!(
+                    concurrency
+                        .gate_version(operation, None, Protocol::Graph)
+                        .is_ok()
+                );
+                let result = concurrency.gate_version(operation, Some(&version), Protocol::Graph);
+                if operation == enabled {
+                    assert!(result.is_ok());
+                } else {
+                    let error = result.expect_err("a different door cannot enforce this version");
+                    assert_eq!(error.kind(), &AccountErrorKind::Unsupported(operation));
+                    assert_eq!(error.operation(), Some(operation));
+                    assert_eq!(error.protocol(), Some(Protocol::Graph));
+                }
+            }
+        }
+        for concurrency in [
+            MutationConcurrency::StateBased,
+            MutationConcurrency::ExpectedVersion(VersionedDoors::NONE),
+        ] {
+            assert!(
+                concurrency
+                    .gate_version(
+                        AccountOperation::UpdateFlags,
+                        Some(&version),
+                        Protocol::Graph
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            MutationConcurrency::ExpectedVersion(VersionedDoors::MAIL_SET_FLAGS)
+                .gate_version(AccountOperation::Send, Some(&version), Protocol::Graph)
+                .is_err()
+        );
     }
 }

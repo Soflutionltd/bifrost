@@ -25,6 +25,136 @@ fn throttled_error(scope: Option<ErrorScope>) -> AccountError {
     builder.try_build().expect("valid")
 }
 
+#[tokio::test(start_paused = true)]
+async fn net_local_hold_paces_without_recording_an_engine_hold() {
+    use bifrost_net::{HoldDeadline, HoldKind, HttpErrorPolicy, NetErrorContext};
+    use bifrost_types::{Application, PartialCommitBuilder, PrimaryLeg, StepReplay, StepTargets};
+
+    let account = AccountId("held".into());
+    let budget = bifrost_types::ThrottleBudget::new("gmail-project|123");
+    let now = Instant::now();
+    let wall = SystemTime::now();
+    let net = bifrost_net::Net::new(bifrost_net::NetConfig::default()).unwrap();
+    let hold = net.shared_hold(budget.as_str());
+    for kind in [HoldKind::RateLimited, HoldKind::QuotaExhausted] {
+        hold.record(
+            HoldDeadline::new(wall + Duration::from_secs(10), wall, now),
+            kind,
+        );
+        for commit in [
+            bifrost_net::CommitEvidence::Unsent,
+            bifrost_net::CommitEvidence::MayHaveCommitted,
+        ] {
+            for stamped in [false, true] {
+                let local = bifrost_net::into_account_error_with_throttle_scope(
+                    bifrost_net::Error::LocalHold {
+                        key: budget.as_str().to_owned(),
+                        held: hold.current().unwrap(),
+                        evidence: bifrost_net::RequestEvidence::new(Vec::new(), commit),
+                    },
+                    NetErrorContext {
+                        provider: None,
+                        protocol: bifrost_types::Protocol::Gmail,
+                        operation: AccountOperation::Send,
+                        scope: None,
+                    },
+                    HttpErrorPolicy {
+                        throttle_scope: Some(ThrottleScope::Account),
+                        throttle_budget: stamped.then(|| budget.clone()),
+                        ..HttpErrorPolicy::default()
+                    },
+                );
+                // Exercise shared-Arc decoration, as provider boundaries do.
+                let decorated = local.clone().into_builder().try_build().unwrap();
+                assert_eq!(decorated.recovery(), local.recovery());
+                let bucket = ThrottleBucket::new();
+                assert_eq!(
+                    bucket.observe(&account, &decorated),
+                    Some(now + Duration::from_secs(10))
+                );
+                assert_eq!(bucket.wait_for_account(&account, now), None);
+                assert_eq!(
+                    bucket.wait_for(&ThrottleKey::Budget(budget.clone()), now),
+                    None
+                );
+
+                // Local provenance belongs to each leg. A real sibling throttle
+                // still enters the bucket, without re-recording the primary.
+                let server = AccountErrorBuilder::new(
+                    AccountErrorKind::Server(ServerErrorKind::RateLimited),
+                    Cause::Server(ServerCause::RateLimited {
+                        retry_hint: Some(RetryHint::After(Duration::from_secs(3))),
+                    }),
+                )
+                .throttle_budget(budget.clone())
+                .try_build()
+                .unwrap();
+                let mut record =
+                    PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
+                record.failed_sibling(
+                    None,
+                    StepTargets::unknown(),
+                    StepReplay::Repeatable,
+                    Application::NotApplicable,
+                    server.clone(),
+                );
+                let compound = decorated
+                    .into_builder()
+                    .partial_commit(record)
+                    .try_build()
+                    .unwrap();
+                assert_eq!(
+                    bucket.observe(&account, &compound),
+                    Some(now + Duration::from_secs(10))
+                );
+                assert_eq!(
+                    bucket.wait_for(&ThrottleKey::Budget(budget.clone()), now),
+                    Some(Duration::from_secs(3))
+                );
+                assert_eq!(bucket.wait_for_account(&account, now), None);
+
+                // The reverse shape also matters: a local sibling or cleanup
+                // refusal must not extend the real primary's shared hold.
+                let mut record =
+                    PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
+                record.failed_sibling(
+                    None,
+                    StepTargets::unknown(),
+                    StepReplay::Repeatable,
+                    Application::NotApplicable,
+                    local.clone(),
+                );
+                let committed = record.committed(
+                    bifrost_types::StepEffect::Created,
+                    StepTargets::unknown(),
+                    StepReplay::Repeatable,
+                );
+                record.compensation(
+                    bifrost_types::StepEffect::Deleted,
+                    StepTargets::unknown(),
+                    vec![committed],
+                    bifrost_types::CompensationOutcome::from_error(local.clone()),
+                );
+                let compound = server
+                    .into_builder()
+                    .partial_commit(record)
+                    .try_build()
+                    .unwrap();
+                let bucket = ThrottleBucket::new();
+                assert_eq!(
+                    bucket.observe(&account, &compound),
+                    Some(now + Duration::from_secs(10))
+                );
+                assert_eq!(
+                    bucket.wait_for(&ThrottleKey::Budget(budget.clone()), now),
+                    Some(Duration::from_secs(3))
+                );
+                assert_eq!(bucket.wait_for_account(&account, now), None);
+            }
+        }
+    }
+}
+
 #[test]
 fn throttle_bucket_records_and_expires() {
     let bucket = ThrottleBucket::new();

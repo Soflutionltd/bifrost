@@ -45,16 +45,6 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
-- **Next-wave fixes, not rulings: request refusal kinds that misread the user.**
-  The AGENTS.md product yardstick settles all three; implement them.
-  - HTTP 413 in `crates/net/src/http_status.rs` should classify as
-    `PayloadTooLarge`: an oversized attachment is not a client bug.
-  - JMAP `urn:ietf:params:jmap:error:limit` should split on its `limit`
-    property: `maxSizeRequest`, `maxCallsInRequest` and `maxObjectsIn*` are
-    `PayloadTooLarge`, and only `maxConcurrentRequests` is `RateLimited`.
-  - A stale UIDVALIDITY on IMAP move or hydrate is now terminal
-    `PreconditionFailed`; the user expects the folder to refresh and the
-    action to retry against the new generation.
 
 ## 2. Blocked on a live probe
 
@@ -356,6 +346,33 @@ Narrow edge cases, audits with no known defect, and design work.
     `Account` cursors cover.
   - Calendars: CalDAV and JMAP normalize floating times to UTC.
 
+- **Residue of the 413, JMAP limit, stale UIDVALIDITY and hold-provenance
+  batch (November 2026).** Each is small; none is a known live defect.
+  - The backfill partition-key format is written twice:
+    `InventoryPartition::durable_key` in bifrost-types and `BackfillKey` in
+    `crates/sync/src/backfill/partitioner.rs`, held together only by a
+    round-trip test.
+  - A 429 absorbed inside bifrost-net's retries no longer reaches the engine
+    throttle budget, so another work item sharing that budget meets the hold
+    only through net's local gate. Undocumented in `reference/net.md` and
+    `reference/sync.md`.
+  - Honest backfill completion counts removed the old ordering safety net
+    (`items_done = total_seen + 1`) for external `CheckpointStore`
+    implementations that still select the resume row by greatest
+    `items_done` instead of calling `backfill_checkpoint_is_later`.
+  - Engine direct PIM and hydration passthroughs return `RestartScope` advice
+    to the caller without dispatching it, so a stale-UIDVALIDITY folder is
+    re-inventoried only when the sync lane next notices. A delay, not a loss.
+  - Graph contact and event `delete_if_version` do not call `gate_version`
+    the way mail `bulk_set_flags_if_version` does.
+  - JMAP's local `maxSizeRequest` guard refuses as `Request(Malformed)`
+    while the server's own refusal of the same limit is now
+    `PayloadTooLarge`.
+  - `maxConcurrentUpload` is not named in JMAP `convert_problem`, so it falls
+    to the status fallback rather than `RateLimited`.
+  - Backfill-checkpoint boundary violations still report `Protocol::Unknown`
+    (`engine_errors.rs::checkpoint_protocol`) although the engine knows the
+    account's protocol.
 - **The backfill bound docs say an acknowledgement frees capacity; the code
   frees it on receipt.** `engine/backfill_bound.rs` documents the permit as the
   consumer's receipt of the page (`ChangesReceiver::note_receipt`), but the
@@ -417,23 +434,6 @@ Narrow edge cases, audits with no known defect, and design work.
   the object-id section, while search pages by position since the bifrost#2
   fix; the test `search_folder_offsets_survive_registry_rebuild_with_display_ties`
   keeps the old word too.
-- **UIDVALIDITY change has several classifications across the IMAP account.**
-  Changes stream `SyncState(CursorInvalid)`, search cursor
-  `ConcurrencyConflict`, hydration and mutation now `Request(PreconditionFailed)`
-  (see the next-wave entry in section 1); reference/error-model.md never names
-  UIDVALIDITY. The poller
-  (`crates/imap/src/account/poll.rs`) answers a typed `GenerationChanged`
-  instead. Needs a ruling on the shared class. The November 2026 design hunt
-  (imap-account scope) counted seven sites: `get.rs` and `mutate.rs`
-  `uidvalidity_changed_error`, `blob.rs::run_raw`, `pim.rs::valid_uids` (no
-  scope), `parts.rs::DecodedPartHandle::verify_uidvalidity` (all
-  `Request(Malformed)`), `pim.rs::SearchPager::check_epoch`
-  (`ConcurrencyConflict`), `changes.rs::validate_uidvalidity`
-  (`SyncState(CursorInvalid)`). It proposed the epoch check live on one IMAP
-  identity type (`ImapRef::check_epoch(live) -> Result<(), EpochVoided>`) with
-  one translation of `EpochVoided` in `error.rs`, most likely
-  `NotFound(Message)` with a folder-scoped cause so the engine also learns the
-  scope needs re-inventory.
 - **No persistence contract for a `ChangeCursor` held outside the engine.**
   bifrost#3 offered it as the alternative to the UID polling surface; the
   surface landed instead. The cursor codec lives in bifrost-sync and nothing

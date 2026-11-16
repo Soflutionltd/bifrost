@@ -1135,6 +1135,9 @@ fn server_status(chain: &CauseChain) -> Option<u16> {
 
 /// Whether the failure is an SMTP (or LMTP) reply, whose numeric status
 /// classes carry RFC 5321 semantics rather than HTTP's. See `derive_server`.
+/// The wire evidence owns the meaning of these digits. Account protocol is
+/// diagnostic metadata and can identify an enclosing IMAP submission account;
+/// restamping that metadata must not turn a permanent SMTP refusal into retry.
 fn smtp_reply(chain: &CauseChain) -> bool {
     chain
         .iter()

@@ -598,20 +598,11 @@ pub(crate) fn search_result_set_superseded(operation: AccountOperation) -> Accou
 /// membership ownership, so an unknown id is a malformed request.
 #[must_use]
 pub(crate) fn send_as_unknown_account(mailbox: &bifrost_types::PrincipalId) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("send_as.mailbox"),
-            message: Some(DiagnosticText::support_only(format!(
-                "unknown foreign submission account {}",
-                mailbox.0
-            ))),
-        }),
+    bifrost_types::compose::classify_send_as_rejection(
+        true,
+        Protocol::Jmap,
+        DiagnosticText::support_only(format!("unknown foreign submission account {}", mailbox.0)),
     )
-    .protocol(Protocol::Jmap)
-    .operation(AccountOperation::Send)
-    .try_build()
-    .expect("valid account error classification")
 }
 
 /// A push subscribe whose every requested scope maps to no JMAP push data
@@ -1478,12 +1469,25 @@ fn convert_problem(
         .as_ref()
         .and_then(|t| retry_after_from_net(t.net.as_ref()));
 
-    let (kind, primary) = match (details.error(), status_u16) {
-        (ProblemType::JMAP(JMAPError::Limit), _) => (
+    let (kind, primary) = match (details.error(), details.limit(), status_u16) {
+        (ProblemType::JMAP(JMAPError::Limit), Some("maxConcurrentRequests"), _) => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
             Cause::Server(ServerCause::RateLimited { retry_hint }),
         ),
-        (ProblemType::JMAP(JMAPError::UnknownCapability), _) => (
+        // An enterprise user expects an oversized attachment or request to
+        // identify the input limit, not retry the same payload indefinitely.
+        (ProblemType::JMAP(JMAPError::Limit), Some(limit), _)
+            if matches!(limit, "maxSizeRequest" | "maxCallsInRequest")
+                || limit.starts_with("maxObjectsIn") =>
+        {
+            (
+                AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+                Cause::Request(RequestCause::PayloadTooLarge {
+                    detail: DiagnosticText::support_only(format!("JMAP request exceeds {limit}")),
+                }),
+            )
+        }
+        (ProblemType::JMAP(JMAPError::UnknownCapability), _, _) => (
             AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
             Cause::State(StateCause::CapabilityChanged { delta: None }),
         ),
@@ -1492,14 +1496,16 @@ fn convert_problem(
         // (any deserialization issue is caught locally before the
         // request leaves), so the server's claim is a protocol contract
         // violation, not a client bug. Per jmap-F2.
-        (ProblemType::JMAP(JMAPError::NotJSON | JMAPError::NotRequest), _) => (
+        (ProblemType::JMAP(JMAPError::NotJSON | JMAPError::NotRequest), _, _) => (
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Jmap,
                 detail: Some(DiagnosticText::support_only(details.to_string())),
             }),
         ),
-        (ProblemType::Other(_), Some(status)) => {
+        // An absent or unfamiliar limit does not itself prove throttling.
+        // Use HTTP evidence when present, just as for an unknown problem type.
+        (ProblemType::JMAP(JMAPError::Limit) | ProblemType::Other(_), _, Some(status)) => {
             let class = bifrost_net::classify_status(
                 status,
                 ctx.scope().as_ref(),
@@ -1508,9 +1514,9 @@ fn convert_problem(
             );
             (class.kind, class.cause)
         }
-        (ProblemType::Other(code), None) => (
+        (error @ (ProblemType::JMAP(JMAPError::Limit) | ProblemType::Other(_)), _, None) => (
             AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Jmap(JmapMethod::Unknown { code: code.clone() })),
+            Cause::Wire(wire_for_problem(error)),
         ),
     };
 
@@ -2340,7 +2346,7 @@ mod tests {
             from_net(bifrost_net::Error::Status {
                 code: reqwest::StatusCode::BAD_REQUEST,
                 body: bytes::Bytes::from_static(
-                    br#"{"type":"urn:ietf:params:jmap:error:limit","limit":"maxObjectsInGet"}"#,
+                    br#"{"type":"urn:ietf:params:jmap:error:limit","limit":"maxConcurrentRequests"}"#,
                 ),
                 headers: retry_after_headers("120"),
             }),
@@ -2369,7 +2375,7 @@ mod tests {
             from_net(bifrost_net::Error::Status {
                 code: reqwest::StatusCode::BAD_REQUEST,
                 body: bytes::Bytes::from_static(
-                    br#"{"type":"urn:ietf:params:jmap:error:limit","limit":"maxObjectsInGet"}"#,
+                    br#"{"type":"urn:ietf:params:jmap:error:limit","limit":"maxConcurrentRequests"}"#,
                 ),
                 headers: retry_after_headers(date),
             }),
@@ -2660,6 +2666,127 @@ mod tests {
             err.kind(),
             &AccountErrorKind::Unsupported(AccountOperation::Search)
         );
+    }
+
+    #[test]
+    fn jmap_limit_problem_payload_refusals_do_not_retry_or_throttle() {
+        for limit in [
+            "maxSizeRequest",
+            "maxCallsInRequest",
+            "maxObjectsIn",
+            "maxObjectsInGet",
+            "maxObjectsInSet",
+        ] {
+            for status in [400, 413, 429] {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "type": "urn:ietf:params:jmap:error:limit",
+                    "limit": limit,
+                }))
+                .unwrap();
+                let net_error = if status == 429 {
+                    bifrost_net::Error::RateLimited {
+                        retry_after: Some(RetryHint::After(Duration::from_secs(120))),
+                        final_response: bifrost_net::FinalResponse {
+                            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                            headers: retry_after_headers("120"),
+                            body: body.into(),
+                        },
+                    }
+                } else {
+                    bifrost_net::Error::Status {
+                        code: reqwest::StatusCode::from_u16(status).unwrap(),
+                        headers: retry_after_headers("120"),
+                        body: body.into(),
+                    }
+                };
+                let err = into_account_error(
+                    from_net(net_error),
+                    JmapErrorContext::new(AccountOperation::Send),
+                );
+                assert_eq!(
+                    err.kind(),
+                    &AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+                    "{limit}, HTTP {status}"
+                );
+                assert!(matches!(err.recovery(), RecoveryClass::ProviderRefused));
+                assert!(matches!(
+                    err.chain().iter().next(),
+                    Some(Cause::Request(RequestCause::PayloadTooLarge { .. }))
+                ));
+                assert!(
+                    err.chain().iter().any(|cause| matches!(
+                        cause,
+                        Cause::Wire(WireCause::Jmap(JmapMethod::Limit))
+                    ))
+                );
+                assert_eq!(err.telemetry_fields().throttle_scope, None);
+                assert!(err.throttle_budgets().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn jmap_limit_problem_without_http_status_uses_the_named_limit() {
+        for (limit, expected) in [
+            (
+                "maxSizeRequest",
+                AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+            ),
+            (
+                "maxConcurrentRequests",
+                AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            ),
+        ] {
+            let err = into_account_error(
+                crate::Error::Problem {
+                    details: Box::new(ProblemDetails::new(
+                        ProblemType::JMAP(JMAPError::Limit),
+                        None,
+                        None,
+                        None,
+                        Some(limit.to_owned()),
+                        Some("request-1".to_owned()),
+                    )),
+                    transport: None,
+                },
+                JmapErrorContext::new(AccountOperation::Send),
+            );
+            assert_eq!(err.kind(), &expected, "{limit}");
+        }
+    }
+
+    #[test]
+    fn jmap_limit_problem_with_unknown_or_missing_limit_uses_status_fallback() {
+        for limit in [None, Some("futureLimit")] {
+            for (status, expected) in [
+                (
+                    Some(413),
+                    AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+                ),
+                (
+                    Some(400),
+                    AccountErrorKind::Request(RequestErrorKind::Malformed),
+                ),
+                (None, AccountErrorKind::Protocol(ProtocolErrorKind::Unknown)),
+            ] {
+                let err = into_account_error(
+                    crate::Error::Problem {
+                        details: Box::new(ProblemDetails::new(
+                            ProblemType::JMAP(JMAPError::Limit),
+                            status,
+                            None,
+                            None,
+                            limit.map(str::to_owned),
+                            None,
+                        )),
+                        transport: None,
+                    },
+                    JmapErrorContext::new(AccountOperation::Send),
+                );
+                assert_eq!(err.kind(), &expected, "{limit:?}, status {status:?}");
+                assert_eq!(err.telemetry_fields().throttle_scope, None);
+            }
+        }
     }
 
     #[test]

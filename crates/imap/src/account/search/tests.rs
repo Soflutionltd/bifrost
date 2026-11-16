@@ -271,7 +271,12 @@ fn a_changed_uidvalidity_in_the_cursor_folder_voids_the_walk() {
     let first = search_page(&[("INBOX", 7, &[1, 2])], None, 1, None).expect("first page");
     let err = search_page(&[("INBOX", 8, &[1, 2])], None, 1, first.next_cursor)
         .expect_err("the cursor's UIDs name nothing under a new UIDVALIDITY");
-    assert_eq!(*err.kind(), AccountErrorKind::ConcurrencyConflict);
+    assert_eq!(
+        err.recovery(),
+        &bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(
+            super::super::folder_scope(&MailboxName::new("INBOX").unwrap()),
+        ))
+    );
     assert_eq!(err.operation(), Some(AccountOperation::SearchMessages));
 }
 

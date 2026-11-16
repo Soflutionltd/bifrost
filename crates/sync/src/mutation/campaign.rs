@@ -166,6 +166,9 @@ impl Campaign {
         account: &dyn Account,
         account_id: &AccountId,
     ) -> bool {
+        // Admission can span a replacement account. Every unsent target must
+        // still belong to this cohort before we use its execution identity;
+        // one unchanged sibling cannot authorize a target whose routing moved.
         self.cohorts[index].submitted()
             || targets.iter().all(|id| {
                 cohort_identity(
@@ -1422,6 +1425,85 @@ mod campaign_tests {
     use bifrost_types::{
         Batch, BatchItemId, BatchSuccess, MutationEffect, ObjectId, PageBoundary, SyncEvent,
     };
+
+    #[test]
+    fn declaration_matches_requires_every_unsent_target_on_the_replacement() {
+        use bifrost_types::{ProtocolKind, ProtocolSalt, RunId, ThrottleBudget, ThrottleKey};
+
+        fn identity(key: &bifrost_types::IdempotencyKey) -> (&RunId, u64, &ProtocolSalt) {
+            (&key.run_id, key.sequence, &key.protocol_salt)
+        }
+
+        let account_id = AccountId("replacement-routing".into());
+        let targets = vec![ObjectId("stays".into()), ObjectId("moves".into())];
+        let original_key = ThrottleKey::Budget(ThrottleBudget::new("original"));
+        let moved_key = ThrottleKey::Budget(ThrottleBudget::new("moved"));
+        let mut original = crate::test_common::StubAccount::new(Vec::new());
+        let mut replacement = crate::test_common::StubAccount::new(Vec::new());
+        let initial_key = original_key.clone();
+        original.object_keys = Some(Arc::new(move |_| vec![initial_key.clone()]));
+        replacement.object_keys = Some(Arc::new(move |ids| {
+            ids.iter()
+                .map(|id| {
+                    if id.0 == "moves" {
+                        moved_key.clone()
+                    } else {
+                        original_key.clone()
+                    }
+                })
+                .collect()
+        }));
+        let vendor = super::super::IdempotencyVendor::with_run_id(
+            RunId("declaration".into()),
+            Box::new(|_| ProtocolSalt::Imap),
+        );
+        let mut campaign = Campaign::new(
+            targets.clone().into(),
+            BulkPipelineOp::Destroy,
+            &original,
+            &account_id,
+            &vendor,
+            ProtocolKind::Imap,
+            &crate::types::EngineConfig::default(),
+        );
+        assert_eq!(campaign.cohorts.len(), 1, "both targets start together");
+        assert!(campaign.declaration_matches(0, &targets, &original, &account_id));
+        let key = campaign.key(0);
+        // The provider snapshot loaded AFTER admission now disagrees on only
+        // the second target. `any` would send it under its sibling's identity.
+        assert!(!campaign.declaration_matches(0, &targets, &replacement, &account_id));
+        campaign.reroute_unsent(&replacement, &account_id, &vendor, ProtocolKind::Imap);
+        assert_eq!(campaign.cohorts.len(), 2);
+        for (index, target) in targets.iter().enumerate() {
+            assert_eq!(campaign.cohorts[index].remaining, vec![target.clone()]);
+            assert!(campaign.declaration_matches(
+                index,
+                std::slice::from_ref(target),
+                &replacement,
+                &account_id,
+            ));
+        }
+        assert_eq!(
+            identity(&campaign.key(0)),
+            identity(&key),
+            "unchanged targets keep their identity"
+        );
+        assert_ne!(
+            identity(&campaign.key(1)),
+            identity(&key),
+            "rerouted targets get their own identity"
+        );
+
+        // Once submitted, the original identity must survive a replacement:
+        // uncertain writes must never acquire a fresh deduplication identity.
+        let mut submitted = vec![targets[1].clone()];
+        assert!(
+            campaign
+                .begin_submission(1, &mut submitted, &Default::default())
+                .is_some()
+        );
+        assert!(campaign.declaration_matches(1, &submitted, &original, &account_id));
+    }
 
     #[tokio::test]
     async fn campaign_rejects_unknown_duplicate_and_missing_answers() {

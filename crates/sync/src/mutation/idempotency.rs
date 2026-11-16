@@ -6,9 +6,9 @@
 //! `sequence` numbers; the engine threads them through the protocol
 //! crate's `bulk_*` surface for engine-side correlation.
 //!
-//! No protocol today carries `ProtocolSalt` onto the wire. The salt
-//! is engine bookkeeping for retry-queue dedup and campaign
-//! correlation.
+//! Built-in providers never carry `ProtocolSalt` onto the wire. Consumer
+//! factories may attach bookkeeping payloads; the engine preserves the salt
+//! across retries without interpreting it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -37,6 +37,8 @@ impl MutationCampaignId {
 pub struct IdempotencyVendor {
     run_id: RunId,
     sequence: AtomicU64,
+    // A consumer hook, not a second protocol registry. Keep payload-bearing
+    // salts reachable even though built-in providers do not read the payload.
     salt_for: Box<dyn Fn(ProtocolKind) -> ProtocolSalt + Send + Sync>,
 }
 
@@ -76,27 +78,10 @@ impl IdempotencyVendor {
     }
 }
 
-/// Default salt factory that returns the empty-string variant per
-/// protocol. Engine-internal bookkeeping; never travels on the wire.
+/// Default bookkeeping salt factory. Payload-bearing variants carry an empty
+/// string; built-in providers never send the salt on the wire.
 pub fn default_salt_factory() -> Box<dyn Fn(ProtocolKind) -> ProtocolSalt + Send + Sync> {
-    Box::new(|protocol| match protocol {
-        ProtocolKind::Jmap => ProtocolSalt::Jmap(String::new()),
-        ProtocolKind::Gmail => ProtocolSalt::Gmail(String::new()),
-        ProtocolKind::Graph => ProtocolSalt::Graph(String::new()),
-        ProtocolKind::Imap => ProtocolSalt::Imap,
-        ProtocolKind::CardDav => ProtocolSalt::CardDav,
-        ProtocolKind::CalDav => ProtocolSalt::CalDav,
-        // `ProtocolKind` is `#[non_exhaustive]`; fall back to the IMAP
-        // salt for unknown FUTURE protocols. The salt is engine
-        // bookkeeping; it never travels on the wire so this is safe.
-        //
-        // Every protocol that exists today is named above, deliberately:
-        // CalDAV used to reach this arm, so the catch-all was absorbing a
-        // live protocol rather than a hypothetical one, which is the state
-        // that stops being harmless the moment the salt acquires meaning.
-        // Keep it that way - a new `ProtocolKind` gets an arm here.
-        _ => ProtocolSalt::Imap,
-    })
+    Box::new(ProtocolSalt::from)
 }
 
 #[cfg(test)]
@@ -121,9 +106,7 @@ mod tests {
         assert_eq!(b.run_id, RunId("fixed".into()));
     }
 
-    /// Every protocol that EXISTS gets its own salt; the catch-all is reserved
-    /// for protocols that do not exist yet. CalDAV used to fall through to the
-    /// IMAP salt, so a live account crate was sharing another protocol's tag.
+    /// The default delegates to the exhaustive types-owned conversion.
     #[test]
     fn every_live_protocol_has_its_own_salt() {
         let factory = default_salt_factory();

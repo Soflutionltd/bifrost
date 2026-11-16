@@ -357,21 +357,16 @@ pub(crate) fn uidvalidity_changed(
     expected: crate::types::UidValidity,
     actual: crate::types::UidValidity,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-        Cause::State(StateCause::CursorInvalid),
-    )
-    .protocol(Protocol::Imap)
-    .operation(AccountOperation::SyncChanges)
-    .scope(ErrorScope::Cursor(super::folder_scope(folder)))
-    .text(DiagnosticText::support_only(format!(
-        "IMAP UIDVALIDITY changed for {} from {} to {}",
-        folder.as_str(),
-        expected,
-        actual,
-    )))
-    .try_build()
-    .expect("valid account error classification")
+    uidvalidity_changed_error(AccountOperation::SyncChanges, folder)
+        .into_builder()
+        .text(DiagnosticText::support_only(format!(
+            "IMAP UIDVALIDITY changed for {} from {} to {}",
+            folder.as_str(),
+            expected,
+            actual,
+        )))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Build a fatal-stream error for HIGHESTMODSEQ regression on a folder cursor.
@@ -1366,25 +1361,23 @@ pub(super) fn concurrency_conflict_error(
     .expect("valid account error classification")
 }
 
-/// Refuse a stale-epoch target before access. An Outlook user must refresh
-/// the target; retrying its old UID could modify a different message. This is
-/// a failed precondition, not malformed input or a retryable concurrency race.
+/// Stop access to an obsolete UID generation and request folder re-inventory.
+/// An enterprise Outlook user expects a rebuilt folder to refresh so the action
+/// can be retried against fresh identities. RestartScope provides that recovery;
+/// replaying the old UID could instead access or modify a different message.
 pub(super) fn uidvalidity_changed_error(
     operation: AccountOperation,
     folder: &MailboxName,
 ) -> AccountError {
     AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::PreconditionFailed),
-        Cause::Request(RequestCause::PreconditionFailed {
-            detail: DiagnosticText::support_only(
-                "target UIDVALIDITY no longer matches the selected mailbox",
-            ),
-        }),
+        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+        Cause::State(StateCause::CursorInvalid),
     )
     .protocol(Protocol::Imap)
     .operation(operation)
-    .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
+    .scope(ErrorScope::Cursor(super::folder_scope(folder)))
+    .text(DiagnosticText::support_only(
+        "target UIDVALIDITY no longer matches the selected mailbox; re-inventory the folder",
     ))
     .try_build()
     .expect("valid account error classification")
@@ -1458,29 +1451,16 @@ pub(super) fn or_folder_restriction_error(op: AccountOperation) -> AccountError 
 /// The cursor's folder answered with a different UIDVALIDITY, so the UID
 /// the walk resumes after no longer names anything there.
 ///
-/// This stays `ConcurrencyConflict`, not the page_cursor `Malformed` fault the
-/// decode and restriction cases use: the cursor was valid when issued and the
-/// server replaced the mailbox under it. `Malformed` derives ClientBug, which
-/// would report a server-side epoch change as an application defect; an
-/// Outlook user whose mailbox was rebuilt expects the search to simply run
-/// again, which a conflict's re-read recovery gives. A consumer restarts
-/// paging on either error. How UIDVALIDITY changes are classified across the
-/// rest of the IMAP account is a separate, still open, question.
+/// The folder generation is invalid, just as for a stale message id. Request
+/// the same folder re-inventory; the caller must also restart search paging.
 pub(super) fn search_cursor_voided(op: AccountOperation, folder: &MailboxName) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::ConcurrencyConflict,
-        Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-    )
-    .protocol(Protocol::Imap)
-    .operation(op)
-    .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
-    ))
-    .text(DiagnosticText::support_only(
-        "UIDVALIDITY of the folder this search page cursor resumes in changed; repeat the search",
-    ))
-    .try_build()
-    .expect("valid account error classification")
+    uidvalidity_changed_error(op, folder)
+        .into_builder()
+        .text(DiagnosticText::support_only(
+            "UIDVALIDITY of the folder this search page cursor resumes in changed; repeat the search",
+        ))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// The message a completed `UID FETCH` did not answer for.

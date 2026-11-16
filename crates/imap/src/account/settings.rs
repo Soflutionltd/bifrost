@@ -57,9 +57,10 @@ pub(crate) fn quota_get(
     account: ImapAccount,
 ) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
     Box::pin(async move {
-        if !account.capabilities.pim_methods.quota_get {
-            return Err(super::error::unsupported(AccountOperation::QuotaGet));
-        }
+        account
+            .capabilities
+            .pim_methods
+            .gate(AccountOperation::QuotaGet, bifrost_types::Protocol::Imap)?;
         let Some(folder) = quota_probe_folder(&account) else {
             return Ok(None);
         };

@@ -534,6 +534,8 @@ pub fn decode_provider(tag: u8, version: u32) -> Result<Provider, Error> {
 }
 
 /// Stable protocol tag in the ledger vocabulary.
+/// These assignments are independent of the cursor codec's ProtocolKind tags;
+/// converting protocol identity does not convert persisted tag bytes.
 #[must_use]
 pub fn encode_protocol(protocol: Protocol) -> u8 {
     match protocol {

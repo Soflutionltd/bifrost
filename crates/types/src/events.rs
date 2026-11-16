@@ -152,6 +152,32 @@ pub enum InventoryPartition {
     Page(crate::PageWindow),
 }
 
+impl InventoryPartition {
+    /// Durable checkpoint identity, preserving the existing partition bytes.
+    ///
+    /// This exhaustive match lives with the non-exhaustive enum so a future
+    /// partition cannot silently share a fallback key with another partition.
+    #[must_use]
+    pub fn durable_key(&self) -> Partition {
+        let text = match self {
+            Self::Full => "full".to_owned(),
+            Self::Time(window) => format!(
+                "time:{}:{}",
+                window.from().map(|v| v.to_string()).unwrap_or_default(),
+                window.to().map(|v| v.to_string()).unwrap_or_default(),
+            ),
+            Self::Uid(window) => format!(
+                "uid:{}:{}:{}",
+                window.uid_validity(),
+                window.from(),
+                window.to(),
+            ),
+            Self::Page(window) => format!("page:{}:{}", window.from(), window.to()),
+        };
+        Partition(text.into_bytes())
+    }
+}
+
 /// Partitioning modes an Account can honor for a scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -915,6 +941,8 @@ pub struct InvalidationHint {
 }
 
 /// Which push transport originated the wake-up.
+/// This records delivery provenance, including synthetic coalescing, rather
+/// than the account's primary protocol or the protocol of a stored cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PushSource {

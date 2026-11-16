@@ -777,6 +777,21 @@ pub(crate) fn scripted_account_parts_from(
     connector: super::pool::Connector,
 ) -> super::ImapAccountParts {
     let mut capabilities = stub_capabilities();
+    // Versioned Account calls read the negotiated snapshot before touching
+    // the transport. Use the production builder so scripted CONDSTORE
+    // sessions advertise the same caller-version door as real accounts.
+    capabilities.mutation.concurrency = super::capabilities::build_capabilities(
+        &conn.server_profile(),
+        &[],
+        false,
+        None,
+        None,
+        false,
+        false,
+        config.push_session_capacity(false),
+    )
+    .mutation
+    .concurrency;
     if conn
         .server_profile()
         .supports(crate::types::Capability::Idle)

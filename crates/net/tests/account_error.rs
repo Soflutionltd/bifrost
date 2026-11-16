@@ -628,9 +628,9 @@ fn shared_http_status_precondition_and_payload_refusals() {
         ),
         (
             413,
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: bifrost_types::DiagnosticText::support_only("HTTP 413 malformed request"),
+            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+            Cause::Request(RequestCause::PayloadTooLarge {
+                detail: bifrost_types::DiagnosticText::support_only("HTTP 413 payload too large"),
             }),
         ),
     ] {
@@ -644,6 +644,36 @@ fn shared_http_status_precondition_and_payload_refusals() {
         );
         assert_eq!(error.kind(), &expected);
         assert_eq!(error.chain().iter().next(), Some(&primary));
+    }
+}
+
+#[test]
+fn http_413_is_a_terminal_payload_refusal_without_throttling() {
+    for operation in [AccountOperation::Send, AccountOperation::Hydrate] {
+        let error = into_account_error_with_throttle_scope(
+            Error::Status {
+                code: StatusCode::PAYLOAD_TOO_LARGE,
+                headers: HeaderMap::from_iter([header("retry-after", "120")]),
+                body: Bytes::from_static(b"attachment exceeds upload limit"),
+            },
+            ctx(operation),
+            bifrost_net::HttpErrorPolicy {
+                throttle_scope: Some(ThrottleScope::Account),
+                throttle_budget: Some(bifrost_types::ThrottleBudget::new("upload-budget")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge)
+        );
+        assert!(matches!(error.recovery(), RecoveryClass::ProviderRefused));
+        assert_eq!(error.telemetry_fields().throttle_scope, None);
+        assert!(error.throttle_budgets().is_empty());
+        assert!(support_text_contains(
+            &error,
+            "attachment exceeds upload limit"
+        ));
     }
 }
 

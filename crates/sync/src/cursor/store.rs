@@ -66,6 +66,10 @@ pub trait CheckpointStore: Send + Sync {
     ///
     /// The whole transition lands or none of it does. Partial persistence is a
     /// contract violation, not a degraded mode.
+    /// For a backfill transition, remove rows selected by
+    /// [`backfill_checkpoint_compacts`] for this account in the same write.
+    /// This bounds unfinished time-window history and retires partition rows
+    /// when completion lands, without changing the supplied debt ledger.
     fn apply_transition<'a>(
         &'a self,
         account: &'a AccountId,
@@ -112,8 +116,8 @@ pub trait CheckpointStore: Send + Sync {
     /// policy. A proven completion wins independently of item counts; other
     /// rows retain the historical count, page-bound and raw-byte ordering.
     /// Consumers can call this helper instead of copying the key codec.
-    /// Completion transitions should atomically remove older partition rows
-    /// for the same scope, so changing time windows do not accumulate forever.
+    /// [`Self::apply_transition`] also compacts redundant rows using
+    /// [`backfill_checkpoint_compacts`].
     ///
     /// The default `InMemoryCheckpointStore` implementation scans every
     /// backfill entry per call (O(n) on total partitions per account).
@@ -298,13 +302,9 @@ impl CheckpointStore for InMemoryCheckpointStore {
                         .insert((account.clone(), cursor.scope.clone()), cursor);
                 }
                 Checkpoint::Backfill(checkpoint) => {
-                    if crate::backfill::partitioner::BackfillKey::decode(&checkpoint.partition)
-                        .proves_completion(checkpoint.progress.items_done)
-                    {
-                        guard.backfill.retain(|(aid, scope, _), _| {
-                            aid != &account || scope != &checkpoint.scope
-                        });
-                    }
+                    guard.backfill.retain(|(aid, _, _), stored| {
+                        aid != &account || !backfill_checkpoint_compacts(&checkpoint, stored)
+                    });
                     let key = (
                         account.clone(),
                         checkpoint.scope.clone(),
@@ -416,6 +416,35 @@ impl CheckpointStore for InMemoryCheckpointStore {
     }
 }
 
+/// Whether writing `candidate` may remove `stored` from the SAME account.
+/// Apply this compaction atomically with the checkpoint and ledger write.
+///
+/// A proven completion replaces every row of its scope. Time-window rows can
+/// replace one another even before completion: fixed plans always replay every
+/// partition on restart, so those rows carry no positional resume evidence.
+/// Keeping one bounds storage across interrupted walks with fresh absolute
+/// bounds. Enterprise users expect interrupted sync to retry without growing
+/// its checkpoint history forever. This is row retention only: debt remains in
+/// the supplied ledger, and a late time acknowledgement cannot erase completion
+/// or a positional page checkpoint. Time compaction retains unknown key kinds.
+#[must_use]
+pub fn backfill_checkpoint_compacts(
+    candidate: &BackfillCheckpoint,
+    stored: &BackfillCheckpoint,
+) -> bool {
+    use crate::backfill::partitioner::BackfillKey;
+    if candidate.scope != stored.scope {
+        return false;
+    }
+    let candidate_key = BackfillKey::decode(&candidate.partition);
+    candidate_key.proves_completion(candidate.progress.items_done)
+        || matches!(candidate_key, BackfillKey::Time { .. })
+            && matches!(
+                BackfillKey::decode(&stored.partition),
+                BackfillKey::Time { .. }
+            )
+}
+
 /// Compare durable resume rows without duplicating engine key policy in stores.
 #[must_use]
 pub fn backfill_checkpoint_is_later(
@@ -478,6 +507,96 @@ mod resume_tests {
                 crate::cursor::ENGINE_VERSION,
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn unfinished_time_walks_compact_rows_across_planning_instants() {
+        let store = InMemoryCheckpointStore::new();
+        let account = AccountId("time-history".into());
+        let other = AccountId("other-account".into());
+        let mut sibling = row(b"time:1:2", 7);
+        sibling.scope = CursorScope::Type(bifrost_types::ObjectType::Email);
+        store.put_backfill(&account, sibling.clone()).await.unwrap();
+        store
+            .put_backfill(&other, row(b"time:1:2", 9))
+            .await
+            .unwrap();
+
+        // Each attach plans fresh absolute bounds, and each interrupted fixed
+        // walk must replay every partition. None of these rows can resume it.
+        for instant in 10..14 {
+            for key in [
+                format!("time::{}", instant - 1),
+                format!("time:{}:{instant}", instant - 1),
+            ] {
+                store
+                    .put_backfill(&account, row(key.as_bytes(), 1))
+                    .await
+                    .unwrap();
+            }
+            let guard = store.inner.lock().unwrap();
+            assert_eq!(
+                guard.backfill.len(),
+                3,
+                "one time row plus two isolated rows"
+            );
+        }
+        assert_eq!(
+            store.get_backfill(&account, &sibling.scope).await.unwrap(),
+            Some(sibling)
+        );
+        assert_eq!(
+            store
+                .get_backfill(&other, &CursorScope::Account)
+                .await
+                .unwrap(),
+            Some(row(b"time:1:2", 9))
+        );
+
+        // A later time acknowledgement must preserve durable completion.
+        store
+            .put_backfill(&account, row(b"complete:v2", 0))
+            .await
+            .unwrap();
+        store
+            .put_backfill(&account, row(b"time:20:30", 100))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_backfill(&account, &CursorScope::Account)
+                .await
+                .unwrap(),
+            Some(row(b"complete:v2", 0))
+        );
+        assert_eq!(store.inner.lock().unwrap().backfill.len(), 4);
+    }
+
+    #[test]
+    fn compaction_preserves_positional_unknown_and_ambiguous_completion_rows() {
+        let time = row(b"time::123", 1);
+        for key in [
+            b"page:0:10".as_slice(),
+            b"uid:1:1:11",
+            b"future:opaque",
+            b"complete",
+            b"complete:v2",
+        ] {
+            assert!(!backfill_checkpoint_compacts(&time, &row(key, 1)));
+            assert_eq!(
+                backfill_checkpoint_compacts(&row(key, 1), &time),
+                key == b"complete:v2",
+            );
+        }
+        assert!(backfill_checkpoint_compacts(&row(b"complete:v2", 0), &time));
+        assert!(backfill_checkpoint_compacts(&row(b"complete", 2), &time));
+        let mut sibling = time.clone();
+        sibling.scope = CursorScope::Type(bifrost_types::ObjectType::Email);
+        assert!(!backfill_checkpoint_compacts(&time, &sibling));
+        assert!(!backfill_checkpoint_compacts(
+            &row(b"complete:v2", 0),
+            &sibling
+        ));
     }
 
     #[test]

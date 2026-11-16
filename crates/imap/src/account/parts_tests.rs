@@ -532,8 +532,15 @@ fn uidvalidity_mismatch_is_reported_not_fetched() {
         .expect_err("stale epoch refused");
     assert!(matches!(
         error.kind(),
-        AccountErrorKind::Request(RequestErrorKind::PreconditionFailed)
+        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid)
     ));
+    assert_eq!(error.operation(), Some(OP));
+    assert_eq!(
+        error.recovery(),
+        &bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(
+            super::super::folder_scope(&folder()),
+        ))
+    );
 }
 
 #[test]

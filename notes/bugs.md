@@ -21,72 +21,6 @@ an entry wrong.
 Each entry names the hunt scope(s) that reported it. The raw reports are in the
 commit that precedes this file's.
 
-## BUG-016 - The backfill completion marker wins resume selection by a magic number, and can lose
-
-**Reported by:** sync-lanes (latent; live once any provider adopts partitioning).
-
-Mostly fixed: a typed `BackfillKey` with codecs for every existing encoding, one
-public resume-comparison helper consumer stores can call, proven completion
-beating counts, honest completion counts, and atomic completion compaction in
-the in-memory store. Residue: incomplete `TimeWindowed` walks still mint fresh
-absolute-instant keys each attach and accumulate rows; an unknown future
-`InventoryPartition` variant still falls back to the historical shared key
-(a safe opaque identity needs bifrost-types support); and external
-`CheckpointStore` implementations must adopt the comparison helper and the
-compaction contract, which nothing enforces. The original account:
-
-The durable "backfill is done" fact is a `BackfillCheckpoint` on partition key
-`b"complete"` with `items_done = total_seen + 1`
-(`engine/backfill.rs::emit_backfill_complete`), whose doc claims every
-per-partition row records `<= total_seen`. The store selects the resume row by
-greatest `items_done` (`CheckpointStore::get_backfill` contract,
-`InMemoryCheckpointStore` via `backfill_checkpoint_is_later`). The guarantee
-only covers rows from the same walk, and rows survive across walks:
-
-- `items_done` is per partition and per walk (`run_partition` resets
-  `seen_total`); `total_seen` counts only the current walk. In a multi-partition
-  `Fixed` plan, if the scope shrank and a window now yields no page, its old row
-  keeps its old count; if that exceeds the new total, the stale row beats the
-  marker, `backfill_complete_recorded` reads false, and the scope is re-walked
-  on every attach indefinitely.
-- In an `OpenPages` walk resumed at `T`, `total_seen` covers only the resumed
-  part; a final empty `Exhausted` probe stamps `items_done = 1`, and the earlier
-  `page:F:T` row with up to `chunk` items beats it. The scope re-probes on every
-  attach.
-- `TimeWindowed` keys embed absolute instants from `Timestamp::now()` at plan
-  time (`partition_key` renders `time:{from}:{to}`; `backfill_plan_for` calls
-  `plan(&policy, Timestamp::now(), 0)`), so every attach writes fresh keys that
-  never overwrite the last set: rows accumulate without bound in the consumer
-  store, each competing with the marker. The partitioner's "keeping partition
-  identity stable across runs" holds only for the `Timestamp::MIN` sentinel.
-
-Every in-tree provider reports `InventoryPartitioning::Full` today (one key each
-walk overwrites), so all three are latent.
-
-The same fact has three encodings: the `b"complete"` key (read by
-`backfill_complete_recorded`, by `persist_ack_request`, and by more than twenty
-literal `checkpoint.partition.0 == b"complete"` comparisons in `tests/`; a
-consumer has no typed way to ask), the `items_done` magic, and
-`PublicationReceipt::walk_watermark.is_some()` (set only by
-`register_walk_marker`, read in `completion_refusal`, which cross-checks the
-second against the first). Partition keys are stringly too: `partition_key`
-formats `full | time:F:T | uid:F:T | page:F:T` with a catch-all `"unknown"` arm,
-so every future `InventoryPartition` variant collides on one key, and
-`parse_page_partition` parses it back. And "which row is the resume position?"
-is engine policy implemented in every consumer store: the `get_backfill`
-contract (greatest `items_done`, then greatest parsed page upper bound, then
-greatest raw bytes) forces each backend to parse the engine's `page:F:T` format
-(`InMemoryCheckpointStore` borrows `partitioner::parse_page_partition`; an
-external backend must copy it), and `open_pages_resume` re-parses the result.
-
-Proposal: a typed durable key, `enum BackfillKey { Partition(PartitionKey),
-Complete }`, `PartitionKey` an enum carrying the bounds with its own codec in
-`cursor/envelope.rs`, the completion row its own row kind; `CheckpointStore`
-gains `get_backfill_resume -> BackfillResume { None, Complete,
-At(PartitionKey) }`, or the store returns rows and the engine selects. Trait
-change, needs the owner. `BackfillProgress::items_done` goes back to meaning a
-count.
-
 ## BUG-055 - IMAP `SearchFilter::Has` (attachment filename or type) compiles to a full-text `BODY` search
 
 **Reported by:** imap-account.
@@ -121,9 +55,6 @@ Rulings:
 - Sync acknowledgement tokens: a wrong or rotated key and a corrupted token
   decode to the same error; a key-identifier byte in the header would separate
   them.
-- Net and engine hold stores: the engine records a second hold for a net
-  `LocalHold` error because nothing marks local-hold provenance on
-  `AccountError`; removing it needs a marker set by net and every provider.
 
 Design:
 

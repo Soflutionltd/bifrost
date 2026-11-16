@@ -12,6 +12,11 @@ impl SyncEngine {
     /// campaign starts, failures are retained in `MutationCounters::error`
     /// alongside partial accounting. Preflight failures return `Err`.
     ///
+    /// `protocol` selects the consumer's idempotency salt namespace. It is
+    /// explicit because custom salt factories are consumer policy and a
+    /// composed account's primary protocol need not identify the selected leg.
+    /// It does not override provider error identity or cursor provenance.
+    ///
     /// Mutation accounting consumes `ItemOutcome<MutationSuccess>` and
     /// classifies per-item failures via [`crate::recovery::plan_recovery`] after
     /// observing shared throttle holds:

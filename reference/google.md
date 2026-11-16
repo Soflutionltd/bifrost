@@ -111,6 +111,9 @@ returned a redirect, the refusal carries effective `InFlight` evidence and
 reconciles through `ThrottledMidFlight`; it does not replay the mutation.
 It never renews the deadline. Dropping all account handles and reopening on the
 same Net does not erase the hold. Different project identities are independent.
+Local refusals also retain `AccountError::is_local_hold()` provenance through
+Google's error decoration, so the engine paces the operation without installing
+or extending another shared hold for the same refusal.
 
 `GoogleAccount::throttle_keys` declares the project budget for
 `CursorScope::Account`, nonempty generic `ObjectId` work, and label memberships.

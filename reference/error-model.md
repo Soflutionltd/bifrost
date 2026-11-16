@@ -55,14 +55,22 @@ state cause while preserving the original classification prefix boundary.
 `AccountError::unsupported(operation, protocol)` is the canonical local refusal
 constructor. It stamps kind, matching request cause, operation and protocol through
 `try_build`; `into_builder` adds provider, scope and diagnostics. Provider helpers
-retain their existing provider and scope choices. `Account::protocol` supplies the
-protocol for inherited default-method refusals; all six built-in account providers
-override it. Its compatibility default is `Protocol::Unknown` for downstream
-implementations that have not supplied an identity. The public
-`unsupported_inventory_stream` also uses `Unknown` because its signature carries
-no account identity; built-in accounts use `unsupported_inventory_stream_with_protocol`.
+retain their existing provider and scope choices. The required `Account::protocol`
+supplies the primary protocol for inherited default-method refusals. Implementors
+can explicitly return `Protocol::Unknown` when identity is unavailable.
+`unsupported_inventory_stream(operation, protocol)` takes explicit protocol
+identity and emits only a termination, with no scope or completeness claim.
 The provider-neutral MIME renderer uses `Unknown` for unsupported inputs; its
 consuming account stamps the protocol at the boundary.
+
+Protocol and provider remain properties of the failing leg, rather than a
+blanket account stamp. Composed accounts can fail through DAV, SMTP, EWS or
+Google auxiliary APIs while their primary protocol stays IMAP, Graph or Gmail.
+`ProtocolKind` cursor provenance converts exhaustively to `Protocol` inside
+`bifrost-types`. SMTP reply classification deliberately reads wire evidence:
+the numeric 5xx class is permanent for SMTP/LMTP, even when enclosing account
+metadata identifies another protocol. Restamping metadata must not change retry
+semantics.
 
 Local unsupported refusals may attach `UnsupportedReason` through
 `AccountErrorBuilder::unsupported_reason`, read through
@@ -105,6 +113,8 @@ translation boundaries call
 - `ThrottleBudgetNotApplicable { kind }` - a `throttle_budget` stamped
   on anything but `Server(RateLimited | QuotaExhausted)`, for the same
   reason.
+- `LocalHoldNotApplicable { kind }` - local-hold provenance stamped on
+  anything but `Server(RateLimited | QuotaExhausted)`.
 - `TransportAcknowledged` - `Transport(_)` kind paired with any
   `Attempt(Acknowledged)` classification cause. Transport failure means no
   complete server response arrived; an acknowledged attempt belongs on a
@@ -557,12 +567,11 @@ reporting `AccountOperation::Send`, leaving telemetry and support exports
 unable to say which operation refused the input and the derived idempotency
 wrong on top of that.
 
-`Protocol::Unknown` exists for errors the ENGINE mints about an account's
-behaviour rather than errors a protocol crate maps from a wire response.
-There is no protocol accessor on `dyn Account`, so where the offending
-payload carries no protocol tag of its own (a backfill checkpoint, say) the
-error declines to name one rather than guessing. Protocol crates always know
-their own protocol and must never use it.
+`Protocol::Unknown` exists for provider-neutral errors and engine errors whose
+failing-leg identity is unavailable. Checkpoint-only contract constructors
+cannot infer a protocol from an untagged backfill checkpoint; the primary
+`Account::protocol()` is not necessarily the origin of a composed payload.
+Protocol crates know their own failing leg and must stamp it explicitly.
 
 The same three lanes carry `push_subscribe`, whose input is a scope list
 rather than a `Vec<BatchItem<_>>`. `PushSubscription { handle, outcomes }`
@@ -703,7 +712,9 @@ The request's `ReplayPolicy` decides wire replay. When a non-replayable
 request may have committed, net stamps `idempotency_override(false)` during
 translation. The operation table is the default otherwise and for every
 non-HTTP protocol. Widening is an operation-level producer decision on requests
-declared replayable only.
+declared replayable only. Overrides compose monotonically: `false` wins in
+either setter order and survives cloning and `into_builder` decoration. A
+later request guard cannot erase earlier evidence that replay is unsafe.
 
 An HTTP acknowledgement does not prove refusal: net preserves 401/429 refusal
 retries, but stops at a 5xx or other configured ambiguous status on an
@@ -836,8 +847,13 @@ InternalFailureAfterSend contributes a terminal InternalFailure barrier.
 
 Scalar projection first preserves auth/permission remediation barriers, since
 observation cannot replace user action and terminal advice authorizes no replay.
-It then projects the first directive (all remain in the plan); directives never
-lift Never or bypass observation. Gating projects CheckTarget plus leg actions,
+It then projects the first directive (all remain in the plan), but only when no
+leg gates and no unresolved committed Blocking effect stands: a caller that
+performs a directive and reissues the operation would otherwise repeat the
+committed effect, and an enterprise user expects no duplicate. In that case the
+reconcile below heads the operation and the directive stays visible through the
+failed leg's `leg_recovery()` and `plan().directives`. Directives never lift
+Never or bypass observation. Gating projects CheckTarget plus leg actions,
 record-driven DedupeByClientId and ObserveOnly when replay is Never. The reason
 is PartialCommit only with an unresolved committed Blocking effect, otherwise
 the first gating leg's reconcile reason or PartialCompletionSignal. Remaining
@@ -930,6 +946,16 @@ scope lifting; hintless budgets and mailbox holds get `HINTLESS_HOLD_WAIT`
 holds require a hint. Unresolved mailbox identities and operation-only advice
 remain `CurrentOperation`, which paces repair without widening shared holds.
 The engine supplies account identity and anchors hints on its monotonic clock.
+
+`AccountErrorBuilder::local_hold()` marks a gate refusal against a hold already
+recorded by its transport owner; `AccountError::is_local_hold()` exposes this
+per-leg provenance. Net sets it when translating `Error::LocalHold`; provider
+decoration and partial-commit records retain it. `throttle_holds()` projects
+that leg as `CurrentOperation` even when it carries a budget or account scope.
+Retry/reconcile advice, timing and budget evidence remain intact, but the engine
+does not install or extend a second shared hold. Real server failures on sibling
+or cleanup legs still record their own holds. An enterprise user expects the
+existing provider wait to be honored once without stalling unrelated work.
 
 `compose::validate_send_recipients` and `SendRequest::validate_recipients`
 require a protocol identity for their local empty-send refusal. Neutral MIME

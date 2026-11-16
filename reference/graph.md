@@ -31,8 +31,9 @@ A non-replayable request stops at its first ambiguous retryable status, with
 401/429 refusal handling preserved. [503, 200 with subrequest 412] stops at 503
 and reconciles; a first-response 200/412 remains a conflict. Missing conditional
 batch answers narrow to CheckTarget-only reconciliation. Context `.idempotent()`
-widening is valid only when every request is declared Idempotent, so it cannot
-undo net's narrowing.
+supplies logical replay safety for requests declared Idempotent. Builder
+overrides compose monotonically, so it cannot undo net's narrowing even if
+the request declaration disagrees.
 
 Current architecture of the Graph Account-layer code under
 `crates/graph/src/account/`. Public surface:

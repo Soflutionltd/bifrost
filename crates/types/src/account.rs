@@ -199,19 +199,10 @@ pub type AccountFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// continue at all: a consumer reading last-event-wins saw success, one reading
 /// first-event-wins saw failure.
 ///
-/// This compatibility entry point has no account from which to obtain a
-/// protocol. Account implementations use `unsupported_inventory_stream_with_protocol`.
-/// The scope is retained for compatibility; no completeness claim is made.
+/// The caller supplies protocol identity explicitly, including `Unknown` for
+/// a provider-neutral refusal. No scope is needed because a refusal makes no
+/// completeness claim.
 pub fn unsupported_inventory_stream(
-    _scope: CursorScope,
-    operation: AccountOperation,
-) -> AccountStream<InventoryEvent> {
-    unsupported_inventory_stream_with_protocol(_scope, operation, crate::Protocol::Unknown)
-}
-
-/// An inventory refusal stamped with the account's protocol.
-pub fn unsupported_inventory_stream_with_protocol(
-    _scope: CursorScope,
     operation: AccountOperation,
     protocol: crate::Protocol,
 ) -> AccountStream<InventoryEvent> {
@@ -227,11 +218,10 @@ pub fn unsupported_inventory_stream_with_protocol(
 /// side via an `AccountFactory`; the engine owns the open
 /// `Arc<dyn Account>` and calls the factory on reopen.
 pub trait Account: Send + Sync {
-    /// Protocol used to stamp default-method refusals. Implementations should
-    /// override this; `Unknown` preserves compatibility for existing accounts.
-    fn protocol(&self) -> crate::Protocol {
-        crate::Protocol::Unknown
-    }
+    /// Primary account protocol used to stamp inherited default refusals.
+    /// Composed implementations retain the actual protocol on errors from
+    /// their other legs; this is not a blanket override for every account error.
+    fn protocol(&self) -> crate::Protocol;
 
     /// Read-once snapshot of the account's capabilities. Mid-session
     /// transitions are signaled by ending streams with
@@ -389,11 +379,7 @@ pub trait Account: Send + Sync {
     ) -> AccountStream<InventoryEvent> {
         match partition {
             InventoryPartition::Full => self.inventory_stream(scope),
-            _ => unsupported_inventory_stream_with_protocol(
-                scope,
-                AccountOperation::SyncInventory,
-                self.protocol(),
-            ),
+            _ => unsupported_inventory_stream(AccountOperation::SyncInventory, self.protocol()),
         }
     }
 
@@ -1698,6 +1684,30 @@ mod push_subscription_tests {
         AccountErrorBuilder, AccountErrorKind, BatchItemId, BatchOutcome, BatchOutcomeBuilder,
         Cause, RequestCause,
     };
+
+    #[test]
+    fn inventory_refusal_preserves_explicit_protocol_without_claiming_completion() {
+        use futures::{FutureExt, StreamExt};
+
+        for protocol in [
+            crate::Protocol::CalDav,
+            crate::Protocol::CardDav,
+            crate::Protocol::Unknown,
+        ] {
+            let events = unsupported_inventory_stream(AccountOperation::SyncInventory, protocol)
+                .collect::<Vec<_>>()
+                .now_or_never()
+                .expect("a local refusal is immediately ready");
+            let [InventoryEvent::Terminated(error)] = events.as_slice() else {
+                panic!("a refusal must terminate without a completeness claim");
+            };
+            assert_eq!(error.protocol(), Some(protocol));
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Unsupported(AccountOperation::SyncInventory)
+            );
+        }
+    }
 
     fn outcomes_with_success() -> BatchOutcome<CursorScope> {
         let item = BatchItemId("0".to_string());

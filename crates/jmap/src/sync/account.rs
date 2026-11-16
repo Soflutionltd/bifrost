@@ -1633,12 +1633,13 @@ fn route_send_as(
     submission_capable: bool,
 ) -> Result<(), AccountError> {
     if !feature_available {
-        return Err(super::error::unsupported_error(
-            AccountOperation::Send,
-            None,
-            bifrost_types::UnsupportedReason::SendAsUnavailable,
-            "no seeded foreign account advertises submission, \
-             so send-as is unavailable on this account",
+        return Err(bifrost_types::compose::classify_send_as_rejection(
+            feature_available,
+            bifrost_types::Protocol::Jmap,
+            bifrost_types::DiagnosticText::support_only(
+                "no seeded foreign account advertises submission, \
+                 so send-as is unavailable on this account",
+            ),
         ));
     }
     if scheduled {

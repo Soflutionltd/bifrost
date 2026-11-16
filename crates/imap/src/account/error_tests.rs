@@ -10,7 +10,7 @@
 use bifrost_types::{
     AccessErrorKind, AccountErrorKind, AccountOperation, AuthErrorKind, Cause, CursorScope,
     EngineDirective, ErrorScope, FolderId, ImapResponseCode, ProtocolErrorKind, RecoveryClass,
-    RequestCause, RequestErrorKind, ResourceKind, ServerErrorKind, StrategyDowngrade,
+    RequestCause, RequestErrorKind, ResourceKind, ServerErrorKind, StateCause, StrategyDowngrade,
     SyncStateErrorKind, ThrottleScope, TransmissionState, TransportErrorKind, WireCause,
 };
 
@@ -1300,8 +1300,7 @@ fn target_state_refusals_do_not_blame_the_caller_or_retry_old_targets() {
         AccountOperation::FilterUpdate,
     );
     let nonempty = super::non_empty_mailbox(&folder);
-    let stale = super::uidvalidity_changed_error(AccountOperation::BulkMove, &folder);
-    for error in [&active, &nonempty, &stale] {
+    for error in [&active, &nonempty] {
         assert_eq!(
             error.kind(),
             &AccountErrorKind::Request(RequestErrorKind::PreconditionFailed)
@@ -1310,12 +1309,69 @@ fn target_state_refusals_do_not_blame_the_caller_or_retry_old_targets() {
         assert_eq!(error.message_key(), "request.precondition-failed");
     }
     assert_eq!(
-        stale.scope(),
-        Some(&ErrorScope::Cursor(folder_cursor("INBOX")))
-    );
-    assert_eq!(
         nonempty.operation(),
         Some(AccountOperation::ContainerDelete)
     );
     assert_eq!(active.operation(), Some(AccountOperation::FilterUpdate));
+}
+
+#[test]
+fn stale_uidvalidity_requests_folder_reinventory_for_every_access() {
+    let folder = mailbox("INBOX");
+    let scope = folder_cursor("INBOX");
+    for operation in [
+        AccountOperation::BulkMove,
+        AccountOperation::BulkDestroy,
+        AccountOperation::UpdateFlags,
+        AccountOperation::AddToContainer,
+        AccountOperation::RemoveFromContainer,
+        AccountOperation::HydrateMessage,
+        AccountOperation::OpenBlob,
+    ] {
+        let error = super::uidvalidity_changed_error(operation, &folder);
+        assert_eq!(error.operation(), Some(operation));
+        assert_eq!(error.scope(), Some(&ErrorScope::Cursor(scope.clone())));
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
+        );
+        assert!(matches!(
+            error.chain().outermost(),
+            Cause::State(StateCause::CursorInvalid)
+        ));
+        assert_eq!(
+            error.recovery(),
+            &RecoveryClass::Engine(EngineDirective::RestartScope(scope.clone()))
+        );
+    }
+    // These entry points decorate the shared classification with their own op
+    // or diagnostics. None may turn the stale generation into a terminal error.
+    for (operation, error) in [
+        (
+            AccountOperation::Hydrate,
+            super::hydration_uidvalidity_changed_error(&folder),
+        ),
+        (
+            AccountOperation::OpenRawRfc822,
+            super::raw_uidvalidity_changed(&folder),
+        ),
+        (
+            AccountOperation::SearchMessages,
+            super::search_cursor_voided(AccountOperation::SearchMessages, &folder),
+        ),
+        (
+            AccountOperation::SyncChanges,
+            super::uidvalidity_changed(
+                &folder,
+                crate::types::UidValidity::new(7).unwrap(),
+                crate::types::UidValidity::new(8).unwrap(),
+            ),
+        ),
+    ] {
+        assert_eq!(error.operation(), Some(operation));
+        assert_eq!(
+            error.recovery(),
+            &RecoveryClass::Engine(EngineDirective::RestartScope(scope.clone()))
+        );
+    }
 }

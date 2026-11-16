@@ -161,9 +161,10 @@ async fn add_to_container_inner(
     target: MutationTarget,
     container: ContainerId,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
-    if !account.capabilities.pim_methods.add_to_container {
-        return Err(super::error::unsupported(AccountOperation::AddToContainer).into());
-    }
+    account.capabilities.pim_methods.gate(
+        AccountOperation::AddToContainer,
+        bifrost_types::Protocol::Imap,
+    )?;
     let destination = folder_from_container(
         &account.dav_scopes,
         &container,
@@ -201,9 +202,10 @@ async fn remove_from_container_inner(
     target: MutationTarget,
     container: ContainerId,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
-    if !account.capabilities.pim_methods.remove_from_container {
-        return Err(super::error::unsupported(AccountOperation::RemoveFromContainer).into());
-    }
+    account.capabilities.pim_methods.gate(
+        AccountOperation::RemoveFromContainer,
+        bifrost_types::Protocol::Imap,
+    )?;
     let source = folder_from_container(
         &account.dav_scopes,
         &container,
@@ -238,9 +240,10 @@ pub(crate) fn set_keyword(
     value: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        if !account.capabilities.pim_methods.set_keyword {
-            return Err(super::error::unsupported(AccountOperation::SetKeyword));
-        }
+        account
+            .capabilities
+            .pim_methods
+            .gate(AccountOperation::SetKeyword, bifrost_types::Protocol::Imap)?;
         let flag = imap_flag_for_keyword(keyword.as_str());
         let ids = resolved_targets(
             &account,
@@ -262,9 +265,10 @@ pub(crate) fn set_is_read(
     is_read: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        if !account.capabilities.pim_methods.set_is_read {
-            return Err(super::error::unsupported(AccountOperation::SetIsRead));
-        }
+        account
+            .capabilities
+            .pim_methods
+            .gate(AccountOperation::SetIsRead, bifrost_types::Protocol::Imap)?;
         let ids = resolved_targets(
             &account,
             &target,
@@ -294,9 +298,10 @@ pub(crate) fn set_importance(
     // keyword. Exclusive: `High` sets it, `Normal`/`Low` clear it - one
     // STORE op, never an expand-into-two.
     Box::pin(async move {
-        if !account.capabilities.pim_methods.set_importance {
-            return Err(super::error::unsupported(AccountOperation::SetImportance));
-        }
+        account.capabilities.pim_methods.gate(
+            AccountOperation::SetImportance,
+            bifrost_types::Protocol::Imap,
+        )?;
         let important = importance_sets_important_keyword(level);
         let ids = resolved_targets(
             &account,
@@ -375,9 +380,10 @@ async fn move_native_thread(
     target: ContainerId,
     source: Option<ContainerId>,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
-    if !account.capabilities.pim_methods.add_to_container {
-        return Err(super::error::unsupported(AccountOperation::AddToContainer).into());
-    }
+    account.capabilities.pim_methods.gate(
+        AccountOperation::AddToContainer,
+        bifrost_types::Protocol::Imap,
+    )?;
     let destination = folder_from_container(
         &account.dav_scopes,
         &target,
@@ -385,11 +391,10 @@ async fn move_native_thread(
     )?;
     let removal = match source {
         Some(source) => {
-            if !account.capabilities.pim_methods.remove_from_container {
-                return Err(
-                    super::error::unsupported(AccountOperation::RemoveFromContainer).into(),
-                );
-            }
+            account.capabilities.pim_methods.gate(
+                AccountOperation::RemoveFromContainer,
+                bifrost_types::Protocol::Imap,
+            )?;
             let source = folder_from_container(
                 &account.dav_scopes,
                 &source,

@@ -440,6 +440,10 @@ impl AccountFactory for RotatingFactory {
 }
 
 impl Account for HealAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::Jmap
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.caps
     }

@@ -4,7 +4,7 @@ use crate::account::folder_registry::FolderRegistry;
 use crate::account::test_support::scripted_account_parts;
 use crate::connection::test_support::{driver_pair, preauth_greeting, read_line, respond, tag_of};
 use crate::types::MailboxInfo;
-use bifrost_types::{AccountErrorKind, RequestErrorKind};
+use bifrost_types::AccountErrorKind;
 
 #[test]
 fn importance_high_sets_keyword_others_clear() {
@@ -198,7 +198,7 @@ async fn result_copy_preserves_live_epoch_commit_beside_stale_target() {
     let error = folder_progress_error(failure);
     assert!(matches!(
         error.kind(),
-        AccountErrorKind::Request(RequestErrorKind::PreconditionFailed)
+        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid)
     ));
     let record = error.partial_commit().unwrap();
     assert_eq!(record.primary().effect, None);
@@ -210,7 +210,29 @@ async fn result_copy_preserves_live_epoch_commit_beside_stale_target() {
             .any(|step| step.effect() == Some(StepEffect::Copied))
     );
     assert!(record.steps().iter().any(|step| step.effect().is_none()));
-    assert!(error.recovery().requires_reconciliation());
+    let restart =
+        bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(
+            super::super::folder_scope(&MailboxName::new("INBOX").unwrap()),
+        ));
+    assert_eq!(error.leg_recovery(), &restart);
+    // The committed live copy would duplicate on replay, so the operation
+    // recovery stays the reconcile; the restart lives on the failed leg.
+    match error.recovery() {
+        bifrost_types::RecoveryClass::Reconcile(advice) => assert!(
+            advice
+                .guidance
+                .actions
+                .contains(&bifrost_types::ReconcileAction::ObserveOnly)
+        ),
+        other => panic!("expected reconcile, got {other:?}"),
+    }
+    assert!(
+        record
+            .plan()
+            .directives
+            .iter()
+            .any(|d| bifrost_types::RecoveryClass::Engine(d.directive.clone()) == restart)
+    );
     let _server = script.await.unwrap();
 }
 

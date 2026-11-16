@@ -9,6 +9,43 @@ use bytes::Bytes;
 
 use crate::ids::{ObjectId, PrincipalId};
 
+/// Classify a rejected send-as route using the negotiated capability flag.
+///
+/// An Outlook user should be asked to fix the mailbox only when send-as is
+/// available. An absent feature is Unsupported, and never falls back to the
+/// authenticated user's mailbox. Providers retain routing and refusal order.
+#[must_use]
+pub fn classify_send_as_rejection(
+    available: bool,
+    protocol: crate::Protocol,
+    detail: crate::DiagnosticText,
+) -> crate::AccountError {
+    use crate::{
+        AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, RequestCause,
+        RequestErrorKind, UnsupportedReason,
+    };
+
+    if !available {
+        return AccountError::unsupported(AccountOperation::Send, protocol)
+            .into_builder()
+            .unsupported_reason(UnsupportedReason::SendAsUnavailable)
+            .text(detail)
+            .try_build()
+            .expect("valid send-as refusal");
+    }
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("send_as.mailbox"),
+            message: Some(detail),
+        }),
+    )
+    .operation(AccountOperation::Send)
+    .protocol(protocol)
+    .try_build()
+    .expect("valid send-as rejection")
+}
+
 /// Opaque handle to a server-side uploaded attachment.
 ///
 /// `attachment_upload` returns one of these; subsequent
@@ -598,6 +635,48 @@ mod send_as_tests {
     use super::{SendAs, SendRequest};
     use crate::capabilities::PimMethodSupport;
     use crate::ids::PrincipalId;
+
+    #[test]
+    fn send_as_rejection_uses_capability_for_classification_and_names_the_field() {
+        use crate::{
+            AccountErrorKind, AccountOperation, Cause, DiagnosticText, Protocol, RequestCause,
+            RequestErrorKind, UnsupportedReason,
+        };
+        for protocol in [Protocol::Graph, Protocol::Jmap] {
+            for available in [false, true] {
+                let error = super::classify_send_as_rejection(
+                    available,
+                    protocol,
+                    DiagnosticText::support_only("unknown mailbox"),
+                );
+                assert_eq!(error.operation(), Some(AccountOperation::Send));
+                assert_eq!(error.protocol(), Some(protocol));
+                assert!(error.recovery().is_terminal());
+                if available {
+                    assert_eq!(
+                        error.kind(),
+                        &AccountErrorKind::Request(RequestErrorKind::Malformed)
+                    );
+                    assert!(error.chain().iter().any(|cause| matches!(
+                        cause,
+                        Cause::Request(RequestCause::InvalidArgument {
+                            field: Some("send_as.mailbox"),
+                            ..
+                        })
+                    )));
+                } else {
+                    assert_eq!(
+                        error.kind(),
+                        &AccountErrorKind::Unsupported(AccountOperation::Send)
+                    );
+                    assert_eq!(
+                        error.unsupported_reason(),
+                        Some(UnsupportedReason::SendAsUnavailable)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn send_as_defaults_none() {

@@ -471,6 +471,8 @@ impl AccountOperation {
     }
 }
 
+/// Vendor or vendor API identity, including provider expression languages.
+/// This is independent of the transport or cursor protocol an account uses.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum Provider {
@@ -487,6 +489,8 @@ pub enum Provider {
     Custom,
 }
 
+/// Protocol of the failing API or transport leg. A composed account can report
+/// several protocols even though `Account::protocol()` names one primary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum Protocol {
@@ -504,9 +508,9 @@ pub enum Protocol {
     CalDav,
     /// The protocol is not derivable at the point the error was classified.
     ///
-    /// Used for engine errors, provider-neutral helpers and compatibility
-    /// defaults such as `Account::protocol`. Protocol crates know their own
-    /// protocol and must stamp it when propagating a shared helper's refusal.
+    /// Used for engine errors and provider-neutral helpers. Protocol crates
+    /// know their own protocol and must stamp it when propagating a shared
+    /// helper's refusal.
     Unknown,
 }
 

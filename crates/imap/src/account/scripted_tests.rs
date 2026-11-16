@@ -27,6 +27,129 @@ fn scripted_account(conn: crate::ImapConnection, pool_cap: usize) -> ImapAccount
     scripted_sync_account(conn, pool_cap, false, None, FolderRegistry::default())
 }
 
+/// Selection discovers an obsolete identity before any UID command. Each lane
+/// must request re-inventory of the folder, preserving the submitted target and
+/// operation instead of reporting terminal failure or reading a reused UID.
+#[tokio::test]
+async fn stale_uidvalidity_accesses_request_folder_reinventory_before_uid_commands() {
+    use bifrost_types::{EngineDirective, ItemOutcome, RecoveryClass, SyncEvent};
+    use futures::{FutureExt, StreamExt};
+    use tokio::io::AsyncReadExt;
+
+    async fn failed_target<T: std::fmt::Debug>(
+        mut stream: bifrost_types::AccountStream<SyncEvent<ItemOutcome<T>>>,
+        id: &bifrost_types::ObjectId,
+    ) -> bifrost_types::AccountError {
+        let mut failures = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                SyncEvent::Batch(batch) => {
+                    for item in batch.items {
+                        let ItemOutcome::Failed(failure) = item else {
+                            panic!("stale target: {item:?}")
+                        };
+                        failures.push(failure);
+                    }
+                }
+                SyncEvent::Done(_) => {}
+                other => panic!("stale target: {other:?}"),
+            }
+        }
+        assert_eq!(failures.len(), 1);
+        let failure = failures.pop().unwrap();
+        assert_eq!(failure.item.0, id.0);
+        failure.error
+    }
+
+    for operation in [
+        AccountOperation::BulkMove,
+        AccountOperation::BulkDestroy,
+        AccountOperation::UpdateFlags,
+        AccountOperation::Hydrate,
+        AccountOperation::HydrateMessage,
+        AccountOperation::OpenRawRfc822,
+    ] {
+        let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS")).await;
+        let mut parts = scripted_account_parts(conn, 1);
+        parts.capabilities.pim_methods.message_hydrate = true;
+        let account = ImapAccount::new(parts);
+        let script = tokio::spawn(async move {
+            let select = read_line(&mut server).await;
+            assert!(
+                select.contains("SELECT") || select.contains("EXAMINE"),
+                "{select}"
+            );
+            respond(&mut server, &format!(
+                "* FLAGS (\\Seen)\r\n* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 8] rebuilt\r\n{} OK selected\r\n",
+                tag_of(&select),
+            )).await;
+            server
+        });
+        let folder = crate::types::MailboxName::new("INBOX").unwrap();
+        // Retain a noncanonical submitted spelling to pin per-target correlation.
+        let id = bifrost_types::ObjectId("imap1:5:INBOX:7:03".into());
+        let targets = Box::pin(futures::stream::iter([id.clone()]));
+        let error = match operation {
+            AccountOperation::OpenRawRfc822 => {
+                let events: Vec<_> = super::blob::open_raw_rfc822(account.clone(), id)
+                    .collect()
+                    .await;
+                match events.as_slice() {
+                    [SyncEvent::Terminated(error)] => error.clone(),
+                    other => panic!("stale raw read: {other:?}"),
+                }
+            }
+            AccountOperation::HydrateMessage => super::message::message_hydrate(
+                account.clone(),
+                id,
+                bifrost_types::HydrationProjection::Headers,
+            )
+            .await
+            .expect_err("stale PIM identity"),
+            AccountOperation::Hydrate => {
+                failed_target(
+                    super::get::get_stream(
+                        account.clone(),
+                        targets,
+                        bifrost_types::Projection::FlagsOnly,
+                    ),
+                    &id,
+                )
+                .await
+            }
+            _ => {
+                let kind = match operation {
+                    AccountOperation::BulkMove => {
+                        super::mutate::MutationKind::Move(bifrost_types::MembershipScope::Folder(
+                            bifrost_types::FolderId("Archive".into()),
+                        ))
+                    }
+                    AccountOperation::BulkDestroy => super::mutate::MutationKind::Destroy,
+                    _ => super::mutate::MutationKind::Flags(bifrost_types::FlagOp::Add(
+                        bifrost_types::FlagSet::from(["$seen".to_owned()]),
+                    )),
+                };
+                failed_target(
+                    super::mutate::mutation_stream(account.clone(), targets, kind),
+                    &id,
+                )
+                .await
+            }
+        };
+        assert_eq!(error.operation(), Some(operation));
+        assert_eq!(
+            error.recovery(),
+            &RecoveryClass::Engine(EngineDirective::RestartScope(super::folder_scope(&folder)))
+        );
+        let mut server = script.await.unwrap();
+        let mut bytes = [0; 1];
+        assert!(
+            server.read(&mut bytes).now_or_never().is_none(),
+            "stale UID command sent for {operation:?}"
+        );
+    }
+}
+
 /// `scripted_account` with the two knobs the sync half needs: whether
 /// QRESYNC survived negotiation, and a registry pre-seeded with the folder
 /// the transcript selects (an unregistered folder makes every cursor and
@@ -5173,6 +5296,64 @@ async fn caller_modseq_rejects_stale_flags_while_absent_keeps_cached_guard() {
         }
         let _server = script.await.unwrap();
     }
+}
+
+/// Without CONDSTORE the caller-version door is unadvertised, so a ModSeq
+/// target is refused locally before any command, not after a SELECT.
+#[tokio::test]
+async fn caller_modseq_without_condstore_is_refused_before_the_wire() {
+    use bifrost_types::{
+        Account, AccountErrorKind, FlagOp, ItemOutcome, MailMutationTarget, ServerVersion,
+        SyncEvent,
+    };
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+    let saw_command = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&saw_command);
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        seen.store(true, Ordering::SeqCst);
+        respond(&mut server, &format!(
+            "{SELECT_PREAMBLE}* 1 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 3] ok\r\n{} OK [READ-WRITE] selected\r\n",
+            tag_of(&select))).await;
+        server
+    });
+    let key = bifrost_types::IdempotencyKey {
+        run_id: bifrost_types::RunId("caller-version".into()),
+        sequence: 0,
+        protocol_salt: bifrost_types::ProtocolSalt::Imap,
+    };
+    let events = Arc::new(account)
+        .bulk_set_flags_if_version(
+            Box::pin(futures::stream::iter([MailMutationTarget {
+                id: super::encode_object_id(
+                    &inbox(),
+                    crate::types::UidValidity::new(5).expect("nonzero epoch"),
+                    crate::types::Uid::new(2).expect("valid protocol test value"),
+                ),
+                expected_version: Some(ServerVersion::ModSeq(100)),
+            }])),
+            FlagOp::Add(bifrost_types::FlagSet::from(["$flagged".into()])),
+            key,
+        )
+        .collect::<Vec<_>>()
+        .await;
+    let failed = events.iter().any(|event| {
+        matches!(event, SyncEvent::Batch(batch) if matches!(
+            batch.items.as_slice(),
+            [ItemOutcome::Failed(failure)]
+                if matches!(failure.error.kind(), AccountErrorKind::Unsupported(_))
+        ))
+    });
+    assert!(failed, "{events:?}");
+    assert!(
+        !saw_command.load(Ordering::SeqCst),
+        "the gate must refuse before SELECT"
+    );
+    script.abort();
 }
 
 const SESSION_GREETING: &[u8] = b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] ready\r\n";

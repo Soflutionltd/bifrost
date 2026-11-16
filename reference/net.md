@@ -239,6 +239,12 @@ with a synthetic unsent replacement attempt. Generic translation produces the
 hold's server kind and a `RetryHint::After` from the remaining monotonic
 duration; the protocol crate stamps its own budget identity.
 
+Translation also stamps `AccountError::is_local_hold()` provenance. Net owns
+the existing provider deadline; the engine receives operation-only pacing from
+`throttle_holds()` rather than recording that refusal into its bucket again.
+Budget and retry/reconcile evidence survive provider decoration. Ordinary server
+throttles and non-HTTP holds retain their existing engine recording behavior.
+
 All other error exits after earlier wire attempts carry
 `Error::AttemptHistory { source, evidence }`. A single
 completion boundary covers deadline checks, retry sleeps, rate admission,
@@ -1593,16 +1599,19 @@ precedence; provider fallback policies declare only exceptions and resource
 hints. An enterprise user expects the same refusal to recover the same way
 whether it arrives as JSON, problem details or a proxy's plain body.
 
-The common table maps 400/413/422 to `Request(Malformed)` with a malformed
-request cause, 401 to reauthorization, 403 to permission denied, 404 to
+The common table maps 400/422 to `Request(Malformed)` with a malformed
+request cause, 413 to `Request(PayloadTooLarge)` with a payload-too-large cause,
+401 to reauthorization, 403 to permission denied, 404 to
 `NotFound` when context names a resource (otherwise a status-bearing server
 error), 409/412 to a state conflict, and 410 to cursor invalid only on a cursor
 scope. 408/502/503/504 are unavailable, 429 is rate limited, and 507 is quota
 exhausted. Other statuses, including 500 and unknown 5xx, retain net's
 `Server(Error { status })` classification; shared recovery still retries HTTP
-5xx server errors. Failed preconditions refresh state;
-payload refusals identify malformed requests. Neither decision depends on the
-body format. Provider-typed transient failures still override the fallback.
+5xx server errors. Failed preconditions refresh state. An enterprise user with
+an oversized attachment expects a terminal size refusal (`ProviderRefused`), so
+413 neither reports a client bug nor throttles the account. Neither decision
+depends on the body format. Provider-typed transient failures still override
+the fallback.
 
 DAV declares 423 as a conflict and supplies its dialect's resource. Graph
 declares cursor-context 400 as cursor invalid. Google declares history-endpoint

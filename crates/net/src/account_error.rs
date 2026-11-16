@@ -182,6 +182,7 @@ fn translate(error: Error, ctx: NetErrorContext, policy: &HttpErrorPolicy) -> Ac
             }
             builder = builder.text(DiagnosticText::support_only(diagnostics));
             builder = policy.apply_throttle(builder, true);
+            builder = builder.local_hold();
             finish(builder, &ctx)
         }
         Error::Network {

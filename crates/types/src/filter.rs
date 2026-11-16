@@ -136,6 +136,9 @@ pub enum FilterCondition {
         after: Option<SystemTime>,
         before: Option<SystemTime>,
     },
+    /// Vendor expression language, not the protocol carrying the rule.
+    /// For example Gmail query syntax remains Gmail's when transported through
+    /// another account surface; `ProtocolKind` would not identify that grammar.
     ProviderExpression {
         provider: Provider,
         expression: String,

@@ -187,6 +187,9 @@ pub type ChangesHook = Arc<dyn Fn(&ChangeCursor) -> Vec<SyncEvent<Change>> + Sen
 /// The throttle keys a scope drive consumes.
 pub type ScopeKeysHook = Arc<dyn Fn(&CursorScope) -> Vec<bifrost_types::ThrottleKey> + Send + Sync>;
 
+/// The throttle keys a mutation target set consumes.
+pub type ObjectKeysHook = Arc<dyn Fn(&[ObjectId]) -> Vec<bifrost_types::ThrottleKey> + Send + Sync>;
+
 /// Optional per-handle classified failure for push teardown.
 pub type UnsubscribeErrorHook =
     Arc<dyn Fn(&SubscriptionHandle) -> Option<AccountError> + Send + Sync>;
@@ -256,6 +259,8 @@ pub struct StubAccount {
     /// none, so the engine waits on account-wide holds only - exactly the
     /// trait's own default.
     pub scope_keys: Option<ScopeKeysHook>,
+    /// Optional per-target mutation declarations, including replacement routing.
+    pub object_keys: Option<ObjectKeysHook>,
     /// Answers one `repair_inventory` request. Mapped over the request
     /// stream, so an answer always carries the attempt id it belongs to -
     /// which a canned outcome list cannot, since attempt ids are minted at
@@ -529,6 +534,7 @@ impl StubAccount {
             resume_inventory_classifier: None,
             changes_hook: None,
             scope_keys: None,
+            object_keys: None,
             repair_hook: None,
             memberships: Vec::new(),
             memberships_error: Mutex::new(None),
@@ -608,6 +614,10 @@ impl AccountFactory for StubFactory {
 }
 
 impl Account for StubAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::Jmap
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.caps
     }
@@ -621,8 +631,17 @@ impl Account for StubAccount {
         _account: &AccountId,
         work: bifrost_types::ThrottleWork<'_>,
     ) -> Vec<bifrost_types::ThrottleKey> {
-        match (work, self.scope_keys.as_ref()) {
-            (bifrost_types::ThrottleWork::Scope(scope), Some(hook)) => hook(scope),
+        match work {
+            bifrost_types::ThrottleWork::Scope(scope) => self
+                .scope_keys
+                .as_ref()
+                .map(|hook| hook(scope))
+                .unwrap_or_default(),
+            bifrost_types::ThrottleWork::Objects(ids) => self
+                .object_keys
+                .as_ref()
+                .map(|hook| hook(ids))
+                .unwrap_or_default(),
             _ => Vec::new(),
         }
     }

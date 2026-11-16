@@ -94,14 +94,9 @@ impl GraphErrorContext {
     /// it says so here rather than borrowing an unrelated operation whose
     /// name would then lie in every telemetry export.
     ///
-    /// Valid only where every request classified under this context is
-    /// declared `ReplayPolicy::Idempotent`. Such a request never carries net's
-    /// the possible-commit ledger verdict, so the widening can never undo a net narrowing.
-    /// The coupling is real: the override survives `into_builder`, and
-    /// `apply_idempotency_override` re-applies this `true` after net
-    /// translates, so on a request net narrowed it WOULD overwrite net's
-    /// `false`. `translate_exchange_ids_is_declared_idempotent` guards the one
-    /// caller.
+    /// Call sites must also declare `ReplayPolicy::Idempotent` for wire
+    /// replay. Builder overrides compose monotonically, so contrary net
+    /// evidence still wins if a request was declared unreplayable.
     #[must_use]
     pub(crate) fn idempotent(mut self) -> Self {
         self.idempotency_override = Some(true);
@@ -313,10 +308,8 @@ fn graph_envelope_evidence(
 ///
 /// `NetErrorContext` carries no override channel, so the context's override
 /// is stamped after net translates. `into_builder` keeps every override,
-/// including a narrowing net stamped itself, and this re-application replaces
-/// it: a widening context (`GraphErrorContext::idempotent`) is therefore
-/// valid only where every request is declared `ReplayPolicy::Idempotent`, so
-/// net never narrowed in the first place. The kind and cause chain are
+/// and the builder composes them monotonically: a narrowing net stamped
+/// itself cannot be widened by this context. The kind and cause chain are
 /// untouched; only `recovery` recomputes. A call site that declared nothing
 /// pays nothing - there is no rebuild.
 #[must_use]

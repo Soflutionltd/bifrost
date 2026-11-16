@@ -111,7 +111,7 @@ pub fn classify_status(
             Cause::State(StateCause::CursorInvalid),
         ),
         _ => match code {
-            400 | 413 | 422 => (
+            400 | 422 => (
                 AccountErrorKind::Request(RequestErrorKind::Malformed),
                 Cause::Request(RequestCause::Malformed {
                     detail: DiagnosticText::support_only(format!("HTTP {code} malformed request")),
@@ -138,6 +138,14 @@ pub fn classify_status(
             409 | 412 => (
                 AccountErrorKind::ConcurrencyConflict,
                 Cause::State(StateCause::ConcurrencyConflict),
+            ),
+            // An enterprise user with an oversized attachment needs a size
+            // refusal so they can reduce it, rather than a client-bug report.
+            413 => (
+                AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+                Cause::Request(RequestCause::PayloadTooLarge {
+                    detail: DiagnosticText::support_only("HTTP 413 payload too large"),
+                }),
             ),
             410 if matches!(scope, Some(ErrorScope::Cursor(_))) => (
                 AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),

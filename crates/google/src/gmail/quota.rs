@@ -496,6 +496,11 @@ mod tests {
             error.throttle_budgets(),
             &[ThrottleBudget::new("gmail-project|123")]
         );
+        assert!(error.is_local_hold());
+        assert!(matches!(
+            error.throttle_holds().as_slice(),
+            [(bifrost_types::HoldTarget::CurrentOperation, _)]
+        ));
         assert!(error.chain().iter().any(|cause| matches!(cause, Cause::Attempt(a) if a.transmission_state == bifrost_types::TransmissionState::Acknowledged)));
         assert_eq!(script.requests().len(), 1);
     }

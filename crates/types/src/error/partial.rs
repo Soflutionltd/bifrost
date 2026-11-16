@@ -646,7 +646,21 @@ impl PartialCommit {
         }) {
             return r.clone();
         }
-        if let Some(d) = p.directives.first() {
+        let blocking = self.outstanding_blocking(&self.resolved());
+        // An engine directive heads the operation only while no recorded
+        // effect stands in the way of the retry it implies. When a committed
+        // step could duplicate on replay (an unresolved Blocking commit) or a
+        // leg gates the retry, a caller that performed the directive and then
+        // reissued the operation would repeat the committed effect - an IMAP
+        // thread add whose live copy landed in Archive while a stale-epoch leg
+        // asks for a restart of INBOX would copy the live message twice. An
+        // enterprise user expects no duplicate, so the headline stays the
+        // reconcile and the directive remains visible through the failed
+        // leg's leg_recovery() and plan().directives.
+        if let Some(d) = p.directives.first()
+            && p.gating.is_empty()
+            && !blocking
+        {
             return RecoveryClass::Engine(d.directive.clone());
         }
         let (retry_hint, throttle_scope) = match leaf {
@@ -654,7 +668,6 @@ impl PartialCommit {
             RecoveryClass::Reconcile(a) => (a.retry_hint, a.throttle_scope),
             _ => (None, None),
         };
-        let blocking = self.outstanding_blocking(&self.resolved());
         if !p.gating.is_empty() || p.barriers.is_empty() && p.replay == ReplaySafety::Never {
             let reason = if blocking {
                 ReconcileReason::PartialCommit

@@ -232,27 +232,7 @@ impl BackfillKey {
 /// Stable durable checkpoint key for an inventory partition.
 #[must_use]
 pub fn partition_key(partition: &InventoryPartition) -> Partition {
-    let key = match partition {
-        InventoryPartition::Full => BackfillKey::Full,
-        InventoryPartition::Time(window) => BackfillKey::Time {
-            from: window.from(),
-            to: window.to(),
-        },
-        InventoryPartition::Uid(window) => BackfillKey::Uid {
-            uid_validity: window.uid_validity(),
-            from: window.from(),
-            to: window.to(),
-        },
-        InventoryPartition::Page(window) => BackfillKey::Page {
-            from: window.from(),
-            to: window.to(),
-        },
-        // The external non-exhaustive partition type has no opaque encoding
-        // door. Preserve the historical fallback until it supplies one; a
-        // Debug rendering would not be a durable identity contract either.
-        _ => BackfillKey::Opaque(Partition(b"unknown".to_vec())),
-    };
-    key.encode()
+    partition.durable_key()
 }
 
 fn optional_i64(value: Option<i64>) -> String {
@@ -329,8 +309,7 @@ fn plan_time(boundaries: &[Duration], now: Timestamp, skew: Duration) -> Partiti
     let mut prev_to = now_skewed;
     for boundary in boundaries {
         // A boundary that runs off the start of the representable range
-        // saturates to the same sentinel the final open-ended partition
-        // uses, keeping partition identity stable across runs.
+        // saturates to the same sentinel the final open-ended partition uses.
         let from = SignedDuration::try_from(*boundary)
             .ok()
             .and_then(|d| now_skewed.checked_sub(d).ok())
@@ -339,8 +318,8 @@ fn plan_time(boundaries: &[Duration], now: Timestamp, skew: Duration) -> Partiti
         prev_to = from;
     }
     // Final open-ended partition: from the minimum representable instant
-    // to the oldest boundary. Encoded as a fixed sentinel so partition
-    // identity is stable across runs.
+    // to the oldest boundary. Only the lower bound is a fixed sentinel;
+    // every absolute time window still changes with the planning instant.
     partitions.push(PartitionBounds::Time {
         from: Timestamp::MIN,
         to: prev_to,
@@ -533,6 +512,10 @@ mod tests {
     #[test]
     fn partition_keys_are_stable() {
         assert_eq!(
+            partition_key(&InventoryPartition::Full),
+            BackfillKey::Full.encode()
+        );
+        assert_eq!(
             partition_key(&InventoryPartition::Page(
                 bifrost_types::PageWindow::new(25, 50).expect("ordered window")
             )),
@@ -550,6 +533,22 @@ mod tests {
             )),
             Partition(b"time::123".to_vec())
         );
+        for partition in [
+            InventoryPartition::Full,
+            InventoryPartition::Time(bifrost_types::TimeWindow::new(None, None).unwrap()),
+            InventoryPartition::Time(bifrost_types::TimeWindow::new(Some(-456), None).unwrap()),
+            InventoryPartition::Time(
+                bifrost_types::TimeWindow::new(Some(-456), Some(123)).unwrap(),
+            ),
+            InventoryPartition::Uid(
+                bifrost_types::UidWindow::new(99, 1, u64::from(u32::MAX) + 1).unwrap(),
+            ),
+            InventoryPartition::Page(bifrost_types::PageWindow::new(0, u32::MAX).unwrap()),
+        ] {
+            let key = partition_key(&partition);
+            assert!(!matches!(BackfillKey::decode(&key), BackfillKey::Opaque(_)));
+            assert_eq!(BackfillKey::decode(&key).encode(), key);
+        }
     }
 
     #[test]

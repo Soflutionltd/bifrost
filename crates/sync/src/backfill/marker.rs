@@ -13,12 +13,8 @@ use std::time::Duration;
 /// marker is acked therefore re-walks rather than recording a false "done".
 ///
 /// `backfill_checkpoint_is_later` selects completion by durable key kind.
-/// `items_done` still sits one past `total_seen`: a consumer-written
-/// `CheckpointStore` that predates that helper and follows the earlier
-/// "greatest items_done, then page bound, then bytes" contract would
-/// otherwise tie the marker with the last page row and pick the page
-/// (`page:` sorts after `complete:`), re-walking a finished scope on every
-/// attach. The honest total rides in `items_estimated`.
+/// Both progress fields report `total_seen`. Stores must use the typed resume
+/// ordering: inflating a count cannot beat a larger row from an older walk.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn emit_backfill_complete(
     scope: &CursorScope,

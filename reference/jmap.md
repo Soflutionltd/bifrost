@@ -1560,7 +1560,14 @@ arrived) and, unless its primary cause already is one, the typed
   `shared_scope_error` intercepts this into `AccountError::revoke_foreign_scope` ->
   `SyncState(ScopeRevoked)` -> `Engine(DisableScope(scope))` (quarantine
   one scope, not the account); a primary scope stays terminal.
-- `Problem(limit)` -> `Server(RateLimited)` w/ `throttle_scope`;
+- `Problem(limit)` splits on its `limit` property: `maxConcurrentRequests` ->
+  `Server(RateLimited)` with account throttle scope and the server's retry hint;
+  `maxSizeRequest`, `maxCallsInRequest` and `maxObjectsIn*` ->
+  `Request(PayloadTooLarge)` -> terminal `ProviderRefused`, without throttle
+  metadata. An enterprise user with an oversized attachment or request expects
+  to reduce the input, rather than retry it unchanged or report a client bug.
+  A missing or unknown limit uses the shared HTTP status fallback; without a
+  status it is `Protocol(Unknown)`.
   `Problem(unknownCapability)` -> `SyncState(CapabilityChanged)` ->
   `Engine(RestartAccount)`; `Problem(notJSON | notRequest)` ->
   `Protocol(ContractViolation)`. A problem document of any other type is
@@ -1568,7 +1575,8 @@ arrived) and, unless its primary cause already is one, the typed
   own `status`, else the carrying net error's). This is the same fallback as a
   plain transport body: 408/502/503/504 are unavailable, 507 is quota exhausted
   with account throttle scope, and other 5xx retain a status-bearing server
-  error. 409/412 are state conflicts and 400/413/422 are malformed requests.
+  error. 409/412 are state conflicts, 400/422 are malformed requests, and 413 is
+  `Request(PayloadTooLarge)`.
   Scope-less 404 remains `Server(Error { 404 })`; cursor-scoped 410 invalidates
   that cursor. No status at all is `Protocol(Unknown)`. Enterprise users should
   get the same recovery when the server changes only its error body format.

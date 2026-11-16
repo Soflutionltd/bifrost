@@ -4,8 +4,7 @@
 use crate::account::GraphAccount;
 use crate::account::GraphClient;
 use crate::account::graph_error::{
-    GraphErrorContext, into_account_error, invalid_argument_account_error,
-    unsupported_account_error,
+    GraphErrorContext, into_account_error, unsupported_account_error,
 };
 use crate::client::Resource;
 use base64::Engine;
@@ -39,22 +38,12 @@ pub(crate) async fn send_message(
     // `/users/{id}` client so the draft is owned by the shared mailbox.
     let client = match &request.send_as {
         None => account.mailboxes.primary(),
-        // The two answers mean different things and the capability flag picks
-        // between them (`SendRequest::send_as` is the governing statement).
-        // An EMPTY map is `pim_methods.send_as == false`: the feature is
-        // absent on this account, so the honest answer is `Unsupported`, and
-        // telling the caller to correct an argument would send them to fix a
-        // request that no argument could have satisfied. A non-empty map is
-        // the flag being true, so an id that is not in it is a bad argument.
-        Some(_) if account.mailboxes.shared().is_empty() => {
-            return Err(crate::account::graph_error::unsupported_account_error(
-                AccountOperation::Send,
-            ));
-        }
         Some(send_as) => account
             .mailboxes
             .shared_client(&send_as.mailbox().0)
-            .ok_or_else(|| send_as_unknown_mailbox(send_as.mailbox()))?,
+            .ok_or_else(|| {
+                send_as_rejection(account.capabilities.pim_methods.send_as, send_as.mailbox())
+            })?,
     };
     let mut message = message_from_send_request(&request)?;
     if let Some(send_as) = &request.send_as {
@@ -204,14 +193,24 @@ pub(super) fn apply_send_as(message: &mut Value, send_as: &SendAs, user_email: O
 /// should not have to know which one it is talking to.
 #[must_use]
 pub(super) fn send_as_unknown_mailbox(mailbox: &PrincipalId) -> AccountError {
-    invalid_argument_account_error(
-        AccountOperation::Send,
-        "send_as.mailbox",
-        format!(
+    // This helper also validates persisted scheduled-send handles, where an
+    // unknown owner remains a bad handle even after the last share is removed.
+    send_as_rejection(true, mailbox)
+}
+
+fn send_as_rejection(available: bool, mailbox: &PrincipalId) -> AccountError {
+    bifrost_types::compose::classify_send_as_rejection(
+        available,
+        bifrost_types::Protocol::Graph,
+        bifrost_types::DiagnosticText::support_only(format!(
             "shared mailbox not configured on this account: {}",
             mailbox.0
-        ),
+        )),
     )
+    .into_builder()
+    .provider(bifrost_types::Provider::Microsoft)
+    .try_build()
+    .expect("valid Graph send-as rejection")
 }
 
 /// MAPI proptag form for `PidTagDeferredSendTime` (`PT_SYSTIME 0x3FEF`),

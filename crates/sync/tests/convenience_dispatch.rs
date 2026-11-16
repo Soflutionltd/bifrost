@@ -99,6 +99,10 @@ fn ok_future() -> AccountFuture<Result<(), AccountError>> {
 }
 
 impl Account for RecorderAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::Unknown
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.caps
     }

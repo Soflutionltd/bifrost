@@ -973,9 +973,11 @@ recovery classification. Cursor-envelope rejection publishes `Terminated`
 before returning its classified account error, so an engine directive is
 dispatched and subscribers are not left with a silently stalled scope.
 
-The protocol tag on that error is read off the offending checkpoint's change
-cursor. There is no protocol accessor on `dyn Account`, so a checkpoint that
-carries no tag yields `Protocol::Unknown` rather than a guess.
+The protocol tag on that error follows the offending checkpoint's change cursor,
+using the exhaustive types-owned `From<ProtocolKind> for Protocol` conversion.
+`Account::protocol()` identifies the primary account protocol, which can differ
+from a composed cursor's origin. These checkpoint-only constructors have no
+failing-leg identity for an untagged checkpoint and use `Protocol::Unknown`.
 
 **Both inventory front ends and the live driver refuse a BACKFILL checkpoint
 outright**, and the reason is about the bound rather than about envelopes. Both
@@ -1460,11 +1462,10 @@ the same consumer-ack path as the page batches (`emit_backfill_complete`
 because it is ordered behind every page it only lands durably after the
 consumer has persisted all of them - a crash before completion re-walks
 rather than recording a false "done". Its `items_estimated` records the
-observed total and its `items_done` sits one past it, so a consumer store that
-still orders rows by greatest `items_done` also selects the marker. Under
-`backfill_checkpoint_is_later` completion wins resume selection by key kind,
-independently of older partitions' counts, so a shrinking folder or an empty
-final probe cannot make a completed walk repeat on every attach.
+observed total and its `items_done` reports that same count, including zero for
+an empty inventory. Under `backfill_checkpoint_is_later` completion wins resume
+selection by key kind, independently of older partitions' counts, so a shrinking
+folder or an empty final probe cannot make a completed walk repeat on every attach.
 
 This skip-on-complete signal is uniform across plan kinds; the difference
 is whether positional resume is also possible:
@@ -2460,6 +2461,11 @@ wire method and final read-back guard. Campaign flow:
    before every submission. A never-submitted target whose singleton
    declaration changes is re-routed; submitted and uncertain targets retain
    their cohort and execution identity.
+   The post-admission check requires every unsent target to retain that
+   declaration on the replacement account. A single unchanged sibling cannot
+   authorize sending a rerouted target under the old cohort's identity.
+   `declaration_matches_requires_every_unsent_target_on_the_replacement` pins
+   this mixed-target case, rerouting and submitted-identity retention.
 
 3. Schedule one ready action at a time: a submission, retry, read-back, or
    reassertion for one cohort. Save its state after the action and return to the
@@ -2625,6 +2631,16 @@ partial completion.
 is consumer-minted and consumer-persisted across process restarts
 so retries from a previous process correlate. `IdempotencyVendor` does not
 persist it; the consumer supplies the durable value.
+
+The campaign's explicit `ProtocolKind` selects the consumer's salt namespace;
+it does not override error identity or cursor provenance. `Account::protocol()`
+names the primary account protocol and is not a replacement for that policy on
+a composed account. `IdempotencyVendor` retains its custom salt factory and
+nonempty payload support. The default factory delegates to the exhaustive
+`ProtocolSalt::from(ProtocolKind)` conversion in `bifrost-types`, so adding a
+cursor protocol cannot silently assign it the IMAP salt. Built-in providers do
+not consume the salt payload, but consumer implementations still receive it in
+the `IdempotencyKey` passed to their bulk methods.
 
 Before every wire action, including read-back, the scheduler waits through
 `SyncControl::wait_until_running` and registers an activity guard.
@@ -3893,9 +3909,18 @@ resume positions. `backfill::partitioner::BackfillKey` provides a typed codec fo
 full, time, UID, page, versioned completion and legacy completion keys, retaining
 unknown bytes as opaque keys. Existing `complete`, `complete:v2` and `page:F:T`
 rows remain readable; legacy empty-plan markers retain their one-time recheck.
-Consumer stores should compact a scope's older partition rows atomically when a
-proven completion lands; the in-memory backend does so. Incomplete time-window
-walks can still accumulate distinct absolute-time keys across attaches.
+`InventoryPartition::durable_key` in `bifrost-types` owns generation of partition
+keys with an exhaustive match; the engine has no shared unknown-variant key.
+Consumer stores must apply `cursor::store::backfill_checkpoint_compacts` within
+the checkpoint-and-ledger transaction. Proven completion removes every older
+row of the scope. A time-window checkpoint removes other time-window rows in
+that scope, bounding unfinished absolute-time history to one row across
+attaches. Fixed plans replay every partition after interruption, so those rows
+cannot provide positional resume evidence. Time compaction preserves completion,
+page, UID and unknown rows, other scopes and accounts, and the supplied ledger.
+The in-memory backend implements both rules. The trait specifies these storage
+semantics, just as it specifies atomicity; external backends remain responsible
+for honoring them and the public resume comparison helper.
 Because a proven completion outranks every partition row, every path that must
 re-walk a scope deletes the marker first. A provider-deleted scope does this
 through `reset_scope_for_deletion` (`delete_backfill`), and schema recovery
@@ -4768,7 +4793,7 @@ a lifecycle epoch and an account generation cannot be substituted at a call.
 | `engine::ReattachAttempt` | `ReattachGuard` issues process-wide provisional-row ownership ids; writer claims, commit and abort carry them unchanged. |
 | `engine::ResetCount` | `DeferredSchemaReset` counts committed clears and snapshots that count when parking an owed reset. |
 | `delivery::ReceiverSequence` | `ChangeDelivery` numbers admitted subscribers. Coverage records delivery and readership against those numbers without issuing them. |
-| `backfill::scope_walk::WalkTotal` | `ScopeWalkDriver` folds observed partition counts; the total supplies completion progress with the established one-past-count marker convention and exposes `count` for reporting. |
+| `backfill::scope_walk::WalkTotal` | `ScopeWalkDriver` folds observed partition counts; the total supplies exact completion progress and exposes `count` for reporting. |
 
 Internal `ScopeTokenGeneration`, `PushTopologyGeneration` and
 `CheckpointGeneration` separately represent poll-task ownership, push topology
@@ -4786,8 +4811,9 @@ ids carry one.
 
 These are representation wrappers, not a storage migration. Ledger generation
 fields and discharge fingerprints still use the same eight little-endian bytes;
-they did not bump the ledger envelope version. Backfill completion progress still writes
-`items_done = observed + 1` (saturating) and `items_estimated = observed`.
+they did not bump the ledger envelope version. Backfill completion progress writes
+`items_done = observed` and `items_estimated = observed`; completion is selected
+by its typed key rather than an inflated count.
 Publication segments and counters retain their existing packed representation.
 Before exposing registrations or starting producers, attach loads the durable
 ledger and seeds the coverage counter strictly above every retained entry,
@@ -4856,6 +4882,12 @@ records shareable targets and returns the longest local deadline, including
 operation-only holds. Repair uses that same deadline; retrying lanes own their
 one-second hintless retry and reconcile pacing. Existing recorder functions
 are forwarding entry points for their callers.
+
+Net local-gate refusals retain `AccountError::is_local_hold()` provenance and
+project to operation-only pacing, even with a stamped provider budget. Net
+continues enforcing its original deadline; observation never installs or extends
+a second engine hold for that leg. Other primary, sibling and cleanup failures
+still record their own shareable targets.
 
 
 Ledger mutations in the account writer have two persistence disciplines.

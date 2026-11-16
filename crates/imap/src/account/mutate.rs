@@ -68,6 +68,13 @@ pub(crate) fn bulk_set_flags_if_version(
     key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     bifrost_types::mutation::versioned_mail_stream(targets, move |target| {
+        if let Err(error) = account.capabilities.mutation.concurrency.gate_version(
+            AccountOperation::UpdateFlags,
+            target.expected_version.as_ref(),
+            Protocol::Imap,
+        ) {
+            return bifrost_types::mutation::refused_mail_target(target.id, error);
+        }
         let Some(version) = target.expected_version else {
             return bulk_set_flags(
                 account.clone(),

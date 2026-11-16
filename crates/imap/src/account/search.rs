@@ -19,9 +19,10 @@ pub(crate) fn search(
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
     Box::pin(async move {
-        if !account.capabilities.pim_methods.search {
-            return Err(super::error::unsupported(AccountOperation::Search));
-        }
+        account
+            .capabilities
+            .pim_methods
+            .gate(AccountOperation::Search, Protocol::Imap)?;
         let plan = search_plan(&account.dav_scopes, &request, AccountOperation::Search)?;
         let mut pager = SearchPager::new(&request, plan.folder.as_ref(), AccountOperation::Search)?;
         for folder in pager.folders(search_folders(&account, plan.folder.as_ref())) {
@@ -70,9 +71,10 @@ pub(crate) fn search_messages(
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
     Box::pin(async move {
-        if !account.capabilities.pim_methods.search_messages {
-            return Err(super::error::unsupported(AccountOperation::SearchMessages));
-        }
+        account
+            .capabilities
+            .pim_methods
+            .gate(AccountOperation::SearchMessages, Protocol::Imap)?;
         let plan = search_plan(
             &account.dav_scopes,
             &request,
@@ -477,8 +479,8 @@ impl SearchPosition {
 /// created or renamed into, a position the walk already passed is not
 /// returned; a thread whose membership changed between pages can come back
 /// under a new id or be passed. A changed UIDVALIDITY on the cursor's folder
-/// voids every UID in the cursor, so the call fails `ConcurrencyConflict` and
-/// the caller repeats the walk.
+/// voids every UID in the cursor. Request folder re-inventory and have the
+/// caller repeat the walk against the fresh generation.
 struct SearchPager<T> {
     resume: Option<SearchPosition>,
     limit: usize,

@@ -164,9 +164,9 @@ pub(crate) fn classify_envelope(
 /// outcome, because an implementation emitting a nonsense boundary does not
 /// heal by being asked again.
 ///
-/// The protocol tag is read off the offending checkpoint. There is no
-/// protocol accessor on `dyn Account`, so where the checkpoint carries no
-/// tag of its own the error says `Protocol::Unknown` rather than guessing.
+/// The protocol tag follows checkpoint provenance, which can differ from a
+/// composed account's primary `Account::protocol()`. Without a checkpoint tag
+/// it remains `Unknown`; this constructor has no account or failing leg.
 #[must_use]
 pub(crate) fn batch_boundary_violation(
     violation: bifrost_types::BatchBoundaryError,
@@ -234,23 +234,12 @@ fn contract_violation(
 }
 
 fn checkpoint_protocol(checkpoint: Option<&bifrost_types::Checkpoint>) -> bifrost_types::Protocol {
-    use bifrost_types::{Checkpoint, Protocol, ProtocolKind};
+    use bifrost_types::{Checkpoint, Protocol};
     let Some(Checkpoint::Change(cursor)) = checkpoint else {
         // A backfill checkpoint carries no protocol tag at all.
         return Protocol::Unknown;
     };
-    match cursor.server_state.protocol {
-        ProtocolKind::Jmap => Protocol::Jmap,
-        ProtocolKind::Imap => Protocol::Imap,
-        ProtocolKind::Gmail => Protocol::Gmail,
-        ProtocolKind::CardDav => Protocol::CardDav,
-        ProtocolKind::CalDav => Protocol::CalDav,
-        ProtocolKind::Graph => Protocol::Graph,
-        // `ProtocolKind` is `#[non_exhaustive]`; a variant added upstream is
-        // unmappable here, and naming the wrong protocol is worse than
-        // declining to name one.
-        _ => Protocol::Unknown,
-    }
+    cursor.server_state.protocol.into()
 }
 
 /// The error a `pause` / `checkpoint_now` waiter returns when the account

@@ -293,7 +293,7 @@ InventoryPartition` has two redundant middle layers, and collapsing it to
 `InventoryPartitioning -> Vec<InventoryPartition>` (or `OpenPages`) in
 `backfill/plan.rs` keeps every behaviour (owner ruling for the middle types);
 and the durable cost of the unexercised machinery (the selection rule every
-store implements, the drifting time keys, BUG-016) is paid now by every backend
+store implements, the time-key compaction contract) is paid now by every backend
 for producers that do not exist yet.
 
 ## STR-048 - Per-scope drive state is split between the cursor registry and the multiplexer
@@ -497,7 +497,7 @@ seam (`sync/push.rs::PushTransport`), the genuinely non-HTTP part.
 **The jmap-account hunter reached the opposite remedy for the same symptom.** It
 reports that `JmapAccount` hardwires `MailAccount = Account<ReqwestTransport>`
 because WebSocket push is reqwest-specific, and that as a consequence
-`capability_contract_tests.rs` can only check the false direction (CON-006);
+`capability_contract_tests.rs` can only check the false direction;
 `route_object_id`, `route_mutation_target`, `draft_route_account` are generic over
 a handle type `H` "purely so they can be exercised"; `foreign_account_id_for_object`
 exists only under `#[cfg(test)]` as a test pin for a rule production implements

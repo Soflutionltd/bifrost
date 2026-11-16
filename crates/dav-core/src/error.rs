@@ -20,6 +20,8 @@ use reqwest::StatusCode;
 /// Carries the three values that distinguish the two otherwise identical error
 /// surfaces, so a caller cannot mix a CalDAV `Protocol` stamp with a CardDAV
 /// `ResourceKind`.
+/// This is a closed dispatch dialect, not another account protocol registry.
+/// Its conversion is exhaustive here, in the same crate that owns the dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DavProtocol {
     CalDav,

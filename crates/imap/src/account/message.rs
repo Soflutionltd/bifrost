@@ -21,9 +21,10 @@ pub(crate) fn thread_hydrate(
     thread: ThreadId,
 ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
     Box::pin(async move {
-        if !account.capabilities.pim_methods.thread_hydrate {
-            return Err(super::error::unsupported(AccountOperation::HydrateThread));
-        }
+        account.capabilities.pim_methods.gate(
+            AccountOperation::HydrateThread,
+            bifrost_types::Protocol::Imap,
+        )?;
         let members = resolve_thread_members(
             &account,
             &thread,
@@ -51,9 +52,10 @@ pub(crate) fn message_hydrate(
     projection: HydrationProjection,
 ) -> AccountFuture<Result<Message, AccountError>> {
     Box::pin(async move {
-        if !account.capabilities.pim_methods.message_hydrate {
-            return Err(super::error::unsupported(AccountOperation::HydrateMessage));
-        }
+        account.capabilities.pim_methods.gate(
+            AccountOperation::HydrateMessage,
+            bifrost_types::Protocol::Imap,
+        )?;
         let decoded = decode_object_id(&message, AccountOperation::HydrateMessage)?;
         // The canonical spelling of the requested id, compared against the
         // ids `fetch_to_message` mints. `hydrate_decoded` already drops

@@ -1,5 +1,43 @@
 use super::*;
 use crate::account::batch::subrequest_replayable;
+
+#[test]
+fn an_idempotent_context_cannot_widen_a_net_possible_commit() {
+    let context = GraphErrorContext::graph(AccountOperation::PushSubscribe).idempotent();
+    let net_error = || bifrost_net::Error::AttemptHistory {
+        source: Box::new(bifrost_net::Error::Timeout {
+            transmission_state: TransmissionState::InFlight,
+        }),
+        evidence: bifrost_net::RequestEvidence::new(
+            Vec::new(),
+            bifrost_net::CommitEvidence::MayHaveCommitted,
+        ),
+    };
+    for error in [
+        net_to_account_error(net_error(), &context),
+        ews_error_to_account_error(
+            EwsError::Transport(net_error()),
+            GraphErrorContext::ews(AccountOperation::PushSubscribe).idempotent(),
+        ),
+    ] {
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Reconcile(_)
+        ));
+    }
+    // A declared repeatable read still widens the operation's default when
+    // net has no contrary request evidence.
+    let repeatable = net_to_account_error(
+        bifrost_net::Error::Timeout {
+            transmission_state: TransmissionState::InFlight,
+        },
+        &context,
+    );
+    assert!(matches!(
+        repeatable.recovery(),
+        bifrost_types::RecoveryClass::Retry(_)
+    ));
+}
 #[test]
 fn a_missing_conditional_subresponse_reconciles() {
     for (op, safe) in [

@@ -21,6 +21,10 @@ struct ScriptAccount {
 }
 #[allow(unused_variables)]
 impl Account for ScriptAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::Unknown
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         unreachable!("capabilities unused")
     }

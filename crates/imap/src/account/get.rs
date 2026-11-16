@@ -1018,7 +1018,7 @@ mod tests {
         assert!(
             matches!(stale.as_slice(), [ItemOutcome::Failed(failure)] if matches!(
                 failure.error.kind(),
-                AccountErrorKind::Request(RequestErrorKind::PreconditionFailed)
+                AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid)
             ))
         );
 
@@ -1203,7 +1203,7 @@ mod tests {
                 batch.items.as_slice(),
                 [ItemOutcome::Failed(failure)] if matches!(
                     failure.error.kind(),
-                    AccountErrorKind::Request(RequestErrorKind::PreconditionFailed)
+                    AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid)
                 )
             )),
             other => panic!("expected a batch, got {other:?}"),

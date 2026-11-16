@@ -8,6 +8,35 @@ and no engine. Protocol crates implement `Account` and
 The shared structured error contract is documented separately in
 `reference/error-model.md`.
 
+## Protocol identity
+
+The identity vocabularies describe different domains. `ProtocolKind` is the
+set of protocols that mint opaque change cursors; `Protocol` also names
+submission and auxiliary APIs and has `Unknown` for unavailable identity.
+`From<ProtocolKind> for Protocol` owns their exhaustive conversion here.
+`ProtocolSalt::from(ProtocolKind)` owns default mutation bookkeeping salts,
+also exhaustively. Custom salt factories retain their payload-bearing variants;
+empty payloads are a default, not a restriction on consumers.
+
+`Provider` names a vendor or vendor API, including the expression language of
+`FilterCondition::ProviderExpression`. A vendor expression is not cursor
+provenance. `PushSource` identifies a delivery mechanism, including synthetic
+coalescing. DAV's private `DavProtocol` selects a closed dialect policy and its
+resource kinds; its exhaustive conversion belongs beside that policy.
+
+`Account::protocol()` is required and names the primary account protocol for
+inherited refusals. Implementors can explicitly return `Unknown` when no
+identity is available. It does not replace per-error protocol/provider stamps:
+Google Calendar and People failures differ from Gmail failures on one account,
+and IMAP can compose DAV and SMTP legs. An enterprise user needs the failing
+service identified rather than every failure attributed to their mail service.
+Cursor provenance likewise remains the source of identity for errors about a
+particular checkpoint. A blanket account context would overwrite this evidence.
+
+Cursor and ledger codecs keep their historical protocol tags independently.
+Graph is tag 3 in a cursor and tag 6 in a ledger; semantic conversion never
+converts those persisted bytes or changes either format.
+
 ## Async object-safe surface
 
 `AccountFuture<T>` and `AccountStream<T>` are boxed, `Send`, and
@@ -140,6 +169,31 @@ fields include:
 Consumers should inspect capabilities before presenting an operation.
 An implementation must still return a structured error if an advertised
 operation fails or support changes at runtime.
+
+`PimMethodSupport` remains the published snapshot. Its declaration generates
+both its existing fields and `gate(operation, protocol)`, which returns the
+canonical `Unsupported(operation)` for a disabled method. IMAP's snapshot
+gates consume this helper. Operations without a PIM field are refused by the
+helper, so it is not a general Account dispatcher. Provider prerequisites and
+the false-direction capability contract tests remain necessary.
+
+The mapping is deliberately not a method/field/operation bijection. `Send`
+checks ordinary sending only; `send_as` can be true while `send_message` is
+false. `scheduled_send` gates two scheduling methods and a request field;
+`directory_enumerate` gates the empty-query path of directory search. Required
+Account method declarations, composing convenience defaults and operation
+variants therefore remain explicit rather than generating default refusals
+from the flag list. A generated refusal would not gate provider overrides or
+prove support, and replacing composing defaults would lose behavior.
+
+`compose::classify_send_as_rejection` owns the flag-selected rejection for
+Graph and JMAP: unavailable means Unsupported(Send) with SendAsUnavailable;
+available but unroutable means Request(Malformed) with the `send_as.mailbox`
+field pointer. Protocol identity and provider diagnostic text survive. Routing
+and refusal order remain provider-owned, including JMAP's foreign scheduling
+and per-share submission checks. An Outlook user should be asked to correct
+a mailbox only when that account can send as another mailbox, and a rejected
+route must never become a personal send.
 
 `MutationCapabilities::reassertion` is a `MutationReassertion { set_flags,
 destroy }`, default off (`MutationReassertion::NONE`). Declaring a door says
@@ -571,6 +625,15 @@ still refuse a compound form that cannot preserve one native atomic guard.
 Unsupported version kinds are refused; a stale supported version is a
 `ConcurrencyConflict`. No supplied version is refreshed and retried silently.
 
+`MutationConcurrency::gate_version(operation, expected_version, protocol)`
+admits absent versions and refuses supplied versions for unadvertised doors.
+IMAP and Graph bulk flag writes apply it per target before token admission or
+I/O, retaining unguarded siblings. A successful gate does not validate token
+kind or implement a wire precondition. The trait's versioned defaults must
+still refuse every supplied version: metadata cannot supply a missing guard
+implementation. The engine dispatches caller versions to the provider rather
+than rejecting a whole mixed batch from this snapshot.
+
 IMAP accepts caller MODSEQ for single-STORE flags. Graph accepts caller ETag for
 message PATCH. JMAP accepts caller account Email state for flags, move and
 destroy (`bulk_move_from_if_version` ignores `source`, as the unversioned
@@ -814,6 +877,13 @@ same windows. `CoverageDomain::for_partition` copies the window and never takes
 an unrelated epoch or a non-UID sentinel. `InventoryPartitioning` describes
 planning hints, not requested windows: an inclusive maximum UID remains u32,
 with its epoch, while page totals and page sizes remain counts.
+
+`InventoryPartition::durable_key` owns checkpoint identity alongside the enum.
+Its exhaustive match forces every new partition variant to choose a durable
+encoding instead of colliding on an external consumer's fallback key. Existing
+`full`, `time:F:T`, `uid:E:F:T` and `page:F:T` bytes are unchanged; omitted time
+bounds encode as empty fields. The engine separately owns completion keys and
+the decoder for older or unknown stored keys.
 
 `SnapshotIdentity` retains value `Eq` for durable-record round trips and
 record deduplication. It is not a coverage proof. Only `same_snapshot_as`

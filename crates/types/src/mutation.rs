@@ -252,9 +252,8 @@ pub struct HydratedObject {
 ///
 /// Distinct from `MutationConcurrency::StateBased`: that is
 /// optimistic concurrency on the wire, this is engine bookkeeping
-/// for "did we already submit this exact batch?" No protocol today
-/// emits `ProtocolSalt` onto the wire; all four rely on the engine's
-/// read-back guard.
+/// for "did we already submit this exact batch?" Built-in providers do not
+/// emit `ProtocolSalt` onto the wire; they rely on the engine's read-back guard.
 #[derive(Debug, Clone)]
 pub struct IdempotencyKey {
     pub run_id: RunId,
@@ -264,9 +263,10 @@ pub struct IdempotencyKey {
 
 /// Protocol-tagged salt used by the engine's idempotency bookkeeping.
 ///
-/// Carried alongside `RunId` and `sequence` so the engine can hash
-/// requests deterministically per protocol without leaking the salt
-/// onto the wire.
+/// Carried alongside `RunId` and `sequence` for protocol-specific correlation.
+/// The engine preserves the salt across retries without interpreting it;
+/// built-in providers never send it on the wire. Custom factories may supply
+/// nonempty payloads as consumer bookkeeping identity, not cursor provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ProtocolSalt {
@@ -286,14 +286,23 @@ pub enum ProtocolSalt {
     /// available and the engine keeps idempotency local.
     CardDav,
     /// CalDAV carries no replay token, on the same terms as CardDAV.
-    ///
-    /// Present because `ProtocolKind::CalDav` is a live protocol with a live
-    /// account crate. Without it, `default_salt_factory`'s catch-all silently
-    /// handed CalDAV the IMAP salt - harmless while the salt is engine-internal
-    /// bookkeeping separated by `RunId` plus a monotonic sequence, but a
-    /// catch-all absorbing a REAL protocol rather than a hypothetical future
-    /// one stops being harmless the moment the salt acquires meaning.
     CalDav,
+}
+
+impl From<crate::ProtocolKind> for ProtocolSalt {
+    /// Default bookkeeping salt. Custom factories can still supply payloads.
+    fn from(protocol: crate::ProtocolKind) -> Self {
+        // Keep this exhaustive inside the vocabulary's owner. An external
+        // wildcard used to silently assign new protocols the IMAP identity.
+        match protocol {
+            crate::ProtocolKind::Jmap => Self::Jmap(String::new()),
+            crate::ProtocolKind::Imap => Self::Imap,
+            crate::ProtocolKind::Gmail => Self::Gmail(String::new()),
+            crate::ProtocolKind::CardDav => Self::CardDav,
+            crate::ProtocolKind::CalDav => Self::CalDav,
+            crate::ProtocolKind::Graph => Self::Graph(String::new()),
+        }
+    }
 }
 
 /// Bulk flag mutation. Carries both the operation and the flag set

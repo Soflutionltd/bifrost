@@ -346,6 +346,9 @@ fn decode_obj_type(tag: u8) -> Result<ObjectType, Error> {
 
 // ---------- change-cursor payload codec ----------
 
+// These persisted cursor tags predate the ledger's broader Protocol vocabulary.
+// For example Graph is 3 here and 6 in the ledger. A semantic From conversion
+// must never be used to substitute one codec's storage tags for the other's.
 const PROTOCOL_JMAP: u8 = 0;
 const PROTOCOL_IMAP: u8 = 1;
 const PROTOCOL_GMAIL: u8 = 2;

@@ -45,9 +45,10 @@ pub(crate) fn draft_create(
     patch: DraftPatch,
 ) -> AccountFuture<Result<DraftHandle, AccountError>> {
     Box::pin(async move {
-        if !account.capabilities.pim_methods.draft_create {
-            return Err(super::error::unsupported(AccountOperation::DraftCreate));
-        }
+        account
+            .capabilities
+            .pim_methods
+            .gate(AccountOperation::DraftCreate, bifrost_types::Protocol::Imap)?;
         let folder = account
             .folders
             .role_folder(FolderRole::Drafts)
@@ -457,9 +458,10 @@ pub(crate) fn draft_discard(
     draft: DraftHandle,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        if !account.capabilities.pim_methods.draft_discard {
-            return Err(super::error::unsupported(AccountOperation::DraftDiscard));
-        }
+        account.capabilities.pim_methods.gate(
+            AccountOperation::DraftDiscard,
+            bifrost_types::Protocol::Imap,
+        )?;
         let id = decode_object_id(&ObjectId(draft.0), AccountOperation::DraftDiscard)?;
         delete_messages(&account, vec![id], AccountOperation::DraftDiscard)
             .await
